@@ -1,0 +1,127 @@
+; bl/vcs.bl — `bl vcs`: the history of a tree, and the gate in front of it.
+;
+; The verb is thin on purpose. `vcs` owns the semantics (checkpoint, mirror,
+; gate, undo); this file owns only the command line, so the daemon can call the
+; same procedures without going through a CLI.
+;
+;   bl vcs status                 what the mirror holds, and jj's head
+;   bl vcs history [-n N]         the timeline: actor, intent, path, operation
+;   bl vcs touched PATH           which requests touched one path
+;   bl vcs checkpoint [-m WHY] [--by ACTOR] [--no-gate]
+;   bl vcs gate [PATH...]         the gate alone — what CI runs (exit 0/1)
+;   bl vcs undo OP                put the whole tree back to an operation
+;   bl vcs init                   make this tree a versioned workspace
+;
+; `checkpoint` gates BEFORE it records: a tree that fails the gate is reported
+; and not advanced, so a failure cannot become history by being skipped.
+
+(ns bl.vcs
+  (:require [vcs] [bl.util :as u]))
+
+(defn- join-argv
+  "A command line for a message. `clojure.string/join` refuses the lazy seq
+   `(map str …)` produces, so the fold is written out."
+  [argv]
+  (reduce (fn [acc a] (str acc (str a) " ")) "" argv))
+
+(defn- render-status [s]
+  (let [m (:mirror s) j (:jj s)]
+    (str "tree          " (:dir s) "\n"
+         "jj            " (:version j) "\n"
+         "head change   " (:head_change j) "\n"
+         "latest op     " (:latest_op j) "\n"
+         "mirror        " (:ops m) " operations, " (:commits m) " commits, "
+         (:requests m) " requests\n"
+         "watermark     " (if (get-in m [:new :skipped]) "up to date" "just advanced") "\n"
+         "mirror ignored " (if (:mirror_ignored s) "yes" "NO — the tree will track its own journal"))))
+
+(defn- render-history [h]
+  (reduce
+    (fn [acc r]
+      (str acc (:by r) ": " (:why r) "\n"
+           "    " (:path r) "  " (:at r) " ms  op " (subs (:op r) 0 12) "\n"))
+    "" h))
+
+(defn- render-touched [t]
+  (reduce
+    (fn [acc r] (str acc (:at r) "  " (:by r) ": " (:why r) "  op " (subs (:op r) 0 12) "\n"))
+    "" (:requests t)))
+
+(defn- cmd-status [args st]
+  (u/emit st (vcs/status {:dir (BeamLisp/cwd)}) render-status)
+  0)
+
+(defn- cmd-history [args st]
+  (let [h (vcs/history {:dir (BeamLisp/cwd) :limit (or (:limit st) 50)})]
+    (u/emit st h (fn [x] (render-history (:history x))))
+    0))
+
+(defn- cmd-touched [args st]
+  (if (empty? args)
+    (u/usage-error "usage: bl vcs touched PATH")
+    (let [t (vcs/touched {:dir (BeamLisp/cwd) :path (first args)})]
+      (u/emit st t render-touched)
+      0)))
+
+(defn- cmd-checkpoint [args st]
+  (let [dir (BeamLisp/cwd)
+        why (or (:message st) (first args) "checkpoint")
+        by (or (:by st) "human")
+        opts {:dir dir :by by :why why}
+        r (if (:no-gate st) (vcs/checkpoint! opts) (vcs/checkpoint+gated! opts))]
+    (u/emit st r (fn [x]
+                   (cond
+                     (:ok x) (if (:skipped x)
+                               (str "nothing to record (" (:reason x) ")")
+                               (str "recorded  op " (subs (:op x) 0 12)
+                                    "  commit " (subs (:commit x) 0 12) "  " by ": " why))
+                     :else (str "refused by the gate: " (get-in x [:gate :out])))))
+    (if (:ok r) 0 1)))
+
+(defn- cmd-gate [args st]
+  (let [r (vcs/gate! {:dir (BeamLisp/cwd) :paths (vec args)})
+        cmd (join-argv (:argv r))]
+    (if (:ok r)
+      (do (u/emit st (assoc r :cmd cmd) (fn [x] (str "gate ok: " (:cmd x)))) 0)
+      (do (u/io-err (str "gate failed: " cmd "\n" (:out r) "\n")) 1))))
+
+(defn- cmd-undo [args st]
+  (if (empty? args)
+    (u/usage-error "usage: bl vcs undo OPERATION")
+    (let [r (vcs/undo! {:dir (BeamLisp/cwd) :op (first args)})]
+      (u/emit st r (fn [x] (if (:ok x) (str "restored to " (subs (:restored_to x) 0 12)) (:out x))))
+      (if (:ok r) 0 1))))
+
+(defn- cmd-init [args st]
+  (let [r (vcs/init! (BeamLisp/cwd))]
+    (u/emit st r (fn [x] (if (:ok x) "initialized (colocated with git; .autovcs/ ignored)" (:out x))))
+    (if (:ok r) 0 1)))
+
+(def USAGE
+  "usage: bl vcs <status|history|touched|checkpoint|gate|undo|init>
+
+  status                     what the mirror holds, and jj's head
+  history [--limit N]        the timeline: actor, intent, path, operation
+  touched PATH               which requests touched one path
+  checkpoint [-m WHY] [--by ACTOR] [--no-gate]
+                             gate, then record the working copy as one change
+  gate [PATH...]             the gate alone — the same procedure CI runs
+  undo OPERATION             put the whole tree back to an operation
+  init                       make this tree a versioned workspace")
+
+(defn run
+  "`bl vcs …`. The exit code is the answer: 0 unless the gate or jj refused."
+  [args st]
+  (u/register-paths st)
+  (let [sub (if (empty? args) "status" (first args))
+        rest (vec (drop 1 args))]
+    (cond
+      (= sub "status") (cmd-status rest st)
+      (= sub "history") (cmd-history rest st)
+      (= sub "touched") (cmd-touched rest st)
+      (= sub "checkpoint") (cmd-checkpoint rest st)
+      (= sub "gate") (cmd-gate rest st)
+      (= sub "undo") (cmd-undo rest st)
+      (= sub "init") (cmd-init rest st)
+      (= sub "help") (do (u/emit st USAGE (fn [x] x)) 0)
+      :else (do (u/io-err (str "bl: unknown vcs command \"" sub "\"\n" USAGE "\n")) 2))))
