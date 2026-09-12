@@ -280,23 +280,77 @@
         (datom/transact! (:conn m)
           (conj tx {:db/id -1 :meta/key "op-head" :meta/value head}))
         (if (:store m) (datom.store-fjall/sync! (:store m)))
+        (ingest-spill! dir m)
         {:ops (count new-ops) :commits (count new-cms) :skipped false :watermark head}))))
+
+;; ── the spill ────────────────────────────────────────────────────────────────
+;;
+;; The request behind a change is the one fact jj cannot re-derive, so it is
+;; written to a FILE first and transacted second. The order is the whole point:
+;; a checkpoint must not lose its intent because the store was unavailable,
+;; slow, or held by another process. `datom.store-fjall/open` takes no lock —
+;; two processes may open the same path — so "the store was there" is not a
+;; guarantee anyone can give in advance; the spill is the intent's own copy.
+;;
+;; Two things this is NOT: it is not a claim that a second writer's facts are
+;; lost (measured on 2026-09-12: a cold process's request written through the
+;; spill was readable by a fresh process and by the daemon — the daemon simply
+;; did not see it on its FIRST look, which is a stale-view question, not a lost
+;; write), and it is not a substitute for one owner per mirror. It is a queue:
+;; whoever holds the mirror ingests it, and it is cleared only once a mirror has
+;; actually taken it.
+
+(defn- spill-path [dir] (str dir "/" MIRROR "/requests.jsonl"))
+
+(defn- spill-lines [dir]
+  (let [p (spill-path dir)]
+    (if (File/exists? p)
+      (filterv (fn [l] (> (count (cs/trim l)) 0)) (cs/split-lines (File/read! p)))
+      [])))
+
+(defn- spill-rewrite! [dir lines]
+  (File/mkdir_p! (str dir "/" MIRROR))
+  (File/write! (spill-path dir) (if (seq lines) (str (reduce (fn [acc l] (str acc l "\n")) "" lines)) "")))
+
+(defn- spill! [dir r]
+  (spill-rewrite! dir (conj (spill-lines dir) (j/->json r)))
+  {:ok true})
+
+(defn- req-facts [r id]
+  {:db/id id
+   :req/id (fld r "id")
+   :req/by (or (fld r "by") "daemon")
+   :req/why (or (fld r "why") "")
+   :req/op (or (fld r "op") "")
+   :req/commit (or (fld r "commit") "")
+   :req/at (System/system_time :millisecond)
+   :req/ms (or (fld r "ms") 0)
+   :req/path (vec (or (fld r "paths") []))})
+
+(defn- ingest-spill!
+  "Transact every spilled request the mirror does not already hold, then keep
+   only the ones that did not land."
+  [dir m]
+  (let [lines (spill-lines dir)]
+    (if (empty? lines)
+      0
+      (let [known (known-set (datom/db (:conn m)) '[:find ?id :where [?e :req/id ?id]])
+            fresh (filterv (fn [l] (not (contains? known (fld (j/json-> l) "id")))) lines)]
+        (when (seq fresh)
+          (datom/transact! (:conn m)
+            (vec (map-indexed (fn [i l] (req-facts (j/json-> l) (- 0 (+ 200000 (inc i))))) fresh)))
+          (if (:store m) (datom.store-fjall/sync! (:store m))))
+        (spill-rewrite! dir (filterv (fn [l] (not (contains? known (fld (j/json-> l) "id")))) lines))
+        (count fresh)))))
 
 (defn- record-request!
   "The one fact jj cannot know: the request behind the operation."
   [dir r]
+  (spill! dir r)
   (let [m (mirror-state dir)]
-    (datom/transact! (:conn m)
-      [{:db/id -1
-        :req/id (fld r "id")
-        :req/by (or (fld r "by") "daemon")
-        :req/why (or (fld r "why") "")
-        :req/op (or (fld r "op") "")
-        :req/commit (or (fld r "commit") "")
-        :req/at (System/system_time :millisecond)
-        :req/ms (or (fld r "ms") 0)
-        :req/path (vec (or (fld r "paths") []))}])
+    (datom/transact! (:conn m) [(req-facts r -1)])
     (if (:store m) (datom.store-fjall/sync! (:store m)))
+    (ingest-spill! dir m)
     {:ok true}))
 
 ; ── checkpoints ──────────────────────────────────────────────────────────────
