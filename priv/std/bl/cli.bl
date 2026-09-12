@@ -645,6 +645,73 @@
               2)
           (run-task cmd task st))))))
 
+; ── automatic version control ─────────────────────────────────────────
+;;
+;; A versioned tree records what a command did to it: one change per command,
+;; described with the argv that did it, so the history answers "what ran" as
+;; well as "what changed". jj makes this cheap — opening the workspace is the
+;; snapshot, so there is no staging step to forget.
+;;
+;; Who is versioned: a tree with a `.jj`, unless BL_VCS=off. A tree that has not
+;; opted in is never given a repository behind its owner's back.
+;;
+;; WHERE it happens is the daemon, and that is a measurement, not a taste.
+;; Loading this stack into a cold VM costs 12–20 s (research/autovcs/results.md);
+;; a warm daemon pays it once, per tree, forever. So a cold CLI run records
+;; nothing on its own — it still has `bl vcs checkpoint` for an explicit one —
+;; unless BL_VCS=on says the caller is willing to pay.
+;;
+;; Who gates: the daemon, since it is the one that knows a command finished
+;; cleanly. Its gate subprocess must run COLD (`vcs/gate!` passes BL_DAEMON=off)
+;; or it would queue behind the very command that is waiting for it.
+;; BL_VCS_GATE=on gates a cold run too, which is the shape CI wants.
+
+(defn- under-daemon?
+  "Whether this VM is a daemon's. The launcher sets BL_DAEMON_ROOT when it
+   spawns one, and only then — a client never passes it to itself."
+  []
+  (some? (System/get_env "BL_DAEMON_ROOT")))
+
+(defn- versioned?
+  "A tree that records itself: a jj workspace, and not opted out."
+  []
+  (and (not= "off" (System/get_env "BL_VCS"))
+       (File/exists? (str (BeamLisp/cwd) "/.jj"))))
+
+(defn- vcs-fn
+  "A function from the `vcs` namespace, loaded only when a checkpoint is
+   actually going to happen — a `bl version` in an ordinary tree must not pay
+   for the fact layer."
+  [name]
+  (BeamLisp.Loader/ensure_loaded "vcs")
+  (BeamLisp.Env/fetch! "vcs" name))
+
+(defn- join-argv
+  "The command line as a description: no trailing space, so the change says
+   exactly what ran."
+  [argv]
+  (reduce (fn [acc a] (if (= acc "") (str a) (str acc " " a))) "" argv))
+
+(defn- auto-checkpoint!
+  "Record what just ran, if anything changed. Never throws: a checkpoint that
+   cannot happen is reported and the command's own exit code still stands."
+  [argv code]
+  (when (and (versioned?)
+             (or (under-daemon?) (= "on" (System/get_env "BL_VCS")))
+             (not= code 141))
+    (try
+      (let [actor (or (System/get_env "BL_VCS_ACTOR") "bl")
+            why (join-argv argv)
+            opts {:dir (BeamLisp/cwd) :by actor :why why}
+            gated (or (under-daemon?) (= "on" (System/get_env "BL_VCS_GATE")))
+            enter (vcs-fn (if gated "checkpoint+gated!" "checkpoint!"))
+            r (enter opts)]
+        (when (and (not (:ok r)) (not (:skipped r)))
+          (u/io-err (str "bl vcs: the gate refused this checkpoint; nothing was recorded\n"
+                         (get-in r [:gate :out]) "\n")))
+        r)
+      (catch e (u/io-err (str "bl vcs: could not record this command: " (pr-str e)))))))
+
 (defn run-argv
   "Parse argv and run the command, returning an EXIT CODE — never halting. The
   re-entrant seam: `main` boots then calls this then halts; the daemon calls it
@@ -664,7 +731,12 @@
         ;; request reads, since warmth is an optimization and never a
         ;; difference in meaning.
         (nil? (:cmd st)) (do (with-project) ((get-in commands ["repl"]) nil st))
-        :else (do (with-project) (dispatch st))))
+        :else (let [code (do (with-project) (dispatch st))]
+                ;; `vcs` records on its own terms; everything else is recorded
+                ;; by what it did, not by what it said.
+                (if (= (:cmd st) "vcs")
+                  code
+                  (do (auto-checkpoint! argv code) code)))))
     (catch e
       (if (closed-output? e)
         ;; stdout went away (`bl watch DIR | head`, `bl ask … | grep -q`): a
