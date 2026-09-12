@@ -1,0 +1,218 @@
+; test/bl/vcs_test.bl — a tree remembers what was done to it, and why.
+;
+; Run: VCS_JJ=$(research/autovcs/fetch.sh) bl -p priv/std test test/bl/vcs_test.bl
+; (`-p priv/std` because a drop's own stdlib is not a checkout's: datom reaches
+; z3pool through priv/std, and `bl test` binds only the tree's priv/lib.)
+;
+; What is being pinned here is not "the code runs". It is the two invariants the
+; design rests on, each as an executable check:
+;
+;   THE MIRROR IS DERIVED — rebuild it from jj and you get the same facts as the
+;     incremental one, because every fact is keyed by a content-addressed id.
+;   THE GATE GUARDS THE RECORD — a checkpoint that fails the gate is refused and
+;     NOT recorded, so a broken tree cannot silently become history.
+;
+; Every test needs the pinned jj; without it each says so and passes, the way
+; the optional native tiers do.
+
+(ns vcs.test
+  (:require [vcs] [datom] [datom.conn] [datom.store]))
+
+; A fresh directory per fixture. `erlang/unique_integer` is NOT enough: a test
+; file may run each `deftest` in its own VM, where the counter starts over, and
+; two tests then share a path — the second one reopens the first one's jj repo
+; and its mirror, and every count is inherited. The clock plus a process-local
+; counter cannot collide, and the tree is wiped before use anyway.
+(def COUNTER (atom 0))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl-vcs-" (System/system_time :millisecond)
+       "-" (swap! COUNTER (fn [n] (+ n 1)))))
+
+(defn- fixture
+  "A colocated jj workspace with one file in it."
+  []
+  (let [d (tmp-dir)]
+    (File/rm_rf! d)
+    (File/mkdir_p! d)
+    (vcs/init! d)
+    (File/write! (str d "/app.bl") "(ns app)\n\n(defn answer [] 1)\n")
+    d))
+
+(defn- skipped? [] (not (vcs/available?)))
+
+(defn- write! [d name content] (File/write! (str d "/" name) content))
+
+; ── a change is recorded, with its actor and its intent ──────────────────────
+
+(deftest a-checkpoint-records-one-change-with-its-intent
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          r (vcs/checkpoint! {:dir d :by "test:agent" :why "first cut" :paths ["app.bl"]})]
+      (is (:ok r))
+      (is (not (:skipped r)) "a tree with a new file has something to record")
+      (is (some? (:op r)) "the operation id is jj's, and is returned")
+      (is (some? (:commit r)))
+      ;; the intent lives in jj's own log — not only in our facts
+      (let [log (:out (vcs/run-jj d ["log" "--no-graph" "-r" "@-" "-T" "self.description()"]))]
+        (is (includes? log "test:agent: first cut"))))))
+
+(deftest a-tree-with-nothing-to-record-is-left-alone
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "test:agent" :why "first cut"})
+          again (vcs/checkpoint! {:dir d :by "test:agent" :why "nothing happened"})]
+      (is (:ok again))
+      (is (:skipped again) "no bytes changed, so no change is created"))))
+
+; ── the mirror is derived ────────────────────────────────────────────────────
+
+(defn- mirror-facts
+  "Every commit fact in an open mirror, as comparable strings."
+  [d query]
+  (let [m (get (deref vcs/REGISTRY) d)]
+    (into #{} (map pr-str (datom/q query (datom/db (:conn m)))))))
+
+(def COMMIT-FACTS
+  '[:find ?id ?change ?desc :where [?e :cm/id ?id] [?e :cm/change ?change] [?e :cm/desc ?desc]])
+
+(deftest a-rebuilt-mirror-agrees-with-the-incremental-one
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "one" :paths ["app.bl"]})
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 2)\n")
+          _ (vcs/checkpoint! {:dir d :by "a" :why "two" :paths ["app.bl"]})
+          _ (write! d "notes.md" "# notes\n")
+          _ (vcs/checkpoint! {:dir d :by "b" :why "three" :paths ["notes.md"]})
+          incremental (vcs/status {:dir d})
+          ;; throw the mirror away and re-derive it from jj alone — twice
+          _ (vcs/close! d)
+          _ (File/rm_rf! (str d "/" vcs/MIRROR))
+          first (vcs/status {:dir d})
+          facts1 (mirror-facts d COMMIT-FACTS)
+          _ (vcs/close! d)
+          _ (File/rm_rf! (str d "/" vcs/MIRROR))
+          _ (vcs/status {:dir d})
+          facts2 (mirror-facts d COMMIT-FACTS)]
+      ;; DERIVED means a re-derivation is a FIXED POINT: the same jj, the same
+      ;; facts. Not the same count as the incremental mirror — jj's head moves
+      ;; between looks (every read is an operation), and an empty working-copy
+      ;; commit that jj abandons later is one datom has seen and `all()` no
+      ;; longer shows. That is the archive being wider than the tree, which is
+      ;; what a fact layer is for.
+      (is (= facts1 facts2)
+          "two rebuilds from the same jj produce identical commit facts")
+      (is (> (count facts1) 0) "and there were facts to compare")
+      (is (>= (get-in first [:mirror :ops]) (get-in incremental [:mirror :ops]))
+          "the rebuilt mirror saw at least the operations the incremental one saw")
+      ;; THE BOUNDARY, asserted so it cannot be forgotten: jj never knew the
+      ;; requests. They are the one thing a re-derivation cannot restore.
+      (is (= 0 (get-in first [:mirror :requests]))
+          "request facts are primary, not derived — a wipe loses them"))))
+
+(deftest ingesting-twice-changes-nothing
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "one"})
+          ;; move jj's head WITHOUT looking at it, the way another writer would
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 7)\n")
+          _ (vcs/run-jj d ["status"])
+          first-pass (vcs/mirror! d)
+          second-pass (vcs/mirror! d)]
+      (is (not (:skipped first-pass)) "the first look ingests the new operation")
+      (is (> (:ops first-pass) 0) "and it ingested something")
+      (is (:skipped second-pass) "the second look is one jj call and stops"))))
+
+; ── the questions only this layer can answer ─────────────────────────────────
+
+(deftest history-joins-a-change-to-the-request-behind-it
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "test:agent" :why "first cut" :paths ["app.bl"]})
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 3)\n")
+          _ (vcs/checkpoint! {:dir d :by "human:you" :why "make it 3" :paths ["app.bl"]})
+          h (:history (vcs/history {:dir d}))]
+      (is (= 2 (count h)))
+      (is (= "test:agent" (:by (first h))))
+      (is (= "make it 3" (:why (second h))))
+      (is (includes? (:jj_args (second h)) "describe")
+          "jj's own argv is in the fact, so the record explains itself"))))
+
+(deftest touched-answers-which-requests-touched-one-path
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "first" :paths ["app.bl"]})
+          _ (write! d "notes.md" "note\n")
+          _ (vcs/checkpoint! {:dir d :by "a" :why "elsewhere" :paths ["notes.md"]})
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 4)\n")
+          _ (vcs/checkpoint! {:dir d :by "b" :why "again" :paths ["app.bl"]})
+          t (:requests (vcs/touched {:dir d :path "app.bl"}))]
+      (is (= 2 (count t)))
+      (is (= ["first" "again"] (mapv (fn [r] (:why r)) t))))))
+
+; ── undo is an operation, not a patch ────────────────────────────────────────
+
+(deftest undo-puts-the-whole-tree-back
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          before (File/read! (str d "/app.bl"))
+          r1 (vcs/checkpoint! {:dir d :by "a" :why "one" :paths ["app.bl"]})
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 9)\n")
+          _ (write! d "side.md" "also new\n")
+          _ (vcs/checkpoint! {:dir d :by "a" :why "two" :paths ["app.bl"]})
+          _ (vcs/undo! {:dir d :op (:op r1)})]
+      (is (= before (File/read! (str d "/app.bl")))
+          "the file the later change touched is back")
+      (is (not (File/exists? (str d "/side.md")))
+          "and so is the file the later change created — two changes undone"))))
+
+; ── the gate guards the record ───────────────────────────────────────────────
+
+(deftest a-refused-gate-is-not-recorded
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "baseline"})
+          before (get-in (vcs/status {:dir d}) [:mirror :requests])
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 5)\n")
+          refused (vcs/checkpoint+gated! {:dir d :by "a" :why "ungated" :cmd ["false"]})
+          after-refusal (get-in (vcs/status {:dir d}) [:mirror :requests])]
+      (is (not (:ok refused)) "a failing gate refuses the checkpoint")
+      (is (= before after-refusal)
+          "and nothing was recorded: the failure is the fact worth keeping")
+      (let [allowed (vcs/checkpoint+gated! {:dir d :by "a" :why "gated" :cmd ["true"]})]
+        (is (:ok allowed))
+        (is (= (inc before) (get-in (vcs/status {:dir d}) [:mirror :requests])))
+        (is (:ok (:gate allowed)) "the gate's verdict travels with the record")))))
+
+; ── init makes a tree safe to mirror ─────────────────────────────────────────
+
+(deftest init-teaches-the-tree-to-ignore-the-mirror
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "first"})]
+      (is (includes? (File/read! (str d "/.gitignore")) (str vcs/MIRROR "/"))
+          "the mirror is inside the tree it mirrors, and must be ignored")
+      (is (get (vcs/status {:dir d}) :mirror_ignored))
+      ;; the proof: the tree is clean after a checkpoint, not dirty from its own journal
+      (is (includes? (:out (vcs/run-jj d ["status"])) "no changes")))))
+
+(deftest status-reports-the-watermark
+  (if (skipped?)
+    (is true "no jj available — skipped")
+    (let [d (fixture)
+          _ (vcs/checkpoint! {:dir d :by "a" :why "first"})
+          _ (write! d "app.bl" "(ns app)\n\n(defn answer [] 8)\n")
+          _ (vcs/run-jj d ["status"])
+          s (vcs/status {:dir d})]
+      (is (some? (get-in s [:mirror :new :watermark])) "the watermark is the operation head")
+      (is (not (get-in s [:mirror :new :skipped])) "the first look after a change ingests")
+      (is (get-in (vcs/status {:dir d}) [:mirror :new :skipped]) "the next look is free"))))
