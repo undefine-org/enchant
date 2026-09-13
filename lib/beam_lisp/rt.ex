@@ -48,8 +48,6 @@ defmodule BeamLisp.RT do
   @doc false
   def invoke({:"$remote", module, fun}, args), do: host_call(module, fun, args)
 
-
-
   @doc false
   def invoke(f, args) when is_function(f), do: apply(f, args)
 
@@ -66,6 +64,7 @@ defmodule BeamLisp.RT do
   # exactly as in Clojure. clojure.set/join relies on this (it uses an index map
   # AND membership tests as functions).
   def invoke(%BeamLisp.Set{} = s, [k]), do: if(Set.member?(s, k), do: k, else: nil)
+
   def invoke(%BeamLisp.Set{} = s, [k, default]),
     do: if(Set.member?(s, k), do: k, else: default)
 
@@ -73,8 +72,10 @@ defmodule BeamLisp.RT do
   # map of its keys — mirroring the plain-map/plain-set clauses below.
   def invoke(%BeamLisp.Sorted.SortedSet{} = s, [k]),
     do: if(BeamLisp.Sorted.set_member?(s, k), do: k, else: nil)
+
   def invoke(%BeamLisp.Sorted.SortedSet{} = s, [k, default]),
     do: if(BeamLisp.Sorted.set_member?(s, k), do: k, else: default)
+
   def invoke(%BeamLisp.Sorted.SortedMap{} = m, [k]), do: get(m, k)
   def invoke(%BeamLisp.Sorted.SortedMap{} = m, [k, default]), do: get(m, k, default)
 
@@ -190,6 +191,7 @@ defmodule BeamLisp.RT do
         |> Enum.map(fn {arg, i} -> if i in positions, do: resolve_path(arg), else: arg end)
     end
   end
+
   def remote_fun(module, fun) do
     # Creating a host-module handle is itself interop: gate it, so a
     # capped env cannot even FORGE a handle it would later sneak past a
@@ -580,6 +582,7 @@ defmodule BeamLisp.RT do
         ArgumentError,
         "conj on a sorted map expects a [k v] entry, got: #{inspect(other)}"
       )
+
   # A reference is not conj-able — conj would otherwise fall through to the
   # map-entry clauses and silently add a field to the struct.
   def conj(%{__struct__: mod} = m, _x) when is_atom(mod) and is_ref_type(m),
@@ -912,7 +915,9 @@ defmodule BeamLisp.RT do
     do: raise(ArgumentError, "contains?: #{inspect(mod)} is a reference, not a collection")
 
   def contains?(%{__struct__: mod} = m, k) when is_atom(mod) do
-    if BeamLisp.Record.record?(m), do: k != :__struct__ and Map.has_key?(m, k), else: Map.has_key?(m, k)
+    if BeamLisp.Record.record?(m),
+      do: k != :__struct__ and Map.has_key?(m, k),
+      else: Map.has_key?(m, k)
   end
 
   def contains?(m, k) when is_bl_map(m), do: Map.has_key?(m, hash_key(k))
@@ -1152,7 +1157,9 @@ defmodule BeamLisp.RT do
   """
   def tree_seq(branch?, children, root) do
     if invoke(branch?, [root]) do
-      kids = invoke(children, [root]) |> seqable() |> Enum.flat_map(&tree_seq(branch?, children, &1))
+      kids =
+        invoke(children, [root]) |> seqable() |> Enum.flat_map(&tree_seq(branch?, children, &1))
+
       [root | kids]
     else
       [root]
@@ -1295,7 +1302,10 @@ defmodule BeamLisp.RT do
   def sort(coll), do: sort(&compare/2, coll)
 
   def sort(comp, coll) do
-    coll |> seqable() |> Enum.sort(fn a, b -> comparator_le(invoke(comp, [a, b])) end) |> empty_contract()
+    coll
+    |> seqable()
+    |> Enum.sort(fn a, b -> comparator_le(invoke(comp, [a, b])) end)
+    |> empty_contract()
   end
 
   # Clojure's `sort`/`sort-by` accept EITHER a 3-way comparator (returns a
@@ -1331,7 +1341,10 @@ defmodule BeamLisp.RT do
 
   @doc "jank's `cpp/jank.runtime.namespace_`: the namespace String, or nil."
   def namespace_of({:symbol, n}), do: ns_part(n)
-  def namespace_of(x) when is_atom(x) and x not in [true, false, nil], do: ns_part(Atom.to_string(x))
+
+  def namespace_of(x) when is_atom(x) and x not in [true, false, nil],
+    do: ns_part(Atom.to_string(x))
+
   def namespace_of(_), do: nil
 
   @doc "jank's `cpp/jank.runtime.keyword`: a keyword with the given namespace and name."
@@ -1388,6 +1401,7 @@ defmodule BeamLisp.RT do
 
   defp reduce_loop(_f, acc, nil), do: acc
   defp reduce_loop(_f, acc, []), do: acc
+
   defp reduce_loop(f, acc, [h | t]) do
     case invoke(f, [acc, h]) do
       %BeamLisp.Reduced{} = r -> r.value
@@ -1676,7 +1690,7 @@ defmodule BeamLisp.RT do
   # Clojure treats nil as an empty seq everywhere a seq is expected:
   # `(map f nil)` is `()`, not an error. An exhausted `& rest` binds
   # nil, so upstream code passes nil into seq fns constantly.
-# A map becomes a seq of `[k v]` entry vectors — the Clojure MapEntry
+  # A map becomes a seq of `[k v]` entry vectors — the Clojure MapEntry
   # shape — so first/rest/seq/next and reduce all see pairs. Elixir map
   # enumeration is insertion-ordered, keeping key order deterministic.
   defp map_entries(m), do: for({k, v} <- m, do: %BeamLisp.Vector{items: {k, v}})
@@ -1710,15 +1724,19 @@ defmodule BeamLisp.RT do
   defp seqable(%{__struct__: mod} = r) when is_atom(mod) do
     if BeamLisp.Record.record?(r), do: record_entries(r), else: r
   end
+
   defp seqable(coll), do: coll
 
   def map(f, coll), do: lazy_map(f, LazySeq.input(seqable(coll)))
 
   defp lazy_map(f, coll) do
     coll = LazySeq.input(coll)
+
     LazySeq.new(fn ->
       case LazySeq.cell(coll) do
-        nil -> nil
+        nil ->
+          nil
+
         [h | t] ->
           {elems, rest} = map_chunk(f, [invoke(f, [h])], t, LazySeq.chunk_size() - 1)
 
@@ -1750,10 +1768,11 @@ defmodule BeamLisp.RT do
 
   defp lazy_multi_map(f, colls) do
     LazySeq.new(fn ->
-      seqs = Enum.map(colls, fn
-        %BeamLisp.SeqCursor{} = cursor -> LazySeq.cell(cursor)
-        other -> seq(other)
-      end)
+      seqs =
+        Enum.map(colls, fn
+          %BeamLisp.SeqCursor{} = cursor -> LazySeq.cell(cursor)
+          other -> seq(other)
+        end)
 
       if Enum.any?(seqs, &is_nil/1) do
         nil
@@ -1770,11 +1789,15 @@ defmodule BeamLisp.RT do
   # that stops early never realizes more than one source chunk past it.
   defp lazy_filter(pred, coll) do
     coll = LazySeq.input(coll)
+
     LazySeq.new(fn ->
       case skip_filter(pred, coll) do
-        nil -> nil
+        nil ->
+          nil
+
         [h | t] ->
           {elems, rest} = filter_chunk(pred, [h], t, LazySeq.chunk_size() - 1)
+
           if is_nil(rest),
             do: elems,
             else: LazySeq.chain(elems, fn -> lazy_filter(pred, rest) end)
@@ -1849,6 +1872,7 @@ defmodule BeamLisp.RT do
   @doc "`(cycle coll)` repeats `coll` forever, lazily."
   def cycle(coll) do
     input = LazySeq.input(coll)
+
     case LazySeq.cell(input) do
       nil -> nil
       _ -> LazySeq.new(fn -> cycle_from(input, input) end)
@@ -1875,6 +1899,7 @@ defmodule BeamLisp.RT do
   # list (all consumed), or `{elems, rest_seqs}` for a lazy tail.
   defp concat_chunk(seqs) do
     seqs = Enum.map(seqs, &LazySeq.input/1)
+
     case concat_pull(seqs, LazySeq.chunk_size(), []) do
       :empty -> nil
       {[], rest} -> concat_chunk(rest)
@@ -1995,7 +2020,8 @@ defmodule BeamLisp.RT do
 
   defp take_while_build(pred, coll, acc, n) do
     case LazySeq.cell(coll) do
-      nil -> if acc == [], do: :empty, else: {Enum.reverse(acc), nil}
+      nil ->
+        if acc == [], do: :empty, else: {Enum.reverse(acc), nil}
 
       [h | t] ->
         if invoke(pred, [h]) do
@@ -2023,7 +2049,10 @@ defmodule BeamLisp.RT do
   list is returned unchanged.
   """
   def doall(%LazySeq{} = l), do: LazySeq.to_list(l)
-  def doall(coll) when is_list(coll), do: if(improper?(coll), do: LazySeq.to_list(coll), else: coll)
+
+  def doall(coll) when is_list(coll),
+    do: if(improper?(coll), do: LazySeq.to_list(coll), else: coll)
+
   def doall(coll), do: coll
 
   # An "improper" list is a cons chain that terminates in a LazySeq
@@ -2061,16 +2090,20 @@ defmodule BeamLisp.RT do
 
   def assoc(%SortedSet{}, _k, _v),
     do: raise(ArgumentError, "assoc not supported on a sorted set")
+
   # A reference is not a map — assoc'ing it would add a field to the struct.
   def assoc(%{__struct__: mod} = m, _k, _v) when is_atom(mod) and is_ref_type(m),
     do: raise(ArgumentError, "assoc: #{inspect(mod)} is a reference, not a collection")
+
   # A record's `__struct__` key is internal; assoc'ing it would silently
   # turn the record into a corrupted plain map, so fail loudly instead.
   def assoc(%{__struct__: mod} = m, k, v) when is_atom(mod) and k == :__struct__ do
     if BeamLisp.Record.record?(m),
-      do: raise(ArgumentError, "assoc on the internal :__struct__ key is not allowed on a record"),
+      do:
+        raise(ArgumentError, "assoc on the internal :__struct__ key is not allowed on a record"),
       else: Map.put(m, k, v)
   end
+
   # A record assoc's its public fields, preserving its type. Any other
   # struct reaching here (a LazySeq is the one the earlier clauses do not
   # own) is not a map and must raise — Map.put would silently grow a
@@ -2080,6 +2113,7 @@ defmodule BeamLisp.RT do
       do: Map.put(m, k, v),
       else: raise(ArgumentError, "assoc not supported on a struct")
   end
+
   def assoc(coll, k, v) when is_bl_map(coll), do: Map.put(coll, hash_key(k), v)
   def assoc(nil, k, v), do: Map.put(%{}, hash_key(k), v)
 
@@ -2283,11 +2317,15 @@ defmodule BeamLisp.RT do
   # `(= a b c)` is a chain: eqv(a, b) and eqv(b, c). Same shape as the
   # comparison chains, but with lazy-aware equality.
   defp eqv_chain do
-    multi_fn(%{}, {1, fn x, rest ->
-      [x | rest]
-      |> Enum.zip(rest)
-      |> Enum.all?(fn {a, b} -> eqv(a, b) end)
-    end})
+    multi_fn(
+      %{},
+      {1,
+       fn x, rest ->
+         [x | rest]
+         |> Enum.zip(rest)
+         |> Enum.all?(fn {a, b} -> eqv(a, b) end)
+       end}
+    )
   end
 
   defp to_str(nil), do: ""
@@ -2311,8 +2349,7 @@ defmodule BeamLisp.RT do
   def gensym(), do: gensym("G")
 
   def gensym(prefix) when is_binary(prefix) do
-    {:symbol,
-     prefix <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"}
+    {:symbol, prefix <> "__" <> Integer.to_string(System.unique_integer([:positive])) <> "__auto"}
   end
 
   # `trace`/`untrace` resolve a quoted symbol against the namespace the
@@ -2331,123 +2368,138 @@ defmodule BeamLisp.RT do
     arith = %{
       "+" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 0, &Kernel.+/2) end}),
       "*" => multi_fn(%{}, {0, fn args -> Enum.reduce(args, 1, &Kernel.*/2) end}),
-      "-" => multi_fn(%{}, {1, fn x, rest ->
-        case rest do
-          [] -> -x
-          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel.-(acc, e) end)
-        end
-      end}),
-      "/" => multi_fn(%{}, {1, fn x, rest ->
-        case rest do
-          [] -> 1 / x
-          _ -> Enum.reduce(rest, x, fn e, acc -> Kernel./(acc, e) end)
-        end
-      end})
+      "-" =>
+        multi_fn(
+          %{},
+          {1,
+           fn x, rest ->
+             case rest do
+               [] -> -x
+               _ -> Enum.reduce(rest, x, fn e, acc -> Kernel.-(acc, e) end)
+             end
+           end}
+        ),
+      "/" =>
+        multi_fn(
+          %{},
+          {1,
+           fn x, rest ->
+             case rest do
+               [] -> 1 / x
+               _ -> Enum.reduce(rest, x, fn e, acc -> Kernel./(acc, e) end)
+             end
+           end}
+        )
     }
 
     # (< 1 2 3) is a chain: 1 < 2 and 2 < 3.
     chain = fn op ->
-      multi_fn(%{}, {1, fn x, rest ->
-        [x | rest]
-        |> Enum.zip(rest)
-        |> Enum.all?(fn {a, b} -> op.(a, b) end)
-      end})
+      multi_fn(
+        %{},
+        {1,
+         fn x, rest ->
+           [x | rest]
+           |> Enum.zip(rest)
+           |> Enum.all?(fn {a, b} -> op.(a, b) end)
+         end}
+      )
     end
 
-    prims = Map.merge(arith, %{
-      "<" => chain.(&Kernel.</2),
-      ">" => chain.(&Kernel.>/2),
-      "<=" => chain.(&Kernel.<=/2),
-      ">=" => chain.(&Kernel.>=/2),
-      "=" => eqv_chain(),
-      "not" => &not_/1,
-      "identical?" => &identical?/2,
-      "str" => str(),
-      "first" => &first/1,
-      "rest" => &rest/1,
-      "seq" => &seq/1,
-      "cons" => &cons/2,
-      "conj" => multi_fn(%{1 => &conj/1, 2 => &conj/2}),
-      "count" => &count/1,
-      "nth" => multi_fn(%{2 => &nth/2, 3 => &nth/3}),
-      "empty?" => &empty?/1,
-      "get" => multi_fn(%{2 => &get/2, 3 => &get/3}),
-      "assoc" => multi_fn(%{3 => &assoc/3}, {3, &assoc_variadic/4}),
-      "apply" => multi_fn(%{2 => &apply_to/2}, {2, &apply_variadic/3}),
-      "next" => &next/1,
-      "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
-      "println" => multi_fn(%{0 => &println/0, 1 => &println/1}, {1, &println_multi/2}),
-      "pr-str" => &print_str/1,
-      # Clojure's `print-str` returns the printed representation (like
-      # pr-str, minus readably-quoted strings); both share the one printer.
-      "print-str" => &print_str/1,
-      "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1}),
-      # lazy sequences: uniformly lazy (chunked at 32), realized only by
-      # forcing consumers (take/reduce/count/doall/…).
-      # `map` is variadic: the 2-arity is the chunked lazy path, 3+ colls stop at the shortest.
-      "map" => multi_fn(%{1 => &map_xform/1, 2 => &map/2}, {2, &map_multi/3}),
-      "filter" => multi_fn(%{1 => &filter_xform/1, 2 => &filter/2}),
-      "range" => multi_fn(%{0 => &range/0, 1 => &range/1, 2 => &range/2}),
-      "iterate" => &iterate/2,
-      "repeat" => multi_fn(%{1 => &repeat/1, 2 => &repeat/2}),
-      "cycle" => &cycle/1,
-      "concat" => multi_fn(%{}, {0, fn args -> concat(args) end}),
-      "take" => multi_fn(%{1 => &take_xform/1, 2 => &take/2}),
-      "drop" => &drop_clj/2,
-      "take-while" => &take_while/2,
-      "drop-while" => &drop_while/2,
-      "doall" => &doall/1,
-      "dorun" => &dorun/1,
-      # numeric / collection predicates
-      "even?" => &even?/1,
-      "odd?" => &odd?/1,
-      "zero?" => &zero?/1,
-      "pos?" => &pos?/1,
-      "neg?" => &neg?/1,
-      "rem" => &rem/2,
-      "float?" => &float?/1,
-      "transientable?" => &transientable?/1,
-      # type & collection predicates (wave 14)
-      "fn?" => &fn?/1,
-      "seq?" => &seq?/1,
-      "boolean" => &boolean/1,
-      "find" => &find/2,
-      "contains?" => &contains?/2,
-      "keyword?" => &keyword?/1,
-      "symbol?" => &symbol?/1,
-      "string?" => &string?/1,
-      "number?" => &number?/1,
-      "int?" => &int?/1,
-      "map?" => &map?/1,
-      "struct?" => &struct?/1,
-      "associative?" => &associative?/1,
-      "vector?" => &vector?/1,
-      "list?" => &list?/1,
-      "coll?" => &coll?/1,
-      "ident?" => &ident?/1,
-      # sets (wave 18)
-      "set" => &set/1,
-      # Ordered collections. The variadic surface (sorted-map, sorted-set)
-      # is defined in priv/boot/core.bl over these; what lands here is only
-      # what needs :gb_trees underneath.
-      "sorted-map-of" => &sorted_map_of/1,
-      "sorted-set-of" => &sorted_set_of/1,
-      "sorted?" => &sorted?/1,
-      "last-key" => &last_key/1,
-      "last-entry" => &last_entry/1,
-      "subseq" => &subseq/3,
-      "rsubseq" => &rsubseq/3,
-      "sorted-map?" => &sorted_map?/1,
-      "sorted-set?" => &sorted_set?/1,
-      "sorted-dissoc" => &sorted_dissoc/2,
-      "set?" => &set?/1,
-      "disj" => &disj/2,
-      "sequential?" => &sequential?/1,
-      "tree-seq" => &tree_seq/3,
-      # sort / compare (wave 18)
-      "compare" => &compare/2,
-      "sort" => multi_fn(%{1 => &sort/1, 2 => &sort/2})
-    })
+    prims =
+      Map.merge(arith, %{
+        "<" => chain.(&Kernel.</2),
+        ">" => chain.(&Kernel.>/2),
+        "<=" => chain.(&Kernel.<=/2),
+        ">=" => chain.(&Kernel.>=/2),
+        "=" => eqv_chain(),
+        "not" => &not_/1,
+        "identical?" => &identical?/2,
+        "str" => str(),
+        "first" => &first/1,
+        "rest" => &rest/1,
+        "seq" => &seq/1,
+        "cons" => &cons/2,
+        "conj" => multi_fn(%{1 => &conj/1, 2 => &conj/2}),
+        "count" => &count/1,
+        "nth" => multi_fn(%{2 => &nth/2, 3 => &nth/3}),
+        "empty?" => &empty?/1,
+        "get" => multi_fn(%{2 => &get/2, 3 => &get/3}),
+        "assoc" => multi_fn(%{3 => &assoc/3}, {3, &assoc_variadic/4}),
+        "apply" => multi_fn(%{2 => &apply_to/2}, {2, &apply_variadic/3}),
+        "next" => &next/1,
+        "list*" => multi_fn(%{0 => &list_star_0/0}, {1, &list_star/2}),
+        "println" => multi_fn(%{0 => &println/0, 1 => &println/1}, {1, &println_multi/2}),
+        "pr-str" => &print_str/1,
+        # Clojure's `print-str` returns the printed representation (like
+        # pr-str, minus readably-quoted strings); both share the one printer.
+        "print-str" => &print_str/1,
+        "gensym" => multi_fn(%{0 => &gensym/0, 1 => &gensym/1}),
+        # lazy sequences: uniformly lazy (chunked at 32), realized only by
+        # forcing consumers (take/reduce/count/doall/…).
+        # `map` is variadic: the 2-arity is the chunked lazy path, 3+ colls stop at the shortest.
+        "map" => multi_fn(%{1 => &map_xform/1, 2 => &map/2}, {2, &map_multi/3}),
+        "filter" => multi_fn(%{1 => &filter_xform/1, 2 => &filter/2}),
+        "range" => multi_fn(%{0 => &range/0, 1 => &range/1, 2 => &range/2}),
+        "iterate" => &iterate/2,
+        "repeat" => multi_fn(%{1 => &repeat/1, 2 => &repeat/2}),
+        "cycle" => &cycle/1,
+        "concat" => multi_fn(%{}, {0, fn args -> concat(args) end}),
+        "take" => multi_fn(%{1 => &take_xform/1, 2 => &take/2}),
+        "drop" => &drop_clj/2,
+        "take-while" => &take_while/2,
+        "drop-while" => &drop_while/2,
+        "doall" => &doall/1,
+        "dorun" => &dorun/1,
+        # numeric / collection predicates
+        "even?" => &even?/1,
+        "odd?" => &odd?/1,
+        "zero?" => &zero?/1,
+        "pos?" => &pos?/1,
+        "neg?" => &neg?/1,
+        "rem" => &rem/2,
+        "float?" => &float?/1,
+        "transientable?" => &transientable?/1,
+        # type & collection predicates (wave 14)
+        "fn?" => &fn?/1,
+        "seq?" => &seq?/1,
+        "boolean" => &boolean/1,
+        "find" => &find/2,
+        "contains?" => &contains?/2,
+        "keyword?" => &keyword?/1,
+        "symbol?" => &symbol?/1,
+        "string?" => &string?/1,
+        "number?" => &number?/1,
+        "int?" => &int?/1,
+        "map?" => &map?/1,
+        "struct?" => &struct?/1,
+        "associative?" => &associative?/1,
+        "vector?" => &vector?/1,
+        "list?" => &list?/1,
+        "coll?" => &coll?/1,
+        "ident?" => &ident?/1,
+        # sets (wave 18)
+        "set" => &set/1,
+        # Ordered collections. The variadic surface (sorted-map, sorted-set)
+        # is defined in priv/boot/core.bl over these; what lands here is only
+        # what needs :gb_trees underneath.
+        "sorted-map-of" => &sorted_map_of/1,
+        "sorted-set-of" => &sorted_set_of/1,
+        "sorted?" => &sorted?/1,
+        "last-key" => &last_key/1,
+        "last-entry" => &last_entry/1,
+        "subseq" => &subseq/3,
+        "rsubseq" => &rsubseq/3,
+        "sorted-map?" => &sorted_map?/1,
+        "sorted-set?" => &sorted_set?/1,
+        "sorted-dissoc" => &sorted_dissoc/2,
+        "set?" => &set?/1,
+        "disj" => &disj/2,
+        "sequential?" => &sequential?/1,
+        "tree-seq" => &tree_seq/3,
+        # sort / compare (wave 18)
+        "compare" => &compare/2,
+        "sort" => multi_fn(%{1 => &sort/1, 2 => &sort/2})
+      })
 
     # Reference types: atoms, futures, promises. All plain Refs
     # fns, so the link entries below turn call sites into direct
@@ -2489,13 +2541,14 @@ defmodule BeamLisp.RT do
     transient_prims = %{
       "transient" => &BeamLisp.Transient.transient/1,
       "persistent!" => &BeamLisp.Transient.persistent!/1,
-      "conj!" =>
-        multi_fn(%{1 => &BeamLisp.Transient.conj!/1, 2 => &BeamLisp.Transient.conj!/2}),
+      "conj!" => multi_fn(%{1 => &BeamLisp.Transient.conj!/1, 2 => &BeamLisp.Transient.conj!/2}),
       "assoc!" => &BeamLisp.Transient.assoc!/3,
       "dissoc!" => &BeamLisp.Transient.dissoc!/2,
       "hash-map" =>
-        multi_fn(%{0 => &BeamLisp.Transient.hash_map_empty/0},
-                 {2, &BeamLisp.Transient.hash_map/3})
+        multi_fn(
+          %{0 => &BeamLisp.Transient.hash_map_empty/0},
+          {2, &BeamLisp.Transient.hash_map/3}
+        )
     }
 
     prims = Map.merge(prims, transient_prims)
@@ -2537,11 +2590,9 @@ defmodule BeamLisp.RT do
           2 => &BeamLisp.Server.start_link/2,
           3 => &BeamLisp.Server.start_link/3
         }),
-      "call" =>
-        multi_fn(%{2 => &BeamLisp.Server.call/2, 3 => &BeamLisp.Server.call/3}),
+      "call" => multi_fn(%{2 => &BeamLisp.Server.call/2, 3 => &BeamLisp.Server.call/3}),
       "cast" => &BeamLisp.Server.cast/2,
-      "stop" =>
-        multi_fn(%{1 => &BeamLisp.Server.stop/1, 2 => &BeamLisp.Server.stop/2}),
+      "stop" => multi_fn(%{1 => &BeamLisp.Server.stop/1, 2 => &BeamLisp.Server.stop/2}),
       "monitor" => &:erlang.monitor(:process, &1),
       "link" => &:erlang.link/1,
       "kill" => &:erlang.exit(&1, :kill)
@@ -2601,9 +2652,18 @@ defmodule BeamLisp.RT do
     # name-is-the-BIF assumption silently linked `<=` to a function
     # that does not exist: `(<= 1 2)` raised :erlang.<=/2 undefined
     # while the chained `(<= 1 2 3)` went through invoke and worked.
-    bif2 = [{"+", :+}, {"-", :-}, {"*", :*}, {"/", :/}, {"<", :<}, {">", :>},
-            {"<=", :"=<"}, {">=", :>=}, {"==", :==},
-            {"rem", :rem}]
+    bif2 = [
+      {"+", :+},
+      {"-", :-},
+      {"*", :*},
+      {"/", :/},
+      {"<", :<},
+      {">", :>},
+      {"<=", :"=<"},
+      {">=", :>=},
+      {"==", :==},
+      {"rem", :rem}
+    ]
 
     for {name, op} <- bif2 do
       Env.put_link("core", name, {:erlang, %{2 => op}, nil})

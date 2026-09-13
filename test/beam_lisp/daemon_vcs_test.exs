@@ -29,7 +29,6 @@ defmodule BeamLisp.DaemonVcsTest do
 
   alias BeamLisp.Daemon.{Paths, Server}
 
-
   setup do
     root = File.cwd!()
 
@@ -62,7 +61,8 @@ defmodule BeamLisp.DaemonVcsTest do
     jj = jj_bin()
 
     if File.exists?(jj) do
-      {:ok, root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_fingerprint(root), jj: jj}
+      {:ok,
+       root: root, ep: ep, token: File.read!(ep.token), tree: Paths.tree_fingerprint(root), jj: jj}
     else
       {:skip, "no pinned jj (#{jj}) — run `mix bl.jj.fetch`"}
     end

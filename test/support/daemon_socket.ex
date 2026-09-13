@@ -41,7 +41,11 @@ defmodule BeamLisp.Test.DaemonSocket do
     {:ok, {:bl, 1, :ready, _}} = recv_frame(sock)
 
     id = :crypto.strong_rand_bytes(16)
-    send_frame(sock, Protocol.encode({:bl, 1, :request, id, %{argv: argv, cwd: cwd, env_paths: []}}))
+
+    send_frame(
+      sock,
+      Protocol.encode({:bl, 1, :request, id, %{argv: argv, cwd: cwd, env_paths: []}})
+    )
 
     result = collect(sock, id, "")
     :gen_tcp.close(sock)

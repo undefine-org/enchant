@@ -96,8 +96,10 @@ defmodule BeamLisp.DaemonHaltTest do
     # gap is filed; this test asserts what the client can rely on today.
     File.write!(Path.join(dir, "halt.bl"), "(ns prog)\n(println \"before\")\n(System/halt 3)\n")
     {outf, codef} = request(ctx, ["run", "halt.bl"], dir)
+
     assert is_integer(codef) and codef != 0,
            "a file that halts must fail too; it exited #{inspect(codef)} saying:\n#{outf}"
+
     assert outf =~ "before", "output before the refusal must still arrive; it said:\n#{outf}"
     assert Process.whereis(Server) != nil, "the daemon must survive a refused halt in a file"
 

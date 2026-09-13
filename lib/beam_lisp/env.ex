@@ -301,23 +301,40 @@ defmodule BeamLisp.Env do
     end
   end
 
-
   # The default table: the dangerous-shape modules, read/write/env/exec
   # split. Deliberately small and data-shaped — a deployment audits ONE
   # table, not the compiler.
   @default_ops [
-    {File, :read, :read}, {File, :read!, :read}, {File, :exists?, :read},
-    {File, :ls, :read}, {File, :ls!, :read}, {File, :stat, :read},
-    {File, :cwd, :read}, {File, :cwd!, :read},
-    {File, :write, :write}, {File, :write!, :write}, {File, :rm, :write},
-    {File, :rm!, :write}, {File, :rm_rf, :write}, {File, :mkdir, :write},
-    {File, :mkdir_p, :write}, {File, :cp, :write}, {File, :rename, :write},
-    {System, :get_env, :env_read}, {System, :fetch_env, :env_read},
-    {System, :put_env, :env_write}, {System, :delete_env, :env_write},
-    {System, :cmd, :exec}, {System, :shell, :exec},
-    {:os, :cmd, :exec}, {:os, :getenv, :env_read}, {:os, :putenv, :env_write},
-    {Code, :eval_string, :eval}, {Code, :eval_quoted, :eval},
-    {Code, :compile_string, :eval}, {:erlang, :apply, :eval}
+    {File, :read, :read},
+    {File, :read!, :read},
+    {File, :exists?, :read},
+    {File, :ls, :read},
+    {File, :ls!, :read},
+    {File, :stat, :read},
+    {File, :cwd, :read},
+    {File, :cwd!, :read},
+    {File, :write, :write},
+    {File, :write!, :write},
+    {File, :rm, :write},
+    {File, :rm!, :write},
+    {File, :rm_rf, :write},
+    {File, :mkdir, :write},
+    {File, :mkdir_p, :write},
+    {File, :cp, :write},
+    {File, :rename, :write},
+    {System, :get_env, :env_read},
+    {System, :fetch_env, :env_read},
+    {System, :put_env, :env_write},
+    {System, :delete_env, :env_write},
+    {System, :cmd, :exec},
+    {System, :shell, :exec},
+    {:os, :cmd, :exec},
+    {:os, :getenv, :env_read},
+    {:os, :putenv, :env_write},
+    {Code, :eval_string, :eval},
+    {Code, :eval_quoted, :eval},
+    {Code, :compile_string, :eval},
+    {:erlang, :apply, :eval}
   ]
 
   defp ensure_op_table do
@@ -419,7 +436,11 @@ defmodule BeamLisp.Env do
   def convey(fun) do
     token = capture()
     inner = fn arg -> BeamLisp.RT.invoke(fun, [arg]) end
-    fn arg -> bind(token); inner.(arg) end
+
+    fn arg ->
+      bind(token)
+      inner.(arg)
+    end
   end
 
   @doc """
@@ -431,8 +452,8 @@ defmodule BeamLisp.Env do
   """
   def destroy(env) do
     spec = [
-      {{:"$1", :_},
-       [{:andalso, {:is_tuple, :"$1"}, {:==, {:element, 1, :"$1"}, {:const, env}}}], [true]}
+      {{:"$1", :_}, [{:andalso, {:is_tuple, :"$1"}, {:==, {:element, 1, :"$1"}, {:const, env}}}],
+       [true]}
     ]
 
     :ets.select_delete(@table, spec)
@@ -512,7 +533,8 @@ defmodule BeamLisp.Env do
           [] -> if instance?, do: :per_env_materialized_here, else: :absent
         end
 
-      kind = if kind == :per_env_definition and instance?, do: :per_env_materialized_here, else: kind
+      kind =
+        if kind == :per_env_definition and instance?, do: :per_env_materialized_here, else: kind
 
       %{env: env, ns: cns, name: cname, found: kind != :absent, kind: kind}
     end
@@ -556,7 +578,8 @@ defmodule BeamLisp.Env do
   Denies are consulted first, unconditionally: a policy saying "not this one"
   must not be answerable by a grant saying "everything".
   """
-  def allowed?(module, fun), do: not denied?(module, fun) and caps_allowed?(module, op_of(module, fun))
+  def allowed?(module, fun),
+    do: not denied?(module, fun) and caps_allowed?(module, op_of(module, fun))
 
   @doc """
   Why `module.fun` is not allowed here, in the terms of what refused it.
@@ -778,7 +801,13 @@ defmodule BeamLisp.Env do
   # the first read — the loader process is long-lived and serializes cold
   # starts, so a double first-read collapses to one instance. A cyclic per-env
   # init (A's thunk reads B's, B's reads A's) is caught deterministically.
-  defp materialize_per_env(%PerEnvDef{generation: gen, init: init}, env, resolved_ns, resolved_name, ikey) do
+  defp materialize_per_env(
+         %PerEnvDef{generation: gen, init: init},
+         env,
+         resolved_ns,
+         resolved_name,
+         ikey
+       ) do
     BeamLisp.Loader.Server.run(fn ->
       # Re-check inside the pin: another queued reader may have just materialized
       # this exact (env, var) at this generation.
@@ -1137,8 +1166,12 @@ defmodule BeamLisp.Env do
   # Any of these proves a live static dependency on the target var. (Before
   # this, `callers_of` returned [] for every ANF def, so a reload that dropped
   # a var another namespace called was APPLIED instead of held.)
-  defp node_calls_remote?(%{op: :remote, mod: mod, fun: f} = n, {_tns, _name, target_mod, fname} = t) do
-    (mod == target_mod and f == fname) or node_calls_remote?(Map.delete(n, :op) |> Map.values(), t)
+  defp node_calls_remote?(
+         %{op: :remote, mod: mod, fun: f} = n,
+         {_tns, _name, target_mod, fname} = t
+       ) do
+    (mod == target_mod and f == fname) or
+      node_calls_remote?(Map.delete(n, :op) |> Map.values(), t)
   end
 
   defp node_calls_remote?(%{op: :global, ns: tns, name: nm}, {target_ns, name, _tm, _fn})
@@ -1331,7 +1364,9 @@ defmodule BeamLisp.Env do
   def search_paths do
     chain()
     |> Enum.flat_map(fn
-      :global -> Agent.get(__MODULE__, &Map.get(&1, :search_paths, []))
+      :global ->
+        Agent.get(__MODULE__, &Map.get(&1, :search_paths, []))
+
       env ->
         case env_state(env) do
           %{search_paths: paths} -> paths
