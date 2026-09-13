@@ -1,0 +1,170 @@
+; vcs/jj.bl — where jj is, and how to talk to it.
+;
+; The change engine, and nothing else: no datom, no mirror, no facts. That
+; separation is load-bearing twice over —
+;
+;   * `bl doctor` can report which jj a machine will use without loading the
+;     fact layer (the same reason the daemon is where the mirror lives);
+;   * the storage seam stays a seam: if datom ever becomes jj's backend
+;     (docs/jj-in-front-datom-in-the-back.md, S3), this is the file that changes
+;     and `vcs` is not.
+;
+; jj is resolved in exactly one place — `priv/jj/bin/jj`, the pin `mix
+; bl.jj.fetch` installs — never the PATH first, because inside a drop the first
+; `bl`-adjacent binary on PATH may well be a release script. VCS_JJ overrides
+; for a test or a spike; PATH is the last resort, for someone who installed jj
+; themselves.
+
+(ns vcs.jj
+  (:require [interop :as j] [bl.util :as u] [clojure.string :as cs]))
+
+(def MIRROR ".autovcs")
+
+(def T "json(self) ++ \"\\n\"")
+
+; ── jj's whereabouts ─────────────────────────────────────────────────────────
+
+(defn uname [flag]
+  (let [r (System/cmd "uname" (u/to-list [flag]) (u/kw [:stderr_to_stdout true]))]
+    (if (= 0 (erlang/element 2 r)) (cs/trim (erlang/element 1 r)) "")))
+
+(defn os-arch
+  "The vendored pin's directory name: `linux-x86_64`, `darwin-aarch64`."
+  []
+  (str (cs/lower-case (uname "-s")) "-" (uname "-m")))
+
+(defn- executable? [p] (and (some? p) (File/exists? p)))
+
+(defn bin
+  "The jj a caller will actually get, decided in ONE place.
+
+   In order: `VCS_JJ` (a test, a spike, an operator overriding), the priv of the
+   binary that is running (a drop ships the pin there, because `mix bl.jj.fetch`
+   put it in the payload), the TREE's own priv (a checkout, or an app that
+   vendors jj itself), then PATH as the last resort.
+
+   The running binary's priv is not enough on its own: run a drop against a
+   checkout and `code/priv_dir` names the payload, not the tree you are standing
+   in."
+  []
+  (let [env (System/get_env "VCS_JJ")
+        own (str (code/priv_dir :beam_lisp) "/jj/bin/jj")
+        tree (str (BeamLisp/cwd) "/priv/jj/bin/jj")]
+    (cond
+      (executable? env) env
+      (executable? own) own
+      (executable? tree) tree
+      :else "jj")))
+
+(defn available?
+  "Whether a jj binary answers at all."
+  []
+  (let [r (System/cmd (bin) (u/to-list ["--version"])
+                      (u/kw [:stderr_to_stdout true]))]
+    (= 0 (erlang/element 2 r))))
+
+; ── the jj boundary ──────────────────────────────────────────────────────────
+;
+; stderr folds into stdout: a jj failure is a message the caller must show,
+; never a silence.
+
+(defn- sh [dir argv]
+  (let [r (System/cmd (bin) (u/to-list argv)
+                      (u/kw [:cd dir] [:stderr_to_stdout true]))]
+    {:out (erlang/element 1 r) :status (erlang/element 2 r)}))
+
+(defn version
+  "The jj in use, as it names itself — or nil when there is none. Nil is a fact
+   about the host, not an error: a checkpoint without jj records nothing, and
+   `bl doctor` says so in one line instead of a stack trace."
+  []
+  (let [r (sh (BeamLisp/cwd) ["--version"])]
+    (if (= 0 (:status r)) (cs/trim (:out r)) nil)))
+
+(defn run-jj
+  "Run jj in `dir` → `{:out :status}`. Public because a caller legitimately asks
+   jj things this namespace does not wrap, and because a test must be able to."
+  [dir argv]
+  (sh dir argv))
+
+(defn run-argv
+  "Run an ARBITRARY command in `dir` — the gate is not a jj call.
+
+   The gate runs with `BL_DAEMON=off` and `BL_VCS=off`, and both are load-bearing:
+
+   - `BL_DAEMON=off`, because the daemon serves ONE request at a time — a gate
+     that attached to it would queue behind the very command waiting for it.
+   - `BL_VCS=off`, because a gate is not a change. Without it the child inherits
+     the daemon's `BL_DAEMON_ROOT`, believes it is a daemon, auto-checkpoints,
+     and runs a gate of its own — each level spawning another cold VM, forever.
+     A gate never records and never attaches; saying so is what stops the
+     recursion rather than a termination condition nobody can name."
+  [dir argv]
+  (let [r (System/cmd (first argv) (u/to-list (rest argv))
+                      (u/kw [:cd dir]
+                            [:stderr_to_stdout true]
+                            ;; Elixir reads env as {name, value} pairs of
+                            ;; binaries. An atom key is rejected outright:
+                            ;; "invalid environment key-value".
+                            [:env [(u/kw-pair "BL_DAEMON" "off")
+                                   (u/kw-pair "BL_VCS" "off")]]))]
+    {:out (erlang/element 1 r) :status (erlang/element 2 r)}))
+
+(defn lines-of [out]
+  (filterv (fn [l] (> (count l) 0)) (cs/split-lines (or out ""))))
+
+(defn- jj [dir argv]
+  (let [r (sh dir argv)]
+    {:status (:status r) :out (:out r) :lines (lines-of (:out r))}))
+
+(defn jj-json [dir argv]
+  (let [r (jj dir argv)]
+    (if (= 0 (:status r)) (mapv j/json-> (:lines r)) [])))
+
+(defn fld [m k]
+  (let [v (get m k)]
+    (if (nil? v) (get m (name k)) v)))
+
+(defn head-op [dir]
+  (cs/trim (:out (jj dir ["op" "log" "-n" "1" "--no-graph" "-T" "self.id()"]))))
+
+(defn at-commit [dir]
+  (first (jj-json dir ["log" "-r" "@" "--no-graph" "-T" T])))
+
+(defn changed-paths [dir commit-id]
+  (let [r (jj dir ["diff" "--summary" "-r" commit-id])]
+    (if (= 0 (:status r))
+      (mapv (fn [l] (cs/trim (subs l 2))) (filterv (fn [l] (> (count l) 2)) (:lines r)))
+      [])))
+
+(defn repo?
+  "Whether `dir` is a jj workspace (its own, not a parent's)."
+  [dir]
+  (and (available?) (File/exists? (str dir "/.jj"))))
+
+(defn- newline-terminated? [s]
+  (and (> (count s) 0) (= "\n" (subs s (- (count s) 1) (count s)))))
+
+(defn init!
+  "Make `dir` a colocated jj workspace and teach the tree to ignore the mirror.
+   Colocated because git stays the interop format: whoever must push to a forge
+   keeps pushing."
+  [dir]
+  (let [r (jj dir ["git" "init" "--colocate"])]
+    (when (= 0 (:status r))
+      (let [ignore (str dir "/.gitignore")
+            existing (if (File/exists? ignore) (File/read! ignore) "")]
+        (if (not (includes? existing (str MIRROR "/")))
+          (File/write! ignore (str existing (if (newline-terminated? existing) "" "\n") MIRROR "/\n")))))
+    {:ok (= 0 (:status r)) :out (cs/trim (:out r))}))
+
+; A working-copy question, not a fact: is there anything in @ to record? Any jj
+; command snapshots first, so this reads the work that just happened rather than
+; the state before it.
+
+(defn dirty?
+  "Whether the working copy commit holds anything. Any jj command snapshots
+   first, so this reads the work that just happened, not the state before it."
+  [dir]
+  (> (count (:lines (jj dir ["diff" "--summary" "-r" "@"]))) 0))
+

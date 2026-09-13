@@ -7,8 +7,8 @@ with an author, an intent, and an undo — with jj doing the hard part and datom
 holding the part that must be queryable?
 
 ```sh
+mix bl.jj.fetch                   # installs the pin (sha256-verified) into priv/jj
 research/autovcs/demo.sh          # end to end, ~1 min, asserts its own claims
-research/autovcs/fetch.sh         # just the pinned binary path (sha256-verified)
 ```
 
 ## The shape
@@ -163,4 +163,4 @@ paging or `--at-op`-style incremental reads at 10 000).
 | `autovcs.bl` | the daemon: protocol, checkpointing, the mirror, the queries |
 | `demo.sh` | the scenario, and every assertion that makes it evidence |
 | `results.md` | the transcript `demo.sh` wrote |
-| `jj.lock`, `fetch.sh` | the pinned jj (version, url, sha256 per target) |
+| — | the pin is the language's now: `mix bl.jj.fetch` → `priv/jj/bin/jj`, resolved by `vcs.jj/bin` |

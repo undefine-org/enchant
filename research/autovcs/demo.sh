@@ -23,7 +23,10 @@ export BL_DROP_KEEP_DAYS=${BL_DROP_KEEP_DAYS:-100000}
 # A warm daemon belongs to one session and one build; this probe is not its work.
 export BL_DAEMON=off
 
-JJ=$("$here/fetch.sh")           # pinned, sha256-verified
+# The pin moved into the language: `mix bl.jj.fetch` installs `priv/jj/bin/jj`
+# and `vcs.jj/bin` resolves it. This probe uses the same one a user would.
+JJ=${VCS_JJ:-$(cd "$repo" && printf '%s' "$repo/priv/jj/bin/jj")}
+[ -x "$JJ" ] || { echo "no pinned jj — run: mix bl.jj.fetch" >&2; exit 2; }
 export AUTOVCS_JJ="$JJ"
 bl() { (cd "$repo" && ./bl -p priv/std "$@"); }
 

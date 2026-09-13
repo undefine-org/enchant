@@ -360,14 +360,16 @@ prerequisites in front:
 mix deps.get
 mix compile                 # also creates _build/$MIX_ENV/lib/beam_lisp/priv
 mix bl.z3.fetch      # writes through that priv symlink into priv/z3
+mix bl.jj.fetch      # …and into priv/jj — the change engine behind `bl vcs`
 mix bl.build --out bl-<target>
 ```
 
 `BL_VERSION` (the tag minus its leading `v`, normalized to a valid
 `Version`: `v2026.0` → `2026.0.0`) stamps the release, so `bl version` on the
 artifact reports it; the GitHub release keeps the tag's name. On macOS the
-fetched z3 binary is ad-hoc signed before packing — Apple Silicon will not
-execute unsigned pages.
+fetched z3 binary — and the fetched jj, which comes from the same kind of
+archive — is ad-hoc signed before packing: Apple Silicon will not execute
+unsigned pages.
 
 **Per-platform prerequisites.** `wry_webview` is a Linux capability (gtk3 +
 webkit2gtk + wlr-layer-shell): its Cargo dependencies are `cfg(target_os =

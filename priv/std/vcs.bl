@@ -35,14 +35,33 @@
 
 (ns vcs
   (:require [datom] [datom.conn] [datom.store] [datom.store-fjall]
-            [interop :as j] [bl.util :as u] [clojure.string :as cs]))
+            [vcs.jj :as jj] [interop :as j] [bl.util :as u] [clojure.string :as cs]))
 
-(def MIRROR ".autovcs")
+; The jj boundary lives in `vcs.jj`: where the binary is, how to run it, what a
+; change and an operation look like, and the working-copy questions. This file is
+; the fact layer on top — the mirror, the queue, the gate, and the questions only
+; a join can answer.
+;
+; `MIRROR` is re-exported because it is this layer's directory too: the queue and
+; the store live inside it.
+
+
+(def MIRROR jj/MIRROR)
 (def STORE "mirror.fjall")
 
-; jj is the only writer; these are the calls this namespace makes.
-(def T "json(self) ++ \"\\n\"")
+; The jj layer's public surface, re-exported. A caller asks `vcs` where jj is and
+; what it can do — the split into two files is an implementation choice, not a
+; thing every caller has to know.
+(def bin jj/bin)
+(defn version [] (jj/version))
+(defn available? [] (jj/available?))
+(defn repo? [dir] (jj/repo? dir))
+(defn init! [dir] (jj/init! dir))
+(defn run-jj [dir argv] (jj/run-jj dir argv))
 
+; What the mirror holds. Every attribute is jj's own word for the thing, or the
+; request's — nothing renamed for our convenience, so a fact and a `jj` field
+; can be read side by side.
 (def SCHEMA
   [{:db/ident :op/id        :db/valueType :db.type/string :db/unique :db.unique/identity}
    {:db/ident :op/parent    :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
@@ -71,126 +90,8 @@
    {:db/ident :meta/key     :db/valueType :db.type/string :db/unique :db.unique/identity}
    {:db/ident :meta/value   :db/valueType :db.type/string}])
 
-; ── jj's whereabouts ─────────────────────────────────────────────────────────
 
-(defn- uname [flag]
-  (let [r (System/cmd "uname" (u/to-list [flag]) (u/kw [:stderr_to_stdout true]))]
-    (if (= 0 (erlang/element 2 r)) (cs/trim (erlang/element 1 r)) "")))
-
-(defn- os-arch
-  "The vendored pin's directory name: `linux-x86_64`, `darwin-aarch64`."
-  []
-  (str (cs/lower-case (uname "-s")) "-" (uname "-m")))
-
-(defn- executable? [p] (and (some? p) (File/exists? p)))
-
-(defn bin
-  "The jj this build uses: VCS_JJ, then the vendored pin next to the language,
-   then PATH. One decision, in one place."
-  []
-  (let [env (System/get_env "VCS_JJ")
-        root (System/get_env "BEAM_LISP_HOME")]
-    (cond
-      (executable? env) env
-      (executable? (str root "/priv/jj/" (os-arch) "/jj")) (str root "/priv/jj/" (os-arch) "/jj")
-      :else "jj")))
-
-(defn available?
-  "Whether a jj binary answers at all."
-  []
-  (let [r (System/cmd (bin) (u/to-list ["--version"])
-                      (u/kw [:stderr_to_stdout true]))]
-    (= 0 (erlang/element 2 r))))
-
-; ── the jj boundary ──────────────────────────────────────────────────────────
-;
-; stderr folds into stdout: a jj failure is a message the caller must show,
-; never a silence.
-
-(defn- sh [dir argv]
-  (let [r (System/cmd (bin) (u/to-list argv)
-                      (u/kw [:cd dir] [:stderr_to_stdout true]))]
-    {:out (erlang/element 1 r) :status (erlang/element 2 r)}))
-
-(defn run-jj
-  "Run jj in `dir` → `{:out :status}`. Public because a caller legitimately asks
-   jj things this namespace does not wrap, and because a test must be able to."
-  [dir argv]
-  (sh dir argv))
-
-(defn- run-argv
-  "Run an ARBITRARY command in `dir` — the gate is not a jj call.
-
-   The gate runs with `BL_DAEMON=off` and `BL_VCS=off`, and both are load-bearing:
-
-   - `BL_DAEMON=off`, because the daemon serves ONE request at a time — a gate
-     that attached to it would queue behind the very command waiting for it.
-   - `BL_VCS=off`, because a gate is not a change. Without it the child inherits
-     the daemon's `BL_DAEMON_ROOT`, believes it is a daemon, auto-checkpoints,
-     and runs a gate of its own — each level spawning another cold VM, forever.
-     A gate never records and never attaches; saying so is what stops the
-     recursion rather than a termination condition nobody can name."
-  [dir argv]
-  (let [r (System/cmd (first argv) (u/to-list (rest argv))
-                      (u/kw [:cd dir]
-                            [:stderr_to_stdout true]
-                            ;; Elixir reads env as {name, value} pairs of
-                            ;; binaries. An atom key is rejected outright:
-                            ;; "invalid environment key-value".
-                            [:env [(u/kw-pair "BL_DAEMON" "off")
-                                   (u/kw-pair "BL_VCS" "off")]]))]
-    {:out (erlang/element 1 r) :status (erlang/element 2 r)}))
-
-(defn- lines-of [out]
-  (filterv (fn [l] (> (count l) 0)) (cs/split-lines (or out ""))))
-
-(defn- jj [dir argv]
-  (let [r (sh dir argv)]
-    {:status (:status r) :out (:out r) :lines (lines-of (:out r))}))
-
-(defn- jj-json [dir argv]
-  (let [r (jj dir argv)]
-    (if (= 0 (:status r)) (mapv j/json-> (:lines r)) [])))
-
-(defn- fld [m k]
-  (let [v (get m k)]
-    (if (nil? v) (get m (name k)) v)))
-
-(defn- head-op [dir]
-  (cs/trim (:out (jj dir ["op" "log" "-n" "1" "--no-graph" "-T" "self.id()"]))))
-
-(defn- at-commit [dir]
-  (first (jj-json dir ["log" "-r" "@" "--no-graph" "-T" T])))
-
-(defn- changed-paths [dir commit-id]
-  (let [r (jj dir ["diff" "--summary" "-r" commit-id])]
-    (if (= 0 (:status r))
-      (mapv (fn [l] (cs/trim (subs l 2))) (filterv (fn [l] (> (count l) 2)) (:lines r)))
-      [])))
-
-(defn repo?
-  "Whether `dir` is a jj workspace (its own, not a parent's)."
-  [dir]
-  (and (available?) (File/exists? (str dir "/.jj"))))
-
-(defn- newline-terminated? [s]
-  (and (> (count s) 0) (= "\n" (subs s (- (count s) 1) (count s)))))
-
-(defn init!
-  "Make `dir` a colocated jj workspace and teach the tree to ignore the mirror.
-   Colocated because git stays the interop format: whoever must push to a forge
-   keeps pushing."
-  [dir]
-  (let [r (jj dir ["git" "init" "--colocate"])]
-    (when (= 0 (:status r))
-      (let [ignore (str dir "/.gitignore")
-            existing (if (File/exists? ignore) (File/read! ignore) "")]
-        (if (not (includes? existing (str MIRROR "/")))
-          (File/write! ignore (str existing (if (newline-terminated? existing) "" "\n") MIRROR "/\n")))))
-    {:ok (= 0 (:status r)) :out (cs/trim (:out r))}))
-
-; ── the mirror (jj → datom) ──────────────────────────────────────────────────
-
+; jj is the only writer; these are the calls this namespace makes.
 (def REGISTRY (atom {}))
 
 (defn- open-mirror [dir]
@@ -233,25 +134,25 @@
 
 (defn- op-facts [i o]
   (assoc
-    {:op/id (fld o "id")
-     :op/parent (vec (or (fld o "parents") []))
-     :op/desc (or (fld o "description") "")
-     :op/args (or (get (fld o "attributes") "args") "")
-     :op/user (or (fld o "username") "")
-     :op/host (or (fld o "hostname") "")
-     :op/start (get (fld o "time") "start")
-     :op/snapshot (true? (fld o "is_snapshot"))
-     :op/workspace (or (fld o "workspace_name") "")}
+    {:op/id (jj/fld o "id")
+     :op/parent (vec (or (jj/fld o "parents") []))
+     :op/desc (or (jj/fld o "description") "")
+     :op/args (or (get (jj/fld o "attributes") "args") "")
+     :op/user (or (jj/fld o "username") "")
+     :op/host (or (jj/fld o "hostname") "")
+     :op/start (get (jj/fld o "time") "start")
+     :op/snapshot (true? (jj/fld o "is_snapshot"))
+     :op/workspace (or (jj/fld o "workspace_name") "")}
     :db/id (- 0 (inc i))))
 
 (defn- commit-facts [i c paths]
   (assoc
-    {:cm/id (fld c "commit_id")
-     :cm/change (fld c "change_id")
-     :cm/parent (vec (or (fld c "parents") []))
-     :cm/desc (or (fld c "description") "")
-     :cm/author (or (get (fld c "author") "name") "")
-     :cm/time (get (fld c "author") "timestamp")
+    {:cm/id (jj/fld c "commit_id")
+     :cm/change (jj/fld c "change_id")
+     :cm/parent (vec (or (jj/fld c "parents") []))
+     :cm/desc (or (jj/fld c "description") "")
+     :cm/author (or (get (jj/fld c "author") "name") "")
+     :cm/time (get (jj/fld c "author") "timestamp")
      :cm/path paths}
     :db/id (- 0 (+ 100000 (inc i)))))
 
@@ -263,7 +164,7 @@
    from a rebuilt one."
   [dir]
   (let [m (mirror-state dir)
-        head (head-op dir)]
+        head (jj/head-op dir)]
     ;; The queue is emptied BEFORE the cheap exit: a request that arrived while
     ;; the store was elsewhere has to be taken by the next look at the tree, and
     ;; the next look is usually one with nothing new from jj at all.
@@ -273,13 +174,13 @@
       (let [db (datom/db (:conn m))
             seen-ops (known-set db '[:find ?id :where [?e :op/id ?id]])
             seen-cms (known-set db '[:find ?id :where [?e :cm/id ?id]])
-            new-ops (filterv (fn [o] (not (contains? seen-ops (fld o "id"))))
-                             (jj-json dir ["op" "log" "--no-graph" "-T" T]))
-            new-cms (filterv (fn [c] (not (contains? seen-cms (fld c "commit_id"))))
-                             (jj-json dir ["log" "-r" "all()" "--no-graph" "-T" T]))
+            new-ops (filterv (fn [o] (not (contains? seen-ops (jj/fld o "id"))))
+                             (jj/jj-json dir ["op" "log" "--no-graph" "-T" jj/T]))
+            new-cms (filterv (fn [c] (not (contains? seen-cms (jj/fld c "commit_id"))))
+                             (jj/jj-json dir ["log" "-r" "all()" "--no-graph" "-T" jj/T]))
             tx (into (into [] (map-indexed op-facts new-ops))
                      (into [] (map-indexed
-                                (fn [i c] (commit-facts i c (changed-paths dir (fld c "commit_id"))))
+                                (fn [i c] (commit-facts i c (jj/changed-paths dir (jj/fld c "commit_id"))))
                                 new-cms)))]
         (datom/transact! (:conn m)
           (conj tx {:db/id -1 :meta/key "op-head" :meta/value head}))
@@ -322,14 +223,14 @@
 
 (defn- req-facts [r id]
   {:db/id id
-   :req/id (fld r "id")
-   :req/by (or (fld r "by") "daemon")
-   :req/why (or (fld r "why") "")
-   :req/op (or (fld r "op") "")
-   :req/commit (or (fld r "commit") "")
+   :req/id (jj/fld r "id")
+   :req/by (or (jj/fld r "by") "daemon")
+   :req/why (or (jj/fld r "why") "")
+   :req/op (or (jj/fld r "op") "")
+   :req/commit (or (jj/fld r "commit") "")
    :req/at (System/system_time :millisecond)
-   :req/ms (or (fld r "ms") 0)
-   :req/path (vec (or (fld r "paths") []))})
+   :req/ms (or (jj/fld r "ms") 0)
+   :req/path (vec (or (jj/fld r "paths") []))})
 
 (defn- ingest-spill!
   "Transact every spilled request the mirror does not already hold, then keep
@@ -339,18 +240,18 @@
     (if (empty? lines)
       0
       (let [known (known-set (datom/db (:conn m)) '[:find ?id :where [?e :req/id ?id]])
-            fresh (filterv (fn [l] (not (contains? known (fld (j/json-> l) "id")))) lines)
+            fresh (filterv (fn [l] (not (contains? known (jj/fld (j/json-> l) "id")))) lines)
             ;; "taken" is decided from what we asked the store to hold — known
             ;; plus what we just transacted — and never from a read AFTER the
             ;; write. A connection only sees up to its own basis, so a
             ;; read-back is a fresh question with a stale answer; the queue must
             ;; not depend on it.
-            taken (into known (map (fn [l] (fld (j/json-> l) "id")) fresh))]
+            taken (into known (map (fn [l] (jj/fld (j/json-> l) "id")) fresh))]
         (when (seq fresh)
           (datom/transact! (:conn m)
             (vec (map-indexed (fn [i l] (req-facts (j/json-> l) (- 0 (+ 200000 (inc i))))) fresh)))
           (if (:store m) (datom.store-fjall/sync! (:store m))))
-        (spill-rewrite! dir (filterv (fn [l] (not (contains? taken (fld (j/json-> l) "id")))) lines))
+        (spill-rewrite! dir (filterv (fn [l] (not (contains? taken (jj/fld (j/json-> l) "id")))) lines))
         (count fresh)))))
 
 (defn- record-request!
@@ -365,12 +266,6 @@
 
 ; ── checkpoints ──────────────────────────────────────────────────────────────
 
-(defn- dirty?
-  "Whether the working copy commit holds anything. Any jj command snapshots
-   first, so this reads the work that just happened, not the state before it."
-  [dir]
-  (> (count (:lines (jj dir ["diff" "--summary" "-r" "@"]))) 0))
-
 (defn checkpoint!
   "Record what just happened as one change.
 
@@ -382,31 +277,31 @@
    A tree with nothing to record is left alone: the daemon calls this after
    every command, and most commands change nothing."
   [{:keys [dir by why paths] :or {by "daemon" why ""}}]
-  (if (not (dirty? dir))
+  (if (not (jj/dirty? dir))
     {:ok true :skipped true :reason "no changes"}
     (let [t0 (System/system_time :millisecond)
-          _ (jj dir ["describe" "-m" (str by ": " why)])
-          c (at-commit dir)
-          op (head-op dir)]
-      (jj dir ["new"])
+          _ (jj/run-jj dir ["describe" "-m" (str by ": " why)])
+          c (jj/at-commit dir)
+          op (jj/head-op dir)]
+      (jj/run-jj dir ["new"])
       (mirror! dir)
       (record-request! dir {"id" (str op "-req")
                             "by" by "why" why
-                            "op" op "commit" (or (fld c "commit_id") "")
+                            "op" op "commit" (or (jj/fld c "commit_id") "")
                             ;; jj knows which paths the change touched, so a
                             ;; checkpoint taken by hand (the CLI, a test) needs
                             ;; no caller to testify: the diff is the testimony.
                             "paths" (if (seq paths) paths
-                                        (changed-paths dir (fld c "commit_id")))
+                                        (jj/changed-paths dir (jj/fld c "commit_id")))
                             "ms" (- (System/system_time :millisecond) t0)})
-      {:ok true :skipped false :op op :commit (or (fld c "commit_id") "")
-       :change (or (fld c "change_id") "")})))
+      {:ok true :skipped false :op op :commit (or (jj/fld c "commit_id") "")
+       :change (or (jj/fld c "change_id") "")})))
 
 (defn undo!
   "Put the whole tree back to an operation. Not an inverse patch: jj restores
    the repository state, working copy included."
   [{:keys [dir op]}]
-  (let [r (jj dir ["op" "restore" op])]
+  (let [r (jj/run-jj dir ["op" "restore" op])]
     (mirror! dir)
     {:ok (= 0 (:status r)) :out (cs/trim (:out r))}))
 
@@ -453,7 +348,7 @@
   [{:keys [dir cmd paths in-process]}]
   (cond
     cmd
-    (let [r (run-argv dir cmd)]
+    (let [r (jj/run-argv dir cmd)]
       {:ok (= 0 (:status r)) :argv cmd :out (cs/trim (:out r))})
 
     in-process
@@ -463,14 +358,14 @@
     :else
     (let [argv (default-gate)
           args (if (seq paths) (concat argv (vec paths)) argv)
-          r (run-argv dir args)]
+          r (jj/run-argv dir args)]
       {:ok (= 0 (:status r)) :argv argv :out (cs/trim (:out r))})))
 
 (defn checkpoint+gated!
   "Gate, then record. The gate runs first, so a tree that fails is reported and
    NOT advanced: the failure is the thing worth knowing about."
   [opts]
-  (if (not (dirty? (:dir opts)))
+  (if (not (jj/dirty? (:dir opts)))
     {:ok true :skipped true :reason "no changes"}
     (let [g (gate! opts)]
       (if (:ok g)
@@ -481,16 +376,16 @@
 
 (defn status [{:keys [dir]}]
   (let [m (mirror! dir)
-        head (at-commit dir)
+        head (jj/at-commit dir)
         db (datom/db (:conn (mirror-state dir)))
         one (fn [q] (let [r (datom/q q db)] (if (> (count r) 0) (first (first r)) 0)))
         ignore (if (File/exists? (str dir "/.gitignore")) (File/read! (str dir "/.gitignore")) "")]
     {:ok true
      :dir dir
-     :jj {:version (cs/trim (:out (jj dir ["--version"])))
-          :head_change (fld head "change_id")
-          :head_desc (fld head "description")
-          :latest_op (head-op dir)}
+     :jj {:version (cs/trim (:out (jj/run-jj dir ["--version"])))
+          :head_change (jj/fld head "change_id")
+          :head_desc (jj/fld head "description")
+          :latest_op (jj/head-op dir)}
      :mirror {:ops (one '[:find (count ?e) :where [?e :op/id _]])
               :commits (one '[:find (count ?e) :where [?e :cm/id _]])
               :requests (one '[:find (count ?e) :where [?e :req/id _]])

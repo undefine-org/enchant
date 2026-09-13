@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [vcs.jj :as vcs]))
 ```
 
 ## A probe never crashes
@@ -121,6 +121,20 @@ invocation, so it reports `not running` and changes nothing.
    (probe "lazy_memo" true
      (fn [] (let [n (BeamLisp.LazyMemo/fast_lane_bytes)]
               {:ok (int? n) :detail (str n " bytes fast lane")})))
+
+   ;; jj is asked through `BeamLisp/eval` so this file stays free of the fact
+   ;; layer: `vcs.jj` is the change engine and nothing else, and the probe says
+   ;; which binary a caller would get, not which one this file could load.
+   ;; jj is the change engine behind `bl vcs` — so the line says which binary a
+   ;; caller would actually get and what it names itself, which is the fact a
+   ;; person needs when a checkpoint silently did nothing.
+   (probe "jj" false
+     (fn []
+       (let [b (vcs/bin)
+             v (vcs/version)]
+         (if (nil? v)
+           {:ok false :detail (str "absent — run `mix bl.jj.fetch` (looked for " b ")")}
+           {:ok true :detail (str v "  " b)}))))
 
    (probe "z3" false
      (fn [] (let [p (z3/open)
