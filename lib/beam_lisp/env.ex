@@ -269,6 +269,39 @@ defmodule BeamLisp.Env do
     :ok
   end
 
+  # The ops whose FIRST argument is not their only path: a copy or a rename
+  # names a source AND a destination.
+  @two_path_ops MapSet.new([{File, :cp}, {File, :rename}])
+
+  # read/write-shaped ops whose arguments name NO path: `File.cwd` ANSWERS a
+  # path rather than taking one, and resolving an argument it does not have
+  # would be a lie in the table.
+  @no_path_ops MapSet.new([{File, :cwd}, {File, :cwd!}])
+
+  @doc """
+  Which ARGUMENTS of a host fn name a path, by index — or nil when none do.
+
+  Derived from the op table rather than kept beside it: a `:read`/`:write` op's
+  first argument is the file it reads or writes, `File.cp/rename` name two,
+  `File.cwd` names none. So ONE audit answers both "may this fn run?" and
+  "which of its arguments are paths?" — and an app that registers a `:read` op
+  (`register_op/3`) gets its path argument resolved with no second table to
+  remember.
+
+  `BeamLisp.RT.host_call/3` is the caller: a relative path argument resolves
+  against the COMMAND's cwd (`BeamLisp.cwd/0`), because the VM's own cwd is
+  global and belongs to whichever process started it — the daemon.
+  """
+  def path_positions(module, fun) do
+    cond do
+      MapSet.member?(@no_path_ops, {module, fun}) -> nil
+      MapSet.member?(@two_path_ops, {module, fun}) -> [0, 1]
+      op_of(module, fun) in [:read, :write] -> [0]
+      true -> nil
+    end
+  end
+
+
   # The default table: the dangerous-shape modules, read/write/env/exec
   # split. Deliberately small and data-shaped — a deployment audits ONE
   # table, not the compiler.

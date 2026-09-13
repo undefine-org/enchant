@@ -27,7 +27,11 @@ defmodule BeamLisp.DaemonHaltTest do
 
   use ExUnit.Case, async: false
 
-  alias BeamLisp.Daemon.{Paths, Protocol, Server}
+  # The wire (a request, and collecting what it said) is shared with the other
+  # daemon tests: BeamLisp.Test.DaemonSocket.
+  import BeamLisp.Test.DaemonSocket
+
+  alias BeamLisp.Daemon.{Paths, Server}
 
   setup do
     root = File.cwd!()
@@ -128,70 +132,6 @@ defmodule BeamLisp.DaemonHaltTest do
            "a command that spoke must not also get the silent-failure line; it said:\n#{out}"
   end
 
-  # ── the tree under test ──
-
-  defp tree do
-    dir = Path.join(System.tmp_dir!(), "bl-halt-#{:erlang.unique_integer([:positive])}")
-    File.mkdir_p!(dir)
-    dir
-  end
-
-  # ── the socket ──
-  # The request/collect/connect trio is the daemon suite's own; a request is a
-  # hello, a token, an argv and a cwd — the same frames `bl` sends.
-
-  defp request(ctx, argv, cwd) do
-    {:ok, sock} = connect(ctx.ep.sock)
-    send_frame(sock, Protocol.encode({:bl, 1, :hello, %{tree: ctx.tree, token: ctx.token}}))
-    {:ok, {:bl, 1, :ready, _}} = recv_frame(sock)
-
-    id = :crypto.strong_rand_bytes(16)
-    send_frame(sock, Protocol.encode({:bl, 1, :request, id, %{argv: argv, cwd: cwd, env_paths: []}}))
-
-    result = collect(sock, id, "")
-    :gen_tcp.close(sock)
-    result
-  end
-
-  defp collect(sock, id, acc) do
-    case recv_frame(sock) do
-      {:ok, {:bl, 1, :stdout, ^id, _seq, bytes}} -> collect(sock, id, acc <> bytes)
-      {:ok, {:bl, 1, :stderr, ^id, _seq, bytes}} -> collect(sock, id, acc <> bytes)
-      {:ok, {:bl, 1, :exit, ^id, code}} -> {acc, code}
-      {:ok, {:bl, 1, :failed, ^id, code, _}} -> {acc, code}
-      {:ok, _other} -> collect(sock, id, acc)
-      {:error, _} -> {acc, :closed}
-    end
-  end
-
-  defp connect(sock_path) do
-    :gen_tcp.connect({:local, String.to_charlist(sock_path)}, 0, [
-      {:inet_backend, :inet},
-      :local,
-      :binary,
-      {:packet, 4},
-      {:active, false}
-    ])
-  end
-
-  defp send_frame(sock, bin), do: :ok = :gen_tcp.send(sock, bin)
-
-  defp recv_frame(sock) do
-    case :gen_tcp.recv(sock, 0, 30_000) do
-      {:ok, bin} -> {:ok, :erlang.binary_to_term(bin)}
-      other -> other
-    end
-  end
-
-  defp wait_for(fun, tries \\ 100)
-  defp wait_for(_fun, 0), do: :timeout
-
-  defp wait_for(fun, tries) do
-    if fun.() do
-      true
-    else
-      Process.sleep(20)
-      wait_for(fun, tries - 1)
-    end
-  end
+  # The wire this file used to carry — request/collect/connect/tree/wait_for —
+  # is shared now: BeamLisp.Test.DaemonSocket.
 end

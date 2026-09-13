@@ -46,18 +46,9 @@ defmodule BeamLisp.RT do
   end
 
   @doc false
-  def invoke({:"$remote", module, fun}, args) do
-    # Dynamic invocation of a host-module handle: the runtime half of the
-    # capability gate (static remote calls are rejected at compile time).
-    if BeamLisp.Env.allowed?(module, fun) do
-      apply(module, fun, args)
-    else
-      raise BeamLisp.CompileError,
-        message:
-          "#{BeamLisp.Env.refusal(module, fun)} " <>
-            "(dynamic invocation of #{inspect(module)}.#{fun}/#{length(args)} denied)"
-    end
-  end
+  def invoke({:"$remote", module, fun}, args), do: host_call(module, fun, args)
+
+
 
   @doc false
   def invoke(f, args) when is_function(f), do: apply(f, args)
@@ -143,6 +134,62 @@ defmodule BeamLisp.RT do
   module the author never mentioned. Failing here names the real
   mistake while the reference is still in view.
   """
+  @doc """
+  Call a host fn the way a bl program means it: with the arguments that NAME A
+  PATH resolved against the command's cwd.
+
+  A relative path in a program means what it means in a shell — relative to
+  where the command was run. `BeamLisp.with_cwd/2` binds that (`:bl_cwd`) and
+  the daemon binds it per request, but the OS cwd of a BEAM VM is GLOBAL and
+  belongs to whoever started it: without this, a served
+  `(File/write! "made.txt" …)` wrote into the DAEMON's checkout, and which
+  tree a program touched depended on which process happened to run it.
+
+  Both entry points arrive here — the compiler routes a statically-known path
+  op (`gate-remote!`'s emit) and `$remote` handles come in by value — so the
+  resolution rule and the runtime half of the capability gate exist ONCE.
+  """
+  def host_call(module, fun, args) do
+    unless BeamLisp.Env.allowed?(module, fun) do
+      raise BeamLisp.CompileError,
+        message:
+          "#{BeamLisp.Env.refusal(module, fun)} " <>
+            "(a call to #{inspect(module)}.#{fun}/#{length(args)} is denied)"
+    end
+
+    apply(module, fun, resolve_path_args(module, fun, args))
+  end
+
+  @doc """
+  Resolve ONE path argument against the command's cwd (see `host_call/3`).
+
+  Absolute paths pass through untouched — including a Windows drive path,
+  which `Path.type/1` recognises — and so does anything that is not a binary,
+  so a non-path argument can never be mangled into one.
+  """
+  def resolve_path(p) when is_binary(p) do
+    if Path.type(p) == :absolute, do: p, else: Path.join(BeamLisp.cwd(), p)
+  end
+
+  def resolve_path(other), do: other
+
+  @doc """
+  Resolve the path-taking arguments of a host fn, per the SAME table the
+  capability audit keeps (`BeamLisp.Env.path_positions/2`): one audit, two
+  questions — "may this fn run?" and "which of its arguments name a file?" —
+  so neither can drift from the other.
+  """
+  def resolve_path_args(module, fun, args) do
+    case BeamLisp.Env.path_positions(module, fun) do
+      nil ->
+        args
+
+      positions ->
+        args
+        |> Enum.with_index()
+        |> Enum.map(fn {arg, i} -> if i in positions, do: resolve_path(arg), else: arg end)
+    end
+  end
   def remote_fun(module, fun) do
     # Creating a host-module handle is itself interop: gate it, so a
     # capped env cannot even FORGE a handle it would later sneak past a

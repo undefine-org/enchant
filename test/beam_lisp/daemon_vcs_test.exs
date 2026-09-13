@@ -23,7 +23,11 @@ defmodule BeamLisp.DaemonVcsTest do
 
   use ExUnit.Case, async: false
 
-  alias BeamLisp.Daemon.{Protocol, Paths, Server}
+  # The wire (a request, and collecting what it said) is shared: the framing is
+  # not what this file is about.
+  import BeamLisp.Test.DaemonSocket
+
+  alias BeamLisp.Daemon.{Paths, Server}
 
 
   setup do
@@ -109,25 +113,16 @@ defmodule BeamLisp.DaemonVcsTest do
     assert bin =~ "jj/bin/jj", "the daemon must resolve the pinned jj, not PATH; it said: #{bin}"
   end
 
-  # The program writes by ABSOLUTE path on purpose: a relative path inside a
-  # daemon-served request resolves against the daemon VM's own working
-  # directory, not the client's `cwd` — the runtime binds `BeamLisp/cwd` for
-  # what it resolves itself, and this is not that. The mutation is what this
-  # test is about, so it names the file outright.
-  defp prog(dir) do
-    "(ns prog)\n(File/write! \"#{Path.join(dir, "made.txt")}\" \"1\\n\")\n(println \"wrote\")\n"
+  # The program writes a RELATIVE path, and that is load-bearing: the request's
+  # cwd is the tree under test, while the daemon's own cwd is this checkout — so
+  # if a relative path resolved against the VM instead of against the command,
+  # the change would land in the wrong tree and the log asserted below would be
+  # empty (BUG-038, and the reason `RT.host_call` exists).
+  defp prog(_dir) do
+    "(ns prog)\n(File/write! \"made.txt\" \"1\\n\")\n(println \"wrote\")\n"
   end
 
   # ── the tree under test ──
-
-  # A throwaway workspace. `bl vcs init` (driven over the daemon, above) is what
-  # makes it a jj repo; this is only the empty directory, so the test never
-  # reimplements what the feature does.
-  defp tree do
-    dir = Path.join(System.tmp_dir!(), "bl-vcs-#{:erlang.unique_integer([:positive])}")
-    File.mkdir_p!(dir)
-    dir
-  end
 
   # What the changes SAY. The count of changes is not a fact a caller can rely
   # on — jj abandons and recreates its own empty working-copy commits — but a
@@ -147,62 +142,5 @@ defmodule BeamLisp.DaemonVcsTest do
 
   defp jj_bin, do: Path.join([to_string(:code.priv_dir(:beam_lisp)), "jj", "bin", "jj"])
 
-  # ── the socket ──
-  # The request/collect/connect trio is the daemon suite's own; a request is a
-  # hello, a token, an argv and a cwd — the same frames `bl` sends.
-
-  defp request(ctx, argv, cwd) do
-    {:ok, sock} = connect(ctx.ep.sock)
-    send_frame(sock, Protocol.encode({:bl, 1, :hello, %{tree: ctx.tree, token: ctx.token}}))
-    {:ok, {:bl, 1, :ready, _}} = recv_frame(sock)
-
-    id = :crypto.strong_rand_bytes(16)
-    send_frame(sock, Protocol.encode({:bl, 1, :request, id, %{argv: argv, cwd: cwd, env_paths: []}}))
-
-    result = collect(sock, id, "")
-    :gen_tcp.close(sock)
-    result
-  end
-
-  defp collect(sock, id, acc) do
-    case recv_frame(sock) do
-      {:ok, {:bl, 1, :stdout, ^id, _seq, bytes}} -> collect(sock, id, acc <> bytes)
-      {:ok, {:bl, 1, :stderr, ^id, _seq, bytes}} -> collect(sock, id, acc <> bytes)
-      {:ok, {:bl, 1, :exit, ^id, code}} -> {acc, code}
-      {:ok, {:bl, 1, :failed, ^id, code, _}} -> {acc, code}
-      {:ok, _other} -> collect(sock, id, acc)
-      {:error, _} -> {acc, :closed}
-    end
-  end
-
-  defp connect(sock_path) do
-    :gen_tcp.connect({:local, String.to_charlist(sock_path)}, 0, [
-      {:inet_backend, :inet},
-      :local,
-      :binary,
-      {:packet, 4},
-      {:active, false}
-    ])
-  end
-
-  defp send_frame(sock, bin), do: :ok = :gen_tcp.send(sock, bin)
-
-  defp recv_frame(sock) do
-    case :gen_tcp.recv(sock, 0, 30_000) do
-      {:ok, bin} -> {:ok, :erlang.binary_to_term(bin)}
-      other -> other
-    end
-  end
-
-  defp wait_for(fun, tries \\ 100)
-  defp wait_for(_fun, 0), do: :timeout
-
-  defp wait_for(fun, tries) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(20)
-      wait_for(fun, tries - 1)
-    end
-  end
+  # The wire is shared: BeamLisp.Test.DaemonSocket (tree/request/collect/…).
 end
