@@ -103,6 +103,17 @@ defmodule BeamLisp.Daemon do
     end
   end
 
+  @doc """
+  Whether THIS VM hosts a daemon server.
+
+  The fact `bl.cli/under-daemon?` turns on when it decides to record what a
+  command did. It is asked here, of the runtime, rather than inferred from
+  `BL_DAEMON_ROOT`: the launcher sets that when it spawns a daemon, but a daemon
+  started in-process (`Daemon.Server.start_link`) — an embedding host, the test
+  suite — never carries it, and a silent `no` there would stop recording.
+  """
+  def serving?, do: Process.whereis(BeamLisp.Daemon.Server) != nil
+
   # --- internals ---
 
   defp resolve(nil), do: System.get_env("BL_DAEMON_ROOT") || File.cwd!()
