@@ -101,7 +101,15 @@ arrives as three positionals; joining them with spaces restores the one form
 the user meant.
 
 ```beam-lisp
-(defn io-err [s] (IO/puts :stderr s))
+;; stderr of the process that is RUNNING, not the device the VM started with.
+;;
+;; Invisible in a CLI and decisive under the daemon: a request's stdout is
+;; framed by its group-leader proxy, while `:standard_error` — what
+;; `(IO/puts :stderr …)` writes to — is registered for the whole VM. A served
+;; command's diagnostics therefore landed on the daemon's console and its client
+;; saw a silent non-zero exit with no reason given, which is the hardest failure
+;; shape to debug: the work happened, the reason is gone.
+(defn io-err [s] (IO/puts (Process/group_leader) s))
 
 (defn resolve
   "Expand a file argument against the command's cwd. Standalone this is the OS

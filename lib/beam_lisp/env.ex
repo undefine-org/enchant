@@ -48,6 +48,8 @@ defmodule BeamLisp.Env do
   @pdict_ns :bl_ns
   @pdict_caps :bl_caps
   @pdict_heap :bl_max_heap
+  @pdict_denies :bl_denies
+  @no_denies MapSet.new()
   @op_table :beam_lisp_ops
   @max_chain_depth 8
 
@@ -115,24 +117,42 @@ defmodule BeamLisp.Env do
       same monotonic-weakening invariant as Biscuit tokens: the child's
       effective caps are `parent ∩ spec` — a fork can only ever narrow,
       never grant a module the parent did not hold. `:global` holds `:all`.
+
+    * `:denies` — host-interop calls the env may NOT make: a list of modules
+      (every fn of them) and/or `{module, fun}` pairs (that one fn). Denies
+      are checked BEFORE caps, so they beat `:all`, and they are inherited by
+      forks — a child may add one, nothing may lift one. This is the shape no
+      grant can express: `:all` is the ABSENCE of a set, and "everything
+      except this fn" is not a set of grants.
   """
   def fork(parent \\ env_id(), opts \\ []) do
     id = {:env, make_ref()}
     caps = intersect_caps(caps_of(parent), Keyword.get(opts, :caps, :all))
+    # Denies UNION: a fork inherits every restriction its parent carries and
+    # may add more; nothing can lift one. Caps narrow by intersection and
+    # denies narrow by union — two spellings of "a child is never stronger".
+    denies = MapSet.union(denies_of(parent), MapSet.new(Keyword.get(opts, :denies, [])))
     # Resource bounds narrow like caps: a child never gets MORE heap than
     # its parent. nil = unbounded (the VM default).
     heap = min_heap(heap_of(parent), Keyword.get(opts, :max_heap_words))
 
     Agent.update(__MODULE__, fn s ->
       envs = Map.get(s, :envs, %{})
-      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent, caps, heap)))
+      Map.put(s, :envs, Map.put(envs, id, fresh_env_state(parent, caps, heap, denies)))
     end)
 
     id
   end
 
-  defp fresh_env_state(parent, caps \\ :all, heap \\ nil),
-    do: %{parent: parent, loaded: MapSet.new(), search_paths: [], caps: caps, max_heap: heap}
+  defp fresh_env_state(parent, caps \\ :all, heap \\ nil, denies \\ @no_denies),
+    do: %{
+      parent: parent,
+      loaded: MapSet.new(),
+      search_paths: [],
+      caps: caps,
+      denies: denies,
+      max_heap: heap
+    }
 
   defp min_heap(nil, spec), do: spec
   defp min_heap(parent, nil), do: parent
@@ -199,16 +219,20 @@ defmodule BeamLisp.Env do
   grant denies (fail closed on a grant we cannot interpret).
 
   The hot path of the capability gate: one pdict read + set membership.
+  A deny (`denied?/2`) is consulted first, so it cannot be outvoted by `:all`.
   """
   def caps_allowed?(module, op \\ nil) do
-    case caps() do
-      :all ->
-        true
+    # Denies first, unconditionally: `:all` is the ABSENCE of a set, so it can
+    # never express "everything except this fn" — the one thing a deny says.
+    not denied?(module) and
+      case caps() do
+        :all ->
+          true
 
-      set ->
-        MapSet.member?(set, module) or
-          (not is_nil(op) and MapSet.member?(set, {module, op}))
-    end
+        set ->
+          MapSet.member?(set, module) or
+            (not is_nil(op) and MapSet.member?(set, {module, op}))
+      end
   end
 
   @doc """
@@ -291,11 +315,13 @@ defmodule BeamLisp.Env do
     prev_chain = Process.get(@pdict_chain)
     prev_ns = Process.get(@pdict_ns)
     prev_caps = Process.get(@pdict_caps)
+    prev_denies = Process.get(@pdict_denies)
     prev_heap = Process.get(@pdict_heap)
 
     Process.put(@pdict_env, env)
     Process.put(@pdict_chain, compute_chain(env))
     Process.put(@pdict_caps, caps_of(env))
+    Process.put(@pdict_denies, denies_of(env))
     restore_pdict(@pdict_heap, heap_of(env))
     # A fresh env means a fresh `*ns*`: Clojure thread-local semantics.
     Process.delete(@pdict_ns)
@@ -307,6 +333,7 @@ defmodule BeamLisp.Env do
       restore_pdict(@pdict_chain, prev_chain)
       restore_pdict(@pdict_ns, prev_ns)
       restore_pdict(@pdict_caps, prev_caps)
+      restore_pdict(@pdict_denies, prev_denies)
       restore_pdict(@pdict_heap, prev_heap)
     end
   end
@@ -317,8 +344,19 @@ defmodule BeamLisp.Env do
   """
   def isolated(fun), do: isolated(env_id(), fun)
 
-  def isolated(parent, fun) do
-    env = fork(parent)
+  def isolated(parent, fun), do: restricted([], fun, parent)
+
+  @doc """
+  `isolated/2` with a policy: the env additionally DENIES `denies` — modules
+  and/or `{module, fun}` pairs — for the duration of `fun`.
+
+  This is the boundary a host process owns: the daemon's request env IS this
+  call, and the list passed here is the whole of that policy. `fun` cannot
+  lift a deny, and neither can anything it forks, because `fork/2` unions the
+  parent's denies into the child's.
+  """
+  def restricted(denies, fun, parent \\ :global) do
+    env = fork(parent, denies: denies)
 
     try do
       with_env(env, fun)
@@ -399,7 +437,8 @@ defmodule BeamLisp.Env do
       chain: Process.get(@pdict_chain),
       ns: Process.get(@pdict_ns),
       caps: Process.get(@pdict_caps),
-      max_heap: Process.get(@pdict_heap)
+      max_heap: Process.get(@pdict_heap),
+      denies: Process.get(@pdict_denies)
     }
   end
 
@@ -415,6 +454,7 @@ defmodule BeamLisp.Env do
     restore_pdict(@pdict_chain, chain)
     restore_pdict(@pdict_ns, ns)
     restore_pdict(@pdict_caps, env && caps_of(env))
+    restore_pdict(@pdict_denies, env && denies_of(env))
     restore_pdict(@pdict_heap, Map.get(token, :max_heap))
     :ok
   end
@@ -444,6 +484,67 @@ defmodule BeamLisp.Env do
       %{env: env, ns: cns, name: cname, found: kind != :absent, kind: kind}
     end
   end
+
+  @doc """
+  The env's deny set — host-interop calls it may not make. `:global` denies
+  nothing, which is what keeps the zero env exactly as it was.
+  """
+  def denies_of(:global), do: @no_denies
+
+  def denies_of(env) do
+    Agent.get(__MODULE__, fn s ->
+      case get_in(s, [:envs, env]) do
+        nil -> @no_denies
+        %{denies: denies} -> denies
+      end
+    end)
+  end
+
+  @doc "The current process's deny set (empty when unbound)."
+  def denies, do: Process.get(@pdict_denies, @no_denies)
+
+  @doc """
+  Whether the CURRENT env denies a host call: `module` denies every fn of it,
+  `{module, fun}` denies that one fn.
+
+  The two shapes cannot collide — a bare module is never a 2-tuple — so one
+  set holds both without ambiguity, and arity never enters the question: a
+  denied fn is denied at every arity it has.
+  """
+  def denied?(module, fun \\ nil) do
+    set = denies()
+    MapSet.member?(set, module) or (not is_nil(fun) and MapSet.member?(set, {module, fun}))
+  end
+
+  @doc """
+  Whether the current env may call `module.fun` at all — the ONE question a
+  host-interop call site asks, and the only place denies and caps combine.
+
+  Denies are consulted first, unconditionally: a policy saying "not this one"
+  must not be answerable by a grant saying "everything".
+  """
+  def allowed?(module, fun), do: not denied?(module, fun) and caps_allowed?(module, op_of(module, fun))
+
+  @doc """
+  Why `module.fun` is not allowed here, in the terms of what refused it.
+
+  A policy deny and a missing grant are different mistakes: one is "this
+  environment says no to this fn", the other is "this environment holds no
+  grant for that module". A caller who cannot tell them apart goes looking for
+  a grant that is already there — and the deny, being the newer idea, is the
+  one nobody expects. One implementation, so the compiler's gate and the
+  runtime's gate cannot drift apart in wording or in judgement.
+  """
+  def refusal(module, fun) do
+    if denied?(module, fun) do
+      "#{module_label(module)}.#{fun} is denied in this environment by policy"
+    else
+      "module #{module_label(module)} is not granted in this environment"
+    end
+  end
+
+  # `File`, not `Elixir.File` — the name the author wrote.
+  defp module_label(module), do: inspect(module)
 
   defp restore_pdict(key, nil), do: Process.delete(key)
   defp restore_pdict(key, value), do: Process.put(key, value)

@@ -14,20 +14,29 @@ defmodule BeamLisp.Daemon.Executor do
     1. installs a per-request group-leader proxy (BeamLisp.Daemon.IO) so the
        program's stdout/stdin become wire frames,
     2. binds the CLIENT's roots (`Loader.with_ambient_dirs`) and program argv
-       (`BeamLisp.with_argv`) and a fresh forked env (`Env.isolated`),
+       (`BeamLisp.with_argv`) and a fresh forked env (`Env.restricted`, which
+       denies the fns that would end the VM),
     3. calls the language entry `bl.daemon/handle` with the raw argv + cwd,
     4. maps the returned exit code (or a caught fault → 1) to an `:exit` /
        `:failed` terminal frame ordered AFTER the last output.
 
-  `System.halt` inside a program is NOT trappable and kills the whole daemon;
-  that is the same trust level as a standalone run and is documented, not
-  worked around. A client that loses the socket mid-request gets "unknown
-  outcome"; the executor never replays.
+  `System.halt` inside a program is NOT trappable — it is a BIF, and no rescue
+  sees it — so the request env DENIES it, along with `System.stop`,
+  `:erlang.halt` and `:init.stop`. A program that ends the VM would end every
+  other request's warmth, and one command is not the trust level of a daemon
+  that serves a session. The refusal lands at the gate, so the client reads a
+  compile error naming the fn instead of a lost connection. A client that loses
+  the socket mid-request gets "unknown outcome"; the executor never replays.
   """
 
   use GenServer
 
   alias BeamLisp.Daemon.{IO, Protocol}
+
+  # Host fns that end the VM. `:erlang.halt/1` is a BIF — nothing in the VM can
+  # catch it — and the others are its friends. A plain script's last line must
+  # not take the daemon with it, so a request env denies the whole family.
+  @vm_enders [{System, :halt}, {System, :stop}, {:erlang, :halt}, {:init, :stop}]
 
   # --- public API ---
 
@@ -144,7 +153,7 @@ defmodule BeamLisp.Daemon.Executor do
 
     code =
       try do
-        BeamLisp.Env.isolated(:global, fn ->
+        BeamLisp.Env.restricted(@vm_enders, fn ->
           BeamLisp.Loader.with_ambient_dirs(ambient_dirs(req), fn ->
             # The program argv (post-`--`) is bound by `bl.cli/cmd-run` from the
             # parsed `:dd`; the handler owns that. Here we only fix the roots
@@ -170,7 +179,20 @@ defmodule BeamLisp.Daemon.Executor do
       end
 
     # order the terminal frame after the last output flush
-    _final_seq = IO.finish(proxy)
+    final_seq = IO.finish(proxy)
+
+    # A failure that said nothing is the shape a client cannot explain: it saw no
+    # output and a bare exit. The daemon was the group leader, so it KNOWS
+    # whether anything was written — it counts the frames it forwarded — and can
+    # say so itself instead of leaving the after-the-fact guess to the client.
+    # (The client-side half of this is in `tooling/drop/src/daemon.rs`.)
+    if is_integer(code) and code != 0 and final_seq == 0 do
+      _ =
+        :gen_tcp.send(
+          sock,
+          Protocol.stderr(id, 999_998, "bl: the command exited #{code} without writing anything\n")
+        )
+    end
 
     frame = if is_integer(code), do: Protocol.exit(id, code), else: Protocol.exit(id, 0)
     _ = :gen_tcp.send(sock, frame)
