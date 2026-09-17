@@ -1,0 +1,93 @@
+(ns k10
+  "K10 — can a RUNNING bl service have its behaviour edited under it, with its socket and its state
+  kept, and a broken edit refused?
+
+  The shape is the gateway's, shrunk to its essentials: a listener the harness owns, and a namespace
+  that decides what a request answers. The namespace is edited ON DISK while the service runs; the
+  harness notices, stages and commits — the same three calls the dev watcher makes.
+
+  Drive it from outside:
+    curl -s 127.0.0.1:7791/            -> what svc/greeting says right now
+    echo ... > /tmp/k10/svc.bl         -> an edit, applied live (or held, if incoherent)"
+  (:require [bl.util :as u] [reload] [env]))
+
+(defn tup [xs] (erlang/list_to_tuple xs))
+(def ^:private Gen (erlang/binary_to_atom "gen_tcp"))
+
+(def FILE "/tmp/k10/svc.bl")
+
+(def V1 "(ns svc)\n(def hits (atom 0))\n(defn touch [] (swap! hits (fn [n] (+ n 1))))\n(defn greeting [] \"v1\")\n")
+
+(defn ev
+  "Reach the reloaded namespace at RUNTIME — a pre-compiled file cannot name a var that does not
+  exist until the reload creates it."
+  [expr]
+  (env/eval expr))
+
+(defn write! [s] (File/write! FILE s) s)
+
+(defn apply-edit
+  "Stage + commit one source. Returns the commit result map (its :status is :applied or :held)."
+  [src]
+  (reload/stage src)
+  (reload/commit))
+
+(defn xsend [s d] (gen_tcp/send s d))
+(defn xclose [s] (gen_tcp/close s))
+
+(defn read-head [s]
+  (let [r (gen_tcp/recv s 0 5000)]
+    (if (and (tuple? r) (= :ok (erlang/element 1 r))) (erlang/element 2 r) nil)))
+
+(defn handle [s]
+  (let [_ (read-head s)
+        body (str "svc says: " (pr-str (ev "(svc/greeting)"))
+                  "  hits=" (pr-str (ev "(deref svc/hits)"))
+                  "  pid=" (erlang/list_to_integer (os/getpid)))
+        resp (str "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: " (count body)
+                  "\r\nconnection: close\r\n\r\n" body)]
+    (xsend s resp)
+    (xclose s)))
+
+(defn accept-loop [ls]
+  (let [ar (gen_tcp/accept ls 600000)]
+    (if (tuple? ar)
+      (do (spawn (fn [] (handle (erlang/element 2 ar))))
+          (accept-loop ls))
+      nil)))
+
+(defn watch
+  "The dev watcher, in ten lines: read the file, and when it changed, stage+commit it and say what
+  happened. A HELD bundle leaves the live image alone — that is the whole safety story."
+  [last]
+  (let [src (File/read! FILE)]
+    (if (= src last)
+      (do (Process/sleep 250) (recur last))
+      (let [before (ev "(svc/greeting)")
+            r (apply-edit src)]
+        (println (str "  edit seen: " (pr-str (:status r))
+                      "  errors=" (pr-str (:errors r))
+                      "  greeting was " (pr-str before) " now " (pr-str (ev "(svc/greeting)"))))
+        (Process/sleep 250)
+        (recur src)))))
+
+;; 1. the first load, through the same path an edit takes
+(File/mkdir_p "/tmp/k10")
+(write! V1)
+(reload/abort)
+(println "k10: first load ->" (pr-str (apply-edit V1)))
+(println "k10: greeting ->" (pr-str (ev "(svc/greeting)")))
+(println "k10: touch ->" (pr-str (ev "(svc/touch)")))
+(println "k10: touch again ->" (pr-str (ev "(svc/touch)")))
+(println "k10: hits (the var) ->" (pr-str (ev "svc/hits")))
+(println "k10: hits (deref) ->" (pr-str (ev "(deref svc/hits)")))
+
+;; 2. a listener the HARNESS owns — nothing in the reloaded namespace can re-create it
+(def lr (gen_tcp/listen 7791 (list :binary (tup (list :active false)) (tup (list :reuseaddr true))
+                                   (tup (list :ip (tup (list 127 0 0 1)))))))
+(println "k10: listening ->" (pr-str (erlang/element 1 lr)) "on 127.0.0.1:7791")
+(println "k10: watching" FILE)
+
+(spawn (fn [] (accept-loop (erlang/element 2 lr))))
+(spawn (fn [] (watch V1)))
+(Process/sleep :infinity)

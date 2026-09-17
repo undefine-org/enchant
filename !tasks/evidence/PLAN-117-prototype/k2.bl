@@ -1,0 +1,61 @@
+(ns k2
+  "K2 — per-SNI certificate selection, and whether a session can be resumed across names.
+
+  Two things at once, because the second needs the first: a multi-name TLS listener must pick the
+  leaf from the SNI (sni_fun), and if a resumed session could be carried from name A to name B on
+  that same listener, the gateway would be answering a name it never checked.
+
+  Run with `bl serve`; drive it with the openssl calls in the README."
+  (:require [bl.util :as u]))
+
+(defn tup [xs] (erlang/list_to_tuple xs))
+(def ^:private SSL (erlang/binary_to_atom "ssl"))
+
+(Application/ensure_all_started :ssl)
+(BeamLisp.Daemon.CA/ensure_started)
+
+(defn opts-of [name]
+  (to-list (erlang/element 2 (BeamLisp.Daemon.CA/ssl_opts name))))
+
+(defn pick [k o]
+  (some (fn [p] (if (= k (erlang/element 1 p)) p nil)) (to-list o)))
+
+;; The SNI callback: the gateway's "which leaf is this connection for" in four lines.
+(defn sni-opts [name]
+  (if (or (nil? name) (= name ""))
+    :undefined
+    (let [n (str name)
+          o (opts-of n)]
+      (println "  sni_fun asked for:" n)
+      (list (pick :cert o) (pick :key o)))))
+
+(def base (to-list (concat (opts-of "a.test")
+                           (list (tup (list :active false))
+                                 (tup (list :reuseaddr true))
+                                 (tup (list :sni_fun (fn [n] (sni-opts n))))))))
+
+(defn handle [s]
+  (let [hr (erlang/apply SSL :handshake (list s 15000))]
+    (println "  handshake ->" (pr-str (erlang/element 1 hr)))
+    (when (and (tuple? hr) (= :ok (erlang/element 1 hr)))
+      (let [h (erlang/element 2 hr)
+            rq (erlang/apply SSL :recv (list h 0 3000))
+            body "k2-ok"
+            resp (str "HTTP/1.1 200 OK\r\ncontent-length: " (count body)
+                      "\r\nconnection: close\r\n\r\n" body)]
+        (when (tuple? rq)
+          (erlang/apply SSL :send (list h resp)))
+        (erlang/apply SSL :close (list h))))))
+
+(defn accept-loop [ls]
+  (let [ar (erlang/apply SSL :transport_accept (list ls 600000))]
+    (if (tuple? ar)
+      (do (spawn (fn [] (handle (erlang/element 2 ar))))
+          (accept-loop ls))
+      (println "accept ended" (pr-str ar)))))
+
+(def lr (erlang/apply SSL :listen (list 7793 base)))
+(println "k2: listening ->" (pr-str (erlang/element 1 lr)) "  (names a.test, b.test)")
+(println "    session_tickets default, reuse_sessions default — see what the handshake does")
+(spawn (fn [] (accept-loop (erlang/element 2 lr))))
+(Process/sleep :infinity)

@@ -17,8 +17,17 @@ registry, the real CA and the real verbs.
 | `t1.bl` | FFI semantics: map literals → atom-keyed Erlang maps, `erlang/apply` splicing, `String/to_integer`, `String.split`/`rest`/`some`/`join`. |
 | `t5.bl` | the `[:safe]` probe: `Ports.list()` in a fresh VM vs one that has decoded a claim unsafely. |
 | `verb2.bl` | seeds the atoms, then runs the real `bl.ports/run` over the prototype registry (the render evidence). |
+
 | `app.log`, `gw.log` | the two daemons' startup lines, verbatim. |
 
+### The K-spikes (2026-09-17) — the three that de-risk D12
+
+| file | what it is | result |
+|------|------------|--------|
+| `k1.bl` | `ssl_config:handle_options/4` with the CA's own list, with an unknown option added, and `ssl:handshake` on a connected socket | unknown options are **accepted**; a *non-list* options argument raises `FunctionClauseError` — which is what `ssl:handshake` renames `{dtls_upgrade, notsup}` |
+| `k1b.bl` | the same, isolating the non-list case (`is_list` → false, exactly the first prototype's `concat` shape) | closes the loop: the lie is about the SHAPE of the argument, never the client |
+| `k2.bl` | a two-name TLS listener with `sni_fun` from bl; drive it with `openssl s_client -sess_out/-sess_in` | the right leaf follows the SNI; TLS 1.3 sends no ticket; TLS 1.2 resumes per name but **not across an SNI change** |
+| `k10.bl` | a live service: a listener the harness owns + a namespace on disk, staged and committed on every change | behaviour changes live (no restart); a broken edit is HELD with `{:kind :dangling, …}`; **namespace state does not survive** (`hits` 2 → 0) |
 ## How it was run (scratch runtime dir — the user's registry is never touched)
 
     mkdir -p /tmp/bl117/run
@@ -59,7 +68,8 @@ registry, the real CA and the real verbs.
 
 ## What it does NOT show (so the plan does not claim it)
 
-No TLS session-resumption test across two names; no load or concurrency measurement; no request
-bodies/POST; no PAC through a system proxy (only Chrome's `--proxy-pac-url`); no allocator (the
-gateway's port is a constant here); no route table (claims are read per request); and the CA wrote
-under the runtime dir, not the state dir.
+No load or concurrency measurement; no request bodies/POST; no PAC through a system proxy (only Chrome's
+`--proxy-pac-url`); no allocator (the gateway's port is a constant here); no route table (claims are read
+per request); no supervision (K10's service dies with an uncaught error in the program — a supervisor
+that restarts and NAMES what died is still unmeasured); and the CA wrote under the runtime dir, not the
+state dir. K2's TLS 1.2 result is per-name-only — see the plan for what that closed.

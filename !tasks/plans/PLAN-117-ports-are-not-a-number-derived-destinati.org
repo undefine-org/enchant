@@ -569,8 +569,8 @@ that restarts with a sentence) get built by making a real service rather than by
 
 | # | spike | the experiment | settles | state |
 |---|-------|----------------|---------|-------|
-| K1 | the failure sentence | force a bad option list into `ssl.handshake/2,3` and print what `ssl_config:handle_options/4` actually returned | what a failed CONNECT prints (F1: OTP's own message names the wrong thing) | open, small |
-| K2 | resumption across names | two names on one listener; `openssl s_client -sess_out` then `-sess_in` with a DIFFERENT SNI | whether `reuse_sessions` stays on for a multi-name listener — a resumption that skips the leaf check IS the cross-name leak | open |
+| K1 | the failure sentence | force a bad option list into `ssl.handshake/2,3` and print what `ssl_config:handle_options/4` actually returned | what a failed CONNECT prints (F1: OTP's own message names the wrong thing) | **settled 2026-09-17** — result below |
+| K2 | resumption across names | two names on one listener; `openssl s_client -sess_out` then `-sess_in` with a DIFFERENT SNI | whether `reuse_sessions` stays on for a multi-name listener — a resumption that skips the leaf check IS the cross-name leak | **settled 2026-09-17** — result below |
 | K3 | the pump under load | 200 sequential + 20 parallel requests across two names, plus one deliberately slow client; `:erlang.system_info(:process_count)` before/after | acceptor-pool size, per-connection timeouts, whether a stalled client can stall the listener (PLAN-116's S3) | open |
 | K4 | bodies | `curl -d` and a chunked upload through the proxy | whether the splice stays blind after the head, or the head reader must understand framing | open |
 | K5 | the allocator across OS processes | a bl daemon and a foreign server racing for the same name | the lease rule: a socket cannot cross an OS boundary, a unix path can — so which case needs a number at all | open |
@@ -578,7 +578,81 @@ that restarts with a sentence) get built by making a real service rather than by
 | K7 | the CA's lifecycle | mint root + two leaves, rotate the root, load again | the load-time rule (`pkix_path_validation`), and F3's two-names-then-the-first-again test | open |
 | K8 | the client half | PAC via `gsettings` and `user.js`; the root into `~/.pki/nssdb` and each Firefox `cert9.db`; `SSL_CERT_FILE` | the exact `bl proxy` surface, and what it prints vs runs | open |
 | K9 | the UI | add `:gateway` to `Inspect.model/1` and render it in the page, `/model` and `bl daemon status` against the live prototype | that the monitoring is ONE field in the existing model, not a second source the frontend has to fetch | open |
-| K10 | hot-reloading a running bl service | edit `gateway.bl.md` under a RUNNING gateway: the coherence gate must reject a broken edit and accept a good one, and the listener, the CA and the route table must survive | whether a bl daemon can be reloaded WITHOUT a restart, state kept — which is what makes the daemon port (FUP-082) cheap instead of a rewrite-per-change. It can flip D12 | open, and it is the first thing to run after I4 |
+| K10 | hot-reloading a running bl service | edit `gateway.bl.md` under a RUNNING gateway: the coherence gate must reject a broken edit and accept a good one, and the listener, the CA and the route table must survive | whether a bl daemon can be reloaded WITHOUT a restart, state kept — which is what makes the daemon port (FUP-082) cheap instead of a rewrite-per-change. It can flip D12 | **settled 2026-09-17, D12 STANDS** — result below |
+
+** Spike results (2026-09-17, the three that de-risk D12)
+
+Every one below is a program in `!tasks/evidence/PLAN-117-prototype/`, run with `./bin/bl` under a
+scratch `XDG_RUNTIME_DIR`.
+
+**K1 — the failure sentence. The lie has a shape, and it is not what F1 guessed.**
+
+`ssl_config:handle_options/4` **accepts an unknown option silently** (`{:ok, config}` for
+`{:frobnicate, true}` — measured, twice) and also accepts a nonsense value for a known one. What it
+raises `FunctionClauseError` on is an options argument that is **not an Erlang list** — which is exactly
+what the first prototype passed (`(concat (to-list …) (list …))` is a bl value, `is_list/1` → false).
+That raise is what `ssl:handshake`'s broad `catch error:{badmatch,_}` renames `{dtls_upgrade, notsup}`.
+
+So the sentence for I4 is decidable:
+
+- `{:error, {:dtls_upgrade, :notsup}}` → **never the client's fault**: print "the TLS options were not a
+  valid Erlang list (internal — check `is_list/1` at the FFI boundary)", because that is the only way to
+  reach it;
+- any other error → print the reason as given (`:timeout` = a peer that connected and said nothing);
+- and after a failed handshake the socket is unusable: close it, do not retry (measured — reusing it
+  returns `:error`).
+
+**K2 — per-SNI leaves work, and cross-name resumption does not happen.**
+
+`sni_fun` from bl picks the right leaf per connection (the harness minted `a.test` and `b.test`; with
+SNI `b.test`, `openssl` reports `subject=CN=…b.test`), so the gateway needs ONE listener for every name.
+On resumption, measured with `openssl s_client`:
+
+| case | observed |
+|------|----------|
+| TLS 1.3, `-sess_out` | `New` and **no ticket file written** — OTP defaults `session_tickets: :disabled`, so there is nothing to resume |
+| TLS 1.2, same name, `-sess_in` | `Reused` — server-side resumption is live with `reuse_sessions: true` |
+| TLS 1.2, session from `a.test`, asking for `b.test` | **`New`** — not carried across an SNI change |
+
+∴ the cross-name leak this plan's risk list worried about is **measured closed on this stack**: TLS 1.3
+has no tickets at all, and a TLS 1.2 session is not resumed under a different name. `reuse_sessions`
+stays on.
+
+**K10 — a running bl service can be edited under it, with the gate refusing a broken edit.**
+
+One OS process (pid 398381 throughout), a listener the harness owns, and a namespace on disk:
+
+```
+GET /                      -> svc says: v1  hits=2
+# edit: greeting v1 -> "v2-EDITED-LIVE"
+GET /                      -> svc says: v2-EDITED-LIVE  hits=0
+# edit: greeting calls (no-such-helper)
+GET /                      -> svc says: v2-EDITED-LIVE  hits=0
+
+watcher log:
+  edit seen: :applied  errors=[]  greeting was v1 now v2-EDITED-LIVE
+  edit seen: :held  errors=[{:msg "undefined var: svc/no-such-helper — nothing in the bundle or image
+                            defines it", :var "no-such-helper", :kind :dangling, :ns "svc"}]
+```
+
+Three answers, and one new REQUIREMENT:
+
+1. **behaviour changes live, no restart, no build step** — `reload/stage` + `reload/commit`, the source
+   read fresh (ALWAYS-LATEST);
+2. **a broken edit is HELD with a named reason** and the old code keeps serving — the coherence gate is
+   real and its report is already a sentence a service can print;
+3. **namespace state does NOT survive**: `hits` went **2 → 0**. A namespace reload is a whole-namespace
+   replacement, so anything a daemon must keep across an edit (the listener, the CA, the route table,
+   the session's own state) has to live OUTSIDE the namespace being reloaded — a separate process, ETS,
+   or a registry — and the reload must say so. This is not a blocker; it is the shape the daemon's
+   supervision tree has to take anyway, and it is now measured rather than assumed.
+
+Incidental, worth not repeating: bl has **no `@` reader macro** (`(deref x)`, as the reload sources use)
+— `@(x)` fails as `cannot call %BeamLisp.Atom{} — a reference is not a function`; and an exception in a
+connection handler is logged with a full stack while the rest of the service keeps running.
+
+** D12 stands**: the wedge holds. What K10 does NOT cover, and what the daemon stages still owe, is
+supervision — a crashed or replaced namespace restarting under a supervisor that names what died.
 
 ** The implementation, in the order it lands
 
