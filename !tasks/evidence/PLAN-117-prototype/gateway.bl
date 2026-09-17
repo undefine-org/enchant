@@ -1,0 +1,207 @@
+(ns gateway
+  (:require [bl.util :as u]))
+
+(defn tup [xs] (erlang/list_to_tuple xs))
+(def ^:private Gen (erlang/binary_to_atom "gen_tcp"))
+(def ^:private SSL (erlang/binary_to_atom "ssl"))
+(def ^:private Maps (erlang/binary_to_atom "maps"))
+(def ^:private Ports (erlang/binary_to_atom "Elixir.BeamLisp.Daemon.Ports"))
+(def ^:private Paths (erlang/binary_to_atom "Elixir.BeamLisp.Daemon.Paths"))
+
+(Application/ensure_all_started :ssl)
+(BeamLisp.Daemon.CA/ensure_started)
+
+(def PORT (String/to_integer (or (System/get_env "GW_PORT") "7788")))
+(def ^:private RUN (erlang/element 2 (erlang/apply Paths :runtime_dir (list))))
+(def CA (str RUN "/ca"))
+
+(defn mget [k m d] (erlang/apply Maps :get (list k m d)))
+
+;; ── the registry IS the routing table: a claim carries the hosts it answers to
+(defn claim-for [host] (erlang/apply Ports :holder_of_host (list host)))
+
+;; ── one algorithm, two transports (passive sockets, so any process may use them)
+(defn xrecv [tls s]
+  (if tls (erlang/apply SSL :recv (list s 0 600000)) (gen_tcp/recv s 0 600000)))
+(defn xsend [tls s d]
+  (if tls (erlang/apply SSL :send (list s d)) (gen_tcp/send s d)))
+(defn xclose [tls s]
+  (if tls (erlang/apply SSL :close (list s)) (gen_tcp/close s)))
+
+(defn read-head [tls s]
+  (loop [acc ""]
+    (if (String/contains? acc "\r\n\r\n")
+      acc
+      (let [r (xrecv tls s)]
+        (if (and (tuple? r) (= :ok (erlang/element 1 r)))
+          (recur (str acc (erlang/element 2 r)))
+          nil)))))
+
+(defn pump [t-in s-in t-out s-out]
+  (loop []
+    (let [r (xrecv t-in s-in)]
+      (if (and (tuple? r) (= :ok (erlang/element 1 r)))
+        (do (xsend t-out s-out (erlang/element 2 r)) (recur))
+        nil))))
+
+(defn header [head key]
+  (let [ls (rest (String/split head "\r\n"))
+        k (str key ":")]
+    (some (fn [l]
+            (if (String/starts_with? (String/downcase l) k)
+              (String/trim (subs l (count k) (count l)))
+              nil))
+          ls)))
+
+(defn split-req [head] (String/split (first (String/split head "\r\n")) " "))
+
+(defn path-of [url]
+  (if (String/starts_with? url "http://")
+    (let [u2 (subs url 7 (count url))
+          ix (index-of u2 "/")]
+      (if (nil? ix) "/" (subs u2 ix (count u2))))
+    url))
+
+(defn authority-of [url]
+  (let [u2 (subs url 7 (count url))
+        ix (index-of u2 "/")]
+    (if (nil? ix) u2 (subs u2 0 ix))))
+
+(defn normalize [head method path]
+  (let [ls (rest (String/split head "\r\n"))
+        keep (filter (fn [l]
+                       (let [ll (String/downcase l)]
+                         (and (not (String/starts_with? ll "proxy-connection:"))
+                              (not (String/starts_with? ll "connection:"))
+                              (not (= l "")))))
+                     ls)]
+    (str method " " path " HTTP/1.1\r\n"
+         (join "\r\n" keep)
+         "\r\nconnection: close\r\n\r\n")))
+
+(defn connect-dest [dest]
+  (let [kind (erlang/element 1 dest)]
+    (if (= kind :unix)
+      (let [r (gen_tcp/connect (tup (list :local (erlang/element 2 dest))) 0
+                (list :binary (tup (list :active false)) (tup (list :packet :raw))))]
+        (if (tuple? r) (erlang/element 2 r) nil))
+      (let [r (gen_tcp/connect (tup (list 127 0 0 1)) (erlang/element 2 dest)
+                (list :binary (tup (list :active false))))]
+        (if (tuple? r) (erlang/element 2 r) nil)))))
+
+(defn body-of [tls s status ct body]
+  (xsend tls s (str "HTTP/1.1 " status "\r\ncontent-type: " ct
+                    "\r\ncontent-length: " (count body)
+                    "\r\nconnection: close\r\n\r\n" body)))
+
+(defn refusal [host]
+  (str "no claim holds \"" host "\" — nothing on this machine answers to that name.\n"
+       "run `bl ports` to see the names that are live.\n"))
+
+(defn ca-opts [host]
+  (to-list (concat (to-list (erlang/element 2 (BeamLisp.Daemon.CA/ssl_opts host)))
+                   (list (tup (list :active false))))))
+
+(defn splice [tls s claim path method head]
+  (let [dest (mget :dest claim :none)]
+    (if (= dest :none)
+      (body-of tls s "502 Bad Gateway" "text/plain" "the claim carries a TCP port, no destination\n")
+      (let [up (connect-dest dest)]
+        (if (nil? up)
+          (body-of tls s "502 Bad Gateway" "text/plain" "cannot reach the destination\n")
+          (do
+            (xsend false up (normalize head method path))
+            (spawn (fn [] (pump tls s false up)))
+            (pump false up tls s)
+            (xclose false up)
+            (xclose tls s)))))))
+
+(defn pac []
+  (str "function FindProxyForURL(url, host) {\n"
+       "  if (shExpMatch(host, \"*.test\") || shExpMatch(host, \"*.localhost\")) {\n"
+       "    return \"PROXY 127.0.0.1:" PORT "\";\n"
+       "  }\n"
+       "  return \"DIRECT\";\n"
+       "}\n"))
+
+(defn index []
+  (let [cs (erlang/apply Ports :list (list))]
+    (str "<h1>bl gateway</h1>"
+         "<p>proxy 127.0.0.1:" PORT " · ca " CA " · port 80: not used, not reserved</p>"
+         "<p><a href=\"/bl.pac\">/bl.pac</a> · <a href=\"/bl-ca.crt\">/bl-ca.crt</a> · one leaf per live name</p>"
+         "<table border=1 cellpadding=4><tr><th>name (a claim)</th><th>destination</th><th>owner</th></tr>"
+         (join "" (map (fn [c]
+                         (str "<tr><td>" (join ", " (mget :hosts c (list)))
+                              "</td><td>" (pr-str (mget :dest c :tcp))
+                              "</td><td>pid " (mget :pid c 0) "</td></tr>"))
+                       cs))
+         "</table>")))
+
+(defn route-plain [s head method target host]
+  (let [claim (claim-for host)]
+    (if (nil? claim)
+      (do (xsend false s (str "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: "
+                              (count (refusal host)) "\r\nconnection: close\r\n\r\n" (refusal host)))
+          (xclose false s))
+      (splice false s claim (path-of target) method head))))
+
+(defn handle-connect [s authority]
+  (let [host (first (String/split authority ":"))
+        claim (claim-for host)]
+    (if (nil? claim)
+      (do (xsend false s (str "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: "
+                              (count (refusal host)) "\r\nconnection: close\r\n\r\n" (refusal host)))
+          (xclose false s))
+      (do
+        (xsend false s "HTTP/1.1 200 Connection Established\r\n\r\n")
+        (let [hr (erlang/apply SSL :handshake (list s (ca-opts host) 15000))]
+          (if (and (tuple? hr) (= :ok (erlang/element 1 hr)))
+            (let [h (erlang/element 2 hr)
+                  h2 (read-head true h)]
+              (if (nil? h2)
+                (xclose true h)
+                (let [parts (split-req h2)
+                      method (first parts)
+                      target (second parts)
+                      hosthdr (or (header h2 "host") host)]
+                  (println (str "connect: " host " -> " (pr-str (mget :dest claim :tcp)) "  " method " " target))
+                  (splice true h claim (path-of target) method h2))))
+            (do (println (str "connect: TLS handshake for " host " failed -> " (pr-str hr)))
+                (xclose false s))))))))
+
+(defn handle [s]
+  (let [head (read-head false s)]
+    (if (nil? head)
+      (xclose false s)
+      (let [parts (split-req head)
+            method (first parts)
+            target (second parts)
+            hosthdr (header head "host")]
+        (if (= method "CONNECT")
+          (handle-connect s target)
+          (cond
+            (= target "/bl.pac") (body-of false s "200 OK" "application/x-ns-proxy-autoconfig" (pac))
+            (= target "/bl-ca.crt") (body-of false s "200 OK" "application/x-x509-ca-cert" (File/read! (str CA "/root.pem")))
+            (= hosthdr (str "127.0.0.1:" PORT)) (body-of false s "200 OK" "text/html" (index))
+            :else (let [host (if (String/starts_with? target "http://") (authority-of target) (or hosthdr ""))]
+                    (route-plain s head method target host))))))))
+
+(defn accept-loop [ls]
+  (let [ar (gen_tcp/accept ls 600000)]
+    (if (tuple? ar)
+      (let [s (erlang/element 2 ar)
+            p (spawn (fn [] (receive [:go sock] (handle sock))))]
+        (erlang/apply Gen :controlling_process (list s p))
+        (erlang/send p [:go s])
+        (accept-loop ls))
+      nil)))
+
+(def lsr (gen_tcp/listen PORT (list :binary (tup (list :active false))
+                                    (tup (list :reuseaddr true))
+                                    (tup (list :ip (tup (list 127 0 0 1)))))))
+(println (str "bl gateway: proxy 127.0.0.1:" PORT " · ca " CA))
+(println (str "            port 80: not bound, not reserved, not needed"))
+(println (str "            pac  http://127.0.0.1:" PORT "/bl.pac   root http://127.0.0.1:" PORT "/bl-ca.crt"))
+(println (str "            listen -> " (pr-str (erlang/element 1 lsr))))
+(spawn (fn [] (accept-loop (erlang/element 2 lsr))))
+(Process/sleep :infinity)
