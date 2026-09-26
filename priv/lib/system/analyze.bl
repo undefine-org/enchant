@@ -9,7 +9,9 @@
 ; caller's footprint now includes its callees' footprints; a caller's return
 ; type flows from its callees' returns; a higher-order call is resolved through
 ; the flow facts (0-CFA) so a function reached only through a parameter is still
-; in the graph.
+; in the graph. A multi-clause fn — same-arity alternatives or arity variants —
+; is summarized over the UNION of its clauses: footprint, calls and returns
+; join, and one clause's opacity makes the whole fn opaque (fail-closed).
 ;
 ; ── Why a fixpoint ──────────────────────────────────────────────────────
 ;
@@ -30,6 +32,7 @@
 (ns system.analyze
   (:require [system.ir :as ir]
             [system.summary :as summary]
+            [system.footprint :as fp]
             [compiler :as c]
             [typed]))
 
@@ -58,21 +61,38 @@
    they have no place in the synthetic function's body."
   #{"ns" "require" "defn" "defn-"})
 
-(defn- peeled-clause
-  "The clause a compiled `(fn …)` carries — the self scaffold's inner fn, or
-   the scaffold in the VARIADIC slot of the `$blfn` dispatch tuple a
-   `& rest`-clause fn compiles to. nil when it is neither shape."
+(defn- scaffold-clauses
+  "Every clause body the self scaffold `n` carries. The scaffold's inner fn
+   holds one clause per same-arity spelling, so a same-arity `[x]`/`[y]`
+   clause pair compiled through ONE scaffold yields BOTH of them, not just
+   the first."
+  [n]
+  (:clauses (ir/scaffold-inner n)))
+
+(defn- peeled-clauses
+  "Every clause a compiled `(fn …)` carries — the self scaffold's inner fn, or
+   EVERY scaffold in the `$blfn` dispatch tuple a multi-ARITY (or `& rest`)
+   clause set compiles to. nil when it is neither shape.
+
+   `{:op :tuple :elems (:lit :$blfn) ARITY-MAP VARIADIC}`:
+     ARITY-MAP is a `:map` of `{arity-lit → self-scaffold}` for each fixed
+     arity; VARIADIC is a `(:lit :val n)`-headed `:tuple` `{min SCAFFOLD}` when
+     the fn has a `& rest` clause, `(:lit :val nil)` when it has none. We union
+     the clauses of every scaffold found in either slot."
   [compiled]
   (cond
     (ir/self-scaffold? compiled)
-      (first (:clauses (ir/scaffold-inner compiled)))
+      (scaffold-clauses compiled)
     (and (= :tuple (:op compiled))
          (= (erlang/binary_to_atom "$blfn") (:val (first (:elems compiled)))))
-      ; {:"$blfn" arity-map {min SCAFFOLD}} — the scaffold is the variadic
-      ; slot's second element, and `(a/lit nil)` when there is no variadic
-      (let [scaffold (last (:elems (last (:elems compiled))))]
-        (when (and (ir/node? scaffold) (ir/self-scaffold? scaffold))
-          (first (:clauses (ir/scaffold-inner scaffold)))))))
+      (let [arity-map (second (:elems compiled))
+            variadic  (last (:elems compiled))
+            fixed     (mapcat (fn [pair] (scaffold-clauses (second pair)))
+                              (:pairs arity-map))
+            var-scaffold (when (= :tuple (:op variadic)) (second (:elems variadic)))
+            var-clauses  (when (and (ir/node? var-scaffold) (ir/self-scaffold? var-scaffold))
+                           (scaffold-clauses var-scaffold))]
+        (concat fixed var-clauses))))
 
 (defn- top-level-body
   "{:params [] :body anf} for the file's top-level NON-declaration forms,
@@ -92,15 +112,17 @@
                                                (typed/->tuple [:vector '()]))
                                          code))])
               compiled (c/compile-node fn-form (c/new-env "an-<top>"))
-              clause (peeled-clause compiled)]
+              clause (first (peeled-clauses compiled))]
           {:params [] :body (:body clause)})
         (catch _e nil)))))
 
 (defn fn-bodies
-  "{name → {:params [names] :body anf}} for every single-clause defn/defn- in
-   src, plus `<top>` for the top-level forms outside any defn. Multi-clause
-   and higher-arity are summarized on their last clause body (the spike scope;
-   a production pass unions all clauses)."
+  "{name → {:params [names] :body anf :clauses [{:params :body} …]}} for every
+   defn/defn- in src, plus `<top>` for the top-level forms outside any defn.
+   :params/:body hold the FIRST clause. :clauses holds EVERY clause — an
+   arity-variant defn or a same-arity multi-clause defn is analyzed over its
+   whole clause set, not one clause. A single-clause defn's :clauses is a
+   one-entry vector, so its params/body are exactly what they always were."
   [src]
   (let [forms (BeamLisp.Reader/read_string src)
         defns (reduce
@@ -109,33 +131,40 @@
         (let [items (typed/node-items (typed/node-form form))
               name (typed/node-name (typed/node-form (second items)))
               parsed (nth (typed/defn-clauses items) 2)
-              c0 (first parsed)
-              params (:params c0)
-              body-forms (:body c0)
-              ; compile a (fn [params] body…) and peel to the clause body
+              ; compile a (fn CLAUSE…) carrying EVERY clause and peel them all.
+              ; :node is the clause's OWN list node, so its guard and body ride
+              ; through unchanged.
               fn-form (typed/->tuple
                         [:list (apply list
-                          (concat (list (typed/sym-node "fn")
-                                        (typed/->tuple [:vector (apply list params)]))
-                                  body-forms))])
+                          (concat (list (typed/sym-node "fn"))
+                                  (map :node parsed)))])
               compiled (c/compile-node fn-form (c/new-env (str "an-" name)))
-              ; a fn compiles to the self scaffold; its inner fn is the clause-bearer
-              clause (peeled-clause compiled)]
+              clauses (peeled-clauses compiled)]
           ;; A peel miss used to store {:params nil :body nil} and say nothing:
           ;; every analysis over that fn then agreed with every other, and a
           ;; checker reading the body found no constructors at all — an empty
           ;; answer that LOOKS like "no violation" (BUG-054). The peel either
           ;; works or the analysis is meaningless, so say which defn failed.
-          (when (or (nil? clause) (nil? (:body clause)))
+          (when (or (empty? clauses) (some (fn [cl] (nil? (:body cl))) clauses))
             (throw (ex-info (str "system.analyze: " name " did not peel to a fn clause — "
                                  "the compiled scaffold carries no clause body, so params/body "
                                  "would be stored as nil and the analysis over it vacuous")
                             {:fn name :compiled (ir/op compiled)})))
-          (assoc m name {:params (map :name (:pats clause)) :body (:body clause)}))
+          (let [cs (map (fn [cl] {:params (map :name (:pats cl)) :body (:body cl)}) clauses)
+                cs (into [] cs)]
+            (assoc m name {:params (:params (first cs)) :body (:body (first cs))
+                           :clauses cs})))
         m))
     {} forms)
         top (top-level-body forms)]
     (if (nil? top) defns (assoc defns top-name top))))
+
+(defn- clauses-of
+  "Every clause of defn entry `d`, in the order the compiler emitted them.
+   `:clauses` is the canonical multi-clause rep; a bare `{:params :body}`
+   (the `<top>` synthetic fn, or a hand-built entry) is a singleton."
+  [d]
+  (or (:clauses d) [{:params (:params d) :body (:body d)}]))
 
 ; ── flow facts: which functions can reach each variable (0-CFA) ──────────
 ;
@@ -168,18 +197,22 @@
             f1 (reduce (fn [fl a] (flow-step defns fl fname a)) flow actuals)
             targets (atom-fns defns f1 callee)]
         (reduce (fn [fl g]
-                  (let [gdef (get defns g)
-                        params (:params gdef)]
-                    (reduce (fn [ff [p a]]
-                              (let [av (atom-fns defns ff a)]
-                                (if (empty? av) ff (assoc ff p (into (get ff p #{}) av)))))
-                            fl (map (fn [p a] [p a]) params actuals))))
+                  (let [gdef (get defns g)]
+                    (reduce (fn [ff cl]
+                              (reduce (fn [ff2 [p a]]
+                                        (let [av (atom-fns defns ff2 a)]
+                                          (if (empty? av) ff2 (assoc ff2 p (into (get ff2 p #{}) av)))))
+                                      ff (map (fn [p a] [p a]) (:params cl) actuals)))
+                            fl (clauses-of gdef))))
                 f1 (into [] targets)))
     :else (reduce (fn [fl ch] (flow-step defns fl fname ch)) flow (ir/child-nodes node))))
 
 (defn- flow-facts [defns]
   (loop [flow {} n 0]
-    (let [next (reduce (fn [fl [fname d]] (flow-step defns fl fname (:body d))) flow (into [] defns))]
+    (let [next (reduce (fn [fl [fname d]]
+                         (reduce (fn [fl2 b] (flow-step defns fl2 fname b))
+                                 fl (map :body (clauses-of d))))
+                       flow (into [] defns))]
       (if (or (= next flow) (> n 8)) next (recur next (inc n))))))
 
 ; ── the summary fixpoint ─────────────────────────────────────────────────
@@ -196,9 +229,129 @@
     (and (BeamLisp.Ns.Rt/vector? k) (= :flow (first k))) (get flow (second k) #{})
     :else #{}))
 
+(defn- merge-summaries
+  "The summary of a multi-clause fn: the UNION over its clauses. Footprints
+   join (each resource keeps its strongest mode; a clause that is opaque makes
+   the whole fn opaque), returns and calls union, and the fn terminates only
+   when EVERY clause does. Fails closed: one clause's opacity survives."
+  [ss]
+  {:footprint  (reduce (fn [m s] (fp/join-fp m (:footprint s))) {} ss)
+   :terminates (reduce (fn [a s] (and a (:terminates s))) true ss)
+   :returns    (reduce (fn [ts s] (into ts (:returns s))) #{} ss)
+   :calls      (reduce (fn [cs s] (into cs (:calls s))) #{} ss)})
+
+(defn- summarize-defn
+  "`summary/summarize` closed over EVERY clause of entry `d`, then merged."
+  [known fp-resolve d]
+  (merge-summaries (map (fn [cl] (summary/summarize known fp-resolve (:body cl)))
+                        (clauses-of d))))
+
+(defn- bound-top-names
+  "Every name ANY top-level form of `src` binds with a def-like head — `defn`,
+   `defn-`, `def`, `defmacro`, `defonce`, `declare`… — i.e. every head starting
+   with `def` or `declare`, plus every name a `declare` lists. A core value
+   name in this set is shadowed by the program, so its purity is NOT the
+   core table's to claim."
+  [src]
+  (reduce
+    (fn [acc form]
+      (let [f (typed/node-form form)
+            its (if (= :list (typed/node-tag f)) (typed/node-items f) nil)
+            head (headname form)]
+        (if (and (some? head) (or (String/starts_with? head "def") (= head "declare")))
+          (into acc (keep (fn [n] (let [nf (typed/node-form n)]
+                                    (when (= :symbol (typed/node-tag nf)) (typed/node-name nf))))
+                          (if (= head "declare") (rest its) (take 1 (rest its)))))
+          acc)))
+    #{} (BeamLisp.Reader/read_string src)))
+
+(defn- core-pure-resolver
+  "The program-aware half of the core purity table: a first-order core value
+   name the program never binds resolves to `{}`; anything else is `:unknown`."
+  [shadowed]
+  (fn [name]
+    (if (and (contains? fp/pure-value-globals name) (not (contains? shadowed name)))
+      {}
+      :unknown)))
+
+; ── latent effects: what a function's VALUES do when they are called ─────────
+;
+; `:footprint` defers a `fn` literal (creating a closure does nothing) and
+; treats a call of a computed value as a value op. Both are right for what a
+; function DOES — and blind to what a function value it HANDS OUT will do. So
+; `(mapv (fn [x] (println x)) xs)` has footprint {} although printing happens.
+;
+; `:latent` closes that gap under a CLOSED-WORLD rule: every function value a
+; program can call was created somewhere in the program — a `fn` literal, a
+; reference to a named function, or a host function reference — or is data
+; (a keyword, map, vector or set, whose call is a pure lookup). Its effect is
+; charged to the function that CREATES or NAMES it:
+;
+;   a `fn` literal             its body's footprint (named calls resolved)
+;   a named function as value  that function's footprint and latent
+;   an unknown global as value opaque, unless an unshadowed pure core value
+;   a host function reference  opaque
+;   a call of a named function that function's latent (it may return a value)
+;
+; So a function whose `:latent` is {} can neither perform an effect itself
+; (`:footprint`) nor pass one on. A value supplied from OUTSIDE the program —
+; an entry point's argument — is its supplier's responsibility.
+
+(defn- latent-walk
+  "The latent footprint contributed by ANF node `n`. `fp-resolve` maps a name
+   to its footprint and `lat-of` a PROGRAM function to its latent; both answer
+   :unknown for what they cannot vouch for."
+  [fp-resolve lat-of n]
+  (let [value-fp (fn [name]
+                   (let [f (fp-resolve name) l (lat-of name)]
+                     (cond
+                       (= f :unknown) {fp/opaque-world :W}
+                       ; not a program function, yet resolved: an unshadowed
+                       ; FIRST-ORDER core value — it returns no function
+                       (= l :unknown) f
+                       :else (fp/join-fp f l))))
+        walk-all (fn [nodes] (reduce (fn [m c] (fp/join-fp m (latent-walk fp-resolve lat-of c))) {} nodes))]
+    (cond
+      (not (ir/node? n)) {}
+      (ir/anf-loop? n)
+        (let [{:keys [body inits]} (ir/loop-parts n)]
+          (fp/join-fp (walk-all inits) (latent-walk fp-resolve lat-of body)))
+      (ir/recur? n) (walk-all (ir/recur-vals n))
+      (ir/self-scaffold? n)
+        (let [inner (ir/scaffold-inner n)]
+          (fp/join-fp (fp/fp-fn-body fp-resolve inner)
+                      (walk-all (map :body (:clauses inner)))))
+      ; any other fn node is a value too: charge its body, fail toward more
+      (= :fn (:op n)) (fp/join-fp (fp/fp-fn-body fp-resolve n) (walk-all (ir/child-nodes n)))
+      (= :global (:op n)) (value-fp (:name n))
+      (and (= :remote (:op n)) (= (:mod n) rt) (= (:fun n) :invoke) (= :global (:op (first (:args n)))))
+        (let [l (lat-of (:name (first (:args n))))]
+          (fp/join-fp (if (= l :unknown) {} l) (walk-all (rest (:args n)))))
+      (and (= :remote (:op n)) (= (:mod n) rt) (= (:fun n) :remote_fun)) {fp/opaque-world :W}
+      :else (walk-all (ir/child-nodes n)))))
+
+(defn- latent-table
+  "{name → latent footprint} for every function, a monotone fixpoint over the
+   call graph. Fails closed: a table that has not converged by the round cap
+   is opaque everywhere."
+  [defns fp-resolve]
+  (let [names (into [] (map first defns))]
+    (loop [lat {} n 0]
+      (let [lat-of (fn [name] (if (contains? defns name) (get lat name {}) :unknown))
+            next (reduce (fn [m [name d]]
+                           (assoc m name (reduce (fn [acc cl] (fp/join-fp acc (latent-walk fp-resolve lat-of (:body cl))))
+                                                 {} (clauses-of d))))
+                         {} (into [] defns))]
+        (cond
+          (= next lat) lat
+          (> n 64) (reduce (fn [m name] (assoc m name {fp/opaque-world :W})) {} names)
+          :else (recur next (inc n)))))))
+
 (defn analyze
   "Whole-program summaries: {fn-name → {:footprint :terminates :returns :calls
-   :edges}} with inter-procedural closure. `src` is source text.
+   :edges :latent}} with inter-procedural closure. `:latent` is the footprint
+   of every function value the function creates, names or receives from a
+   callee (see `latent-walk`). `src` is source text.
 
    Each round recomputes every function's summary with two tables from the
    PREVIOUS round substituted: `returns` (callee return tagsets) and `fps`
@@ -209,25 +362,43 @@
   [src]
   (let [defns (fn-bodies src)
         flow (flow-facts defns)
-        names (into [] (map first defns))]
+        names (into [] (map first defns))
+        core (core-pure-resolver (bound-top-names src))]
     (loop [returns {} fps {} n 0]
       ; a footprint resolver over the PREVIOUS round's fps: a resolved user call
-      ; contributes its callee's known footprint; an unresolved one stays opaque.
+      ; contributes its callee's known footprint; an unshadowed first-order core
+      ; value is pure; anything else stays opaque.
+      ; A PROGRAM function starts at bottom ({}), so recursion converges to
+      ; the LEAST fixpoint — the effects the recursion really has — instead
+      ; of being stuck at opaque by its own first-round guess.
       (let [fp-resolve (fn [callee-name]
-                         (if (contains? fps callee-name) (get fps callee-name) :unknown))
+                         (cond (contains? fps callee-name) (get fps callee-name)
+                               (contains? defns callee-name) {}
+                               :else (core callee-name)))
             locals (reduce (fn [m [name d]]
-                             (assoc m name (summary/summarize returns fp-resolve (:body d))))
+                             (assoc m name (summarize-defn returns fp-resolve d)))
                            {} (into [] defns))
             returns2 (reduce (fn [m name] (assoc m name (:returns (get locals name)))) {} names)
             fps2 (reduce (fn [m name] (assoc m name (:footprint (get locals name)))) {} names)]
         (if (or (and (= returns2 returns) (= fps2 fps)) (> n 12))
-          ; final table: local summary + resolved call edges
-          (reduce (fn [m name]
-                    (let [loc (get locals name)
-                          resolved (reduce (fn [s k] (into s (resolve-calls defns flow k)))
-                                           #{} (into [] (:calls loc)))]
-                      (assoc m name (assoc loc :edges resolved))))
-                  {} names)
+          ; final table: local summary + resolved call edges + latent effects.
+          ; An iteration from bottom that has NOT converged is not yet sound,
+          ; so at the round cap every footprint fails closed to opaque.
+          (let [converged (and (= returns2 returns) (= fps2 fps))
+                fps2 (if converged fps2
+                       (reduce (fn [m k] (assoc m k {fp/opaque-world :W})) {} names))
+                locals (if converged locals
+                         (reduce (fn [m k] (assoc m k (assoc (get locals k) :footprint {fp/opaque-world :W})))
+                                 locals names))
+                final-resolve (fn [callee-name]
+                                (if (contains? fps2 callee-name) (get fps2 callee-name) (core callee-name)))
+                lat (latent-table defns final-resolve)]
+            (reduce (fn [m name]
+                      (let [loc (get locals name)
+                            resolved (reduce (fn [s k] (into s (resolve-calls defns flow k)))
+                                             #{} (into [] (:calls loc)))]
+                        (assoc m name (assoc loc :edges resolved :latent (get lat name)))))
+                    {} names))
           (recur returns2 fps2 (inc n)))))))
 
 ; ── the call/flow graph (for reachability / dead-code / impact) ──────────
