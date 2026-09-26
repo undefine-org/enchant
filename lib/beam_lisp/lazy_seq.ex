@@ -3,10 +3,46 @@ defmodule BeamLisp.LazySeq do
   A lazy sequence with resource-owned memo state. Successful answers are shared;
   known failed attempts may be retried. Recursive force, cyclic retained values,
   and evaluator loss are terminal. Metadata is immutable and value-owned.
+
+  ## The fold recipe
+
+  Realising one element through the memo cell is expensive: the state term is
+  copied into and out of the cell, its dependency graph is walked, and the CAS
+  compares the whole old state — all O(size of what the thunk captured). A
+  consumer that walks the WHOLE seq once (a `reduce`, a `count`, a `vec`) pays
+  that cost per element for no benefit: it never reads the memo again.
+
+  So a producer that can also compute its elements from its SOURCE may attach a
+  fold `recipe` to its node. It is called by a reducing consumer INSTEAD of the
+  cell walk, and creates no cells at all:
+
+      recipe :: (fn [rf init] -> acc | BeamLisp.Reduced)
+
+  `rf` is a raw 2-arity Erlang fun `(rf acc x)` — already call-shaped by the
+  caller, so a recipe never has to dispatch a callable itself. The recipe folds
+  the seq's elements in order and returns the accumulator, or a `Reduced` when
+  `rf` asks the fold to stop; the caller peels the sentinel, exactly as the
+  memo walk does (`rt.k-fold`/`rt.k-reduce`).
+
+  ### When the recipe may be used
+
+  Only while the node's head cell is still `:pending`. Once anything is
+  realised the memo walk is used instead, so elements already published keep
+  their shared values and a side-effecting `f` is not re-run for them.
+
+  ### What it means for a still-pending node
+
+  A pending node folded from source RE-COMPUTES its elements instead of reading
+  shared memo state, and does NOT publish them: the node stays `:pending`. That
+  is Clojure's own contract — `(reduce f init (map g coll))` over a `LazySeq`
+  walks the source without realising it — and it means a concurrent consumer of
+  the SAME seq may run `g` again. It is identical for pure `g`, and only those
+  are safe to fold: the caller must not rely on a fold to memoise side effects.
+  `doall` deliberately does NOT use a recipe — it is defined to realise.
   """
   alias BeamLisp.LazyMemo
   @chunk_size 32
-  defstruct resource: nil, metadata: nil
+  defstruct resource: nil, metadata: nil, reduce: nil
 
   defmodule ForceError do
     defexception [:reason, :message]
@@ -15,10 +51,50 @@ defmodule BeamLisp.LazySeq do
       do: %__MODULE__{reason: reason, message: "LazySeq force failed: #{inspect(reason)}"}
   end
 
-  @type t :: %__MODULE__{resource: reference(), metadata: map() | nil}
+  @type t :: %__MODULE__{
+          resource: reference(),
+          metadata: map() | nil,
+          reduce: (recipe() | nil)
+        }
+
+  @typedoc """
+  A fold recipe — `(fn [rf init] -> acc | Reduced)` — folds the seq's elements
+  from source, creating no memo cells. `rf` is a raw 2-arity step `(rf acc x)`.
+  """
+  @type recipe :: (term(), term() -> term())
+
   @doc "Wrap a recipe in a shared lazy node. A successful result is memoized."
   def new(thunk) when is_function(thunk, 0),
     do: %__MODULE__{resource: LazyMemo.create({:pending, thunk})}
+
+  @doc """
+  As `new/1`, plus a fold recipe (`t:recipe/0`) a reducing consumer may use
+  while this node is still `:pending` — see the moduledoc. `rt.lazy-with-fold`
+  is the beam-lisp-facing spelling of the same thing.
+  """
+  def new(thunk, recipe) when is_function(thunk, 0) and is_function(recipe, 2),
+    do: %{new(thunk) | reduce: recipe}
+
+  @doc "Attach a fold recipe to an already-built node."
+  def with_reduce(%__MODULE__{} = l, recipe) when is_function(recipe, 2),
+    do: %{l | reduce: recipe}
+
+  @doc "The node's fold recipe, or `nil` when it has none."
+  def reduce_recipe(%__MODULE__{reduce: recipe}), do: recipe
+  def reduce_recipe(_), do: nil
+
+  @doc """
+  Whether the node's head cell is still `:pending` — the one state in which a
+  fold recipe may be used (see the moduledoc). Any other state — already
+  realised, in flight elsewhere, failed-then-retried, or terminal — reads
+  through the memo walk instead.
+  """
+  def pending?(%__MODULE__{resource: resource}) do
+    case LazyMemo.read(resource) do
+      {:pending, _thunk} -> true
+      _ -> false
+    end
+  end
 
   def from_fun(thunk) when is_function(thunk, 0), do: new(thunk)
   def lazy?(%__MODULE__{}), do: true
