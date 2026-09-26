@@ -27,6 +27,8 @@ const APPS = [
     what: 'j/k/x/e/p and ? — a keymap the view declares as data; drag rows to reorder for everyone; rename inline.' },
   { app: 'ledger', name: 'Household ledger', track: 'Exact numbers',
     what: 'Money exact to the cent beyond 2^53, formatted and broken down in your browser with the same answers as the BEAM.' },
+  { app: 'workspace', name: 'Generative editor', track: 'Mockup · Source and Stream',
+    what: 'The Source/Stream workspace in Carbon and Snow: forms you move through with j k h l, evaluation receipts, a Stream document, and Made/Verified/Saved/Live as separate decisions.' },
 ];
 
 const argv = process.argv.slice(2);

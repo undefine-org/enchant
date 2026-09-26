@@ -108,6 +108,13 @@ export function vecSize(x) { return x.items.items.length; }
 export function vecEl(x, i) { return x.items.items[i]; }
 export function vecAppend(v, x) { return vecFromArray(vecItems(v).concat([x])); }
 export function vecRemove(v, i) { return vecFromArray(vecItems(v).filter((_, k) => k !== i)); }
+// `(assoc v i x)`: i in [0, count] (count appends), else an error — as on BEAM
+export function vecSet(v, i, x) {
+  const items = vecItems(v);
+  if (!Number.isSafeInteger(i) || i < 0 || i > items.length) throw new Error('assoc: index ' + String(i) + ' out of bounds for a vector of ' + items.length);
+  const next = items.slice(); next[i] = x;
+  return vecFromArray(next);
+}
 export function vecToList(v) { return listFromArray(vecItems(v)); }
 export function vecFromList(l) { return vecFromArray(listToArray(l)); }
 
@@ -1146,6 +1153,7 @@ export const PURE = {
   "vec-el": vecEl,
   "vec-append": vecAppend,
   "vec-remove": vecRemove,
+  "vec-set": vecSet,
   "vec-to-list": vecToList,
   "vec-from-list": vecFromList,
   "is-set": isSet,

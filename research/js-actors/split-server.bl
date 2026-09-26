@@ -80,12 +80,13 @@
    :redo (if (empty? (:future h)) nil (:entry (last (:future h))))})
 
 (defn split-decide
-  "The whole decision for one proposal: `[:commit state entry-line]` or
-   `[:refuse reason]`. `h` is the history record (past/future)."
-  [contract state revision proposal who h]
+  "The whole decision for one proposal: `[:commit state entry-line board]` or
+   `[:refuse reason]`. `board` is the current state's projection; a commit
+   answers the NEXT state's, already checked against the snapshot type, so
+   each commit projects once. `h` is the history record (past/future)."
+  [contract state board revision proposal who h]
   (let [op (:op proposal)
         args (:args proposal)
-        board (wire-snapshot contract state)
         history? (< 0 (split-history-size))]
     (cond
       (not (= (split-digest) (:digest proposal))) [:refuse :client-outdated]
@@ -95,13 +96,15 @@
           (not (= revision (:revision proposal))) [:refuse :stale-revision]
           (empty? (:past h)) [:refuse :nothing-to-undo]
           (some? (split-undo-allow who board)) [:refuse (split-undo-allow who board)]
-          :else [:commit (:state (last (:past h))) (str "undid " (:says (:entry (last (:past h)))))])
+          :else [:commit (:state (last (:past h))) (str "undid " (:says (:entry (last (:past h)))))
+                 (wire-snapshot contract (:state (last (:past h))))])
       (and history? (= op :redo))
         (cond
           (not (= revision (:revision proposal))) [:refuse :stale-revision]
           (empty? (:future h)) [:refuse :nothing-to-redo]
           (some? (split-undo-allow who board)) [:refuse (split-undo-allow who board)]
-          :else [:commit (:state (last (:future h))) (str "redid " (:says (:entry (last (:future h)))))])
+          :else [:commit (:state (last (:future h))) (str "redid " (:says (:entry (last (:future h)))))
+                 (wire-snapshot contract (:state (last (:future h))))])
       (nil? (wire-intent contract op)) [:refuse :unknown-intent]
       (not (wire-args-ok? contract op args)) [:refuse :malformed-args]
       (not (= revision (:revision proposal))) [:refuse :stale-revision]
@@ -115,9 +118,10 @@
                 (some? denied) [:refuse denied]
                 (some? guard) [:refuse guard]
                 :else
-                  (let [next (split-apply op state args who)]
-                    (if (and (map? next) (wire-snapshot-ok? contract (wire-snapshot contract next)))
-                      [:commit next (or (split-says op board args) (name op))]
+                  (let [next (split-apply op state args who)
+                        next-board (if (map? next) (wire-snapshot contract next) nil)]
+                    (if (and (some? next-board) (wire-snapshot-ok? contract next-board))
+                      [:commit next (or (split-says op board args) (name op)) next-board]
                       [:refuse :handler-broke-contract])))))))))
 
 (defn split-next-history
@@ -146,66 +150,66 @@
         board0 (wire-snapshot contract state0)
         keep (split-history-size)]
     (if (not (wire-snapshot-ok? contract board0))
-      (host/raise "split: the server :init state does not satisfy the snapshot type")
+      (host/raise (str "split: the server :init state does not satisfy the snapshot type: "
+                       (wire-problem (:wire contract) (:snapshot contract) board0)))
       (do
         (rt-register-input!)
         (host/emit :ready {:digest (split-digest) :revision 0 :board board0
                            :people (if (some? (split-people)) (split-public-people) nil)
                            :recent [] :history (split-history-summary {:past [] :future []})})
-        (loop [state state0 revision 0 seen [] h {:past [] :future []} recent [] boards [[0 board0]]]
+        ; `board` is always `state` projected: computed once per commit
+        (loop [state state0 board board0 revision 0 seen [] h {:past [] :future []} recent [] boards [[0 board0]]]
           (receive
             [:browser :intent proposal]
               (if (not (split-proposal-shape-ok? proposal))
                 (do
-                  (host/emit :result (split-refused -1 :malformed-proposal revision
-                                                    (wire-snapshot contract state)))
-                  (recur state revision seen h recent boards))
+                  (host/emit :result (split-refused -1 :malformed-proposal revision board))
+                  (recur state board revision seen h recent boards))
                 (let [req (:request proposal)
                       who (split-person (:actor proposal))]
                   (if (split-seen? seen (:nonce proposal))
                     (do
                       (host/emit :result {:request req :ok true :duplicate true :revision revision
-                                          :board (wire-snapshot contract state)
+                                          :board board
                                           :recent recent :history (split-history-summary h)})
-                      (recur state revision seen h recent boards))
-                    (let [verdict (split-decide contract state revision proposal who h)]
+                      (recur state board revision seen h recent boards))
+                    (let [verdict (split-decide contract state board revision proposal who h)]
                       (if (= :commit (first verdict))
                         (let [next (nth verdict 1)
                               rev (inc revision)
-                              board (wire-snapshot contract next)
+                              next-board (nth verdict 3)
                               entry {:revision rev :actor (:actor proposal)
                                      :name (if (nil? who) "" (:name who))
                                      :op (:op proposal) :says (nth verdict 2)}
                               h2 (if (< 0 keep) (split-next-history h (:op proposal) state entry) h)
                               recent2 (split-cap (conj recent entry) (split-recent-size))
-                              boards2 (if (< 0 keep) (split-cap (conj boards [rev board]) (inc keep)) boards)
+                              boards2 (if (< 0 keep) (split-cap (conj boards [rev next-board]) (inc keep)) boards)
                               summary (split-history-summary h2)]
                           (do
-                            (host/emit :result {:request req :ok true :revision rev :board board
+                            (host/emit :result {:request req :ok true :revision rev :board next-board
                                                 :recent recent2 :history summary})
-                            (host/emit :snapshot {:revision rev :board board :op (:op proposal) :request req
+                            (host/emit :snapshot {:revision rev :board next-board :op (:op proposal) :request req
                                                   :recent recent2 :history summary})
                             (host/emit :commit {:entry entry :nonce (:nonce proposal) :args (:args proposal)})
-                            (recur next rev (split-cap (conj seen (:nonce proposal)) (split-nonce-memory))
+                            (recur next next-board rev (split-cap (conj seen (:nonce proposal)) (split-nonce-memory))
                                    h2 recent2 boards2)))
                         (do
-                          (host/emit :result (split-refused req (nth verdict 1) revision
-                                                            (wire-snapshot contract state)))
-                          (recur state revision seen h recent boards)))))))
+                          (host/emit :result (split-refused req (nth verdict 1) revision board))
+                          (recur state board revision seen h recent boards)))))))
             [:browser :login req]
               (do
                 (host/emit :login {:request (:request req) :person (split-person (:user req))})
-                (recur state revision seen h recent boards))
+                (recur state board revision seen h recent boards))
             [:browser :presence p]
               (do
                 (host/emit :presence {:people (filterv some? (mapv split-person (or (:users p) [])))})
-                (recur state revision seen h recent boards))
+                (recur state board revision seen h recent boards))
             [:browser :peek q]
               (do
                 (host/emit :peek {:request (:request q) :revision (:revision q)
                                   :board (split-peek boards (:revision q))})
-                (recur state revision seen h recent boards))
+                (recur state board revision seen h recent boards))
             [:browser :stop _]
               (host/emit :stopped {:revision revision})
             [:browser _topic _payload]
-              (recur state revision seen h recent boards)))))))
+              (recur state board revision seen h recent boards)))))))

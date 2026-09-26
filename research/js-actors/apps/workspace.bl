@@ -1,0 +1,1255 @@
+; apps/workspace.bl — a functional mockup of the generative editor, ONE BL file.
+;
+; The direction (docs/design/workspace-editor.md, stream-workspace.md,
+; form-first-interaction.md): two full-size perspectives, SOURCE and STREAM,
+; a contextual inspector for the selected form or block, one command palette,
+; and an Activity lens that projects work — never a third place it lives.
+;
+; What is real here, and what is a mock:
+;
+;   REAL   the form tree: the server reads each file with a small reader
+;          (`read-source`, loop/recur, no recursion) into forms with stable
+;          ids; the browser renders code FROM that tree and selects forms,
+;          not characters
+;   REAL   the structural motion contract (j/k/h/l ≙ Ctrl+J/K/H/L): computed
+;          in the browser by `motion`, with the documented boundary cues
+;   REAL   evaluation receipts: `Evaluate form` is an intent the server
+;          checks against the file's revision (a stale basis is refused in
+;          the browser AND on the server) and answers by EVALUATING the form
+;          in a small mock runtime; the receipt carries path · rev · form ·
+;          runtime, and appends to the active Stream or the file's own activity
+;   REAL   Made / Verified / Saved / Live as four independent decisions; Save
+;          is basis-guarded and bumps the file's revision (old receipts stay on
+;          their captured revision); Live swaps what the image runs without
+;          touching the file
+;   MOCK   the runtime (`ev`): integers, strings, keywords, vectors, maps, a
+;          dozen builtins and top-level `def`s — calling a `defn` says so
+;   MOCK   no model provider: `Record turn` appends the task and says no
+;          response was invented; the seeded model turns are illustrative
+;   OUT    typing into source (Edit mode), hover preview, history lens
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Seed sources
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn invoices-src []
+  "(ns app.invoices)
+
+(def late-fee-rate 5)
+
+(defn total [items]
+  (reduce + (map :amount items)))
+
+(defn late-fee [amount days]
+  (if (< 30 days)
+    (quot (* amount late-fee-rate) 100)
+    0))
+
+(+ 40 2)
+
+(* late-fee-rate 12)
+
+(total [{:amount 40} {:amount 2}])")
+
+(defn invoices-v1-src []
+  "(ns app.invoices)
+
+(def late-fee-rate 8)
+
+(def late-fee-cap 25)
+
+(defn total [items]
+  (reduce + (map :amount items)))
+
+(defn late-fee [amount days]
+  (if (< 30 days)
+    (min late-fee-cap (quot (* amount late-fee-rate) 100))
+    0))
+
+(+ 40 2)
+
+(* late-fee-rate 12)
+
+(total [{:amount 40} {:amount 2}])")
+
+(defn rules-src []
+  "(ns billing.rules)
+
+(def grace-days 30)
+
+(def fee-kinds [:late :reminder])
+
+(count fee-kinds)
+
+(> 45 grace-days)")
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The reader — source text → forms with ids (loop/recur only)
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn digit-of [c]
+  (get {"0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9} c))
+
+(defn parse-int
+  "The integer `s` spells (optionally negative), or nil."
+  [s]
+  (let [n (count s)
+        neg (and (< 0 n) (= "-" (subs s 0 1)))
+        start (if neg 1 0)]
+    (if (<= n start)
+      nil
+      (loop [i start acc 0]
+        (cond
+          (<= n i) (if neg (- 0 acc) acc)
+          (nil? (digit-of (subs s i (inc i)))) nil
+          :else (recur (inc i) (+ (* acc 10) (digit-of (subs s i (inc i))))))))))
+
+(defn delim? [c]
+  (get {" " true "\n" true "\t" true "\r" true "," true "(" true ")" true "[" true "]" true
+        "{" true "}" true "\"" true ";" true}
+       c false))
+
+(defn opener [c] (get {"(" :list "[" :vector "{" :map} c))
+(defn closer [c] (get {")" :list "]" :vector "}" :map} c))
+
+(defn atom-kind [t]
+  (cond
+    (= ":" (subs t 0 1)) :keyword
+    (some? (parse-int t)) :number
+    :else :symbol))
+
+(defn scan-atom [s i n]
+  (loop [j i]
+    (if (and (< j n) (not (delim? (subs s j (inc j))))) (recur (inc j)) j)))
+
+(defn scan-string
+  "Given `i` at an opening quote, the index just past its closing quote, or -1."
+  [s i n]
+  (loop [j (inc i)]
+    (cond
+      (<= n j) -1
+      (= "\\" (subs s j (inc j))) (recur (+ j 2))
+      (= "\"" (subs s j (inc j))) (inc j)
+      :else (recur (inc j)))))
+
+(defn scan-line [s i n]
+  (loop [j i]
+    (if (and (< j n) (not (= "\n" (subs s j (inc j))))) (recur (inc j)) j)))
+
+(defn pop-frame [stack] (vec (take (dec (count stack)) stack)))
+
+(defn add-kid [stack form]
+  (let [top (last stack)]
+    (assoc stack (dec (count stack)) (assoc top :kids (conj (:kids top) form)))))
+
+(defn a-form [id kind text kids col] {:id id :kind kind :text text :kids kids :col col})
+
+(defn read-source
+  "`{:forms [...] :next id :error nil}` for `src`. Each form keeps `:col`: the
+   column it starts at when a newline precedes it inside its parent, else -1,
+   so the view can lay code out as it was written. Ids count from `first-id`."
+  [src first-id]
+  (let [n (count src)]
+    (loop [i 0 stack [{:kind :root :kids [] :id 0 :col -1}] next first-id nl false sp 0]
+      (if (<= n i)
+        (if (= 1 (count stack))
+          {:forms (:kids (first stack)) :next next :error nil}
+          {:forms [] :next next :error "unclosed form at end of source"})
+        (let [c (subs src i (inc i))
+              col (if nl sp -1)]
+          (cond
+            (= c "\n") (recur (inc i) stack next true 0)
+            (or (= c " ") (= c ",") (= c "\t") (= c "\r")) (recur (inc i) stack next nl (if (= c " ") (inc sp) sp))
+            (= c ";") (recur (scan-line src i n) stack next nl sp)
+            (some? (opener c))
+              (recur (inc i) (conj stack {:kind (opener c) :kids [] :id next :col col}) (inc next) false 0)
+            (some? (closer c))
+              (let [top (last stack)]
+                (if (or (= 1 (count stack)) (not (= (closer c) (:kind top))))
+                  {:forms [] :next next :error (str "unexpected " c " at offset " i)}
+                  (recur (inc i) (add-kid (pop-frame stack) (a-form (:id top) (:kind top) "" (:kids top) (:col top)))
+                         next false 0)))
+            (= c "\"")
+              (let [j (scan-string src i n)]
+                (if (< j 0)
+                  {:forms [] :next next :error "unterminated string"}
+                  (recur j (add-kid stack (a-form next :string (subs src i j) [] col)) (inc next) false 0)))
+            :else
+              (let [j (scan-atom src i n)
+                    t (subs src i j)]
+                (recur j (add-kid stack (a-form next (atom-kind t) t [] col)) (inc next) false 0))))))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Forms — shared by both halves
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn coll-kind? [kind] (contains? {:list true :vector true :map true} kind))
+(defn open-of [kind] (get {:list "(" :vector "[" :map "{"} kind ""))
+(defn close-of [kind] (get {:list ")" :vector "]" :map "}"} kind ""))
+
+(defn spaces [n] (reduce (fn [s _] (str s " ")) "" (range n)))
+
+(defn form-src
+  "The form printed back as source, keeping its line breaks."
+  [f]
+  (if (coll-kind? (:kind f))
+    (str (open-of (:kind f))
+         (first (reduce (fn [acc k]
+                          [(str (first acc)
+                                (if (second acc) (if (<= 0 (:col k)) (str "\n" (spaces (:col k))) " ") "")
+                                (form-src k))
+                           true])
+                        ["" false] (:kids f)))
+         (close-of (:kind f)))
+    (:text f)))
+
+(defn find-form
+  "The form with `id` anywhere under `forms`, or nil."
+  [forms id]
+  (some (fn [f] (if (= id (:id f)) f (find-form (:kids f) id))) forms))
+
+(defn find-file [ws path] (some (fn [f] (if (= path (:path f)) f nil)) (:files ws)))
+(defn find-stream [ws id] (some (fn [s] (if (= id (:id s)) s nil)) (:streams ws)))
+(defn find-block [s id] (some (fn [b] (if (= id (:id b)) b nil)) (:blocks s)))
+(defn find-cand [s id] (some (fn [c] (if (= id (:id c)) c nil)) (:candidates s)))
+(defn member? [xs x] (some? (some (fn [y] (if (= x y) y nil)) xs)))
+
+(defn live-cand
+  "The candidate the workspace image runs for `path`, or nil."
+  [ws path]
+  (some (fn [s] (some (fn [c] (if (and (:live c) (= (:path c) path)) c nil)) (:candidates s)))
+        (:streams ws)))
+
+(defn image-label [ws file]
+  (let [live (live-cand ws (:path file))]
+    (if (nil? live)
+      (str "workspace image · " (:ns file) " @ rev " (:rev file))
+      (str "workspace image · " (:ns file) " · candidate v" (:version live) " live"))))
+
+(defn update-stream [ws id f]
+  (assoc ws :streams (mapv (fn [s] (if (= id (:id s)) (f s) s)) (:streams ws))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The structural motion contract (form-first-interaction.md)
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn path-in
+  "Indices from the top-level forest down to `id`, or nil."
+  [forms id]
+  (:hit (reduce (fn [acc f]
+                  (cond
+                    (some? (:hit acc)) acc
+                    (= id (:id f)) {:i (inc (:i acc)) :hit [(:i acc)]}
+                    :else (let [p (path-in (:kids f) id)]
+                            {:i (inc (:i acc)) :hit (if (some? p) (into [(:i acc)] p) nil)})))
+                {:i 0 :hit nil} forms)))
+
+(defn node-at [forms path]
+  (loop [xs forms p path node nil]
+    (cond
+      (empty? p) node
+      (<= (count xs) (first p)) nil
+      :else (recur (:kids (nth xs (first p))) (rest p) (nth xs (first p))))))
+
+(defn prefix [path d] (vec (take d path)))
+
+(defn sibs-of [forms path]
+  (if (= 1 (count path)) forms (:kids (node-at forms (prefix path (dec (count path)))))))
+
+(defn descend
+  "Repeat first- or last-child descent from `path` to the deepest form."
+  [forms path which]
+  (loop [p path k 0]
+    (if (< k 24)
+      (let [kids (:kids (node-at forms p))]
+        (if (empty? kids)
+          p
+          (recur (conj p (if (= which :first) 0 (dec (count kids)))) (inc k))))
+      p)))
+
+(defn climb
+  "The nearest ancestor-level sibling in direction `w` (:prev/:next) of an
+   ancestor of `path` — the \"previous/next parent\" — or nil."
+  [forms path w]
+  (loop [d (dec (count path))]
+    (if (< d 1)
+      nil
+      (let [pre (prefix path d)
+            idx (last pre)
+            pp (prefix pre (dec d))]
+        (cond
+          (and (= w :prev) (< 0 idx)) (conj pp (dec idx))
+          (and (= w :next) (< (inc idx) (count (sibs-of forms pre)))) (conj pp (inc idx))
+          :else (recur (dec d)))))))
+
+(defn motion
+  "Where key `dir` (:j :k :h :l) moves the selection `sel`: `{:id :cue}`. A
+   move that cannot advance stays and says why; nothing wraps."
+  [forms sel dir]
+  (let [path (path-in forms sel)]
+    (if (nil? path)
+      {:id sel :cue "Choose a form first"}
+      (let [i (last path)
+            parent (prefix path (dec (count path)))
+            n-sibs (count (sibs-of forms path))
+            at (fn [p] (:id (node-at forms p)))
+            kids (:kids (node-at forms path))]
+        (cond
+          (= dir :j) (cond
+                       (not (empty? kids)) {:id (at (conj path 0)) :cue ""}
+                       (< (inc i) n-sibs) {:id (at (conj parent (inc i))) :cue ""}
+                       :else {:id sel :cue "No child or next sibling"})
+          (= dir :k) (cond
+                       (< 1 (count path)) {:id (at parent) :cue ""}
+                       (< (inc i) (count forms)) {:id (at [(inc i)]) :cue ""}
+                       :else {:id sel :cue "Already at last top-level form"})
+          (= dir :h) (if (< 0 i)
+                       {:id (at (conj parent (dec i))) :cue ""}
+                       (let [a (climb forms path :prev)]
+                         (if (nil? a) {:id sel :cue "First form"} {:id (at (descend forms a :last)) :cue ""})))
+          :else (if (< (inc i) n-sibs)
+                  {:id (at (conj parent (inc i))) :cue ""}
+                  (let [a (climb forms path :next)]
+                    (if (nil? a) {:id sel :cue "Last form"} {:id (at (descend forms a :first)) :cue ""}))))))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The mock runtime — server only (declared :private below)
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn v-err [s] {:t :err :s s})
+
+(defn show
+  "A value printed as the REPL would."
+  [v]
+  (let [t (:t v)]
+    (cond
+      (= t :int) (str (:n v))
+      (= t :str) (str "\"" (:s v) "\"")
+      (= t :bool) (if (:b v) "true" "false")
+      (= t :nil) "nil"
+      (or (= t :kw) (= t :var) (= t :err)) (:s v)
+      (or (= t :fn) (= t :defn)) (str "#fn " (:s v))
+      (or (= t :vec) (= t :map))
+        (str (if (= t :vec) "[" "{")
+             (reduce (fn [acc x] (str acc (if (= "" acc) "" " ") (show x))) "" (:items v))
+             (if (= t :vec) "]" "}"))
+      :else "?")))
+
+(defn first-err [vs] (some (fn [v] (if (= :err (:t v)) v nil)) vs))
+(defn ints? [vs] (every? (fn [v] (= :int (:t v))) vs))
+(defn nums [vs] (mapv (fn [v] (:n v)) vs))
+(defn v-int [n] {:t :int :n n})
+(defn v-bool [b] {:t :bool :b b})
+
+(defn builtins [] ["+" "-" "*" "quot" "inc" "dec" "max" "min" "str" "count" "=" "<" ">"])
+
+(defn chain?
+  "Is `ns` strictly increasing (:lt) or decreasing (:gt)?"
+  [ns op]
+  (loop [xs ns]
+    (cond
+      (empty? xs) true
+      (empty? (rest xs)) true
+      (if (= op :lt) (< (first xs) (second xs)) (> (first xs) (second xs))) (recur (rest xs))
+      :else false)))
+
+(defn apply-builtin [op args]
+  (let [name op ns (nums args) n (count args)]
+    (cond
+      (= name "str") {:t :str :s (reduce (fn [s v] (str s (if (= :str (:t v)) (:s v) (show v)))) "" args)}
+      (= name "count") (if (and (= 1 n) (contains? {:vec true :map true} (:t (first args))))
+                         (v-int (if (= :map (:t (first args))) (quot (count (:items (first args))) 2) (count (:items (first args)))))
+                         (v-err "count: expected one vector or map"))
+      (= name "=") (v-bool (every? (fn [v] (= (show v) (show (first args)))) args))
+      (not (ints? args)) (v-err (str name ": expected numbers"))
+      (= name "+") (v-int (reduce (fn [a b] (+ a b)) 0 ns))
+      (= name "*") (v-int (reduce (fn [a b] (* a b)) 1 ns))
+      (= name "-") (if (= 1 n) (v-int (- 0 (first ns))) (v-int (reduce (fn [a b] (- a b)) (first ns) (rest ns))))
+      (= 0 n) (v-err (str name ": expected arguments"))
+      (= name "inc") (v-int (inc (first ns)))
+      (= name "dec") (v-int (dec (first ns)))
+      (= name "max") (v-int (reduce (fn [a b] (if (< a b) b a)) (first ns) ns))
+      (= name "min") (v-int (reduce (fn [a b] (if (< b a) b a)) (first ns) ns))
+      (= name "quot") (if (or (not (= 2 n)) (= 0 (second ns))) (v-err "quot: expected a number and a non-zero divisor")
+                        (v-int (quot (first ns) (second ns))))
+      (= name "<") (v-bool (chain? ns :lt))
+      (= name ">") (v-bool (chain? ns :gt))
+      :else (v-err (str name ": unknown")))))
+
+(defn ev
+  "Evaluate form `f` under `env` (name → value, plus \"*ns*\")."
+  [env f]
+  (let [k (:kind f) kids (:kids f)]
+    (cond
+      (= k :number) (v-int (parse-int (:text f)))
+      (= k :string) {:t :str :s (subs (:text f) 1 (dec (count (:text f))))}
+      (= k :keyword) {:t :kw :s (:text f)}
+      (= k :symbol) (let [s (:text f)]
+                      (cond
+                        (= s "true") (v-bool true)
+                        (= s "false") (v-bool false)
+                        (= s "nil") {:t :nil}
+                        (contains? env s) (get env s)
+                        (member? (builtins) s) {:t :fn :s s}
+                        :else (v-err (str "Unable to resolve symbol: " s " in this context"))))
+      (or (= k :vector) (= k :map))
+        (let [vs (mapv (fn [x] (ev env x)) kids)]
+          (or (first-err vs) {:t (if (= k :vector) :vec :map) :items vs}))
+      (empty? kids) {:t :vec :items []}
+      :else
+        (let [head (first kids)
+              hs (if (= :symbol (:kind head)) (:text head) "")]
+          (cond
+            (or (= hs "def") (= hs "defn"))
+              {:t :var :s (str "#'" (get env "*ns*") "/" (:text (second kids)))}
+            (= hs "ns") {:t :nil}
+            (member? ["let" "fn" "if" "when" "loop" "reduce" "map"] hs)
+              (v-err (str hs ": special forms and sequence functions are outside this mockup's runtime"))
+            :else
+              (let [vs (mapv (fn [x] (ev env x)) kids)
+                    hv (first vs)]
+                (cond
+                  (some? (first-err vs)) (first-err vs)
+                  (= :fn (:t hv)) (apply-builtin (:s hv) (vec (rest vs)))
+                  (= :defn (:t hv)) (v-err (str "calling " (:s hv) ": defn bodies are outside this mockup's runtime"))
+                  :else (v-err (str (show hv) " is not a function")))))))))
+
+(defn load-defs
+  "The environment after loading `forms` as a namespace: each top-level
+   `def` evaluated in order, each `defn` bound as a (mock) function."
+  [ns forms]
+  (reduce (fn [env f]
+            (let [kids (:kids f)
+                  hs (if (and (= :list (:kind f)) (< 1 (count kids))) (:text (first kids)) "")]
+              (cond
+                (and (= hs "def") (= 3 (count kids))) (assoc env (:text (second kids)) (ev env (nth kids 2)))
+                (= hs "defn") (assoc env (:text (second kids)) {:t :defn :s (:text (second kids))})
+                :else env)))
+          {"*ns*" ns} forms))
+
+(defn image-forms
+  "What the workspace image runs for `file`: the Live candidate's source when
+   one is live, else the saved file. A candidate's `:source` is server-private:
+   the wire declares no such field, so it never reaches the browser."
+  [ws file]
+  (let [live (live-cand ws (:path file))]
+    {:forms (if (nil? live) (:forms file) (:forms (read-source (:source live) 1)))
+     :label (image-label ws file)}))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The model the server owns
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn block [id kind author text]
+  {:id id :kind kind :author author :text text :result "" :failed false
+   :reply 0 :path "" :rev 0 :form 0 :ref 0 :runtime ""})
+
+(defn a-file [path ns src]
+  (let [r (read-source src 1)]
+    {:path path :ns ns :rev 1 :forms (:forms r)}))
+
+(defn top-id [file i] (:id (nth (:forms file) i)))
+
+(defn clip [s n] (if (< n (count s)) (str (subs s 0 (- n 1)) "…") s))
+
+(defn receipt
+  "An evaluation receipt for form `id` of `file`, run in the workspace image."
+  [ws file id bid]
+  (let [f (find-form (:forms file) id)
+        img (image-forms ws file)
+        v (ev (load-defs (:ns file) (:forms img)) f)]
+    (assoc (block bid :receipt "eval" (clip (form-src f) 2000))
+           :result (clip (show v) 400) :failed (= :err (:t v))
+           :path (:path file) :rev (:rev file) :form id :runtime (:label img))))
+
+(defn initial-workspace []
+  (let [inv (a-file "src/app/invoices.bl" "app.invoices" (invoices-src))
+        rules (a-file "src/billing/rules.bl" "billing.rules" (rules-src))
+        ws0 {:files [inv rules] :streams [] :direct []}
+        s1 {:id 1 :slug "invoice-edge-cases" :title "Invoice edge cases"
+            :spec "Explore late fees and decide whether they belong in the invoice total.\nNo source changes until the computation and its tests agree."
+            :spec-rev 1
+            :sources ["src/app/invoices.bl" "src/billing/rules.bl"]
+            :candidates [{:id 1 :version 1 :path "src/app/invoices.bl" :basis 1
+                          :summary "Raise the late-fee rate to 8% and cap any single fee at 25."
+                          :hunk "@@ src/app/invoices.bl · basis rev 1\n-(def late-fee-rate 5)\n+(def late-fee-rate 8)\n+\n+(def late-fee-cap 25)\n@@ late-fee\n-    (quot (* amount late-fee-rate) 100)\n+    (min late-fee-cap (quot (* amount late-fee-rate) 100))"
+                          :source (invoices-v1-src)
+                          :verified false :saved false :live false :checks []}]
+            :blocks [(block 101 :task "operator" "Compare the two representations; do not write source yet.")
+                     (block 102 :model "model · t1" "Late fees are a flat 5% once an invoice is more than 30 days overdue, and they are not part of `total`. A cap would keep large invoices from producing outsized fees — see candidate v1.")
+                     (assoc (block 103 :cell "model · t1" "(+ 40 2)")
+                            :result "42" :runtime "harness · invoice-edge-cases")
+                     (block 104 :comment "operator" "Check what happens when the due date is missing.")
+                     (assoc (block 105 :comment "model · t1" "A missing due date reaches `(< 30 days)` as nil. Treat it as not overdue rather than guessing a date.")
+                            :reply 104)
+                     (receipt ws0 inv (top-id inv 5) 106)
+                     (assoc (block 107 :comment "operator" "Should a single fee be capped?")
+                            :path "src/app/invoices.bl" :rev 1 :form (top-id inv 3))
+                     (assoc (block 108 :candidate "model · t1" "Candidate v1") :ref 1 :path "src/app/invoices.bl" :rev 1)
+                     (block 109 :steer "operator" "Focus on the edge case in src/app/invoices.bl.")]}
+        s2 {:id 2 :slug "fee-kinds-as-data" :title "Fee kinds as data"
+            :spec "Can fee kinds live in data rather than code?"
+            :spec-rev 1 :sources ["src/billing/rules.bl"] :candidates []
+            :blocks [(block 201 :task "operator" "List the fee kinds the rules know about.")
+                     (receipt ws0 rules (top-id rules 3) 202)
+                     (assoc (block 203 :comment "operator" "Reminder fees need their own grace period.")
+                            :path "src/billing/rules.bl" :rev 1 :form (top-id rules 2))]}]
+    {:files [inv rules]
+     :streams [s1 s2]
+     :direct [(receipt ws0 rules (top-id rules 4) 301)]
+     :next-id 400}))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Checks and changes
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn max-blocks [] 200)
+
+(defn stream-problem [ws id]
+  (cond
+    (nil? (find-stream ws id)) :no-such-stream
+    (<= (max-blocks) (count (:blocks (find-stream ws id)))) :stream-full
+    :else nil))
+
+(defn ask-problem [ws args] (stream-problem ws (:stream args)))
+
+(defn spec-problem [ws args]
+  (let [s (find-stream ws (:stream args))]
+    (cond
+      (nil? s) :no-such-stream
+      (not (= (:basis args) (:spec-rev s))) :stale-basis
+      :else nil)))
+
+(defn save-spec [ws args]
+  (update-stream ws (:stream args) (fn [s] (assoc s :spec (:spec args) :spec-rev (inc (:spec-rev s))))))
+
+(defn attach-problem [ws args]
+  (let [s (find-stream ws (:stream args))]
+    (cond
+      (nil? s) :no-such-stream
+      (nil? (find-file ws (:path args))) :no-such-file
+      (member? (:sources s) (:path args)) :already-attached
+      :else nil)))
+
+(defn attach [ws args]
+  (update-stream ws (:stream args) (fn [s] (assoc s :sources (conj (:sources s) (:path args))))))
+
+(defn eval-problem [ws args]
+  (let [file (find-file ws (:path args))]
+    (cond
+      (nil? file) :no-such-file
+      (not (= (:rev args) (:rev file))) :stale-basis
+      (nil? (find-form (:forms file) (:form args))) :no-form-selected
+      (and (= 0 (:stream args)) (<= 60 (count (:direct ws)))) :activity-full
+      (and (< 0 (:stream args)) (some? (stream-problem ws (:stream args)))) (stream-problem ws (:stream args))
+      :else nil)))
+
+(defn comment-problem [ws args]
+  (let [s (find-stream ws (:stream args))]
+    (cond
+      (nil? s) :no-such-stream
+      (some? (stream-problem ws (:stream args))) (stream-problem ws (:stream args))
+      (and (< 0 (:reply args)) (nil? (find-block s (:reply args)))) :no-such-block
+      (and (< 0 (:form args)) (nil? (find-file ws (:path args)))) :no-such-file
+      :else nil)))
+
+(defn cell-problem [ws args]
+  (let [s (find-stream ws (:stream args))
+        b (if (nil? s) nil (find-block s (:cell args)))]
+    (cond
+      (nil? s) :no-such-stream
+      (or (nil? b) (not (= :cell (:kind b)))) :no-such-cell
+      :else nil)))
+
+(defn decide-problem [ws args]
+  (let [s (find-stream ws (:stream args))
+        c (if (nil? s) nil (find-cand s (:cand args)))
+        step (:step args)
+        file (if (nil? c) nil (find-file ws (:path c)))]
+    (cond
+      (nil? c) :no-such-candidate
+      (some? (stream-problem ws (:stream args))) (stream-problem ws (:stream args))
+      (and (= step :verify) (:verified c)) :already-verified
+      (and (= step :save) (:saved c)) :already-saved
+      (and (= step :live) (:live c)) :already-live
+      (and (not (= step :verify)) (not (:verified c))) :not-verified
+      (and (= step :save) (not (= (:basis c) (:rev file)))) :stale-basis
+      :else nil)))
+
+(defn stream-count-problem [ws args]
+  (if (<= 8 (count (:streams ws))) :too-many-streams nil))
+
+; ── server-only: these choose ids, evaluate, or rewrite files ────────────────
+
+(defn append-to [ws sid b]
+  (if (= 0 sid)
+    (assoc ws :direct (conj (:direct ws) b))
+    (update-stream ws sid (fn [s] (assoc s :blocks (conj (:blocks s) b))))))
+
+(defn eval-form [ws args]
+  (let [file (find-file ws (:path args))
+        id (:next-id ws)]
+    (assoc (append-to ws (:stream args) (receipt ws file (:form args) id)) :next-id (inc id))))
+
+(defn add-comment [ws args]
+  (let [id (:next-id ws)]
+    (assoc (append-to ws (:stream args)
+                      (assoc (block id :comment "operator" (:text args))
+                             :reply (:reply args) :path (if (< 0 (:form args)) (:path args) "")
+                             :rev (:rev args) :form (:form args)))
+           :next-id (inc id))))
+
+(defn ask [ws args]
+  (let [id (:next-id ws)]
+    (assoc (append-to (append-to ws (:stream args) (block id :task "operator" (:text args)))
+                      (:stream args)
+                      (assoc (block (inc id) :model "harness" "No model provider is connected to this mockup. The turn is recorded; no response is invented.")
+                             :failed true))
+           :next-id (+ id 2))))
+
+(defn run-cell [ws args]
+  (let [s (find-stream ws (:stream args))
+        b (find-block s (:cell args))
+        r (read-source (:text b) 1)
+        env (load-defs (str "harness." (:slug s)) (:forms r))
+        v (if (some? (:error r)) (v-err (:error r))
+            (reduce (fn [_ f] (ev env f)) {:t :nil} (:forms r)))]
+    (update-stream ws (:stream args)
+                   (fn [st] (assoc st :blocks (mapv (fn [x] (if (= (:id x) (:id b))
+                                                              (assoc x :result (clip (show v) 400) :failed (= :err (:t v)))
+                                                              x))
+                                                    (:blocks st)))))))
+
+(defn candidate-checks
+  "Mock verification: the candidate's source must read, and every top-level
+   def must evaluate. Answers `[passed? lines]`."
+  [c ns]
+  (let [r (read-source (:source c) 1)]
+    (if (some? (:error r))
+      [false [(str "✗ reads · " (:error r))]]
+      (let [env (load-defs ns (:forms r))
+            bad (filterv (fn [k] (= :err (:t (get env k)))) (keys env))]
+        [(empty? bad)
+         [(str "✓ reads · " (count (:forms r)) " top-level forms")
+          (if (empty? bad) (str "✓ loads · " (dec (count env)) " vars defined")
+            (str "✗ loads · " (count bad) " def(s) fail"))]]))))
+
+(defn decide [ws args]
+  (let [sid (:stream args)
+        s (find-stream ws sid)
+        c (find-cand s (:cand args))
+        file (find-file ws (:path c))
+        step (:step args)
+        id (:next-id ws)
+        checks (if (= step :verify) (candidate-checks c (:ns file)) nil)
+        c2 (cond
+             (= step :verify) (assoc c :verified (first checks) :checks (second checks))
+             (= step :save) (assoc c :saved true)
+             :else (assoc c :live true))
+        ws1 (update-stream ws sid (fn [st] (assoc st :candidates (mapv (fn [x] (if (= (:id x) (:id c)) c2 x))
+                                                                       (:candidates st)))))
+        ws2 (if (= step :save)
+              (assoc ws1 :files (mapv (fn [f] (if (= (:path f) (:path c))
+                                                (assoc f :rev (inc (:rev f)) :forms (:forms (read-source (:source c) 1)))
+                                                f))
+                                      (:files ws1)))
+              ws1)
+        what (cond
+               (= step :verify) (if (first checks) "Verified" "Verification failed")
+               (= step :save) (str "Saved source · " (:path c) " rev " (inc (:rev file)))
+               :else "Made Live · the workspace image runs it; the file is unchanged")]
+    ; a decision records the file revision it acted on: Save's is the new one
+    (assoc (append-to ws2 sid (assoc (block id :decision "operator" (str what " · candidate v" (:version c)))
+                                     :ref (:id c) :path (:path c) :rev (:rev (find-file ws2 (:path c)))
+                                     :failed (and (= step :verify) (not (first checks)))))
+           :next-id (inc id))))
+
+(defn new-stream
+  "A new, empty Stream. Its id is the next free one, so the browser's
+   prediction and the server's commit agree."
+  [ws args]
+  (let [id (inc (reduce (fn [m s] (max m (:id s))) 0 (:streams ws)))]
+    (assoc ws :streams (conj (:streams ws)
+                             {:id id :slug (str "stream-" id) :title (:title args) :spec "" :spec-rev 1
+                              :sources [] :candidates [] :blocks []}))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Client-only — this tab's view
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn initial-local []
+  {:persp :stream :stream 1 :file "src/app/invoices.bl" :sel 0 :block 0 :cue ""
+   :palette false :q "" :editing false :spec nil :spec-basis 0 :comment "" :ask "" :title nil
+   :activity false :pane "" :snow false})
+
+(defn on-event [local event]
+  (let [kind (first event)
+        l (if (or (= kind :q) (= kind :palette)) local (assoc local :palette false))
+        arg (fn [i] (nth event i))]
+    (cond
+      (= kind :persp) {:local (assoc l :persp (arg 1) :activity false)}
+      (= kind :open-file) {:local (assoc l :persp :source :file (arg 1) :sel 0 :cue "" :activity false)}
+      (= kind :open-stream) {:local (assoc l :persp :stream :stream (arg 1) :block (arg 2) :pane "" :activity false
+                                           :editing false :spec nil)}
+      (= kind :pick) {:local (assoc l :sel (arg 1) :cue "")}
+      (= kind :move) {:local (assoc l :sel (arg 1) :cue (arg 2))}
+      (= kind :clear) {:local (assoc l :sel 0 :cue "")}
+      (= kind :pick-block) {:local (if (= "" (arg 2))
+                                     (assoc l :block (arg 1))
+                                     (assoc l :block (arg 1) :pane (arg 2) :file (arg 2) :sel (arg 3) :cue ""))}
+      (= kind :pane) {:local (assoc l :pane (arg 1) :file (arg 1) :sel 0 :cue "")}
+      (= kind :close-pane) {:local (assoc l :pane "")}
+      (= kind :palette) {:local (assoc l :palette (not (:palette local)) :q "")}
+      (= kind :close-palette) {:local l}
+      (= kind :q) {:local (assoc l :q (arg 1))}
+      (= kind :activity) {:local (assoc l :activity (not (:activity local)))}
+      (= kind :theme) {:local (assoc l :snow (not (:snow local)))}
+      ; the basis is the spec revision editing STARTED from: a save racing
+      ; another tab's is a :stale-basis refusal, and the draft survives it
+      (= kind :edit-spec) {:local (assoc l :editing true :spec nil :spec-basis (arg 1))}
+      (= kind :spec) {:local (assoc l :spec (arg 1))}
+      (= kind :discard-spec) {:local (assoc l :editing false :spec nil)}
+      (= kind :save-spec) (if (nil? (:spec local))
+                            {:local (assoc l :editing false)}
+                            {:local (assoc l :editing false :spec nil)
+                             :intent [:save-spec {:stream (arg 1) :spec (:spec local) :basis (:spec-basis local)}]})
+      (= kind :comment-draft) {:local (assoc l :comment (arg 1))}
+      (= kind :send-comment)
+        {:local (assoc l :comment "")
+         :intent [:comment (if (= :form (arg 2))
+                             {:stream (arg 1) :reply 0 :text (:comment local) :path (:file local) :rev (arg 3) :form (:sel local)}
+                             {:stream (arg 1) :reply (:block local) :text (:comment local) :path "" :rev 0 :form 0})]}
+      (= kind :ask-draft) {:local (assoc l :ask (arg 1))}
+      (= kind :ask) {:local (assoc l :ask "") :intent [:ask {:stream (arg 1) :text (:ask local)}]}
+      (= kind :eval) {:local l :intent [:eval-form {:stream (arg 1) :path (:file local) :rev (arg 2) :form (:sel local)}]}
+      (= kind :run-cell) {:local l :intent [:run-cell {:stream (arg 1) :cell (arg 2)}]}
+      (= kind :decide) {:local l :intent [:decide {:stream (arg 1) :cand (arg 2) :step (arg 3)}]}
+      (= kind :attach) {:local l :intent [:attach {:stream (arg 1) :path (arg 2)}]}
+      (= kind :new-open) {:local (assoc l :title "")}
+      (= kind :new-title) {:local (assoc l :title (arg 1))}
+      (= kind :new-cancel) {:local (assoc l :title nil)}
+      (= kind :new-stream) {:local (assoc l :title nil :persp :stream :stream -1 :block 0 :pane "")
+                            :intent [:new-stream {:title (or (:title local) "")}]}
+      :else {:local local})))
+
+; ── search: ASCII case folding ───────────────────────────────────────────────
+
+(defn fold-char [c]
+  (get {"A" "a" "B" "b" "C" "c" "D" "d" "E" "e" "F" "f" "G" "g" "H" "h" "I" "i" "J" "j" "K" "k" "L" "l"
+        "M" "m" "N" "n" "O" "o" "P" "p" "Q" "q" "R" "r" "S" "s" "T" "t" "U" "u" "V" "v" "W" "w" "X" "x"
+        "Y" "y" "Z" "z"}
+       c c))
+
+(defn fold-case [s]
+  (let [n (count s)]
+    (loop [i 0 acc ""]
+      (if (< i n) (recur (inc i) (str acc (fold-char (subs s i (inc i))))) acc))))
+
+(defn matches? [text q]
+  (let [t (fold-case text) f (fold-case q) n (count f)]
+    (loop [i 0]
+      (cond
+        (< (- (count t) n) i) false
+        (= f (subs t i (+ i n))) true
+        :else (recur (inc i))))))
+
+; ── what the view reads ──────────────────────────────────────────────────────
+
+(defn cur-stream [ws local]
+  (if (< (:stream local) 0)
+    (last (:streams ws))
+    (or (find-stream ws (:stream local)) (first (:streams ws)))))
+
+(defn cur-file [ws local] (or (find-file ws (:file local)) (first (:files ws))))
+
+(defn eval-context
+  "Where an evaluation from this view lands: the open Stream when the source
+   is a pane inside it, else the file's own activity (0)."
+  [ws local]
+  (if (= :stream (:persp local)) (:id (cur-stream ws local)) 0))
+
+(defn all-receipts
+  "Every receipt on `path` with the Stream that owns it (0 = direct)."
+  [ws path]
+  (into (mapv (fn [b] {:sid 0 :b b}) (filterv (fn [b] (= path (:path b))) (:direct ws)))
+        (reduce (fn [acc s] (into acc (mapv (fn [b] {:sid (:id s) :b b})
+                                            (filterv (fn [b] (and (= :receipt (:kind b)) (= path (:path b))))
+                                                     (:blocks s)))))
+                [] (:streams ws))))
+
+(defn newest
+  "The most recent receipt among `rs`: block ids only grow, so the largest
+   id is the latest, whichever Stream (or the file itself) owns it."
+  [rs]
+  (reduce (fn [best r] (if (or (nil? best) (< (:id (:b best)) (:id (:b r)))) r best)) nil rs))
+
+(defn last-receipt-in [ws file top]
+  (newest (filterv (fn [r] (and (= (:rev (:b r)) (:rev file)) (some? (find-form [top] (:form (:b r))))))
+                   (all-receipts ws (:path file)))))
+
+(defn receipt-for [ws file id]
+  (newest (filterv (fn [r] (and (= (:rev (:b r)) (:rev file)) (= id (:form (:b r)))))
+                   (all-receipts ws (:path file)))))
+
+(defn move-ev [m] [:move (:id m) (:cue m)])
+
+(defn actions
+  "The command palette: every action this view offers, by name and key."
+  [ws local]
+  (let [file (cur-file ws local)
+        s (cur-stream ws local)
+        forms (:forms file)
+        sel (:sel local)
+        has-sel (some? (find-form forms sel))
+        src (or (= :source (:persp local)) (not (= "" (:pane local))))]
+    (filterv some?
+      (into
+        [{:label (if (= :source (:persp local)) "Switch to Stream" "Switch to Source") :key "s"
+          :ev [:persp (if (= :source (:persp local)) :stream :source)]}
+         (if (and src has-sel) {:label "Go to first child" :key "j" :ev (move-ev (motion forms sel :j))} nil)
+         (if (and src has-sel) {:label "Go to parent" :key "k" :ev (move-ev (motion forms sel :k))} nil)
+         (if (and src has-sel) {:label "Go to previous form" :key "h" :ev (move-ev (motion forms sel :h))} nil)
+         (if (and src has-sel) {:label "Go to next form" :key "l" :ev (move-ev (motion forms sel :l))} nil)
+         (if (and src has-sel) {:label "Evaluate selected form" :key "Enter"
+                                :ev [:eval (eval-context ws local) (:rev file)]} nil)
+         (if (and src (not has-sel) (not (empty? forms)))
+           {:label "Explore forms" :key "" :ev [:pick (:id (first forms))]} nil)
+         {:label (if (:activity local) "Close Activity" "Open Activity") :key "a" :ev [:activity]}
+         {:label "New Stream" :key "" :ev [:new-open]}
+         {:label (if (:snow local) "Theme: Carbon" "Theme: Snow") :key "t" :ev [:theme]}]
+        (into (into (mapv (fn [f] {:label (str "Open source " (:path f)) :key "" :ev [:open-file (:path f)]}) (:files ws))
+                    (mapv (fn [st] {:label (str "Open Stream · " (:title st)) :key "" :ev [:open-stream (:id st) 0]})
+                          (:streams ws)))
+              (mapv (fn [f] (if (member? (:sources s) (:path f)) nil
+                              {:label (str "Attach source " (:path f) " to " (:title s)) :key ""
+                               :ev [:attach (:id s) (:path f)]}))
+                    (:files ws)))))))
+
+; ── the view: code ───────────────────────────────────────────────────────────
+
+(defn special? [t] (member? ["def" "defn" "ns" "fn" "let" "if" "when" "loop"] t))
+
+(defn form-view
+  "One form and, inside it, each child. A collection is picked by its
+   delimiters, an atom by itself — never both at once."
+  [f sel]
+  (let [k (:kind f)
+        cls (str "f " (name k) (if (= sel (:id f)) " sel" ""))]
+    (if (coll-kind? k)
+      [:span {:key (str "f" (:id f)) :class cls}
+       [:span {:class "d" :on-click [:pick (:id f)]} (open-of k)]
+       (mapv (fn [kid] [(cond (<= 0 (:col kid)) (str "\n" (spaces (:col kid)))
+                              (= (:id kid) (:id (first (:kids f)))) ""
+                              :else " ")
+                        (form-view kid sel)])
+             (:kids f))
+       [:span {:class "d" :on-click [:pick (:id f)]} (close-of k)]]
+      [:span {:key (str "f" (:id f))
+              :class (str cls (if (and (= k :symbol) (special? (:text f))) " sp" ""))
+              :on-click [:pick (:id f)]}
+       (:text f)])))
+
+(defn kind-label [k] (get {:list "list" :vector "vector" :map "map" :symbol "symbol" :number "number"
+                           :string "string" :keyword "keyword"} k "form"))
+
+(defn code-view [ws file local compact]
+  [:div {:class (if compact "code compact" "code") :role "group" :aria-label (str "Source of " (:path file))}
+   (mapv (fn [top]
+           (let [r (last-receipt-in ws file top)]
+             [:div {:key (str "t" (:id top)) :class "tl"}
+              [:div {:class "src"} (form-view top (:sel local))]
+              (if (nil? r)
+                ""
+                [:div {:class (if (:failed (:b r)) "inline err" "inline")}
+                 [:span {:class "arrow"} "⇒"] (:result (:b r))
+                 [:small {} (str (if (= 0 (:sid r)) "source activity" (str "Stream · " (:title (find-stream ws (:sid r)))))
+                                 " · " (:text (:b r)))]])]))
+         (:forms file))])
+
+(defn file-head [ws file local compact]
+  (let [live-cand (some? (live-cand ws (:path file)))]
+    [:div {:class "filehead"}
+     [:strong {:class "path"} (:path file)]
+     [:span {:class "pill"} (str "rev " (:rev file))]
+     [:span {:class "pill"} (:ns file)]
+     (if live-cand [:span {:class "pill live"} "image runs a live candidate"] "")
+     [:span {:class "grow"} ""]
+     [:span {:class "mode"} (if (some? (find-form (:forms file) (:sel local))) "Explore · form selected" "Explore")]
+     (if compact [:button {:class "ghost" :aria-label "Close source pane" :on-click [:close-pane]} "✕"] "")]))
+
+; ── the view: stream blocks ──────────────────────────────────────────────────
+
+(defn author-line [label b extra]
+  [:div {:class "who"} [:span {:class (str "tag " (name (:kind b)))} label] [:span {:class "by"} (:author b)] extra])
+
+(defn anchor-label [b]
+  (cond
+    (< 0 (:form b)) (str "on a form in " (:path b) " @ rev " (:rev b))
+    (< 0 (:reply b)) (str "reply to #" (:reply b))
+    :else ""))
+
+(defn hunk-view [hunk]
+  [:div {:class "hunk"}
+   (mapv (fn [line]
+           (let [c (if (= "" line) "" (subs line 0 1))]
+             [:div {:class (cond (= c "+") "ln add" (= c "-") "ln del" (= c "@") "ln at" :else "ln")} (if (= "" line) " " line)]))
+         (lines-of hunk))])
+
+(defn lines-of [s]
+  (let [n (count s)]
+    (loop [i 0 start 0 acc []]
+      (cond
+        (<= n i) (conj acc (subs s start n))
+        (= "\n" (subs s i (inc i))) (recur (inc i) (inc i) (conj acc (subs s start i)))
+        :else (recur (inc i) start acc)))))
+
+(defn pointer [label on]
+  [:span {:class (if on "ptr on" "ptr")} (if on "● " "○ ") label])
+
+(defn candidate-view [sid c file]
+  [:div {:class "cand"}
+   [:div {:class "ptrs"}
+    (pointer "Made" true) (pointer "Verified" (:verified c)) (pointer "Saved" (:saved c)) (pointer "Live" (:live c))]
+   [:p {:class "summary"} (:summary c)]
+   (hunk-view (:hunk c))
+   (if (empty? (:checks c)) "" [:ul {:class "checks"} (mapv (fn [x] [:li {} x]) (:checks c))])
+   [:div {:class "acts"}
+    [:button {:disabled (:verified c) :on-click [:decide sid (:id c) :verify]} "Verify"]
+    [:button {:disabled (or (:saved c) (not (:verified c))) :on-click [:decide sid (:id c) :save]
+              :title (str "Basis-guarded write of " (:path c) " (basis rev " (:basis c) ")")} "Save source"]
+    [:button {:disabled (or (:live c) (not (:verified c))) :on-click [:decide sid (:id c) :live]
+              :title "Install in the workspace image; the file is not written"} "Make Live"]
+    [:small {} (str "basis rev " (:basis c) (if (and (some? file) (not (= (:basis c) (:rev file))))
+                                                (str " · file is now rev " (:rev file)) ""))]]])
+
+(defn block-view [ws s b local]
+  (let [sel (= (:id b) (:block local))
+        k (:kind b)
+        file (if (= "" (:path b)) nil (find-file ws (:path b)))
+        stale (and (some? file) (< 0 (:rev b)) (not (= (:rev b) (:rev file))))
+        pick [:pick-block (:id b) (if (< 0 (:form b)) (:path b) "") (if stale 0 (:form b))]]
+    [:li {:key (str "b" (:id b))
+          :class (str "blk " (name k) (if sel " sel" "") (if (< 0 (:reply b)) " reply" "") (if (:failed b) " failed" ""))}
+     [:div {:class "hit" :on-click pick}
+      (cond
+        (= k :cell)
+          [:div {}
+           (author-line "cell" b [:span {:class "rt"} (:runtime b)])
+           [:div {:class "code cell"} (:text b)]
+           [:div {:class (if (:failed b) "result err" "result")} [:span {:class "arrow"} "⇒"] (if (= "" (:result b)) "not run" (:result b))]]
+        (= k :receipt)
+          [:div {}
+           (author-line "eval" b [:span {:class "rt"} (:runtime b)])
+           [:div {:class "code cell"} (:text b)]
+           [:div {:class (if (:failed b) "result err" "result")} [:span {:class "arrow"} "⇒"] (:result b)]
+           [:small {:class "prov"} (str (:path b) " @ rev " (:rev b) (if stale " · an earlier revision" ""))]]
+        (= k :candidate)
+          (let [c (find-cand s (:ref b))]
+            [:div {}
+             (author-line (str "candidate v" (:version c)) b [:span {:class "rt"} (:path c)])
+             (candidate-view (:id s) c file)])
+        (= k :decision)
+          [:div {:class "decided"} [:span {:class "tag decision"} "decision"] (:text b)]
+        :else
+          [:div {}
+           (author-line (name k) b [:span {:class "rt"} (anchor-label b)])
+           [:p {:class "prose"} (:text b)]
+           (if stale [:small {:class "prov"} "anchored to an earlier revision · re-anchor explicitly"] "")])]
+     (if (and (= k :cell) sel)
+       [:div {:class "acts"} [:button {:on-click [:run-cell (:id s) (:id b)]} "Run cell"]
+        [:small {} "in the Stream harness namespace; the result replaces this cell's"]]
+       "")]))
+
+(defn spec-view [s local]
+  (let [editing (:editing local)
+        draft (:spec local)]
+    [:section {:class "spec"}
+     [:div {:class "sechead"}
+      [:h2 {} "Spec"]
+      (cond
+        (some? draft) [:span {:class "pill draft"} "Draft · unsaved"]
+        editing [:span {:class "pill"} "Editing"]
+        :else [:span {:class "pill"} (str "saved · rev " (:spec-rev s))])
+      [:span {:class "grow"} ""]
+      (if editing
+        [:span {}
+         [:button {:class "ghost" :on-click [:discard-spec]} "Discard"]
+         [:button {:class "primary" :on-click [:save-spec (:id s)]} "Save Stream"]]
+        [:button {:class "ghost" :on-click [:edit-spec (:spec-rev s)]} "Edit"])]
+     (if editing
+       [:textarea {:class "spec-edit" :value (or draft (:spec s)) :maxlength 256 :autofocus true
+                   :aria-label "Stream spec" :on-input [:spec] :on-escape [:discard-spec]}]
+       [:div {:class "prose spec-text" :on-dblclick [:edit-spec (:spec-rev s)]}
+        (if (= "" (:spec s)) [:em {} "No spec yet — state an intent before choosing any file."]
+          (mapv (fn [line] [:p {} line]) (lines-of (:spec s))))])]))
+
+(defn sources-view [ws s local]
+  [:section {:class "sources"}
+   [:div {:class "sechead"} [:h2 {} "Sources"] [:small {} (if (empty? (:sources s)) "none yet — a Stream needs no file" "")]]
+   [:ul {}
+    (mapv (fn [p]
+            (let [f (find-file ws p)]
+              [:li {:key (str "s" p) :class (if (= p (:pane local)) "on" "")}
+               [:button {:class "link" :on-click [:pane p]} p]
+               [:span {:class "pill"} (str "rev " (:rev f))]]))
+          (:sources s))]
+   [:div {:class "attach"}
+    (mapv (fn [f] (if (member? (:sources s) (:path f)) ""
+                    [:button {:key (str "a" (:path f)) :class "ghost" :on-click [:attach (:id s) (:path f)]}
+                     (str "+ Attach " (:path f))]))
+          (:files ws))]])
+
+(defn history? [b] (member? [:task :model :cell :receipt :candidate :decision :steer] (:kind b)))
+
+(defn stream-view [ws s local]
+  (let [blocks (if (:activity local) (filterv history? (:blocks s)) (:blocks s))
+        target (find-block s (:block local))]
+    [:article {:class "doc"}
+     [:header {:class "dochead"}
+      [:h1 {} (str "Stream · " (:title s))]
+      [:small {} (str "streams/" (:slug s) ".bl.md · id " (:slug s) "-v1")]]
+     (spec-view s local)
+     (sources-view ws s local)
+     [:section {:class "history"}
+      [:div {:class "sechead"} [:h2 {} (if (:activity local) "Activity · history only" "Document")]
+       [:small {} (str (count (:blocks s)) " blocks")]]
+      (if (empty? blocks) [:p {:class "empty"} "Nothing recorded yet."] "")
+      [:ol {:class "blocks"} (mapv (fn [b] (block-view ws s b local)) blocks)]]
+     [:section {:class "composer"}
+      [:div {:class "row"}
+       [:input {:type "text" :value (:ask local) :maxlength 256 :placeholder "Ask or direct the next turn"
+                :aria-label "Task for the next turn" :on-input [:ask-draft] :on-enter [:ask (:id s)]}]
+       [:button {:disabled (= "" (:ask local)) :on-click [:ask (:id s)]} "Record turn"]]
+      [:div {:class "row"}
+       [:input {:type "text" :value (:comment local) :maxlength 256
+                :placeholder (if (nil? target) "Comment on this Stream" (str "Reply to #" (:id target)))
+                :aria-label "Comment" :on-input [:comment-draft] :on-enter [:send-comment (:id s) :block 0]}]
+       [:button {:disabled (= "" (:comment local)) :on-click [:send-comment (:id s) :block 0]} "Comment"]]]]))
+
+; ── the view: activity lens on a source file ─────────────────────────────────
+
+(defn source-activity [ws file]
+  (let [direct (filterv (fn [b] (= (:path file) (:path b))) (:direct ws))
+        groups (filterv (fn [g] (not (empty? (:bs g))))
+                        (mapv (fn [s] {:s s :bs (filterv (fn [b] (= (:path file) (:path b))) (:blocks s))}) (:streams ws)))
+        item (fn [sid b]
+               [:li {:key (str "x" (:id b))}
+                [:button {:class "act" :on-click (if (= 0 sid) [:pick (:form b)] [:open-stream sid (:id b)])}
+                 [:span {:class (str "tag " (name (:kind b)))} (name (:kind b))]
+                 [:span {:class "what"} (if (= :receipt (:kind b)) (str (:text b) " ⇒ " (:result b)) (:text b))]
+                 [:small {} (str "rev " (:rev b) (if (= (:rev b) (:rev file)) "" " · earlier revision"))]]])]
+    [:section {:class "activity"}
+     [:div {:class "sechead"} [:h2 {} (str "Activity · " (:path file))]
+      [:small {} "projected from Streams and direct evaluations that cite this file"]]
+     (if (and (empty? direct) (empty? groups))
+       [:p {:class "empty"} "No tracked events for this file. Nothing is inferred from timestamps."]
+       [:div {}
+        (if (empty? direct) ""
+          [:div {:class "group"} [:h3 {} "Direct · source activity"] [:ul {} (mapv (fn [b] (item 0 b)) direct)]])
+        (mapv (fn [g] [:div {:key (str "g" (:id (:s g))) :class "group"}
+                       [:h3 {} (str "Stream · " (:title (:s g)))]
+                       [:ul {} (mapv (fn [b] (item (:id (:s g)) b)) (:bs g))]])
+              groups)])]))
+
+; ── the view: inspector ──────────────────────────────────────────────────────
+
+(defn form-inspector [ws file local sid]
+  (let [f (find-form (:forms file) (:sel local))
+        path (path-in (:forms file) (:sel local))
+        r (if (nil? f) nil (receipt-for ws file (:id f)))
+        notes (reduce (fn [acc s] (into acc (filterv (fn [b] (and (= :comment (:kind b)) (= (:path file) (:path b))
+                                                                  (= (:rev file) (:rev b)) (= (:sel local) (:form b))))
+                                                     (:blocks s))))
+                      [] (:streams ws))
+        cands (reduce (fn [acc s] (into acc (filterv (fn [c] (= (:path file) (:path c))) (:candidates s)))) [] (:streams ws))]
+    (if (nil? f)
+      [:div {:class "insp-empty"}
+       [:p {} "Select a form: click an atom, or a bracket for its whole collection."]
+       [:p {:class "muted"} "Then j k h l move by structure, ⏎ evaluates. Search actions lists every move."]
+       (if (empty? (:forms file)) "" [:button {:on-click [:pick (:id (first (:forms file)))]} "Explore forms"])]
+      [:div {}
+       [:div {:class "kv"}
+        [:span {} "kind"] [:strong {} (kind-label (:kind f))]
+        [:span {} "where"] [:span {} (str (:path file) " @ rev " (:rev file))]
+        [:span {} "depth"] [:span {} (str (count path) (if (= 1 (count path)) " · top level" ""))]
+        [:span {} "runtime"] [:span {} (image-label ws file)]
+        [:span {} "receipt to"] [:span {} (if (= 0 sid) "this file's activity" "the open Stream")]]
+       [:div {:class "code cell"} (form-src f)]
+       (if (= "" (:cue local)) "" [:p {:class "cue" :role "status"} (:cue local)])
+       [:div {:class "acts"}
+        [:button {:class "primary" :on-click [:eval sid (:rev file)]} "Evaluate form"]
+        [:button {:disabled (empty? (:kids f)) :on-click (move-ev (motion (:forms file) (:id f) :j))} "Explore children"]
+        [:button {:class "ghost" :on-click [:clear]} "Clear"]]
+       (if (nil? r) [:p {:class "muted"} "Not evaluated at this revision. Hover never evaluates."]
+         [:div {:class (if (:failed (:b r)) "result err" "result")} [:span {:class "arrow"} "⇒"] (:result (:b r))
+          [:small {:class "prov"} (str "receipt #" (:id (:b r)) " · " (:runtime (:b r)))]])
+       [:h3 {} "Comments on this form"]
+       (if (empty? notes) [:p {:class "muted"} "None at this revision."]
+         [:ul {:class "notes"} (mapv (fn [b] [:li {:key (str "n" (:id b))} [:strong {} (:author b)] " " (:text b)]) notes)])
+       (if (< 0 sid)
+         [:div {:class "row"}
+          [:input {:type "text" :value (:comment local) :maxlength 256 :placeholder "Comment on this form"
+                   :aria-label "Comment on this form" :on-input [:comment-draft] :on-enter [:send-comment sid :form (:rev file)]}]]
+         [:p {:class "muted"} "Comments on a form live in a Stream — open one to add them."])
+       (if (empty? cands) ""
+         [:div {} [:h3 {} "Related proposals"]
+          [:ul {:class "notes"} (mapv (fn [c] [:li {:key (str "c" (:id c))} (str "candidate v" (:version c) " · " (:summary c))]) cands)]])])))
+
+(defn block-inspector [ws s local]
+  (let [b (find-block s (:block local))]
+    (if (nil? b)
+      [:div {}
+       [:div {:class "kv"}
+        [:span {} "stream"] [:strong {} (:title s)]
+        [:span {} "document"] [:span {} (str "streams/" (:slug s) ".bl.md")]
+        [:span {} "spec"] [:span {} (str "rev " (:spec-rev s))]
+        [:span {} "sources"] [:span {} (str (count (:sources s)))]
+        [:span {} "blocks"] [:span {} (str (count (:blocks s)))]]
+       [:p {:class "muted"} "Select a heading, cell, comment or candidate to see it here."]]
+      [:div {}
+       [:div {:class "kv"}
+        [:span {} "block"] [:strong {} (str "#" (:id b) " · " (name (:kind b)))]
+        [:span {} "author"] [:span {} (:author b)]
+        [:span {} "anchor"] [:span {} (let [a (anchor-label b)] (if (= "" a) "the Stream" a))]
+        [:span {} "replies"] [:span {} (str (count (filterv (fn [x] (= (:id b) (:reply x))) (:blocks s))))]]
+       (if (= "" (:runtime b)) "" [:p {:class "muted"} (str "runtime · " (:runtime b))])
+       [:p {:class "muted"} "Reply from the composer below the document."]])))
+
+; ── the view: chrome ─────────────────────────────────────────────────────────
+
+(defn palette-view [ws local]
+  (let [all (actions ws local)
+        shown (if (= "" (:q local)) all (filterv (fn [a] (matches? (:label a) (:q local))) all))]
+    [:div {:class "scrim"}
+     [:div {:class "palette" :role "dialog" :aria-label "Search actions"}
+      [:input {:type "text" :value (:q local) :maxlength 60 :autofocus true :placeholder "Search actions"
+               :aria-label "Search actions" :on-input [:q]
+               :on-enter (if (empty? shown) [:close-palette] (:ev (first shown))) :on-escape [:close-palette]}]
+      (if (empty? shown) [:p {:class "empty"} "No action matches."] "")
+      [:ul {}
+       (mapv (fn [a] [:li {:key (str "p" (:label a))}
+                      [:button {:class "action" :on-click (:ev a)}
+                       [:span {} (:label a)] (if (= "" (:key a)) "" [:kbd {} (:key a)])]])
+             shown)]]]))
+
+(defn note-banner [note]
+  (if (nil? note)
+    ""
+    [:p {:class (str "note " (name (:where note)))}
+     [:strong {} (cond
+                   (= :client (:where note)) "Checked in your browser: "
+                   (= :server (:where note)) "Refused by the server: "
+                   :else "Not sent: ")]
+     (name (:reason note))]))
+
+(defn pending-chip [sync]
+  (let [n (count (:pending sync))]
+    (cond
+      (= :down (:link sync)) [:span {:class "pill warn"} (str "offline · " n " queued")]
+      (< 0 n) [:span {:class "pill busy"} (str (name (:op (first (:pending sync)))) " · waiting for the server")]
+      :else [:span {:class "pill ok"} (str "rev " (:revision sync))])))
+
+(defn new-stream-view [local]
+  (if (nil? (:title local))
+    ""
+    [:div {:class "scrim"}
+     [:div {:class "palette" :role "dialog" :aria-label "New Stream"}
+      [:h2 {} "New Stream"]
+      [:p {:class "muted"} "A Stream can start with no source file."]
+      [:input {:type "text" :value (:title local) :maxlength 60 :autofocus true :placeholder "Title"
+               :aria-label "Stream title" :on-input [:new-title] :on-enter [:new-stream] :on-escape [:new-cancel]}]
+      [:div {:class "acts"}
+       [:button {:class "ghost" :on-click [:new-cancel]} "Cancel"]
+       [:button {:class "primary" :disabled (= "" (:title local)) :on-click [:new-stream]} "Create"]]]]))
+
+(defn motion-keys [file local sid]
+  (let [forms (:forms file) sel (:sel local)]
+    (if (nil? (find-form forms sel))
+      {}
+      {"j" (move-ev (motion forms sel :j)) "k" (move-ev (motion forms sel :k))
+       "h" (move-ev (motion forms sel :h)) "l" (move-ev (motion forms sel :l))
+       "Enter" [:eval sid (:rev file)] "Escape" [:clear]})))
+
+(defn workspace-view [ws local sync]
+  (let [s (cur-stream ws local)
+        file (cur-file ws local)
+        source (= :source (:persp local))
+        pane (and (not source) (not (= "" (:pane local))))
+        sid (eval-context ws local)
+        modal (or (:palette local) (some? (:title local)))
+        keys (if modal {}
+               (merge-keys {"/" [:palette] "?" [:palette] "t" [:theme] "a" [:activity]
+                            "s" [:persp (if source :stream :source)]}
+                           (if (or source pane) (motion-keys file local sid) {})))]
+    [:section {:class (str "ws" (if (:snow local) " snow" "")) :keys keys}
+     [:header {:class "bar"}
+      [:nav {:class "crumb" :aria-label "Location"}
+       [:span {:class "proj"} "invoices-app"]
+       [:span {:class "sep"} "/"]
+       [:strong {} (if source (:path file) (str "Stream · " (:title s)))]]
+      [:div {:class "seg" :role "tablist" :aria-label "Perspective"}
+       [:button {:role "tab" :aria-pressed source :class (if source "on" "") :on-click [:persp :source]} "Source"]
+       [:button {:role "tab" :aria-pressed (not source) :class (if source "" "on") :on-click [:persp :stream]} "Stream"]]
+      [:span {:class "grow"} ""]
+      (pending-chip sync)
+      [:button {:class (if (:activity local) "chip on" "chip") :aria-pressed (:activity local) :on-click [:activity]} "Activity"]
+      [:button {:class "search" :on-click [:palette]} "Search actions" [:kbd {} "/"]]
+      [:button {:class "chip" :title "Carbon / Snow" :on-click [:theme]} (if (:snow local) "Carbon" "Snow")]]
+     (note-banner (:note sync))
+     [:div {:class (str "body" (if pane " with-pane" ""))}
+      [:div {:class "surface"}
+       (if source
+         [:div {:class "editor"}
+          (file-head ws file local false)
+          (if (:activity local) (source-activity ws file) (code-view ws file local false))]
+         (stream-view ws s local))]
+      (if pane
+        [:div {:class "pane"} (file-head ws file local true) (code-view ws file local true)]
+        "")
+      [:aside {:class "inspector" :aria-label "Inspector"}
+       [:h2 {} (if (or source pane) "Selected form" "Selected block")]
+       (if (or source pane) (form-inspector ws file local sid) (block-inspector ws s local))]]
+     (if (:palette local) (palette-view ws local) "")
+     (new-stream-view local)]))
+
+(defn merge-keys [a b] (reduce (fn [m k] (assoc m k (get b k))) a (keys b)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The declaration the build reads
+; ─────────────────────────────────────────────────────────────────────────────
+
+(split/defapp workspace
+  {:wire {:form [:record {:id [:int 1 9999] :kind [:one-of :list :vector :map :symbol :number :string :keyword]
+                          :text [:text 0 200] :kids [:list 64 :form] :col [:int -1 200]}]
+          :file [:record {:path [:text 1 80] :ns [:text 1 60] :rev [:int 1 9999] :forms [:list 64 :form]}]
+          :block [:record {:id [:int 1 9999]
+                           :kind [:one-of :task :model :cell :comment :steer :receipt :candidate :decision]
+                           :author [:text 0 60] :text [:text 0 2000] :result [:text 0 400] :failed :bool
+                           :reply [:int 0 9999] :path [:text 0 80] :rev [:int 0 9999] :form [:int 0 9999]
+                           :ref [:int 0 99] :runtime [:text 0 80]}]
+          :candidate [:record {:id [:int 1 99] :version [:int 1 99] :path [:text 1 80] :basis [:int 1 9999]
+                               :summary [:text 0 200] :hunk [:text 0 2000] :verified :bool :saved :bool :live :bool
+                               :checks [:list 8 [:text 0 120]]}]
+          :stream [:record {:id [:int 1 99] :slug [:text 1 60] :title [:text 1 60] :spec [:text 0 2000]
+                            :spec-rev [:int 1 9999] :sources [:list 8 [:text 1 80]]
+                            :blocks [:list 256 :block] :candidates [:list 8 :candidate]}]
+          :workspace [:record {:files [:list 8 :file] :streams [:list 8 :stream] :direct [:list 64 :block]}]}
+   :server {:init initial-workspace :snapshot :workspace :private [ev]}
+   :client {:init initial-local :view workspace-view :on on-event}
+   :intents {:save-spec {:params {:stream [:int 1 99] :spec [:text 0 2000] :basis [:int 1 9999]}
+                         :check spec-problem :predict save-spec :apply save-spec}
+             :attach {:params {:stream [:int 1 99] :path [:text 1 80]}
+                      :check attach-problem :predict attach :apply attach}
+             :eval-form {:params {:stream [:int 0 99] :path [:text 1 80] :rev [:int 1 9999] :form [:int 0 9999]}
+                         :check eval-problem :apply eval-form}
+             :comment {:params {:stream [:int 1 99] :reply [:int 0 9999] :text [:text 1 400]
+                                :path [:text 0 80] :rev [:int 0 9999] :form [:int 0 9999]}
+                       :check comment-problem :apply add-comment}
+             :ask {:params {:stream [:int 1 99] :text [:text 1 400]}
+                   :check ask-problem :apply ask}
+             :run-cell {:params {:stream [:int 1 99] :cell [:int 1 9999]}
+                        :check cell-problem :apply run-cell}
+             :decide {:params {:stream [:int 1 99] :cand [:int 1 99] :step [:one-of :verify :save :live]}
+                      :check decide-problem :apply decide}
+             :new-stream {:params {:title [:text 1 60]}
+                          :check stream-count-problem :predict new-stream :apply new-stream}}})

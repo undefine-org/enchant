@@ -329,9 +329,13 @@ mark = client.frames.length;
 client.tell({ kind: 'event', event: [':submit'] });
 const secret = (await client.next('propose', mark)).value;
 r = await app.post(secret);
+// the submit's own render follows its `propose`, so it may still be in flight
+// here: wait for the render that shows the server's answer, not the next one
 mark = client.frames.length;
 client.tell({ kind: 'result', frame: r.body });
 view = await client.next('view', mark);
+for (let i = mark; !texts(view.value.tree).includes('Refused by the server: ') && i < mark + 64; i++)
+  view = await client.next('view', client.frames.indexOf(view) + 1);
 assert.ok(texts(view.value.tree).includes('Refused by the server: '));
 assert.ok(texts(view.value.tree).includes('looks-like-a-credential'));
 assert.equal(inputOf(view.value.tree).value, 'the secret plan', 'a refused submit gives the draft back');

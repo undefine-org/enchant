@@ -279,6 +279,8 @@ function runs** and emits three artifacts:
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
+BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
+  JS_ACTORS_APP=workspace ./bin/bl run research/js-actors/compiler.bl  # ONE app under apps/, ~1.5 min
 node research/js-actors/verify-split.mjs                                # 28 end-to-end checks
 node research/js-actors/verify-outline.mjs                              # the nested-plan app, 22 checks
 node research/js-actors/verify-groceries.mjs                            # instant + offline, 22 checks
@@ -286,15 +288,16 @@ node research/js-actors/verify-team.mjs                                 # identi
 node research/js-actors/verify-session.mjs                              # session cookies, log parsing
 node research/js-actors/verify-triage.mjs                               # keys, drag-and-drop, inline edit
 node research/js-actors/verify-ledger.mjs                               # exact money beyond 2^53
+node research/js-actors/verify-workspace.mjs                            # the generative-editor mockup, 21 checks
 node research/js-actors/verify-numeric-exact.mjs                        # host exact-integer edge cases
 node research/js-actors/verify-shell.mjs                                # the shared page/server shell
-node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators/exact-int/map+set order = BEAM, 95 answers
+node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators/exact-int/map+set order = BEAM, 102 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
 node research/js-actors/split-server.mjs --port 8792 --app outline      # any app under apps/
 ```
 
 **All of them at once:** `node research/js-actors/showcase-all.mjs --base 8801`
-starts every built app on its own port (8802–8807) and a gallery on 8801
+starts every built app on its own port (8802–8808) and a gallery on 8801
 that says what each one shows ([proof/gallery.png](proof/gallery.png)). Every
 screenshot and measurement behind the table below is in
 [proof/PROOF.md](proof/PROOF.md).
@@ -314,6 +317,7 @@ evidence, timeline, contract) collapses to give the app the whole width.
 | `apps/team.bl` — a team's task board | **who and when**: sign-in, sessions the transport stamps on every proposal, permissions in BL (`:allow`), presence, "assigned to me"; a durable log replayed at boot, an activity feed, shared undo/redo, "view as of" | `verify-team.mjs`, [proof/track4-team-lead.png](proof/track4-team-lead.png), [proof/track5-team-history.png](proof/track5-team-history.png) |
 | `apps/triage.bl` — a bug inbox cleared by keyboard | **interaction as data**: a keymap in the view (`j`/`k`/`x`/`e`/`p`/`?`), drag-and-drop reorder (a team-wide, predicted intent), inline rename (⏎/esc/blur), focus that follows the selection | `verify-triage.mjs`, [proof/track6-triage.png](proof/track6-triage.png) |
 | `apps/ledger.bl` — household ledger | **numbers the browser gets right**: exact integer money beyond 2^53 (BigInt promotion, a `:exact` wire type carrying digits), formatting and a `group-by` breakdown in the browser identical to the BEAM | `verify-ledger.mjs`, `verify-numeric-exact.mjs`, [proof/track7-ledger.png](proof/track7-ledger.png) |
+| `apps/workspace.bl` — the generative editor (mockup) | **the Source/Stream direction, functional**: [docs/design/workspace-editor.md](../../docs/design/workspace-editor.md) in Carbon/Snow. Source and Stream at full size, a contextual inspector, one command palette, Activity as a projection; the [form-motion contract](../../docs/design/form-first-interaction.md) (`j`/`k`/`h`/`l`, both climb rules, boundary cues) computed in the browser over a form tree the server reads; `Evaluate form` as a revision-guarded intent with a receipt; Made/Verified/Saved/Live as four decisions. The model and the runtime are mocks and say so | `verify-workspace.mjs`, [proof/workspace-carbon-source.png](proof/workspace-carbon-source.png), [proof/workspace-carbon-stream.png](proof/workspace-carbon-stream.png), [proof/workspace-snow-activity.png](proof/workspace-snow-activity.png), [proof/workspace-snow-palette.png](proof/workspace-snow-palette.png) |
 | `apps/outline.bl` — nested project plan | **data of any shape**: a recursive wire type, a recursive view, recursive roll-ups, search that keeps ancestors, a whole subtree ticked at once | `verify-outline.mjs`, [proof/track2-outline.png](proof/track2-outline.png), [proof/track2-outline-search.png](proof/track2-outline-search.png) |
 
 **The declaration.** Roots only — nothing says "client" or "server" per function:

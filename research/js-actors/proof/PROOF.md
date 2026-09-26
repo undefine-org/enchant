@@ -1,7 +1,7 @@
 # Proof log — the split showcase, track by track
 
 Start everything: `node research/js-actors/showcase-all.mjs --base 8801`, then
-open http://127.0.0.1:8801/ (gallery, `gallery.png`). Six apps, one per
+open http://127.0.0.1:8801/ (gallery, `gallery.png`). Seven apps, one per
 capability; each entry below says what was claimed, how it was checked, and
 what was observed — including what was found broken along the way.
 
@@ -176,6 +176,59 @@ cases whose order is determined. Maps over 32 keys: BEAM uses hash order; the
 JS target keeps term order. `1` and `1.0` are one JS Number (`(/ 8 2)` prints
 `4`, BEAM `4.0`). Decimals are not implemented.
 | full build + all Node suites | build exit 0 (52 OK diagnostics: the "unsafe literal refused" diagnostic became a positive exact-emission test), SPLIT PASS ×6, parity 95, **28/28** Node suites |
+
+## Generative editor mockup — Source and Stream (`apps/workspace.bl`)
+
+**Claim.** The direction in [docs/design/workspace-editor.md](../../../docs/design/workspace-editor.md),
+[stream-workspace.md](../../../docs/design/stream-workspace.md) and
+[form-first-interaction.md](../../../docs/design/form-first-interaction.md) can be
+mocked up *functionally* as one split BL app, in the playground's Carbon (dark)
+and Snow (light) tokens (`research/workspace-spike/play/ui.css`, copied
+verbatim). The pieces the design depends on are real, not drawn:
+
+| Real | Mock (and labelled as one in the UI) |
+|---|---|
+| the form tree: the server reads each file with a small BL reader into forms with stable ids; the browser renders code from it and selects forms, never characters | the runtime: integers, strings, keywords, vectors, maps, 13 builtins and top-level `def`s; calling a `defn` says it is outside the mock |
+| the motion contract (`j`/`k`/`h`/`l` ≐ Ctrl+J/K/H/L), computed in the browser by `motion` | the model: **Record turn** appends the task and a block saying no response was invented |
+| `Evaluate form` → an intent naming path · rev · form, refused if stale in the browser AND on the server; the receipt goes to the open Stream (source pane) or the file's own Activity | typing into source (Edit mode), hover preview, history lens: not in this mockup |
+| Made / Verified / Saved / Live: four decisions, each its own block; Save is basis-guarded and bumps the file's revision; Live changes what evaluation sees without writing the file | |
+
+| Check | Result |
+|---|---|
+| split build `JS_ACTORS_APP=workspace` | `SPLIT PASS workspace: 22 placements, 6 recursion proofs, 2 refusals named` — refused: a view that calls the server-private runtime `ev`; a form walk recursing on itself instead of a child |
+| `node research/js-actors/verify-workspace.mjs` | `WORKSPACE PASS (21 checks)`: placement (no reader, runtime or candidate source in the client bundle or on the wire); every row of the motion table incl. both climb rules and deepest descent; the four boundary cues with no wrap; Escape unbinds motion and eval; eval → 60 with a receipt on path/rev/form; the newest receipt wins across Streams; an unbound symbol is an error receipt; Save before Verify refused locally, never sent; Verify's checks; Live → the same form evaluates to 96, file still rev 1; Save → rev 2 with the candidate's forms, decisions record rev 1, 1, 2; stale eval and double Save refused by the server; spec save from an older basis refused; a pane comment anchored to path · rev · form; Run cell; New Stream predicted with no file and no spec; palette filters and owns the keyboard; a timed-out authority answers 503 instead of hanging |
+| verifier mutation checks | changing the boundary cue `Last form` in the built client fails the motion check; replacing "newest receipt" with "last in list" fails the receipt check |
+| real browser, port 8811 | the four screenshots below; refusals probed over HTTP: `stale-basis`, `no-form-selected`, `no-such-file`, `already-saved`, spec `stale-basis`, bad step / extra arg → `malformed-args`, unknown op → `unknown-intent` |
+
+Screenshots: `workspace-carbon-source.png` (a nested `(if …)` selected, its
+inspector, a receipt inline), `workspace-carbon-stream.png` (a Stream with a
+source pane opened from a form-anchored comment, the image running candidate
+v1), `workspace-snow-activity.png` (Source Activity grouped by owner, earlier
+revisions labelled), `workspace-snow-palette.png` (Search actions filtered to
+the four motions and their keys).
+
+**Found while building it, fixed in the shared target:**
+
+| Finding | Fix | Test |
+|---|---|---|
+| `(assoc v i x)` on a **vector** turned it into a map on the JS target (BEAM updates the index); `update`, `assoc-in`, `update-in` and the variadic form all went the same way | `rt-assoc` writes a vector index through a new `vec-set` host leaf (bounds as on BEAM); every assoc route goes through it | `verify-order-parity`: +7 cases (`vec-assoc*`, `vec-update*`), **102 answers identical to BEAM** |
+| a UI event with four items (the Worker's documented maximum) was refused as "exceeds transport bounds": the node budget did not count the event vector itself | the Worker's budget is items + 1, one constant | `verify-workspace` sends 4-item decide events |
+| a snapshot failing its wire type at boot said only "does not satisfy the snapshot type" | `wire-problem` names the first failing path (`.direct[0].form does not satisfy int`) | (diagnostic only) |
+| Enter on a focused button also fired a view-level `Enter` key | page keymap ignores Enter/Space on a focused button | real browser |
+| **an intent that timed out left its HTTP request hanging forever**: the timer removed the waiter before failing the service, so the fail-closed path never answered it (seen as a 300 s client timeout) | the timer only fails the service; `fail` rejects every waiter, which answers 503 at once; the authority timeout is a `startSplitServer` option | `verify-workspace`: a 1 ms authority answers 503 promptly and stays closed; with the old code the check reports "left hanging" |
+| two verifier races that a loaded machine exposed: `verify-split` read the render right after a result, which can still be the submit's own; `verify-triage` waited a fixed 60 ms for a render | wait for the render that shows the answer / for the render itself | 10/10 and 6/6 reruns under load |
+| each commit projected the board to the wire twice more than needed | `split-server.bl` threads the projected board through its loop; a commit projects once | all apps' verifiers |
+
+**Measured, not fixed.** A commit on this app costs ~0.8 s of CPU on the JS
+authority: projecting and type-checking the whole board (~670 wire nodes) is
+~125 000 trampoline steps at ~2.7 µs each. On a loaded machine that passes
+the 4 s authority limit, so `verify-workspace` runs its authority with a 60 s
+limit and asserts content, not latency. The cost is in the generic step
+machinery, not in any one wire function.
+
+After the fixes: the full build is exit 0 with every app's split tests, and
+all 30 Node suites pass (workspace 21, parity 102, split 28, triage 18,
+outline 22, groceries 22, team 31, ledger 6, shell 6, …).
 
 ## Independent security review (after tracks 4–7)
 

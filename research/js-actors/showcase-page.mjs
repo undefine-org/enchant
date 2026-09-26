@@ -46,7 +46,7 @@ function glideRows(before) {
 }
 const TAGS = new Set(['section', 'header', 'footer', 'nav', 'div', 'h1', 'h2', 'p', 'strong', 'small',
                       'span', 'ul', 'li', 'button', 'input',
-                      'ol', 'h3', 'label', 'em', 'code', 'kbd', 'article', 'aside']);
+                      'ol', 'h3', 'label', 'em', 'code', 'kbd', 'article', 'aside', 'textarea']);
 const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown', 'on-escape': 'escape',
                  'on-dblclick': 'dblclick', 'on-blur': 'blur', 'on-drop': 'drop' };
 
@@ -78,6 +78,8 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.altKey || e.metaKey) return;
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+  // Enter and Space on a focused button press that button, never a view key
+  if (t && t.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   const ev = keymap.get(e.key.length === 1 ? e.key.toLowerCase() === e.key ? e.key : null : e.key);
   if (ev) { e.preventDefault(); send(ev); }
 });

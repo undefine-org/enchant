@@ -189,6 +189,9 @@ ok(":drop 'abc' '1' parses to id 0, fails the wire's int 1..9999, and is refused
 const lastTree = JSON.stringify(client.frames.filter(f => f.topic === 'view').at(-1).value.tree);
 mark = client.frames.length;
 client.tell({ kind: 'event', event: [':bogus'] });
+// the reducer answers every event with a render; wait for it (not a fixed
+// sleep, which a loaded machine outruns) and give a stray propose a moment
+await client.next('view', mark);
 await sleep(60);
 assert.equal(client.frames.slice(mark).some(f => f.topic === 'propose'), false, 'an unhandled kind proposes nothing');
 const strayViews = client.frames.slice(mark).filter(f => f.topic === 'view');

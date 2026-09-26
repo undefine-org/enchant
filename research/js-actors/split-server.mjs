@@ -103,7 +103,7 @@ function readBody(req, limit) {
 const presenceLine = people => `event: presence\ndata: ${JSON.stringify({ people })}\n\n`;
 
 // The bridge to the ONE BL authority in this process.
-function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
+function createAuthority(codec, bundleUrl, { onCommit, watch, timeoutMs = AUTHORITY_TIMEOUT_MS } = {}) {
   const waiting = new Map();       // key → { resolve, reject, timer }
   const listeners = new Set();     // snapshot subscribers
   let failure = null;
@@ -196,10 +196,11 @@ function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
     const run = tail.then(() => new Promise((resolve, reject) => {
       if (failure) { reject(new Error(failure)); return; }
       const key = 'result:' + request;
+      // on timeout the service fails closed; `fail` rejects every waiter,
+      // this one included, so the HTTP request is answered (503), never left hanging
       const timer = setTimeout(() => {
-        waiting.delete(key);
-        fail(`authority did not answer request ${request} within ${AUTHORITY_TIMEOUT_MS}ms`);
-      }, AUTHORITY_TIMEOUT_MS);
+        fail(`authority did not answer request ${request} within ${timeoutMs}ms`);
+      }, timeoutMs);
       waiting.set(key, { resolve, reject, timer });
       try { H.enqueueData('intent', value, { nodes: 256, depth: 8, text: 4096 }); }
       catch (error) { waiting.delete(key); clearTimeout(timer); reject(error); }
@@ -210,12 +211,11 @@ function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
 
   // A login/peek question. Not serialized against the intent tail: it decides
   // nothing and may interleave.
-  function ask(topic, request, value, timeoutMs = AUTHORITY_TIMEOUT_MS) {
+  function ask(topic, request, value) {
     return new Promise((resolve, reject) => {
       if (failure) { reject(new Error(failure)); return; }
       const key = topic + ':' + request;
       const timer = setTimeout(() => {
-        waiting.delete(key);
         fail(`authority did not answer ${key} within ${timeoutMs}ms`);
       }, timeoutMs);
       waiting.set(key, { resolve, reject, timer });
@@ -239,7 +239,9 @@ function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
   };
 }
 
-export async function startSplitServer({ port = 0, app = 'showcase', logFile } = {}) {
+// `authorityTimeoutMs` bounds how long one intent may take before the
+// service fails closed (every waiting request answered 503); tests lower it.
+export async function startSplitServer({ port = 0, app = 'showcase', logFile, authorityTimeoutMs } = {}) {
   const dir = new URL('./', import.meta.url);
   const contract = JSON.parse(readFileSync(new URL(`out/${app}.contract.json`, dir), 'utf8'));
   const codec = createCodec(contract);
@@ -278,6 +280,7 @@ export async function startSplitServer({ port = 0, app = 'showcase', logFile } =
   const authority = createAuthority(codec, new URL(`out/${app}-server.mjs`, dir).href, {
     onCommit: frame => { if (logPath !== null && !replaying) appendCommit(frame); },
     watch: (topic, frame) => { if (topic === 'presence') fanPresence(frame); },
+    ...(authorityTimeoutMs === undefined ? {} : { timeoutMs: authorityTimeoutMs }),
   });
 
   // Replay the durable log through the SAME BL decision loop before anything

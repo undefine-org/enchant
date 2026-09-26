@@ -2,7 +2,7 @@
 
 The workspace has two first-class perspectives: **Source** and **Stream**. Source opens a file's code at full size. Stream opens its literate `.bl.md` document at full size, with a spec, comments, executable cells and history. Either view has an Activity lens; Activity projects work that belongs to the current file or Stream, not a third place where work lives. A Stream may start without a file and later explore several. The editor stays the destination; supporting material opens around it only when requested.
 
-This is a design contract for future implementation. The [illustrated proposal](../../research/workspace-spike/editor-design-proposals.html) shows existing screenshots alongside schematic future states. [Stream documents](stream-workspace.md) specifies persistence and harness integration. [Form-first interaction](form-first-interaction.md) specifies source selection and evaluation.
+This is a design contract for future implementation. The [illustrated proposal](../../research/workspace-spike/editor-design-proposals.html) shows existing screenshots alongside schematic future states. A clickable mockup lives in [`research/js-actors/apps/workspace.bl`](../../research/js-actors/apps/workspace.bl): run `node research/js-actors/split-server.mjs --port 8811 --app workspace` and try the forms, the palette and a candidate's four decisions in Carbon or Snow. [Stream documents](stream-workspace.md) specifies persistence and harness integration. [Form-first interaction](form-first-interaction.md) specifies source selection and evaluation.
 
 ## The source-first frame
 

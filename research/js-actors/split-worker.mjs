@@ -86,8 +86,12 @@ function itemToBL(v) {
   if (Number.isSafeInteger(v) || typeof v === 'boolean') return v;
   throw new Error('UI event item is not a bounded scalar');
 }
+// A UI event is ONE vector of at most EVENT_ITEMS scalars. The transport
+// counts the vector as a node too, so the node budget is items + 1.
+const EVENT_ITEMS = 4;
+const EVENT_BOUNDS = Object.freeze({ nodes: EVENT_ITEMS + 1, depth: 1, text: 256 });
 function eventToBL(event) {
-  if (!Array.isArray(event) || event.length < 1 || event.length > 4 ||
+  if (!Array.isArray(event) || event.length < 1 || event.length > EVENT_ITEMS ||
       !(event[0] && offered.has(event[0].k)))
     throw new Error('the view offers no such event');
   return H.vec(event.map(itemToBL));
@@ -97,7 +101,7 @@ globalThis.onmessage = ({ data }) => {
   try {
     if (!data || typeof data !== 'object') return;
     if (data.kind === 'stop') { H.enqueueData('stop', ''); return; }
-    if (data.kind === 'event') { H.enqueueData('event', eventToBL(data.event), { nodes: 4, depth: 1, text: 256 }); return; }
+    if (data.kind === 'event') { H.enqueueData('event', eventToBL(data.event), EVENT_BOUNDS); return; }
     if (!codec) throw new Error('contract not loaded');
     if (data.kind === 'hello') {
       if (typeof data.tab !== 'string' || !/^[a-z0-9]{8,32}$/.test(data.tab)) throw new Error('hello needs a tab id');
