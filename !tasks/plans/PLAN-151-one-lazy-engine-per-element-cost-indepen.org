@@ -1,0 +1,129 @@
+#+TITLE: One lazy engine: per-element cost independent of what a thunk captured
+#+STATE: DOING
+#+CUSTOM_ID: PLAN-151-one-lazy-engine-per-element-cost-indepen
+#+BRANCH: perf/lazy-engine (worktree ~/code/undefine/beam-lisp--lazy-perf, base main 4da5c8d7)
+
+* Initial Message
+
+Found from a downstream project (~/code/personal/system): `bl doc run
+research/system-report.bl.org` took 103 s, 87 s of it in one cell that parses
+~/org with a line reader built on `(reduce step init (map-indexed vector lines))`.
+The user asked for the structural upstream fix that removes the whole class of
+bug, and for a drop that carries it.
+
+* The defect, measured
+
+Every `lazy-seq` element is one native shared memo cell (`BeamLisp.LazyMemo`,
+native/lazy_memo). Before this plan, realising ONE element did
+create → read(:pending) → CAS claim → read → CAS publish → read(:completed).
+Every create/exchange ran `dependencies/1` (the Elixir `walk/4` over the thunk's
+closure environment through `:erlang.fun_info(f, :env)`) and `estimate_bytes`
+(`:erts_debug.flat_size`), copied the state term into an OwnedEnv, and compared
+the old state structurally. All of it is O(size of what the thunk captured).
+
+Component costs with an 8k-element list captured (drop 725ed831, this host):
+walk 105 µs · flat_size 21 µs · copy-in 114 µs · copy-out 92 µs · per element
+realised ≈ 1.2 ms. With 100 captured elements: 16 µs.
+
+Two producer families existed:
+- rt.bl prims (map, filter, take-while, range, concat …) normalise input with
+  `LazySeq/input` — a native cursor, O(1) to copy — and emit 32 elements per
+  cell. Linear.
+- core.bl producers (interleave, partition, distinct, dedupe, interpose,
+  repeatedly, keep, keep-indexed, map-indexed, partition-by) and the `for`
+  macro walk `(rest s)` over the RAW input, so each per-element thunk captures
+  the unconsumed tail → O(n²).
+
+Baseline (main 4da5c8d7, drop 7f2c9955, `bench/lazy_scaling.bl -- 4000`; ms at
+n=4000 → n=8000, ratio 4 = quadratic):
+
+| case                        |   n |    2n | ratio |
+|-----------------------------+-----+-------+-------|
+| map-indexed                 | 522 |  2621 |   5.0 |
+| keep-indexed                | 226 |  1072 |   4.7 |
+| distinct                    | 1901 | 11592 |   6.1 |
+| dedupe                      | 793 |  2768 |   3.5 |
+| keep                        | 208 |   857 |   4.1 |
+| partition-by                |  52 |   237 |   4.6 |
+| partition 4                 |  93 |   541 |   5.8 |
+| interpose                   | 467 |  2017 |   4.3 |
+| interleave                  | 1299 |  3805 |   2.9 |
+| for                         | 511 |  2004 |   3.9 |
+| for :when                   | 247 |   957 |   3.9 |
+| map                         |   9 |    16 |   1.8 |
+| first/rest walk map-indexed | 611 |  2225 |   3.6 |
+| reduce map-indexed          | 601 |  2482 |   4.1 |
+| into [] map                 |  14 |    39 |   2.8 |
+| mapv, f closes over env     | 1808 |  3539 |   2.0 |
+| map, f closes over env      | 1619 |  2692 |   1.7 |
+| for, body closes over env   | 56451 | 130912 |   2.3 |
+| distinct walk, env          | 5720 | 20895 |   3.7 |
+
+Also: an atom holding a 10k-entry map costs 1.16 ms per `swap!` (50k: 5.85 ms)
+through the same cell (`exchange_ref` compares the whole old value and copies
+the new one).
+
+FUP-112 had rated the dependency walk "~1 µs, low value" — true only for a thunk
+whose environment is empty. That verdict is corrected in FUP-112 by this plan.
+
+* Waves
+
+** W1 — one lazy engine (priv/boot/core.bl)
+Every core.bl producer and `for` normalise input once through the rt cursor and
+emit chunks of `LazySeq/chunk_size` through `LazySeq/chain`, via ONE shared
+chunked-step helper. No thunk captures the raw unconsumed input.
+Gate: test/bl/lazy_producers_test.bl (equivalence vs eager reference at sizes
+0/1/31/32/33/100/1000; ≤ one chunk of over-realisation on infinite inputs; `for`
+nesting/modifiers/destructuring); bench ratios ≤ 2.6.
+
+** W2 — a fold path with no cells (priv/boot/rt.bl, lazy_seq.ex)
+A pending lazy seq built by a producer that knows its source carries a fold
+recipe; `reduce`/`into`/`count`/`vec`/`mapv`/`frequencies`/`group-by` fold the
+source directly and allocate no memo cells. A seq that has been (partly)
+realised keeps using the memo walk, so f never re-runs for realised elements.
+Gate: test/bl/lazy_fold_test.bl (equivalence, `reduced` stops the source,
+memo-cell count ≤ 2 for an 8k fold that allocated 501).
+
+** W3 — a slim memo cell (native/lazy_memo, lazy_memo.ex, lazy_seq.ex)
+The thunk moves out of the cell into the `%LazySeq{}` wrapper; control states
+(`:pending`, running/waiters, terminal) are tiny. CAS compares a version
+counter, not the old term. The per-transition environment walk is deleted;
+cycle rejection runs once, on the value being published. Atoms' `swap!` moves
+to version CAS.
+Gate: lazy_memo_native_test.exs, wave23_lazyseq_test.exs, deferred_test.bl
+unchanged in meaning; cargo tests; bench/memo_cell.bl before/after.
+
+** W4 — keep the class out
+- test/bl/lazy_scaling_test.bl: every lazy producer at n and 2n; fails when the
+  ratio exceeds 3 (a quadratic producer shows 4+).
+- `bl lint`: a hand-written `lazy-seq` whose thunk walks `(rest …)` of a
+  collection it did not pass through the rt input normaliser is reported.
+- FUP-112 corrected (verdict measured on an empty environment).
+
+** W5 — what remains: a captured environment still costs one copy per cell
+After W1–W3 the one cost left is inherent to a SHARED memo: publishing a value
+into a native cell copies it, and a chunk's continuation closure is part of the
+published cons tail. Mitigation in this plan: keep continuation closures small
+(W1's helper threads only the cursor and O(output) state) and publish chunks,
+not elements. The alternative — process-local memo — is a semantic change and
+is a research spike: FUP-129.
+
+* Risks and interactions
+- PLAN-150 (concurrent) ports lib/beam_lisp/*.ex to .bl. W2/W3 edit
+  lazy_seq.ex and lazy_memo.ex; whichever lands second rebases onto the other.
+  The native cell (Rust) is unaffected by that port.
+- Chunking changes observable realisation granularity for core.bl producers
+  from 1 to 32 — the same contract rt.bl's map/filter already have and
+  Clojure's chunked seqs have. Side-effecting producers (`repeatedly`) realise
+  up to one chunk ahead of demand; documented in each docstring.
+- A fold that bypasses the memo re-runs f for a consumer that folds a seq
+  another process is concurrently realising; identical to Clojure's reduce over
+  a LazySeq built from a reducible. Documented in lazy_seq.ex.
+
+* Acceptance
+- bench/lazy_scaling.bl: every row linear (ratio ≤ 2.6); the table recorded
+  below as NOTE with before/after.
+- The full `bl test` corpus no worse than main 4da5c8d7.
+- A drop built from this branch; ~/code/personal/system pins it through
+  env.bl `:bl`, and its `bl doc run research/system-report.bl.org` wall time is
+  recorded here before/after.

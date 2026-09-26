@@ -1,0 +1,96 @@
+#+TITLE: Shared vs process-local lazy memo — a research spike
+#+STATE: ITEM
+#+CUSTOM_ID: FUP-129-shared-vs-process-local-lazy-memo-a-rese
+#+PARENT: PLAN-151-one-lazy-engine-per-element-cost-indepen
+
+* Why this exists
+
+PLAN-151 removed every per-element cost that scaled with a thunk's captured
+environment except ONE, which is inherent to the design: a lazy seq's memo is
+SHARED across processes, so it lives in a native cell (native/lazy_memo), and a
+native resource cannot hold a term from a process heap without COPYING it into
+an OwnedEnv. Publishing a realised chunk therefore copies the chunk — including
+its tail's continuation closure and whatever that closure captured. Reading it
+back copies it out again.
+
+After PLAN-151 this cost is bounded per CHUNK (32 elements), not per element,
+and core producers keep continuation closures small. It still bites:
+- a hand-written `lazy-seq` whose thunk closes over a large value (a 50k-entry
+  map, a parsed document) and is walked with first/rest;
+- an atom holding a large value: every `deref` copies the value out of the
+  cell (measured before PLAN-151: 2.3 ms for a 50k-entry map; `swap!` 5.85 ms).
+  live/loom keep UI state in atoms and deref on every render.
+
+The user kept the shared memo for now and asked for this spike before any
+semantic change.
+
+* The question
+
+Should a lazy seq (and separately: an atom) keep its memo in a SHARED native
+cell, in PROCESS-LOCAL storage, or in a hybrid that is local until shared?
+
+* What shared memo guarantees today (must be decided, not lost by accident)
+
+Pinned by test/beam_lisp/lazy_memo_native_test.exs,
+test/beam_lisp/wave23_lazyseq_test.exs, test/bl/deferred_test.bl:
+1. One realisation per seq, even when several processes force it concurrently
+   (herd protection: waiters block on the owner's attempt).
+2. `delay` bodies run at most once machine-wide; `memoize` agrees on one delay
+   per key.
+3. Failure is retryable; owner death is terminal and never replays the thunk.
+4. Recursive force and retained-value cycles are rejected (:cyclic_memo).
+5. A realised seq sent to another process (message, ETS, Agent) arrives
+   realised — the receiver does not recompute.
+6. The memo outlives the var table / Loader restarts (BUG-011).
+
+* Candidates
+
+A. Status quo (shared native cell) — PLAN-151's version.
+   + all guarantees; − one copy in and out per published chunk/deref.
+
+B. Process-local memo (process dictionary or a per-process ETS keyed by cell
+   ref; the struct carries a ref).
+   + zero copies for a single-process walk.
+   − guarantee 1, 2, 5 lost across processes; lifetime has no GC story on the
+     BEAM (pdict never collects; the earlier ETS memo cache OOM'd the host —
+     ea78b32f); a seq passed to a Task recomputes.
+
+C. Hybrid: local until shared ("escape" promotion).
+   The memo starts in the creating process's heap (e.g. a mutable
+   :atomics/:counters index + pdict, or a NIF-owned per-process slot); the
+   first time the seq crosses a process boundary it is promoted into a shared
+   cell. Detecting "crossed a boundary" is the hard part on the BEAM: sends are
+   term copies with no hook. Options to evaluate: promote on first force by a
+   non-owner (the struct records the owner pid; a non-owner force asks the
+   owner — message round trip — or finds a promoted cell); promote at
+   `send`/`spawn` through the bl runtime's own send wrappers (misses raw
+   erlang/send).
+
+D. Shared, but zero-copy for large immutable values: store large terms as
+   refc binaries (term_to_binary once) or in persistent_term-like shared heaps.
+   + removes the copy-out on deref for big values; − term_to_binary is itself a
+     copy and decode is O(size); persistent_term updates are global GC events.
+   Probably wins only for read-mostly atoms.
+
+E. Atoms separately: an atom does not need thundering-herd protection — it
+   could be a process-owned value with message-based swap! (Agent-like) or an
+   ETS row with `:ets.lookup` (still copies). Measure against the cell.
+
+* Spike tasks
+1. Micro-benches (bench/memo_cell.bl extended): per-chunk publish/read cost vs
+   captured size for A; same for B and C prototypes; atom deref/swap! for A, D, E
+   at 10/1k/10k/50k-entry maps.
+2. Guarantee matrix: for each candidate, which of 1–6 hold; which existing tests
+   fail if it lands as-is.
+3. Real workloads: (a) ~/code/personal/system `bl doc run
+   research/system-report.bl.org`; (b) a live/loom app render loop (atom deref
+   per render); (c) datom `load-facts!` over a 100k-datom corpus; (d) the
+   compiler's own lazy trees (ea78b32f: ~160 MB/form under the old cache).
+4. GC/lifetime for B and C: prove memory returns when the seq is dropped
+   (live_cells / retained_bytes / process heap after :erlang.garbage_collect).
+5. Write the verdict: pick one per value kind (lazy seq, delay, atom), with the
+   guarantee that is given up named explicitly, and the migration (flag, default,
+   deprecation) if any.
+
+* Out of scope
+Anything that changes the default before the verdict. PLAN-151 ships A.
