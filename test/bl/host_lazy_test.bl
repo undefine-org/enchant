@@ -1,0 +1,629 @@
+; host_lazy_test.bl — the pinned lazy engine: LazyMemo, LazySeq, its ForceError,
+; Enumerable + Inspect impls, and the SeqCursor pair.
+;
+; Seven `.bl` sources under `priv/host/` replace the `LazyMemo` / `LazySeq` /
+; `SeqCursor` halves of `lib/beam_lisp/*.ex` at their exact module atoms:
+;
+;   * lazy_memo.bl          → Elixir.BeamLisp.LazyMemo          (functions-only)
+;   * lazy_seq.bl           → Elixir.BeamLisp.LazySeq           (struct)
+;   * lazy_seq_force_error.bl → Elixir.BeamLisp.LazySeq.ForceError (struct + Exception)
+;   * lazy_seq_enumerable.bl  → Elixir.Enumerable.BeamLisp.LazySeq  (functions-only)
+;   * lazy_seq_inspect.bl     → Elixir.Inspect.BeamLisp.LazySeq     (functions-only)
+;   * seq_cursor.bl           → Elixir.BeamLisp.SeqCursor          (struct)
+;   * seq_cursor_enumerable.bl → Elixir.Enumerable.BeamLisp.SeqCursor (functions-only)
+;
+; The probe-compile discipline is the point. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here, and the
+; live atom is untouched. Every probe is purged at the end of its test (the
+; `deftest` bodies are wrapped in `try`/`finally`), so no probe lingers to
+; collide with a later one.
+;
+; The Enumerable/Inspect impls are also loaded at their EXACT atoms over the
+; live beams (saved first, RESTORED in a `finally`), because their whole
+; contract is defined by how a LIVE `BeamLisp.LazySeq` / `BeamLisp.SeqCursor`
+; value dispatches through them.
+;
+; A pinned module is functions-only and every top-level `defn` is exported, so
+; a port's export set is a SUPERSET of the live module's (LazySeq exposes its
+; `attempt_*`/`force_*` helpers by design) — and `LazyMemo` predates the port's
+; `control_state?/1`. Those two drifts are asserted explicitly rather than
+; papered over with an equality that is simply false.
+;
+; Run: bin/bl test test/bl/host_lazy_test.bl
+
+(ns host.lazy.test)
+
+; ── the off-heap cache valve ──────────────────────────────────────────────
+; `BeamLisp.LazyMemo/admit!` refuses a NEW memo once the native cell cache
+; exceeds `:lazy_cache_budget_bytes` (default 512 MiB). The ward runs every
+; file in a corpus several times in ONE VM — a fresh process and env fork per
+; evaluation, but ONE native heap — so a corpus of this size already reaches
+; ~400 MiB before this file runs (measured after a solo `bl test` of each:
+; prelude ~165 MiB, lazy-producers ~92 MiB, core-additions ~70 MiB,
+; host-reactive ~47 MiB). Raise the valve for the run so a test that forces a
+; memo is judged on its answer, not on what ran before it. This is VM-wide
+; Application env, exactly as `test/beam_lisp/lazy_memo_native_test.exs` sets
+; it around its own budget assertions; 2 GiB leaves the corpus the headroom a
+; multi-evaluation run needs without disabling the gate (a budget of 0 still
+; refuses every attempt).
+(Application/put_env :beam_lisp :lazy_cache_budget_bytes 2147483648)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_lazy_" (erlang/unique_integer (list :positive))))
+
+(defn- host-source [name]
+  (Path/join (Path/join (BeamLisp/cwd) "priv/host") name))
+
+; ── the seven probe atoms + the namespace shim each compile emits ────────────
+
+(def ^:private memo-mod :Elixir.BeamLisp.HostLazyMemo)
+(def ^:private seq-mod :Elixir.BeamLisp.HostLazySeq)
+(def ^:private fe-mod :Elixir.BeamLisp.HostLazySeq.ForceError)
+(def ^:private enum-seq-mod :Elixir.Enumerable.BeamLisp.HostLazySeq)
+(def ^:private inspect-mod :Elixir.Inspect.BeamLisp.HostLazySeq)
+(def ^:private cursor-mod :Elixir.BeamLisp.HostSeqCursor)
+(def ^:private enum-cur-mod :Elixir.Enumerable.BeamLisp.HostSeqCursor)
+
+(def ^:private memo-shim :"Elixir.BeamLisp.Ns.Host.Lazy-memo")
+(def ^:private seq-shim :"Elixir.BeamLisp.Ns.Host.Lazy-seq")
+(def ^:private fe-shim :"Elixir.BeamLisp.Ns.Host.Lazy-seq-force-error")
+(def ^:private enum-seq-shim :"Elixir.BeamLisp.Ns.Host.Lazy-seq-enumerable")
+(def ^:private inspect-shim :"Elixir.BeamLisp.Ns.Host.Lazy-seq-inspect")
+(def ^:private cursor-shim :"Elixir.BeamLisp.Ns.Host.Seq-cursor")
+(def ^:private enum-cur-shim :"Elixir.BeamLisp.Ns.Host.Seq-cursor-enumerable")
+
+; ── the live production atoms ────────────────────────────────────────────────
+
+(def ^:private live-memo :Elixir.BeamLisp.LazyMemo)
+(def ^:private live-seq :Elixir.BeamLisp.LazySeq)
+(def ^:private live-fe :Elixir.BeamLisp.LazySeq.ForceError)
+(def ^:private live-enum-seq :Elixir.Enumerable.BeamLisp.LazySeq)
+(def ^:private live-inspect :Elixir.Inspect.BeamLisp.LazySeq)
+(def ^:private live-cursor :Elixir.BeamLisp.SeqCursor)
+(def ^:private live-enum-cur :Elixir.Enumerable.BeamLisp.SeqCursor)
+
+; ── probe-compile plumbing ───────────────────────────────────────────────────
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first. Returns the
+; `[module, beam-path]` tuple `compile_host_file` produced.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))
+    res))
+
+(defn- base-opts [mod dir]
+  (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))
+
+(defn- compile-memo! [dir]
+  (let [res (compile-pinned memo-mod (host-source "lazy_memo.bl")
+              (base-opts memo-mod dir))]
+    (drop! memo-shim)
+    (elem res 1)))
+
+(defn- compile-seq! [dir]
+  (let [opts (erlang/++
+               (base-opts seq-mod dir)
+               (list (t2 :struct_fields
+                         (list (t2 :resource nil) (t2 :metadata nil) (t2 :reduce nil)))))
+        res (compile-pinned seq-mod (host-source "lazy_seq.bl") opts)]
+    (drop! seq-shim)
+    (elem res 1)))
+
+(defn- compile-fe! [dir]
+  (let [opts (erlang/++
+               (base-opts fe-mod dir)
+               (list (t2 :struct_fields
+                         (list (t2 :__exception__ true) (t2 :reason nil) (t2 :message nil)))
+                     (t2 :behaviour :"Elixir.Exception")))
+        res (compile-pinned fe-mod (host-source "lazy_seq_force_error.bl") opts)]
+    (drop! fe-shim)
+    (elem res 1)))
+
+(defn- compile-enum-seq! [dir]
+  (let [res (compile-pinned enum-seq-mod (host-source "lazy_seq_enumerable.bl")
+              (base-opts enum-seq-mod dir))]
+    (drop! enum-seq-shim)
+    (elem res 1)))
+
+(defn- compile-inspect! [dir]
+  (let [res (compile-pinned inspect-mod (host-source "lazy_seq_inspect.bl")
+              (base-opts inspect-mod dir))]
+    (drop! inspect-shim)
+    (elem res 1)))
+
+(defn- compile-cursor! [dir]
+  (let [opts (erlang/++
+               (base-opts cursor-mod dir)
+               (list (t2 :struct_fields
+                         (list (t2 :chunk ()) (t2 :tail nil) (t2 :dirty false)))))
+        res (compile-pinned cursor-mod (host-source "seq_cursor.bl") opts)]
+    (drop! cursor-shim)
+    (elem res 1)))
+
+(defn- compile-enum-cur! [dir]
+  (let [res (compile-pinned enum-cur-mod (host-source "seq_cursor_enumerable.bl")
+              (base-opts enum-cur-mod dir))]
+    (drop! enum-cur-shim)
+    (elem res 1)))
+
+; ── observation helpers ──────────────────────────────────────────────────────
+
+(defn- raise-shape [f]
+  (try (list :value (f))
+       (catch e (list :raise (:__struct__ e) (ex-message e) (:reason e)))))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise)
+       (catch e (:__struct__ e))))
+
+(defn- export-set [mod]
+  (MapSet/new (erlang/apply mod :module_info (list :exports))))
+
+(defn- sorted-exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- inspect-str [impl l limit]
+  (let [opts (erlang/apply :Elixir.Inspect.Opts :new (list (list (t2 :limit limit))))
+        doc (erlang/apply impl :inspect (list l opts))]
+    (erlang/iolist_to_binary (erlang/apply :Elixir.Inspect.Algebra :format (list doc 80)))))
+
+(defn- ints [a b]
+  (if (erlang/=< a b)
+    (cons a (BeamLisp.LazySeq/new (fn [] (ints (erlang/+ a 1) b))))
+    ()))
+
+(defn- lazy-of [xs] (BeamLisp.LazySeq/new (fn [] xs)))
+
+; ── 1. LazyMemo: functions-only export surface ───────────────────────────────
+
+(deftest memo-pinned-surface
+  (testing "LazyMemo compiles as a functions-only port with the native stubs"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-memo! dir)
+        (is (= :non_existing (erlang/apply :code :which (list memo-shim))))
+        ; The port predates the drop's `control_state?/1`; its export set is the
+        ; live module's minus exactly that one name. Asserted, not swallowed.
+        (is (= (sorted-exports live-memo)
+               (Enum/sort (cons (tuple :control_state? 1) (sorted-exports memo-mod)))))
+        (is (= (tuple :control_state? 1)
+               (erlang/hd (MapSet/to_list
+                            (MapSet/difference (export-set live-memo) (export-set memo-mod))))))
+        ; functions-only: no synthesized struct surface.
+        (is (not (erlang/function_exported memo-mod :__struct__ 0)))
+        (is (not (erlang/function_exported memo-mod :__info__ 1)))
+        ; the cell/lane/version/cursor ABI is present.
+        (is (erlang/function_exported memo-mod :create 1))
+        (is (erlang/function_exported memo-mod :create_ref 1))
+        (is (erlang/function_exported memo-mod :read_versioned 1))
+        (is (erlang/function_exported memo-mod :exchange_version 4))
+        (is (erlang/function_exported memo-mod :exchange_version 5))
+        (is (erlang/function_exported memo-mod :dependencies 1))
+        (is (erlang/function_exported memo-mod :estimate_bytes 1))
+        (is (erlang/function_exported memo-mod :cursor 1))
+        (is (erlang/function_exported memo-mod :cursor_chunk 1))
+        (is (erlang/function_exported memo-mod :cursor_chunk 2))
+        (is (erlang/function_exported memo-mod :cursor_dirty_chunks? 1))
+        (is (erlang/function_exported memo-mod :stats 0))
+        (is (erlang/function_exported memo-mod :ensure_loaded! 0))
+        (is (erlang/function_exported memo-mod :nif_new 3))
+        (is (erlang/function_exported memo-mod :nif_read_fast 1))
+        ; the public predicate/walk helpers are PURE and answer without the NIF.
+        (is (erlang/apply memo-mod :deps_scalar? (list 42)))
+        (is (not (erlang/apply memo-mod :deps_scalar? (list [1]))))
+        (is (erlang/apply memo-mod :deps_scalar_list? (list (list 1 2 3))))
+        (is (not (erlang/apply memo-mod :deps_scalar_list? (list (list 1 (fn [] 1))))))
+        (is (erlang/apply memo-mod :deps_lazy_node?
+              (list (erlang/apply live-seq :new (list (fn [] 1))))))
+        (is (not (erlang/apply memo-mod :deps_lazy_node? (list 42))))
+        (is (= (erlang/apply live-memo :estimate_bytes (list (list 1 2 3)))
+               (erlang/apply memo-mod :estimate_bytes (list (list 1 2 3)))))
+        (finally (drop! memo-mod) (File/rm_rf! dir))))))
+
+; ── 2. LazySeq: struct surface + live __info__ ───────────────────────────────
+
+(deftest seq-pinned-struct-is-probe-tagged
+  (testing "`:struct_fields` synthesizes __struct__/0,1; `new/1` is module-exact"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-seq! dir)
+        (is (= :non_existing (erlang/apply :code :which (list seq-shim))))
+        ; live is a SUBSET: the port exposes its top-level helpers by design.
+        (is (= () (MapSet/to_list (MapSet/difference (export-set live-seq) (export-set seq-mod)))))
+        (is (= 16 (erlang/- (erlang/length (sorted-exports seq-mod))
+                            (erlang/length (sorted-exports live-seq)))))
+        ; the public ABI, both arities, is present.
+        (doseq [[name arity] [[:new 1] [:new 2] [:from_fun 1] [:with_reduce 2]
+                              [:reduce_recipe 1] [:lazy? 1] [:pending? 1] [:chunk_size 0]
+                              [:input 1] [:chain 2] [:force 1] [:memo_state 1] [:realize 1]
+                              [:cell 1] [:to_list 1] [:prefix 2] [:sample 2] [:count 1]
+                              [:nth 2] [:run 1]]]
+          (is (erlang/function_exported seq-mod name arity)))
+        ; __struct__/0 — tag is the PROBE atom; three fields all default nil.
+        (let [s0 (erlang/apply seq-mod :__struct__ (list))]
+          (is (erlang/is_map s0))
+          (is (= 4 (erlang/map_size s0)))
+          (is (= seq-mod (erlang/map_get :__struct__ s0)))
+          (is (nil? (erlang/map_get :resource s0)))
+          (is (nil? (erlang/map_get :metadata s0)))
+          (is (nil? (erlang/map_get :reduce s0))))
+        ; __struct__/1 folds the given fields over the defaults.
+        (let [s1 (erlang/apply seq-mod :__struct__ (list (list (t2 :metadata :m))))]
+          (is (= seq-mod (erlang/map_get :__struct__ s1)))
+          (is (= :m (erlang/map_get :metadata s1)))
+          (is (nil? (erlang/map_get :reduce s1))))
+        ; new/1 builds a node tagged with the PROBE atom — a hard-coded
+        ; `BeamLisp.LazySeq` tag would make this false. It calls the LIVE
+        ; LazyMemo/create, so a real cell is behind it.
+        (let [n (erlang/apply seq-mod :new (list (fn [] 1)))]
+          (is (= seq-mod (erlang/map_get :__struct__ n)))
+          (is (erlang/is_reference (erlang/map_get :resource n)))
+          (is (= :Elixir.BeamLisp.HostLazySeq (erlang/map_get :__struct__ n))))
+        ; __info__(:struct) is the live beam's list, datum for datum.
+        (is (= (erlang/apply live-seq :__info__ (list :struct))
+               (erlang/apply seq-mod :__info__ (list :struct))))
+        ; Inspect.Any renders the probe tag (a live LazySeq would print `…LazySeq`).
+        (is (String/contains? (Kernel/inspect (erlang/apply seq-mod :new (list (fn [] 1))))
+                              "%BeamLisp.HostLazySeq{"))
+        (finally (drop! seq-mod) (File/rm_rf! dir))))))
+
+; ── 3. ForceError: struct + Exception behaviour ──────────────────────────────
+
+(deftest force-error-pinned-exception
+  (testing "ForceError is a probe-tagged struct AND a genuine `Exception`"
+    (let [dir (tmp-dir)]
+      (try
+        (let [path (compile-fe! dir)]
+          (is (= :non_existing (erlang/apply :code :which (list fe-shim))))
+          ; exact export parity (the port has no helpers beyond the surface).
+          (is (= (sorted-exports live-fe) (sorted-exports fe-mod)))
+          (is (erlang/function_exported fe-mod :exception 1))
+          (is (erlang/function_exported fe-mod :message 1))
+          ; __struct__/0: `__exception__` first and true, reason/message nil.
+          (let [s0 (erlang/apply fe-mod :__struct__ (list))]
+            (is (= 4 (erlang/map_size s0)))
+            (is (= fe-mod (erlang/map_get :__struct__ s0)))
+            (is (erlang/== true (erlang/map_get :__exception__ s0)))
+            (is (nil? (erlang/map_get :reason s0)))
+            (is (nil? (erlang/map_get :message s0))))
+          (is (= (erlang/apply live-fe :__info__ (list :struct))
+                 (erlang/apply fe-mod :__info__ (list :struct))))
+          ; exception/1 + Exception.message/1 are module-exact.
+          (let [e (erlang/apply fe-mod :exception (list :boom))]
+            (is (= fe-mod (erlang/map_get :__struct__ e)))
+            (is (= :boom (erlang/map_get :reason e)))
+            (is (= "LazySeq force failed: :boom" (erlang/map_get :message e)))
+            (is (= "LazySeq force failed: :boom"
+                   (erlang/apply :Elixir.Exception :message (list e)))))
+          ; the beam really carries the `Exception` behaviour in its attribute chunk.
+          (let [chunks (erlang/apply :beam_lib :chunks
+                         (list (erlang/binary_to_list path) (list :attributes)))
+                attrs (erlang/element 2 (erlang/hd (erlang/element 2 (erlang/element 2 chunks))))]
+            (is (Enum/member? attrs (tuple :behaviour :"Elixir.Exception"))))
+          (is (String/contains? (Kernel/inspect (erlang/apply fe-mod :exception (list :boom)))
+                                "%BeamLisp.HostLazySeq.ForceError{")))
+        (finally (drop! fe-mod) (File/rm_rf! dir))))))
+
+; ── 4. Enumerable.BeamLisp.LazySeq: direct probe invocation ──────────────────
+
+(deftest enum-seq-pinned-direct-probe
+  (testing "the reduce protocol over a LIVE LazySeq value — cont / halt / suspend"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-enum-seq! dir)
+        (is (= :non_existing (erlang/apply :code :which (list enum-seq-shim))))
+        (is (= (sorted-exports live-enum-seq) (sorted-exports enum-seq-mod)))
+        (is (not (erlang/function_exported enum-seq-mod :__struct__ 0)))
+        (is (not (erlang/function_exported enum-seq-mod :__info__ 1)))
+        (is (= (erlang/apply live-enum-seq :__impl__ (list :for))
+               (erlang/apply enum-seq-mod :__impl__ (list :for))))
+        (is (= (erlang/apply live-enum-seq :__impl__ (list :protocol))
+               (erlang/apply enum-seq-mod :__impl__ (list :protocol))))
+        (is (= :Elixir.BeamLisp.LazySeq (erlang/apply enum-seq-mod :__impl__ (list :for))))
+        (is (= :Elixir.Enumerable (erlang/apply enum-seq-mod :__impl__ (list :protocol))))
+        (is (= :Elixir.FunctionClauseError
+               (raise-class (fn [] (erlang/apply enum-seq-mod :__impl__ (list :bogus))))))
+        ; the impl serves LIVE LazySeq values: its `BeamLisp.LazySeq/*` calls
+        ; resolve against the live atoms.
+        (let [l (lazy-of (list 1 2 3 4))]
+          (is (= (tuple :ok 4) (erlang/apply enum-seq-mod :count (list l))))
+          (is (= (tuple :error enum-seq-mod) (erlang/apply enum-seq-mod :member? (list l 2))))
+          (is (= (tuple :error enum-seq-mod) (erlang/apply enum-seq-mod :slice (list l))))
+          (is (= (tuple :error live-enum-seq) (erlang/apply live-enum-seq :slice (list l))))
+          ; :cont — fold runs to completion, accumulator returned in `:done`.
+          (is (= (tuple :done (list 4 3 2 1))
+                 (erlang/apply enum-seq-mod :reduce
+                   (list l (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))
+          ; :halt — the reducer stops the fold; its value is `:halted`.
+          (is (= (tuple :halted (list :stopped))
+                 (erlang/apply enum-seq-mod :reduce
+                   (list l (tuple :cont ())
+                         (fn [x acc] (if (erlang/== x 2)
+                                       (tuple :halt (list :stopped))
+                                       (tuple :cont (cons x acc))))))))
+          ; :suspend — `{:suspended, acc, cont}`; the continuation resumes at the
+          ; cell AFTER the one it suspended on (so no element is repeated).
+          (let [r (erlang/apply enum-seq-mod :reduce
+                    (list l (tuple :cont ())
+                          (fn [x acc] (if (erlang/== x 1)
+                                        (tuple :suspend (cons x acc))
+                                        (tuple :cont (cons x acc))))))
+                cont (erlang/element 3 r)
+                r2 (cont (tuple :cont (list 1)))]
+            (is (= :suspended (erlang/element 1 r)))
+            (is (= (list 1) (erlang/element 2 r)))
+            (is (= (tuple :done (list 4 3 2 1)) r2)))
+          ; full walk through the live `Enum` machinery still works.
+          (is (= (list 1 2 3 4) (Enum/to_list l)))
+          (is (= 4 (Enum/count l))))
+        (finally (drop! enum-seq-mod) (File/rm_rf! dir))))))
+
+; ── 5. Inspect.BeamLisp.LazySeq: rendering + truncation ──────────────────────
+
+(deftest inspect-pinned-renders-truncation
+  (testing "inspect/2 stamps `…` when the seq continues past `opts.limit`"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-inspect! dir)
+        (is (= :non_existing (erlang/apply :code :which (list inspect-shim))))
+        (is (= (sorted-exports live-inspect) (sorted-exports inspect-mod)))
+        (is (not (erlang/function_exported inspect-mod :__struct__ 0)))
+        (is (not (erlang/function_exported inspect-mod :__info__ 1)))
+        (is (= (erlang/apply live-inspect :__impl__ (list :for))
+               (erlang/apply inspect-mod :__impl__ (list :for))))
+        (is (= (erlang/apply live-inspect :__impl__ (list :protocol))
+               (erlang/apply inspect-mod :__impl__ (list :protocol))))
+        (is (= :Elixir.Inspect (erlang/apply inspect-mod :__impl__ (list :protocol))))
+        (is (= :Elixir.FunctionClauseError
+               (raise-class (fn [] (erlang/apply inspect-mod :__impl__ (list :bogus))))))
+        ; a long seq truncates at the limit with an ellipsis; a short one does not.
+        (is (= "(1 2…)" (inspect-str inspect-mod (BeamLisp.LazySeq/new (fn [] (ints 1 100))) 2)))
+        (is (String/contains?
+              (inspect-str inspect-mod (BeamLisp.LazySeq/new (fn [] (ints 1 100))) 20) "…"))
+        (is (= "(1 2 3)" (inspect-str inspect-mod (lazy-of (list 1 2 3)) 20)))
+        ; the live impl renders the same way (the probe matches it datum for datum).
+        (is (= (inspect-str live-inspect (lazy-of (list 1 2 3)) 20)
+               (inspect-str inspect-mod (lazy-of (list 1 2 3)) 20)))
+        (finally (drop! inspect-mod) (File/rm_rf! dir))))))
+
+; ── 6. SeqCursor: struct surface + live cell walk ────────────────────────────
+
+(defn- cursor-elems [mod cursor]
+  (loop [cur cursor acc ()]
+    (let [c (erlang/apply mod :cell (list cur))]
+      (cond
+        (erlang/== c nil) (Enum/reverse acc)
+        :else (recur (erlang/tl c) (cons (erlang/hd c) acc))))))
+
+(deftest seq-cursor-pinned-surface
+  (testing "SeqCursor compiles probe-tagged; the live cursor walks in order"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-cursor! dir)
+        (is (= :non_existing (erlang/apply :code :which (list cursor-shim))))
+        (is (= (sorted-exports live-cursor) (sorted-exports cursor-mod)))
+        (is (erlang/function_exported cursor-mod :new 1))
+        (is (erlang/function_exported cursor-mod :cell 1))
+        (let [s0 (erlang/apply cursor-mod :__struct__ (list))]
+          (is (= 4 (erlang/map_size s0)))
+          (is (= cursor-mod (erlang/map_get :__struct__ s0)))
+          (is (= () (erlang/map_get :chunk s0)))
+          (is (nil? (erlang/map_get :tail s0)))
+          (is (erlang/== false (erlang/map_get :dirty s0))))
+        (is (= (erlang/apply live-cursor :__info__ (list :struct))
+               (erlang/apply cursor-mod :__info__ (list :struct))))
+        ; the PROBE's own new/cell pair walks its probe-tagged cursor.
+        (let [pc (erlang/apply cursor-mod :new (list (list 10 20 30 40 50)))]
+          (is (= cursor-mod (erlang/map_get :__struct__ pc)))
+          (is (= (list 10 20 30 40 50) (cursor-elems cursor-mod pc))))
+        ; the LIVE pair walks a live cursor and ends nil.
+        (let [lc (erlang/apply live-cursor :new (list (list 10 20 30 40 50)))]
+          (is (= live-cursor (erlang/map_get :__struct__ lc)))
+          (is (= (list 10 20 30 40 50) (cursor-elems live-cursor lc)))
+          (is (= (list 10 20 30 40 50) (Enum/to_list lc))))
+        (finally (drop! cursor-mod) (File/rm_rf! dir))))))
+
+; ── 7. Enumerable.BeamLisp.SeqCursor: direct probe invocation ────────────────
+
+(deftest enum-cur-pinned-direct-probe
+  (testing "the cursor reduce protocol over a LIVE SeqCursor value"
+    (let [dir (tmp-dir)]
+      (try
+        (compile-enum-cur! dir)
+        (is (= :non_existing (erlang/apply :code :which (list enum-cur-shim))))
+        (is (= (sorted-exports live-enum-cur) (sorted-exports enum-cur-mod)))
+        (is (not (erlang/function_exported enum-cur-mod :__struct__ 0)))
+        (is (not (erlang/function_exported enum-cur-mod :__info__ 1)))
+        (is (= :Elixir.BeamLisp.SeqCursor (erlang/apply enum-cur-mod :__impl__ (list :for))))
+        (is (= :Elixir.Enumerable (erlang/apply enum-cur-mod :__impl__ (list :protocol))))
+        (is (= :Elixir.FunctionClauseError
+               (raise-class (fn [] (erlang/apply enum-cur-mod :__impl__ (list :bogus))))))
+        (let [c (erlang/apply live-cursor :new (list (list 1 2 3 4)))]
+          ; a forward-only walk reports {:error, impl} for the constant-time ops.
+          (is (= (tuple :error enum-cur-mod) (erlang/apply enum-cur-mod :count (list c))))
+          (is (= (tuple :error enum-cur-mod) (erlang/apply enum-cur-mod :member? (list c 2))))
+          (is (= (tuple :error enum-cur-mod) (erlang/apply enum-cur-mod :slice (list c))))
+          (is (= (tuple :done (list 4 3 2 1))
+                 (erlang/apply enum-cur-mod :reduce
+                   (list c (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))
+          (is (= (tuple :halted (list :stopped))
+                 (erlang/apply enum-cur-mod :reduce
+                   (list c (tuple :cont ())
+                         (fn [x acc] (if (erlang/== x 2)
+                                       (tuple :halt (list :stopped))
+                                       (tuple :cont (cons x acc)))))))))
+        (finally (drop! enum-cur-mod) (File/rm_rf! dir))))))
+
+; ── 8. the Enumerable impl under its EXACT atom, then restored ───────────────
+
+(deftest enum-seq-at-the-exact-atom
+  (testing "loads at Enumerable.BeamLisp.LazySeq, dispatches a live value, restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live-enum-seq))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          probe (Path/join dir "Elixir.Enumerable.BeamLisp.LazySeq.beam")]
+      (is (not= :non_existing orig-path) "precondition: the live impl beam is readable")
+      (try
+        (BeamLisp.AOT/compile_host_file (host-source "lazy_seq_enumerable.bl")
+          (base-opts live-enum-seq dir))
+        (drop! enum-seq-shim)
+        (drop! live-enum-seq)
+        (code/load_binary live-enum-seq (erlang/binary_to_list probe) (File/read! probe))
+        (let [l (lazy-of (list 1 2 3))]
+          (is (= live-enum-seq (erlang/apply :Elixir.Enumerable :impl_for (list l))))
+          (is (= (tuple :ok 3) (Elixir.Enumerable/count l)))
+          (is (= (tuple :error live-enum-seq) (Elixir.Enumerable/slice l)))
+          (is (= (list 1 2 3) (Enum/to_list l))))
+        (finally
+          (drop! live-enum-seq)
+          (code/load_binary live-enum-seq orig-path orig-bin)))
+      ; RESTORED at the same atom.
+      (is (= live-enum-seq
+             (erlang/apply :Elixir.Enumerable :impl_for (list (lazy-of (list 1))))))
+      (is (= (list 1 2 3) (Enum/to_list (lazy-of (list 1 2 3)))))
+      (File/rm_rf! dir))))
+
+(deftest inspect-at-the-exact-atom
+  (testing "loads at Inspect.BeamLisp.LazySeq, formats a live value, restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live-inspect))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          probe (Path/join dir "Elixir.Inspect.BeamLisp.LazySeq.beam")]
+      (is (not= :non_existing orig-path) "precondition: the live impl beam is readable")
+      (try
+        (BeamLisp.AOT/compile_host_file (host-source "lazy_seq_inspect.bl")
+          (base-opts live-inspect dir))
+        (drop! inspect-shim)
+        (drop! live-inspect)
+        (code/load_binary live-inspect (erlang/binary_to_list probe) (File/read! probe))
+        (is (= :Elixir.Inspect.BeamLisp.LazySeq
+               (erlang/apply :Elixir.Inspect :impl_for (list (lazy-of (list 1))))))
+        (is (= "(1 2…)" (inspect-str live-inspect (BeamLisp.LazySeq/new (fn [] (ints 1 100))) 2)))
+        (finally
+          (drop! live-inspect)
+          (code/load_binary live-inspect orig-path orig-bin)))
+      (is (= "(1 2 3)" (inspect-str live-inspect (lazy-of (list 1 2 3)) 20)))
+      (File/rm_rf! dir))))
+
+(deftest enum-cur-at-the-exact-atom
+  (testing "loads at Enumerable.BeamLisp.SeqCursor, dispatches a live cursor, restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live-enum-cur))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          probe (Path/join dir "Elixir.Enumerable.BeamLisp.SeqCursor.beam")]
+      (is (not= :non_existing orig-path) "precondition: the live impl beam is readable")
+      (try
+        (BeamLisp.AOT/compile_host_file (host-source "seq_cursor_enumerable.bl")
+          (base-opts live-enum-cur dir))
+        (drop! enum-cur-shim)
+        (drop! live-enum-cur)
+        (code/load_binary live-enum-cur (erlang/binary_to_list probe) (File/read! probe))
+        (let [c (erlang/apply live-cursor :new (list (list 1 2 3)))]
+          (is (= live-enum-cur (erlang/apply :Elixir.Enumerable :impl_for (list c))))
+          (is (= (list 1 2 3) (Enum/to_list c)))
+          (is (= (tuple :error live-enum-cur) (Elixir.Enumerable/count c))))
+        (finally
+          (drop! live-enum-cur)
+          (code/load_binary live-enum-cur orig-path orig-bin)))
+      (is (= (list 1 2 3)
+             (Enum/to_list (erlang/apply live-cursor :new (list (list 1 2 3))))))
+      (File/rm_rf! dir))))
+
+; ── 9. LIVE host: the force protocol ─────────────────────────────────────────
+
+(deftest live-force-once-memoizes
+  (testing "a thunk runs once; a second force reads the shared `:completed` value"
+    (let [runs (atom 0)
+          n (BeamLisp.LazySeq/new (fn [] (swap! runs inc) 42))
+          before (BeamLisp.LazySeq/memo_state n)
+          v1 (BeamLisp.LazySeq/force n)
+          v2 (BeamLisp.LazySeq/force n)
+          after (BeamLisp.LazySeq/memo_state n)]
+      (is (= :pending (erlang/element 1 before)))
+      (is (= 42 v1))
+      (is (= 42 v2))
+      (is (= 1 @runs))
+      (is (= (tuple :completed 42) after)))))
+
+(deftest live-force-herd-shares-one-attempt
+  (testing "8 concurrent forces of one node share a single evaluator run"
+    (let [runs (atom 0)
+          n (BeamLisp.LazySeq/new (fn [] (swap! runs inc) (Process/sleep 40) :shared))
+          tasks (vec (map (fn [_] (Task/async (fn [] (BeamLisp.LazySeq/force n))))
+                          (range 8)))
+          results (vec (map (fn [t] (Task/await t 5000)) tasks))]
+      (is (= 1 @runs))
+      (is (= 8 (Enum/count results)))
+      (is (every? (fn [r] (= :shared r)) results))
+      (is (= (tuple :completed :shared) (BeamLisp.LazySeq/memo_state n))))))
+
+(deftest live-force-failure-then-retry
+  (testing "a thunk's failure is retryable; the retry's value wins"
+    (let [runs (atom 0)
+          n (BeamLisp.LazySeq/new
+              (fn [] (swap! runs inc)
+                     (if (erlang/== 1 @runs)
+                       (erlang/error (Elixir.RuntimeError/exception "boom"))
+                       :ok)))
+          a (raise-shape (fn [] (BeamLisp.LazySeq/force n)))
+          st1 (BeamLisp.LazySeq/memo_state n)
+          v (BeamLisp.LazySeq/force n)
+          st2 (BeamLisp.LazySeq/memo_state n)]
+      (is (= :Elixir.RuntimeError (nth a 1)))
+      (is (= "boom" (nth a 2)))
+      (is (= :failed (erlang/element 1 st1)))
+      (is (= :error (erlang/element 3 st1)))
+      (is (= :Elixir.RuntimeError (:__struct__ (erlang/element 4 st1))))
+      (is (= :ok v))
+      (is (= (tuple :completed :ok) st2))
+      (is (= 2 @runs)))))
+
+(deftest live-force-owner-death-is-terminal
+  (testing "an evaluator killed mid-run leaves a terminal node; later forces raise"
+    (let [n (BeamLisp.LazySeq/new (fn [] (Process/sleep 10000) :never))
+          p (erlang/spawn (fn [] (Elixir.BeamLisp.LazySeq/force n)))
+          _ (Process/sleep 80)
+          mid (BeamLisp.LazySeq/memo_state n)]
+      (is (= :running (erlang/element 1 mid)))
+      (erlang/exit p :kill)
+      (Process/sleep 80)
+      (let [r (raise-shape (fn [] (Elixir.BeamLisp.LazySeq/force n)))
+            st (BeamLisp.LazySeq/memo_state n)]
+        (is (= :Elixir.BeamLisp.LazySeq.ForceError (nth r 1)))
+        (is (= :terminal (erlang/element 1 st)))
+        (is (= :force_owner_lost (erlang/element 1 (erlang/element 2 st))))))))
+
+(deftest live-force-recursive-is-terminal
+  (testing "a thunk that forces its own node is terminal; both forces raise"
+    (let [box (atom nil)
+          n (BeamLisp.LazySeq/new (fn [] (Elixir.BeamLisp.LazySeq/force @box)))]
+      (reset! box n)
+      (let [a (raise-shape (fn [] (Elixir.BeamLisp.LazySeq/force n)))
+            st (BeamLisp.LazySeq/memo_state n)
+            b (raise-shape (fn [] (Elixir.BeamLisp.LazySeq/force n)))]
+        (is (= :Elixir.BeamLisp.LazySeq.ForceError (nth a 1)))
+        (is (= :Elixir.BeamLisp.LazySeq.ForceError (nth b 1)))
+        (is (= :terminal (erlang/element 1 st)))
+        ; the self-force guard publishes `:recursive_force` (the pinned source's
+        ; own reason; `:cyclic_memo` is the retained-cycle path, not this one).
+        (is (= :recursive_force (erlang/element 2 st)))))))
+
+; ── 10. cleanup proof ────────────────────────────────────────────────────────
+
+(deftest no-probe-modules-linger
+  (testing "every probe atom and every namespace shim is unloaded after its test"
+    (doseq [m [memo-mod seq-mod fe-mod enum-seq-mod inspect-mod cursor-mod enum-cur-mod
+               memo-shim seq-shim fe-shim enum-seq-shim inspect-shim cursor-shim enum-cur-shim]]
+      (is (= :non_existing (erlang/apply :code :which (list m)))))))

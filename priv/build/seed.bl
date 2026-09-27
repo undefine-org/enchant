@@ -181,7 +181,7 @@
    `:module` is an atom because the emitter takes an atom (a string is never
    turned into one on that path); the beam filename is derived from it.
 
-   Ten leaves now. The first four are the compiler's own substrate.
+   Seventeen leaves now. The first four are the compiler's own substrate.
    `CompilerData` and the `Emit`/`Link` pair are seeded TOGETHER on purpose:
    `Emit` builds every descriptor and the `Link` pinned beside it CALLS `Emit`,
    so a floor carrying one without the other would straddle the boundary the pin
@@ -215,7 +215,23 @@
    impl. Three entries carry `:struct-fields` (`Delay` `[{:seq nil}]`, `Derived`
    `[{:cell nil} {:deps nil} {:thunk nil}]`, `Set` `[{:members nil}]`); every
    other entry is functions-only and produces exactly the option list it did
-   before."
+   before.
+
+   The LAST SEVEN are the lazy-sequence family ported off Elixir in PLAN-151.
+   Order is load-safe, and the rule is the same one `Set` established: a TYPE
+   before the protocol impls compiled beside it. `LazyMemo` (the native memo
+   cell and the NIF load) is before `LazySeq` (its struct embeds a memo
+   resource), which is before `SeqCursor` (its own struct holds a native cursor
+   resource); `LazySeq.ForceError` follows `LazySeq` because it is raised out of
+   a force. The `Enumerable`/`Inspect` impls come after the type they serve.
+   Four carry `:struct-fields` — `LazySeq` `[{:resource nil} {:metadata nil}
+   {:reduce nil}]` (the cell handle plus the fold recipe of PLAN-151 W2),
+   `LazySeq.ForceError` `[{:__exception__ true} {:reason nil} {:message nil}]`
+   (the field order `defexception` gives an exception, `__exception__` first),
+   and `SeqCursor` `[{:chunk ()} {:tail nil} {:dirty false}]` (the literal
+   defaults of its `defstruct`). `LazySeq.ForceError` is the one entry carrying
+   `:behaviour` — `:\"Elixir.Exception\"`, the behaviour `defexception` declares
+   — which `compile-host` forwards as the Elixir `:behaviour` opt."
   [host-dir]
   [{:module :"Elixir.BeamLisp.CompilerData"
     :source (Path/join host-dir "compiler_data.bl")}
@@ -239,7 +255,25 @@
     :source (Path/join host-dir "set.bl")
     :struct-fields (list (tuple :members nil))}
    {:module :"Elixir.Enumerable.BeamLisp.Set"
-    :source (Path/join host-dir "set_enumerable.bl")}])
+    :source (Path/join host-dir "set_enumerable.bl")}
+   {:module :"Elixir.BeamLisp.LazyMemo"
+    :source (Path/join host-dir "lazy_memo.bl")}
+   {:module :"Elixir.BeamLisp.LazySeq"
+    :source (Path/join host-dir "lazy_seq.bl")
+    :struct-fields (list (tuple :resource nil) (tuple :metadata nil) (tuple :reduce nil))}
+   {:module :"Elixir.BeamLisp.LazySeq.ForceError"
+    :source (Path/join host-dir "lazy_seq_force_error.bl")
+    :struct-fields (list (tuple :__exception__ true) (tuple :reason nil) (tuple :message nil))
+    :behaviour :"Elixir.Exception"}
+   {:module :"Elixir.Enumerable.BeamLisp.LazySeq"
+    :source (Path/join host-dir "lazy_seq_enumerable.bl")}
+   {:module :"Elixir.Inspect.BeamLisp.LazySeq"
+    :source (Path/join host-dir "lazy_seq_inspect.bl")}
+   {:module :"Elixir.BeamLisp.SeqCursor"
+    :source (Path/join host-dir "seq_cursor.bl")
+    :struct-fields (list (tuple :chunk ()) (tuple :tail nil) (tuple :dirty false))}
+   {:module :"Elixir.Enumerable.BeamLisp.SeqCursor"
+    :source (Path/join host-dir "seq_cursor_enumerable.bl")}])
 
 (defn host-beam
   "The seed beam filename a host mapping entry compiles to."
@@ -289,10 +323,12 @@
 (defn- host-opts
   "The Elixir keyword opts `BeamLisp.AOT/compile_host_file` compiles one host
    entry under: the module, the scratch output dir, the source file, its source
-   hash and `load? false` — the ISOLATED build every pinned leaf needs. When the
-   mapping declares `:struct-fields` (a `[{field default}]` list), it is appended
-   as `:struct_fields`, the option that widens the pinned module with the
-   `defstruct` constructor/introspection surface. An entry WITHOUT the key
+   hash and `load? false` — the ISOLATED build every pinned leaf needs. Two
+   optional keys are appended when the mapping declares them: `:struct-fields`
+   (a `[{field default}]` list) becomes `:struct_fields`, the option that widens
+   the pinned module with the `defstruct` constructor/introspection surface, and
+   `:behaviour` (a module atom) becomes `:behaviour`, the `-behaviour(Mod)`
+   attribute a `defexception` module carries. An entry WITHOUT either key
    produces exactly the option list it did before — same elements, same order —
    so a functions-only pinned beam stays byte-identical."
   [entry dir source-hash]
@@ -304,13 +340,18 @@
                    ;; live module in this VM, and the pinned beam exists for the
                    ;; NEXT boot, not this one.
                    (erlang/list_to_tuple (list :load? false)))]
-    (if (some? (:struct-fields entry))
+    (cond-> base
+      (some? (:struct-fields entry))
       ;; `erlang/++`, not `concat`: a bl list is a List struct, and the option
       ;; list must BE an Erlang list of 2-tuples for `Keyword` to read it.
-      (erlang/++ base
-                 (list (erlang/list_to_tuple
+      (erlang/++ (list (erlang/list_to_tuple
                          (list :struct_fields (:struct-fields entry)))))
-      base)))
+      ;; `:behaviour` rides the same way: a `defexception` module records
+      ;; `-behaviour(Elixir.Exception)`, and the emitter reads the opt as the
+      ;; module attribute.
+      (some? (:behaviour entry))
+      (erlang/++ (list (erlang/list_to_tuple
+                         (list :behaviour (:behaviour entry))))))))
 
 (defn- compile-host
   "Compile ONE pinned host source into `dir` with `load? false`, then VERIFY its
