@@ -9,10 +9,11 @@
 ; — no `defstruct`, no Elixir source.
 ;
 ; THE CELL HOLDS THE RECIPE (PLAN-151 W5). A node's cell state is one of
-; `{:pending thunk}`, `{:running owner attempt waiters}`, `{:completed value}`,
+; `{:pending thunk}` (or `{:pending thunk recipe}`, see THE FOLD RECIPE),
+; `{:running owner attempt waiters}`, `{:completed value}`,
 ; `{:failed thunk kind reason stack}` or `{:terminal reason}`. The struct is
-; `resource metadata reduce`: a handle into that cell plus two value-owned
-; fields. The THUNK is on the cell — it is the recipe, and the state that owns
+; `resource metadata`: a handle into that cell plus the value-owned metadata.
+; The THUNK (and the fold recipe) is on the cell — it is the recipe, and the state that owns
 ; it keeps it alive. The running state does not carry it: its owner is executing
 ; it, and every other process reaches the outcome through the attempt's reply.
 ;
@@ -63,23 +64,30 @@
 ;
 ; ### When the recipe may be used
 ;
-; Only while the node's head cell is still `:pending`. Once anything is realised
-; the memo walk is used instead, so elements already published keep their shared
-; values and a side-effecting `f` is not re-run for them.
+; Only while the node's head cell is still `{:pending thunk recipe}`
+; (`pending_recipe` answers it with the version it read). Once anything is
+; realised the memo walk is used instead, so elements already published keep
+; their shared values and a side-effecting `f` is not re-run for them.
 ;
-; ### What it means for a still-pending node
+; ### A fold REALISES the node
 ;
-; A pending node folded from source RE-COMPUTES its elements instead of reading
-; shared memo state, and does NOT publish them: the node stays `:pending`. That
-; is Clojure's own contract — `(reduce f init (map g coll))` over a `LazySeq`
-; walks the source without realising it — and it means a concurrent consumer of
-; the SAME seq may run `g` again. It is identical for pure `g`, and only those
-; are safe to fold: the caller must not rely on a fold to memoise side effects.
-; `doall` deliberately does NOT use a recipe — it is defined to realise.
+; A fold that runs to the end publishes the complete element list it produced
+; as the node's `{:completed …}` state (`publish_folded`, a version CAS against
+; the `:pending` it read). The next consumer reads that answer: a producer runs
+; once per element however many consumers fold the seq, which is Clojure's
+; realise-once contract. Two consumers racing on one pending node may both fold
+; from source; the CAS lets one publish, and both return correct answers. A
+; fold the consumer HALTS (a `Reduced`) produced only a prefix and publishes
+; nothing: the node stays pending.
+;
+; The recipe is ON THE CELL, never a struct field: a value that embeds the node
+; (`(concat prev [x])` built in a loop) would otherwise carry every recipe
+; closure behind it, and each cell holding such a value copies the whole chain
+; (measured: 400 chained concats retained 15 MB instead of 0.2 MB).
 ;
 ; A PINNED MODULE IS FUNCTIONS-ONLY and EVERY top-level `defn` is exported. The
 ; recalled module's private helpers are TOP LEVEL here under their recalled
-; names, plus the fold-recipe quartet — a call through a local closure is an
+; names, plus the fold-recipe helpers — a call through a local closure is an
 ; INDIRECT call, and on this host an indirect call costs up to ten times a
 ; direct one (measured on the dependency walk: 12 us vs 82 us for one pass over
 ; an 8000-element list). `force/1` runs on every realised element, so its whole
@@ -110,17 +118,17 @@
    the walk is unbounded in the reachable set, and a cell that carried no edges
    until its value arrived would re-walk every node behind each new one.
 
-   The two-arity form also attaches a fold recipe (`recipe`) a reducing consumer
-   may use while this node is still `:pending` — see the namespace header.
-   `rt.lazy-with-fold` is the beam-lisp-facing spelling of the same thing."
+   The two-arity form also gives the node a fold `recipe` a reducing consumer
+   may use while it is still `:pending` (see the namespace header). The recipe
+   lives ON THE CELL, `{:pending thunk recipe}`, for the reason the thunk does:
+   a struct field would be copied with every value that embeds the node."
   ([thunk]
    (if (and (erlang/is_function thunk)
             (erlang/== 0 (erlang/element 2 (erlang/fun_info thunk :arity))))
      (let [mod (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
        {:__struct__ mod
         :resource (BeamLisp.LazyMemo/create (tuple :pending thunk))
-        :metadata nil
-        :reduce nil})
+        :metadata nil})
      (erlang/error
        (Elixir.FunctionClauseError/exception
          (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
@@ -131,7 +139,10 @@
             (erlang/== 0 (erlang/element 2 (erlang/fun_info thunk :arity)))
             (erlang/is_function recipe)
             (erlang/== 2 (erlang/element 2 (erlang/fun_info recipe :arity))))
-     (maps/put :reduce recipe (new thunk))
+     (let [mod (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+       {:__struct__ mod
+        :resource (BeamLisp.LazyMemo/create (tuple :pending thunk recipe))
+        :metadata nil})
      (erlang/error
        (Elixir.FunctionClauseError/exception
          (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
@@ -150,25 +161,20 @@
               (tuple :function :from_fun)
               (tuple :arity 1))))))
 
-(defn with_reduce
-  "Attach a fold recipe to an already-built node."
-  [l recipe]
-  (if (and (lazy? l)
-           (erlang/is_function recipe)
-           (erlang/== 2 (erlang/element 2 (erlang/fun_info recipe :arity))))
-    (maps/put :reduce recipe l)
-    (erlang/error
-      (Elixir.FunctionClauseError/exception
-        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
-              (tuple :function :with_reduce)
-              (tuple :arity 2))))))
-
-(defn reduce_recipe
-  "The node's fold recipe, or `nil` when it has none."
+(defn pending_recipe
+  "`{recipe version}` when the node's head cell is `{:pending thunk recipe}` at
+   `version`, else `nil`: no recipe, or already claimed, realised, failed or
+   terminal. One read answers both questions a fold asks, and the version is
+   what `publish_folded` CASes against."
   [l]
-  (cond
-    (lazy? l) (erlang/map_get :reduce l)
-    :else nil))
+  (let [current (BeamLisp.LazyMemo/read_versioned (erlang/map_get :resource l))
+        state (erlang/element 2 current)]
+    (cond
+      (and (erlang/is_tuple state)
+           (erlang/== 3 (erlang/tuple_size state))
+           (erlang/== :pending (erlang/element 1 state)))
+      (tuple (erlang/element 3 state) (erlang/element 1 current))
+      :else nil)))
 
 (defn pending?
   "Whether the node's head cell is still `:pending` — the one state in which a
@@ -240,18 +246,6 @@
 ; `again` is the caller's FRESH REFERENCE: a term minted inside this call, so no
 ; user value can equal it. That is how a helper says "the cell moved under me,
 ; re-dispatch" without a sentinel a user term could be mistaken for.
-
-(defn pending_version
-  "The version at which the node's head cell is `:pending`, or `nil` when it is
-   in any other state. A fold recipe runs only against a pending cell, and
-   `publish_folded` CASes against exactly this version."
-  [l]
-  (let [current (BeamLisp.LazyMemo/read_versioned (erlang/map_get :resource l))
-        state (erlang/element 2 current)]
-    (cond
-      (and (erlang/is_tuple state) (erlang/== :pending (erlang/element 1 state)))
-      (erlang/element 1 current)
-      :else nil)))
 
 (defn publish_folded
   "Publish the COMPLETE element list a fold recipe produced over the node's
