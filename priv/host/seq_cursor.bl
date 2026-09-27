@@ -1,0 +1,58 @@
+; host/seq_cursor.bl — the pinned HOST MODULE for `Elixir.BeamLisp.SeqCursor`.
+;
+; Finite eager inputs are copied into native storage once, not once for every
+; deferred tail; each cursor keeps at most one small chunk on the BEAM heap.
+; This is the `.bl` port of `lib/beam_lisp/seq_cursor.ex`, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose
+; `__struct__/0,1` pair and `__info__/1` are SYNTHESIZED by `:struct_fields`
+; (`chunk` defaults to the EMPTY LIST, `tail` to nil, `dirty` to `false` — the
+; literal defaults `defstruct chunk: [], tail: nil, dirty: false` declared).
+;
+; `dirty` is the source's lane decision, made ONCE by the native cursor at
+; creation (a chunk of large elements takes the dirty scheduler; a normal chunk
+; of <= 32 small heads takes the fast one). It rides on every sub-cursor so the
+; whole walk uses the lane the source's shape demands.
+;
+; A pinned module is FUNCTIONS-only, so the source must spell at least one
+; `defn`; `new/1` and `cell/1` are those. `new` builds the struct by hand,
+; tagged with whatever module this file was compiled into — so a probe compile
+; answers its own `__struct__/1` — and `cell` never needs the atom: it reads
+; `:chunk`/`:tail`/`:dirty` out of the value it is handed.
+;
+; Run: bin/bl test test/bl/host_lazy_test.bl
+
+(ns host.seq-cursor)
+
+(defn new
+  "A cursor over the finite eager `list`: its first chunk empty, its tail the
+   native source resource, and its lane the source's own decision."
+  [list]
+  (let [mod (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+        resource (BeamLisp.LazyMemo/cursor list)]
+    (maps/put :__struct__ mod
+      (maps/put :chunk ()
+        (maps/put :tail resource
+          (maps/put :dirty (BeamLisp.LazyMemo/cursor_dirty_chunks? resource)
+                    (maps/new)))))))
+
+(defn cell
+  "The next cell `[head | tail]`, pulling a chunk from native storage when the
+   local one runs out; `nil` at the end. The tail is again a cursor, so a walk
+   is one small term at a time."
+  [cursor]
+  (let [chunk (erlang/map_get :chunk cursor)]
+    (cond
+      (and (erlang/is_list chunk) (erlang/== false (erlang/== chunk ())))
+      (erlang/apply :lists :append
+        (list (list (list (erlang/hd chunk))
+                    (maps/put :chunk (erlang/tl chunk) cursor))))
+
+      (and (erlang/== chunk ()) (erlang/== nil (erlang/map_get :tail cursor)))
+      nil
+
+      :else
+      (let [pulled (BeamLisp.LazyMemo/cursor_chunk
+                     (erlang/map_get :tail cursor)
+                     (erlang/map_get :dirty cursor))]
+        (cell (maps/put :chunk (erlang/element 1 pulled)
+                (maps/put :tail (erlang/element 2 pulled) cursor)))))))

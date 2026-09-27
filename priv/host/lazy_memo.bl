@@ -1,0 +1,417 @@
+; host/lazy_memo.bl — the pinned HOST MODULE for `Elixir.BeamLisp.LazyMemo`.
+;
+; `BeamLisp.LazyMemo` owns the native memo CELL and the policy around it, and
+; this file is the `.bl` port of `lib/beam_lisp/lazy_memo.ex` compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam,
+; `Elixir.BeamLisp.LazyMemo.beam`. The Rust NIF is unchanged and still names
+; that module (`native/lazy_memo/src/lib.rs`, `nif_init`), so the pinned module
+; must be the one that LOADS it: `erlang:load_nif/2` binds a library to the
+; CALLING module, so `ensure_loaded!` calls it from this module's own code —
+; exactly the load the recalled Elixir module did, under the same `:global`
+; lock and with the same error text.
+;
+; WHAT THE CELL HOLDS (PLAN-151 W3). A cell's state is a term the caller
+; chooses: `:pending`, `{:running, owner, attempt, waiters}`, `{:completed,
+; value}`, `{:failed, kind, reason, stack}` or `{:terminal, reason}`. The
+; THUNK does NOT live here — it lives in the `BeamLisp.LazySeq` struct, whose
+; resource this module hands back. That is the whole performance argument: a
+; cell that holds a zero-arity closure copies the closure's captured
+; environment through `OwnedEnv` on every create and every state transition,
+; and the closure is what made a lazy producer quadratic. Control states are
+; tiny terms and copy in constant time.
+;
+; DEPENDENCIES are the memo graph's edges, and they exist for ONE question:
+; `would_cycle`, asked by the NIF when the new edge set is not a subset of the
+; old one. They are NOT an ownership mechanism — a saved state term already
+; keeps every resource it embeds alive (FUP-112). So `dependencies/1` is walked
+; only when a caller has a term that may hold resources: a published value, a
+; fun's captured environment, or a `LazySeq`'s resource and metadata. A bare
+; scalar cannot hold one and is answered without a walk.
+;
+; A PINNED MODULE IS FUNCTIONS-ONLY and EVERY top-level `defn` is exported —
+; `defn-` is not privatized on this path, unlike Elixir's `defp`. So the
+; helpers the recalled module kept private (`load_nif!`, `load_advice`,
+; `foreign_module?`, `await_budget`, `walk`, `include_resource`,
+; `prepend_tuple`) are LOCAL closures here, and the module's export surface is
+; exactly the recalled module's.
+;
+; Run: bin/bl test test/bl/host_lazy_test.bl
+
+(ns host.lazy-memo)
+
+(defn ensure_loaded!
+  "Load the native cell runtime into THIS module, once, under the `:global`
+   lock the recalled module used (`{BeamLisp.LazyMemo, :load_nif}` keyed by the
+   caller). Idempotent: a loaded library answers `nif_loaded?` true and the
+   whole call is a probe."
+  []
+  (if (nif_loaded?)
+    :ok
+    (let [; The one failure that is NOT 'build it': `load_nif` answers `:bad_lib`
+          ; when the library at this path declares a DIFFERENT module — the file
+          ; is there, it belongs to another crate, and the mismatch IS the
+          ; diagnosis. Reported, never summarised away.
+          advice (fn [reason path]
+                   (let [detail (cond
+                                  (and (erlang/is_tuple reason)
+                                       (erlang/== 2 (erlang/tuple_size reason))
+                                       (erlang/== :bad_lib (erlang/element 1 reason)))
+                                  (erlang/element 2 reason)
+                                  :else nil)
+                         text (cond
+                                (erlang/is_binary detail) detail
+                                (erlang/is_list detail) (erlang/list_to_binary detail)
+                                :else "")
+                         foreign? (String/contains? text "does not match calling module")]
+                     (cond
+                       foreign?
+                       (str "\nThe artifact is NOT this crate's library — the loader reports:\n"
+                            "  " detail "\n"
+                            "Fix: rm " path ".so && bl native build\n")
+                       :else
+                       (str "Fix: bl native build   (builds native/lazy_memo into " path ".so)\n"))))
+          load! (fn []
+                  (if (nif_loaded?)
+                    :ok
+                    (let [path (Path/join (BeamLisp.Tiers/priv_root) "native/lazy_memo")
+                          r (erlang/load_nif (erlang/binary_to_list path) 0)]
+                      (cond
+                        (erlang/== :ok r) :ok
+                        :else
+                        (erlang/error
+                          (Elixir.RuntimeError/exception
+                            (str "the lazy_memo native runtime is not loadable, and nothing runs without it:\n"
+                                 "  " path ".so\n"
+                                 "  " (Kernel/inspect (erlang/element 2 r)) "\n\n"
+                                 (advice (erlang/element 2 r) path)
+                                 "After changing a native runtime module, restart the VM; live NIF\n"
+                                 "upgrades are intentionally unsupported.\n")))))))]
+      (let [outcome (erlang/apply :global :trans
+                      (list (tuple (tuple :"Elixir.BeamLisp.LazyMemo" :load_nif) (erlang/self))
+                            load!))]
+        (cond
+          (erlang/== :ok outcome) :ok
+          :else
+          (erlang/error
+            (Elixir.RuntimeError/exception
+              (str "lazy memo NIF load lock failed: " (Kernel/inspect outcome)))))))))
+
+(defn create
+  "Create a cell holding `state`. Its dependencies and its byte estimate are
+   measured here, before the call, so the lane is chosen directly — a small
+   initial value is copied on a regular scheduler, a large one into the dirty
+   lane."
+  [state]
+  (ensure_loaded!)
+  (let [deps (dependencies state)
+        bytes (estimate_bytes state)]
+    (cond
+      (erlang/=< bytes (nif_fast_lane_bytes)) (nif_new_fast state deps bytes)
+      :else (nif_new state deps bytes))))
+
+(defn create_ref
+  "Create an EAGER reference cell: GC-owned like any cell, but its value is not
+   scanned for dependency edges and not cycle-checked. This is what an atom
+   wants — it holds ordinary data (which may legally point back at another
+   atom), and a lazy memo's cycle rejection would wrongly refuse those.
+   Ownership is unaffected: the saved term still holds any embedded resource
+   handles."
+  [value]
+  (ensure_loaded!)
+  (let [bytes (estimate_bytes value)]
+    (cond
+      (erlang/=< bytes (nif_fast_lane_bytes)) (nif_new_fast value () bytes)
+      :else (nif_new value () bytes))))
+
+(defn exchange_ref
+  "Compare-exchange on an eager ref cell: no dependency scan, no cycle check."
+  ([resource expected value] (exchange_ref resource expected value ()))
+  ([resource expected value notifications]
+   (ensure_loaded!)
+   (let [bytes (estimate_bytes value)]
+     (cond
+       (erlang/=< bytes (nif_fast_lane_bytes))
+       (let [outcome (nif_compare_exchange_fast resource expected value () bytes notifications)]
+         (cond
+           (erlang/== :reroute outcome)
+           (nif_compare_exchange resource expected value () bytes notifications)
+           :else outcome))
+       :else (nif_compare_exchange resource expected value () bytes notifications)))))
+
+(defn exchange
+  "Compare-exchange a cell's state. Two scheduler lanes, one cell: the fast
+   lane is a regular-scheduler NIF and must finish well under 1 ms — it answers
+   `:reroute` for a large current value, a large replacement, or any NEW
+   dependency edge (an unbounded cycle walk), and we then take the dirty lane.
+   The router only skips the fast attempt when the replacement is obviously too
+   big, so the common tiny-memo case costs one crossing.
+
+   A control state (`:pending`, `{:running …}`, `{:terminal …}`) is a tiny term
+   whose only elements are pids, refs and lists, so its walk is trivially `[]`
+   and its estimate constant — the thunk-free cell is what makes that true."
+  ([resource expected state] (exchange resource expected state ()))
+  ([resource expected state notifications]
+   (ensure_loaded!)
+   (let [deps (dependencies state)
+         bytes (estimate_bytes state)]
+     (cond
+       (erlang/=< bytes (nif_fast_lane_bytes))
+       (let [outcome (nif_compare_exchange_fast resource expected state deps bytes notifications)]
+         (cond
+           (erlang/== :reroute outcome)
+           (nif_compare_exchange resource expected state deps bytes notifications)
+           :else outcome))
+       :else (nif_compare_exchange resource expected state deps bytes notifications)))))
+
+(defn dependencies
+  "The memo resources `term` can reach, in a list, deduplicated by the NIF's
+   cell identity. A memo handle is a graph boundary (its transitive
+   dependencies live in the native graph); immutable metadata belongs to the
+   wrapper and must be walked, which is why a `LazySeq` node contributes both
+   its resource AND its metadata.
+
+   A scalar — atom, number, binary, pid, port — cannot hold a resource or a
+   fun, so a term of that shape is answered without a walk. Everything else is
+   walked: tuples, maps, proper and improper lists, funs (through
+   `erlang:fun_info/2`'s `:env`), `LazySeq` structs and bare memo/cursor
+   handles.
+
+   ONE LOOP, TWO PHASES. `:inspect` consumes the current term; `:advance` pops
+   the next pending term off the stack. The stack is a list terminated by a
+   FRESH REFERENCE minted per call, so a pop is `hd`/`tl` with no emptiness
+   test and the terminator cannot be confused with a stacked term — any atom
+   could appear inside a value; a reference that never leaves this call cannot.
+
+   The common case is the one that decides the cost: a lazy value is a cons
+   list ending in a node, so `:inspect` walks the SPINE with `recur`, testing
+   each head's shape and pushing only a head that can itself contain something.
+   A flat list of numbers — the overwhelming majority of produced values — is
+   therefore one shape test per element and NO allocation, which a
+   worklist-of-every-subterm walk cannot manage (measured: 1220 us vs 21 us for
+   `estimate_bytes/1` over the same 8k list, and this walk runs on every
+   publish)."
+  [term]
+  (ensure_loaded!)
+  (let [stack-end (erlang/make_ref)
+        lazy-node? (fn [t]
+                     (and (erlang/is_map t)
+                          (erlang/is_map_key :__struct__ t)
+                          (erlang/== :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ t))))
+        scalar? (fn [t]
+                  (or (erlang/is_atom t) (erlang/is_number t) (erlang/is_binary t)
+                      (erlang/is_pid t) (erlang/is_port t)))
+        push (fn [x xs] (erlang/++ (list x) xs))
+        push-all (fn [xs acc]
+                   (erlang/apply :lists :foldl
+                     (list (fn [v a] (erlang/++ (list v) a)) acc xs)))]
+    (loop [phase :inspect
+           cur term
+           stack (list stack-end)
+           ids (MapSet/new)
+           functions (MapSet/new)
+           resources ()]
+      (cond
+        ; ── pop the next pending term, or answer ──
+        (erlang/== phase :advance)
+        (let [nextup (erlang/hd stack)
+              rest-stack (erlang/tl stack)]
+          (cond
+            (erlang/== nextup stack-end) resources
+            :else (recur :inspect nextup rest-stack ids functions resources)))
+
+        ; ── a cons: test its head, continue down the spine ──
+        (and (erlang/is_list cur) (erlang/== false (erlang/== cur ())))
+        (let [head (erlang/hd cur)
+              tail (erlang/tl cur)]
+          (cond
+            (scalar? head) (recur :inspect tail stack ids functions resources)
+            :else (recur :inspect tail (push head stack) ids functions resources)))
+
+        ; ── a scalar: nothing inside ──
+        (scalar? cur) (recur :advance cur stack ids functions resources)
+
+        ; ── a lazy node: resource + metadata, both walked ──
+        (lazy-node? cur)
+        (let [resource (erlang/map_get :resource cur)
+              identity (nif_id resource)
+              seen? (MapSet/member? ids identity)]
+          (recur :inspect (erlang/map_get :metadata cur) stack
+                 (cond seen? ids :else (MapSet/put ids identity))
+                 functions
+                 (cond seen? resources :else (push resource resources))))
+
+        ; ── a bare memo handle (or a cursor, whose source it answers) ──
+        (erlang/is_reference cur)
+        (let [found (nif_dependency_resource cur)
+              seen? (cond (erlang/== found nil) true
+                          :else (MapSet/member? ids (nif_id found)))]
+          (cond
+            (or (erlang/== found nil) seen?)
+            (recur :advance cur stack ids functions resources)
+            :else
+            (recur :advance cur stack
+                   (MapSet/put ids (nif_id found)) functions
+                   (push found resources))))
+
+        ; ── a closure: walk its captured environment, once per fun ──
+        (erlang/is_function cur)
+        (cond
+          (MapSet/member? functions cur) (recur :advance cur stack ids functions resources)
+          :else
+          (let [env (erlang/element 2 (erlang/fun_info cur :env))]
+            (recur :advance cur (push-all env stack)
+                   ids (MapSet/put functions cur) resources)))
+
+        ; ── a tuple: walk its elements ──
+        (erlang/is_tuple cur)
+        (recur :advance cur (push-all (erlang/tuple_to_list cur) stack)
+               ids functions resources)
+
+        ; ── a map (a struct included): walk its values and keys ──
+        (erlang/is_map cur)
+        (recur :advance cur
+               (maps/fold (fn [k v acc] (push v (push k acc))) stack cur)
+               ids functions resources)
+
+        :else (recur :advance cur stack ids functions resources)))))
+
+(defn cursor
+  "A native chunked cursor over the finite eager `list`. Its source is saved
+   once, and each pulled chunk shares that storage."
+  [list]
+  (ensure_loaded!)
+  (nif_cursor list (dependencies list) (estimate_bytes list)))
+
+(defn cursor_dirty_chunks?
+  "Whether this cursor's chunks must take the dirty lane, decided at creation
+   from the source's average element size."
+  [resource]
+  (nif_cursor_dirty_chunks resource))
+
+(defn cursor_chunk
+  "Pull the next chunk. `dirty?` (from `cursor_dirty_chunks?/1`) picks the lane."
+  ([resource] (cursor_chunk resource false))
+  ([resource dirty?]
+   (cond
+     (erlang/== false dirty?) (nif_cursor_chunk_fast resource)
+     :else (nif_cursor_chunk resource))))
+
+(defn estimate_bytes
+  "The term's size in bytes — the estimate the lanes are chosen by and the
+   number the cache budget is charged.
+
+   `:erts_debug.flat_size/1` is exact, O(size) at the BIF, and safe on every
+   term a cell here can hold: a lazy node's `thunk` is a HANDLE into another
+   cell (see `BeamLisp.LazySeq`), so `flat_size` stops at it the way it stops at
+   any resource and never walks the capture chain behind it."
+  [term]
+  (erlang/* (erlang/apply :erts_debug :flat_size (list term)) (erlang/system_info :wordsize)))
+
+(defn admit!
+  "The cache budget gate. `:lazy_cache_budget_bytes` (default 512 MiB) bounds
+   the bytes retained off-heap; a budget of 0 refuses every new attempt. At or
+   over budget, collect and give the deferred off-heap reclaim a bounded grace
+   period before refusing — live answers are untouched."
+  []
+  (let [default 536870912
+        budget (Application/get_env :beam_lisp :lazy_cache_budget_bytes default)]
+    (cond
+      (and (erlang/is_integer budget) (erlang/>= budget 0)) :ok
+      :else (erlang/error
+              (Elixir.ArgumentError/exception
+                "lazy_cache_budget_bytes must be a non-negative integer")))
+    (cond
+      (erlang/== budget 0)
+      (erlang/error (Elixir.BeamLisp.LazySeq.ForceError/exception
+                      (tuple :lazy_cache_budget_exceeded budget)))
+
+      (erlang/>= (:retained_bytes (stats)) budget)
+      (let [await (fn await [deadline]
+                    (cond
+                      (erlang/< (:retained_bytes (stats)) budget) :ok
+                      (erlang/>= (System/monotonic_time :millisecond) deadline)
+                      (erlang/error (Elixir.BeamLisp.LazySeq.ForceError/exception
+                                      (tuple :lazy_cache_budget_exceeded budget)))
+                      :else (do (Process/sleep 1) (await deadline))))]
+        (erlang/garbage_collect)
+        (await (erlang/+ (System/monotonic_time :millisecond) 25)))
+
+      :else :ok)))
+
+(defn new
+  "Create a cell from an already-measured state, dependency list and byte
+   estimate — the low-level door `create/1` and the lazy force path route
+   through."
+  [state dependencies bytes]
+  (ensure_loaded!)
+  (nif_new state dependencies bytes))
+
+(defn read
+  "The cell's current state. One crossing on the hot path: the fast NIF
+   self-guards, answering `:reroute` for an over-ceiling cell instead of a
+   routing round-trip. A small cell whose state IS the literal `:reroute` atom
+   falls through to the dirty read and returns the same value — one extra
+   crossing for that lone pathological case only."
+  [resource]
+  (ensure_loaded!)
+  (let [value (nif_read_fast resource)]
+    (cond
+      (erlang/== :reroute value) (nif_read resource)
+      :else value)))
+
+(defn fast_lane_bytes
+  "Byte ceiling below which cell reads/writes take the regular-scheduler lane."
+  []
+  (ensure_loaded!)
+  (nif_fast_lane_bytes))
+
+(defn set_fast_lane_bytes
+  "Tune the fast-lane ceiling. Raising it trades scheduler fairness for
+   throughput."
+  [bytes]
+  (ensure_loaded!)
+  (nif_set_fast_lane_bytes bytes))
+
+(defn compare_exchange
+  "Dirty-lane-only compare-exchange, for a caller that has measured its own
+   dependencies."
+  [resource expected replacement dependencies bytes]
+  (ensure_loaded!)
+  (nif_compare_exchange resource expected replacement dependencies bytes ()))
+
+(defn id
+  "The cell's stable identity, as the dependency graph keys it."
+  [resource]
+  (ensure_loaded!)
+  (nif_id resource))
+
+(defn stats []
+  (ensure_loaded!)
+  (nif_stats))
+
+; Runtime loading happens after the compiler's own load, so the probe lives in
+; the NIF, not in a persistent term: a host-module reload then cannot lie. Each
+; stub exists so `load_nif` can bind the real entry point over it — a library
+; whose function list this module does not declare is refused `{:bad_lib, …}`.
+
+(defn nif_loaded? [] false)
+(defn nif_new [_state _dependencies _bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_new_fast [_state _dependencies _bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_read [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_read_fast [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_fast_lane_bytes [] (erlang/nif_error :nif_not_loaded))
+(defn nif_set_fast_lane_bytes [_bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_compare_exchange_fast
+  [_resource _expected _replacement _dependencies _bytes _notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_compare_exchange
+  [_resource _expected _replacement _dependencies _bytes _notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_id [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_resource_id [_term] (erlang/nif_error :nif_not_loaded))
+(defn nif_stats [] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor [_list _dependencies _bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_chunk [_cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_chunk_fast [_cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_dirty_chunks [_cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_dependency_resource [_term] (erlang/nif_error :nif_not_loaded))
