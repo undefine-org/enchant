@@ -1,0 +1,72 @@
+;; bench/memo_cell.bl — what one memo cell costs, as a function of what it holds.
+;;
+;;   bl run bench/memo_cell.bl
+;;
+;; PLAN-151. Before: a lazy-seq cell's create/claim/publish each walked and
+;; copied the thunk's captured environment, so a thunk capturing an 8k list
+;; cost ~1.2 ms per realised element (16 us with 100 captured), and an atom's
+;; swap!/deref copied and compared the whole value (10k-entry map: 1.16 ms /
+;; 475 us). Each row prints the mean per operation.
+;;
+;; BEST OF FIVE, AND WHY. Every row is timed five times and the best run is the
+;; number printed: on a shared host a GC pause or a scheduler hiccup moves a
+;; single sample by tens of percent (measured on this machine: the same 10k
+;; `deref` row read 146 us and 216 us minutes apart), which is wider than every
+;; difference this file exists to show. `test/bl/lazy_scaling_test.bl` takes the
+;; best of three for exactly this reason.
+
+(ns bench.memo-cell (:require [clojure.string :as cs]))
+
+(def ^:private reps 5)
+
+(defn- once-us
+  "One timed run of `f`, `n` times, as a mean in microseconds."
+  [n f]
+  (let [t0 (erlang/monotonic_time :microsecond)]
+    (loop [i 0] (when (< i n) (f) (recur (inc i))))
+    (/ (- (erlang/monotonic_time :microsecond) t0) (* 1.0 n))))
+
+(defn- best-us-per
+  "Best of `reps` measured means, after one untimed warm-up run (first-touch
+   allocation, any one-off module load)."
+  [n f]
+  (f)
+  (loop [i 0 b nil]
+    (cond
+      (erlang/== i reps) b
+      :else (let [v (once-us n f)]
+              (recur (inc i) (cond (nil? b) v (< v b) v :else b))))))
+
+(defn- best-ms-per-node
+  "Best of `reps` runs of `f` (which realises `k` nodes), as a mean per node in
+   microseconds."
+  [k f]
+  (f)
+  (loop [i 0 b nil]
+    (cond
+      (erlang/== i reps) b
+      :else
+      (let [v (/ (* 1000.0 (let [t0 (erlang/monotonic_time :millisecond)]
+                             (f)
+                             (- (erlang/monotonic_time :millisecond) t0)))
+                 k)]
+        (recur (inc i) (cond (nil? b) v (< v b) v :else b))))))
+
+(defn- row [label v] (println (str (subs (str label "                                          ") 0 44) (/ (erlang/round (* 10 v)) 10.0) " us")))
+
+(println "── lazy-seq cell: create + force, thunk captures a list of k")
+(doseq [k [100 1000 8000 32000]]
+  (let [big (apply list (range k))]
+    (row (str "k=" k) (best-us-per 50 (fn [] (first (lazy-seq (cons (count big) nil))))))))
+
+(println "── chain of self-referencing nodes: per node realised")
+(doseq [k [1000 4000]]
+  (row (str "chain of " k)
+       (best-ms-per-node k
+         (fn [] (count (reduce (fn [prev i] (lazy-seq (cons i prev))) () (range k)))))))
+
+(println "── atom holding a map of k entries")
+(doseq [k [10 1000 10000 50000]]
+  (let [a (atom (into {} (map (fn [i] [i i]) (range k))))]
+    (row (str "swap! assoc, k=" k) (best-us-per 50 (fn [] (swap! a assoc 0 1))))
+    (row (str "deref, k=" k) (best-us-per 50 (fn [] (deref a))))))
