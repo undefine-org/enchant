@@ -1,0 +1,462 @@
+; host/refs.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Refs`.
+;
+; Clojure's reference types, on the BEAM: `atom` (a value behind a native memo
+; cell), `future` (a `Task` running a computation), `promise` (a
+; single-assignment box), `volatile!` (a process-dictionary box). This is the
+; `.bl` port of `lib/beam_lisp/refs.ex`'s `BeamLisp.Refs` half, compiled
+; FUNCTIONS-ONLY by `BeamLisp.AOT/compile_host_file` into
+; `Elixir.BeamLisp.Refs.beam` — no struct of its own.
+;
+; ABI PARITY IS THE CONTRACT. The `rt.bl` link table points at these names
+; (`priv/boot/rt.bl`, the reference table: atom/1, deref/1,3, swap!/2,3,
+; reset!/2, compare-and-set!/3, add-watch/3, remove-watch/2, promise/0,
+; deliver/2, future?/1, future-cancel/1, volatile!/1, vreset!/2, vswap!/2,3,
+; volatile?/1). The pinned emitter exports EVERY top-level `defn` (and does not
+; privatize a `defn-`), so a helper written at the top level would become
+; public ABI the recalled module never had. Every helper here is therefore a
+; LOCAL closure — the export set is exactly the live module's.
+;
+; VERSIONED TRANSITIONS. The atom's value and its watch table are native memo
+; cells, and every write is a `read_versioned` + `exchange_version … :keep`
+; pair: the comparison is an INTEGER (the cell's publication counter), so the
+; old full-term compare — which loaded and compared the whole value on every
+; `swap!` — is gone. A racing writer bumps the counter, the exchange answers
+; `:retry`, and the loop re-reads and re-applies, which is Clojure's atom
+; contract. `compare-and-set!` keeps Clojure's VALUE equality (`==`: `1` and
+; `1.0` are equal) checked in the caller against the read term, while the
+; EXACT race is still closed by the version.
+;
+; Run: bin/bl test test/bl/host_refs_test.bl test/bl/reactive_test.bl
+
+(ns host.refs)
+
+; ── atoms ──────────────────────────────────────────────────────────────────
+;
+; An atom's value lives in one GC-owned cell; `swap!` is a compare-exchange
+; retry loop, the loop Clojure's atom runs and the old Agent version avoided by
+; serializing in a process. `watches` is a SECOND cell holding `%{key => fn}`,
+; so watches share the value's ownership discipline and need no
+; process-dictionary side table. The atom struct is built with the PUBLIC tag
+; literal (never `BeamLisp.Atom/new`), exactly as `deferred.bl` builds `Delay`:
+; a probe compile under any atom must still produce the one `%BeamLisp.Atom{}`
+; shape every caller and `deref` recognize.
+
+(defn atom
+  "A new atom holding `v`: a value cell and an (empty) watch-table cell."
+  [v]
+  (maps/put :__struct__ :"Elixir.BeamLisp.Atom"
+    (maps/put :cell (BeamLisp.LazyMemo/create_ref v)
+      (maps/put :watches (BeamLisp.LazyMemo/create_ref (maps/new))
+        (maps/new)))))
+
+(defn swap!
+  "`(swap! ref f)` / `(swap! ref f & args)` — apply `f` to the current value
+   (plus `args`), publish the result with a version CAS, and return it. Watches
+   fire AFTER the value commits, in the caller's process."
+  ([ref f] (swap! ref f ()))
+  ([ref f args_list]
+   (let [tag? (fn [t x] (and (erlang/is_map x)
+                             (erlang/== t (maps/get :__struct__ x nil))))]
+     (if (tag? :"Elixir.BeamLisp.Atom" ref)
+       (let [notify
+             (fn notify [a old new]
+               ; A no-op change still notifies, matching Clojure: the watch
+               ; decides what counts as a change, not the atom.
+               (let [watches (BeamLisp.LazyMemo/read (maps/get :watches a nil))]
+                 (if (erlang/== 0 (erlang/map_size watches))
+                   :ok
+                   (do (maps/foreach
+                         (fn [key wf] (BeamLisp.Ns.Rt/invoke wf (list key a old new)))
+                         watches)
+                       :ok))))
+             step
+             (fn step [a]
+               (let [cell (maps/get :cell a nil)
+                     cur (BeamLisp.LazyMemo/read_versioned cell)
+                     version (erlang/element 1 cur)
+                     old (erlang/element 2 cur)
+                     new (BeamLisp.Ns.Rt/invoke f (erlang/++ (list old) args_list))
+                     outcome (BeamLisp.LazyMemo/exchange_version cell version new :keep)]
+                 (cond
+                   (erlang/== :ok outcome) (do (notify a old new) new)
+                   (erlang/== :retry outcome) (step a)
+                   :else (erlang/error
+                           (Elixir.ArgumentError/exception
+                             "swap!: the new value would form a reference cycle")))))]
+         (step ref))
+       (erlang/error
+         (Elixir.ArgumentError/exception
+           (str "swap!: not a reference: " (Kernel/inspect ref))))))))
+
+(defn reset!
+  "Set an atom's value to `v` with a version CAS, returning `v`; notifies
+   watches after the commit."
+  [ref v]
+  (let [tag? (fn [t x] (and (erlang/is_map x)
+                            (erlang/== t (maps/get :__struct__ x nil))))]
+    (if (tag? :"Elixir.BeamLisp.Atom" ref)
+      (let [notify
+            (fn notify [a old new]
+              (let [watches (BeamLisp.LazyMemo/read (maps/get :watches a nil))]
+                (if (erlang/== 0 (erlang/map_size watches))
+                  :ok
+                  (do (maps/foreach
+                        (fn [key wf] (BeamLisp.Ns.Rt/invoke wf (list key a old new)))
+                        watches)
+                      :ok))))
+            step
+            (fn step [a]
+              (let [cell (maps/get :cell a nil)
+                    cur (BeamLisp.LazyMemo/read_versioned cell)
+                    version (erlang/element 1 cur)
+                    old (erlang/element 2 cur)
+                    outcome (BeamLisp.LazyMemo/exchange_version cell version v :keep)]
+                (cond
+                  (erlang/== :ok outcome) (do (notify a old v) v)
+                  (erlang/== :retry outcome) (step a)
+                  :else (erlang/error
+                          (Elixir.ArgumentError/exception
+                            "reset!: the value would form a reference cycle")))))]
+        (step ref))
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (str "reset!: not an atom: " (Kernel/inspect ref)))))))
+
+; ── watches (PLAN-148 W6a) ─────────────────────────────────────────────────
+;
+; Clojure's `add-watch` / `remove-watch`, which beam-lisp did not have: atoms
+; supported deref/swap!/reset!/compare-and-set! but nothing could OBSERVE a
+; change. The watch table lives in the atom's SECOND memo cell, so it shares
+; the value's ownership discipline. Watches fire in the CALLER's process, after
+; the swap has committed — as in Clojure. Running them inside a cell would
+; block it, and a watch that touched its own atom would deadlock.
+
+(defn add_watch!
+  "Register `f` (called `(f key ref old new)` on change) under `key`."
+  [ref key wf]
+  (let [tag? (fn [t x] (and (erlang/is_map x)
+                            (erlang/== t (maps/get :__struct__ x nil))))]
+    (if (tag? :"Elixir.BeamLisp.Atom" ref)
+      (let [; CAS-loop on the watches cell, so concurrent add/remove do not lose
+            ; each other. `:keep` edges: a watch table reaches nothing new.
+            update (fn update [w g]
+                     (let [cur (BeamLisp.LazyMemo/read_versioned w)
+                           version (erlang/element 1 cur)
+                           old (erlang/element 2 cur)
+                           outcome (BeamLisp.LazyMemo/exchange_version w version (g old) :keep)]
+                       (cond
+                         (erlang/== :ok outcome) :ok
+                         (erlang/== :retry outcome) (update w g)
+                         :else (erlang/error
+                                 (Elixir.ArgumentError/exception
+                                   "watch table would form a reference cycle")))))]
+        (update (maps/get :watches ref nil) (fn [m] (maps/put key wf m)))
+        ref)
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (str "add-watch!: not an atom: " (Kernel/inspect ref)))))))
+
+(defn remove_watch!
+  "Remove the watch registered under `key`."
+  [ref key]
+  (let [tag? (fn [t x] (and (erlang/is_map x)
+                            (erlang/== t (maps/get :__struct__ x nil))))]
+    (if (tag? :"Elixir.BeamLisp.Atom" ref)
+      (let [update (fn update [w g]
+                     (let [cur (BeamLisp.LazyMemo/read_versioned w)
+                           version (erlang/element 1 cur)
+                           old (erlang/element 2 cur)
+                           outcome (BeamLisp.LazyMemo/exchange_version w version (g old) :keep)]
+                       (cond
+                         (erlang/== :ok outcome) :ok
+                         (erlang/== :retry outcome) (update w g)
+                         :else (erlang/error
+                                 (Elixir.ArgumentError/exception
+                                   "watch table would form a reference cycle")))))]
+        (update (maps/get :watches ref nil) (fn [m] (maps/remove key m)))
+        ref)
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (str "remove-watch!: not an atom: " (Kernel/inspect ref)))))))
+
+(defn compare_and_set!
+  "Clojure's `compare-and-set!`: set the atom to `new` iff its current value
+   `== old`, answering whether it did. Clojure's `=` is beam-lisp's `==`, so `1`
+   and `1.0` count as equal; the native exchange compares EXACTLY, so the
+   value-equality check runs here against the read term and the exact exchange
+   is made against that term — a racing writer bumps the version, the exchange
+   answers `:retry`, and we re-check."
+  [ref old new]
+  (let [tag? (fn [t x] (and (erlang/is_map x)
+                            (erlang/== t (maps/get :__struct__ x nil))))]
+    (if (tag? :"Elixir.BeamLisp.Atom" ref)
+      (let [notify
+            (fn notify [a cur nv]
+              (let [watches (BeamLisp.LazyMemo/read (maps/get :watches a nil))]
+                (if (erlang/== 0 (erlang/map_size watches))
+                  :ok
+                  (do (maps/foreach
+                        (fn [key wf] (BeamLisp.Ns.Rt/invoke wf (list key a cur nv)))
+                        watches)
+                      :ok))))
+            step
+            (fn step [a]
+              (let [cell (maps/get :cell a nil)
+                    cur (BeamLisp.LazyMemo/read_versioned cell)
+                    version (erlang/element 1 cur)
+                    current (erlang/element 2 cur)]
+                (if (erlang/== current old)
+                  (let [outcome (BeamLisp.LazyMemo/exchange_version cell version new :keep)]
+                    (cond
+                      (erlang/== :ok outcome) (do (notify a current new) true)
+                      (erlang/== :retry outcome) (step a)
+                      :else (erlang/error
+                              (Elixir.ArgumentError/exception
+                                "compare-and-set!: the value would form a reference cycle"))))
+                  false)))]
+        (step ref))
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (str "compare-and-set!: not an atom: " (Kernel/inspect ref)))))))
+
+; ── volatiles ──────────────────────────────────────────────────────────────
+;
+; A volatile is an *unsynchronized* box: a process-dictionary cell, not a cell
+; reference. The transducer layer creates and swaps a volatile per step, so
+; spawning a process for each would forfeit the performance deal. The cost is
+; the documented honesty: visible only within the creating process.
+
+(defn volatile
+  "A new volatile holding `v` in THIS process's dictionary, keyed by a fresh
+   reference. The struct holds only the key."
+  [v]
+  (let [key (erlang/make_ref)]
+    (Process/put (tuple :"Elixir.BeamLisp.Volatile" key) v)
+    (maps/put :__struct__ :"Elixir.BeamLisp.Volatile"
+      (maps/put :key key (maps/new)))))
+
+(defn vreset!
+  "Overwrite a volatile's value in the creating process's dictionary."
+  [ref v]
+  (if (and (erlang/is_map ref)
+           (erlang/== :"Elixir.BeamLisp.Volatile" (maps/get :__struct__ ref nil)))
+    (do (Process/put (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key ref nil)) v)
+        v)
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "vreset!: not a volatile: " (Kernel/inspect ref))))))
+
+(defn vswap!
+  "`(vswap! vol f)` / `(vswap! vol f & args)` — read-modify-write a volatile.
+   The step fn runs in the caller's process (no cell, no process), so it is
+   atomic only against other ops in the same process — the volatile contract."
+  ([ref f] (vswap! ref f ()))
+  ([ref f args_list]
+   (if (and (erlang/is_map ref)
+            (erlang/== :"Elixir.BeamLisp.Volatile" (maps/get :__struct__ ref nil)))
+     (let [new (BeamLisp.Ns.Rt/invoke f (erlang/++ (list (deref ref)) args_list))]
+       (Process/put (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key ref nil)) new)
+       new)
+     (erlang/error
+       (Elixir.ArgumentError/exception
+         (str "vswap!: not a volatile: " (Kernel/inspect ref)))))))
+
+(defn volatile?
+  "True for a volatile."
+  [x]
+  (and (erlang/is_map x)
+       (erlang/== :"Elixir.BeamLisp.Volatile" (maps/get :__struct__ x nil))))
+
+; ── futures ────────────────────────────────────────────────────────────────
+;
+; A fork's `:max_heap_words` bound is enforced per spawned process (PLAN-047
+; W5): the token carries it, and the process sets its own `max_heap_size` flag
+; — overflow kills THIS process, never the VM. The map form with `kill: false`
+; is deliberate: the integer form exits `:killed`, which is UNTRAPPABLE and
+; would take the awaiting caller down through the task link. Non-kill overflow
+; raises in the bounded process, so `deref` surfaces it like any other error.
+
+(defn future_exec
+  "Run `thunk_fn` in a `Task`, carrying the caller's env binding and heap bound
+   into it (the process dictionary does not propagate across spawn)."
+  [thunk_fn]
+  (let [token (BeamLisp.Env/capture)
+        bound (fn [] (let [w (BeamLisp.Env/max_heap)]
+                       (if (erlang/== nil w)
+                         :ok
+                         (erlang/process_flag :max_heap_size
+                           (maps/put :size w
+                             (maps/put :kill false
+                               (maps/put :error_logger false (maps/new))))))))
+        task (Task/async (fn [] (BeamLisp.Env/bind token) (bound) (thunk_fn)))]
+    (maps/put :__struct__ :"Elixir.BeamLisp.Future"
+      (maps/put :task task (maps/new)))))
+
+(defn spawn_exec
+  "Start `thunk_fn` on a new process that INHERITS the spawning env, the same
+   binding-conveyance `future_exec/1` and `promise/0` use. Raw `erlang/spawn`
+   starts a child with an EMPTY process dict, so the child resolves its vars and
+   caps at `:global`; capturing the token and binding it first makes `spawn`
+   env-transparent. `kind` is `:plain | :link | :monitor`, mirroring the three
+   `:erlang.spawn*` shapes; `:monitor` returns a `{pid, ref}` tuple."
+  ([thunk_fn] (spawn_exec thunk_fn :plain))
+  ([thunk_fn kind]
+   (let [token (BeamLisp.Env/capture)
+         bound (fn [] (let [w (BeamLisp.Env/max_heap)]
+                        (if (erlang/== nil w)
+                          :ok
+                          (erlang/process_flag :max_heap_size
+                            (maps/put :size w
+                              (maps/put :kill false
+                                (maps/put :error_logger false (maps/new))))))))
+         wrapped (fn [] (BeamLisp.Env/bind token) (bound) (thunk_fn))]
+     (cond
+       (erlang/== :plain kind) (erlang/spawn wrapped)
+       (erlang/== :link kind) (erlang/spawn_link wrapped)
+       (erlang/== :monitor kind) (erlang/spawn_monitor wrapped)
+       :else (erlang/error
+               (Elixir.CaseClauseError/exception (list (tuple :term kind))))))))
+
+(defn future?
+  "True for a future."
+  [x]
+  (and (erlang/is_map x)
+       (erlang/== :"Elixir.BeamLisp.Future" (maps/get :__struct__ x nil))))
+
+(defn future_cancel
+  "Cancel a running future. `:brutal_kill` terminates it immediately and
+   returns nil (no reply), so the answer is gated on whether the task was still
+   alive — `true` only when it actually cancelled a running computation."
+  [ref]
+  (if (and (erlang/is_map ref)
+           (erlang/== :"Elixir.BeamLisp.Future" (maps/get :__struct__ ref nil)))
+    (let [task (maps/get :task ref nil)
+          running (Process/alive? (maps/get :pid task nil))]
+      (Task/shutdown task :brutal_kill)
+      running)
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "future-cancel: not a future: " (Kernel/inspect ref))))))
+
+; ── promises ───────────────────────────────────────────────────────────────
+;
+; The promise process holds `{:unset, waiters}` or `{:set, v}`. `deref` just
+; registers as a waiter; the process replies once the value arrives — no
+; polling anywhere. Replies carry the promise's pid so a timed-out deref can
+; never confuse one promise's value with another's.
+
+(defn promise
+  "A fresh single-assignment promise: a loop process that inherits the caller's
+   env binding and heap bound."
+  []
+  (let [token (BeamLisp.Env/capture)
+        bound (fn [] (let [w (BeamLisp.Env/max_heap)]
+                       (if (erlang/== nil w)
+                         :ok
+                         (erlang/process_flag :max_heap_size
+                           (maps/put :size w
+                             (maps/put :kill false
+                               (maps/put :error_logger false (maps/new))))))))
+        wake (fn wake [ws v]
+               (if (erlang/== ws ())
+                 :ok
+                 (do (erlang/send (erlang/hd ws) (tuple (erlang/self) :bl_value v))
+                     (wake (erlang/tl ws) v))))
+        ploop
+        (fn ploop [state]
+          (cond
+            (erlang/== :set (erlang/element 1 state))
+            (let [v (erlang/element 2 state)]
+              (receive
+                [:bl_deref from] (do (erlang/send from (tuple (erlang/self) :bl_value v))
+                                     (ploop state))
+                [:bl_set from _] (do (erlang/send from (tuple (erlang/self) :bl_set_ack false))
+                                     (ploop state))))
+
+            :else
+            (let [waiters (erlang/element 2 state)]
+              (receive
+                [:bl_deref from] (ploop (tuple :unset (erlang/++ (list from) waiters)))
+                [:bl_set from v]
+                (do (wake (erlang/apply :lists :reverse (list waiters)) v)
+                    (erlang/send from (tuple (erlang/self) :bl_set_ack true))
+                    (ploop (tuple :set v)))))))]
+    (maps/put :__struct__ :"Elixir.BeamLisp.Promise"
+      (maps/put :pid (erlang/spawn (fn [] (BeamLisp.Env/bind token) (bound) (ploop (tuple :unset ()))))
+                (maps/new)))))
+
+(defn deliver
+  "Set a promise's value ONCE, answering the promise on first delivery and nil
+   on any later one — Clojure allows a single delivery, and the nil return lets
+   callers detect the no-op."
+  [ref v]
+  (if (and (erlang/is_map ref)
+           (erlang/== :"Elixir.BeamLisp.Promise" (maps/get :__struct__ ref nil)))
+    (let [pid (maps/get :pid ref nil)]
+      (erlang/send pid (tuple :bl_set (erlang/self) v))
+      (receive
+        [q :bl_set_ack true] :when (== q pid) ref
+        [q :bl_set_ack false] :when (== q pid) nil))
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "deliver: not a promise: " (Kernel/inspect ref))))))
+
+; ── deref ──────────────────────────────────────────────────────────────────
+
+(defn deref
+  "Read a reference. Atoms/volatiles/reduceds read immediately; futures block
+   until the task returns; promises block until delivered; a delay forces once;
+   a derived recomputes only if a dependency changed."
+  ([x]
+   (let [tag? (fn [t y] (and (erlang/is_map y)
+                             (erlang/== t (maps/get :__struct__ y nil))))]
+     (cond
+       (tag? :"Elixir.BeamLisp.Atom" x) (BeamLisp.LazyMemo/read (maps/get :cell x nil))
+       (tag? :"Elixir.BeamLisp.Future" x) (Task/await (maps/get :task x nil) :infinity)
+       (tag? :"Elixir.BeamLisp.Promise" x) (deref x :infinity nil)
+       (tag? :"Elixir.BeamLisp.Volatile" x)
+       (Process/get (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key x nil)))
+       (tag? :"Elixir.BeamLisp.Reduced" x) (maps/get :value x nil)
+       ; A delay derefs to its value, forcing it once. `@d` therefore works on
+       ; a delay exactly as on an atom or promise.
+       (tag? :"Elixir.BeamLisp.Delay" x) (BeamLisp.Deferred/force x)
+       ; A derived derefs to its current value, recomputing only if a
+       ; dependency changed. `@d` on a derived reads it exactly like an atom.
+       (tag? :"Elixir.BeamLisp.Derived" x) (BeamLisp.Reactive/deref x)
+       :else (erlang/error
+               (Elixir.ArgumentError/exception
+                 (str "deref: not a derefable reference: " (Kernel/inspect x)))))))
+  ([x timeout_ms timeout_val]
+   (let [tag? (fn [t y] (and (erlang/is_map y)
+                             (erlang/== t (maps/get :__struct__ y nil))))]
+     (cond
+       (tag? :"Elixir.BeamLisp.Atom" x) (BeamLisp.LazyMemo/read (maps/get :cell x nil))
+
+       (tag? :"Elixir.BeamLisp.Future" x)
+       (try
+         (Task/await (maps/get :task x nil) timeout_ms)
+         (catch-raw [kind reason stack]
+           ; Only `Task.await`'s own timeout is swallowed; every other exit is
+           ; re-raised with the raw class/reason/stack it arrived with.
+           (if (and (erlang/== kind :exit)
+                    (erlang/is_tuple reason)
+                    (erlang/> (erlang/tuple_size reason) 0)
+                    (erlang/== :timeout (erlang/element 1 reason)))
+             timeout_val
+             (erlang/raise kind reason stack))))
+
+       (tag? :"Elixir.BeamLisp.Volatile" x)
+       (Process/get (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key x nil)))
+
+       (tag? :"Elixir.BeamLisp.Reduced" x) (maps/get :value x nil)
+
+       (tag? :"Elixir.BeamLisp.Promise" x)
+       (let [pid (maps/get :pid x nil)]
+         (erlang/send pid (tuple :bl_deref (erlang/self)))
+         (receive
+           [q :bl_value v] :when (== q pid) v
+           (after timeout_ms timeout_val)))
+
+       :else (erlang/error
+               (Elixir.ArgumentError/exception
+                 (str "deref: not a derefable reference: " (Kernel/inspect x))))))))

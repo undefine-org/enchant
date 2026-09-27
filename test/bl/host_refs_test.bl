@@ -1,0 +1,317 @@
+; host_refs_test.bl — the pinned `Refs` ABI and its five struct hosts.
+;
+; Six `.bl` sources under `priv/host/` replace `lib/beam_lisp/refs.ex` at its
+; exact module atoms:
+;
+;   * `priv/host/refs.bl`  → `Elixir.BeamLisp.Refs`, FUNCTIONS-ONLY: the exact
+;     live export set and NOTHING else (every helper is a local closure, since
+;     the pinned emitter exports every top-level `defn`).
+;   * `priv/host/atom.bl`  → `Elixir.BeamLisp.Atom` (struct `[:cell, :watches]`
+;     + a public `new/2`)
+;   * `priv/host/volatile.bl` → `Elixir.BeamLisp.Volatile` (`[:key]`, `new/1`)
+;   * `priv/host/reduced.bl`  → `Elixir.BeamLisp.Reduced` (`[:value]`, `new/1`)
+;   * `priv/host/promise.bl`  → `Elixir.BeamLisp.Promise` (`[:pid]`, `new/1`)
+;   * `priv/host/future.bl`   → `Elixir.BeamLisp.Future` (`[:task]`, `new/1`)
+;
+; The compile half runs at PROBE atoms (the live modules are untouched); the
+; behaviour half runs against the LIVE pinned modules the floor installs.
+;
+; Run: bin/bl test test/bl/host_refs_test.bl
+
+(ns host.refs.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_refs_" (erlang/unique_integer (list :positive))))
+
+(defn- host-src [name] (Path/join (BeamLisp/cwd) (str "priv/host/" name)))
+
+(def ^:private refs-mod :Elixir.BeamLisp.HostRefsProbe)
+(def ^:private atom-mod :Elixir.BeamLisp.HostAtomProbe)
+(def ^:private volatile-mod :Elixir.BeamLisp.HostVolatileProbe)
+(def ^:private reduced-mod :Elixir.BeamLisp.HostReducedProbe)
+(def ^:private promise-mod :Elixir.BeamLisp.HostPromiseProbe)
+(def ^:private future-mod :Elixir.BeamLisp.HostFutureProbe)
+
+(def ^:private refs-shim :Elixir.BeamLisp.Ns.Host.Refs)
+(def ^:private atom-shim :Elixir.BeamLisp.Ns.Host.Atom)
+(def ^:private volatile-shim :Elixir.BeamLisp.Ns.Host.Volatile)
+(def ^:private reduced-shim :Elixir.BeamLisp.Ns.Host.Reduced)
+(def ^:private promise-shim :Elixir.BeamLisp.Ns.Host.Promise)
+(def ^:private future-shim :Elixir.BeamLisp.Ns.Host.Future)
+
+(def ^:private live-atom :Elixir.BeamLisp.Atom)
+(def ^:private live-volatile :Elixir.BeamLisp.Volatile)
+(def ^:private live-reduced :Elixir.BeamLisp.Reduced)
+(def ^:private live-promise :Elixir.BeamLisp.Promise)
+(def ^:private live-future :Elixir.BeamLisp.Future)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))))
+
+(defn- base-opts [mod dir]
+  (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))
+
+(defn- compile-refs [dir]
+  (let [m (compile-pinned refs-mod (host-src "refs.bl") (base-opts refs-mod dir))]
+    (drop! refs-shim) m))
+
+(defn- compile-struct [mod shim src fields dir]
+  (let [m (compile-pinned mod (host-src src)
+            (erlang/++ (base-opts mod dir) (list (t2 :struct_fields fields))))]
+    (drop! shim) m))
+
+(defn- sorted-exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+; ── the Refs export surface ────────────────────────────────────────────────
+
+(deftest refs-pinned-is-functions-only-and-export-exact
+  (testing "the probe beam exports the live ABI and not one name more"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (erlang/== :non_existing (erlang/apply :code :which (list refs-shim))))
+      (is (= (Enum/sort
+               (list (tuple :add_watch! 3) (tuple :atom 1) (tuple :compare_and_set! 3)
+                     (tuple :deliver 2) (tuple :deref 1) (tuple :deref 3)
+                     (tuple :future? 1) (tuple :future_cancel 1) (tuple :future_exec 1)
+                     (tuple :promise 0) (tuple :remove_watch! 2) (tuple :reset! 2)
+                     (tuple :spawn_exec 1) (tuple :spawn_exec 2)
+                     (tuple :swap! 2) (tuple :swap! 3)
+                     (tuple :volatile 1) (tuple :volatile? 1)
+                     (tuple :vreset! 2) (tuple :vswap! 2) (tuple :vswap! 3)
+                     (tuple :module_info 0) (tuple :module_info 1)))
+             (sorted-exports refs-mod))
+          "the export set is EXACTLY the live module's ABI list")
+      (is (not (erlang/function_exported refs-mod :__struct__ 0)))
+      (is (not (erlang/function_exported refs-mod :__info__ 1)))
+      ; The helper closures the recalled module kept private must not leak.
+      (is (not (erlang/function_exported refs-mod :notify 4)))
+      (is (not (erlang/function_exported refs-mod :update 2)))
+      (is (not (erlang/function_exported refs-mod :promise_loop 1)))
+      (File/rm_rf! dir))))
+
+; ── the five structs ───────────────────────────────────────────────────────
+
+(defn- struct-probe! [mod shim src fields dir]
+  (compile-struct mod shim src fields dir)
+  (is (erlang/== :non_existing (erlang/apply :code :which (list shim))))
+  (is (erlang/function_exported mod :__struct__ 0))
+  (is (erlang/function_exported mod :__struct__ 1))
+  (is (erlang/function_exported mod :__info__ 1))
+  (is (erlang/function_exported mod :new (erlang/length fields))))
+
+(deftest refs-struct-hosts-carry-the-live-shape
+  (testing "__struct__/0,1 + __info__/1 synthesized; new/N matches the probe tag"
+    (let [dir (tmp-dir)]
+      ; Atom: [:cell, :watches]
+      (struct-probe! atom-mod atom-shim "atom.bl"
+                     (list (t2 :cell nil) (t2 :watches nil)) dir)
+      (let [s0 (erlang/apply atom-mod :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 3 (erlang/map_size s0)))
+        (is (= atom-mod (erlang/map_get :__struct__ s0)))
+        (is (nil? (erlang/map_get :cell s0)))
+        (is (nil? (erlang/map_get :watches s0))))
+      (is (= (erlang/apply atom-mod :__struct__ (list (list (t2 :cell 1) (t2 :watches 2))))
+             (erlang/apply atom-mod :new (list 1 2))))
+      (is (= (erlang/apply live-atom :__info__ (list :struct))
+             (erlang/apply atom-mod :__info__ (list :struct))))
+      (is (= (Enum/sort (list (tuple :new 2) (tuple :__struct__ 0) (tuple :__struct__ 1)
+                              (tuple :__info__ 1) (tuple :module_info 0) (tuple :module_info 1)))
+             (sorted-exports atom-mod)))
+
+      ; Volatile: [:key]
+      (struct-probe! volatile-mod volatile-shim "volatile.bl" (list (t2 :key nil)) dir)
+      (is (= (erlang/apply volatile-mod :__struct__ (list (list (t2 :key :k))))
+             (erlang/apply volatile-mod :new (list :k))))
+      (is (= (erlang/apply live-volatile :__info__ (list :struct))
+             (erlang/apply volatile-mod :__info__ (list :struct))))
+
+      ; Reduced: [:value]
+      (struct-probe! reduced-mod reduced-shim "reduced.bl" (list (t2 :value nil)) dir)
+      (is (= (erlang/apply reduced-mod :__struct__ (list (list (t2 :value 9))))
+             (erlang/apply reduced-mod :new (list 9))))
+      (is (= (erlang/apply live-reduced :__info__ (list :struct))
+             (erlang/apply reduced-mod :__info__ (list :struct))))
+
+      ; Promise: [:pid]
+      (struct-probe! promise-mod promise-shim "promise.bl" (list (t2 :pid nil)) dir)
+      (is (= (erlang/apply promise-mod :__struct__ (list (list (t2 :pid 1))))
+             (erlang/apply promise-mod :new (list 1))))
+      (is (= (erlang/apply live-promise :__info__ (list :struct))
+             (erlang/apply promise-mod :__info__ (list :struct))))
+
+      ; Future: [:task]
+      (struct-probe! future-mod future-shim "future.bl" (list (t2 :task nil)) dir)
+      (is (= (erlang/apply future-mod :__struct__ (list (list (t2 :task 1))))
+             (erlang/apply future-mod :new (list 1))))
+      (is (= (erlang/apply live-future :__info__ (list :struct))
+             (erlang/apply future-mod :__info__ (list :struct))))
+
+      (File/rm_rf! dir))))
+
+; ── live behaviour ─────────────────────────────────────────────────────────
+
+(defn- bang [f]
+  (try (do (f) :no-raise) (catch e (:message e))))
+
+(deftest refs-live-abi
+  (testing "atoms, watches, volatiles, futures, promises, and deref dispatch"
+    (let [a (BeamLisp.Refs/atom 1)]
+      (is (= 1 (BeamLisp.Refs/deref a)))
+      (is (= 2 (BeamLisp.Refs/swap! a (fn [v] (erlang/+ v 1)))))
+      (is (= 12 (BeamLisp.Refs/swap! a (fn [v x y] (erlang/+ v (erlang/+ x y))) (list 4 6))))
+      (is (= 9 (BeamLisp.Refs/reset! a 9)))
+      (is (= 9 (BeamLisp.Refs/deref a)))
+      (is (erlang/== true (BeamLisp.Refs/compare_and_set! a 9 10)))
+      (is (erlang/== false (BeamLisp.Refs/compare_and_set! a 9 99)))
+      (is (= 10 (BeamLisp.Refs/deref a))))
+
+    ; Clojure `=` is `==`: 1 and 1.0 compare equal, in both directions.
+    (let [i (BeamLisp.Refs/atom 1)
+          f (BeamLisp.Refs/atom 1.0)]
+      (is (erlang/== true (BeamLisp.Refs/compare_and_set! i 1.0 :v)))
+      (is (= :v (BeamLisp.Refs/deref i)))
+      (is (erlang/== true (BeamLisp.Refs/compare_and_set! f 1 :w)))
+      (is (= :w (BeamLisp.Refs/deref f))))
+
+    ; watches: fire once per change with (key ref old new); remove stops them.
+    (let [w (BeamLisp.Refs/atom 0)
+          me (erlang/self)
+          f (fn [k _r o n] (erlang/send me (tuple :watch k o n)))]
+      (is (= w (BeamLisp.Refs/add_watch! w :k f)))
+      (is (= 1 (BeamLisp.Refs/swap! w (fn [v] (erlang/+ v 1)))))
+      (is (= 2 (BeamLisp.Refs/swap! w (fn [v] (erlang/+ v 1)))))
+      (is (= (list :k 0 1) (receive [:watch k o n] (list k o n) (after 500 :none))))
+      (is (= (list :k 1 2) (receive [:watch k o n] (list k o n) (after 500 :none))))
+      (is (= w (BeamLisp.Refs/remove_watch! w :k)))
+      (is (= 3 (BeamLisp.Refs/swap! w (fn [v] (erlang/+ v 1)))))
+      (is (= :none (receive [:watch k o n] (list k o n) (after 100 :none))))
+      ; reset! notifies too, and a no-op change still notifies (Clojure).
+      (is (= w (BeamLisp.Refs/add_watch! w :r f)))
+      (is (= 9 (BeamLisp.Refs/reset! w 9)))
+      (is (= (list :r 3 9) (receive [:watch k o n] (list k o n) (after 500 :none))))
+      (is (= 9 (BeamLisp.Refs/reset! w 9)))
+      (is (= (list :r 9 9) (receive [:watch k o n] (list k o n) (after 500 :none)))))
+
+    ; volatile: a per-process dictionary box.
+    (let [v (BeamLisp.Refs/volatile 5)
+          me (erlang/self)
+          _ (BeamLisp.Refs/spawn_exec (fn [] (erlang/send me (tuple :child (BeamLisp.Refs/deref v)))))
+          child (receive [:child cv] cv (after 1000 :none))]
+      (is (= 5 (BeamLisp.Refs/deref v)))
+      (is (= 5 (BeamLisp.Refs/vreset! v 5)))
+      (is (= 7 (BeamLisp.Refs/vswap! v (fn [x] (erlang/+ x 2)))))
+      (is (erlang/== true (BeamLisp.Refs/volatile? v)))
+      (is (erlang/== false (BeamLisp.Refs/volatile? (BeamLisp.Refs/atom 1))))
+      (is (nil? child) "a volatile is invisible outside its creating process"))
+
+    ; futures.
+    (let [f (BeamLisp.Refs/future_exec (fn [] (erlang/+ 1 2)))]
+      (is (erlang/== true (BeamLisp.Refs/future? f)))
+      (is (erlang/== false (BeamLisp.Refs/future? 5)))
+      (is (= 3 (BeamLisp.Refs/deref f))))
+    (let [slow (BeamLisp.Refs/future_exec (fn [] (Process/sleep 200) :slow))]
+      (is (= :timeout (BeamLisp.Refs/deref slow 20 :timeout))))
+    (let [cancel-me (BeamLisp.Refs/future_exec (fn [] (Process/sleep 500) :slow))]
+      (is (erlang/== true (BeamLisp.Refs/future_cancel cancel-me))))
+    (let [done (BeamLisp.Refs/future_exec (fn [] 1))]
+      (is (= 1 (BeamLisp.Refs/deref done)))
+      (is (erlang/== false (BeamLisp.Refs/future_cancel done))))
+
+    ; spawn_exec kinds: :plain/:link pids; :monitor a {pid, ref} tuple.
+    (let [me (erlang/self)
+          plain (BeamLisp.Refs/spawn_exec (fn [] (erlang/send me :plain_done)))
+          linked (BeamLisp.Refs/spawn_exec (fn [] (erlang/send me :link_done)) :link)
+          monitored (BeamLisp.Refs/spawn_exec (fn [] (erlang/send me :mon_done)) :monitor)
+          r1 (receive :plain_done :ok (after 2000 :timeout))
+          r2 (receive :link_done :ok (after 2000 :timeout))
+          r3 (receive :mon_done :ok (after 2000 :timeout))
+          down (receive [:DOWN _ :process _ _] :down (after 2000 :none))]
+      (is (erlang/is_pid plain))
+      (is (erlang/is_pid linked))
+      (is (and (erlang/is_tuple monitored) (erlang/== 2 (erlang/tuple_size monitored))))
+      (is (= (list :ok :ok :ok :down) (list r1 r2 r3 down))))
+
+    ; promises: single assignment, blocking deref, timed deref, waiter wake.
+    (let [p (BeamLisp.Refs/promise)]
+      (is (= :timeout (BeamLisp.Refs/deref p 30 :timeout)))
+      (is (not= nil (BeamLisp.Refs/deliver p :later)))
+      (is (= :later (BeamLisp.Refs/deref p)))
+      (is (nil? (BeamLisp.Refs/deliver p :twice)) "second delivery is the no-op nil")
+      (is (= :later (BeamLisp.Refs/deref p))))
+    (let [p (BeamLisp.Refs/promise)
+          me (erlang/self)
+          _ (BeamLisp.Refs/spawn_exec (fn [] (erlang/send me (tuple :waiter (BeamLisp.Refs/deref p)))))
+          _ (Process/sleep 20)
+          d (BeamLisp.Refs/deliver p :woken)
+          got (receive [:waiter v] v (after 1000 :none))]
+      (is (not= nil d))
+      (is (= :woken got) "a waiter registered before delivery is woken with the value"))
+
+    ; deref dispatch: delay, derived, reduced, volatile, atom.
+    (let [a (BeamLisp.Refs/atom 5)
+          v (BeamLisp.Refs/volatile 6)
+          d (BeamLisp.Deferred/delay (fn [] 7))
+          r (BeamLisp.Reduced/new 8)
+          dv (BeamLisp.Reactive/derive (list a) (fn [] (erlang/* 2 (BeamLisp.Refs/deref a))))]
+      (is (= (list 5 6 7 8 10)
+             (list (BeamLisp.Refs/deref a) (BeamLisp.Refs/deref v) (BeamLisp.Refs/deref d)
+                   (BeamLisp.Refs/deref r) (BeamLisp.Refs/deref dv))))
+      ; a derived recomputes only after a dependency actually changes.
+      (is (= 10 (BeamLisp.Refs/deref dv)))
+      (is (= 6 (BeamLisp.Refs/swap! a (fn [x] (erlang/+ x 1)))))
+      (is (= 12 (BeamLisp.Refs/deref dv))))
+
+    ; the exact ArgumentError messages.
+    (is (= "deref: not a derefable reference: 5"
+           (bang (fn [] (BeamLisp.Refs/deref 5)))))
+    (is (= "swap!: not a reference: 5"
+           (bang (fn [] (BeamLisp.Refs/swap! 5 (fn [v] v))))))
+    (is (= "reset!: not an atom: 5"
+           (bang (fn [] (BeamLisp.Refs/reset! 5 1)))))
+    (is (= "compare-and-set!: not an atom: 5"
+           (bang (fn [] (BeamLisp.Refs/compare_and_set! 5 1 2)))))
+    (is (= "add-watch!: not an atom: 5"
+           (bang (fn [] (BeamLisp.Refs/add_watch! 5 :k (fn [a b c d] nil))))))
+    (is (= "remove-watch!: not an atom: 5"
+           (bang (fn [] (BeamLisp.Refs/remove_watch! 5 :k)))))
+    (is (= "vreset!: not a volatile: 5"
+           (bang (fn [] (BeamLisp.Refs/vreset! 5 1)))))
+    (is (= "vswap!: not a volatile: 5"
+           (bang (fn [] (BeamLisp.Refs/vswap! 5 (fn [v] v))))))
+    (is (= "deliver: not a promise: 5"
+           (bang (fn [] (BeamLisp.Refs/deliver 5 1)))))
+    (is (= "future-cancel: not a future: 5"
+           (bang (fn [] (BeamLisp.Refs/future_cancel 5)))))))
+
+(deftest refs-live-concurrency-loses-no-swap
+  (testing "8 processes × 1000 swap! inc lands exactly on 8000"
+    (let [a (BeamLisp.Refs/atom 0)
+          me (erlang/self)
+          pids (vec (map (fn [_]
+                           (BeamLisp.Refs/spawn_exec
+                             (fn []
+                               (loop [i 0]
+                                 (when (erlang/< i 1000)
+                                   (BeamLisp.Refs/swap! a (fn [v] (erlang/+ v 1)))
+                                   (recur (erlang/+ i 1))))
+                               (erlang/send me :done))))
+                         (range 8)))]
+      (is (= 8 (count pids)))
+      (doseq [_ pids] (receive :done :ok (after 30000 :timeout)))
+      (is (= 8000 (BeamLisp.Refs/deref a))))))
