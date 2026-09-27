@@ -1020,7 +1020,7 @@
 ; The fold toolkit lives with `k-reduce` at the bottom of the file — it needs
 ; `step`, which is defined there — but `k-count`/`k-to-list` and the lazy
 ; producers above need it first, so the names are reserved here.
-(declare lazy-recipe lazy-fold-with lazy-fold-source lazy-reduce-source)
+(declare lazy-recipe lazy-fold-pending lazy-fold-source lazy-reduce-source)
 (declare reduce-reduced? reduce-reduced unwrap k-fold k-reduce)
 
 (defn- count-list [xs]
@@ -1038,16 +1038,14 @@
 
 (defn- lazy-count
   "Count a lazy seq. A node that still carries an unused fold recipe is counted
-   straight from its source — no memo cell per element, no capture copied — and
-   anything else walks the shared memo cells as before. The recipe's step never
-   returns a Reduced, so the fold always runs to the end."
+   straight from its source (no memo cell per element, no capture copied) and
+   realised as it goes (`lazy-fold-pending`); anything else walks the shared
+   memo cells as before."
   [x]
-  (let [rec (lazy-recipe x)]
+  (let [rv (lazy-recipe x)]
     (cond
-      (erlang/== rec nil) (BeamLisp.LazySeq/count x)
-      :else
-      (let [out (lazy-fold-with rec (fn [acc _] (erlang/+ acc 1)) 0)]
-        (cond (reduce-reduced? out) (unwrap out) :else out)))))
+      (erlang/== rv nil) (BeamLisp.LazySeq/count x)
+      :else (erlang/length (erlang/element 2 (lazy-fold-pending x rv (fn [a _] a) nil))))))
 
 (defn- k-count-classified [x]
   (let [kd (kind-kind x)]
@@ -1188,16 +1186,15 @@
 
 (defn k-to-list
   "Realize a sequence as a proper list. The one place a lazy seq is forced.
-   A lazy node that still carries an unused fold recipe is realized through it
-   — the same list, built without a memo cell per element; anything else walks
-   the shared cells, so an already-realised seq is not recomputed."
+   A lazy node that still carries an unused fold recipe is realized through it:
+   the same list, built and published without a memo cell per element.
+   Anything else walks the shared cells, so an already-realised seq is not
+   recomputed."
   [x]
-  (let [rec (lazy-recipe x)]
+  (let [rv (lazy-recipe x)]
     (cond
-      (erlang/== rec nil) (to-list-memo x)
-      :else
-      (let [out (lazy-fold-with rec (fn [acc v] (raw-cons v acc)) ())]
-        (cond (reduce-reduced? out) (rev (unwrap out)) :else (rev out))))))
+      (erlang/== rv nil) (to-list-memo x)
+      :else (erlang/element 2 (lazy-fold-pending x rv (fn [a _] a) nil)))))
 
 ; `doall` is defined to REALISE: it publishes every cell so a second consumer
 ; reads the shared answers. It therefore walks the memo, never a fold recipe —
@@ -3935,8 +3932,9 @@
     (cond (reduce-reduced? out) (unwrap out) :else out)))
 
 (defn- lazy-recipe
-  "The fold recipe to use for `x`, or nil. Non-nil only for a LazySeq that
-   carries a recipe AND whose head cell is still `:pending`."
+  "`{recipe version}` for a LazySeq that carries a fold recipe AND whose head
+   cell is still `:pending` at `version`; nil otherwise. The version is what
+   `lazy-fold-pending` publishes the folded elements against."
   [x]
   (cond
     (erlang/== false (struct-of? x :"Elixir.BeamLisp.LazySeq")) nil
@@ -3944,25 +3942,57 @@
     (let [rec (BeamLisp.LazySeq/reduce_recipe x)]
       (cond
         (erlang/== rec nil) nil
-        (BeamLisp.LazySeq/pending? x) rec
-        :else nil))))
+        :else
+        (let [version (BeamLisp.LazySeq/pending_version x)]
+          (cond
+            (erlang/== version nil) nil
+            :else (tuple rec version)))))))
 
-(defn lazy-fold-with
-  "Invoke `recipe` with the callable `f` and `acc`. `f` is wrapped in a raw
-   2-arity fun so a recipe never has to dispatch a callable itself; the wrapper
-   is `step`, which handles a BL multi-arity fn or keyword as well as a plain
-   fun."
-  [recipe f acc]
-  (lazy-invoke recipe (lazy-two (fn [a x] (step f a x)) acc)))
+(defn- lazy-fold-pending
+  "Fold the pending node `l` through its recipe (`rv` = `{recipe version}`) and
+   REALISE it: every element the recipe yields is also collected, and a fold
+   that runs to the end publishes the complete list as the node's shared
+   answer. A second consumer then reads the memo instead of re-running the
+   producer: the realise-once contract Clojure's `seq-reduce` keeps (a
+   side-effecting `f` under `map` runs once per element, however many folds).
+   A fold the step halts publishes nothing (the rest of the seq was never
+   produced), and the node stays `:pending`.
+
+   The halt is carried IN the accumulator (`{acc buf halted?}`), never read
+   off the recipe's return: a recipe that propagates a halt through
+   `lazy-reduce-source` peels the `Reduced` before returning, and a partial
+   list published as the whole seq would be a wrong answer forever after.
+
+   Returns `{acc elems}`: `acc` is the step's accumulator (a `Reduced` when it
+   halted) and `elems` the published list (nil when halted)."
+  [l rv f acc]
+  (let [out (lazy-invoke (erlang/element 1 rv)
+              (lazy-two
+                (fn [p x]
+                  (let [a2 (step f (erlang/element 1 p) x)
+                        buf (raw-cons x (erlang/element 2 p))]
+                    (cond
+                      (reduce-reduced? a2) (reduce-reduced (tuple (unwrap a2) buf true))
+                      :else (tuple a2 buf false))))
+                (tuple acc () false)))
+        p (cond (reduce-reduced? out) (unwrap out) :else out)]
+    (cond
+      (erlang/element 3 p)
+      (tuple (reduce-reduced (erlang/element 1 p)) nil)
+      :else
+      (let [elems (erlang/apply :lists :reverse (list (erlang/element 2 p)))]
+        (BeamLisp.LazySeq/publish_folded l (erlang/element 2 rv) elems)
+        (tuple (erlang/element 1 p) elems)))))
 
 (defn- lazy-fold
   "Fold a LazySeq with the callable `f`: from source through its recipe when it
-   may be used, otherwise the memo-cell walk."
+   may be used (realising the node, see `lazy-fold-pending`), otherwise the
+   memo-cell walk."
   [f acc l]
-  (let [rec (lazy-recipe l)]
+  (let [rv (lazy-recipe l)]
     (cond
-      (erlang/== rec nil) (reduce-lazy f acc l)
-      :else (lazy-fold-with rec f acc))))
+      (erlang/== rv nil) (reduce-lazy f acc l)
+      :else (erlang/element 1 (lazy-fold-pending l rv f acc)))))
 
 ;; ── the one entry point ────────────────────────────────────────────────────
 (defn k-fold
