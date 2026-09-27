@@ -5,7 +5,7 @@
 //! are intentionally not treated as interchangeable.
 
 use rustler::env::SavedTerm;
-use rustler::{Atom, Env, LocalPid, NifMap, NifResult, OwnedEnv, ResourceArc, Term};
+use rustler::{Atom, Env, Encoder, LocalPid, NifMap, NifResult, OwnedEnv, ResourceArc, Term};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 
-rustler::atoms! { ok, retry, cycle, fast, dirty, reroute }
+rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep }
 
 /// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must
 /// return in well under 1 ms or it stalls every process on its scheduler.
@@ -78,10 +78,93 @@ struct State {
     retained_bytes: usize,
 }
 
+/// The cell's publication counter (PLAN-151 W5). Every successful replace
+/// bumps it, so a claim can be a pure integer compare: no term is loaded and no
+/// term is compared. A plain `AtomicU64` — all ordering is provided by the
+/// state mutex, which every reader and writer holds across the read/write of
+/// both the counter and the term.
+struct Version(AtomicU64);
+
+impl Version {
+    fn new() -> Self {
+        Version(AtomicU64::new(0))
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// O(1) compare-and-swap precondition: has the cell moved since the caller
+    /// read it?
+    fn matches(&self, expected: u64) -> bool {
+        self.get() == expected
+    }
+
+    fn bump(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 struct MemoCell {
     id: u64,
     read_only: bool,
+    version: Version,
     state: Mutex<Option<State>>,
+}
+
+/// How a versioned exchange treats the cell's dependency EDGES.
+///
+/// `Keep` leaves them exactly as they are: a claim, a waiter registration or a
+/// terminal transition changes no reachable resource, so there is nothing to
+/// walk and nothing to check — no graph lock work at all.
+///
+/// `Union` adds the ids of the caller's term. Only genuinely NEW ids are
+/// cycle-checked (`added`); the rest were already accepted by an earlier
+/// transition of this same cell, and re-walking them would make a chain
+/// quadratic (the walk is unbounded in the reachable set).
+///
+/// EDGES NEVER SHRINK while a cell is alive. They exist for one question —
+/// `would_cycle` — and a retained stale edge can only reject a publication that
+/// would close a cycle through an edge the cell really did hold at some point.
+/// The alternative (replacing them with each state's own walk) is what made the
+/// abandoned design quadratic: a claim that drops an edge forces the next
+/// publish to re-add it, and every re-add pays a full reachable-set walk.
+enum Deps {
+    Keep,
+    Union(Vec<ResourceArc<MemoCell>>),
+}
+
+impl Deps {
+    fn decode(term: Term<'_>) -> NifResult<Deps> {
+        if term.decode::<Atom>().ok() == Some(keep()) {
+            return Ok(Deps::Keep);
+        }
+        term.decode::<Vec<ResourceArc<MemoCell>>>()
+            .map(Deps::Union)
+            .map_err(|_| rustler::Error::BadArg)
+    }
+
+    /// The dependency ids to union in, or `None` for `Keep`.
+    fn ids(self) -> Option<Vec<u64>> {
+        match self {
+            Deps::Keep => None,
+            Deps::Union(resources) => Some(dependency_ids(resources)),
+        }
+    }
+}
+
+/// `(added, merged)`: the ids the cycle walk must consider (those not already
+/// an edge) and the union to publish (never smaller than `previous`).
+fn edge_plan(previous: &[u64], new_ids: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let mut merged = previous.to_vec();
+    let mut added = Vec::new();
+    for id in new_ids {
+        if !merged.contains(id) {
+            added.push(*id);
+            merged.push(*id);
+        }
+    }
+    (added, merged)
 }
 
 #[rustler::resource_impl]
@@ -299,6 +382,7 @@ fn allocate(
     Ok(ResourceArc::new(MemoCell {
         id,
         read_only,
+        version: Version::new(),
         state: Mutex::new(Some(saved)),
     }))
 }
@@ -462,6 +546,164 @@ fn read_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Ter
 fn read<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
     count(OP_READ);
     read_impl(env, resource)
+}
+
+fn read_versioned_impl<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+) -> NifResult<Term<'a>> {
+    let guard = lock(&resource.state);
+    let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
+    let version = resource.version.get();
+    Ok(state
+        .env
+        .run(|owned| (version, state.term.load(owned).in_env(env)).encode(env)))
+}
+
+/// The cell's `{version, state}`, where `version` is the publication counter a
+/// caller hands back to `nif_exchange_version`. Read under the same state lock
+/// the exchange takes, so the pair is consistent: an exchange that bumps the
+/// version does so while holding it.
+#[rustler::nif(name = "nif_read_versioned", schedule = "DirtyCpu")]
+fn read_versioned<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    count(OP_READ);
+    read_versioned_impl(env, resource)
+}
+
+/// Fast lane, self-guarding exactly like `nif_read_fast`: an over-ceiling cell
+/// answers the bare `:reroute` atom WITHOUT loading the term, and the caller
+/// retries on the dirty lane. The answer here is a 2-tuple, never a bare atom,
+/// so — unlike `nif_read_fast` — there is no ambiguity to reason about at all.
+#[rustler::nif(name = "nif_read_versioned_fast")]
+fn read_versioned_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
+    count(OP_READ_FAST);
+    let guard = lock(&resource.state);
+    let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
+    if state.retained_bytes > fast_lane_bytes() {
+        return Ok(reroute().to_term(env));
+    }
+    let version = resource.version.get();
+    Ok(state
+        .env
+        .run(|owned| (version, state.term.load(owned).in_env(env)).encode(env)))
+}
+
+/// Shared body of the versioned exchange. The version compare is O(1) — no term
+/// is loaded, no term is compared — so unlike `compare_exchange_impl` a retry
+/// costs nothing but a lock. `deps` selects the edge policy: `Keep` does no
+/// graph work, `Union` cycle-checks only the NEW ids and never shrinks the
+/// edge set.
+#[allow(clippy::too_many_arguments)]
+fn exchange_version_impl<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+    expected_version: u64,
+    replacement: Term<'a>,
+    deps: Deps,
+    estimate: u64,
+    notifications: Vec<(LocalPid, Term<'a>)>,
+    fast_lane: bool,
+) -> NifResult<Atom> {
+    count(if fast_lane { OP_CAS_FAST } else { OP_CAS });
+    if resource.read_only {
+        return Err(rustler::Error::BadArg);
+    }
+    let retained_bytes = accounted_bytes(estimate)?;
+    let new_ids = deps.ids();
+    let mut cell = lock(&resource.state);
+    let current = cell.as_ref().ok_or(rustler::Error::BadArg)?;
+    if fast_lane {
+        let ceiling = fast_lane_bytes();
+        if current.retained_bytes > ceiling || retained_bytes > ceiling {
+            drop(cell);
+            count(OP_REROUTE);
+            return Ok(reroute());
+        }
+    }
+    if !resource.version.matches(expected_version) {
+        drop(cell);
+        count(OP_RETRY);
+        return Ok(retry());
+    }
+
+    // Decide the cycle question BEFORE copying the replacement term: a rejected
+    // attempt then costs no term copy and no deferred reclaim. The graph lock is
+    // held until the state is replaced, so the edge set and the state it
+    // describes become visible together.
+    let mut edges = None;
+    if let Some(new_ids) = new_ids {
+        let mut graph_lock = lock(graph());
+        let previous: Vec<u64> = graph_lock.get(&resource.id).cloned().unwrap_or_default();
+        let (added, merged) = edge_plan(&previous, &new_ids);
+        if fast_lane && !added.is_empty() {
+            // New edges mean an unbounded cycle walk: not fast-lane work.
+            drop(graph_lock);
+            drop(cell);
+            count(OP_REROUTE);
+            return Ok(reroute());
+        }
+        if would_cycle(&graph_lock, resource.id, &added) {
+            drop(graph_lock);
+            drop(cell);
+            count(OP_CYCLE);
+            return Ok(cycle());
+        }
+        graph_lock.insert(resource.id, merged);
+        edges = Some(graph_lock);
+    }
+
+    let replacement = save(replacement, retained_bytes);
+    let old = cell.replace(replacement).ok_or(rustler::Error::BadArg)?;
+    resource.version.bump();
+    saturating_sub(&RETAINED_BYTES, old.retained_bytes);
+    saturating_add(&RETAINED_BYTES, retained_bytes);
+    drop(edges);
+    drop(cell);
+
+    // An evaluator cannot be interrupted between publication and notification:
+    // both happen in this NIF call. A dead recipient simply discards its reply.
+    for (pid, message) in notifications {
+        let _ = env.send(&pid, message);
+    }
+    if fast_lane {
+        reclaim_state_small(old);
+    } else {
+        reclaim_state(old);
+    }
+    Ok(ok())
+}
+
+/// Fast lane: regular scheduler. Self-guarding like the term CAS — a large
+/// current value, a large replacement or a NEW dependency edge answers
+/// `:reroute` and changes nothing; the caller retries on the dirty lane.
+#[rustler::nif(name = "nif_exchange_version_fast")]
+fn exchange_version_fast<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+    expected_version: u64,
+    replacement: Term<'a>,
+    deps: Term<'a>,
+    estimate: u64,
+    notifications: Vec<(LocalPid, Term<'a>)>,
+) -> NifResult<Atom> {
+    let deps = Deps::decode(deps)?;
+    exchange_version_impl(env, resource, expected_version, replacement, deps, estimate, notifications, true)
+}
+
+/// Dirty lane: for a value past the fast-lane ceiling or a dependency set that
+/// adds an edge.
+#[rustler::nif(name = "nif_exchange_version", schedule = "DirtyCpu")]
+fn exchange_version<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<MemoCell>,
+    expected_version: u64,
+    replacement: Term<'a>,
+    deps: Term<'a>,
+    estimate: u64,
+    notifications: Vec<(LocalPid, Term<'a>)>,
+) -> NifResult<Atom> {
+    let deps = Deps::decode(deps)?;
+    exchange_version_impl(env, resource, expected_version, replacement, deps, estimate, notifications, false)
 }
 
 /// Shared CAS body. `fast_lane` makes the call refuse (with `reroute`) any
@@ -711,6 +953,48 @@ mod tests {
         graph.insert(2, vec![3]);
         graph.insert(3, vec![2]);
         assert!(!would_cycle(&graph, 9, &[2]));
+    }
+
+    #[test]
+    fn version_is_a_cas_precondition_and_bumps_on_commit() {
+        let version = Version::new();
+        assert!(version.matches(0), "a fresh cell is at version 0");
+        assert_eq!(version.bump(), 1);
+        assert!(!version.matches(0), "a stale reader must be told to retry");
+        assert!(version.matches(1));
+        assert_eq!(version.bump(), 2);
+        assert_eq!(version.get(), 2);
+    }
+
+    #[test]
+    fn edge_plan_unions_and_names_only_new_edges() {
+        // A genuinely new id is the only thing the cycle walk must consider.
+        let (added, merged) = edge_plan(&[1, 2], &[2, 3, 3]);
+        assert_eq!(added, vec![3]);
+        assert_eq!(merged, vec![1, 2, 3]);
+
+        // Re-asserting edges the cell already holds is free: nothing added, so
+        // no cycle walk at all.
+        let (added, merged) = edge_plan(&[1, 2], &[2, 1]);
+        assert!(added.is_empty());
+        assert_eq!(merged, vec![1, 2]);
+
+        // Never shrinks: a new set that mentions nothing keeps every retained
+        // edge, which is what makes a `:keep`-then-`union` sequence monotone.
+        let (added, merged) = edge_plan(&[7], &[]);
+        assert!(added.is_empty());
+        assert_eq!(merged, vec![7]);
+
+        let (added, merged) = edge_plan(&[], &[5]);
+        assert_eq!(added, vec![5]);
+        assert_eq!(merged, vec![5]);
+    }
+
+    #[test]
+    fn keep_is_the_mode_that_does_no_graph_work() {
+        // `Deps::ids()` is what decides whether the exchange takes the graph
+        // lock and runs `would_cycle` at all.
+        assert!(Deps::Keep.ids().is_none());
     }
 
     #[test]

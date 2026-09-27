@@ -10,15 +10,25 @@
 ; exactly the load the recalled Elixir module did, under the same `:global`
 ; lock and with the same error text.
 ;
-; WHAT THE CELL HOLDS (PLAN-151 W3). A cell's state is a term the caller
-; chooses: `:pending`, `{:running, owner, attempt, waiters}`, `{:completed,
-; value}`, `{:failed, kind, reason, stack}` or `{:terminal, reason}`. The
-; THUNK does NOT live here — it lives in the `BeamLisp.LazySeq` struct, whose
-; resource this module hands back. That is the whole performance argument: a
-; cell that holds a zero-arity closure copies the closure's captured
-; environment through `OwnedEnv` on every create and every state transition,
-; and the closure is what made a lazy producer quadratic. Control states are
-; tiny terms and copy in constant time.
+; WHAT THE CELL HOLDS (PLAN-151 W5). A cell's state is a term the caller
+; chooses: `{:pending, thunk}`, `{:running, owner, attempt, waiters}`,
+; `{:completed, value}`, `{:failed, thunk, kind, reason, stack}` or
+; `{:terminal, reason}`. The THUNK lives on the cell: it is the recipe, and the
+; cell that owns the state owns the recipe with it. What must never live in a
+; VALUE is a closure — a published value may EMBED a node (`chain/2` builds
+; `[e | %LazySeq{…}]`), and a closure in the struct would make every deep copy
+; of such a value walk the whole chain behind it. A node's `resource` is one
+; word, so copies, CAS comparisons and `flat_size` all stop at it.
+;
+; VERSIONED TRANSITIONS. Every state transition is a version CAS: the cell
+; carries a publication counter, `read_versioned/1` hands it out with the state,
+; and `exchange_version/4,5` compares INTEGERS — no term is loaded and no term
+; is compared on a path that every realised element pays for. Its `deps_mode`
+; argument is the edge policy: `:keep` for a transition that reaches nothing new
+; (a claim, a waiter registration, a terminal state — no walk, no graph lock at
+; all), or a dependency list for a state that may reach something new, which is
+; UNIONED with the cell's existing edges. Only genuinely new ids are
+; cycle-checked; edges never shrink while the cell is alive.
 ;
 ; DEPENDENCIES are the memo graph's edges, and they exist for ONE question:
 ; `would_cycle`, asked by the NIF when the new edge set is not a subset of the
@@ -26,16 +36,21 @@
 ; keeps every resource it embeds alive (FUP-112). So `dependencies/1` is walked
 ; only when a caller has a term that may hold resources: a published value, a
 ; fun's captured environment, or a `LazySeq`'s resource and metadata. A bare
-; scalar cannot hold one and is answered without a walk.
+; scalar — or a flat proper list of scalars, the shape a produced chunk has —
+; cannot hold one and is answered without a walk.
 ;
-; A PINNED MODULE IS FUNCTIONS-ONLY and EVERY top-level `defn` is exported —
-; `defn-` is not privatized on this path, unlike Elixir's `defp`. So the
-; helpers the recalled module kept private (`load_nif!`, `load_advice`,
-; `foreign_module?`, `await_budget`, `walk`, `include_resource`,
-; `prepend_tuple`) are LOCAL closures here, and the module's export surface is
-; exactly the recalled module's.
+; INTERNAL HELPERS ARE TOP LEVEL, AND NAMED `deps_*`. A pinned module is
+; functions-only and EVERY top-level `defn` is exported, so the recalled
+; module's private helpers would normally be LOCAL closures here. Not for the
+; walk: a call through a closure is an INDIRECT call, and on this host an
+; indirect call costs about ten times a direct one (one pass over an
+; 8000-element list: 12 us as a top-level self-recursion vs 82 us through a
+; `loop`'s `recur`). `deps_walk/6` and its two predicates are therefore
+; top-level so that the walk — which runs on every create and every publish —
+; is a direct self-call. The public surface is otherwise the recalled module's,
+; plus the versioned pair.
 ;
-; Run: bin/bl test test/bl/host_lazy_test.bl
+; Run: bin/bl test test/bl/deferred_test.bl test/bl/host_deferred_test.bl
 
 (ns host.lazy-memo)
 
@@ -163,6 +178,166 @@
            :else outcome))
        :else (nif_compare_exchange resource expected state deps bytes notifications)))))
 
+(defn deps_scalar?
+  "INTERNAL (see the namespace header): a term that cannot contain a resource, a
+   fun or a handle. Inlined at every spine step."
+  [t]
+  (or (erlang/is_atom t) (erlang/is_number t) (erlang/is_binary t)
+      (erlang/is_pid t) (erlang/is_port t)))
+
+(defn deps_lazy_node?
+  "INTERNAL: a `BeamLisp.LazySeq` struct, whose resource is a graph boundary and
+   whose metadata is walked."
+  [t]
+  (and (erlang/is_map t)
+       (erlang/is_map_key :__struct__ t)
+       (erlang/== :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ t))))
+
+(defn deps_scalar_list?
+  "INTERNAL: a proper list whose every element is a scalar — a produced chunk, a
+   captured range, a flat data list. There is nothing behind one, so the walk is
+   skipped entirely instead of spending a spine step per element."
+  [t]
+  (cond
+    (erlang/== t ()) true
+    (erlang/is_list t)
+    (let [h (erlang/hd t)]
+      (cond (deps_scalar? h) (deps_scalar_list? (erlang/tl t))
+            :else false))
+    :else false))
+
+(defn deps_walk
+  "INTERNAL: the dependency walk, as a TOP-LEVEL self-recursion.
+
+   Why top level and not a `loop` or a `let`-bound fn: a `recur` inside a loop
+   compiles to an indirect call through a closure, and an indirect call costs
+   ~10x a direct one here (measured on this host: 12 us vs 82 us for one pass
+   over an 8000-element list). The walk is on every publish, so it must be a
+   direct self-call.
+
+   ONE LOOP, TWO PHASES. `:inspect` consumes the current term; `:advance` pops
+   the next pending term off `stack` — the empty list, which no push can
+   produce, terminates it. The common case is a cons list ending in a node, so
+   `:inspect` walks the SPINE with `recur`, testing each head's shape and
+   pushing only a head that can itself contain something: a flat list of
+   numbers — the overwhelming majority of produced values — is one shape test
+   per element and NO allocation."
+  [phase cur stack ids functions resources]
+  (cond
+    ; ── pop the next pending term, or answer ──
+    (erlang/== phase :advance)
+    (cond
+      (erlang/== stack ()) resources
+      :else (deps_walk :inspect (erlang/hd stack) (erlang/tl stack)
+                       ids functions resources))
+
+    ; ── a cons: test its head, continue down the spine ──
+    (and (erlang/is_list cur) (erlang/== false (erlang/== cur ())))
+    (let [head (erlang/hd cur)
+          tail (erlang/tl cur)]
+      (cond
+        (deps_scalar? head) (deps_walk :inspect tail stack ids functions resources)
+        :else (deps_walk :inspect tail (erlang/++ (list head) stack)
+                        ids functions resources)))
+
+    ; ── a scalar: nothing inside ──
+    (deps_scalar? cur) (deps_walk :advance cur stack ids functions resources)
+
+    ; ── a lazy node: resource + metadata, both walked ──
+    (deps_lazy_node? cur)
+    (let [resource (erlang/map_get :resource cur)
+          identity (nif_id resource)
+          seen? (MapSet/member? ids identity)]
+      (deps_walk :inspect (erlang/map_get :metadata cur) stack
+                 (cond seen? ids :else (MapSet/put ids identity))
+                 functions
+                 (cond seen? resources
+                       :else (erlang/++ (list resource) resources))))
+
+    ; ── a bare memo handle (or a cursor, whose source it answers) ──
+    (erlang/is_reference cur)
+    (let [found (nif_dependency_resource cur)
+          seen? (cond (erlang/== found nil) true
+                      :else (MapSet/member? ids (nif_id found)))]
+      (cond
+        (or (erlang/== found nil) seen?)
+        (deps_walk :advance cur stack ids functions resources)
+        :else
+        (deps_walk :advance cur stack
+                   (MapSet/put ids (nif_id found)) functions
+                   (erlang/++ (list found) resources))))
+
+    ; ── a closure: walk its captured environment, once per fun ──
+    (erlang/is_function cur)
+    (cond
+      (MapSet/member? functions cur)
+      (deps_walk :advance cur stack ids functions resources)
+      :else
+      (let [env (erlang/element 2 (erlang/fun_info cur :env))]
+        (deps_walk :advance cur (erlang/++ env stack)
+                   ids (MapSet/put functions cur) resources)))
+
+    ; ── a tuple: walk its elements ──
+    (erlang/is_tuple cur)
+    (deps_walk :advance cur (erlang/++ (erlang/tuple_to_list cur) stack)
+               ids functions resources)
+
+    ; ── a map (a struct included): walk its values and keys ──
+    (erlang/is_map cur)
+    (deps_walk :advance cur
+               (maps/fold (fn [k v acc] (erlang/++ (list v k) acc)) stack cur)
+               ids functions resources)
+
+    :else (deps_walk :advance cur stack ids functions resources)))
+
+(defn read_versioned
+  "The cell's `{version, state}` — the state together with the publication
+   counter that must be handed back to `exchange_version/4,5` to claim it.
+
+   One crossing on the hot path, exactly like `read/1`: the fast NIF
+   self-guards and answers the bare atom `:reroute` for an over-ceiling cell
+   instead of a routing round-trip. Here that atom cannot be confused with a
+   real answer — the answer is a 2-tuple, never an atom."
+  [resource]
+  (ensure_loaded!)
+  (let [value (nif_read_versioned_fast resource)]
+    (cond
+      (erlang/== :reroute value) (nif_read_versioned resource)
+      :else value)))
+
+(defn exchange_version
+  "Versioned compare-exchange: the `expected_version` is the counter that came
+   with the state the caller read, and the comparison is an integer compare —
+   NO term is loaded and no term is compared.
+
+   `deps_mode` is the whole point of the lane split:
+
+     - `:keep` — this transition reaches no resource the cell did not already
+       hold (a claim, a waiter registration, a terminal state). The edge set is
+       left exactly as it is: no walk, no graph lock, no cycle check.
+
+     - a dependency list — a state that may reach something new (`{:pending
+       thunk}` at creation, `{:completed value}`, `{:failed …}`). It is UNIONED
+       with the cell's existing edges; only genuinely new ids are cycle-checked,
+       and a new edge is not fast-lane work (the cycle walk is unbounded in the
+       reachable set), so such a call answers `:reroute` and we retry dirty."
+  ([resource expected_version replacement deps_mode]
+   (exchange_version resource expected_version replacement deps_mode ()))
+  ([resource expected_version replacement deps_mode notifications]
+   (ensure_loaded!)
+   (let [bytes (estimate_bytes replacement)]
+     (cond
+       (erlang/=< bytes (nif_fast_lane_bytes))
+       (let [outcome (nif_exchange_version_fast
+                       resource expected_version replacement deps_mode bytes notifications)]
+         (cond
+           (erlang/== :reroute outcome)
+           (nif_exchange_version
+             resource expected_version replacement deps_mode bytes notifications)
+           :else outcome))
+       :else (nif_exchange_version
+               resource expected_version replacement deps_mode bytes notifications)))))
+
 (defn dependencies
   "The memo resources `term` can reach, in a list, deduplicated by the NIF's
    cell identity. A memo handle is a graph boundary (its transitive
@@ -170,110 +345,16 @@
    wrapper and must be walked, which is why a `LazySeq` node contributes both
    its resource AND its metadata.
 
-   A scalar — atom, number, binary, pid, port — cannot hold a resource or a
-   fun, so a term of that shape is answered without a walk. Everything else is
-   walked: tuples, maps, proper and improper lists, funs (through
-   `erlang:fun_info/2`'s `:env`), `LazySeq` structs and bare memo/cursor
-   handles.
-
-   ONE LOOP, TWO PHASES. `:inspect` consumes the current term; `:advance` pops
-   the next pending term off the stack. The stack is a list terminated by a
-   FRESH REFERENCE minted per call, so a pop is `hd`/`tl` with no emptiness
-   test and the terminator cannot be confused with a stacked term — any atom
-   could appear inside a value; a reference that never leaves this call cannot.
-
-   The common case is the one that decides the cost: a lazy value is a cons
-   list ending in a node, so `:inspect` walks the SPINE with `recur`, testing
-   each head's shape and pushing only a head that can itself contain something.
-   A flat list of numbers — the overwhelming majority of produced values — is
-   therefore one shape test per element and NO allocation, which a
-   worklist-of-every-subterm walk cannot manage (measured: 1220 us vs 21 us for
-   `estimate_bytes/1` over the same 8k list, and this walk runs on every
-   publish)."
+   TWO CHEAP PRE-CHECKS before the walk — the shapes that dominate real traffic
+   and can hold nothing: a scalar, and a flat proper list of scalars (a produced
+   chunk, a `range`'s vector backing, a captured data list). Both answer `[]`
+   without minting a worklist. Everything else goes to `deps_walk/6`."
   [term]
   (ensure_loaded!)
-  (let [stack-end (erlang/make_ref)
-        lazy-node? (fn [t]
-                     (and (erlang/is_map t)
-                          (erlang/is_map_key :__struct__ t)
-                          (erlang/== :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ t))))
-        scalar? (fn [t]
-                  (or (erlang/is_atom t) (erlang/is_number t) (erlang/is_binary t)
-                      (erlang/is_pid t) (erlang/is_port t)))
-        push (fn [x xs] (erlang/++ (list x) xs))
-        push-all (fn [xs acc]
-                   (erlang/apply :lists :foldl
-                     (list (fn [v a] (erlang/++ (list v) a)) acc xs)))]
-    (loop [phase :inspect
-           cur term
-           stack (list stack-end)
-           ids (MapSet/new)
-           functions (MapSet/new)
-           resources ()]
-      (cond
-        ; ── pop the next pending term, or answer ──
-        (erlang/== phase :advance)
-        (let [nextup (erlang/hd stack)
-              rest-stack (erlang/tl stack)]
-          (cond
-            (erlang/== nextup stack-end) resources
-            :else (recur :inspect nextup rest-stack ids functions resources)))
-
-        ; ── a cons: test its head, continue down the spine ──
-        (and (erlang/is_list cur) (erlang/== false (erlang/== cur ())))
-        (let [head (erlang/hd cur)
-              tail (erlang/tl cur)]
-          (cond
-            (scalar? head) (recur :inspect tail stack ids functions resources)
-            :else (recur :inspect tail (push head stack) ids functions resources)))
-
-        ; ── a scalar: nothing inside ──
-        (scalar? cur) (recur :advance cur stack ids functions resources)
-
-        ; ── a lazy node: resource + metadata, both walked ──
-        (lazy-node? cur)
-        (let [resource (erlang/map_get :resource cur)
-              identity (nif_id resource)
-              seen? (MapSet/member? ids identity)]
-          (recur :inspect (erlang/map_get :metadata cur) stack
-                 (cond seen? ids :else (MapSet/put ids identity))
-                 functions
-                 (cond seen? resources :else (push resource resources))))
-
-        ; ── a bare memo handle (or a cursor, whose source it answers) ──
-        (erlang/is_reference cur)
-        (let [found (nif_dependency_resource cur)
-              seen? (cond (erlang/== found nil) true
-                          :else (MapSet/member? ids (nif_id found)))]
-          (cond
-            (or (erlang/== found nil) seen?)
-            (recur :advance cur stack ids functions resources)
-            :else
-            (recur :advance cur stack
-                   (MapSet/put ids (nif_id found)) functions
-                   (push found resources))))
-
-        ; ── a closure: walk its captured environment, once per fun ──
-        (erlang/is_function cur)
-        (cond
-          (MapSet/member? functions cur) (recur :advance cur stack ids functions resources)
-          :else
-          (let [env (erlang/element 2 (erlang/fun_info cur :env))]
-            (recur :advance cur (push-all env stack)
-                   ids (MapSet/put functions cur) resources)))
-
-        ; ── a tuple: walk its elements ──
-        (erlang/is_tuple cur)
-        (recur :advance cur (push-all (erlang/tuple_to_list cur) stack)
-               ids functions resources)
-
-        ; ── a map (a struct included): walk its values and keys ──
-        (erlang/is_map cur)
-        (recur :advance cur
-               (maps/fold (fn [k v acc] (push v (push k acc))) stack cur)
-               ids functions resources)
-
-        :else (recur :advance cur stack ids functions resources)))))
+  (cond
+    (deps_scalar? term) ()
+    (deps_scalar_list? term) ()
+    :else (deps_walk :inspect term () (MapSet/new) (MapSet/new) ())))
 
 (defn cursor
   "A native chunked cursor over the finite eager `list`. Its source is saved
@@ -300,12 +381,29 @@
   "The term's size in bytes — the estimate the lanes are chosen by and the
    number the cache budget is charged.
 
+   A CONTROL STATE — `{:running owner attempt waiters}` or `{:terminal reason}`
+   — answers a constant: it is a pid, a ref and a waiter list, so its copy is
+   fixed work and the only element that can grow is the waiter list, which is
+   exactly what a per-element walk would charge for on a transition meant to be
+   O(1). Everything else (a `{:pending thunk}`, a `{:completed value}`, a
+   `{:failed …}`) measures exactly.
+
    `:erts_debug.flat_size/1` is exact, O(size) at the BIF, and safe on every
-   term a cell here can hold: a lazy node's `thunk` is a HANDLE into another
-   cell (see `BeamLisp.LazySeq`), so `flat_size` stops at it the way it stops at
-   any resource and never walks the capture chain behind it."
+   term a cell here can hold: a lazy node's `resource` is a HANDLE into the
+   native graph, so `flat_size` stops at it the way it stops at any resource and
+   never walks the capture chain behind it."
   [term]
-  (erlang/* (erlang/apply :erts_debug :flat_size (list term)) (erlang/system_info :wordsize)))
+  (cond
+    ; the control-state tag test, inline: this function is on every create,
+    ; every exchange and every atom swap!, and a single-use predicate does not
+    ; earn a call there.
+    (and (erlang/is_tuple term)
+         (let [tag (erlang/element 1 term)]
+           (or (erlang/== tag :running) (erlang/== tag :terminal))))
+    64
+
+    :else (erlang/* (erlang/apply :erts_debug :flat_size (list term))
+                    (erlang/system_info :wordsize))))
 
 (defn admit!
   "The cache budget gate. `:lazy_cache_budget_bytes` (default 512 MiB) bounds
@@ -340,8 +438,9 @@
 
 (defn new
   "Create a cell from an already-measured state, dependency list and byte
-   estimate — the low-level door `create/1` and the lazy force path route
-   through."
+   estimate — the door for a caller that has done its own measuring. The lazy
+   force path does NOT use it: `create/1` measures and picks the lane, which is
+   what keeps a small initial state off the dirty scheduler."
   [state dependencies bytes]
   (ensure_loaded!)
   (nif_new state dependencies bytes))
@@ -399,6 +498,14 @@
 (defn nif_new_fast [_state _dependencies _bytes] (erlang/nif_error :nif_not_loaded))
 (defn nif_read [_resource] (erlang/nif_error :nif_not_loaded))
 (defn nif_read_fast [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_read_versioned [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_read_versioned_fast [_resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_exchange_version_fast
+  [_resource _expected_version _replacement _deps_mode _bytes _notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_exchange_version
+  [_resource _expected_version _replacement _deps_mode _bytes _notifications]
+  (erlang/nif_error :nif_not_loaded))
 (defn nif_fast_lane_bytes [] (erlang/nif_error :nif_not_loaded))
 (defn nif_set_fast_lane_bytes [_bytes] (erlang/nif_error :nif_not_loaded))
 (defn nif_compare_exchange_fast
