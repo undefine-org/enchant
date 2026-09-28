@@ -259,3 +259,73 @@ row that scaled with capture size got cheaper; nothing became super-linear.
 - `distinct`: O(n²/32) seen-set copy per chunk — FUP-129 (gate uses an absolute budget for it).
 - Pre-existing, unchanged: self-referential atoms/delays leak their cells on
   both main and branch (native refcount cycle) — probe /tmp/prof/selfref.bl.
+
+* NOTE (2026-09-28) — residuals closed: laziness regression, `distinct` O(n), reference types leak-free
+
+** 1. Laziness regression found and fixed (16e7cfa2)
+The chunk engine sealed a chunk after 32 OUTPUTS and filtering steps looped
+until an output, so over an infinite input with sparse outputs a chunk never
+sealed. None of the gates caught it; found by probing.
+| expr | main 4da5c8d7 | 85533dd0 | 16e7cfa2 |
+|------+---------------+----------+----------|
+| (first (keep f (range))) | 0 | HANG | 0 |
+| (first (distinct (cycle [1 2 3]))) | 1 | HANG | 1 |
+| (first (dedupe (cycle [1 1]))) | 1 | HANG | 1 |
+| (first (for [x (range) :when (< x 3)] x)) | 0 | HANG | 0 |
+| (first (filter #(< % 3) (range))) | HANG | HANG | 0 |
+Chunks are now bounded by INPUTS walked. lazy_scaling_test gained
+`sparse-producers-over-infinite-input-terminate` (each case under a deadline).
+
+** 2. `distinct` O(n) (6ffd6f4b)
+The seen set is a native `Seen` resource (native/lazy_memo/src/seen.rs)
+captured by handle; keys are admitted once per chunk AFTER every fallible
+step, so a throwing chunk admits nothing.
+| n → 2n (bench/lazy_scaling.bl -- 4000) | before | after |
+|---------------------------------------+--------+-------|
+| distinct | 54 → 204 ms (3.8) | 26 → 47 ms (1.8) |
+FUP-129's residual budget is gone; distinct is a linear case again.
+
+** 3. Reference types leak-free (7869969d)
+Trial-deletion cycle collector over memo cells, cursors and Seen sets
+(native/lazy_memo/src/collector.rs; soundness argument in its header). ERTS
+has no refcount API: offsets are CALIBRATED at load and the collector stays
+off if calibration fails (`LazyMemo/collector_status`). Promises and
+volatiles became ref cells (were: a never-stopped process per promise, a
+never-deleted pdict key per volatile).
+| 20× probe, left after GC | before | after |
+|--------------------------+--------+-------|
+| atom holding itself / via watch / via swap fn | 40 cells each | 0 |
+| atom → lazy seq → atom | 60 cells | 0 |
+| a ↔ b atoms | 80 cells | 0 |
+| delay reaching itself | 20 cells + 20 procs | 0 |
+| promise (any) | 20 procs | 0 |
+| volatile!/transducer | 1 pdict key each | 0 |
+Semantics change: a volatile is readable from another process (as in
+Clojure). A revived ETF handle to a COLLECTED cycle reads as reclaimed.
+
+** Gate hardening
+lazy_scaling_test compares n with 4n (bound 8×; linear 4, quadratic 16) and
+re-measures a failing case twice. Old 2n/3× bound flipped on noise
+(interleave, map, partition each failed once on unchanged code). The new gate
+still fails the 85533dd0 drop: distinct 25 → 422–726 ms, and 8 hang cases.
+
+** Evidence (/tmp/cold2 = branch HEAD, memory-capped)
+- Clean clone of e5c05630 builds from source incl. the NIF; `seed --check`
+  current; probes: 0 hangs, 0 leaked cells/procs, collector enabled.
+- Full .bl corpus minus z3: 313 passed / 8 failed / 1 incoherent (main:
+  303 / 8 / 2). Failures ⊆ main's pre-existing set, plus system.ask-test
+  (stale: 8 vs 9 questions, see earlier NOTE) and system.arity-test
+  (2086 ms vs a 2000 ms wall-clock ceiling under corpus load; 3/3 green alone).
+- ref_cycles_test 228 pass, incl. a reader walking a 50-atom ring while
+  rounds run back to back; lazy.fold 285, host.lazy 210, host.refs 113,
+  lazy-producers 226, prelude 300, system.linear 32, test.seed 209.
+- cargo test: 8 pass (ETF census fixture from OTP 29, calibration logic runs
+  at load, not in cargo tests).
+
+** Not verified / open
+- Collector calibration proven on OTP 29.0.1 / ERTS 17.0.1 only; each OTP
+  upgrade must re-run test/bl/ref_cycles_test.bl (it asserts `cycle_enabled`).
+- memo_cell bench on the loaded host read 2–3× slower than the 2026-09-27
+  table on BOTH cells and atoms, including rows this change does not touch
+  (deref k=10); not attributed. Re-measure on a quiet host before claiming
+  anything about per-op cost.
