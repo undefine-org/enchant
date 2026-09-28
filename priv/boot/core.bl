@@ -573,9 +573,17 @@
       :else (recur (rest xs) (cons (first xs) acc)))))
 
 (defn- chunked-run
-  "Run `step` until it signals exhaustion or `n` elements have been emitted.
-   Returns an Erlang `{elems state cursor}` tuple; `cursor` is nil when `step`
-   signalled exhaustion."
+  "Run `step` at most `n` times, or until it signals exhaustion. Returns an
+   Erlang `{elems state cursor}` tuple; `cursor` is nil when `step` signalled
+   exhaustion.
+
+   The budget counts STEPS, never outputs. A step consumes a bounded amount of
+   input (one element, one partition) and may emit nothing, so a chunk always
+   seals after a bounded walk: `(first (keep f (range)))` terminates, and a
+   filtering producer whose matches are sparse costs one cell per 32 inputs
+   rather than one unbounded walk per 32 matches. A chunk that emitted nothing
+   is still sealed (the engine loops, not the consumer), so an empty cell never
+   exists."
   [step state coll n acc]
   (cond
     (<= n 0) (erlang/list_to_tuple (list (reverse acc) state coll))
@@ -584,10 +592,24 @@
       (cond
         (nil? r) (erlang/list_to_tuple (list (reverse acc) state nil))
         :else
-        (let [outs (erlang/element 1 r)
-              st (erlang/element 2 r)
-              cursor (erlang/element 3 r)]
-          (chunked-run step st cursor (- n (count outs)) (prepend-all outs acc)))))))
+        (chunked-run step (erlang/element 2 r) (erlang/element 3 r) (erlang/- n 1)
+                     (prepend-all (erlang/element 1 r) acc))))))
+
+(declare chunked)
+
+(defn- chunked-realise
+  "One cell's worth of `chunked`: run chunks until one emits (or the input
+   ends), then chain the rest. Looping HERE, rather than chaining an empty
+   chunk, keeps every cell non-empty without an unbounded single step."
+  [step state input]
+  (let [r (chunked-run step state input (BeamLisp.LazySeq/chunk_size) ())
+        elems (erlang/element 1 r)
+        st (erlang/element 2 r)
+        cursor (erlang/element 3 r)]
+    (cond
+      (nil? cursor) elems
+      (erlang/== elems ()) (chunked-realise step st cursor)
+      :else (BeamLisp.LazySeq/chain elems (fn [] (chunked step st cursor))))))
 
 (defn- chunked
   "The chunked lazy producer engine — `rt`'s `lazy-map`/`lazy-filter`
@@ -598,15 +620,7 @@
    to continue at. Up to `chunk_size` elements share one memo cell, and the
    cell captures only the step fn, the state and the cursor."
   [step state input]
-  (BeamLisp.LazySeq/new
-    (fn []
-      (let [r (chunked-run step state input (BeamLisp.LazySeq/chunk_size) ())]
-        (let [elems (erlang/element 1 r)
-              st (erlang/element 2 r)
-              cursor (erlang/element 3 r)]
-          (cond
-            (nil? cursor) elems
-            :else (BeamLisp.LazySeq/chain elems (fn [] (chunked step st cursor)))))))))
+  (BeamLisp.LazySeq/new (fn [] (chunked-realise step state input))))
 
 (defn- interleave-step
   "One round of `interleave`: the head of every cursor. Returns an Erlang
@@ -835,16 +849,16 @@
   [coll]
   (chunked
     (fn [prev s]
-      (loop [prev prev s s]
-        (let [c (BeamLisp.LazySeq/cell s)]
-          (cond
-            (nil? c) nil
-            :else
-            (let [x (erlang/hd c)]
-              (cond
-                (and (not (empty? prev)) (= (first prev) x)) (recur prev (erlang/tl c))
-                :else (erlang/list_to_tuple
-                        (list (list x) (list x) (erlang/tl c)))))))))
+      (let [c (BeamLisp.LazySeq/cell s)]
+        (cond
+          (nil? c) nil
+          :else
+          (let [x (erlang/hd c)]
+            (cond
+              (and (not (empty? prev)) (= (first prev) x))
+              (erlang/list_to_tuple (list () prev (erlang/tl c)))
+              :else (erlang/list_to_tuple
+                      (list (list x) (list x) (erlang/tl c))))))))
     ()
     (lazy-input coll)))
 
@@ -1095,15 +1109,13 @@
   [f coll]
   (chunked
     (fn [_ s]
-      (loop [s s]
-        (let [c (BeamLisp.LazySeq/cell s)]
-          (cond
-            (nil? c) nil
-            :else
-            (let [x (f (erlang/hd c))]
-              (cond
-                (nil? x) (recur (erlang/tl c))
-                :else (erlang/list_to_tuple (list (list x) nil (erlang/tl c)))))))))
+      (let [c (BeamLisp.LazySeq/cell s)]
+        (cond
+          (nil? c) nil
+          :else
+          (let [x (f (erlang/hd c))]
+            (erlang/list_to_tuple
+              (list (if (nil? x) () (list x)) nil (erlang/tl c)))))))
     nil
     (lazy-input coll)))
 
@@ -1114,16 +1126,13 @@
   [f coll]
   (chunked
     (fn [i s]
-      (loop [i i s s]
-        (let [c (BeamLisp.LazySeq/cell s)]
-          (cond
-            (nil? c) nil
-            :else
-            (let [x (f i (erlang/hd c))]
-              (cond
-                (nil? x) (recur (inc i) (erlang/tl c))
-                :else (erlang/list_to_tuple
-                        (list (list x) (inc i) (erlang/tl c)))))))))
+      (let [c (BeamLisp.LazySeq/cell s)]
+        (cond
+          (nil? c) nil
+          :else
+          (let [x (f i (erlang/hd c))]
+            (erlang/list_to_tuple
+              (list (if (nil? x) () (list x)) (inc i) (erlang/tl c)))))))
     0
     (lazy-input coll)))
 
@@ -1303,15 +1312,19 @@
                            gn (gensym "n__")
                            gc (gensym "c__")
                            tails `(erlang/tl ~gc)
+                           ; An empty inner iterator contributes nil, never
+                           ; a second copy of the step: every element spends
+                           ; one unit of budget through ONE recur.
                            emit (if next-groups
                                   (let [[_ next-expr] (first next-groups)]
                                     `(let [inner# ~(emit-group next-groups)
                                            ys# (seq (inner# (lazy-input ~next-expr)))]
-                                       (if ys#
-                                         (recur ~tails (cons ys# ~gacc) (dec ~gn))
-                                         (recur ~tails ~gacc ~gn))))
+                                       (recur ~tails (if ys# (cons ys# ~gacc) ~gacc) (dec ~gn))))
                                   `(recur ~tails (cons ~body-expr ~gacc) (dec ~gn)))
-                           skip `(recur ~tails ~gacc ~gn)
+                           ; a skip SPENDS budget, like an emit: the chunk
+                           ; is bounded by inputs walked, so a sparse :when
+                           ; over an infinite coll still seals a chunk.
+                           skip `(recur ~tails ~gacc (dec ~gn))
                            ; end the group: hand back what the chunk holds, an
                            ; outer group's inner iterators concatenated in ONE
                            ; FLAT `concat`. A nested `(concat y1 (concat y2 …))`
@@ -1326,9 +1339,15 @@
                                   `(if (empty? ~gacc) nil (reverse ~gacc)))
                            ; chunk full: same, but the continuation is the
                            ; next chunk's iterator, so the tail stays lazy.
+                           ; An all-skip chunk restarts the loop in place,
+                           ; so no cell is ever an empty chain link.
                            flush (if next-groups
-                                   `(apply concat (reverse (cons (~giter ~gs) ~gacc)))
-                                   `(BeamLisp.LazySeq/chain (reverse ~gacc) (fn [] (~giter ~gs))))
+                                   `(if (empty? ~gacc)
+                                      (recur ~gs () (BeamLisp.LazySeq/chunk_size))
+                                      (apply concat (reverse (cons (~giter ~gs) ~gacc))))
+                                   `(if (empty? ~gacc)
+                                      (recur ~gs () (BeamLisp.LazySeq/chunk_size))
+                                      (BeamLisp.LazySeq/chain (reverse ~gacc) (fn [] (~giter ~gs)))))
                            do-mod (fn do-mod [[[k v] & etc]]
                                     (cond
                                       (nil? k) emit
