@@ -10,10 +10,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 
 rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep }
+
+mod collector;
+use collector::{register, unregister, Key, Node, Traced};
 
 /// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must
 /// return in well under 1 ms or it stalls every process on its scheduler.
@@ -76,6 +79,20 @@ struct State {
     term: SavedTerm,
     env: OwnedEnv,
     retained_bytes: usize,
+    /// The references this term holds, as the cycle collector's ETF census
+    /// found them — computed at most once per state (None: unreadable).
+    census: OnceLock<Option<Vec<Key>>>,
+}
+
+impl State {
+    fn census(&self) -> Option<&[Key]> {
+        self.census
+            .get_or_init(|| {
+                self.env
+                    .run(|env| collector::etf_keys(self.term.load(env).to_binary().as_slice()))
+            })
+            .as_deref()
+    }
 }
 
 /// The cell's publication counter (PLAN-151 W5). Every successful replace
@@ -109,7 +126,46 @@ struct MemoCell {
     id: u64,
     read_only: bool,
     version: Version,
+    /// Set by every read that hands this cell's term to a process (`export`).
+    /// The cycle collector clears it when it traces the cell and refuses to
+    /// reclaim a cell it then finds set.
+    touched: AtomicBool,
     state: Mutex<Option<State>>,
+}
+
+impl MemoCell {
+    /// Copy the state out into `env`. EVERY path that returns a cell's term to
+    /// a process goes through here — the collector's soundness rests on it.
+    fn export<'a>(&self, state: &State, env: Env<'a>) -> Term<'a> {
+        self.touched.store(true, Ordering::Release);
+        state.env.run(|owned| state.term.load(owned).in_env(env))
+    }
+}
+
+impl Node for MemoCell {
+    fn trace(&self, visit: &mut dyn FnMut(&Key)) -> Traced {
+        let guard = lock(&self.state);
+        self.touched.store(false, Ordering::Release);
+        let Some(state) = guard.as_ref() else { return Traced::Vacant };
+        match state.census() {
+            Some(keys) => {
+                keys.iter().for_each(|k| visit(k));
+                Traced::At(self.version.get())
+            }
+            None => Traced::Opaque,
+        }
+    }
+
+    fn quiet(&self, version: u64) -> bool {
+        let _guard = lock(&self.state);
+        !self.touched.load(Ordering::Acquire) && self.version.matches(version)
+    }
+
+    fn detach(&self) -> Option<Box<dyn Send>> {
+        let state = lock(&self.state).take()?;
+        saturating_sub(&RETAINED_BYTES, state.retained_bytes);
+        Some(Box::new(state))
+    }
 }
 
 /// How a versioned exchange treats the cell's dependency EDGES.
@@ -174,6 +230,7 @@ impl rustler::Resource for MemoCell {
 
         // Never drop a SavedTerm environment while graph/cell locks are held:
         // embedded resource releases can invoke more MemoCell destructors.
+        unregister(self.id);
         lock(graph()).remove(&self.id);
         LIVE_CELLS.fetch_sub(1, Ordering::AcqRel);
 
@@ -207,6 +264,14 @@ struct MemoStats {
     op_cursor: u64,
     op_cursor_chunk: u64,
     op_cursor_chunk_fast: u64,
+    // The cycle collector: whether the calibration passed on this emulator,
+    // rounds run / abandoned (a validated set changed under it), cells freed.
+    cycle_enabled: bool,
+    cycle_runs: u64,
+    cycle_aborts: u64,
+    cycle_collected: u64,
+    // Rounds that panicked (a bug; the round is dropped, nothing is freed).
+    cycle_anomalies: u64,
 }
 
 fn graph() -> &'static Mutex<HashMap<u64, Vec<u64>>> {
@@ -237,6 +302,7 @@ fn save(term: Term<'_>, retained_bytes: usize) -> State {
         term: saved,
         env,
         retained_bytes,
+        census: OnceLock::new(),
     }
 }
 
@@ -368,9 +434,7 @@ fn allocate(
 ) -> NifResult<ResourceArc<MemoCell>> {
     let retained_bytes = accounted_bytes(estimate)?;
     let dependencies = dependency_ids(dependencies);
-    let id = NEXT_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
-        .map_err(|_| rustler::Error::BadArg)?;
+    let id = next_id()?;
     let saved = save(state, retained_bytes);
 
     // A fresh ID cannot occur in any existing path, but publish its edges
@@ -379,15 +443,25 @@ fn allocate(
     LIVE_CELLS.fetch_add(1, Ordering::AcqRel);
     saturating_add(&RETAINED_BYTES, retained_bytes);
 
-    Ok(ResourceArc::new(MemoCell {
+    let cell = ResourceArc::new(MemoCell {
         id,
         read_only,
         version: Version::new(),
+        touched: AtomicBool::new(false),
         state: Mutex::new(Some(saved)),
-    }))
+    });
+    register(id, &cell);
+    Ok(cell)
+}
+
+fn next_id() -> NifResult<u64> {
+    NEXT_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .map_err(|_| rustler::Error::BadArg)
 }
 
 struct Cursor {
+    id: u64,
     position: Mutex<SavedTerm>,
     source: ResourceArc<MemoCell>,
     // Whether pulling a chunk must take the dirty lane. Decided ONCE, at cursor
@@ -400,7 +474,37 @@ struct Cursor {
     dirty_chunks: bool,
 }
 #[rustler::resource_impl]
-impl rustler::Resource for Cursor {}
+impl rustler::Resource for Cursor {
+    fn destructor(self, _env: Env<'_>) {
+        unregister(self.id);
+    }
+}
+
+impl Cursor {
+    fn arc(position: SavedTerm, source: ResourceArc<MemoCell>, dirty_chunks: bool) -> NifResult<ResourceArc<Cursor>> {
+        let id = next_id()?;
+        let cursor = ResourceArc::new(Cursor { id, position: Mutex::new(position), source, dirty_chunks });
+        register(id, &cursor);
+        Ok(cursor)
+    }
+}
+
+/// A cursor is immutable and holds exactly one count the ETF cannot show: its
+/// Rust handle on the source cell. Its position lives in the source's own
+/// environment, so the source's census already covers it. It never detaches —
+/// every cycle through a cursor also runs through its source, a cell.
+impl Node for Cursor {
+    fn trace(&self, visit: &mut dyn FnMut(&Key)) -> Traced {
+        visit(&collector::key_of(&self.source));
+        Traced::At(0)
+    }
+    fn quiet(&self, _version: u64) -> bool {
+        true
+    }
+    fn detach(&self) -> Option<Box<dyn Send>> {
+        None
+    }
+}
 
 #[rustler::nif(name = "nif_cursor", schedule = "DirtyCpu")]
 fn cursor(
@@ -423,11 +527,7 @@ fn cursor(
         .ok_or(rustler::Error::BadArg)?
         .term
         .clone();
-    Ok(ResourceArc::new(Cursor {
-        position: Mutex::new(position),
-        source,
-        dirty_chunks,
-    }))
+    Cursor::arc(position, source, dirty_chunks)
 }
 
 /// Whether this cursor's chunks must take the dirty lane. `SeqCursor` reads it
@@ -444,6 +544,7 @@ fn cursor_chunk_impl<'a>(
     let position = lock(&cursor.position);
     let guard = lock(&cursor.source.state);
     let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
+    cursor.source.touched.store(true, Ordering::Release);
     state.env.run(|owned| {
         let mut remaining = position.load(owned);
         let mut chunk = Vec::with_capacity(32);
@@ -458,11 +559,7 @@ fn cursor_chunk_impl<'a>(
         let tail = if remaining.is_empty_list() {
             None
         } else {
-            Some(ResourceArc::new(Cursor {
-                position: Mutex::new(state.env.save(remaining)),
-                source: cursor.source.clone(),
-                dirty_chunks: cursor.dirty_chunks,
-            }))
+            Some(Cursor::arc(state.env.save(remaining), cursor.source.clone(), cursor.dirty_chunks)?)
         };
         Ok((chunk, tail))
     })
@@ -495,9 +592,12 @@ fn cursor_chunk<'a>(
 fn dependency_resource(term: Term<'_>) -> Option<ResourceArc<MemoCell>> {
     count(OP_DEP_RESOURCE);
     term.decode::<ResourceArc<MemoCell>>().ok().or_else(|| {
-        term.decode::<ResourceArc<Cursor>>()
-            .ok()
-            .map(|cursor| cursor.source.clone())
+        term.decode::<ResourceArc<Cursor>>().ok().map(|cursor| {
+            // Hands the caller a reference it did not hold: a read, for the
+            // cycle collector's purposes (see `MemoCell::touched`).
+            cursor.source.touched.store(true, Ordering::Release);
+            cursor.source.clone()
+        })
     })
 }
 
@@ -519,7 +619,7 @@ fn set_fast_lane_bytes(bytes: u64) -> NifResult<u64> {
 fn read_impl<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Term<'a>> {
     let guard = lock(&resource.state);
     let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
-    Ok(state.env.run(|owned| state.term.load(owned).in_env(env)))
+    Ok(resource.export(state, env))
 }
 
 /// Fast lane: regular scheduler. SELF-GUARDING (PLAN-132 Phase 1, fixes F1):
@@ -538,7 +638,7 @@ fn read_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> NifResult<Ter
     if state.retained_bytes > fast_lane_bytes() {
         return Ok(reroute().to_term(env));
     }
-    Ok(state.env.run(|owned| state.term.load(owned).in_env(env)))
+    Ok(resource.export(state, env))
 }
 
 /// Dirty lane: unchanged behaviour for large values.
@@ -555,9 +655,7 @@ fn read_versioned_impl<'a>(
     let guard = lock(&resource.state);
     let state = guard.as_ref().ok_or(rustler::Error::BadArg)?;
     let version = resource.version.get();
-    Ok(state
-        .env
-        .run(|owned| (version, state.term.load(owned).in_env(env)).encode(env)))
+    Ok((version, resource.export(state, env)).encode(env))
 }
 
 /// The cell's `{version, state}`, where `version` is the publication counter a
@@ -583,9 +681,7 @@ fn read_versioned_fast<'a>(env: Env<'a>, resource: ResourceArc<MemoCell>) -> Nif
         return Ok(reroute().to_term(env));
     }
     let version = resource.version.get();
-    Ok(state
-        .env
-        .run(|owned| (version, state.term.load(owned).in_env(env)).encode(env)))
+    Ok((version, resource.export(state, env)).encode(env))
 }
 
 /// Shared body of the versioned exchange. The version compare is O(1) — no term
@@ -774,6 +870,7 @@ fn compare_exchange_impl<'a>(
     let replacement = save(replacement, retained_bytes);
     edges.insert(resource.id, dependencies);
     let old = cell.replace(replacement).ok_or(rustler::Error::BadArg)?;
+    resource.version.bump();
     saturating_sub(&RETAINED_BYTES, old.retained_bytes);
     saturating_add(&RETAINED_BYTES, retained_bytes);
     drop(edges);
@@ -859,7 +956,61 @@ fn stats() -> MemoStats {
         op_cursor: op(OP_CURSOR),
         op_cursor_chunk: op(OP_CURSOR_CHUNK),
         op_cursor_chunk_fast: op(OP_CURSOR_CHUNK_FAST),
+        cycle_enabled: collector::enabled(),
+        cycle_runs: collector::RUNS.load(Ordering::Relaxed),
+        cycle_aborts: collector::ABORTS.load(Ordering::Relaxed),
+        cycle_collected: collector::COLLECTED.load(Ordering::Relaxed),
+        cycle_anomalies: collector::ANOMALIES.load(Ordering::Relaxed),
     }
+}
+
+/// Unconditional replace — a volatile's `vreset!`. No version compare, no
+/// edges (`:keep`): the last writer wins, which is the volatile contract. The
+/// fast lane answers `:reroute` for a large current or new value.
+fn put_impl(resource: ResourceArc<MemoCell>, value: Term<'_>, estimate: u64, fast_lane: bool) -> NifResult<Atom> {
+    if resource.read_only {
+        return Err(rustler::Error::BadArg);
+    }
+    let retained_bytes = accounted_bytes(estimate)?;
+    let mut cell = lock(&resource.state);
+    let current = cell.as_ref().ok_or(rustler::Error::BadArg)?;
+    if fast_lane && (current.retained_bytes > fast_lane_bytes() || retained_bytes > fast_lane_bytes()) {
+        return Ok(reroute());
+    }
+    let old = cell.replace(save(value, retained_bytes)).ok_or(rustler::Error::BadArg)?;
+    resource.version.bump();
+    saturating_sub(&RETAINED_BYTES, old.retained_bytes);
+    saturating_add(&RETAINED_BYTES, retained_bytes);
+    drop(cell);
+    if fast_lane {
+        reclaim_state_small(old);
+    } else {
+        reclaim_state(old);
+    }
+    Ok(ok())
+}
+
+#[rustler::nif(name = "nif_put_fast")]
+fn put_fast(resource: ResourceArc<MemoCell>, value: Term<'_>, estimate: u64) -> NifResult<Atom> {
+    put_impl(resource, value, estimate, true)
+}
+
+#[rustler::nif(name = "nif_put", schedule = "DirtyCpu")]
+fn put(resource: ResourceArc<MemoCell>, value: Term<'_>, estimate: u64) -> NifResult<Atom> {
+    put_impl(resource, value, estimate, false)
+}
+
+/// Run one cycle-collection round now; answers the cells it freed. Rounds
+/// also run on their own, on a background thread, as allocation grows.
+#[rustler::nif(name = "nif_collect_cycles", schedule = "DirtyCpu")]
+fn collect_cycles() -> u64 {
+    collector::collect() as u64
+}
+
+/// Empty when the collector calibrated; else why it is off.
+#[rustler::nif(name = "nif_collector_status")]
+fn collector_status() -> &'static str {
+    collector::calibration_error()
 }
 
 #[rustler::nif(name = "nif_loaded?")]
@@ -886,6 +1037,9 @@ extern "C" fn load_native(
     if start_reclaimer().is_err() {
         return 1;
     }
+    if collector::start().is_err() {
+        return 1;
+    }
     0
 }
 
@@ -893,6 +1047,7 @@ extern "C" fn unload_native(
     _env: rustler::codegen_runtime::NIF_ENV,
     _private: *mut rustler::codegen_runtime::c_void,
 ) {
+    collector::stop();
     let worker = lock(&RECLAIMER).take();
     if let Some(Reclaimer { sender, worker }) = worker {
         drop(sender);

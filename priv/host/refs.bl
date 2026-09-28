@@ -221,26 +221,25 @@
 
 ; ── volatiles ──────────────────────────────────────────────────────────────
 ;
-; A volatile is an *unsynchronized* box: a process-dictionary cell, not a cell
-; reference. The transducer layer creates and swaps a volatile per step, so
-; spawning a process for each would forfeit the performance deal. The cost is
-; the documented honesty: visible only within the creating process.
+; A volatile is an *unsynchronized* box: one GC-owned ref cell, written with an
+; unconditional `put` (no CAS, last writer wins — the volatile contract). It
+; used to be a process-dictionary entry, which nothing ever deleted: every
+; `volatile!` — one per `take`/`drop`/`partition-all` transducer instance —
+; leaked a pdict key for the life of the process. A cell is freed with its last
+; reference, and a cell cycle by the cycle collector.
 
 (defn volatile
-  "A new volatile holding `v` in THIS process's dictionary, keyed by a fresh
-   reference. The struct holds only the key."
+  "A new volatile holding `v`: one ref cell."
   [v]
-  (let [key (erlang/make_ref)]
-    (Process/put (tuple :"Elixir.BeamLisp.Volatile" key) v)
-    (maps/put :__struct__ :"Elixir.BeamLisp.Volatile"
-      (maps/put :key key (maps/new)))))
+  (maps/put :__struct__ :"Elixir.BeamLisp.Volatile"
+    (maps/put :key (BeamLisp.LazyMemo/create_ref v) (maps/new))))
 
 (defn vreset!
-  "Overwrite a volatile's value in the creating process's dictionary."
+  "Overwrite a volatile's value; returns `v`."
   [ref v]
   (if (and (erlang/is_map ref)
            (erlang/== :"Elixir.BeamLisp.Volatile" (maps/get :__struct__ ref nil)))
-    (do (Process/put (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key ref nil)) v)
+    (do (BeamLisp.LazyMemo/put (maps/get :key ref nil) v)
         v)
     (erlang/error
       (Elixir.ArgumentError/exception
@@ -248,14 +247,14 @@
 
 (defn vswap!
   "`(vswap! vol f)` / `(vswap! vol f & args)` — read-modify-write a volatile.
-   The step fn runs in the caller's process (no cell, no process), so it is
-   atomic only against other ops in the same process — the volatile contract."
+   Not atomic (the volatile contract): a racing writer may be lost."
   ([ref f] (vswap! ref f ()))
   ([ref f args_list]
    (if (and (erlang/is_map ref)
             (erlang/== :"Elixir.BeamLisp.Volatile" (maps/get :__struct__ ref nil)))
-     (let [new (BeamLisp.Ns.Rt/invoke f (erlang/++ (list (deref ref)) args_list))]
-       (Process/put (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key ref nil)) new)
+     (let [cell (maps/get :key ref nil)
+           new (BeamLisp.Ns.Rt/invoke f (erlang/++ (list (BeamLisp.LazyMemo/read cell)) args_list))]
+       (BeamLisp.LazyMemo/put cell new)
        new)
      (erlang/error
        (Elixir.ArgumentError/exception
@@ -340,50 +339,23 @@
 
 ; ── promises ───────────────────────────────────────────────────────────────
 ;
-; The promise process holds `{:unset, waiters}` or `{:set, v}`. `deref` just
-; registers as a waiter; the process replies once the value arrives — no
-; polling anywhere. Replies carry the promise's pid so a timed-out deref can
-; never confuse one promise's value with another's.
+; A promise is one GC-owned ref cell holding `{:unset waiters}` or `{:set v}`
+; (the `:pid` field name is kept for the struct shape; it holds the cell). It
+; used to be a looping process per promise, which nothing ever stopped: every
+; `(promise)` leaked a process, delivered or not.
+;
+; `deliver` and a waiting `deref` are version CASes on that cell. `deliver`
+; publishes `{:set v}` and, in the SAME native call, sends
+; `{:bl_promise cell v}` to every registered waiter — so a waiter registered
+; before the publish is always told, and one that reads after it sees the
+; value. A timed-out waiter leaves its pid in the list; delivery then sends it
+; one stray message, the same cost the old process design had.
 
 (defn promise
-  "A fresh single-assignment promise: a loop process that inherits the caller's
-   env binding and heap bound."
+  "A fresh, undelivered single-assignment promise."
   []
-  (let [token (BeamLisp.Env/capture)
-        bound (fn [] (let [w (BeamLisp.Env/max_heap)]
-                       (if (erlang/== nil w)
-                         :ok
-                         (erlang/process_flag :max_heap_size
-                           (maps/put :size w
-                             (maps/put :kill false
-                               (maps/put :error_logger false (maps/new))))))))
-        wake (fn wake [ws v]
-               (if (erlang/== ws ())
-                 :ok
-                 (do (erlang/send (erlang/hd ws) (tuple (erlang/self) :bl_value v))
-                     (wake (erlang/tl ws) v))))
-        ploop
-        (fn ploop [state]
-          (cond
-            (erlang/== :set (erlang/element 1 state))
-            (let [v (erlang/element 2 state)]
-              (receive
-                [:bl_deref from] (do (erlang/send from (tuple (erlang/self) :bl_value v))
-                                     (ploop state))
-                [:bl_set from _] (do (erlang/send from (tuple (erlang/self) :bl_set_ack false))
-                                     (ploop state))))
-
-            :else
-            (let [waiters (erlang/element 2 state)]
-              (receive
-                [:bl_deref from] (ploop (tuple :unset (erlang/++ (list from) waiters)))
-                [:bl_set from v]
-                (do (wake (erlang/apply :lists :reverse (list waiters)) v)
-                    (erlang/send from (tuple (erlang/self) :bl_set_ack true))
-                    (ploop (tuple :set v)))))))]
-    (maps/put :__struct__ :"Elixir.BeamLisp.Promise"
-      (maps/put :pid (erlang/spawn (fn [] (BeamLisp.Env/bind token) (bound) (ploop (tuple :unset ()))))
-                (maps/new)))))
+  (maps/put :__struct__ :"Elixir.BeamLisp.Promise"
+    (maps/put :pid (BeamLisp.LazyMemo/create_ref (tuple :unset ())) (maps/new))))
 
 (defn deliver
   "Set a promise's value ONCE, answering the promise on first delivery and nil
@@ -392,11 +364,22 @@
   [ref v]
   (if (and (erlang/is_map ref)
            (erlang/== :"Elixir.BeamLisp.Promise" (maps/get :__struct__ ref nil)))
-    (let [pid (maps/get :pid ref nil)]
-      (erlang/send pid (tuple :bl_set (erlang/self) v))
-      (receive
-        [q :bl_set_ack true] :when (== q pid) ref
-        [q :bl_set_ack false] :when (== q pid) nil))
+    (let [cell (maps/get :pid ref nil)
+          attempt
+          (fn attempt []
+            (let [cur (BeamLisp.LazyMemo/read_versioned cell)
+                  state (erlang/element 2 cur)]
+              (cond
+                (erlang/== :set (erlang/element 1 state)) nil
+                :else
+                (let [note (tuple :bl_promise cell v)
+                      outcome (BeamLisp.LazyMemo/exchange_version
+                                cell (erlang/element 1 cur) (tuple :set v) :keep
+                                (Enum/map (erlang/element 2 state) (fn [w] (tuple w note))))]
+                  (cond
+                    (erlang/== :ok outcome) ref
+                    :else (attempt))))))]
+      (attempt))
     (erlang/error
       (Elixir.ArgumentError/exception
         (str "deliver: not a promise: " (Kernel/inspect ref))))))
@@ -415,7 +398,7 @@
        (tag? :"Elixir.BeamLisp.Future" x) (Task/await (maps/get :task x nil) :infinity)
        (tag? :"Elixir.BeamLisp.Promise" x) (deref x :infinity nil)
        (tag? :"Elixir.BeamLisp.Volatile" x)
-       (Process/get (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key x nil)))
+       (BeamLisp.LazyMemo/read (maps/get :key x nil))
        (tag? :"Elixir.BeamLisp.Reduced" x) (maps/get :value x nil)
        ; A delay derefs to its value, forcing it once. `@d` therefore works on
        ; a delay exactly as on an atom or promise.
@@ -446,16 +429,35 @@
              (erlang/raise kind reason stack))))
 
        (tag? :"Elixir.BeamLisp.Volatile" x)
-       (Process/get (tuple :"Elixir.BeamLisp.Volatile" (maps/get :key x nil)))
+       (BeamLisp.LazyMemo/read (maps/get :key x nil))
 
        (tag? :"Elixir.BeamLisp.Reduced" x) (maps/get :value x nil)
 
+       ; Register as a waiter with a CAS, then receive the delivery; a promise
+       ; already set answers without registering (see `deliver`).
        (tag? :"Elixir.BeamLisp.Promise" x)
-       (let [pid (maps/get :pid x nil)]
-         (erlang/send pid (tuple :bl_deref (erlang/self)))
-         (receive
-           [q :bl_value v] :when (== q pid) v
-           (after timeout_ms timeout_val)))
+       (let [cell (maps/get :pid x nil)
+             me (erlang/self)
+             register
+             (fn register []
+               (let [cur (BeamLisp.LazyMemo/read_versioned cell)
+                     state (erlang/element 2 cur)]
+                 (cond
+                   (erlang/== :set (erlang/element 1 state)) state
+                   :else
+                   (let [outcome (BeamLisp.LazyMemo/exchange_version
+                                   cell (erlang/element 1 cur)
+                                   (tuple :unset (erlang/++ (list me) (erlang/element 2 state))) :keep)]
+                     (cond
+                       (erlang/== :ok outcome) :waiting
+                       :else (register))))))
+             r (register)]
+         (cond
+           (erlang/== :waiting r)
+           (receive
+             [:bl_promise c v] :when (== c cell) v
+             (after timeout_ms timeout_val))
+           :else (erlang/element 2 r)))
 
        :else (erlang/error
                (Elixir.ArgumentError/exception
