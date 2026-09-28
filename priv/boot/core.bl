@@ -814,32 +814,55 @@
 ; `distinct` was the trigger: a real program died on it, which is how the
 ; rest of this batch earns its place.
 
+(defn- distinct-fresh
+  "The elements of `xs` whose flag in `fresh` is true, in order."
+  [xs fresh]
+  (loop [xs xs fresh fresh acc ()]
+    (cond
+      (erlang/== xs ()) (reverse acc)
+      (erlang/hd fresh) (recur (erlang/tl xs) (erlang/tl fresh) (cons (erlang/hd xs) acc))
+      :else (recur (erlang/tl xs) (erlang/tl fresh) acc))))
+
+(declare distinct-from)
+
+(defn- distinct-realise
+  "One cell of `distinct`: read up to `chunk_size` inputs, compute their keys,
+   then admit the whole batch to the native seen set in ONE call. Every
+   fallible step (forcing the input, `keyfn`) runs before the admit, so a
+   thrown attempt admits nothing and its retry sees the same set. An all-dup
+   batch loops in place: no cell is empty."
+  [keyfn seen s]
+  (let [r (take-upto (BeamLisp.LazySeq/chunk_size) s)
+        xs (erlang/element 1 r)
+        rest (erlang/element 2 r)
+        keys (loop [xs xs acc ()]
+               (cond
+                 (erlang/== xs ()) (reverse acc)
+                 :else (recur (erlang/tl xs)
+                              (cons (BeamLisp.Ns.Rt/hash_key (keyfn (erlang/hd xs))) acc))))
+        elems (distinct-fresh xs (BeamLisp.LazyMemo/seen_admit seen keys))]
+    (cond
+      (nil? rest) elems
+      (erlang/== elems ()) (distinct-realise keyfn seen rest)
+      :else (BeamLisp.LazySeq/chain elems (fn [] (distinct-from keyfn seen rest))))))
+
+(defn- distinct-from [keyfn seen s]
+  (BeamLisp.LazySeq/new (fn [] (distinct-realise keyfn seen s))))
+
 (defn distinct
   "Returns a lazy seq of the elements of coll with duplicates removed.
    First occurrence wins: order is preserved, so this is dedup by
    position, never a set abstraction leaking out. Accepts a keyfn that
    decides equality between elements.
 
-   Chunked at `(BeamLisp.LazySeq/chunk_size)` elements per memo cell, so the
-   walk is linear. The seen set is threaded through the chunk continuation and
-   therefore RETAINS every key seen so far, as Clojure's does."
+   O(n) for the whole walk. The keys seen so far live in ONE native set
+   (`BeamLisp.LazyMemo/seen`) that every chunk's cell captures as an O(1)
+   handle; each key is copied once, when it is admitted. (A persistent set
+   threaded through the continuation made every cell copy the whole set:
+   O(n²/32).) Keys compare as a set's do — through `hash_key`, so metadata is
+   invisible."
   ([coll] (distinct identity coll))
-  ([keyfn coll]
-   (chunked
-     (fn [seen s]
-       (loop [seen seen s s]
-         (let [c (BeamLisp.LazySeq/cell s)]
-           (cond
-             (nil? c) nil
-             :else
-             (let [x (erlang/hd c)
-                   k (keyfn x)]
-               (cond
-                 (contains? seen k) (recur seen (erlang/tl c))
-                 :else (erlang/list_to_tuple
-                         (list (list x) (conj seen k) (erlang/tl c)))))))))
-     (set [])
-     (lazy-input coll))))
+  ([keyfn coll] (distinct-from keyfn (BeamLisp.LazyMemo/seen) (lazy-input coll))))
 
 (defn dedupe
   "Returns a lazy seq with consecutive duplicate elements removed:

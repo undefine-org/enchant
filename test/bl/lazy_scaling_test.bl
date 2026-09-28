@@ -4,34 +4,47 @@
 ; PLAN-151. A lazy producer whose per-element memo cell captures the rest of its
 ; input costs O(n²): each cell's price is proportional to what its thunk
 ; captured. The symptom is not a wrong answer but a slow one, which no
-; equivalence test notices — so this file times every producer at n and 2n and
-; fails when doubling the input more than triples the time. A linear producer
-; shows ~2; the defect this guards against showed 3.5–6.
+; equivalence test notices — so this file times every producer at n and 4n and
+; fails when quadrupling the input costs more than 8x. Linear shows ~4 and
+; quadratic ~16, so the bound sits a factor of 2 from each: a 2n comparison
+; (linear 2, quadratic 4, bound 3) flipped on ordinary scheduler noise.
 ;
-; Timing tests are noisy on a loaded host, so each side takes the best of three
-; runs and the bound (3.0) sits well above linear and well below quadratic. A
-; case too fast to time (< 3 ms at 2n) is linear by construction and passes.
+; Each side takes the best of five runs. A case too fast to time (< 4 ms at
+; 4n) is linear by construction and passes.
 ; bench/lazy_scaling.bl prints the same cases as a table.
 
 (ns lazy-scaling.test)
 
-(def ^:private n 3000)
+(def ^:private n 2000)
 
 (defn- us [f]
   (let [t0 (erlang/monotonic_time :microsecond)]
     (f)
     (- (erlang/monotonic_time :microsecond) t0)))
 
-(defn- best [f] (min (us f) (us f) (us f)))
+(defn- best [f] (min (us f) (us f) (us f) (us f) (us f)))
+
+(defn- measure [f]
+  (let [small (vec (range n))
+        large (vec (range (* 4 n)))
+        a (best (fn [] (f small)))
+        b (best (fn [] (f large)))]
+    {:ok? (or (< b 4000) (<= b (* 8 (max a 1))))
+     :n-us a :4n-us b}))
 
 (defn- linear?
-  "Whether `f` (given a vector of size k) scales linearly from n to 2n. Answers
-   the measurement too, so a failure names its numbers."
+  "Whether `f` (given a vector of size k) scales linearly from n to 4n. Answers
+   the measurement too, so a failure names its numbers.
+
+   A single measurement can lose to a scheduler stall that lands on one side
+   only (seen: `map` 1.6 ms -> 16 ms once, 1.4 -> 5.6 on every rerun). So a
+   failing case is measured twice more and fails only when EVERY attempt does:
+   a real O(n²) producer fails all three by a wide margin (distinct before
+   this gate was tightened: 25 ms -> 422 ms), noise does not repeat."
   [f]
-  (let [a (best (fn [] (f (vec (range n)))))
-        b (best (fn [] (f (vec (range (* 2 n))))))]
-    {:ok? (or (< b 3000) (<= b (* 3 (max a 1))))
-     :n-us a :2n-us b}))
+  (loop [k 0]
+    (let [r (measure f)]
+      (if (or (:ok? r) (= k 2)) r (recur (inc k))))))
 
 (def ^:private env (into {} (map (fn [i] [i i]) (range 20000))))
 
@@ -39,6 +52,10 @@
   [["map-indexed"   (fn [c] (count (map-indexed (fn [i x] [i x]) c)))]
    ["keep-indexed"  (fn [c] (count (keep-indexed (fn [i x] (when (even? i) x)) c)))]
    ["dedupe"        (fn [c] (count (dedupe c)))]
+   ; distinct's seen set is ONE native set captured by handle — it used to be
+   ; threaded through every chunk and copied with it (O(n²/32)).
+   ["distinct"      (fn [c] (count (distinct c)))]
+   ["distinct, many dups" (fn [c] (count (distinct (map (fn [x] (mod x 97)) c))))]
    ["keep"          (fn [c] (count (keep (fn [x] (when (odd? x) x)) c)))]
    ["partition-by"  (fn [c] (count (partition-by (fn [x] (quot x 7)) c)))]
    ["partition"     (fn [c] (count (partition 4 c)))]
@@ -54,23 +71,29 @@
    ["mapv, f closes over a large map" (fn [c] (count (mapv (fn [x] (get env x)) c)))]
    ["for, body closes over a large map" (fn [c] (count (for [x c] (get env x))))]])
 
-; A producer whose carried STATE grows with the input is a different class: the
-; state is part of the value a shared memo hands to a waiter, so every chunk
-; copies it. `distinct` (its seen set) is the one such producer. It is 34x
-; cheaper than before PLAN-151 yet still O(n^2/32), and only FUP-129 (local
-; until shared / store-once terms) can make it linear. It is timed here so the
-; residual stays visible and cannot regress past its measured shape (ratio ~4
-; at n=3000, ~70 ms): bounded at 2n by an absolute budget instead of the ratio.
-(def residuals
-  [["distinct (FUP-129)" (fn [c] (count (distinct c))) 1000000]])
-
-(deftest state-carrying-producers-stay-within-their-budget
-  (doseq [[nm f budget-us] residuals]
-    (let [r (linear? f)]
-      (is (<= (:2n-us r) budget-us)
-          (str nm ": " (:n-us r) " us at n=" n ", " (:2n-us r) " us at 2n, budget " budget-us)))))
-
 (deftest every-lazy-producer-is-linear
   (doseq [[nm f] cases]
     (let [r (linear? f)]
-      (is (:ok? r) (str nm ": " (:n-us r) " us at n=" n ", " (:2n-us r) " us at 2n")))))
+      (is (:ok? r) (str nm ": " (:n-us r) " us at n=" n ", " (:4n-us r) " us at 4n")))))
+
+; A chunk is bounded by the INPUTS it walks, never by the outputs it emits. A
+; producer that sealed a chunk only after 32 outputs walked forever when
+; matches ran out: `(first (keep f (range)))` with 3 matches never returned.
+; Each case must answer within its own deadline (a hang fails, not blocks).
+(defn- within [ms f]
+  (let [t (Task/async f)
+        r (Task/yield t ms)]
+    (when (nil? r) (Task/shutdown t :brutal_kill))
+    (if (nil? r) ::timeout (second r))))
+
+(deftest sparse-producers-over-infinite-input-terminate
+  (doseq [[nm want f]
+          [["distinct"     [1 2 3] #(vec (take 3 (distinct (cycle [1 2 3]))))]
+           ["keep"         0       #(first (keep (fn [x] (when (< x 3) x)) (range)))]
+           ["keep-indexed" 0       #(first (keep-indexed (fn [i x] (when (< i 2) x)) (range)))]
+           ["filter"       0       #(first (filter (fn [x] (< x 3)) (range)))]
+           ["remove"       0       #(first (remove (fn [x] (>= x 3)) (range)))]
+           ["dedupe"       1       #(first (dedupe (cycle [1 1])))]
+           ["for :when"    0       #(first (for [x (range) :when (< x 3)] x))]
+           ["nested for :when" [0 0] #(first (for [x (range) y [0] :when (< x 2)] [x y]))]]]
+    (is (= want (within 5000 f)) (str nm " over an infinite input"))))

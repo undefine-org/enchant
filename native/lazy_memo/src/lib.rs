@@ -16,6 +16,7 @@ use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep }
 
 mod collector;
+mod seen;
 use collector::{register, unregister, Key, Node, Traced};
 
 /// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must
@@ -998,6 +999,19 @@ fn put_fast(resource: ResourceArc<MemoCell>, value: Term<'_>, estimate: u64) -> 
 #[rustler::nif(name = "nif_put", schedule = "DirtyCpu")]
 fn put(resource: ResourceArc<MemoCell>, value: Term<'_>, estimate: u64) -> NifResult<Atom> {
     put_impl(resource, value, estimate, false)
+}
+
+/// A fresh, empty `Seen` set (see seen.rs) — `distinct`'s memory.
+#[rustler::nif(name = "nif_seen_new")]
+fn seen_new() -> NifResult<ResourceArc<seen::Seen>> {
+    Ok(seen::Seen::arc(next_id()?))
+}
+
+/// Admit a chunk's keys; answers one boolean per key, true where it was new.
+/// A chunk is at most 32 keys, but keys can be large terms: dirty lane.
+#[rustler::nif(name = "nif_seen_admit", schedule = "DirtyCpu")]
+fn seen_admit(seen: ResourceArc<seen::Seen>, keys: Vec<Term<'_>>) -> Vec<bool> {
+    seen.admit(&keys)
 }
 
 /// Run one cycle-collection round now; answers the cells it freed. Rounds
