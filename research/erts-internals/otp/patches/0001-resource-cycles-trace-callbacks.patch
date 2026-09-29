@@ -1,0 +1,1046 @@
+From b753189b26faa77f6af248aa629fcf8d558e898b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 29 Sep 2026 16:37:16 +0100
+Subject: [PATCH] resource cycles: trace callbacks + collector + observability
+ (prototype)
+
+---
+ erts/emulator/beam/erl_bif_info.c  |   4 +
+ erts/emulator/beam/erl_nif.c       |  11 +
+ erts/emulator/beam/erl_nif_trace.c | 823 +++++++++++++++++++++++++++++
+ erts/emulator/beam/erl_nif_trace.h | 115 ++++
+ erts/emulator/beam/global.h        |   2 +
+ 5 files changed, 955 insertions(+)
+ create mode 100644 erts/emulator/beam/erl_nif_trace.c
+ create mode 100644 erts/emulator/beam/erl_nif_trace.h
+
+diff --git a/erts/emulator/beam/erl_bif_info.c b/erts/emulator/beam/erl_bif_info.c
+index 0b6eb12..7328763 100644
+--- a/erts/emulator/beam/erl_bif_info.c
++++ b/erts/emulator/beam/erl_bif_info.c
+@@ -2846,6 +2846,10 @@ BIF_RETTYPE system_info_1(BIF_ALIST_1)
+ 	default:
+ 	    ERTS_INTERNAL_ERROR("Invalid time offset state");
+ 	}
++    } else if (ERTS_IS_ATOM_STR("resource_cycles", BIF_ARG_1)) {
++        /* Resource cycle collector counters (PROTOTYPE, erl_nif_trace.c). */
++        extern ERL_NIF_TERM erts_resource_cycles_info_term(Process *);
++        BIF_RET(erts_resource_cycles_info_term(BIF_P));
+     } else if (ERTS_IS_ATOM_STR("os_monotonic_time_source", BIF_ARG_1)) {
+ 	BIF_RET(erts_monotonic_time_source(BIF_P));
+     } else if (ERTS_IS_ATOM_STR("os_system_time_source", BIF_ARG_1)) {
+diff --git a/erts/emulator/beam/erl_nif.c b/erts/emulator/beam/erl_nif.c
+index ae5e6b7..269b003 100644
+--- a/erts/emulator/beam/erl_nif.c
++++ b/erts/emulator/beam/erl_nif.c
+@@ -2955,6 +2955,7 @@ int erts_dbg_is_resource_dying(ErtsResource* resource)
+ #define NIF_RESOURCE_DTOR &nif_resource_dtor_prologue
+ 
+ static void run_resource_dtor(void* vbin);
++static void rc_on_dtor(ErtsResource *r);   /* erl_nif_trace.c */
+  
+ static int nif_resource_dtor_prologue(Binary* bin)
+ {
+@@ -3011,6 +3012,7 @@ static void run_resource_dtor(void* vbin)
+         erts_mtx_destroy(&rm->lock);
+     }
+ 
++    rc_on_dtor(resource);
+     if (type->fn.dtor != NULL) {
+         struct enif_msg_environment_t msg_env;
+         pre_nif_noproc(&msg_env, type->owner, NULL);
+@@ -3140,6 +3142,8 @@ void* enif_alloc_resource(ErlNifResourceType* type, size_t data_sz)
+ 
+     ASSERT(type->owner && type->next && type->prev); /* not allowed in load/upgrade */
+     resource->type = type;
++    resource->rc_type = NULL;
++    resource->rc_tracked = 0;
+     erts_refc_inc(&bin->intern.refc, 1);
+ #ifdef DEBUG
+     erts_refc_init(&resource->nif_refc, 1);
+@@ -5370,8 +5374,11 @@ erts_unload_nif(struct erl_module_nif* lib)
+     deref_nifmod(lib);
+ }	
+ 
++static void erts_nif_rcycles_init(void);  /* erl_nif_trace.c */
++
+ void erl_nif_init(void)
+ {
++    erts_nif_rcycles_init();
+     ERTS_CT_ASSERT((offsetof(ErtsResource,data) % 8)
+                    == ERTS_MAGIC_BIN_BYTES_TO_ALIGN);
+ 
+@@ -6874,3 +6881,7 @@ ERL_NIF_TERM erl_nif_user_trace_n(ErlNifEnv* env, int argc,
+ }
+ 
+ #endif /* HAVE_USE_DTRACE */
++
++/* Resource cycle collector (PROTOTYPE): sees this file's static types. */
++#define ERL_NIF_TRACE_DECLARE_EXPORTS
++#include "erl_nif_trace.c"
+diff --git a/erts/emulator/beam/erl_nif_trace.c b/erts/emulator/beam/erl_nif_trace.c
+new file mode 100644
+index 0000000..7673ce2
+--- /dev/null
++++ b/erts/emulator/beam/erl_nif_trace.c
+@@ -0,0 +1,823 @@
++/*
++ * erl_nif_trace.c -- resource cycle collector (PROTOTYPE, not part of OTP).
++ *
++ * See erl_nif_trace.h for the contract a traced resource type honours. This
++ * file is #included at the end of erl_nif.c so it can see that file's static
++ * types (ErtsResource, enif_msg_environment_t) without widening any header.
++ *
++ * ── Why ERTS is the right place ─────────────────────────────────────────────
++ * Outside ERTS, a collector must (1) find the refcount (private field),
++ * (2) map a resource to its reference number (private field), (3) find the
++ * references a term holds (ETF-encode it: O(term size)), (4) guess resource
++ * boundaries. Inside ERTS all four are free:
++ *   refcount       bin->intern.refc                         (one load)
++ *   identity       the ErtsResource* itself                 (no key lookup)
++ *   held refs      the owned env's off-heap list: ERTS already links every
++ *                  magic ref and resource binary created in the env there;
++ *                  that list IS the set of counts the env holds     O(#refs)
++ *   boundaries     resource->type                           (no guessing)
++ *
++ * ── A round (trial deletion, concurrent) ────────────────────────────────────
++ *  1. SNAPSHOT  under rc_lock: pin every registered resource (refc++, unless
++ *               already 0 = dying: skip), copying the pointers into an array.
++ *  2. TRACE     for each node: e0 = epoch(obj); trace(obj) -> edges. Edges to
++ *               non-snapshot resources are ignored (they cannot close a cycle
++ *               through the snapshot). internal[t]++ per edge.
++ *  3. OUTSIDE   outside[n] = refc[n] - 1 (our pin) - internal[n]. > 0 = root.
++ *               A node whose trace was opaque is a root.
++ *  4. MARK      BFS from roots: reached = live. Unreached = candidate G.
++ *  5. VALIDATE  pass A: every g in G re-reads outside == 0.
++ *               pass B: every g in G has epoch(g) == e0[g].
++ *               Order matters (A then B), same argument as a concurrent
++ *               trial-deletion collector: any process that obtains a new
++ *               reference to a G member must first READ a G cell (all G's
++ *               holders are in G), and that first read needs a reference held
++ *               since before the trace, which pass A proves was dropped; so
++ *               the read happened before pass B inspected the cell and bumped
++ *               its epoch.
++ *  6. BREAK     clear(g) for each g; then unpin everything. The refcounts fall
++ *               to zero in ERTS's ordinary order and the ordinary destructors
++ *               run (as aux work, as always).
++ *
++ * The collector runs on its own unmanaged thread: it never occupies a
++ * scheduler and never blocks one. Holding a pin keeps a resource alive, so no
++ * trace/clear/epoch call can race its destructor.
++ *
++ * ── Observability ───────────────────────────────────────────────────────────
++ * Counters per type and global, the last round's shape, a dry-run graph
++ * snapshot with a "why alive" BFS tree, and a subscription that sends every
++ * round's summary to a process. Surfaced through erts_debug-free NIF entry
++ * points (enif_resource_cycles_*), so any NIF library -- and beam-lisp's
++ * `rc` host module -- can expose them without further ERTS changes.
++ */
++
++#include "erl_nif_trace.h"
++
++/* ---- per-type hooks ------------------------------------------------------- */
++
++typedef struct rc_type_ {
++    struct rc_type_ *next;
++    ErlNifResourceType *type;
++    ErlNifResourceCycleHooks hooks;
++    erts_atomic_t live;        /* registered objects of this type */
++    erts_atomic_t collected;   /* objects cleared by the collector */
++} RcType;
++
++/* ---- registry of traced resources (open addressing on the pointer) -------- */
++
++typedef struct {
++    ErtsResource **slot;       /* NULL = empty, RC_TOMB = deleted */
++    Uint size;                 /* power of two */
++    Uint used;                 /* live entries */
++    Uint tombs;
++} RcSet;
++
++#define RC_TOMB ((ErtsResource *) 1)
++
++static erts_mtx_t rc_lock;         /* registry + type list + subscriber */
++static erts_cnd_t rc_cnd;          /* wakes the collector thread */
++static erts_cnd_t rc_done_cnd;     /* wakes collect(wait) callers */
++static RcSet rc_set;
++static RcType *rc_types;
++static int rc_initialized;
++static int rc_thread_started;
++
++/* policy + stats (read without the lock: atomics) */
++static erts_atomic_t rc_since;         /* registrations since last round */
++static erts_atomic_t rc_threshold;     /* auto round when since >= threshold */
++static erts_atomic_t rc_rounds;
++static erts_atomic_t rc_collected;
++static erts_atomic_t rc_aborted;       /* candidates rejected by validation */
++static erts_atomic_t rc_requested;     /* latch: explicit request pending */
++static erts_atomic_t rc_last_nodes, rc_last_roots, rc_last_garbage,
++                     rc_last_usec, rc_last_opaque;
++
++static int rc_subscribed;
++static ErlNifPid rc_subscriber;
++
++#define RC_DEFAULT_THRESHOLD 1024
++
++static ERTS_INLINE Binary *rc_bin(ErtsResource *r)
++{
++    return &ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(r)->binary;
++}
++
++static ERTS_INLINE RcType *rc_type_of(ErtsResource *r)
++{
++    /* Hooks are kept in a side list rather than in ErlNifResourceType, whose
++     * init struct is part of the frozen NIF ABI. Few types: linear is fine.
++     * Resolved once, at track time, and cached in the resource header. */
++    RcType *t;
++    for (t = rc_types; t; t = t->next)
++        if (t->type == r->type)
++            return t;
++    return NULL;
++}
++
++static ERTS_INLINE Uint rc_hash(ErtsResource *r)
++{
++    UWord x = (UWord) r;
++    x ^= x >> 33; x *= (UWord) 0xff51afd7ed558ccdULL; x ^= x >> 33;
++    return (Uint) x;
++}
++
++static void rc_set_insert_raw(RcSet *s, ErtsResource *r)
++{
++    Uint mask = s->size - 1, i = rc_hash(r) & mask;
++    while (s->slot[i] && s->slot[i] != RC_TOMB)
++        i = (i + 1) & mask;
++    if (s->slot[i] == RC_TOMB)
++        s->tombs--;
++    s->slot[i] = r;
++    s->used++;
++}
++
++static void rc_set_grow(RcSet *s)
++{
++    RcSet n;
++    Uint i;
++    n.size = s->size ? s->size * 2 : 256;
++    while (n.size < 2 * (s->used + 1))
++        n.size *= 2;
++    n.used = n.tombs = 0;
++    n.slot = erts_alloc(ERTS_ALC_T_NIF, n.size * sizeof(ErtsResource *));
++    sys_memzero(n.slot, n.size * sizeof(ErtsResource *));
++    for (i = 0; i < s->size; i++)
++        if (s->slot[i] && s->slot[i] != RC_TOMB)
++            rc_set_insert_raw(&n, s->slot[i]);
++    if (s->slot)
++        erts_free(ERTS_ALC_T_NIF, s->slot);
++    *s = n;
++}
++
++static void rc_set_add(RcSet *s, ErtsResource *r)
++{
++    if (4 * (s->used + s->tombs + 1) > 3 * s->size)
++        rc_set_grow(s);
++    rc_set_insert_raw(s, r);
++}
++
++static void rc_set_del(RcSet *s, ErtsResource *r)
++{
++    Uint mask, i;
++    if (!s->size)
++        return;
++    mask = s->size - 1;
++    i = rc_hash(r) & mask;
++    while (s->slot[i]) {
++        if (s->slot[i] == r) {
++            s->slot[i] = RC_TOMB;
++            s->used--;
++            s->tombs++;
++            return;
++        }
++        i = (i + 1) & mask;
++    }
++}
++
++/* ---- hooks called from erl_nif.c ------------------------------------------ */
++
++static void rc_wake_collector(void);
++static void rc_ensure_thread(void);
++
++/* run_resource_dtor, before the user destructor: leave the registry.
++ * Idempotent (the monitor path can run the prologue twice). */
++static void rc_on_dtor(ErtsResource *r)
++{
++    if (!rc_initialized || !r->rc_tracked)
++        return;
++    erts_mtx_lock(&rc_lock);
++    if (r->rc_tracked) {
++        r->rc_tracked = 0;
++        rc_set_del(&rc_set, r);
++        erts_atomic_dec_nob(&((RcType *) r->rc_type)->live);
++    }
++    erts_mtx_unlock(&rc_lock);
++}
++
++/* Like CPython's PyObject_GC_Track: the object is fully constructed, the
++ * collector may now call its hooks. enif_alloc_resource returns raw memory,
++ * so registering at allocation would expose uninitialised state. */
++int enif_resource_cycles_track(void *obj)
++{
++    ErtsResource *r;
++    RcType *t;
++    if (!rc_initialized || !obj)
++        return 1;
++    r = DATA_TO_RESOURCE(obj);
++    erts_mtx_lock(&rc_lock);
++    t = rc_type_of(r);
++    if (t && !r->rc_tracked) {
++        r->rc_tracked = 1;
++        r->rc_type = t;
++        rc_set_add(&rc_set, r);
++        erts_atomic_inc_nob(&t->live);
++    }
++    erts_mtx_unlock(&rc_lock);
++    if (!t)
++        return 1;
++    if (erts_atomic_inc_read_nob(&rc_since)
++        >= erts_atomic_read_nob(&rc_threshold))
++        rc_wake_collector();
++    return 0;
++}
++
++/* ---- public: registration + trace-callback helpers ------------------------ */
++
++int enif_set_resource_cycle_hooks(ErlNifResourceType *type,
++                                  const ErlNifResourceCycleHooks *hooks)
++{
++    RcType *t;
++    if (!rc_initialized || !type || !hooks || !hooks->trace
++        || !hooks->clear || !hooks->epoch)
++        return 1;
++    erts_mtx_lock(&rc_lock);
++    for (t = rc_types; t; t = t->next)
++        if (t->type == type)
++            break;
++    if (!t) {
++        t = erts_alloc(ERTS_ALC_T_NIF, sizeof(RcType));
++        t->type = type;
++        erts_atomic_init_nob(&t->live, 0);
++        erts_atomic_init_nob(&t->collected, 0);
++        t->next = rc_types;
++        rc_types = t;
++    }
++    /* Takeover (module upgrade) replaces the hooks in place. */
++    t->hooks = *hooks;
++    erts_mtx_unlock(&rc_lock);
++    rc_ensure_thread();
++    return 0;
++}
++
++/* Edge sink handed to a trace callback. */
++struct enif_trace_ctx_t {
++    ErtsResource **to;     /* edges found by this trace */
++    Uint n, cap;
++    int opaque;
++};
++
++static void rc_ctx_push(ErlNifTraceCtx *ctx, ErtsResource *r)
++{
++    if (ctx->n == ctx->cap) {
++        Uint cap = ctx->cap ? 2 * ctx->cap : 16;
++        ErtsResource **to = erts_alloc(ERTS_ALC_T_NIF, cap * sizeof(*to));
++        if (ctx->to) {
++            sys_memcpy(to, ctx->to, ctx->n * sizeof(*to));
++            erts_free(ERTS_ALC_T_NIF, ctx->to);
++        }
++        ctx->to = to;
++        ctx->cap = cap;
++    }
++    ctx->to[ctx->n++] = r;
++}
++
++static ERTS_INLINE ErtsResource *rc_resource_of_bin(Binary *b)
++{
++    if (!(b->intern.flags & BIN_FLAG_MAGIC)
++        || ERTS_MAGIC_BIN_DESTRUCTOR(b) != NIF_RESOURCE_DTOR)
++        return NULL;
++    return (ErtsResource *) ERTS_MAGIC_BIN_UNALIGNED_DATA(b);
++}
++
++static void rc_trace_offheap(ErlNifTraceCtx *ctx, struct erl_off_heap_header *h)
++{
++    union erl_off_heap_ptr u;
++    for (u.hdr = h; u.hdr; u.hdr = u.hdr->next) {
++        ErtsResource *r = NULL;
++        switch (thing_subtag(u.hdr->thing_word)) {
++        case REF_SUBTAG:
++            r = rc_resource_of_bin((Binary *) u.mref->mb);
++            break;
++        case BIN_REF_SUBTAG:   /* enif_make_resource_binary */
++            r = rc_resource_of_bin(u.br->val);
++            break;
++        default:               /* external pids/ports/refs: no resource */
++            break;
++        }
++        if (r)
++            rc_ctx_push(ctx, r);
++    }
++}
++
++void enif_trace_env(ErlNifTraceCtx *ctx, ErlNifEnv *env)
++{
++    struct enif_msg_environment_t *menv = (struct enif_msg_environment_t *) env;
++    ErlHeapFragment *bp;
++    if (!ctx || !env)
++        return;
++    /* Process-independent env: every magic ref / resource binary it holds is
++     * linked on the phony process's off-heap list or on a heap fragment's. */
++    rc_trace_offheap(ctx, MSO(&menv->phony_proc).first);
++    for (bp = MBUF(&menv->phony_proc); bp; bp = bp->next)
++        rc_trace_offheap(ctx, bp->off_heap.first);
++}
++
++void enif_trace_resource(ErlNifTraceCtx *ctx, void *obj)
++{
++    if (ctx && obj)
++        rc_ctx_push(ctx, DATA_TO_RESOURCE(obj));
++}
++
++void enif_trace_opaque(ErlNifTraceCtx *ctx)
++{
++    if (ctx)
++        ctx->opaque = 1;
++}
++
++/* ---- the round ------------------------------------------------------------ */
++
++typedef struct {
++    ErtsResource *r;
++    RcType *t;
++    Uint64 epoch;
++    Sint internal;
++    Sint outside;
++    Uint edge_start, edge_n;   /* into edges[] */
++    int opaque;
++    int live;
++    Sint parent;               /* BFS tree; -1 for roots/garbage */
++} RcNode;
++
++typedef struct {
++    RcNode *nodes;
++    Uint n;
++    Uint *edges;               /* target node indices */
++    Uint n_edges;
++    Uint roots, garbage, opaque;
++} RcRound;
++
++/* index lookup: a small open-address map resource -> node index */
++typedef struct { ErtsResource **k; Uint *v; Uint size; } RcIndex;
++
++static void rc_index_init(RcIndex *ix, Uint n)
++{
++    Uint size = 16;
++    while (size < 2 * n + 1) size *= 2;
++    ix->size = size;
++    ix->k = erts_alloc(ERTS_ALC_T_NIF, size * sizeof(*ix->k));
++    ix->v = erts_alloc(ERTS_ALC_T_NIF, size * sizeof(*ix->v));
++    sys_memzero(ix->k, size * sizeof(*ix->k));
++}
++
++static void rc_index_put(RcIndex *ix, ErtsResource *r, Uint v)
++{
++    Uint m = ix->size - 1, i = rc_hash(r) & m;
++    while (ix->k[i]) i = (i + 1) & m;
++    ix->k[i] = r; ix->v[i] = v;
++}
++
++static Sint rc_index_get(RcIndex *ix, ErtsResource *r)
++{
++    Uint m = ix->size - 1, i = rc_hash(r) & m;
++    while (ix->k[i]) {
++        if (ix->k[i] == r) return (Sint) ix->v[i];
++        i = (i + 1) & m;
++    }
++    return -1;
++}
++
++static void rc_index_free(RcIndex *ix)
++{
++    erts_free(ERTS_ALC_T_NIF, ix->k);
++    erts_free(ERTS_ALC_T_NIF, ix->v);
++}
++
++/* A NIF env for callbacks that runs without a process. */
++static void rc_callback_env(struct enif_msg_environment_t *menv, ErtsResource *r)
++{
++    pre_nif_noproc(menv, r->type->owner, NULL);
++}
++
++/* Steps 1-4. Pins every node; the caller must rc_round_release(). */
++static void rc_round_build(RcRound *rd)
++{
++    Uint i, j, n = 0;
++    RcIndex ix;
++
++    /* 1. snapshot + pin */
++    erts_mtx_lock(&rc_lock);
++    rd->nodes = erts_alloc(ERTS_ALC_T_NIF,
++                           (rc_set.used + 1) * sizeof(RcNode));
++    for (i = 0; i < rc_set.size; i++) {
++        ErtsResource *r = rc_set.slot[i];
++        if (!r || r == RC_TOMB)
++            continue;
++        /* refc 0 = dying (dtor scheduled): never resurrect it. */
++        if (erts_refc_inc_unless(&rc_bin(r)->intern.refc, 0, 0) == 0)
++            continue;
++        rd->nodes[n].r = r;
++        rd->nodes[n].t = (RcType *) r->rc_type;
++        n++;
++    }
++    erts_mtx_unlock(&rc_lock);
++    rd->n = n;
++    rd->edges = NULL;
++    rd->n_edges = 0;
++    rd->roots = rd->garbage = rd->opaque = 0;
++
++    rc_index_init(&ix, n);
++    for (i = 0; i < n; i++)
++        rc_index_put(&ix, rd->nodes[i].r, i);
++
++    /* 2. trace */
++    {
++        Uint cap = 0;
++        for (i = 0; i < n; i++) {
++            RcNode *nd = &rd->nodes[i];
++            struct enif_msg_environment_t menv;
++            ErlNifTraceCtx ctx = {NULL, 0, 0, 0};
++            nd->internal = 0;
++            nd->parent = -1;
++            nd->live = 0;
++            rc_callback_env(&menv, nd->r);
++            nd->epoch = nd->t->hooks.epoch(nd->r->data);
++            nd->t->hooks.trace(&menv.env, nd->r->data, &ctx);
++            post_nif_noproc(&menv);
++            nd->opaque = ctx.opaque;
++            nd->edge_start = rd->n_edges;
++            for (j = 0; j < ctx.n; j++) {
++                Sint to = rc_index_get(&ix, ctx.to[j]);
++                if (to < 0)
++                    continue;           /* not traced: cannot close a cycle */
++                if (rd->n_edges == cap) {
++                    Uint ncap = cap ? 2 * cap : 64;
++                    Uint *e = erts_alloc(ERTS_ALC_T_NIF, ncap * sizeof(Uint));
++                    if (rd->edges) {
++                        sys_memcpy(e, rd->edges, rd->n_edges * sizeof(Uint));
++                        erts_free(ERTS_ALC_T_NIF, rd->edges);
++                    }
++                    rd->edges = e;
++                    cap = ncap;
++                }
++                rd->edges[rd->n_edges++] = (Uint) to;
++            }
++            nd->edge_n = rd->n_edges - nd->edge_start;
++            if (ctx.to)
++                erts_free(ERTS_ALC_T_NIF, ctx.to);
++        }
++        for (i = 0; i < rd->n_edges; i++)
++            rd->nodes[rd->edges[i]].internal++;
++    }
++    rc_index_free(&ix);
++
++    /* 3. outside counts, 4. mark from roots (BFS; parent = why alive) */
++    {
++        Uint *queue = erts_alloc(ERTS_ALC_T_NIF, (n + 1) * sizeof(Uint));
++        Uint head = 0, tail = 0;
++        for (i = 0; i < n; i++) {
++            RcNode *nd = &rd->nodes[i];
++            Sint refc = (Sint) erts_refc_read(&rc_bin(nd->r)->intern.refc, 1);
++            nd->outside = refc - 1 - nd->internal;
++            if (nd->outside > 0 || nd->opaque) {
++                nd->live = 1;
++                queue[tail++] = i;
++                rd->roots++;
++                rd->opaque += nd->opaque;
++            }
++        }
++        while (head < tail) {
++            RcNode *nd = &rd->nodes[queue[head]];
++            Uint self = queue[head++];
++            for (j = 0; j < nd->edge_n; j++) {
++                Uint to = rd->edges[nd->edge_start + j];
++                if (!rd->nodes[to].live) {
++                    rd->nodes[to].live = 1;
++                    rd->nodes[to].parent = (Sint) self;
++                    queue[tail++] = to;
++                }
++            }
++        }
++        erts_free(ERTS_ALC_T_NIF, queue);
++        rd->garbage = n - tail;
++    }
++}
++
++static void rc_round_release(RcRound *rd)
++{
++    Uint i;
++    for (i = 0; i < rd->n; i++)
++        erts_bin_release(rc_bin(rd->nodes[i].r));   /* unpin; may free */
++    erts_free(ERTS_ALC_T_NIF, rd->nodes);
++    if (rd->edges)
++        erts_free(ERTS_ALC_T_NIF, rd->edges);
++}
++
++/* Steps 5-6 on a built round. Returns the number of objects cleared. */
++static Uint rc_round_collect(RcRound *rd)
++{
++    Uint i, cleared = 0, rejected = 0;
++    if (!rd->garbage)
++        return 0;
++    /* 5A. outside counts still zero (recomputed from a fresh refc read;
++     *     the internal count cannot have grown: G's holders are G). */
++    for (i = 0; i < rd->n; i++) {
++        RcNode *nd = &rd->nodes[i];
++        if (nd->live)
++            continue;
++        if ((Sint) erts_refc_read(&rc_bin(nd->r)->intern.refc, 1)
++            - 1 - nd->internal != 0)
++            goto reject;
++    }
++    /* 5B. nobody looked (epoch unchanged) -- after 5A, never before. */
++    for (i = 0; i < rd->n; i++) {
++        RcNode *nd = &rd->nodes[i];
++        if (!nd->live && nd->t->hooks.epoch(nd->r->data) != nd->epoch)
++            goto reject;
++    }
++    /* 6. break */
++    for (i = 0; i < rd->n; i++) {
++        RcNode *nd = &rd->nodes[i];
++        struct enif_msg_environment_t menv;
++        if (nd->live)
++            continue;
++        rc_callback_env(&menv, nd->r);
++        nd->t->hooks.clear(&menv.env, nd->r->data);
++        post_nif_noproc(&menv);
++        erts_atomic_inc_nob(&nd->t->collected);
++        cleared++;
++    }
++    return cleared;
++reject:
++    /* Conservative: a racing reader or writer touched the candidate set.
++     * Nothing is cleared; the next round retries. */
++    for (i = 0; i < rd->n; i++)
++        rejected += !rd->nodes[i].live;
++    erts_atomic_add_nob(&rc_aborted, (erts_aint_t) rejected);
++    return 0;
++}
++
++/* ---- round summary term (for info/subscription) --------------------------- */
++
++static Eterm rc_bld_map(ErlNifEnv *env, int n, const char **keys, Eterm *vals)
++{
++    ERL_NIF_TERM m = enif_make_new_map(env);
++    int i;
++    for (i = 0; i < n; i++)
++        enif_make_map_put(env, m, enif_make_atom(env, keys[i]), vals[i], &m);
++    return m;
++}
++
++static Eterm rc_last_round_term(ErlNifEnv *env)
++{
++    const char *k[] = {"round", "nodes", "roots", "garbage", "opaque", "usec"};
++    Eterm v[6];
++    v[0] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_rounds));
++    v[1] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_last_nodes));
++    v[2] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_last_roots));
++    v[3] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_last_garbage));
++    v[4] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_last_opaque));
++    v[5] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_last_usec));
++    return rc_bld_map(env, 6, k, v);
++}
++
++static void rc_notify_subscriber(void)
++{
++    ErlNifPid to;
++    int have;
++    erts_mtx_lock(&rc_lock);
++    have = rc_subscribed;
++    to = rc_subscriber;
++    erts_mtx_unlock(&rc_lock);
++    if (have) {
++        ErlNifEnv *env = enif_alloc_env();
++        Eterm msg = enif_make_tuple2(env, enif_make_atom(env, "resource_cycles"),
++                                     rc_last_round_term(env));
++        enif_send(NULL, &to, env, msg);   /* unmanaged thread: env NULL */
++        enif_free_env(env);
++    }
++}
++
++/* ---- the collector thread ------------------------------------------------- */
++
++static erts_tid_t rc_tid;
++
++static void rc_wake_collector(void)
++{
++    erts_mtx_lock(&rc_lock);
++    erts_cnd_signal(&rc_cnd);
++    erts_mtx_unlock(&rc_lock);
++}
++
++static void rc_run_round(void)
++{
++    RcRound rd;
++    Uint cleared;
++    ErtsMonotonicTime t0 = erts_get_monotonic_time(NULL), t1;
++
++    erts_atomic_set_nob(&rc_since, 0);
++    rc_round_build(&rd);
++    cleared = rc_round_collect(&rd);
++    t1 = erts_get_monotonic_time(NULL);
++
++    erts_atomic_set_nob(&rc_last_nodes, (erts_aint_t) rd.n);
++    erts_atomic_set_nob(&rc_last_roots, (erts_aint_t) rd.roots);
++    erts_atomic_set_nob(&rc_last_garbage, (erts_aint_t) rd.garbage);
++    erts_atomic_set_nob(&rc_last_opaque, (erts_aint_t) rd.opaque);
++    erts_atomic_set_nob(&rc_last_usec,
++                        (erts_aint_t) ERTS_MONOTONIC_TO_USEC(t1 - t0));
++    erts_atomic_add_nob(&rc_collected, (erts_aint_t) cleared);
++
++    rc_round_release(&rd);   /* unpin AFTER clear: destructors run now */
++
++    /* Adaptive threshold: a round costs O(live); run it again only after
++     * as many new objects as survived (amortised O(1) per allocation). */
++    {
++        erts_aint_t live = (erts_aint_t) (rd.n - cleared);
++        erts_atomic_set_nob(&rc_threshold,
++                            live > RC_DEFAULT_THRESHOLD ? live
++                                                        : RC_DEFAULT_THRESHOLD);
++    }
++
++    erts_mtx_lock(&rc_lock);
++    erts_atomic_inc_nob(&rc_rounds);
++    erts_cnd_broadcast(&rc_done_cnd);
++    erts_mtx_unlock(&rc_lock);
++
++    rc_notify_subscriber();
++}
++
++static void *rc_thread_main(void *unused)
++{
++    (void) unused;
++    for (;;) {
++        erts_mtx_lock(&rc_lock);
++        while (!erts_atomic_read_nob(&rc_requested)
++               && erts_atomic_read_nob(&rc_since)
++                  < erts_atomic_read_nob(&rc_threshold))
++            erts_cnd_wait(&rc_cnd, &rc_lock);
++        erts_atomic_set_nob(&rc_requested, 0);
++        erts_mtx_unlock(&rc_lock);
++        rc_run_round();
++    }
++    return NULL;
++}
++
++static void rc_ensure_thread(void)
++{
++    /* Started lazily, from the first set_resource_cycle_hooks, so a node that
++     * never traces pays nothing. */
++    int start;
++    erts_mtx_lock(&rc_lock);
++    start = !rc_thread_started;
++    rc_thread_started = 1;
++    erts_mtx_unlock(&rc_lock);
++    if (start) {
++        erts_thr_opts_t opts = ERTS_THR_OPTS_DEFAULT_INITER;
++        opts.detached = 1;
++        opts.name = "resource_cycles";
++        erts_thr_create(&rc_tid, rc_thread_main, NULL, &opts);
++    }
++}
++
++/* ---- public: observability ------------------------------------------------ */
++
++ERL_NIF_TERM enif_resource_cycles_info(ErlNifEnv *env)
++{
++    const char *k[] = {"enabled", "rounds", "collected", "aborted",
++                       "threshold", "since", "live", "last", "types"};
++    Eterm v[9];
++    ERL_NIF_TERM types = enif_make_list(env, 0);
++    RcType *t;
++    Uint live;
++
++    erts_mtx_lock(&rc_lock);
++    live = rc_set.used;
++    for (t = rc_types; t; t = t->next) {
++        const char *tk[] = {"module", "name", "live", "collected"};
++        Eterm tv[4];
++        tv[0] = t->type->module;
++        tv[1] = t->type->name;
++        tv[2] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&t->live));
++        tv[3] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&t->collected));
++        types = enif_make_list_cell(env, rc_bld_map(env, 4, tk, tv), types);
++    }
++    erts_mtx_unlock(&rc_lock);
++
++    v[0] = rc_thread_started ? am_true : am_false;
++    v[1] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_rounds));
++    v[2] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_collected));
++    v[3] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_aborted));
++    v[4] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_threshold));
++    v[5] = enif_make_uint64(env, (ErlNifUInt64) erts_atomic_read_nob(&rc_since));
++    v[6] = enif_make_uint64(env, (ErlNifUInt64) live);
++    v[7] = rc_last_round_term(env);
++    v[8] = types;
++    return rc_bld_map(env, 9, k, v);
++}
++
++ERL_NIF_TERM enif_resource_cycles_graph(ErlNifEnv *env)
++{
++    RcRound rd;
++    Uint i, j;
++    ERL_NIF_TERM nodes = enif_make_list(env, 0), edges = enif_make_list(env, 0),
++                 parents = enif_make_list(env, 0);
++    const char *nk[] = {"resource", "type", "refc", "internal", "outside",
++                        "epoch", "verdict"};
++    const char *gk[] = {"nodes", "edges", "parent"};
++    Eterm gv[3];
++
++    rc_round_build(&rd);   /* dry: never collected */
++    for (i = rd.n; i-- > 0;) {
++        RcNode *nd = &rd.nodes[i];
++        Eterm v[7];
++        v[0] = enif_make_resource(env, nd->r->data);
++        v[1] = enif_make_tuple2(env, nd->r->type->module, nd->r->type->name);
++        v[2] = enif_make_int64(env, (ErlNifSInt64)
++                   erts_refc_read(&rc_bin(nd->r)->intern.refc, 1) - 1);
++        v[3] = enif_make_int64(env, (ErlNifSInt64) nd->internal);
++        v[4] = enif_make_int64(env, (ErlNifSInt64) nd->outside);
++        v[5] = enif_make_uint64(env, (ErlNifUInt64) nd->epoch);
++        v[6] = enif_make_atom(env, !nd->live ? "garbage"
++                                  : nd->parent < 0 ? "root" : "live");
++        nodes = enif_make_list_cell(env, rc_bld_map(env, 7, nk, v), nodes);
++        parents = enif_make_list_cell(env, enif_make_int64(env, nd->parent),
++                                      parents);
++        for (j = nd->edge_n; j-- > 0;)
++            edges = enif_make_list_cell(
++                env, enif_make_tuple2(env, enif_make_uint64(env, i),
++                                      enif_make_uint64(env,
++                                          rd.edges[nd->edge_start + j])),
++                edges);
++    }
++    rc_round_release(&rd);
++    gv[0] = nodes; gv[1] = edges; gv[2] = parents;
++    return rc_bld_map(env, 3, gk, gv);
++}
++
++unsigned long enif_resource_cycles_collect(ErlNifEnv *env, int wait)
++{
++    erts_aint_t target;
++    (void) env;
++    if (!rc_thread_started)
++        return 0;
++    erts_mtx_lock(&rc_lock);
++    /* A round already running may have snapshotted before the caller's last
++     * drop; wait for the one AFTER it. */
++    target = erts_atomic_read_nob(&rc_rounds) + 2;
++    erts_atomic_set_nob(&rc_requested, 1);
++    erts_cnd_signal(&rc_cnd);
++    if (wait) {
++        while (erts_atomic_read_nob(&rc_rounds) < target) {
++            erts_atomic_set_nob(&rc_requested, 1);
++            erts_cnd_signal(&rc_cnd);
++            erts_cnd_wait(&rc_done_cnd, &rc_lock);
++        }
++    }
++    erts_mtx_unlock(&rc_lock);
++    return (unsigned long) erts_atomic_read_nob(&rc_rounds);
++}
++
++int enif_resource_cycles_subscribe(ErlNifEnv *env, const ErlNifPid *pid)
++{
++    (void) env;
++    erts_mtx_lock(&rc_lock);
++    rc_subscribed = pid != NULL;
++    if (pid)
++        rc_subscriber = *pid;
++    erts_mtx_unlock(&rc_lock);
++    return 0;
++}
++
++/* ---- init ----------------------------------------------------------------- */
++
++static void erts_nif_rcycles_init(void)
++{
++    erts_mtx_init(&rc_lock, "resource_cycles", NIL,
++                  ERTS_LOCK_FLAGS_PROPERTY_STATIC
++                  | ERTS_LOCK_FLAGS_CATEGORY_GENERIC);
++    erts_cnd_init(&rc_cnd);
++    erts_cnd_init(&rc_done_cnd);
++    rc_set.slot = NULL;
++    rc_set.size = rc_set.used = rc_set.tombs = 0;
++    rc_types = NULL;
++    erts_atomic_init_nob(&rc_since, 0);
++    erts_atomic_init_nob(&rc_threshold, RC_DEFAULT_THRESHOLD);
++    erts_atomic_init_nob(&rc_rounds, 0);
++    erts_atomic_init_nob(&rc_collected, 0);
++    erts_atomic_init_nob(&rc_aborted, 0);
++    erts_atomic_init_nob(&rc_requested, 0);
++    erts_atomic_init_nob(&rc_last_nodes, 0);
++    erts_atomic_init_nob(&rc_last_roots, 0);
++    erts_atomic_init_nob(&rc_last_garbage, 0);
++    erts_atomic_init_nob(&rc_last_usec, 0);
++    erts_atomic_init_nob(&rc_last_opaque, 0);
++    rc_subscribed = 0;
++    rc_thread_started = 0;
++    rc_initialized = 1;
++}
++
++ERL_NIF_TERM erts_resource_cycles_info_term(Process *c_p);
++
++/* erlang:system_info(resource_cycles): the same map, built in a scratch env
++ * and copied onto the caller's heap. No NIF needed to observe the collector. */
++ERL_NIF_TERM erts_resource_cycles_info_term(Process *c_p)
++{
++    ErlNifEnv *env = enif_alloc_env();
++    Eterm t = enif_resource_cycles_info(env);
++    Uint sz = size_object(t);
++    Eterm *hp = HAlloc(c_p, sz);
++    Eterm res = copy_struct(t, sz, &hp, &MSO(c_p));
++    enif_free_env(env);
++    return res;
++}
+diff --git a/erts/emulator/beam/erl_nif_trace.h b/erts/emulator/beam/erl_nif_trace.h
+new file mode 100644
+index 0000000..cce5b72
+--- /dev/null
++++ b/erts/emulator/beam/erl_nif_trace.h
+@@ -0,0 +1,115 @@
++/*
++ * erl_nif_trace.h -- resource cycle collection for NIF resources (PROTOTYPE).
++ *
++ * Not part of OTP. A proposal carried by beam-lisp's research tree
++ * (research/erts-internals/). Mirrors CPython's tp_traverse / tp_clear.
++ *
++ * WHY. ERTS reference counts NIF resources. A resource that stores terms
++ * (an atom cell, a memo cell, a lazy node) can hold a reference to itself,
++ * directly or through other resources. Such a cycle never reaches refcount
++ * zero, and the per-process garbage collector can never see it: a garbage
++ * cycle is, by definition, referenced from NO process heap.
++ *
++ * HOW. A resource type registers three hooks. ERTS keeps a registry of every
++ * live resource of a traced type, counts how many references each one
++ * receives from OTHER traced resources ("internal"), and treats
++ * refcount - internal > 0 as a root. Everything a root reaches is live; the
++ * rest is a garbage cycle, which ERTS breaks by calling `clear` on each member.
++ * Mutators are never stopped; `epoch` makes the concurrent round sound.
++ *
++ * THE CONTRACT a traced type must honour:
++ *   trace(env, obj, ctx)  report EVERY count obj holds on a resource:
++ *                         enif_trace_env()      for each process-independent
++ *                                               env it owns (enif_alloc_env).
++ *                                               ERTS reads the env's off-heap
++ *                                               list -- exactly the counts the
++ *                                               env holds, found wherever they
++ *                                               sit (tuples, maps, fun
++ *                                               closures, resource binaries,
++ *                                               garbage terms still in the env)
++ *                                               at O(#refs), not O(term size).
++ *                         enif_trace_resource() for each counted native handle
++ *                                               (enif_keep_resource'd pointer).
++ *                         enif_trace_opaque()   when it cannot enumerate: the
++ *                                               object then counts as a root.
++ *                         Hold the object's own lock while tracing.
++ *   clear(env, obj)       drop every reference reported by trace. Called only
++ *                         on members of a validated garbage cycle. The object
++ *                         is later destroyed by its ordinary destructor.
++ *   epoch(obj)            a counter the object bumps on EVERY mutation and on
++ *                         EVERY read that hands a held term to a caller. Must
++ *                         be lock-free. Unchanged epoch == "nobody looked".
++ *
++ * Every function below is exported by a patched beam.smp only. A NIF that
++ * wants to run on stock ERTS as well resolves them with dlsym(RTLD_DEFAULT,
++ * ...) and degrades when they are absent.
++ */
++#ifndef ERL_NIF_TRACE_H__
++#define ERL_NIF_TRACE_H__
++
++#include "erl_nif.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define ERL_NIF_RCYCLES_VSN 1
++
++typedef struct enif_trace_ctx_t ErlNifTraceCtx;
++
++typedef void ErlNifResourceTrace(ErlNifEnv* env, void* obj, ErlNifTraceCtx* ctx);
++typedef void ErlNifResourceClear(ErlNifEnv* env, void* obj);
++typedef unsigned long long ErlNifResourceEpoch(void* obj);
++
++typedef struct {
++    ErlNifResourceTrace* trace;
++    ErlNifResourceClear* clear;
++    ErlNifResourceEpoch* epoch;
++} ErlNifResourceCycleHooks;
++
++/* Register hooks for a resource type. Call from the load/upgrade callback,
++ * right after opening the type. Returns 0 on success. */
++typedef int  ErlNifSetResourceCycleHooksFn(ErlNifResourceType* type,
++                                           const ErlNifResourceCycleHooks* hooks);
++/* Enter a fully constructed object into the collector's registry (like
++ * PyObject_GC_Track). Returns 0 if its type has hooks. */
++typedef int  ErlNifResourceCyclesTrackFn(void* obj);
++/* Inside a trace callback. */
++typedef void ErlNifTraceEnvFn(ErlNifTraceCtx* ctx, ErlNifEnv* owned_env);
++typedef void ErlNifTraceResourceFn(ErlNifTraceCtx* ctx, void* obj);
++typedef void ErlNifTraceOpaqueFn(ErlNifTraceCtx* ctx);
++
++/* ---- observability ------------------------------------------------------ */
++
++/* #{enabled, rounds, collected, aborted, pending, threshold, live, last,
++ *   types => [#{module, name, live, collected}]} */
++typedef ERL_NIF_TERM ErlNifResourceCyclesInfoFn(ErlNifEnv* env);
++/* A dry round (nothing is collected), as a snapshot:
++ * #{nodes => [#{resource, type => {Module, Name}, refc, internal, outside,
++ *               epoch, verdict => root | live | garbage}],
++ *   edges => [{FromIx, ToIx}],   (0-based indices into nodes)
++ *   parent => [ParentIx | -1]}   (BFS tree from the roots: why it is alive) */
++typedef ERL_NIF_TERM ErlNifResourceCyclesGraphFn(ErlNifEnv* env);
++/* Request a round. wait != 0: block until a round that started after the
++ * request has finished (call from a dirty NIF). Returns that round's number. */
++typedef unsigned long ErlNifResourceCyclesCollectFn(ErlNifEnv* env, int wait);
++/* After every round send {resource_cycles, RoundMap} to pid (NULL: stop). */
++typedef int ErlNifResourceCyclesSubscribeFn(ErlNifEnv* env, const ErlNifPid* pid);
++
++#ifdef ERL_NIF_TRACE_DECLARE_EXPORTS
++ERL_NAPI_EXPORT extern ErlNifSetResourceCycleHooksFn enif_set_resource_cycle_hooks;
++ERL_NAPI_EXPORT extern ErlNifResourceCyclesTrackFn   enif_resource_cycles_track;
++ERL_NAPI_EXPORT extern ErlNifTraceEnvFn              enif_trace_env;
++ERL_NAPI_EXPORT extern ErlNifTraceResourceFn         enif_trace_resource;
++ERL_NAPI_EXPORT extern ErlNifTraceOpaqueFn           enif_trace_opaque;
++ERL_NAPI_EXPORT extern ErlNifResourceCyclesInfoFn    enif_resource_cycles_info;
++ERL_NAPI_EXPORT extern ErlNifResourceCyclesGraphFn   enif_resource_cycles_graph;
++ERL_NAPI_EXPORT extern ErlNifResourceCyclesCollectFn enif_resource_cycles_collect;
++ERL_NAPI_EXPORT extern ErlNifResourceCyclesSubscribeFn enif_resource_cycles_subscribe;
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ERL_NIF_TRACE_H__ */
+diff --git a/erts/emulator/beam/global.h b/erts/emulator/beam/global.h
+index f918cbf..98c1701 100644
+--- a/erts/emulator/beam/global.h
++++ b/erts/emulator/beam/global.h
+@@ -95,6 +95,8 @@ typedef struct ErtsResource_
+ {
+     struct enif_resource_type_t* type;
+     ErtsResourceMonitors* monitors;
++    void* rc_type;      /* resource cycles: RcType* once tracked, else NULL */
++    UWord rc_tracked;   /* resource cycles: in the collector's registry */
+ #ifdef DEBUG
+     erts_refc_t nif_refc;
+ #else
+-- 
+2.55.0
+
