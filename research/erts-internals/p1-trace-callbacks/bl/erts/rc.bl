@@ -1,0 +1,252 @@
+; erts/rc.bl — the ERTS resource-cycle collector, from beam-lisp.
+;
+; A patched emulator (research/erts-internals/otp/patches/0001) collects
+; garbage cycles among NIF resources whose type registered trace hooks. This
+; namespace is how a beam-lisp program sees and steers that collector. It
+; needs NO NIF: everything goes through two emulator entry points,
+;
+;   (erlang/system_info :resource_cycles)             -> counters map
+;   (erlang/system_flag :resource_cycles (tuple …))   -> control / requests
+;
+; and a stock emulator answers both with badarg, which `available?` turns
+; into `false` (every other fn then returns :unavailable, never throws).
+;
+; ── Shapes ───────────────────────────────────────────────────────────────
+;   info   {:enabled :auto :rounds :full_rounds :collected :aborted
+;           :overflows :candidates :scanned :live :pending :threshold
+;           :interval_ms :budget :shards :last round :types [type …]}
+;   round  {:round :kind (:partial|:full) :candidates :nodes :roots :garbage
+;           :collected :aborted :opaque :overflow :usec}
+;   type   {:module :name :live :collected}
+;   graph  {:nodes [node …] :edges [[from to] …] :parent [ix|-1 …]}
+;   node   {:resource :address :type [module name] :refc :internal :outside
+;           :epoch :verdict (:root|:live|:garbage) :traced}
+;
+; ── Reading a graph ──────────────────────────────────────────────────────
+;   refc      counts held on the resource (the collector's own pin removed)
+;   internal  of those, held by OTHER traced resources in the graph
+;   outside   refc - internal: held by a process heap, ETS, a message, a
+;             native handle, … — anything > 0 makes the node a :root
+;   verdict   :root (held from outside) · :live (reachable from a root) ·
+;             :garbage (a cycle the next round frees)
+;   parent    the BFS tree from the roots: `why` walks it
+
+(ns erts.rc)
+
+;; ── capability ────────────────────────────────────────────────────────────
+
+(defn available?
+  "True when this emulator carries the resource-cycle collector."
+  []
+  (try (map? (erlang/system_info :resource_cycles))
+       (catch _e false)))
+
+(defn- flag! [op]
+  (erlang/system_flag :resource_cycles op))
+
+(defn- await-reply
+  "Wait for the collector's answer to request `ref` (tag :collected or
+   :graph). Rounds run off-scheduler; a full round over a large live set can
+   take a while, so the default wait is generous."
+  [ref tag timeout-ms]
+  (receive
+    [:resource_cycles r t v] :when (and (= r ref) (= t tag)) v
+    (after timeout-ms {:error :timeout :waited-ms timeout-ms})))
+
+(defmacro ^:private guarded [& body]
+  `(if (available?) (do ~@body) :unavailable))
+
+;; ── observe ───────────────────────────────────────────────────────────────
+
+(defn info
+  "The collector's counters, policy, last round and per-type census."
+  []
+  (guarded (erlang/system_info :resource_cycles)))
+
+(defn stats
+  "One flat map for dashboards and `bl doc` cells: the counters without the
+   per-type list, plus the last round's shape under :last-*."
+  []
+  (guarded
+    (let [i (info)
+          l (:last i)]
+      (merge (dissoc i :types :last)
+             {:last-kind (:kind l) :last-nodes (:nodes l)
+              :last-garbage (:garbage l) :last-collected (:collected l)
+              :last-usec (:usec l) :last-overflow (:overflow l)}))))
+
+(defn types
+  "Per traced resource type: {:module :name :live :collected}."
+  []
+  (guarded (vec (:types (info)))))
+
+;; ── act ───────────────────────────────────────────────────────────────────
+
+(defn collect!
+  "Run a round that starts after this call and wait for it; returns the
+   round map. `:full` examines every traced object instead of the recorded
+   candidates (use after bulk drops, or to measure)."
+  ([] (collect! :partial))
+  ([kind]
+   (guarded
+     (let [op (if (= kind :full)
+                (tuple :collect (erlang/self) :full)
+                (tuple :collect (erlang/self)))]
+       (await-reply (flag! op) :collected 60000)))))
+
+(defn set!
+  "Change one policy knob; returns the previous value.
+     :auto       true|false  automatic rounds
+     :threshold  candidates on one scheduler that cut the batching short
+     :interval   ms the collector batches candidates before a round
+     :budget     nodes a partial round may examine before it overflows"
+  [k v]
+  (guarded (flag! (tuple k v))))
+
+(defmacro with-policy
+  "Evaluate `body` with policy knobs temporarily set, e.g.
+   (with-policy {:auto false} …). Restores the old values on every exit."
+  [policy & body]
+  `(let [p# ~policy
+         old# (into {} (map (fn [[k# v#]] [k# (set! k# v#)]) p#))]
+     (try (do ~@body)
+          (finally (doseq [[k# v#] old#] (set! k# v#))))))
+
+;; ── the graph: what the collector would decide right now ─────────────────
+
+(defn graph
+  "A dry full round (nothing is cleared) as data. See the header for shapes."
+  []
+  (guarded
+    (let [g (await-reply (flag! (tuple :graph (erlang/self))) :graph 60000)]
+      (if (:error g)
+        g
+        {:nodes (vec (:nodes g))
+         :edges (vec (map tuple->vec (:edges g)))
+         :parent (vec (:parent g))}))))
+
+(defn- node-view [n]
+  (-> (select-keys n [:verdict :refc :internal :outside :traced])
+      (assoc :type (tuple->vec (:type n)))))
+
+(defn- index-of [nodes resource]
+  (first (keep-indexed (fn [i n] (when (= (:resource n) resource) i)) nodes)))
+
+(defn why
+  "Why is `resource` still alive? Walks the collector's own BFS tree from
+   the root that reaches it:
+     {:alive [root-step … resource-step]}  — the first step is held from
+                                             outside (:outside > 0)
+     {:garbage step}                       — the next round frees it
+     :not-traced                           — not a tracked resource
+   Each step is {:verdict :type :refc :internal :outside :traced}."
+  ([resource] (why resource (graph)))
+  ([resource g]
+   (guarded
+     (let [nodes (:nodes g)
+           parents (:parent g)]
+       (if-let [ix (index-of nodes resource)]
+         (if (= :garbage (:verdict (nth nodes ix)))
+           {:garbage (node-view (nth nodes ix))}
+           (loop [i ix acc ()]
+             (let [p (nth parents i)
+                   acc (cons (node-view (nth nodes i)) acc)]
+               (if (neg? p) {:alive (vec acc)} (recur p acc)))))
+         :not-traced)))))
+
+(defn garbage
+  "Resources the next round would free, right now."
+  ([] (garbage (graph)))
+  ([g] (guarded (vec (map :resource (filter #(= :garbage (:verdict %))
+                                            (:nodes g)))))))
+
+(defn summary
+  "Verdict counts per traced type: {[module name] {:root n :live n :garbage n}}."
+  ([] (summary (graph)))
+  ([g]
+   (guarded
+     (reduce (fn [acc n]
+               (update-in acc [(tuple->vec (:type n)) (:verdict n)]
+                          (fnil inc 0)))
+             {} (:nodes g)))))
+
+(def ^:private colours
+  {:root "palegreen" :live "lightgrey" :garbage "salmon"})
+
+(defn dot
+  "The graph as Graphviz source: roots green, live grey, garbage red; each
+   edge is a held reference. Write it with (File/write! path (dot))."
+  ([] (dot (graph)))
+  ([g]
+   (guarded
+     (str "digraph resource_cycles {\n"
+          (join (map-indexed
+                  (fn [i n]
+                    (str "  n" i " [label=\"" (name (second (tuple->vec (:type n))))
+                         "\\nrefc=" (:refc n) " in=" (:internal n)
+                         " out=" (:outside n) "\" style=filled fillcolor="
+                         (get colours (:verdict n)) "];\n"))
+                  (:nodes g)))
+          (join (map (fn [[f t]] (str "  n" f " -> n" t ";\n")) (:edges g)))
+          "}\n"))))
+
+;; ── watch ─────────────────────────────────────────────────────────────────
+
+(defn subscribe!
+  "After every round the calling process receives
+   [:resource_cycles :round round-map]."
+  []
+  (guarded (flag! (tuple :subscribe (erlang/self)))))
+
+(defn unsubscribe! []
+  (guarded (flag! (tuple :unsubscribe (erlang/self)))))
+
+(defn watch
+  "Collect every round that completes within `ms` milliseconds; returns
+   the round maps, oldest first. (Subscribes the caller for the duration.)"
+  [ms]
+  (guarded
+    (subscribe!)
+    (let [deadline (+ (erlang/monotonic_time :millisecond) ms)
+          rounds (loop [acc []]
+                   (let [left (max 0 (- deadline
+                                        (erlang/monotonic_time :millisecond)))]
+                     (receive
+                       [:resource_cycles :round r] (recur (conj acc r))
+                       (after left acc))))]
+      (unsubscribe!)
+      rounds)))
+
+(defn leak-check
+  "Run `f`, then collect until quiet, and report what `f` left behind per
+   traced type (live counts after minus before). Destructors run as
+   scheduler aux work, so it re-reads until the counts stop moving (or
+   `settle-ms` passes). An all-zero :delta means `f` leaked no traced
+   resource — cycles included."
+  ([f] (leak-check f 2000))
+  ([f settle-ms]
+   (guarded
+     (let [census (fn [] (into {} (map (fn [t] [[(:module t) (:name t)] (:live t)])
+                                       (types))))
+           quiesce! (fn []
+                      (erlang/garbage_collect)
+                      (collect!)
+                      (let [deadline (+ (erlang/monotonic_time :millisecond)
+                                        settle-ms)]
+                        (loop [prev (census)]
+                          (erlang/garbage_collect)
+                          (collect!)
+                          (receive (after 20 nil))
+                          (let [now (census)]
+                            (if (or (= now prev)
+                                    (> (erlang/monotonic_time :millisecond)
+                                       deadline))
+                              now
+                              (recur now))))))
+           before (quiesce!)
+           result (f)
+           after (quiesce!)
+           ks (distinct (concat (keys before) (keys after)))]
+       {:result result
+        :delta (into {} (map (fn [k] [k (- (get after k 0) (get before k 0))])
+                             ks))}))))

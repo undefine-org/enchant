@@ -46,6 +46,7 @@ for p in "$HERE"/patches/*.patch; do
   git apply --check "$p" 2>/dev/null && git apply "$p" && echo "applied $(basename "$p")"
 done
 # erl_nif_trace.c is #included by erl_nif.c; make's dep file does not know.
+# (erl_binary.h / global.h changes are tracked and rebuild what they must.)
 touch erts/emulator/beam/erl_nif.c
 $LIM make -C erts/emulator -j12 opt TYPE= FLAVOR=jit > "$BASE/emulator.log" 2>&1
 
@@ -56,4 +57,4 @@ for f in erlexec inet_gethost epmd heart; do
 done
 echo "patched emulator: $BIN/beam.smp"
 "$HERE/erl-patched" -noshell -eval \
-  'io:format("~p~n", [maps:with([enabled, threshold], erlang:system_info(resource_cycles))]), halt().'
+  'io:format("~p~n", [maps:with([enabled, auto, threshold, shards], erlang:system_info(resource_cycles))]), halt().'

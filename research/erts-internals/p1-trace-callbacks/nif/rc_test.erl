@@ -31,7 +31,17 @@ run() ->
               {reader_racing_rounds, fun racing_reader/1},
               {writer_racing_rounds, fun racing_writer/1},
               {graph_explains_liveness, fun graph_why/1},
-              {subscription_delivers_rounds, fun subscription/1}],
+              {subscription_delivers_rounds, fun subscription/1},
+              {partial_round_is_local, fun partial_round_is_local/1},
+              {budget_overflow_completes, fun budget_overflow_completes/1},
+              {untraced_type_ignored, fun untraced_type_ignored/1},
+              {auto_off_then_request, fun auto_off_then_request/1},
+              {parallel_shards, fun parallel_shards/1},
+              {auto_round_without_request, fun auto_round_without_request/1},
+              {freed_after_ets_delete, fun ets_release/1},
+              {freed_after_holder_exits, fun exit_release/1},
+              {freed_after_unread_message, fun mailbox_release/1},
+              {freed_after_persistent_term_erase, fun pterm_release/1}],
     Results = [{Name, safe(F, Api)} || {Name, F} <- Probes],
     [io:format("  ~-40s ~p~n", [N, R]) || {N, R} <- Results],
     Results.
@@ -52,7 +62,7 @@ settle(Api) -> settle(Api, 0).
 %% NOT "done" -- only reaching the target is.
 settle(Api, Target) ->
     drop(),
-    case Api of patched -> rc_cell:collect(); stock -> ok end,
+    case Api of patched -> rc_ctl:collect(); stock -> ok end,
     wait_live(Target, 300).
 
 wait_live(_, 0) -> rc_cell:live();
@@ -74,7 +84,7 @@ expect_freed(Api, Before, _After, Made) ->
 
 diag(stock) -> none;
 diag(patched) ->
-    maps:with([rounds, collected, aborted, live, last], rc_cell:info()).
+    maps:with([rounds, collected, aborted, live, pending, last], rc_ctl:info()).
 
 %% ---- probes: garbage cycles are freed --------------------------------------
 
@@ -192,7 +202,7 @@ walk(C, K) ->
     end.
 
 collect_loop(0) -> ok;
-collect_loop(K) -> rc_cell:collect(), collect_loop(K - 1).
+collect_loop(K) -> rc_ctl:collect(), collect_loop(K - 1).
 
 %% A writer keeps rewiring a cycle it still holds, while rounds run.
 racing_writer(stock) -> pass;
@@ -224,7 +234,7 @@ graph_why(patched) ->
                      rc_cell:put(H, I), rc_cell:put(I, H), H end)(),
     (fun() -> G = rc_cell:new(g), rc_cell:put(G, {self, G}) end)(),
     drop(),
-    #{nodes := Nodes, parent := Parents, edges := Edges} = rc_cell:graph(),
+    #{nodes := Nodes, parent := Parents, edges := Edges} = rc_ctl:graph(),
     Verdicts = lists:sort([V || #{verdict := V} <- Nodes]),
     %% Held must be USED after the snapshot: `_ = Held` is dead code the
     %% compiler removes, and then the process really does not hold it.
@@ -237,12 +247,146 @@ graph_why(patched) ->
 
 subscription(stock) -> pass;
 subscription(patched) ->
-    ok = rc_cell:subscribe(self()),
-    _ = rc_cell:collect(),
-    R = receive {resource_cycles, #{round := N}} when N > 0 -> pass
+    ok = rc_ctl:subscribe(),
+    _ = rc_ctl:collect(),
+    R = receive {resource_cycles, round, #{round := N}} when N > 0 -> pass
         after 2000 -> {fail, no_message} end,
-    ok = rc_cell:subscribe(undefined),
+    ok = rc_ctl:unsubscribe(),
     flush(),
     R.
 
-flush() -> receive {resource_cycles, _} -> flush() after 0 -> ok end.
+flush() -> receive {resource_cycles, round, _} -> flush() after 0 -> ok end.
+
+%% ---- probes: v2 (candidates, budget, untraced types, control) --------------
+
+%% A garbage cycle hanging off a big LIVE structure: a partial round sees only
+%% the candidates (the dropped cycle), never the 20 000 live cells.
+partial_round_is_local(stock) -> pass;
+partial_round_is_local(patched) ->
+    Live = [rc_cell:new(I) || I <- lists:seq(1, 20000)],
+    _ = settle(patched),
+    B = rc_cell:live(),
+    (fun() -> A = rc_cell:new(a), C = rc_cell:new(c),
+              rc_cell:put(A, C), rc_cell:put(C, A) end)(),
+    drop(),
+    #{kind := Kind, nodes := N, collected := Got} = rc_ctl:collect(),
+    After = wait_live(B, 300),
+    _ = length(Live),
+    case {Kind, N < 100, Got, After} of
+        {partial, true, 2, B} -> pass;
+        Other -> {fail, Other}
+    end.
+
+%% A ring bigger than the budget: the partial round overflows, stays sound
+%% (nothing live is freed), and the explicit request completes it in full.
+budget_overflow_completes(stock) -> pass;
+budget_overflow_completes(patched) ->
+    Old = rc_ctl:set(budget, 64),
+    try
+        B = settle(patched),
+        make_ring(500),
+        After = settle(patched, B),
+        #{overflows := O} = rc_ctl:info(),
+        case {After - B, O > 0} of
+            {0, true} -> pass;
+            Other -> {fail, Other}
+        end
+    after rc_ctl:set(budget, Old)
+    end.
+
+%% Untraced resource types carry no link and are never examined.
+untraced_type_ignored(stock) -> pass;
+untraced_type_ignored(patched) ->
+    #{live := L0} = rc_ctl:info(),
+    Ps = [rc_cell:plain(x) || _ <- lists:seq(1, 1000)],
+    #{live := L1} = rc_ctl:info(),
+    _ = length(Ps),
+    case L1 - L0 of 0 -> pass; D -> {fail, {tracked, D}} end.
+
+%% With automatic rounds off, garbage waits; a request still collects.
+auto_off_then_request(stock) -> pass;
+auto_off_then_request(patched) ->
+    true = rc_ctl:set(auto, false),
+    try
+        B = settle(patched),
+        (fun() -> [begin C = rc_cell:new(x), rc_cell:put(C, {self, C}) end
+                   || _ <- lists:seq(1, 50)], ok end)(),
+        drop(),
+        timer:sleep(300),
+        Waiting = rc_cell:live() - B,
+        After = settle(patched, B) - B,
+        case {Waiting, After} of
+            {50, 0} -> pass;
+            Other -> {fail, Other}
+        end
+    after rc_ctl:set(auto, true)
+    end.
+
+%% Cells made and dropped on many processes (many shards) at once.
+parallel_shards(Api) ->
+    B = settle(Api),
+    Self = self(),
+    Pids = [spawn_link(fun() ->
+                [begin C = rc_cell:new(x), rc_cell:put(C, {self, C}) end
+                 || _ <- lists:seq(1, 200)],
+                Self ! {done, self()}
+            end) || _ <- lists:seq(1, 16)],
+    [receive {done, P} -> ok end || P <- Pids],
+    expect_freed(Api, B, settle(Api), 3200).
+
+%% The automatic trigger alone (no request) reclaims garbage.
+auto_round_without_request(stock) -> pass;
+auto_round_without_request(patched) ->
+    B = settle(patched),
+    (fun() -> [begin C = rc_cell:new(x), rc_cell:put(C, {self, C}) end
+               || _ <- lists:seq(1, 100)], ok end)(),
+    drop(),
+    case wait_live(B, 300) - B of 0 -> pass; D -> {fail, {left, D}} end.
+
+%% ---- probes: every way ERTS drops a count reports a candidate ------------
+%% A partial round only sees candidates; each probe drops the LAST outside
+%% count through a different ERTS path and expects the cycle freed.
+
+self_cycles(N) ->
+    [begin C = rc_cell:new(x), rc_cell:put(C, {self, C}), C end
+     || _ <- lists:seq(1, N)].
+
+ets_release(Api) ->
+    B = settle(Api),
+    T = ets:new(t, [public]),
+    (fun() -> [ets:insert(T, {I, C}) || {I, C} <- lists:enumerate(self_cycles(50))],
+              ok end)(),
+    _ = settle(Api), _ = settle(Api),       % held by ETS: survives
+    Held = rc_cell:live() - B,
+    ets:delete(T),                          % db_cleanup_offheap_comp
+    R = expect_freed(Api, B, settle(Api), 50),
+    case {Held, R} of {50, _} -> R; _ -> {fail, {held, Held}} end.
+
+exit_release(Api) ->
+    B = settle(Api),
+    Self = self(),
+    P = spawn(fun() -> Cs = self_cycles(50), Self ! ready,
+                       receive go -> _ = length(Cs) end end),
+    receive ready -> ok end,
+    Ref = monitor(process, P),
+    P ! go,                                 % holder dies: heap freed
+    receive {'DOWN', Ref, _, _, _} -> ok end,
+    expect_freed(Api, B, settle(Api), 50).
+
+mailbox_release(Api) ->
+    B = settle(Api),
+    P = spawn(fun() -> receive never -> ok end end),
+    (fun() -> [P ! {cell, C} || C <- self_cycles(50)], ok end)(),
+    Ref = monitor(process, P),
+    exit(P, kill),                          % unread messages freed
+    receive {'DOWN', Ref, _, _, _} -> ok end,
+    expect_freed(Api, B, settle(Api), 50).
+
+pterm_release(Api) ->
+    B = settle(Api),
+    (fun() -> persistent_term:put({?MODULE, cells}, self_cycles(50)), ok end)(),
+    _ = settle(Api),
+    Held = rc_cell:live() - B,
+    true = persistent_term:erase({?MODULE, cells}), % literal area release
+    R = expect_freed(Api, B, settle(Api), 50),
+    case {Held, R} of {50, _} -> R; _ -> {fail, {held, Held}} end.

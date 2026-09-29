@@ -10,21 +10,23 @@ Look at the resource-cycle collector the way a developer debugs a leak.
                    live grey, garbage red), edges as held references
   watch(Ms)        print every round's summary for Ms milliseconds
 
-Everything reads the collector's own view (enif_resource_cycles_graph: a dry
-round), so what you see is what the collector will decide.
+Everything reads the collector's own view (system_flag(resource_cycles,
+{graph, Pid}): a dry full round), so what you see is what it will decide.
+No NIF is involved: rc_ctl wraps system_info/system_flag.
 """.
 -export([summary/0, why/1, garbage/0, dot/1, watch/1, snapshot/0]).
 
 summary() ->
     case erlang:system_info(resource_cycles) of
         #{live := L, rounds := R, collected := C, aborted := A,
-          last := #{nodes := N, garbage := G, usec := U}} ->
+          last := #{kind := K, nodes := N, garbage := G, usec := U}} ->
             io:format("live=~p rounds=~p collected=~p aborted=~p "
-                      "last: nodes=~p garbage=~p ~pus~n", [L, R, C, A, N, G, U])
+                      "last: ~p nodes=~p garbage=~p ~pus~n",
+                      [L, R, C, A, K, N, G, U])
     end.
 
 snapshot() ->
-    #{nodes := Nodes, edges := Edges, parent := Parents} = rc_cell:graph(),
+    #{nodes := Nodes, edges := Edges, parent := Parents} = rc_ctl:graph(),
     {list_to_tuple(Nodes), Edges, list_to_tuple(Parents)}.
 
 why(Resource) ->
@@ -73,14 +75,15 @@ dot(File) ->
     {nodes, tuple_size(Nodes), edges, length(Edges)}.
 
 watch(Ms) ->
-    ok = rc_cell:subscribe(self()),
+    ok = rc_ctl:subscribe(),
     Deadline = erlang:monotonic_time(millisecond) + Ms,
     watch_loop(Deadline),
-    rc_cell:subscribe(undefined).
+    rc_ctl:unsubscribe().
 
 watch_loop(Deadline) ->
     Left = Deadline - erlang:monotonic_time(millisecond),
     receive
-        {resource_cycles, R} -> io:format("round ~p~n", [R]), watch_loop(Deadline)
+        {resource_cycles, round, R} ->
+            io:format("round ~p~n", [R]), watch_loop(Deadline)
     after max(Left, 0) -> ok
     end.

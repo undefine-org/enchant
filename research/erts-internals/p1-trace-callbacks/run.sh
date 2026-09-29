@@ -18,7 +18,7 @@ mkdir -p "$OUT"
 $LIM cc -O2 -g -Wall -Wextra -fPIC -shared \
   -I/usr/lib/erlang/usr/include -I"$OTP/erts/emulator/beam" \
   -o "$OUT/rc_cell.so" "$HERE/nif/rc_cell.c"
-$LIM erlc -o "$OUT" "$HERE/nif/rc_cell.erl" "$HERE/nif/rc_test.erl"
+$LIM erlc -o "$OUT" "$HERE"/nif/*.erl
 
 run_on() {
   echo "== $1"
@@ -29,4 +29,20 @@ run_on() {
   $LIM $ERL -noshell -pa "$OUT" -s rc_test main
 }
 
-for which in ${1:-stock patched}; do run_on "$which"; done
+# beam-lisp: erts.rc on a copy of the pinned drop whose beam.smp is swapped
+# for the patched one (DROP_PATCHED), and on the stock drop (DROP_STOCK).
+run_bl() {
+  mkdir -p "$OUT/bl" && cd "$OUT/bl"
+  printf '{:name "rcbl" :paths ["%s"] :bl "commit:e5c05630"}\n' "$HERE/bl" > env.bl
+  for d in "${DROP_PATCHED:-/tmp/drop-patched}" ${DROP_STOCK:-}; do
+    [ -x "$d/bin/bl" ] || { echo "== skip $d (no drop)"; continue; }
+    echo "== bl on $d"
+    RC_CELL_DIR="$OUT" $LIM "$d/bin/bl" eval 'BeamLisp.Ns.Bl.Cli.main(System.argv())' \
+      test "$HERE/bl/rc_test.bl"
+  done
+}
+
+case ${1:-} in
+  bl) run_bl ;;
+  *)  for which in ${1:-stock patched}; do run_on "$which"; done ;;
+esac

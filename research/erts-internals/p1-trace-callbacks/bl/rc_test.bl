@@ -1,0 +1,72 @@
+; rc_test.bl — erts.rc against real traced resources (the rc_cell probe NIF).
+; Run: p1-trace-callbacks/run.sh bl   (builds rc_cell, runs this on the
+;      patched emulator AND on stock, where everything is :unavailable)
+
+(ns erts.rc.test
+  (:require [erts.rc :as rc]))
+
+(erlang/apply :code :add_patha (list (String/to_charlist (or (System/get_env "RC_CELL_DIR")
+                                                      "/tmp/erts-trace-p1"))))
+
+(defn- self-cycle []
+  (let [c (rc_cell/new :x)] (rc_cell/put c (tuple :self c)) c))
+
+(deftest capability-is-answered-not-thrown
+  (let [on? (rc/available?)]
+    (is (contains? #{true false} on?))
+    (when-not on?
+      (is (= :unavailable (rc/info)))
+      (is (= :unavailable (rc/collect!)))
+      (is (= :unavailable (rc/graph))))))
+
+(deftest info-and-stats-have-their-shape
+  (when (rc/available?)
+    (rc_cell/new :touch)                 ; loads the NIF: registers the type
+    (let [i (rc/info) s (rc/stats)]
+      (is (every? #(contains? i %) [:rounds :collected :live :pending :last :types]))
+      (is (contains? s :last-usec))
+      (is (some #(= :rc_cell (:name %)) (rc/types))))))
+
+(deftest leak-check-sees-cycles-freed
+  (when (rc/available?)
+    (let [{:keys [delta result]} (rc/leak-check #(do (doseq [_ (range 100)] (self-cycle)) :done))]
+      (is (= :done result))
+      (is (= 0 (get delta [:rc_cell :rc_cell] 0)) (str "delta " delta)))))
+
+(deftest collect-reports-the-round
+  (when (rc/available?)
+    ((fn [] (doseq [_ (range 20)] (self-cycle))))
+    (erlang/garbage_collect)
+    (let [r (rc/collect!)]
+      (is (#{:partial :full} (:kind r)))
+      (is (<= 0 (:collected r))))
+    (is (= :full (:kind (rc/collect! :full))))))
+
+(deftest why-explains-a-live-chain-and-names-garbage
+  (when (rc/available?)
+    (rc/collect! :full)
+    (let [held (let [h (rc_cell/new :held) i (rc_cell/new :inner)]
+                 (rc_cell/put h i) (rc_cell/put i h) h)
+          inner (rc_cell/get held)
+          g (rc/graph)
+          w (rc/why inner g)]
+      (is (contains? w :alive) (str w))
+      (is (= :root (:verdict (first (:alive w)))))
+      (is (pos? (:outside (first (:alive w)))))
+      (is (string? (rc/dot g)))
+      (is (= :not-traced (rc/why (rc_cell/plain :x) g)))
+      (rc_cell/get held))))
+
+(deftest policy-knobs-round-trip
+  (when (rc/available?)
+    (let [old (rc/set! :budget 128)]
+      (is (= 128 (rc/set! :budget old))))
+    (rc/with-policy {:auto false}
+      (is (= false (:auto (rc/info)))))
+    (is (= true (:auto (rc/info))))))
+
+(deftest watch-sees-rounds
+  (when (rc/available?)
+    (let [p (erlang/self)]
+      (spawn (fn [] (receive (after 50 nil)) (rc/collect!))))
+    (is (seq (rc/watch 1000)))))

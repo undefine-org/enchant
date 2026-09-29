@@ -7,10 +7,17 @@ finds and breaks garbage cycles among resources. The design is CPython's
 schedulers never stop. There are three parts: the collector, the NIF API, and
 the tools a developer uses to watch it.
 
+> **This is v2.** v1 (commit `b753189` in the OTP tree) had a global lock, two
+> extra words in every resource, O(live) rounds and NIF-only observability.
+> v2 removes all four without dropping a guarantee: see
+> **[OVERHEAD.md](OVERHEAD.md)** for how, the race it found, and the
+> measurements. The beam-lisp namespace is in **[bl/](bl/README.md)**.
+
 - patch: [`../otp/patches/0001-resource-cycles-trace-callbacks.patch`](../otp/patches/0001-resource-cycles-trace-callbacks.patch)
-  (`erl_nif_trace.{h,c}` new; `erl_nif.c` +11, `global.h` +2,
-  `erl_bif_info.c` +4)
-- client + probes: `nif/` · run: `./run.sh` (stock and patched)
+  (`erl_nif_trace.{h,c}` new; ~60 hook lines in `erl_nif.c`, `erl_binary.h`,
+  `global.h`, `bif.c`, `erl_bif_info.c`, `erl_bif_unique.{c,h}`,
+  `erl_io_queue.c`, `io.c`)
+- client + probes: `nif/` · run: `./run.sh` (stock and patched), `./run.sh bl`
 
 ## 1. The problem, in ERTS terms
 
@@ -52,11 +59,18 @@ int  enif_resource_cycles_track(void* obj);        /* object is fully built   */
 void enif_trace_env(ErlNifTraceCtx*, ErlNifEnv* owned_env);
 void enif_trace_resource(ErlNifTraceCtx*, void* obj);   /* a kept native handle */
 void enif_trace_opaque(ErlNifTraceCtx*);            /* "can't say": be a root */
-/* observability */
-ERL_NIF_TERM  enif_resource_cycles_info(ErlNifEnv*);
-ERL_NIF_TERM  enif_resource_cycles_graph(ErlNifEnv*);
-unsigned long enif_resource_cycles_collect(ErlNifEnv*, int wait);
-int           enif_resource_cycles_subscribe(ErlNifEnv*, const ErlNifPid*);
+```
+
+Observability and control are **not** NIF calls (v2). They are part of the
+emulator, so they work from Erlang, Elixir or beam-lisp without loading
+anything (§4):
+
+```erlang
+erlang:system_info(resource_cycles)
+erlang:system_flag(resource_cycles, {collect, Pid} | {collect, Pid, full}
+                                  | {graph, Pid} | {subscribe, Pid}
+                                  | {unsubscribe, Pid} | {auto, Bool}
+                                  | {threshold, N} | {interval, Ms} | {budget, N})
 ```
 
 Decisions, and why:
@@ -70,28 +84,41 @@ Decisions, and why:
   counts). A term walk would cost O(size) and could miss such garbage.
 - **`track` is explicit** (CPython's `PyObject_GC_Track`). `enif_alloc_resource`
   returns raw memory; registering there would let the collector call `trace`
-  on an uninitialised object.
+  on an uninitialised object. Call it **last**, after `enif_make_resource` +
+  `enif_release_resource`: the allocation's own release then is not recorded
+  as a cycle candidate (OVERHEAD.md §5: 8000M → 7680M instructions per 1M
+  cells).
+- **`set_resource_cycle_hooks` only during load/upgrade, only for a type with
+  a destructor.** The destructor pins the library (`dynlib_refc`) while
+  objects exist, so the hook code cannot be unloaded under a round. Only
+  objects allocated *after* the call carry the collector's link.
 - **Hooks live in a side table**, not in `ErlNifResourceTypeInit`, whose layout
   is frozen NIF ABI. Upstream would add a `members` bump instead (A10).
 - **Symbols are resolved with `dlsym`.** The client `.so` links against nothing
   new and loads on stock ERTS, where it simply does not collect.
-- **`ErtsResource` gains two words** (`rc_type`, `rc_tracked`): the type is
-  resolved once, at track time, and the destructor leaves the registry in
-  O(1).
+- **Per-object state lives only in traced objects** (v2): a 56-byte `RcLink`
+  after the user data, flagged by `BIN_FLAG_RC_TRACED` on the binary.
+  `ErtsResource` is unchanged; `ErlNifResourceType` gains one pointer.
 
 ## 3. A round (concurrent trial deletion)
 
 On its own unmanaged thread (`resource_cycles`, started lazily by the first
-`set_resource_cycle_hooks`), so it never occupies or blocks a scheduler:
+`set_resource_cycle_hooks` or request), so it never occupies or blocks a
+scheduler:
 
-1. **Snapshot + pin.** Under `rc_lock`, pin every tracked resource with
-   `refc++ unless 0`. A resource at 0 is already dying (its destructor is
-   queued as aux work) and is skipped; it is never resurrected. A pin keeps
-   every object alive for the whole round, so no hook races a destructor.
-2. **Trace.** For each node: read `epoch`, call `trace` (the object takes its
-   own lock), map edges to snapshot indices, `internal[target]++`. Edges to
-   untracked resources are dropped, since they cannot close a cycle through
-   the snapshot.
+1. **Candidates + pin.** A *partial* round (the normal kind) takes every
+   scheduler shard's candidate stack: objects whose count was dropped and
+   stayed above zero since the last round (Bacon–Rajan; OVERHEAD.md §2c). A
+   *full* round (explicit request, graph view, or amortised after a budget
+   overflow) walks every shard's census instead. Each node is pinned with
+   `refc++ unless 0`: a resource at 0 is already dying (its destructor is
+   queued as aux work) and is skipped, never resurrected. A pin keeps every
+   object alive for the whole round, so no hook races a destructor.
+2. **Trace + expand.** For each node: read `epoch`, call `trace` (the object
+   takes its own lock), `internal[target]++`. In a partial round, a traced
+   target not yet in the round is pinned and added (up to `budget` nodes;
+   past it, nodes become opaque roots and the round reports `overflow`).
+   Edges to untraced resources are dropped: they cannot close a cycle.
 3. **Outside count.** `outside = refc − 1 (pin) − internal`. `outside > 0`
    (held by a process, ETS, a non-traced holder, a native handle) → **root**.
    An `opaque` trace → root.
@@ -112,7 +139,15 @@ pass B inspected it and bumped its epoch. Hence, after both passes, nobody
 holds or can obtain a reference into G. This is the same argument as
 `collector.rs`; here the refcount and edge counts are exact rather than
 calibrated. If validation fails, nothing is cleared: the candidates are
-counted in `aborted` and the next round retries.
+counted in `aborted`, recorded again, and the next round retries.
+
+**Why a partial round is as sound as a full one.** A node outside the round
+that holds a count on a node inside it is invisible to the trace, so the
+inside node shows `outside > 0` and is a root. Over-approximating roots is
+always safe; it only defers collection to a round with the right candidates.
+Completeness rests on every count-drop being recorded, which the patch
+guarantees by routing every decrement site through `erts_bin_release`
+(audit and the one race it found: OVERHEAD.md §2c, §4).
 
 **Residual (unchanged from today).** ETF revival: `binary_to_term` of a binary
 taken earlier finds a *live* resource by reference number through the
@@ -122,48 +157,66 @@ bumps the refcount, so pass A fails and the round aborts. After a clear the
 object has an empty state, and a client reads it as `reclaimed`, exactly as
 with a weak reference.
 
-**Scheduling.** A round runs when `since ≥ threshold` (tracked allocations
-since the last round) or on request. After a round,
-`threshold = max(1024, survivors)`: a round costs O(live), so it runs again
-only after as many new objects as survived. That is amortised O(1) per
-allocation, the classic generational-trigger argument.
+**Scheduling (v2).** Idle costs nothing: with no candidates the thread sleeps
+without a timeout. The first candidate wakes it; it batches for `interval` ms
+(default 100) unless a scheduler's shard reaches `threshold` (default 4096)
+or a request arrives, then runs one partial round. After a budget overflow, a
+full round runs once the candidates that passed since the last full round
+reach the live count, i.e. amortised O(1) per candidate.
 
 ## 4. Observability: what a developer sees
 
-Everything is surfaced three ways: from Erlang or beam-lisp *without any
-NIF*, from the NIF API, and as developer tools (`nif/rc_observe.erl`).
+Everything is surfaced through the emulator (no NIF needed), and twice more
+as tools: `nif/rc_ctl.erl` + `nif/rc_observe.erl` for Erlang, and the
+beam-lisp namespace **`erts.rc`** ([bl/README.md](bl/README.md)).
 
-**`erlang:system_info(resource_cycles)`** (a new `system_info` item; stock
-answers `badarg`, which is itself a capability probe). In beam-lisp:
-`(erlang/system_info :resource_cycles)`.
+**`erlang:system_info(resource_cycles)`** (stock: `badarg`, itself a
+capability probe). In beam-lisp: `(rc/info)` / `(rc/stats)`.
 
 ```erlang
-#{enabled => true, rounds => 2, collected => 0, aborted => 0,
-  threshold => 1024, since => 0, live => 3,
-  last => #{round => 2, nodes => 3, roots => 2, garbage => 0,
-            opaque => 0, usec => 2},
-  types => [#{module => rc_cell, name => rc_cell, live => 3, collected => 0}]}
+#{enabled => true, auto => true, rounds => 41, full_rounds => 2,
+  collected => 5370, aborted => 0, overflows => 1,
+  candidates => 6120, scanned => 9001, live => 1203, pending => 0,
+  threshold => 4096, interval_ms => 100, budget => 65536, shards => 43,
+  last => #{round => 41, kind => partial, candidates => 3, nodes => 3,
+            roots => 1, garbage => 2, collected => 2, aborted => 0,
+            opaque => 0, overflow => false, usec => 14},
+  types => [#{module => rc_cell, name => rc_cell, live => 1203,
+              collected => 5370}]}
 ```
 
-**The graph** (`enif_resource_cycles_graph`): a *dry* round, where nothing is
-collected, returned as data. Each node has its `refc`, `internal` and
-`outside` counts, its `epoch`, and a `verdict` of `root | live | garbage`.
-Edges are held references. `parent` is the BFS tree from the roots, i.e. the
-reason each live node is alive. The verdicts are exactly the ones the
-collector itself would reach.
+**`erlang:system_flag(resource_cycles, Op)`** is how to ask for things.
+Every request is asynchronous and the answer arrives as a message, so a long
+round never blocks a scheduler:
 
-**Developer tools** (`rc_observe`):
+| Op | returns | then |
+|---|---|---|
+| `{collect, Pid}` / `{collect, Pid, full}` | `Ref` | `Pid ! {resource_cycles, Ref, collected, Round}` |
+| `{graph, Pid}` | `Ref` | `Pid ! {resource_cycles, Ref, graph, #{nodes, edges, parent}}` |
+| `{subscribe, Pid}` / `{unsubscribe, Pid}` | `ok` | after every round: `Pid ! {resource_cycles, round, Round}` |
+| `{auto, Bool}`, `{threshold, N}`, `{interval, Ms}`, `{budget, N}` | old value | policy changes at once |
+
+**The graph** is a *dry full* round: nothing is collected. It gives each
+node's `refc`, `internal` and `outside` counts, its `epoch`, whether it was
+`traced`, and a `verdict` of `root | live | garbage`. `edges` are held
+references, and `parent` is the BFS tree from the roots, i.e. the reason each
+live node is alive. The verdicts are exactly the ones the collector would
+reach.
+
+**Developer tools** (Erlang `rc_observe`, beam-lisp `erts.rc`):
 
 ```
-rc_observe:summary()   live=3 rounds=2 collected=0 aborted=0 last: nodes=3 garbage=0 2us
+rc_observe:summary()   live=3 rounds=2 collected=0 aborted=0 last: partial nodes=3 garbage=0 14us
 rc_observe:why(B)      {alive,[#{verdict=>root, refc=>3, internal=>1, outside=>1,
                                  held_from_outside=>1}]}
 rc_observe:garbage()   resources the next round would free, right now
 rc_observe:dot(F)      Graphviz: roots green, live grey, garbage red
 rc_observe:watch(Ms)   print every round as it happens (subscription)
+
+(rc/why cell)  (rc/garbage)  (rc/dot)  (rc/watch 5000)  (rc/leak-check f)
 ```
 
-Real `dot/1` output (a held pair plus a dropped self-cycle):
+Real `dot` output (a held pair plus a dropped self-cycle):
 
 ```dot
 digraph resource_cycles {
@@ -174,13 +227,9 @@ digraph resource_cycles {
 }
 ```
 
-**Subscription** (`enif_resource_cycles_subscribe`): after every round, the
-subscriber receives `{resource_cycles, #{round, nodes, roots, garbage, opaque,
-usec}}`. That is enough for a live dashboard or a datom sink (D1).
-
 ## 5. Results
 
-### Probe suite (`run.sh`; 13 probes, `nif/rc_test.erl`)
+### Probe suite (`run.sh`; 23 probes, `nif/rc_test.erl`)
 
 | probe | stock ERTS | patched |
 |---|---|---|
@@ -197,12 +246,19 @@ usec}}`. That is enough for a live dashboard or a datom sink (D1).
 | writer rewires a live pair 20 000× while 40 rounds run | n/a | intact |
 | graph: held pair = root + live, dropped self-cycle = garbage, 3 edges | n/a | ✓ |
 | subscription delivers rounds | n/a | ✓ |
+| 16 processes × 200 self-cycles at once (all shards) | **leaks 3200** | freed |
+| last count dropped by `ets:delete` / holder exit / unread message on a killed process / `persistent_term:erase` | **leaks 50** each | freed |
+| 1 garbage pair among 20 000 live cells | n/a | partial round, < 100 nodes, 2 collected |
+| 500-ring with budget 64 | n/a | overflow → full round → freed |
+| 1000 untraced resources | n/a | not tracked (live += 0) |
+| `auto` off: garbage waits 300 ms, then a request frees it | n/a | ✓ |
+| no request at all: the automatic trigger frees garbage | n/a | ✓ |
 
-Patched: 25/25 consecutive full-suite runs green after the harness fix below
-(10 + 5 + 10 across three rebuilds of the final patch).
-Stock: the five leak probes measure the leak exactly (`{pass,{leaked_on_stock,N}}`).
+Patched v2: 15/15 consecutive full-suite runs green (after the release/drain
+race fix, OVERHEAD.md §4). Stock: every leak probe measures the leak exactly
+(`{pass,{leaked_on_stock,N}}`), every liveness probe passes.
 
-**Two harness bugs this found, both instructive:**
+**Harness bugs found along the way (v1 and v2), all instructive:**
 
 1. `graph_explains_liveness` first reported *both* cells of a held pair as
    `root`. The collector was right: both were still live on the test
@@ -214,38 +270,36 @@ Stock: the five leak probes measure the leak exactly (`{pass,{leaked_on_stock,N}
    destruction on a machine at load 30+. The harness now waits for the
    target count (with a 3 s cap) and prints the collector's own counters on
    failure. The general rule: reclamation latency is not correctness.
+3. The first v2 bench reported a *full* round over 1000 live cells in 4 µs,
+   which was implausible. The bench kept its cells "alive" with
+   `_ = length(Live)` after the measured call; the compiler drops that as
+   dead code, so the GC freed the cells first. Benches now park live data in
+   the process dictionary. `rc_bench` also reports `nodes` next to every
+   time, so a number without the work it covers is never shown.
 
 ### beam-lisp on the patched emulator
 
 Copying the patched `beam.smp` into a copy of the `e5c05630` drop
 (`<drop>/erts-17.0.1/bin/beam.smp`):
 
-- `bl test test/bl/ref_cycles_test.bl`: green (it also passes on stock; the
-  `lazy_memo` crate does not use p1 yet);
-- `(erlang/system_info :resource_cycles)` answers the map; stock raises
-  `badarg`.
+- `bl test ref_cycles_test.bl`: 228 passed on v2 (it also passes on stock;
+  the `lazy_memo` crate does not use p1 yet);
+- `bl test bl/rc_test.bl` (the `erts.rc` namespace against rc_cell): 18
+  passed on v2; 4 passed on the stock drop, where it answers `:unavailable`.
 
-### Cost (`nif/rc_bench.erl`, best of 5, host load 30–40, so treat as upper bounds)
+### Cost
 
-| cells | alloc µs/op stock | alloc µs/op patched | one round over N **live** cells | reclaim all N cyclic garbage (end-to-end) |
-|---|---|---|---|---|
-| 1 000 | 1.8 | 5.2 | 0.9 ms | 5.3 ms |
-| 10 000 | 2.0 | 2.7 | 5.5 ms | 7.3 ms |
-| 100 000 | 2.8 | 3.6 | 50 ms | 8.4 ms |
+The full measurements and method are in **[OVERHEAD.md](OVERHEAD.md) §5**.
+They use instruction counts, because the host was at load 46–58, and are
+taken against a pristine emulator rebuilt from the same tree. In summary:
 
-What the numbers say:
-
-- **Allocation overhead** is one mutex plus a hash insert. It sits within the
-  noise at 10k and is ~+0.8 µs/op at 100k. It is a single global lock: under
-  heavy parallel allocation it is the first thing to shard (per-scheduler
-  registries).
-- **A round is O(live)**, ~0.5 µs per live object, and runs off-scheduler. The
-  adaptive threshold keeps the *amortised* cost O(1) per allocation, but a
-  large live heap still pays the full scan each time. That makes A8
-  (incremental candidate roots) the next real improvement.
-- **Reclaiming 100 000 cyclic objects takes ~8 ms** end to end, much less
-  than one 100k live scan, because auto rounds already ran during
-  construction.
+| | v1 | v2 |
+|---|---|---|
+| untraced resources, plain binaries | +2 words each; ~noise | **nothing** (within ±1% of pristine) |
+| traced cell lifetime (100k ×10) | +12.4% instructions | **+6.3%** |
+| 8 processes × 50k traced allocs | 3× pristine (global lock) | **≈ pristine** |
+| round after 1 pair dropped among 100k live | 97–129 ms (every node) | **20–26 µs, 2 nodes** |
+| full round, 100k live | 97–129 ms | 42–51 ms |
 
 ### Not verified
 
@@ -256,9 +310,16 @@ What the numbers say:
 - `enif_trace_resource` (kept native handles) and `enif_trace_opaque` are not
   exercised by `rc_cell`; the `lazy_memo` `Cursor` (a native handle on its
   source cell) is the natural test.
-- Lock-order review: `rc_lock` is never held while calling hooks, and hooks
-  take only the object's lock. `enif_send` from the collector thread is used
-  as for any unmanaged thread. This has been reviewed, not model-checked.
+- Lock-order review (v2): no allocation, release or destruction path takes
+  `rc_ctl`; the shard locks guard only list links and are never held while
+  calling hooks; hooks take only the object's own lock. `enif_send` from the
+  collector thread is used as for any unmanaged thread. This has been
+  reviewed, not model-checked, and not run under the lock checker
+  (`TYPE=debug` / `ERTS_ENABLE_LOCK_CHECK`).
+- The release/drain protocol (OVERHEAD.md §4) was found by a failing probe
+  and closed with an argument. It has not been model-checked (a TLA+ or
+  loom-style model of stack, flag, refcount and inflight is the right next
+  step before upstreaming).
 - Distribution: an external ref to a resource is a plain ref (no count), so
   it cannot keep or break a cycle. Unchanged from stock.
 
@@ -266,20 +327,23 @@ What the numbers say:
 
 1. **Adopt in `lazy_memo`** (behind a load-time capability check):
    - `MemoCell`, `Cursor` and `Seen` register hooks;
+   - `track` is called last in each constructor;
    - `trace` = `enif_trace_env` over the state env (and `enif_trace_resource`
      for `Cursor.source`);
    - `clear` = take the state;
    - `epoch` = `version` + `touched` folded into one counter;
    - `collector.rs` stays as the stock fallback (A2–A4 make it sturdier);
    - `ref_cycles_test.bl` gains a `:collector` field (`:erts | :calibrated |
-     :off`) and runs on both.
-2. **`bl` surface:** a `bl.rc` namespace over `system_info`, graph,
-   `why`/`dot` and watch, so `bl doc` cells and the live view can show the
-   collector (D1).
-3. **Sharded registry** plus **A8 incremental rounds** once `lazy_memo` load
-   is measured.
-4. **Drop plumbing (F1):** `bl self-update` builds the patched emulator from
+     :off`) and runs on both;
+   - `erts.rc` moves from `research/…/bl` to `priv/lib/erts/rc.bl`.
+2. **Scoped graph:** `{graph, Pid, Resource}` answers "why is this alive" in
+   O(its reach) instead of a full round (OVERHEAD.md §6).
+3. **Lock checker + model:** run the probes on a `TYPE=debug` emulator with
+   the lock checker on; model the release/drain protocol.
+4. **Generational scanning** (index A8's second half) if a real workload
+   shows large live structures rewritten near their roots (`rc_churn`).
+5. **Drop plumbing (F1):** `bl self-update` builds the patched emulator from
    `otp/patches/` for the pinned OTP tag and records it in `BUILD_INFO`.
-5. **Upstream draft (A10):** fold the side table into
-   `ErlNifResourceTypeInit` (`members = 5`); `system_info(resource_cycles)`
-   → `erlang:memory`-style docs; an EEP.
+6. **Upstream draft (A10):** fold the side table into
+   `ErlNifResourceTypeInit` (`members = 5`); document
+   `system_info`/`system_flag(resource_cycles)`; write an EEP.
