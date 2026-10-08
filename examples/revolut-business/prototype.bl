@@ -1,0 +1,229 @@
+; examples/revolut-business/prototype.bl — plan an external payment draft, off-line.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; A PLANNER, not a sender. It turns values a person has already checked — a
+; payer account, a counterparty, that counterparty's account, an amount and a
+; reference — into the exact JSON body `POST /payment-drafts` takes, plus a
+; preview of what the draft says in plain words.
+;
+; It holds no token, opens no socket, and names no host. Everything it returns
+; is a value to read; sending is a separate act, done in the Revolut Business
+; app by a person.
+;
+; ── A draft is not a payment ──────────────────────────────────────────
+;
+; `POST /payment-drafts` creates a DRAFT. It waits until someone sends it for
+; processing in the Revolut Business app. That send starts payment processing.
+; A draft can still be deleted, and an approval process can hold it for review.
+;
+; The scope follows that line. The reference gives four scopes — `READ` for
+; GET, `WRITE` for issuing payment drafts, `PAY` for initiating transactions,
+; `READ_SENSITIVE_CARD_DATA` for card details. The offline planner needs no
+; token. A future client that creates drafts needs `WRITE`, not `PAY`; this
+; namespace accepts neither.
+;
+; ── Verify before you plan ────────────────────────────────────────────
+;
+; Nothing here distinguishes a right payee from a wrong one. The account, the
+; counterparty, the beneficiary account and the reference come from OUT OF
+; BAND (`GET /accounts` and `GET /counterparties` read them back; a person
+; matches them against the invoice) and arrive as explicit arguments. A wrong
+; value planned correctly is still a wrong payment.
+
+(ns revolut-business.prototype
+  (:require [bl.json :as json]))
+
+;; ── the shape the API documents ───────────────────────────────────────
+;
+; Path, method and body from
+;   https://developer.revolut.com/docs/api/business/operations/create-payment-draft
+; This namespace fills that body in; it does not restate it.
+
+(def method "POST")
+
+(def path "/payment-drafts")
+
+(def currency "EUR")
+
+(def scope "WRITE")
+
+;; The API's own rule, and the reason the payer is a DRAFT argument rather than
+;; a payment one: "You can specify only one account ID for multiple payments in
+;; the same payment draft."
+
+;; ── refusal ───────────────────────────────────────────────────────────
+
+(defn- refuse
+  "Stop with a message that says what to fix. A planner that guesses is a
+   planner that sends the guess."
+  [msg]
+  (throw (ex-info (str "revolut-business: " msg) {:error :invalid-payment-draft})))
+
+;; ── text ──────────────────────────────────────────────────────────────
+
+(defn- required-text
+  "A non-empty string with no surrounding whitespace. An ID with a trailing
+   space is a different ID to the API, and a reference that is only spaces
+   identifies nothing."
+  [what v]
+  (cond
+    (not (string? v)) (refuse (str what " must be a string"))
+    (= "" (trim v)) (refuse (str what " must not be empty"))
+    (not= v (trim v)) (refuse (str what " must not have surrounding whitespace"))
+    :else v))
+
+;; ── amount ────────────────────────────────────────────────────────────
+
+(defn- digits?
+  "Every character a decimal digit. The check is by codepoint, so no locale and
+   no number format gets a vote on what an amount may look like."
+  [s]
+  (and (not= "" s)
+       (every? (fn [c] (and (<= 48 c) (<= c 57))) (String/to_charlist s))))
+
+(defn- decimal-cents
+  "A strictly-formed decimal string → integer cents, or nil when it is not the
+   shape `digits` or `digits.digits{1,2}`. No sign, no exponent, no thousands
+   separator, at most two fractional places — so nothing is rounded and no
+   digit is invented."
+  [s]
+  (let [parts (split s ".")]
+    (cond
+      (= 1 (count parts))
+        (when (digits? (first parts))
+          (* 100 (String/to_integer (first parts))))
+
+      (= 2 (count parts))
+        (let [whole (first parts)
+              frac (second parts)
+              places (erlang/byte_size frac)]
+          (when (and (digits? whole) (digits? frac) (<= 1 places) (<= places 2))
+            (+ (* 100 (String/to_integer whole))
+               (if (= 1 places)
+                 (* 10 (String/to_integer frac))
+                 (String/to_integer frac)))))
+
+      :else nil)))
+
+(defn amount-cents
+  "The amount as integer cents. An integer is cents already; a string is parsed
+   strictly. A FLOAT is refused: many decimal amounts (for example 0.1) have
+   no exact binary representation, and nearly right is wrong for money."
+  [amount]
+  (let [cents (cond
+                (float? amount)
+                  (refuse "amount must not be a float — pass integer cents or a decimal string")
+                (string? amount)
+                  (or (decimal-cents amount)
+                      (refuse (str "amount " (pr-str amount)
+                                   " is not a decimal with at most two places")))
+                (int? amount) amount
+                :else (refuse "amount must be integer cents or a decimal string"))]
+    (if (pos? cents)
+      cents
+      (refuse "amount must be positive"))))
+
+(defn cents->decimal
+  "Integer cents → decimal text for the API's number field: 4275 → \"42.75\".
+   The result holds digits and one dot, and goes into the body as a JSON NUMBER
+   — never as a string, never through a float."
+  [cents]
+  (let [whole (quot cents 100)
+        frac (rem cents 100)]
+    (str whole "." (if (< frac 10) (str "0" frac) (str frac)))))
+
+;; ── one payment ───────────────────────────────────────────────────────
+
+(defn- payment-plan
+  "A payment's verified fields, validated, with its amount in cents."
+  [p]
+  (if-not (map? p)
+    (refuse "each payment must be a map")
+    {:counterparty-id (required-text "counterparty id" (:counterparty-id p))
+     :beneficiary-account-id (required-text "beneficiary account id"
+                                            (:beneficiary-account-id p))
+     :reference (required-text "reference" (:reference p))
+     :cents (amount-cents (:amount p))}))
+
+;; ── the body ──────────────────────────────────────────────────────────
+;
+; Every string crosses through `bl.json/encode`, which escapes AND validates
+; UTF-8. The amount is the one value written raw, because JSON has no type for
+; "exact decimal" and the API wants a number: `cents->decimal` produces digits
+; and a dot, and nothing else can reach that position.
+
+(defn- payment-json
+  [payer p]
+  (str "{\"account_id\":" (json/encode payer)
+       ",\"receiver\":{\"counterparty_id\":" (json/encode (:counterparty-id p))
+       ",\"account_id\":" (json/encode (:beneficiary-account-id p))
+       "},\"amount\":" (cents->decimal (:cents p))
+       ",\"currency\":" (json/encode currency)
+       ",\"reference\":" (json/encode (:reference p))
+       "}"))
+
+(defn- body-json
+  [payer title payments]
+  (str "{"
+       (if (nil? title) "" (str "\"title\":" (json/encode title) ","))
+       "\"payments\":["
+       (join "," (map (fn [p] (payment-json payer p)) payments))
+       "]}"))
+
+;; ── the preview ───────────────────────────────────────────────────────
+
+(defn- payment-line
+  [p]
+  (str "  " (pr-str (:counterparty-id p)) " / " (pr-str (:beneficiary-account-id p))
+       "  " currency " " (cents->decimal (:cents p))
+       "  ref " (pr-str (:reference p))))
+
+(defn- preview
+  [payer title payments total]
+  (str method " " path "  (draft — nothing is sent)\n"
+       "  payer account " (pr-str payer) "\n"
+       (join "\n" (map payment-line payments)) "\n"
+       "  total " currency " " (cents->decimal total) "\n"
+       (if (nil? title) "" (str "  title " (pr-str title) "\n"))
+       "  " scope " scope: a draft, sent later in the Revolut Business app"))
+
+;; ── the planner ───────────────────────────────────────────────────────
+
+(defn plan-draft
+  "Plan one payment draft, off-line. `opts`:
+
+     :account-id  the PAYER's account id, verified out of band
+     :payments    a non-empty vector of payments, all from that one account
+     :title       optional draft title
+
+   Each payment is a map:
+
+     :counterparty-id          the verified counterparty
+     :beneficiary-account-id   the verified account the money goes to; explicit,
+                               because a counterparty with two payment methods
+                               is ambiguous otherwise
+     :amount                   integer cents, or a strict decimal string
+     :reference                what the payment is for
+
+   Returns `{:method :path :scope :currency :account-id :title :amounts
+   :total-cents :body-json :preview}`. The body is a string; nothing is sent."
+  [opts]
+  (let [payer (required-text "account id" (:account-id opts))
+        title (let [t (:title opts)]
+                (if (nil? t) nil (required-text "title" t)))
+        ps (get opts :payments)]
+    (when-not (and (sequential? ps) (not (empty? ps)))
+      (refuse "payments must be a non-empty vector"))
+    (let [payments (vec (map payment-plan ps))
+          total (reduce (fn [sum p] (+ sum (:cents p))) 0 payments)]
+      {:method method
+       :path path
+       :scope scope
+       :currency currency
+       :account-id payer
+       :title title
+       :amounts (vec (map (fn [p] (cents->decimal (:cents p))) payments))
+       :total-cents total
+       :body-json (body-json payer title payments)
+       :preview (preview payer title payments total)})))

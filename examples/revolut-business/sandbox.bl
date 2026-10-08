@@ -1,0 +1,243 @@
+; examples/revolut-business/sandbox.bl — the planned draft, over a wire, sandbox only.
+;
+; ── What this is ──────────────────────────────────────────────────────
+;
+; Three operations of the Revolut Business API, and no more:
+;
+;   GET  /accounts        the accounts a payment may come FROM
+;   GET  /counterparties  the counterparties whose ids the planner is handed
+;   POST /payment-drafts  one draft, built by `revolut-business.prototype`
+;
+; It talks to the SANDBOX host and to nothing else. The base URL is a `def` and
+; not an option, so no caller can aim this namespace at production, and no
+; operation here moves money: a draft waits in the Revolut Business app until a
+; person sends it, and the call that sends it is not in this file.
+;
+; The reads need `READ` and creating a draft needs `WRITE`. Nothing here needs
+; `PAY` — the scope that initiates a transaction.
+;
+; ── The token is an ARGUMENT ──────────────────────────────────────────
+;
+; Every call takes the bearer access token as a value. This namespace does not
+; mint one, refresh one, store one or return one: the token enters the transport
+; request and stops there. Response data may still be sensitive financial data.
+; Obtaining a sandbox token follows Revolut's Business API setup flow; this
+; client implements no token exchange, refresh, or credential file.
+;
+; ── Every outcome is a value ──────────────────────────────────────────
+;
+; A wire failure is a value, never a raise, and a 2xx is the only `:ok true`:
+;
+;   {:ok true  :status 200 :data <decoded body>}
+;   {:ok true  :status 201 :data <decoded body> :id "…"}
+;   {:ok false :status 204 :error :no-content :detail "…"}
+;   {:ok false :status 0   :error :transport :detail "…"}
+;   {:ok false :status 400 :error :http}
+;
+; Two of those are easy to misread, and the shapes keep them apart. `:status 0`
+; is nobody answering — a dropped socket — which is a different animal from a
+; 500. And 204 is this API's answer for `no payments provided`, which is NOT a
+; created draft, so it comes back as an explicit failure rather than as an empty
+; success. Nothing here retries: a retried create is a second draft.
+
+(ns revolut-business.sandbox
+  (:require [revolut-business.prototype :as proto]
+            [connector.http :as http]
+            [bl.json :as json]))
+
+;; ── where it points ───────────────────────────────────────────────────
+
+; The sandbox host. Production is `https://b2b.revolut.com/api/1.0`, which no
+; call in this namespace can spell: the URL is built from this `def`, and the
+; only thing a caller supplies is a path the code already names.
+(def base-url "https://sandbox-b2b.revolut.com/api/1.0")
+
+; The two reads. The draft path is not repeated here — it is the planner's own
+; `path`, so the request the planner describes and the request this client sends
+; cannot drift apart.
+(def accounts-path "/accounts")
+
+(def counterparties-path "/counterparties")
+
+;; ── refusal ───────────────────────────────────────────────────────────
+
+(defn- refuse
+  "Stop before the wire, naming what to fix. The message carries field names and
+   never a token."
+  [msg]
+  (throw (ex-info (str "revolut-business.sandbox: " msg) {:error :sandbox-client})))
+
+(defn- access-token
+  "The bearer, checked. A blank token would put `Bearer ` on the wire and a
+   padded one would send a token the API does not know, so both are refused
+   before a socket is touched. The value is returned, handed to the transport,
+   and written nowhere else."
+  [token]
+  (cond
+    (not (string? token)) (refuse "access token must be a string")
+    (= "" (trim token)) (refuse "access token must not be empty")
+    (not= token (trim token)) (refuse "access token must not have surrounding whitespace")
+    (not (every? (fn [c] (and (<= 33 c) (<= c 126))) (String/to_charlist token)))
+      (refuse "access token must contain only printable non-space ASCII")
+    :else token))
+
+;; ── the wire ──────────────────────────────────────────────────────────
+
+(defn real-transport
+  "The default transport: `req` over a real socket. → {:status n :body string}.
+
+   `req` is `{:method :url :headers :content-type :body}`. `:status 0` with the
+   failure term as `:body` is the transport's own way of saying `nothing
+   answered`, kept distinct so a caller can tell a dead socket from an HTTP
+   refusal.
+
+   The content type is the THIRD element of the POST request tuple and nowhere
+   else — in the header list as well it goes out twice, and the endpoint answers
+   a malformed request with an HTML body where an error should be."
+  [req]
+  (http/ensure-apps)
+  (let [url (String/to_charlist (:url req))
+        headers (to-list (map (fn [h]
+                                (tuple (String/to_charlist (get h 0))
+                                       (String/to_charlist (get h 1))))
+                              (:headers req)))
+        http-opts (list (tuple :timeout 30000))
+        req-opts (list (tuple :body_format :binary))
+        r (if (= "POST" (:method req))
+            (httpc/request :post
+              (tuple url headers (String/to_charlist (:content-type req)) (:body req))
+              http-opts req-opts)
+            (httpc/request :get (tuple url headers) http-opts req-opts))]
+    (if (= :ok (elem r 0))
+      (let [resp (elem r 1)]
+        {:status (elem (elem resp 0) 1) :body (elem resp 2)})
+      {:status 0 :body (str (elem r 1))})))
+
+(defn- request
+  "The transport request for one call — the ONE place a token meets a URL."
+  [method path token body]
+  {:method method
+   :url (str base-url path)
+   :headers [["authorization" (str "Bearer " token)]
+             ["accept" "application/json"]]
+   :content-type (if (= "POST" method) "application/json" nil)
+   :body body})
+
+(defn- send
+  "One exchange through the injected transport, or the real one."
+  [opts req]
+  ((get opts :transport real-transport) req))
+
+;; ── one response, read as a result ────────────────────────────────────
+
+(defn- decoded
+  "The body as a value, or nil when it is not one JSON document. A malformed
+   body is a missing answer here rather than a raise, because the status is
+   what decides the outcome and the body only describes it."
+  [body]
+  (when (and (string? body) (not= "" body))
+    (let [r (json/try-decode body)]
+      (when (contains? r :ok) (get r :ok)))))
+
+(defn- outcome
+  [resp]
+  (let [status (get resp :status)
+        body (get resp :body)]
+    (cond
+      (zero? status)
+        {:ok false :error :transport :status 0
+         :detail (str "nothing answered at " base-url)}
+
+      (= 204 status)
+        {:ok false :error :no-content :status 204
+         :detail "204: the API answered `no payments provided`, so no draft exists"}
+
+      (and (>= status 200) (< status 300))
+        (let [v (decoded body)]
+          (if (nil? v)
+            {:ok false :error :empty :status status
+             :detail "a 2xx with no JSON body — no answer to trust"}
+            {:ok true :status status :data v}))
+
+      :else
+        {:ok false :error :http :status status
+         :detail "Revolut returned a non-success HTTP status"})))
+
+;; ── the reads ─────────────────────────────────────────────────────────
+
+(defn- read-path
+  [path token opts]
+  (outcome (send opts (request "GET" path (access-token token) nil))))
+
+(defn accounts
+  "GET /accounts — every account of the business. → the outcome map.
+
+   The ids this returns are what a plan's `:account-id` must be. A person
+   matches them against what they mean to pay from; this call cannot."
+  ([token] (accounts token {}))
+  ([token opts] (read-path accounts-path token opts)))
+
+(defn counterparties
+  "GET /counterparties — the FIRST page of counterparties, newest first.
+
+   The API pages this list with `created_before` set to the `created_at` of the
+   last counterparty on the previous page. This call sends no query parameters,
+   so it reads page one and stops: a business with more counterparties than a
+   page holds needs the walk the API guide describes, done by a caller that
+   keeps the cursor. `:data` is the page, and an empty page is the API's
+   `nothing matched` — an answer, not an error."
+  ([token] (counterparties token {}))
+  ([token opts] (read-path counterparties-path token opts)))
+
+;; ── the one write ─────────────────────────────────────────────────────
+
+(defn- planned-body
+  "The wire body of a plan this client may send.
+
+   This client sends ONE request — `proto/method` `proto/path` — and a plan
+   supplies only its body; the URL is built here and never read from the plan.
+   A plan whose method or path is anything else is refused rather than sent,
+   because a body built for another endpoint is not a draft, and finding that
+   out from a response is too late. A body with no payments is refused here too,
+   so the API never has to answer 204."
+  [plan]
+  (when-not (map? plan)
+    (refuse "a plan must be the map `revolut-business.prototype/plan-draft` returns"))
+  (when-not (= proto/method (get plan :method))
+    (refuse (str "a plan's method must be " (pr-str proto/method)
+                 ", got " (pr-str (get plan :method)))))
+  (when-not (= proto/path (get plan :path))
+    (refuse (str "a plan's path must be " (pr-str proto/path)
+                 ", got " (pr-str (get plan :path))
+                 " — this client sends the draft request and nothing else")))
+  (let [body (get plan :body-json)]
+    (when-not (and (string? body) (not= "" body))
+      (refuse "a plan must carry a non-empty :body-json string"))
+    (let [parsed (decoded body)
+          payments (when (map? parsed) (get parsed "payments"))]
+      (when-not (and (sequential? payments) (not (empty? payments)))
+        (refuse "a plan's body must carry at least one payment — the API creates no draft for none"))
+      body)))
+
+(defn create-draft
+  "POST /payment-drafts from a plan, against the sandbox. → the outcome map.
+
+   On 2xx the result carries `:id` beside `:data`: the id is the point of the
+   response, because it is what reading or deleting the draft later needs. A 2xx
+   without one is refused rather than passed on as success.
+
+   The POST goes out ONCE. Nothing here retries, and nothing here can be made
+   to: a caller who wants a retry owns the problem, because a retried create is
+   a second draft."
+  ([plan token] (create-draft plan token {}))
+  ([plan token opts]
+   (let [bearer (access-token token)
+         body (planned-body plan)
+         r (outcome (send opts (request "POST" proto/path bearer body)))]
+     (if (get r :ok)
+       (let [id (get (:data r) "id")]
+         (if (and (string? id) (not= "" id))
+           (assoc r :id id)
+           {:ok false :error :no-id :status (:status r)
+            :detail "a 2xx without an id — a draft that cannot be named is not a created draft"}))
+       r))))

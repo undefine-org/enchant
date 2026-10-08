@@ -1,0 +1,360 @@
+; test/bl/revolut_business_prototype_test.bl — the draft planner's contract.
+; Run: bl test test/bl/revolut_business_prototype_test.bl
+;
+; ── Provenance ───────────────────────────────────────────────────────────────
+; The official reference fixes the shape these tests pin:
+;   https://developer.revolut.com/docs/api/business/operations/create-payment-draft
+; POST /payment-drafts takes `title?` and `payments[]` of
+; `{account_id, receiver:{counterparty_id, account_id}, amount, currency,
+; reference}`, and "you can specify only one account ID for multiple payments in
+; the same payment draft".
+;
+; Two properties are PLANNER properties and are pinned hardest:
+;
+; 1. THE AMOUNT IS A JSON NUMBER. `42.75` crosses as the six bytes
+;    `42.75`, not as `"42.75"` and not through a float. Money read as a
+;    string is accepted by a lenient receiver and means something else.
+; 2. STRINGS ARE ENCODED, NOT INTERPOLATED. A reference containing a quote, a
+;    brace or a newline survives a decode unchanged and adds no structure.
+;
+; Nothing here calls the network. A plan is a value, and the sandbox client's
+; tests hand it a transport that records the request instead of sending one.
+
+(ns revolut-business.prototype-test
+  (:require [revolut-business.prototype :as rb]
+            [revolut-business.sandbox :as sandbox]
+            [bl.json :as json]))
+
+(defn- plan-one
+  "The smallest well-formed draft, with `over` merged over it."
+  [over]
+  (rb/plan-draft
+    (merge {:account-id "acct-payer"
+            :payments [{:counterparty-id "cp-1"
+                        :beneficiary-account-id "cp-acct-1"
+                        :amount 4275
+                        :reference "INV-1"}]}
+           over)))
+
+(defn- payment-of
+  "The first payment of a plan's decoded body."
+  [plan]
+  (first (get (json/decode (:body-json plan)) "payments")))
+
+;; ── the request line ────────────────────────────────────────────────────────
+
+(deftest a-plan-names-the-documented-request
+  (let [p (plan-one {})]
+    (is (= "POST" (:method p)))
+    (is (= "/payment-drafts" (:path p)))
+    (is (= "WRITE" (:scope p)) "a draft is WRITE; PAY is initiating a transaction")
+    (is (= "EUR" (:currency p)))
+    (is (= ["42.75"] (:amounts p)))
+    (is (= 4275 (:total-cents p)))))
+
+(deftest a-plan-holds-no-credential
+  ; The planner never holds a token, so no key it returns can carry one. The
+  ; exact key set is the guard: a credential field added later fails here.
+  (is (= #{:method :path :scope :currency :account-id :title :amounts
+           :total-cents :body-json :preview}
+         (set (keys (plan-one {}))))))
+
+;; ── the body ────────────────────────────────────────────────────────────────
+
+(deftest the-body-is-the-documented-shape
+  (let [p (plan-one {:title "September"})
+        body (json/decode (:body-json p))
+        payment (payment-of p)]
+    (is (= "September" (get body "title")))
+    (is (= 1 (count (get body "payments"))))
+    (is (= "acct-payer" (get payment "account_id")))
+    (is (= "cp-1" (get-in payment ["receiver" "counterparty_id"])))
+    (is (= "cp-acct-1" (get-in payment ["receiver" "account_id"]))
+        "the beneficiary account is always explicit, so an ambiguous counterparty cannot be guessed at")
+    (is (= "EUR" (get payment "currency")))
+    (is (= "INV-1" (get payment "reference")))))
+
+(deftest the-title-is-optional
+  (is (not (contains? (json/decode (:body-json (plan-one {}))) "title"))
+      "an absent title is absent from the body, not null")
+  (is (= "T" (get (json/decode (:body-json (plan-one {:title "T"}))) "title")))
+  (is (thrown? (plan-one {:title ""}))))
+
+(deftest one-payer-covers-every-payment-in-the-draft
+  ; The API's rule, made structural: the payer is an argument of the DRAFT, so
+  ; two payments cannot come from two accounts.
+  (let [p (rb/plan-draft
+            {:account-id "acct-payer"
+             :payments [{:counterparty-id "cp-1" :beneficiary-account-id "b-1"
+                         :amount 100 :reference "INV-1"}
+                        {:counterparty-id "cp-2" :beneficiary-account-id "b-2"
+                         :amount 250 :reference "INV-2"}]})
+        body (json/decode (:body-json p))
+        ids (map (fn [pay] (get pay "account_id")) (get body "payments"))]
+    (is (= 2 (count (get body "payments"))))
+    (is (= ["acct-payer" "acct-payer"] (vec ids)))
+    (is (= ["1.00" "2.50"] (:amounts p)))
+    (is (= 350 (:total-cents p)))
+    (is (= ["cp-1" "cp-2"]
+           (vec (map (fn [pay] (get-in pay ["receiver" "counterparty_id"]))
+                     (get body "payments")))))))
+
+;; ── the amount is a number ──────────────────────────────────────────────────
+
+(deftest the-amount-is-a-json-number-not-a-string
+  (let [p (plan-one {})
+        body (:body-json p)
+        amount (get (payment-of p) "amount")]
+    (is (includes? body "\"amount\":42.75") "the exact decimal, unquoted")
+    (is (not (includes? body "\"42.75\"")) "never a JSON string")
+    (is (number? amount))
+    (is (not (string? amount)))
+    (is (= 42.75 amount))))
+
+(deftest cents-are-formatted-exactly
+  (are [cents text] (= text (rb/cents->decimal cents))
+    1       "0.01"
+    5       "0.05"
+    99      "0.99"
+    100     "1.00"
+    4275   "42.75"
+    1000000 "10000.00"))
+
+(deftest a-decimal-string-is-parsed-strictly
+  (are [amount cents] (= cents (rb/amount-cents amount))
+    "42.75" 4275
+    "1.2"    120
+    "1"      100
+    "0.05"   5
+    4275    4275))
+
+(deftest a-bad-amount-is-refused
+  (is (thrown? (rb/amount-cents 1.5)) "a float is not exactly representable")
+  (is (thrown? (rb/amount-cents 0)))
+  (is (thrown? (rb/amount-cents -1)))
+  (is (thrown? (rb/amount-cents "1.234")) "three places would round")
+  (is (thrown? (rb/amount-cents "1.2.3")))
+  (is (thrown? (rb/amount-cents "-1")))
+  (is (thrown? (rb/amount-cents "1e3")))
+  (is (thrown? (rb/amount-cents "abc")))
+  (is (thrown? (rb/amount-cents "")))
+  (is (thrown? (rb/amount-cents nil))))
+
+;; ── encoding, not interpolation ─────────────────────────────────────────────
+
+(deftest strings-are-encoded-not-interpolated
+  ; Braces, quotes and a newline in a reference or a counterparty id must come
+  ; back byte-for-byte, and must add no keys and no payments on the way.
+  (let [reference "INV \"7\" \\ }; {\n\tX"
+        counterparty "cp}],\"x\":{\""
+        p (plan-one {:payments [{:counterparty-id counterparty
+                                 :beneficiary-account-id "b-1"
+                                 :amount 1
+                                 :reference reference}]})
+        body (json/decode (:body-json p))
+        payment (payment-of p)]
+    (is (= reference (get payment "reference")))
+    (is (= counterparty (get-in payment ["receiver" "counterparty_id"])))
+    (is (= 1 (count (get body "payments")))
+        "the injected braces did not become structure")
+    (is (= 2 (count (keys (get-in payment ["receiver"])))))))
+
+;; ── what is refused ─────────────────────────────────────────────────────────
+
+(deftest a-missing-beneficiary-account-is-refused
+  (is (thrown? (plan-one {:payments [{:counterparty-id "cp-1"
+                                      :amount 1
+                                      :reference "INV-1"}]}))
+      "an explicit beneficiary account is required, never defaulted")
+  (is (thrown? (plan-one {:payments [{:counterparty-id "cp-1"
+                                      :beneficiary-account-id ""
+                                      :amount 1
+                                      :reference "INV-1"}]}))))
+
+(deftest empty-identifiers-and-references-are-refused
+  (is (thrown? (rb/plan-draft {:account-id ""
+                               :payments [{:counterparty-id "cp-1"
+                                           :beneficiary-account-id "b-1"
+                                           :amount 1 :reference "r"}]})))
+  (is (thrown? (rb/plan-draft {:payments [{:counterparty-id "cp-1"
+                                           :beneficiary-account-id "b-1"
+                                           :amount 1 :reference "r"}]}))
+      "no payer at all")
+  (is (thrown? (plan-one {:payments [{:counterparty-id ""
+                                      :beneficiary-account-id "b-1"
+                                      :amount 1 :reference "r"}]})))
+  (is (thrown? (plan-one {:payments [{:counterparty-id "cp-1"
+                                      :beneficiary-account-id "b-1"
+                                      :amount 1 :reference ""}]})))
+  (is (thrown? (plan-one {:account-id " acct-payer"}))
+      "a padded ID is a different ID"))
+
+(deftest a-draft-with-no-payments-is-refused
+  (is (thrown? (rb/plan-draft {:account-id "a" :payments []})))
+  (is (thrown? (rb/plan-draft {:account-id "a"}))))
+
+;; ── the preview ─────────────────────────────────────────────────────────────
+
+(deftest the-preview-shows-the-exact-amount
+  (let [p (plan-one {})]
+    (is (includes? (:preview p) "/payment-drafts"))
+    (is (includes? (:preview p) "EUR 42.75"))
+    (is (includes? (:preview p) "WRITE"))))
+
+(deftest the-preview-escapes-untrusted-identifiers
+  (let [p (plan-one {:account-id "payer\n  forged account"
+                     :payments [{:counterparty-id "cp\n  forged payment"
+                                 :beneficiary-account-id "b-1"
+                                 :amount 1
+                                 :reference "INV-1"}]})]
+    (is (not (includes? (:preview p) "\n  forged account")))
+    (is (not (includes? (:preview p) "\n  forged payment")))
+    (is (includes? (:preview p) "\\n  forged payment"))))
+
+
+;; ── the sandbox client ──────────────────────────────────────────────────────
+;
+; No test here opens a socket. `opts` carries a transport that RECORDS the
+; request it was handed and answers what the test decides, which is what pins
+; the method, the URL, the headers and the body exactly — and what proves that a
+; refusal never reached the wire at all.
+
+(def SANDBOX "https://sandbox-b2b.revolut.com/api/1.0")
+
+(defn- recording
+  "A transport that records the request and answers `resp`."
+  [seen resp]
+  (fn [req] (reset! seen req) resp))
+
+(deftest the-client-points-at-the-sandbox-and-nowhere-else
+  (is (= SANDBOX sandbox/base-url))
+  (is (not (includes? sandbox/base-url "https://b2b.revolut.com"))
+      "the production host is a different string, and no option spells it"))
+
+(deftest accounts-reads-the-documented-url
+  (let [seen (atom nil)
+        r (sandbox/accounts "tok-read"
+            {:transport (recording seen {:status 200 :body "[{\"id\":\"acct-1\"}]"})})
+        req (deref seen)]
+    (is (= "GET" (get req :method)))
+    (is (= (str SANDBOX "/accounts") (get req :url)))
+    (is (= [["authorization" "Bearer tok-read"] ["accept" "application/json"]]
+           (get req :headers)))
+    (is (nil? (get req :content-type)) "a GET carries no content type")
+    (is (nil? (get req :body)))
+    (is (= true (get r :ok)))
+    (is (= 200 (get r :status)))
+    (is (= "acct-1" (get (first (get r :data)) "id")))))
+
+(deftest counterparties-reads-the-documented-url
+  (let [seen (atom nil)
+        r (sandbox/counterparties "tok-read"
+            {:transport (recording seen {:status 200 :body "[]"})})
+        req (deref seen)]
+    (is (= "GET" (get req :method)))
+    (is (= (str SANDBOX "/counterparties") (get req :url)))
+    (is (= [["authorization" "Bearer tok-read"] ["accept" "application/json"]]
+           (get req :headers)))
+    (is (= true (get r :ok)))
+    (is (= [] (get r :data)) "an empty page is the API's `nothing matched`, not an error")))
+
+(deftest the-draft-post-carries-the-planned-body
+  (let [plan (plan-one {})
+        seen (atom nil)
+        r (sandbox/create-draft plan "tok-draft"
+            {:transport (recording seen {:status 201 :body "{\"id\":\"draft-1\"}"})})
+        req (deref seen)]
+    (is (= "POST" (get req :method)))
+    (is (= (str SANDBOX "/payment-drafts") (get req :url)))
+    (is (= [["authorization" "Bearer tok-draft"] ["accept" "application/json"]]
+           (get req :headers)))
+    (is (= "application/json" (get req :content-type)))
+    (is (= (:body-json plan) (get req :body)) "the planner's own bytes, unrewritten")
+    (is (= true (get r :ok)))
+    (is (= 201 (get r :status)))
+    (is (= "draft-1" (get r :id)))
+    (is (= "draft-1" (get (get r :data) "id")))))
+
+(deftest no-result-carries-the-token
+  (let [seen (atom nil)
+        ok (sandbox/accounts "tok-secret"
+             {:transport (recording seen {:status 200 :body "[]"})})
+        bad (sandbox/create-draft (plan-one {}) "tok-secret"
+              {:transport (recording seen {:status 400 :body "{\"message\":\"no\"}"})})]
+    (is (not (includes? (pr-str ok) "tok-secret")))
+    (is (not (includes? (pr-str bad) "tok-secret")))
+    (let [echo (sandbox/accounts "tok-secret"
+                 {:transport (fn [_] {:status 403 :body "Bearer tok-secret denied"})})]
+      (is (= 403 (:status echo)))
+      (is (not (includes? (pr-str echo) "tok-secret"))))))
+
+(deftest a-refusal-keeps-status-but-redacts-provider-body
+  (let [r (sandbox/create-draft (plan-one {}) "tok-draft"
+            {:transport (fn [_] {:status 400 :body "{\"message\":\"bad amount\"}"})})]
+    (is (= false (get r :ok)))
+    (is (= :http (get r :error)))
+    (is (= 400 (get r :status)))
+    (is (= "Revolut returned a non-success HTTP status" (get r :detail)))
+    (is (not (contains? r :body)) "provider bodies are not echoed to callers")))
+
+(deftest a-204-is-not-a-created-draft
+  ; The API answers 204 for `no payments provided`. That is a draft that does
+  ; not exist, so it must not read as success.
+  (let [r (sandbox/create-draft (plan-one {}) "tok-draft"
+            {:transport (fn [_] {:status 204 :body ""})})]
+    (is (= false (get r :ok)))
+    (is (= :no-content (get r :error)))
+    (is (= 204 (get r :status)))
+    (is (not (contains? r :id)))
+    (is (not (contains? r :data)))))
+
+(deftest a-dead-socket-is-not-empty-data
+  (let [read-r (sandbox/accounts "tok-read"
+                 {:transport (fn [_] {:status 0 :body "{:error, :timeout}"})})
+        write-r (sandbox/create-draft (plan-one {}) "tok-draft"
+                  {:transport (fn [_] {:status 0 :body "{:error, :timeout}"})})]
+    (is (= :transport (get read-r :error)))
+    (is (zero? (get read-r :status)))
+    (is (not (contains? read-r :data)))
+    (is (= :transport (get write-r :error)))
+    (is (not (contains? write-r :id)))))
+
+(deftest an-empty-2xx-is-not-success
+  (let [r (sandbox/accounts "tok-read" {:transport (fn [_] {:status 200 :body ""})})]
+    (is (= false (get r :ok)))
+    (is (= :empty (get r :error)))))
+
+(deftest a-draft-post-goes-out-exactly-once
+  (let [n (atom 0)
+        t (fn [_] (swap! n inc) {:status 500 :body "boom"})]
+    (sandbox/create-draft (plan-one {}) "tok-draft" {:transport t})
+    (is (= 1 (deref n)) "a retried create is a second draft")))
+
+(deftest a-plan-for-another-request-is-refused-before-the-wire
+  (let [seen (atom nil)
+        t (recording seen {:status 201 :body "{\"id\":\"draft-1\"}"})]
+    (is (thrown? (sandbox/create-draft (assoc (plan-one {}) :path "/transfers")
+                                       "tok-draft" {:transport t})))
+    (is (thrown? (sandbox/create-draft (assoc (plan-one {}) :method "GET")
+                                       "tok-draft" {:transport t})))
+    (is (thrown? (sandbox/create-draft {:method "POST" :path "/payment-drafts"
+                                        :body-json "{\"payments\":[]}"}
+                                       "tok-draft" {:transport t}))
+        "a body with no payments is refused here, so 204 is never forced")
+    (is (thrown? (sandbox/create-draft {:method "POST" :path "/payment-drafts"
+                                        :body-json "not json"}
+                                       "tok-draft" {:transport t})))
+    (is (thrown? (sandbox/create-draft "not a plan" "tok-draft" {:transport t})))
+    (is (nil? (deref seen)) "nothing was sent")))
+
+(deftest a-blank-or-padded-token-is-refused-before-the-wire
+  (let [seen (atom nil)
+        t (recording seen {:status 200 :body "[]"})]
+    (is (thrown? (sandbox/accounts "" {:transport t})))
+    (is (thrown? (sandbox/accounts "   " {:transport t})))
+    (is (thrown? (sandbox/accounts " tok" {:transport t})))
+    (is (thrown? (sandbox/accounts nil {:transport t})))
+    (is (thrown? (sandbox/accounts "tok\r\nforged: value" {:transport t})))
+    (is (thrown? (sandbox/create-draft (plan-one {}) "" {:transport t})))
+    (is (nil? (deref seen)) "no usable token, no request")))
+
