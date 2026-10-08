@@ -1,0 +1,49 @@
+#+TITLE: beam-lisp--adding-a-collection-type-mean
+
+** ITEM beam-lisp: adding a collection type means threading ~20 RT clauses
+:PROPERTIES:
+:CUSTOM_ID: CON-beam-lisp--adding-a-collection-type-mean
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-21T02:01:16Z
+:END:
+:RELATIONS:
+ABOUT: PLAN-033-datomic-in-elixir-eav-datalog-layer-over
+ABOUT: BUG-004-reader-quoted-keyword-literal-silently-m
+ABOUT: BUG-005-index-keys-must-not-be-tuples-vectors-er
+:END:
+Adding a new collection struct to beam-lisp (PLAN-033 wave 1 added SortedMap/SortedSet) is not "write the type" — it is threading it through every shared chokepoint, and the failures are SILENT.
+
+## The struct-is-a-map hazard
+
+A struct IS a map on the BEAM. Every RT fn with an `is_bl_map(x)` or generic `%{__struct__: mod}` clause will swallow a new collection type and read its STRUCT FIELDS instead of its contents. `lib/beam_lisp/guards.ex` documents this; the practical consequence is that each new clause must be placed ABOVE the generic ones.
+
+Sites that needed clauses: get/3 first/1 rest/1 next/1 conj/2 count/1 seq/1 contains?/2 coll?/1 map?/1 set?/1 find/2 assoc/3 disj/2 rank/1 seqable/1 transientable?/1 print_str/1 peek/1 pop/1.
+
+`find/2` regressed exactly this way and returned nil for keys that EXIST. Caught by probe, not by reading the diff.
+
+## Definitions may live in core.bl, not rt.ex
+
+`peek`/`pop` are defined in `priv/core.bl`. Elixir clauses added to `RT.peek/1` were DEAD CODE for every `.bl` caller. Before fixing a fn's behaviour, `grep -n "defn <name>" priv/core.bl` — the .bl definition wins.
+
+## Do not invent a second total order
+
+`BeamLisp.RT.compare/2` (+ its private `rank/1`) is the authoritative Clojure order. A sorted collection's key encoder must PROJECT that order, not define its own. The first version invented ranks and disagreed in three places (false vs 0, keywords vs strings, true vs 1). Two competing definitions of "sorted" is how an index silently returns wrong rows.
+
+Test that catches it: cross-check every pair from a mixed value set against `RT.compare`, plus assert `sorted-set == RT.sort(values)`.
+
+## Never use a bare atom as an internal sentinel
+
+`:unbounded` as a raw range marker made the legal keyword `:unbounded` unusable as a bound — a scan for it silently returned the whole collection. Tag it: `{:bound, k} | :unbounded`, translated at the RT boundary so no user value can forge it.
+
+## Erlang order != Clojure order (and ETS uses Erlang's)
+
+ETS `:ordered_set` walks in ERLANG term order. Any bound check against a cursor position must use `erlang/>` etc., NOT beam-lisp `compare`. They disagree (Erlang: atoms before binaries; Clojure: strings before keywords), and mixing them made range scans truncate early — returning a SUBSET, which no filter above can recover.
+
+## Erlang orders tuples by ARITY before content
+
+`{:eavt} < {:aevt, 1, :age}` is true. So tuple/vector keys cannot support prefix range bounds: both a short lower bound and a short upper bound sort before all longer keys, and the scan window closes before it opens (returns nothing). Index keys need a flat order-preserving encoding (FoundationDB tuple-layer style). Recorded as BUG-005.
+
+## Reader gap
+
+`:"quoted keyword"` misparses into TWO forms (`:""` + a string) rather than one keyword or an error. Workaround: `(keyword "name")`. Recorded as BUG-004.

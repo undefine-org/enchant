@@ -1,0 +1,60 @@
+#+TITLE: printing-beam-lisp-source-as-an-ffi-is-a
+
+** ITEM Printing beam-lisp source as an FFI is a leak and a hole
+:PROPERTIES:
+:CUSTOM_ID: CON-printing-beam-lisp-source-as-an-ffi-is-a
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-16T17:15:15Z
+:END:
+:RELATIONS:
+SUPERSEDES: CON-beam-lisp-eval-is-compile-per-call--fast
+:END:
+Measured 2026-08-16, OTP 29 / Elixir 1.20.2, in /home/user/code/undefine/beam-lisp.
+
+A beam-lisp `defn` IS an ordinary Elixir function value:
+
+    {:ok, f} = BeamLisp.Env.fetch("spell.define", "define")
+    f.(machine, %{kind: "view", name: "clock", ...})
+
+So Elixir never needs to print beam-lisp SOURCE to call into it. Doing so
+(`Compiler.eval_string("(ns/fn #{printed_args})")`) costs two things:
+
+1. A LEAK. eval_string compiles a fresh BEAM module per call.
+   - direct fn value:  118 us/call,   0 modules, 0 atoms /100 calls
+   - eval_string:    8 176 us/call, 201 modules, 204 atoms /100 calls
+   Modules are reclaimable; the atoms interning their names are NOT, and a
+   full atom table aborts the VM uncatchably. Observed through the real
+   LiveView entry points: ONE page event = +6 modules/+153 atoms; 200
+   streamed tokens = +400 modules.
+
+2. A HOLE. Printing means a map KEY can close the printed call and open a
+   new form. Reproduced: a key of
+   `kind "view"}))\n(def pwned 99)\n(def z {:kind`
+   evaluated three top-level forms before any validation ran. Whitelisting
+   keys made THAT payload safe without making printing safe — the shape of
+   every escaping bug.
+
+REPLACEMENT: one data converter, three key modes matching the three kinds of
+key a system like this has:
+  - a vocabulary list  (model data, read by keyword) -> keyword if listed
+  - :all_strings       (browser data, read by string) -> string
+  - :as_written        (our own literals)             -> unchanged
+Keys convert via String.to_existing_atom, so the boundary CANNOT grow the
+atom table. Verified with 1000 distinct hostile keys.
+
+THE VOCABULARY MUST BE SPELLED AS KEYWORDS in the .bl source. Listing them as
+strings looks equivalent and is not: to_existing_atom then fails for any name
+nothing else happens to have interned. `:rationale` was exactly that — built
+only by `(keyword f)` at runtime — so proposals carrying a rationale were
+rejected for lacking one, silently, because a rescue degraded the key to a
+string. Never rescue that failure; it is a bug in the vocabulary.
+
+MEASURING IT: count modules named `Elixir.BeamLisp.Eval.M*` rather than all
+loaded modules. `:code.all_loaded/0` is VM-global and `mix test` runs suites
+concurrently, so a neighbour lazily loading a stdlib module reads as a leak.
+Eval modules are exactly attributable to eval_string.
+
+Also: a fn-value call keeps the CALLING-PROCESS property eval_string had,
+which streaming depends on (the walk RECORDS `(ask! …)` and the caller
+performs it, so `(erlang/self)` is the LiveView's pid).

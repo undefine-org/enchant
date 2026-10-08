@@ -1,0 +1,27 @@
+#+TITLE: datom-migration-system--with--tx-fns--pl
+
+** ITEM datom migration system: with, tx-fns, plan against prod
+:PROPERTIES:
+:CUSTOM_ID: CON-datom-migration-system--with--tx-fns--pl
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-27T01:42:56Z
+:END:
+:RELATIONS:
+DISTILLED_FROM: org://PLAN-043-datom-migration-system-with-tx-fns-prod
+:END:
+PLAN-043 shipped a full schema-migration system for datom (beam-lisp), built on two new primitives + a namespace.
+
+ARCHITECTURE:
+- datom.conn/with = speculative transaction: runs run-tx-pipeline (extracted, shared with transact! so a preview cannot drift from the real tx) over an OverlayStore, advances no basis, returns {:db-after ...}. OverlayStore (priv/datom/store-overlay.bl) = read-through base + speculative buffer atom. KEY: datom writes are ALL :put of NEW keys (op is in the key; retraction is a new key, never a store -delete), so overlay never needs base-masking — zero copy.
+- datom.tx/expand-tx-fns = :db/fn support: [:db/fn f & args] runs f against the tx before-value, splices output through the SAME resolve/validate/realize/commit path. f = direct fn value OR registry name (register-fn!/registered-fn, process-wide Agent). Recurses (fn may return maps, [:db/add], or another :db/fn). Wired into run-tx-pipeline which now takes db-before.
+- datom.migrate: migration = {:migration/id :grows :checks :fn}. plan(db-value) reports breakage present in data (deploy gate, takes a VALUE so it runs against a prod replica). plan-with(conn) previews residual AFTER remediation via with. apply!(conn) = gated (blocks if remediation insufficient) + atomic (remediation + schema-deltas-as-tempid-maps + ledger-stamp in ONE transact!) + idempotent (ledger is a query [?m :migration/id ?id]). apply-all!/apply-batched! for online.
+
+CRITICAL DISCOVERIES (by probing, not assertion):
+1. Schema deltas as TEMPID MAPS {:db/id -1 :db/ident :x ...} UPSERT on :db/ident (unique/identity) → 1 attr entity, idempotent. But install-schema!'s raw :db/add path creates a NEW attr entity per call (3 after 2 installs) — NOT datom-idempotent. So migrations MUST write schema as tempid maps, and each grow def needs a DISTINCT tempid (-10,-11,...): sharing one across two identity idents makes resolver try to unify two attr entities → "undefined var: datom.tx/tempid".
+2. LATENT BUG FIXED in conn.bl backfill-newly-indexed!: it re-indexed from a RAW store scan (datom.index/scan), which returns TOMBSTONED assertions (retraction appends, never deletes). So a migration retracting a value AND indexing the attr in one commit had its retraction RESURRECTED by the backfill. Fix: backfill from a basis/retraction-filtered db value (datom.db/datoms (db-value store after basis) :aevt a). Predated migrations; only retract+index-in-one-commit reached it.
+3. datom/q returns a SET of tuples — NOT indexable by (get _ 0). Use (get (first set) 0).
+4. install-schema! validates only definition SHAPE, not existing data (more permissive than Datomic-JVM which aborts). So datom.migrate/plan IS the safety backstop, not a convenience.
+5. redb frees its file handle on GC → immediate same-VM file reopen races the collector ("Database already open"). Test durability by REUSING the store handle (connect-with store), like conformance's reopening tests — exercises recover-from-datoms without the lock.
+
+Result: 822 bl tests 0 failures (+16 with, +10 txfn, +15 migrate, +4 durable). Full ACID on redb single-node. Q3 (walk prod, know breakage pre-deploy) is the feature the value model uniquely affords — Ecto/Rails/Prisma structurally cannot.

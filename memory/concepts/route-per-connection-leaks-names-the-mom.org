@@ -1,0 +1,38 @@
+#+TITLE: route-per-connection-leaks-names-the-mom
+
+** ITEM Route-per-connection leaks names the moment a proxy reuses the connection
+:PROPERTIES:
+:CUSTOM_ID: CON-route-per-connection-leaks-names-the-mom
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-09-15T15:36:14Z
+:END:
+:RELATIONS:
+ABOUT: PLAN-105-names-instead-of-ports
+:END:
+A reverse proxy that routes once per CONNECTION and then splices bytes opaquely is correct for direct traffic — a browser opens a connection per origin — and WRONG the moment a proxy client is involved, because proxies reuse one connection for many hosts.
+
+Measured on this repo's gateway (routing by `Host:`, then a raw splice):
+
+```
+separate connections   : web.beam-lisp.test → 200,  nope.beam-lisp.test → 404   (routing is real)
+one connection, two names: web → 200, nope → 200 + WEB'S BODY   ← name leak
+```
+
+The second request was never routed; it was spliced to the first name's backend. That is a security-shaped bug, not an efficiency one: name A's app answers name B, so cookies, auth state and sessions cross a boundary the user never crossed.
+
+**Two things make it visible, and both are worth doing before claiming a proxy works:**
+1. assert on *content*, not status — both requests returned `200`, so a status-only check proves nothing;
+2. drive the **same connection** twice with different names. `curl` cannot do this; ~15 lines of python sockets can.
+
+**Fix that keeps the opaque splice.** For proxy-style requests (absolute-form request line, `GET http://name/path HTTP/1.1`):
+- rewrite the request line to origin-form and replace `host:` with the authority — RFC 9112 §3.2.2: in absolute-form the authority *overrides* the Host header, and the backend must never see the other name;
+- force `connection: close` so the backend ends the connection after one response, and the client must open a new one where routing is decided again.
+
+Forcing a close is how you say "one request per route" without teaching the gateway to parse HTTP framing — the framing stays the backend's job, which is the whole reason the splice can be opaque.
+
+Corollaries:
+- keep the direct path untouched: origin-form traffic is one origin per connection, so closing it would only cost keep-alive. Test that explicitly, or the fix silently taxes normal browsing.
+- `https://` absolute-form must NOT be rewritten — TLS through a proxy is CONNECT's job; rewriting it would speak plaintext to a TLS-only backend.
+- a proxy on a non-default port also needs the client's URL untouched, which is what the PAC does: `*.test` → `PROXY 127.0.0.1:7777`, everything else `DIRECT`. In Chrome, `<-loopback>` is needed for the *system-proxy* path because loopback is implicitly bypassed; with `--proxy-pac-url` it was not.
+- the fake backend in tests must honour `connection: close`, or the test proves the fake's behaviour instead of the gateway's.

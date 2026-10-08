@@ -1,0 +1,44 @@
+#+TITLE: semantic-similarity-and-graph-ml-in-the-
+
+** ITEM Semantic similarity and graph-ML in the beam-lisp datom store
+:PROPERTIES:
+:CUSTOM_ID: CON-semantic-similarity-and-graph-ml-in-the-
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-27T03:01:15Z
+:END:
+:RELATIONS:
+:END:
+FEAT-024: native semantic similarity + graph ML + GraphRAG on the Datomic-style datom store, built as an EXTENSION of PLAN-042's columnar engine.
+
+## Architecture
+- A vector is a datom (:db.type/vector, a DVec = dim + packed normalised f32 body). Durable, time-travelable, transactional like any fact.
+- Similarity is NOT a 5th sorted index (no order-preserving key for metric space) — it is a new ACCESS METHOD beside the ordered ones. A generating datalog clause.
+- Vector math in Rust (native/datom_vector crate, own init! — separate from datom_redb because vector math is backend-agnostic, works on ETS too). DB semantics (which datoms are current) stay in bl via datom.db/attr-datoms (basis/retraction aware). Only arithmetic crosses to Rust.
+
+## Method (Prototype A, measured)
+Binary quantization (sign bits, XOR+popcount coarse pass) + exact f32 rerank. ~100x @100k, ~75x @1M vs flat, 768-dim. Recall a tunable rerank knob. search_flat kept as exact path.
+GOTCHA: synthetic isotropic Gaussian vectors in high-dim are ~orthogonal -> recall becomes coin-flip. Must use clustered/manifold generator + leave-one-out + averaged-over-many-queries to measure recall honestly.
+
+## Clause surface (all generating clauses, join with facts + aggregation)
+[(similar-to :attr ?q k) [?e ?score]] — free ?e generates kNN, bound ?e PREFILTERS (scores only candidate set).
+[(cluster :attr {:k n}) [?e ?c]] — k-means++. [(project-2d :attr) [?e ?x ?y]] — PCA. [(community :ref) [?e ?comm]] — label propagation. [(components :ref) [?e ?comp]] — union-find.
+
+## Critical correctness lessons (from review)
+1. bound-?e prefilter requires PLANNER cooperation: an analytic clause whose only arg-input is bound (e.g. ?q via :in) runs FIRST (global top-k) unless the planner DEFERS it behind a SELECTIVE pattern (constant value slot) that binds its output entity. Deferring behind a NON-selective projection pattern breaks kNN (k-per-entity). The heuristic: defer only behind patterns with a constant in value position.
+2. Label propagation MUST be asynchronous (in-place sweep) — synchronous oscillates forever on bipartite graphs.
+3. NIF over packed bytes: aggregate length check is insufficient — validate EACH body length or mixed dims misalign rows (score wrong entity). Validate at both the bl corpus builder AND schema write.
+4. select_nth_unstable_by(m-1) underflows on empty — guard n==0.
+
+## Structured LLM output the beam-lispy way
+semantic.shape: declare a shape ONCE as data (shared type tokens :string/:integer/:enum/:list/maps), derive BOTH the Gemini responseSchema AND a validator from the same declaration. 'One definition, many shapes' (docs/auth-downstream-a-breeze.md, the defresource vision). gemini/generate-structured passes derived schema directly, validates reply before caching. Entity extraction returns DATA not prose.
+
+## GraphRAG (examples 11-15, Holmes canon)
+ingest (embed passages) -> naive-rag (shows global-question wall) -> entity-graph (structured extraction -> datoms) -> communities (detect + summarise) -> graphrag (LOCAL = vectors+graph join, GLOBAL = community-summary synthesis). All 5 GraphRAG needs (vectors, graph, communities, aggregation, consistency) are ONE datom store.
+
+## Gemini bridge
+httpc (inets, on code path — Req is NOT loaded). embed: gemini-embedding-001, 768-dim Matryoshka, task-typed. generate: gemini-3.6-flash. Disk cache keyed by sha256 — embed/extract once, offline after. httpc status is element 2 of the status-line tuple {HttpVersion, Code, Reason}.
+
+## Files
+native/datom_vector/src/lib.rs; priv/datom/vector.bl; priv/datom/query/analytic.bl; priv/datom/query/{engine,parse,plan}.bl (analytic routing + deferral); priv/datom/schema.bl (:db.type/vector); examples/semantic/{shape,gemini,corpus-util,holmes-graph,embed}.bl + 01-15.
+Tests: test/bl/datom/{vector,shape}_test.bl. 396 datom tests / 887 assertions green.

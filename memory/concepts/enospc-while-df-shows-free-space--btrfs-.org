@@ -1,0 +1,65 @@
+#+TITLE: enospc-while-df-shows-free-space--btrfs-
+
+** ITEM ENOSPC while df shows free space: btrfs metadata exhaustion, and how to tell it apart
+:PROPERTIES:
+:CUSTOM_ID: CON-enospc-while-df-shows-free-space--btrfs-
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-09-15T13:54:31Z
+:END:
+:RELATIONS:
+ABOUT: PLAN-105-names-instead-of-ports
+:END:
+Observed 2026-09-13 on this workstation (`/home` = btrfs on `/dev/nvme0n1p2`, 775G, 663G used).
+
+SYMPTOM — and the reason it wastes an hour if you trust `df`
+
+`df -h /home` says **113G free**, and writing a NEW file works. But:
+
+* `edit` on ANY target — even a 6-byte scratch file — fails `I/O error: No space left on device (os error 28)`;
+* `create --force` over an existing file fails the same way;
+* `mix compile` fails with `could not rename from _build/…/build.log.tmp … : no space left on device`.
+
+DIAGNOSIS (one command, and it is the only one that tells the truth here)
+
+```
+$ btrfs filesystem usage /home
+    Device size:             774.97GiB
+    Device allocated:        774.97GiB
+    Device unallocated:          1.02MiB     ← the whole problem
+    Metadata, DUP: Size:16.51GiB, Used:16.00GiB (96.92%)
+```
+
+`df` reports *free extents inside allocated chunks*; ENOSPC here comes from **metadata** needing a
+new chunk while the device has no unallocated space left to put one in. Operations that need
+fresh metadata — rename, reflink/`FICLONE`, snapshot, creating a directory entry — fail;
+overwriting existing extents keeps working. That asymmetry is the tell: reads fine, new files
+fine, *renames* and *snapshot-based writers* dead. Tools that snapshot-on-write (which is how
+most editors and the spell edit tool implement safe writes) die on `ENOSPC` while the filesystem
+looks two-thirds empty.
+
+A plain `rm` does NOT fix it quickly: btrfs returns space to the unallocated pool only when a
+whole chunk empties, so freeing 594MB moved `Device unallocated` by zero. Freeing ~1GiB in one
+place may empty a data chunk; the reliable fix is a balance.
+
+FIX (root)
+
+```
+sudo btrfs balance start -dusage=25 -musage=50 /home
+```
+
+`-musage` is the one that matters; `-dusage=25` reclaims nearly-empty data chunks first so the
+balance has somewhere to work. It rewrites chunks (slow, disk-heavy) — not something to run
+while a build or an emulator is going.
+
+WORKAROUND until then
+
+Writes that overwrite existing bytes still work: `python3` rewrite-in-place, `printf > file`,
+shell redirection. So a session can keep working by rewriting files wholesale and verifying with
+`git diff`, and must not assume the editor/`mix` paths are usable. `git` itself is fine (it
+writes loose objects — new files — but not snapshots; a commit still creates many small files,
+so expect it to be the next thing to break).
+
+Worth knowing for the whole machine: this condition is host-wide and hits every session and
+every repo at once, so "my tool suddenly refuses to write" is a disk fact here, not a bug in
+whatever you were running.

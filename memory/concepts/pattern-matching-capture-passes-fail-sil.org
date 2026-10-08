@@ -1,0 +1,68 @@
+#+TITLE: pattern-matching-capture-passes-fail-sil
+
+** ITEM Pattern-matching capture passes fail silently on reader metadata
+:PROPERTIES:
+:CUSTOM_ID: CON-pattern-matching-capture-passes-fail-sil
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-25T04:52:13Z
+:END:
+:RELATIONS:
+:END:
+beam-lisp's AOT compiler (`lib/beam_lisp/aot.ex`) lost SEVEN distinct things,
+all to one root cause. Worth recognising because the shape recurs anywhere a
+compiler pass walks a syntax tree with comprehensions.
+
+## The mechanism
+
+The capture pass is built from pattern-matching comprehensions and `Enum.reduce`
+clauses with a catch-all. Both FILTER on a non-match rather than raise. So a
+shape the reader produces but a pattern does not name simply VANISHES — no
+error, no warning, a `.beam` that loads cleanly and fails later at first use,
+somewhere else, with a message about a missing var.
+
+The reader wraps forms in `{:meta, form, position}` to carry source positions.
+It wraps them in places you do not expect:
+
+- the NAME of a def: `(def ^:private T :x)` → `{:meta, {:symbol, "T"}, _}`
+- each CLAUSE of an ns form: `(:require …)` → `{:meta, {:list, …}, _}`
+- each FLAG inside a require spec: `:refer` → `{:meta, {:keyword, "refer"}, _}`
+
+The third was the nastiest: the reducer's catch-all swallowed the wrapped
+`:refer`, leaving the `{:expecting, "refer"}` SENTINEL in the accumulator,
+which then reached a comprehension — "protocol Enumerable not implemented for
+Tuple", raised from a require clause that is perfectly well formed.
+
+∴ peel metadata at EVERY level of a form, not just the top. A `defp unmeta/1`
+applied to clauses and flags is the whole fix.
+
+## The second class: define-by-interning forms
+
+`defn`/`defmacro` become functions in the emitted module. These do NOT — each
+builds something at EVAL time and interns the result, so an AOT build wrote
+none of it to disk:
+
+    defmacro defserver defrecord deftype defprotocol defmulti
+    extend-type extend-protocol
+
+`defmacro` is subtle: a macro is a compile-time expander, so the emitted module
+correctly has no function for it — but a namespace loaded from a `.beam` still
+has to OFFER its macros to whatever compiles NEXT. Capture the FORM and re-eval
+it in `__bl_init__/0`.
+
+## The third: matching on tuple WIDTH
+
+`ns_defs` entries are `{:fixed, arity, fname, ast, meta}` — five elements. A
+four-element pattern matched nothing, so a multi-arity fn was emitted as
+`{:"$blfn", %{}, nil}`: an empty dispatch table, failing with "wrong number of
+args (1)" for an arity the module plainly exports. Single-arity fns took a
+different code path, hiding it. Match on the TAG, read by index.
+
+## The lesson that generalises
+
+When a compiler pass loses things silently, the bug is almost never in the
+logic — it is a pattern that does not name every shape the producer emits.
+And FIX THE REPORTING FIRST: `Mix.Task.Compiler` renders `%Diagnostic{}`
+structs and discards plain strings, so a failing AOT compile printed only
+mix's generic "could not compile dependency". Two real bugs hid behind that
+silence for an hour. One `Mix.shell().error/1` found both immediately.

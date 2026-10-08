@@ -1,0 +1,34 @@
+#+TITLE: beam-lisp-aot-shim-body-companion-module
+
+** ITEM beam-lisp AOT shim/body/companion module split
+:PROPERTIES:
+:CUSTOM_ID: CON-beam-lisp-aot-shim-body-companion-module
+:KIND: concept
+:CONFIDENCE: 0.6
+:CREATED: 2026-08-25T16:11:59Z
+:END:
+:RELATIONS:
+DISTILLED_FROM: EP-ed3a5a60a5e518af
+DISTILLED_FROM: EP-c2d8ef3c132fc4ea
+DISTILLED_FROM: PLAN-036
+:END:
+PROBLEM: AOT-compiling a namespace (esp. core) to .beam must behave byte-for-byte like source-loading it, INCLUDING surviving BEAM module version churn. A runtime (def) into a namespace reloads its ns module; BEAM keeps 2 versions and purges the oldest on the 3rd load. Any fn-capture or closure that lived in the reloaded module → BadFunctionError.
+
+INVARIANT (proven): external capture &Mod.fun/arity survives churn (resolves newest); a local closure from a purged version dies. So real code + closures must live in NEVER-RELOADED modules.
+
+SOLUTION (BeamLisp.Emit, shared by runtime Link.defvar AND AOT):
+- BeamLisp.Ns.<Ns>       — SHIM module: thin forwarding defs only. Churns on every runtime (def), holds nothing anyone closes over.
+- BeamLisp.Ns.Body.<Ns>  — BODY module: ALL of a namespace's real fn code. ONE per ns (not per var — per-var was correct but made ~600 modules and a 5min build; per-ns is ~33 modules, churn-safe because it's never reloaded, only the shim is). Never reloaded.
+- BeamLisp.Ns.Init.<Ns>  — COMPANION module: value/macro initializers. A defmacro's expander CLOSURE is created here (never-reloaded) instead of inline in ns module's __bl_init__ (which churns). Mirrors how source-seed isolates each form in a never-reloaded Eval.M<n>.
+
+__bl_init__/0 (on the shim module) interns fn values as captures of the SHIM (&Ns.<Ns>.f/arity, stable), replays requires/aliases/refers/native/doc-meta, then CALLS Ns.Init.<Ns>.__bl_init_values__/0.
+
+GOTCHAS fixed along the way:
+- :refer :all was dropped by AOT capture (only {:vector,syms} handled, not {:keyword,"all"}) → emit Env.add_refer_all in ns_ops. specter.navs re-exports NONE over :refer :all.
+- defn docstrings weren't replayed → (doc core-fn) printed "No doc found". Read Env.meta(ns,name) at emit, replay put_meta in fn_ops.
+- Deterministic naming: runtime uses System.unique_integer (right for runtime); AOT must remap to Ns.Body.<Ns> (pure fn of ns) so rebuilds are byte-stable and Mix manifest tracks exactly what's on disk.
+- Mix task: emitting N beams/source needs stale-delete (old_modules -- new_modules) on recompile, else unique body beams accumulate.
+- Batch: compile all of a namespace's defmodules in ONE Code.compile_quoted (compile_block!) not N calls.
+- Hot-swap unit is now the beam SET (shim+body+init), not one beam — hotswap_probe_test updated to load_all + revert-all.
+
+RESULT: core boot 6-8s → 1ms (per-boot recompile of 65KB prelude eliminated). Full suite 499 fails → 1243 passed. Files: lib/beam_lisp/emit.ex (new), aot.ex, link.ex, beam_lisp.ex (init AOT-first), mix/tasks/compile.beam_lisp.ex, priv/core.bl (+(ns core)). Regression test: wave9_aot_test "an AOT-loaded namespace survives runtime (def) churn".
