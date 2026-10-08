@@ -286,6 +286,49 @@ Rows are tab-separated. Exit `0` for any valid question, even one with no rows;
 
 `--json` keys: `question`, `target`, `rows`, `count`.
 
+### override
+
+The `.bl` the compiler ships is on every tree's search path — and the search
+order (tree > configured roots > shipped tiers) means a project file whose
+namespace matches already shadows a shipped one. `bl override` makes that a
+workflow. A tree's `overrides/` directory is a library root by convention: no
+flag, no config.
+
+#### `bl override vendor NS...`
+
+Copy a shipped namespace's source into `overrides/` to fix a bug in it. The
+copy shadows the shipped file for every command in the tree; the shipped file
+is untouched.
+
+#### `bl override apply PATCH.bl`
+
+Apply a patch: a beam-lisp PROGRAM exporting `(transform [ctx])`, handed the
+shipped sources plus the codebase database to locate its targets by structure
+(`:db-for`, `:read-shipped`), returning the new sources and its test files.
+Landing is all-or-nothing, verified before it takes effect:
+
+- logical, implicit: the compiler's diagnostics must be clean on each new
+  source, and each overridden namespace must load in an isolated env;
+- unit, implicit: the shipped tests of each touched namespace must pass
+  against the override (when a checkout's test tree is visible);
+- unit, explicit: the patch's own tests must pass.
+
+Any failure rolls every written file back and exits `1`.
+
+```sh
+$ bl override apply patches/edn_tagged_readers.bl
+wrote overrides/clojure/edn.bl
+✓ override applied — 1 file(s), 2 test file(s) passed
+```
+
+#### `bl override list · diff NS · revert NS...`
+
+See what this tree shadows and whether it drifted, diff an override against
+the shipped source, or drop an override and return to shipped behavior.
+
+See research/p17_overrides/ for a worked patch (teaching clojure.edn tagged
+literals via :readers/:default).
+
 ### build
 
 #### `bl build PATH... [--out DIR] [--force] [--jobs N] [--native]`
