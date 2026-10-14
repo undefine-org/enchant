@@ -12,6 +12,29 @@ import { ERLANG, IO, bindOutput } from "../../priv/lib/js/host-leaves.mjs";
 
 const dir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../priv/lib/js");
 
+test("make_ref: opaque identity survives equality, hashing and map lookup", () => {
+  const make = ERLANG["erlang/make_ref/0"];
+  const a = make(), b = make();
+  assert.equal(ERLANG["erlang/is_reference/1"](a), true);
+  assert.equal(ERLANG["erlang/is_reference/1"]({ blRef: true }), false);
+  assert.equal(ERLANG["erlang/is_map/1"](a), false);
+  assert.equal(R.keyEq(a, a), true);
+  assert.equal(R.keyEq(a, b), false);
+  assert.equal(R.eqv(a, b), false);
+  assert.equal(R.hashOf(a), R.hashOf(a));
+  const m = R.EMPTY_MAP.assoc(a, "a").assoc(b, "b");
+  assert.equal(m.cnt, 2);
+  assert.equal(m.get(a), "a");
+  assert.equal(m.get(b), "b");
+  assert.equal(m.get(make(), "absent"), "absent");
+  assert.equal(R.termCompare(a, a), 0);
+  assert.notEqual(R.termCompare(a, b), 0);
+  assert.equal(R.termCompare(a, b), -R.termCompare(b, a));
+  assert.ok(R.termCompare(R.kw("z"), a) < 0);
+  assert.ok(R.termCompare(a, () => {}) < 0);
+  assert.match(R.printStr(a), /^#Ref</);
+});
+
 test("the leaf table loads (no key is defined twice)", async () => {
   const L = await import(path.join(dir, "leaves.mjs"));
   assert.ok(L.NAMES.length > 300, "expected the full table, got " + L.NAMES.length);
