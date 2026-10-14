@@ -41,6 +41,12 @@ and private browsers are released before that final encode. A composition
 failure therefore retains decodable tracks and provenance without keeping the
 display processes alive.
 
+`browser.page/fill!` supports writable text, number and civil-time controls.
+Text uses trusted CDP insertion. Segmented date/time controls use the DOM value
+setter and ordinary, untrusted `input`/`change` events: CDP text insertion does
+not edit them. Invalid civil values restore the existing draft and refuse;
+disabled or readonly controls are left untouched. This only edits form inputs.
+
 X11 is an explicit compatibility choice, with no silent fallback:
 
 ```sh
