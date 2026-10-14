@@ -175,3 +175,32 @@
         (is (= 1 (:account/value (db/entity before 9000))))
         (is (= {:values [2]} (current/projected-values (conn/db c) 9000 :account/value))))
       (finally (conn/close! c)))))
+
+(defrecord AtomicProjectionStore [inner commits]
+  store/Store
+  (-get [s k] (store/-get (:inner s) k))
+  (-range [s lo hi] (store/-range (:inner s) lo hi))
+  (-put [s k v] (store/-put (:inner s) k v) s)
+  (-delete [s k] (store/-delete (:inner s) k) s)
+  (-update [s k f] (let [[_ v] (store/-update (:inner s) k f)] [s v]))
+  (-commit [s ops] (swap! (:commits s) conj (count ops)) (store/-commit (:inner s) ops) s))
+
+(deftest a-wide-fresh-batch-keeps-current-projections-and-history-in-one-commit
+  (let [commits (atom []) s (->AtomicProjectionStore (ets-store/open) commits)
+        c (conn/connect-with s [{:db/ident :account/value :db/valueType :db.type/long}
+                               {:db/ident :account/tag :db/valueType :db.type/string
+                                :db/cardinality :db.cardinality/many}])
+        rows (mapv (fn [i] {:db/id (+ 9000 i) :account/value i :account/tag ["first" "second"]}) (range 20000))]
+    (try
+      (reset! commits [])
+      (let [before (conn/db c) report (conn/load-facts! c rows)]
+        (is (= 1 (count @commits)))
+        (is (= before (:db-before report)))
+        (is (= 60001 (count (:tx-datoms report))))
+        (doseq [i [0 10000 19999]]
+          (let [e (+ 9000 i)]
+            (is (= i (:account/value (db/entity (:db-after report) e))))
+            (is (nil? (:account/value (db/entity before e))))
+            (is (= [i] (current/values s e :account/value)))
+            (is (= #{"first" "second"} (set (current/values s e :account/tag)))))))
+      (finally (conn/close! c)))))
