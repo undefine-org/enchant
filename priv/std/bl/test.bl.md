@@ -38,11 +38,13 @@ that mutates globals wants the default instead.
   [args]
   (let [ps (mapcat u/expand-targets (map u/resolve (if (empty? args) ["test"] args)))]
     (if (empty? args)
-      ; No arguments means the CONVENTIONAL corpus — `test/**/*_test.bl` — the
-      ; same rule ExUnit uses for `.exs`. 340 `.bl` files live under test/ and
+      ; Both namespace spellings are conventional: foo_test.bl and foo-test.bl,
+      ; including literate sources. Fixtures stay outside the selection.
+      ; 340 `.bl` files live under test/ and
       ; only 176 are tests: the rest are fixtures, and running a fixture as a
       ; suite is a failure with a misleading name.
-      (filter (fn [p] (ends-with? p "_test.bl")) ps)
+      (filter (fn [p] (some (fn [suffix] (ends-with? p suffix))
+                            ["_test.bl" "-test.bl" "_test.bl.md" "-test.bl.md" "_test.bl.org" "-test.bl.org"])) ps)
       ps)))
 
 (defn missing-targets
