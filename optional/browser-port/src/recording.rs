@@ -111,6 +111,8 @@ impl Recording {
                 "-an",
                 "-vf",
                 &format!("scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"),
+                "-threads",
+                "4",
                 "-c:v",
                 "libx264",
                 "-preset",

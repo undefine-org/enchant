@@ -35,6 +35,12 @@ A headless compositor can answer CDP while EGL initialization repeatedly fails;
 that is not a working native frame stream. Recording must receive a real frame
 before it reports that capture started.
 
+Encoders use four threads; multiscreen input decoders use two per stream.
+Completed actor tracks and their clock trims are saved before composition,
+and private browsers are released before that final encode. A composition
+failure therefore retains decodable tracks and provenance without keeping the
+display processes alive.
+
 X11 is an explicit compatibility choice, with no silent fallback:
 
 ```sh
