@@ -30,6 +30,11 @@ the user's compositor, display settings, sockets or environment. CPU rendering
 captures damage rather than polling browser screenshots. This follows wayvnc's
 [headless guidance](https://github.com/any1/wayvnc/blob/master/FAQ.md).
 
+Chromium also uses software rendering (`--disable-gpu`) in this owned display.
+A headless compositor can answer CDP while EGL initialization repeatedly fails;
+that is not a working native frame stream. Recording must receive a real frame
+before it reports that capture started.
+
 X11 is an explicit compatibility choice, with no silent fallback:
 
 ```sh
