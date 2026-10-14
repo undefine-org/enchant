@@ -133,11 +133,20 @@ keeps the cost one analysis per file instead of one per function.
 
 (defn- source-metrics
   "Read one path and measure it. A file that cannot be read at all is a metric,
-   never a crash: the gate must survive the one bad file among a thousand."
+   never a crash: the gate must survive the one bad file among a thousand.
+   BL_CHECK_PROGRESS=1 reports boundaries on stderr without changing the gate."
   [p]
-  (try
-    (analyze-source (u/rel-path p) (BeamLisp.Loader/read_source p))
-    (catch _ (unreadable-metrics (u/rel-path p) nil))))
+  (let [progress? (= "1" (System/get_env "BL_CHECK_PROGRESS"))
+        started (System/monotonic_time :millisecond)
+        path (u/rel-path p)]
+    (when progress? (u/io-err (str "bl check: analyzing " path)))
+    (let [result (try
+                   (analyze-source path (BeamLisp.Loader/read_source p))
+                   (catch _ (unreadable-metrics path nil)))]
+      (when progress?
+        (u/io-err (str "bl check: analyzed " path " in "
+                       (- (System/monotonic_time :millisecond) started) " ms")))
+      result)))
 
 (defn- sum-by [k files]
   (reduce + 0 (map (fn [f] (get f k)) files)))
