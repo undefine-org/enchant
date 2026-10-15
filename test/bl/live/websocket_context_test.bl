@@ -1,0 +1,49 @@
+(ns live.websocket-context-test (:require [web] [env] [vm.osenv :as osenv]))
+
+(defn free-port []
+  (let [socket (elem (gen_tcp/listen 0 (list :binary (tuple :active false) (tuple :ip (tuple 127 0 0 1)))) 1)
+        port (elem (elem (inet/sockname socket) 1) 1)]
+    (gen_tcp/close socket) port))
+(defn event [kind]
+  (receive [received scope marker cwd pid] :when (= kind received) [received scope marker cwd pid]
+    (after 5000 (throw (ex-info "WebSocket callback did not arrive" {:kind kind})))))
+
+(deftest every-websocket-callback-keeps-the-serving-environment-after-upgrade
+  (let [scope (env/fork) parent (erlang/self) port (free-port)
+        prior (env/current) overlay (osenv/overlay)
+        observe (fn [kind]
+                  (erlang/send parent [kind (env/current) (System/get_env "BL_WS_CONTEXT_FIXTURE")
+                                       (BeamLisp/cwd) (erlang/self)]))
+        server (env/with-env scope
+                 (fn []
+                   (osenv/with-env {"BL_WS_CONTEXT_FIXTURE" "socket-scope"}
+                     (fn []
+                       (BeamLisp/with_cwd "/scope/websocket"
+                         (fn []
+                           (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                                   :plug (fn [conn]
+                                           (web/upgrade conn
+                                             {:init (fn [state] (observe :init) [:ok state])
+                                              :handle-in (fn [_ state] (observe :input) [:ok state])
+                                              :handle-info (fn [_ state] (observe :info) [:ok state])
+                                              :terminate (fn [_ _] (observe :terminate) :ok)} nil))}) 1)))))))
+        socket (elem (gen_tcp/connect (tuple 127 0 0 1) port (list :binary (tuple :active false)) 3000) 1)]
+    (try
+      (gen_tcp/send socket "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+      (let [response (gen_tcp/recv socket 0 5000)
+            initialized (event :init) pid (nth initialized 4)]
+        (is (= :ok (elem response 0)))
+        (is (String/contains? (elem response 1) "101"))
+        (gen_tcp/send socket (erlang/list_to_binary (list 129 130 0 0 0 0 104 105)))
+        (let [input (event :input)]
+          (erlang/send pid :probe)
+          (let [info (event :info)]
+            (gen_tcp/close socket)
+            (let [terminated (event :terminate)]
+              (doseq [witness [initialized input info terminated]]
+                (is (= scope (nth witness 1)) (str "serving scope: " (first witness)))
+                (is (= "socket-scope" (nth witness 2)) (str "scoped OS environment: " (first witness)))
+                (is (= "/scope/websocket" (nth witness 3)) (str "serving cwd: " (first witness))))))))
+      (is (= prior (env/current)))
+      (is (= overlay (osenv/overlay)))
+      (finally (gen_tcp/close socket) (Supervisor/stop server :normal 30000) (env/destroy scope)))))
