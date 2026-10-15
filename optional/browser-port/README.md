@@ -180,6 +180,11 @@ and aligns their native takes into one horizontal video. Use ordered
 `:basis :video` supplies the continuous source and measured elapsed time. See
 the demo film documentation and `test/multiscreen_test.bl` for the contract.
 
+For long takes, `:compose-preset "ultrafast"` opts into a faster, larger
+offline mosaic. The default remains `"veryfast"`. This changes only derived
+composition encoding: native actor streams, their clocks, frame rate and
+reference screenshots are unchanged. Curated film export has its own encoding.
+
 ## Demo tests
 
 `scenario.demo` combines normal scenario events with narrated scenes in one
