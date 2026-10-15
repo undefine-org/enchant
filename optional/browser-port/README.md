@@ -207,3 +207,7 @@ Native clicks use a visible client-rectangle fragment and hit-test it before
 pressing. A union bounding-box centre can land between wrapped link lines or
 under another control. Scrolling waits for paint; the pointer still moves
 through real input, and a changed/covered target is refused before mouse press.
+
+Rejected DevTools calls name their method in the error and its `:method` data.
+Parameters are excluded: a transport failure must be locatable without exposing
+page data or credentials. Errors remain failures and are never retried.
