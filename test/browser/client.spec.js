@@ -9,7 +9,7 @@
 //
 // Run:  cd test/browser && npx playwright test
 // (fixture.json must be regenerated first:
-//    bl run test/browser/gen_fixture.bl > fixture.json)
+//    bl run test/browser/gen_fixture.bl)
 
 const { test, expect } = require("@playwright/test");
 const fs = require("fs");
@@ -22,6 +22,36 @@ const clientJs = fs.readFileSync(
 const fixture = JSON.parse(
   fs.readFileSync(path.join(__dirname, "fixture.json"), "utf8")
 );
+
+test("SSR text fragments retain patch paths, Unicode and element identity", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate(f => {
+    const root = document.getElementById("live-root");
+    root.innerHTML = f.mount;
+    window.fragmentLabel = root.querySelector("label");
+    window.fragmentUnit = root.querySelector("label span");
+    window.fragmentPre = root.querySelector("pre").textContent;
+    Live.hydrateText(root, f["text-layout"]);
+  }, fixture.fragments);
+  expect(await page.locator("#live-root>div").evaluate(e => e.childNodes[0].data)).toBe("");
+  expect(await page.locator("label").evaluate(e => Array.from(e.childNodes).map(n => n.textContent)))
+    .toEqual(["Bonnes sorties", " · ", "feuilles"]);
+  for (const patch of fixture.fragments.patches) {
+    await page.evaluate(ops => {
+      const root = document.getElementById("live-root");
+      ops.forEach(op => Live.applyOp(root, op));
+    }, patch.ops);
+  }
+  await expect(page.locator("label span")).toHaveText("couvertures");
+  await expect(page.locator("p")).toHaveText("🙂 مرحبا après");
+  expect(await page.locator("pre").evaluate(e => e.textContent === window.fragmentPre)).toBe(true);
+  expect(await page.locator("label").evaluate(e => e === window.fragmentLabel)).toBe(true);
+  expect(await page.locator("label span").evaluate(e => e === window.fragmentUnit)).toBe(true);
+  expect(errors).toEqual([]);
+});
 
 // normalize whitespace-free HTML comparison (attribute order can vary once
 // the DOM round-trips, so compare structure via a canonical serialization)

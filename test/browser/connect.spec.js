@@ -54,6 +54,24 @@ async function boot(page, opts) {
 const pingsOf = (page) =>
   page.evaluate(() => window.__sockets.map((s) => s.sent.filter((d) => d === '["ping"]').length));
 
+test("mount restores SSR text boundaries before ordinary patch frames", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixture.json"), "utf8")).fragments;
+  await boot(page, { heartbeatMs: 0, reconnect: false });
+  await page.waitForFunction(() => window.__sockets[0].readyState === 1);
+  await page.evaluate(f => {
+    const socket = window.__sockets[0];
+    socket.onmessage({ data: JSON.stringify(["mount", f.mount,
+      { "input-ack": true, "text-layout": f["text-layout"] }]) });
+    f.patches.forEach(patch => socket.onmessage({ data: JSON.stringify(["patch", patch.ops]) }));
+  }, fixture);
+  await expect(page.locator("label span")).toHaveText("couvertures");
+  await expect(page.locator("p")).toHaveText("🙂 مرحبا après");
+  expect(await page.evaluate(() => Live.root.__liveInputAck)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
 // ── the heartbeat ─────────────────────────────────────────────────────
 
 test("heartbeat: a ['ping'] frame per heartbeatMs, and no stray traffic", async ({ page }) => {
