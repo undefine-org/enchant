@@ -72,7 +72,7 @@ driving a real Chromium with Playwright against the JS client.
 
 ```sh
 # 1. regenerate the fixture from the real differ
-bl run test/browser/gen_fixture.bl > test/browser/fixture.json
+./bin/bl --cold run test/browser/gen_fixture.bl
 
 # 2. install the Playwright test runner matching the cached browser
 cd test/browser
