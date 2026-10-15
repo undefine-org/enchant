@@ -165,6 +165,10 @@ Run the headed integration with `BL_BROWSER_PORT`, `CHROMIUM`, `SWAY` and
 ./bin/bl test -p optional/browser-port/bl optional/browser-port/test/film_test.bl
 ```
 
+`page/evaluate!` retains Chromium’s exception description in both the thrown
+message and structured data. `wait!` propagates genuine predicate errors; a
+readiness predicate must itself return false while its document is absent.
+
 `page/record!`, `recording`, and `stop-recording!` expose the native continuous
 recorder separately from `screenshot!`. `show-cursor!` opts into a visible
 pointer driven only by trusted browser pointer/drag events: screencasts omit
