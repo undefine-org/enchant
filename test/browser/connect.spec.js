@@ -209,3 +209,24 @@ test("session: a fresh connect() mints a NEW sid (a reload is a new session)", a
   expect(other).not.toBe(first);
   expect(other).toMatch(/[?&]live-sid=[0-9a-f]{32}/);
 });
+
+test("session: reconnect distinguishes an undelivered first mount from a hydrated DOM", async ({ page }) => {
+  await boot(page, { heartbeatMs: 0 });
+  await page.waitForFunction(() => window.__sockets[0].readyState === 1);
+  const first = await page.evaluate(() => window.__sockets[0].url);
+  expect(new URL(first).searchParams.get('live-mounted')).toBe('0');
+  await page.evaluate(() => window.__sockets[0].close());
+  await page.waitForFunction(() => window.__sockets.length === 2 && window.__sockets[1].readyState === 1);
+  const lostMount = await page.evaluate(() => window.__sockets[1].url);
+  expect(new URL(lostMount).searchParams.get('live-sid')).toBe(new URL(first).searchParams.get('live-sid'));
+  expect(new URL(lostMount).searchParams.get('live-mounted')).toBe('0');
+  await page.evaluate(() => {
+    window.__sockets[1].onmessage({ data: JSON.stringify(['mount', '<input value="retained">', { 'input-ack': true, 'text-layout': [] }]) });
+    window.__sockets[1].close();
+  });
+  await page.waitForFunction(() => window.__sockets.length === 3 && window.__sockets[2].readyState === 1);
+  const mounted = await page.evaluate(() => window.__sockets[2].url);
+  expect(new URL(mounted).searchParams.get('live-sid')).toBe(new URL(first).searchParams.get('live-sid'));
+  expect(new URL(mounted).searchParams.get('live-mounted')).toBe('1');
+  expect(await page.locator('input').inputValue()).toBe('retained');
+});

@@ -1,0 +1,57 @@
+(ns live.initial-mount-wire-test
+ (:require [live.app :as app] [web] [datom]))
+
+(defn free-port []
+ (let [s (elem (gen_tcp/listen 0 (list :binary (tuple :active false) (tuple :ip (tuple 127 0 0 1)))) 1)
+       p (elem (elem (inet/sockname s) 1) 1)] (gen_tcp/close s) p))
+(defn connect [port sid mounted]
+ (let [s (elem (gen_tcp/connect (tuple 127 0 0 1) port (list :binary (tuple :active false)) 3000) 1)]
+  (gen_tcp/send s (str "GET /ws/?q=visible&live-sid=" sid "&live-mounted=" mounted
+    " HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")) s))
+(defn until [socket marker ms]
+ (let [end (+ (erlang/monotonic_time :millisecond) ms)]
+  (loop [bytes ""]
+   (if (or (String/contains? bytes marker) (>= (erlang/monotonic_time :millisecond) end)) bytes
+    (let [received (gen_tcp/recv socket 0 100)]
+     (if (= :ok (elem received 0)) (recur (str bytes (elem received 1)))
+      (if (= :timeout (elem received 1)) (recur bytes) bytes)))))))
+
+(deftest initial-mount-recovery-travels-over-the-wire-without-leaking-transport-query
+ (let [conn (datom/connect []) port (free-port)
+       application {:principal (fn [_] "viewer") :worlds (fn [_ _] {}) :shared-conn conn
+                    :routes [["/" (fn [ctx] [:main {:data-query (pr-str (:query ctx))}
+                                             [:input {:value (get-in ctx [:locals :draft] "original")} ]])]]}
+       server (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                               :plug (fn [request] (app/router application request))}) 1)
+       sid (str "lost-initial-wire-" (erlang/unique_integer (list :positive)))
+       sockets (atom []) pid (atom nil)]
+  (try
+   (let [first (connect port sid "0") _ (swap! sockets conj first)
+         initial (until first "[\"mount\"," 5000)
+         session (app/session-of sid)]
+    (reset! pid session)
+    (is (String/contains? initial "101 Switching Protocols"))
+    (is (String/contains? initial "[\"mount\","))
+    (is (not (String/contains? initial "live-mounted")))
+    (is (not (String/contains? initial sid)))
+    (call session [:event [:assign :draft "retained"]])
+    ;; The browser did not apply its mount. Discard all transport deliveries.
+    (gen_tcp/close first)
+    (let [second (connect port sid "0") _ (swap! sockets conj second)
+          recovered (until second "[\"mount\"," 5000)]
+     (is (= session (app/session-of sid)))
+     (is (String/contains? recovered "[\"mount\","))
+     (is (String/contains? recovered "retained"))
+     (is (String/contains? recovered "input-ack"))
+     (is (String/contains? recovered "text-layout"))
+     (is (not (String/contains? recovered "live-mounted")))
+     (gen_tcp/close second)
+     (let [third (connect port sid "1") _ (swap! sockets conj third)
+           resumed (until third "[\"mount\"," 600)]
+      (is (String/contains? resumed "101 Switching Protocols"))
+      (is (not (String/contains? resumed "[\"mount\",")) "a hydrated reconnect preserves its DOM")
+      (is (= "retained" (get-in (call session [:state]) [:locals :draft]))))))
+   (finally
+    (doseq [s @sockets] (gen_tcp/close s))
+    (when (and @pid (Process/alive? @pid)) (stop @pid))
+    (Supervisor/stop server :normal 30000) (datom/close! conn)))))

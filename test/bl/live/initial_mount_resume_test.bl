@@ -1,0 +1,47 @@
+;; An initial transport can die before its mount reaches the browser. The
+;; retained server tree is then not evidence that the client has mounted.
+(ns live.initial-mount-resume-test
+ (:require [live.app :as app] [live.socket :as socket] [datom]))
+
+(defn drain []
+ (loop [frames []]
+  (let [frame (receive [:mount html features] [:mount html features]
+                      [:patch ops] [:patch ops]
+                      [:style css] [:style css]
+                      (after 80 nil))]
+   (if frame (recur (conj frames frame)) frames))))
+
+(deftest an-unmounted-reconnect-receives-the-full-mount-with-its-existing-session
+ (let [conn (datom/connect [])
+       application {:worlds (fn [_ _] {}) :routes [["/" (fn [ctx] [:main [:input {:value (get-in ctx [:locals :draft] "original")} ]])]]}
+       initial {:app application :me "viewer" :route "/" :shared conn
+                :sid (str "initial-mount-" (erlang/unique_integer (list :positive))) :mounted? false}
+       first-connection ((:init app/ws-handlers) initial)
+       pid (get-in first-connection [1 :srv])]
+  (try
+   ;; Deliberately discard the first mount, as a transport lost before delivery.
+   (is (some #(= :mount (first %)) (drain)))
+   (call pid [:event [:assign :draft "retained"]])
+   (drain)
+   (let [reconnected ((:init app/ws-handlers) initial)
+         frames (drain) mounts (filterv #(= :mount (first %)) frames)]
+    (is (= pid (get-in reconnected [1 :srv])) "recovery retains the same authorized session")
+    (is (some #(= :style (first %)) frames) "initial style delivery must also recover")
+    (is (= 1 (count mounts)) "SSR is not a hydrated client tree: resend an undelivered initial mount")
+    (when (seq mounts)
+     (is (String/contains? (get-in mounts [0 1]) "retained"))
+     (is (= true (get-in mounts [0 2 :input-ack])))
+     (is (vector? (get-in mounts [0 2 :text-layout])))))
+   (finally (stop pid) (datom/close! conn) (drain)))))
+
+(deftest an-unmounted-request-still-cannot-adopt-another-principals-session
+ (let [conn (datom/connect [])
+       state (socket/mount {:shared conn :me "viewer" :sink (erlang/self)
+                            :view (fn [_ _ _] [:input {:value "private"}])})]
+  (try
+   (drain)
+   (let [result (socket/attach state (erlang/self) "intruder" false)]
+    (is (= :denied (first result)))
+    (is (= state (second result)))
+    (is (= [] (drain))))
+   (finally (erlang/demonitor (:sink-mon state)) (datom/close! conn)))))

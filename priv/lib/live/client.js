@@ -435,6 +435,9 @@
     // last saw — instead of mounting a fresh one. In memory only, on purpose:
     // a reload is a new page load and wants a fresh session, so there is
     // nothing to persist, expire or clear.
+    // A reconnect before initial delivery cannot resume from SSR as though
+    // it were hydrated. Only a successfully applied mount changes this receipt.
+    var mounted = false;
     var sid = (function () {
       var a = new Uint8Array(16), i, s = "";
       if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a);
@@ -443,7 +446,7 @@
       return s;
     })();
     function sessionUrl(url) {
-      return url + (url.indexOf("?") === -1 ? "?" : "&") + "live-sid=" + sid;
+      return url + (url.indexOf("?") === -1 ? "?" : "&") + "live-sid=" + sid + "&live-mounted=" + (mounted ? "1" : "0");
     }
 
     // `ws` is now MUTABLE — a reconnect swaps in a fresh socket while the event
@@ -594,6 +597,7 @@
           root.innerHTML = a;
           hydrateText(root, b && b["text-layout"]);
           syncInputs(root);
+          mounted = true;
           announce("live:mount", { root: root });
         } else if (kind === "style") {
           // the head sheet holds what the warm reached; a socket that renders

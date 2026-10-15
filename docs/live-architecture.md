@@ -77,6 +77,13 @@ What that buys, and what it does not:
   missed ships nothing; the DOM the viewer holds (a half-typed query, a
   wizard's step) is never replaced. `on-commit` is a no-op while detached, so
   a commit made during the gap ships once, on attach.
+- **Initial delivery must be known.** A transport can lose its first mount
+  before the browser hydrates. The client carries `live-mounted=0` until it
+  applies that mount successfully; this reconnect receives the full mount,
+  hydration features and styles on the existing authorized session. Once
+  hydrated it sends `live-mounted=1` and resumes with deltas. Both transport
+  keys are removed from route queries. Older clients omit the receipt and
+  keep the previous delta behavior. This does not acknowledge later patches.
 - **It is never handed over.** `attach` refuses a transport whose principal is
   not the session's `:me` — a guessed sid is not a way into another viewer's
   stream. The refused connection gets its own fresh session.
@@ -88,7 +95,10 @@ What that buys, and what it does not:
 
 Proof: `test/bl/live/resume_test.bl` (headless — detach, attach's delta, the
 principal refusal, expiry) and `test/browser/connect.spec.js` (the sid rides
-on every socket URL and is identical across a reconnect).
+on every socket URL and is identical across a reconnect). Initial delivery
+recovery and transport-query isolation are covered by
+`test/bl/live/initial_mount_resume_test.bl`,
+`test/bl/live/initial_mount_wire_test.bl` and the browser reconnect cases.
 
 ### Truth ordering — LOG ⊐ FILE ⊐ IMAGE
 
