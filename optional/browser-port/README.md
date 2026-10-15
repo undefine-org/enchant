@@ -189,6 +189,11 @@ offline mosaic. The default remains `"veryfast"`. This changes only derived
 composition encoding: native actor streams, their clocks, frame rate and
 reference screenshots are unchanged. Curated film export has its own encoding.
 
+For aborted actions, `:compose-on-dispose? false` retains complete raw actor
+videos and clocks without encoding a mosaic during cleanup. Its receipt marks
+composition `deferred` and has no joined source. Normal `:close!` still composes
+all views; the default disposal behavior remains unchanged.
+
 ## Demo tests
 
 `scenario.demo` combines normal scenario events with narrated scenes in one

@@ -75,6 +75,8 @@
    actors is an ordered vector of [actor page-options]; opts accepts :ffmpeg,
    :fps and :cursor? (default true). :compose-preset selects the offline x264
    speed/size tradeoff (default veryfast), without changing source recordings.
+   :compose-on-dispose? false defers mosaics after an abort while retaining raw
+   tracks/clocks; normal :close! still composes. The default remains true.
    All ports stay with the scenario owner."
   [actors directory opts]
   (when (or (empty? actors) (not= (count actors) (count (set (map first actors))))
@@ -90,14 +92,15 @@
         release (fn []
                   (doseq [[_ p] @owned] (try (page/close! p) (catch _ nil)))
                   (reset! owned {}) (File/rm_rf! scratch))
-        finish (fn []
+        finish (fn [compose?]
                  (when (and (not @finished) @epoch)
                    (reset! finished true)
                    (let [recordings (mapv (fn [[actor _]] (assoc (page/stop-recording! (get @owned actor))
                                                                :actor actor :trim (get @starts actor))) actors)
-                         _ (File/write! (str root "/recordings.json")
-                             (interop/->json {:kind :native-screencast :layout :horizontal :source movie
-                                              :actors (mapv first actors) :recordings recordings}))
+                         receipt {:kind :native-screencast :layout :horizontal :source (when compose? movie)
+                                  :composition (if compose? :requested :deferred)
+                                  :actors (mapv first actors) :recordings recordings}
+                         _ (File/write! (str root "/recordings.json") (interop/->json receipt))
                          _ (release)
                          inputs (mapcat (fn [r] ["-threads" "2" "-ss" (str (:trim r)) "-i" (get r "path")]) recordings)
                          filters (str (apply str (map-indexed (fn [i _]
@@ -105,11 +108,14 @@
                                       (apply str (map-indexed (fn [i _] (str "[v" i "]")) actors))
                                       (if (= 1 (count actors)) "null[out]"
                                           (str "hstack=inputs=" (count actors) ":shortest=1[out]")))
-                         result (System/cmd ffmpeg (to-list (concat ["-hide_banner" "-loglevel" "error" "-nostdin" "-n"] inputs
+                         result (when compose? (System/cmd ffmpeg (to-list (concat ["-hide_banner" "-loglevel" "error" "-nostdin" "-n"] inputs
                                   ["-filter_complex" filters "-map" "[out]" "-an" "-threads" "4" "-c:v" "libx264"
-                                   "-preset" (get opts :compose-preset "veryfast") "-crf" "18" "-pix_fmt" "yuv420p" "-movflags" "+faststart" movie])))]
-                     (when (not= 0 (elem result 1))
+                                   "-preset" (get opts :compose-preset "veryfast") "-crf" "18" "-pix_fmt" "yuv420p" "-movflags" "+faststart" movie]))))]
+                     (when (and compose? (not= 0 (elem result 1)))
                        (throw (ex-info "Native multiscreen composition failed" {:diagnostic (elem result 0)})))
+                     (when compose?
+                       (File/write! (str root "/recordings.json")
+                                    (interop/->json (assoc receipt :composition :complete))))
                      :ok)))]
     {:kind :browser
      :open (fn [_]
@@ -144,6 +150,6 @@
                            :video {:source movie :at (/ (- (clock) @epoch) 1000.0)
                                    :kind :native-screencast :actors (mapv first actors)}}]
                 (reset! last-basis basis) basis))
-     :close! (fn [_] (try (finish) @last-basis (finally (release))))
+     :close! (fn [_] (try (finish true) @last-basis (finally (release))))
      :views-fn (fn [basis actor] (assoc basis :frame (get-in basis [:frames actor])))
-     :dispose! (fn [] (try (finish) (finally (release))))}))
+     :dispose! (fn [] (try (finish (get opts :compose-on-dispose? true)) (finally (release))))}))
