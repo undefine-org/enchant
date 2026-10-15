@@ -202,3 +202,8 @@ cleanup after successful runs and failed actions. Each `defdemo` is registered
 with the ordinary test engine; tests capture evidence, and `BL_DEMO_EXPORT=1`
 also produces a film. See [the executable two-demo literate file](../../examples/scenario/browser-demos.bl.org)
 and [the demo API](../../docs/scenarios/demo-films.md).
+
+Native clicks use a visible client-rectangle fragment and hit-test it before
+pressing. A union bounding-box centre can land between wrapped link lines or
+under another control. Scrolling waits for paint; the pointer still moves
+through real input, and a changed/covered target is refused before mouse press.
