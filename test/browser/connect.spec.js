@@ -230,3 +230,29 @@ test("session: reconnect distinguishes an undelivered first mount from a hydrate
   expect(new URL(mounted).searchParams.get('live-mounted')).toBe('1');
   expect(await page.locator('input').inputValue()).toBe('retained');
 });
+
+
+test("fragment setting links use native navigation and land on the exact field", async ({ page }) => {
+  await page.route("http://live.test/**", route => route.fulfill({
+    contentType: "text/html",
+    body: "<div style='height:1600px'></div><input id='machine-setting-clamp' value='16'><div style='height:500px'></div>"
+  }));
+  await page.goto("http://live.test/start");
+  await boot(page, { heartbeatMs: 0, reconnect: false });
+  await page.waitForFunction(() => window.__sockets[0].readyState === 1);
+  await page.evaluate(() => {
+    document.getElementById("live-root").innerHTML =
+      '<a id="plain" href="/resource/other?tab=settings">Settings</a>' +
+      '<a id="source" href="/resource/cutter?tab=settings#machine-setting-clamp">16 mm source</a>';
+  });
+  await page.click("#plain");
+  expect(await page.evaluate(() => window.__sockets[0].sent)).toEqual([
+    '["event",["navigate","/resource/other?tab=settings"],{}]'
+  ]);
+  await page.click("#source");
+  await expect(page).toHaveURL("http://live.test/resource/cutter?tab=settings#machine-setting-clamp");
+  await expect(page.locator("#machine-setting-clamp")).toHaveValue("16");
+  expect(await page.locator("#machine-setting-clamp").evaluate(e => {
+    const r=e.getBoundingClientRect();return r.top>=0 && r.bottom<=innerHeight;
+  })).toBe(true);
+});

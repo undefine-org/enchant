@@ -655,7 +655,7 @@
           !e.shiftKey && !e.altKey && (a.getAttribute("target") || "") === "") {
         var href = a.getAttribute("href") || "";
         if (href.indexOf("/") === 0 && href.indexOf("//") !== 0 &&
-            href.indexOf("#") !== 0 && ws && ws.__navigate) {
+            href.indexOf("#") < 0 && ws && ws.__navigate) {
           e.preventDefault();
           ws.__navigate(href);
           return;
