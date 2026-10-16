@@ -123,6 +123,14 @@ port to prevent late-response reuse; do not silently retry uncertain mutations.
 `close` requests stop before closing; callers needing a save acknowledgement use
 an explicit `stop` request and inspect its result. Owner death is abrupt recovery.
 
+For form submissions that redirect, use `browser.page/wait-url!` with a pure
+URL predicate before `wait!` checks DOM readiness. It reads `Target.getTargetInfo`
+through the browser process: renderer queries can block while navigation waits
+for a slow HTTP response. The caller supplies its navigation deadline; native
+transport limits remain unchanged. This barrier observes committed URLs and
+does not certify same-URL reloads, DOM readiness or business success. Predicate
+and protocol errors still propagate, and no submission is retried.
+
 ## Verification
 
 ```sh

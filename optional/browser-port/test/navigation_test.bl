@@ -1,0 +1,43 @@
+(ns browser.navigation-test
+  (:require [browser.page :as page] [web]))
+
+(defn free-port []
+  (let [socket (elem (gen_tcp/listen 0 (list :binary (tuple :active false)
+                                          (tuple :ip (tuple 127 0 0 1)))) 1)]
+    (try (elem (elem (inet/sockname socket) 1) 1)
+      (finally (gen_tcp/close socket)))))
+
+(deftest committed-url-wait-survives-slow-native-form-navigation-without-resubmission
+  (let [root (str "/tmp/bl-navigation-test-" (erlang/unique_integer (list :positive)))
+        posts (atom 0) port (free-port) origin (str "http://127.0.0.1:" port)
+        server (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                    :plug (fn [c]
+                      (cond
+                        (= "post" (web/method c))
+                        (do (web/form-params c) (swap! posts inc)
+                            (Process/sleep 35000)
+                            (web/redirect (web/resp-header c "connection" "close") "/accepted"))
+                        (= "/accepted" (web/path c)) (web/html c 200 "<p id='accepted'>Accepted</p>")
+                        :else (web/html c 200 "<form method='post' action='/accept'><button id='accept'>Accept</button></form>")))}) 1)
+        p (page/open! {:width 640 :height 480
+                       :launch {"profile" (str root "/profile") "runtime" (str root "/runtime")
+                                "chromium" (System/get_env "CHROMIUM") "compositor" (System/get_env "SWAY")
+                                "vnc" (System/get_env "WAYVNC") "width" 640 "height" 580}})]
+    (try
+      (page/navigate! p origin) (page/wait! p "!!document.querySelector('#accept')")
+      (is (= (str origin "/") (page/current-url p)))
+      (let [started (erlang/monotonic_time :millisecond)]
+        (page/click! p "#accept")
+        (is (page/wait-url! p #(= (str origin "/accepted") %) 45000))
+        (is (> (- (erlang/monotonic_time :millisecond) started) 30000))
+        (page/wait! p "!!document.querySelector('#accepted')")
+        (is (= "Accepted" (page/evaluate! p "document.querySelector('#accepted').textContent")))
+        (is (= 1 @posts)))
+      (is (= "Browser URL condition timed out"
+             (try (page/wait-url! p (fn [_] false) 100) (catch e (ex-message e)))))
+      (let [calls (atom 0)]
+        (is (= "URL predicate sentinel"
+               (try (page/wait-url! p (fn [_] (swap! calls inc) (throw (ex-info "URL predicate sentinel" {}))) 1000)
+                    (catch e (ex-message e)))))
+        (is (= 1 @calls)))
+      (finally (page/close! p) (Supervisor/stop server :normal 30000) (File/rm_rf! root)))))
