@@ -81,6 +81,13 @@ error. Diagnostics stay in private runtime files, not protocol stdout.
   Unmatched events are consumed; this is not an event subscription API.
 - `record-start` takes `targetId`, a new absolute MP4 `path`, even viewport
   `width`/`height`, `fps` (1–60, default 30) and an explicit `ffmpeg` executable.
+  Optional `preset` is `veryfast` (the existing default) or `ultrafast`. The
+  reply and recording receipt confirm `encoderPreset`. This changes encoder
+  work and file size, while preserving the frame rate, canvas, CRF 18, native
+  frame consumer and wall-clock pacing. Invalid presets refuse before media
+  creation. Beam Lisp callers use `:record-preset`; an explicit preset must be
+  acknowledged by the installed helper, preventing silent fallback to an older
+  executable. Multiscreen `:compose-preset` remains an independent offline choice.
   A separate native CDP connection continuously consumes and acknowledges
   `Page.screencastFrame` events, including while the caller waits. A bounded
   latest-frame buffer feeds a wall-clock-paced encoder. Static content holds

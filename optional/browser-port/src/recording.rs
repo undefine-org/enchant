@@ -14,8 +14,19 @@ pub struct Recording {
     frames: Arc<AtomicU64>,
     started: Instant,
     path: PathBuf,
+    preset: String,
     reader: Option<thread::JoinHandle<Result<()>>>,
     encoder: Option<thread::JoinHandle<Result<u64>>>,
+}
+
+fn encoder_preset(opts: &Value) -> Result<&str> {
+    match opts.get("preset") {
+        None => Ok("veryfast"),
+        Some(Value::String(preset)) if matches!(preset.as_str(), "veryfast" | "ultrafast") => {
+            Ok(preset)
+        }
+        _ => Err("recording preset must be veryfast or ultrafast".into()),
+    }
 }
 
 fn call(
@@ -54,6 +65,7 @@ impl Recording {
         if !(1..=60).contains(&fps) {
             return Err("recording fps must be 1..60".into());
         }
+        let preset = encoder_preset(opts)?;
         let ffmpeg = field(opts, "ffmpeg")?;
         let width = opts["width"].as_u64().ok_or("recording width required")?;
         let height = opts["height"].as_u64().ok_or("recording height required")?;
@@ -116,7 +128,7 @@ impl Recording {
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                preset,
                 "-crf",
                 "18",
                 "-pix_fmt",
@@ -262,6 +274,7 @@ impl Recording {
             frames,
             started,
             path,
+            preset: preset.to_owned(),
             reader: Some(reader),
             encoder: Some(encoder),
         };
@@ -274,7 +287,8 @@ impl Recording {
 
     pub fn info(&self) -> Value {
         json!({"path":self.path,"at":self.started.elapsed().as_secs_f64(),
-               "sourceFrames":self.frames.load(Ordering::Relaxed),"kind":"native-screencast"})
+               "sourceFrames":self.frames.load(Ordering::Relaxed),"kind":"native-screencast",
+               "encoderPreset":self.preset})
     }
 
     pub fn stop(mut self) -> Result<Value> {
@@ -318,5 +332,21 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_is_closed_and_keeps_the_existing_default() {
+        assert_eq!(encoder_preset(&json!({})).unwrap(), "veryfast");
+        for preset in ["veryfast", "ultrafast"] {
+            assert_eq!(encoder_preset(&json!({"preset":preset})).unwrap(), preset);
+        }
+        for preset in [json!("unknown"), json!(null), json!(false), json!(7)] {
+            assert!(encoder_preset(&json!({"preset":preset})).is_err());
+        }
     }
 }
