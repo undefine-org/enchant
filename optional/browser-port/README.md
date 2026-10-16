@@ -204,6 +204,13 @@ offline mosaic. The default remains `"veryfast"`. This changes only derived
 composition encoding: native actor streams, their clocks, frame rate and
 reference screenshots are unchanged. Curated film export has its own encoding.
 
+Consumers that supply their own finished composition may set
+`:compose-on-close? false` to skip the otherwise redundant full-width mosaic.
+Normal close still finalizes every raw actor track, clock and browser release;
+`recordings.json` reports `composition: deferred` and no completed `source`.
+The caller owns the final video. Normal close composes by default; nonboolean
+values are refused before launch.
+
 For aborted actions, `:compose-on-dispose? false` retains complete raw actor
 videos and clocks without encoding a mosaic during cleanup. Its receipt marks
 composition `deferred` and has no joined source. Normal `:close!` still composes
