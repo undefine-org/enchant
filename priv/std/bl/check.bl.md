@@ -74,7 +74,12 @@ you own.
 leading `(ns …)` form — the reader's own convention, shared with `bl lsp`.
 A source the compiler cannot parse is not an error here: it is a metric,
 `:unreadable true`, which the regression rule treats as a failure the moment
-it appears where the baseline records a readable file.
+it appears where the baseline records a readable file. An engine exception
+also keeps that failure marker, but carries `:analysis-error` with its stage
+and actual message; a compiler failure must not masquerade as an empty check.
+Reports retain `:diagnostic-info`, `:smell-info` and per-function footprints
+beside the counts so a baseline review can inspect the named evidence. Those
+details do not silently alter the accepted baseline or its regression rules.
 
 The eligible count is the conjunction of the two badges rather than a second
 call into `lsp/native-eligible`: that function answers exactly `pure ∧
@@ -98,6 +103,7 @@ keeps the cost one analysis per file instead of one per function.
      :pure pure
      :terminates terminates
      :returns (:returns s)
+     :footprint (:footprint s)
      :eligible (and pure terminates)}))
 
 (defn- unreadable-metrics
@@ -117,10 +123,14 @@ keeps the cost one analysis per file instead of one per function.
     (try
       (let [ns (u/ns-of src)
             fns (into [] (map fn-facts (lsp/document-symbols src)))
-            with (fn [k] (into [] (map (fn [f] (:name f)) (filter (fn [f] (get f k)) fns))))]
+            with (fn [k] (into [] (map (fn [f] (:name f)) (filter (fn [f] (get f k)) fns))))
+            diagnostics (vec (lsp/diagnostics src ns))
+            smells (:smells (lint/lint-source (deodorant/all-rules) path src))]
         {:path path :sha digest :unreadable false
-         :diagnostics (count (lsp/diagnostics src ns))
-         :smells (lint/smell-count (deodorant/all-rules) src)
+         :diagnostics (count diagnostics)
+         :diagnostic-info diagnostics
+         :smells (count smells)
+         :smell-info smells
          :fns (count fns)
          :pure (count (filter (fn [f] (:pure f)) fns))
          :terminates (count (filter (fn [f] (:terminates f)) fns))
@@ -129,7 +139,9 @@ keeps the cost one analysis per file instead of one per function.
          :terminates-fns (with :terminates)
          :eligible-fns (with :eligible)
          :fn-info fns})
-      (catch _ (unreadable-metrics path digest)))))
+      (catch error
+        (assoc (unreadable-metrics path digest)
+               :analysis-error {:stage :analysis :message (pr-str error)})))))
 
 (defn- source-metrics
   "Read one path and measure it. A file that cannot be read at all is a metric,
@@ -142,7 +154,9 @@ keeps the cost one analysis per file instead of one per function.
     (when progress? (u/io-err (str "bl check: analyzing " path)))
     (let [result (try
                    (analyze-source path (BeamLisp.Loader/read_source p))
-                   (catch _ (unreadable-metrics path nil)))]
+                   (catch error
+                     (assoc (unreadable-metrics path nil)
+                            :analysis-error {:stage :read :message (pr-str error)})))]
       (when progress?
         (u/io-err (str "bl check: analyzed " path " in "
                        (- (System/monotonic_time :millisecond) started) " ms")))
@@ -337,7 +351,8 @@ each named regression, then the verdict.
   "One file's metrics, as `path  diags=N smells=N fns=N pure=N eligible=N`."
   [f]
   (str (:path f) "  diags=" (:diagnostics f) " smells=" (:smells f)
-       " fns=" (:fns f) " pure=" (:pure f) " eligible=" (:eligible f)))
+       " fns=" (:fns f) " pure=" (:pure f) " eligible=" (:eligible f)
+       (when-let [error (:analysis-error f)] (str " error=" (:message error)))))
 
 (defn render
   "The human report: a metrics line per file, the note when there is no

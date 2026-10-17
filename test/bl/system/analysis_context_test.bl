@@ -1,0 +1,62 @@
+; Valid source keeps its declaration context through analysis, without running it.
+(ns system.analysis-context-test
+  (:require [system.analyze :as an] [lsp] [typed]))
+
+(deftest an-ordinary-program-function-shadows-an-ambient-core-macro
+  (let [source "(defn derived [label x unit evidence] {:v x :u unit})
+                (defn convert [x] (derived :convert x :mm {}))"
+        before (BeamLisp.Env/peek "core" "derived")
+        program-before (BeamLisp.Env/peek "system.analyze.program" "derived")
+        bodies (an/fn-bodies source)
+        summary (an/analyze source)]
+    (is (contains? bodies "convert"))
+    (is (contains? (:edges (get summary "convert")) "derived"))
+    (is (= {} (:footprint (get summary "convert"))))
+    (is (= before (BeamLisp.Env/peek "core" "derived")))
+    (is (= program-before (BeamLisp.Env/peek "system.analyze.program" "derived")))))
+
+(deftest javascript-opt-in-reaches-every-analysis-body
+  (let [source "(ns ^:js sample.browser)
+                (defn closest [node] (.closest node \"[data-item]\"))
+                (defn width [node] (.-clientWidth node))"
+        before (BeamLisp.Env/lookup (tuple :js-interop "system.analyze.program"))
+        bodies (an/fn-bodies source)
+        symbols (lsp/document-symbols source)]
+    (is (contains? bodies "closest"))
+    (is (contains? bodies "width"))
+    (is (= #{"closest" "width"} (set (map :name symbols))))
+    (is (every? #(not (:pure %)) symbols) "Browser access retains its effect")
+    (is (empty? (lsp/diagnostics source "sample.browser")))
+    (is (= before (BeamLisp.Env/lookup (tuple :js-interop "system.analyze.program")))))
+  (is (try (an/fn-bodies "(ns sample.host) (defn closest [node] (.closest node \"x\"))")
+           false (catch _ true)) "A JavaScript grant must not leak to a host program"))
+
+(deftest collection-callbacks-share-the-runtime-invokable-contract
+  (doseq [source ["(defn f [] (map #{:x} [:x :y]))"
+                  "(defn f [] (filter #{:x} [:x :y]))"
+                  "(defn f [] (remove #{:x} [:x :y]))"
+                  "(defn f [] (keep {:x 1} [:x :y]))"
+                  "(defn f [] (mapv [10 20] [0 1]))"
+                  "(defn f [] (every? #{:x} [:x]))"]]
+    (is (empty? (:warnings (typed/check-source source "sample.callbacks"))) source))
+  (is (seq (:warnings (typed/check-source "(defn f [] (filter 42 [:x]))" "sample.callbacks")))
+      "Non-callable scalars remain a diagnosed error"))
+
+(deftest literal-program-data-does-not-acquire-a-latent-callback-effect
+  (let [source "(def palette {:ready {:hue :green}})
+                (defn label [status] (get palette status {:word (name status)}))"
+        summary (an/analyze source)]
+    (is (= {} (:footprint (get summary "label"))))
+    (is (= {} (:latent (get summary "label"))))))
+
+(deftest function-or-lazy-global-values-do-not-borrow-the-data-proof
+  (doseq [source ["(def palette {:run (fn [] (println :effect))})
+                  (defn label [status] (get palette status {:word (name status)}))"
+                 "(def palette (lazy-seq (println :effect) (list 1)))
+                  (defn label [status] (count palette))"
+                 "(def palette mystery)
+                  (defn label [status] (count palette))"
+                 "(def palette (fn [] (println :effect))) (def palette {})
+                  (defn label [status] (count palette))"
+                 "(def palette {}) (defn label [status] (count foreign/palette))"]]
+    (is (contains? (:latent (get (an/analyze source) "label")) :opaque-world))))
