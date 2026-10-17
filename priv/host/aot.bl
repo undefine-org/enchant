@@ -4889,6 +4889,7 @@
   (Map/put values ns
     (erlang/++ (Map/get values ns (list)) (list (tuple nil nil compiled false))))))
 
+; @compiler-component sdk-declarations
 (defn stage-sdk-unit!
  "Compile-only SDK declarations with ordered deferred values/actions; result is AOT.load_unit's exact tuple.
   This helper neither emits binaries nor registers trust. Caller must prohibit
@@ -4902,6 +4903,10 @@
        forms (BeamLisp.Reader/read_string source file)
        header (stage-preflight! forms) ns (:ns header)
        previous (BeamLisp.Env/current_ns)]
+  ;; Bootstrap artifacts use only the shared compiler pipeline. SDK staging
+  ;; cannot manufacture a bootstrap or pinned-host artifact under that key.
+  (when (or (BeamLisp.AOTCache/bootstrap_namespace? ns) (Keyword/has_key? opts :module))
+   (stage-refuse :sdk-stage-bootstrap-artifact))
   (try
    (BeamLisp.Env/declare_ns ns) (BeamLisp.Env/in_ns ns)
    (doseq [pair (Map/get (:metadata header) :aliases)]
@@ -4913,7 +4918,7 @@
    (BeamLisp.Compiler/reset_fresh!)
    (doseq [form (rest forms)]
     (BeamLisp.Compiler/prelink_defn form ns)
-    (BeamLisp.Compiler/prelink_type form ns))
+    (constructor_prelink_type! form ns))
    (let [staged (stage-sdk-forms! (rest forms) ns file {} {})
          values (elem staged 0) defined (elem staged 1)]
     (tuple defined values (MapSet/new (list ns))
@@ -6624,6 +6629,7 @@
 
 ; ── authenticated compile-only SDK macro/source context ───────────────────
 ; AOT-owned compiler context: source data only, no runtime macro Fn values.
+; @compiler-component sdk-declarations
 (defn- constructor_source_input! [namespace path content]
  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
        selected (physical_sdk_path (BeamLisp.Loader/source_path namespace))
@@ -6635,7 +6641,7 @@
    (throw (ex-info "SDK declaration staging refused"
                    {:kind :unattested-sdk-constructor-source :namespace namespace})))
   {:namespace namespace :file actual :source content :digest (crypto/hash :sha256 content)
-   :compiler-key (BeamLisp.AOTCache/compiler_key)}))
+   :compiler-key (BeamLisp.AOTCache/compiler_key) :sdk-key (BeamLisp.AOTCache/sdk_key)}))
 
 (defn- constructor_context []
  (when-let [context (Process/get :bl_sdk_constructor_context)]
@@ -6697,6 +6703,44 @@
     (constructor_context_put! :binding-metadata (Map/put cache key metadata))
     metadata))))
 
+; @compiler-component sdk-declarations
+(defn- constructor_shadow_staged_type! [namespace binding]
+ (when-let [context (constructor_context)]
+  ;; A later ordinary declaration shadows the compiler-only class symbol,
+  ;; including nil. Apply this during prelink as well as ordered staging so
+  ;; foreign namespaces see the final declaration before initialization.
+  (when (Map/has_key? (Map/get context :staged-types {}) [namespace binding])
+   (when-not (= (BeamLisp.Env/env_id) (:compiler-env context))
+    (stage-refuse :unowned-sdk-constructor-type-binding))
+   (BeamLisp.Env/intern namespace binding nil)
+   (constructor_context_put! :staged-types
+    (Map/delete (Map/get (constructor_context!) :staged-types {}) [namespace binding])))))
+
+; @compiler-component sdk-declarations
+(defn- constructor_prelink_type! [form namespace]
+ (let [linked (BeamLisp.Compiler/prelink_type form namespace)]
+  (when linked
+   (when-let [context (constructor_context)]
+    (when-not (= (BeamLisp.Env/env_id) (:compiler-env context))
+     (stage-refuse :unowned-sdk-constructor-type-binding))
+    (let [name (stage-symbol (second (stage-items form :list)))
+          descriptor (elem (BeamLisp.Env/lookup (tuple :class-declaration namespace name)) 1)]
+     (when-not (BeamLisp.Record/declaration_kind descriptor namespace name)
+      (stage-refuse :unsupported-sdk-stage-class-bindings))
+     ;; A symbolic class binding belongs only to this disposable compiler view.
+     ;; It shadows inherited values without loading a module or publishing its
+     ;; schema/factories. The ordinary compiler can then use its exact prelink
+     ;; descriptor instead of mistaking our nil mask for a Source rebinding.
+     (BeamLisp.Env/intern namespace name (:name descriptor))
+     (constructor_context_put! :staged-types
+      (Map/put (Map/get (constructor_context!) :staged-types {})
+       [namespace name] (:name descriptor))))))
+  (when (and (not linked) (constructor_context)
+             (contains? #{"defn" "defn-" "defmacro" "def"} (stage-head form)))
+   (constructor_shadow_staged_type! namespace (stage-symbol (second (stage-items form :list)))))
+  linked))
+
+; @compiler-component sdk-declarations
 (defn- constructor_unit! [namespace]
  (let [context (constructor_context!)]
   (or (Map/get (:units context) namespace)
@@ -6745,7 +6789,7 @@
          (BeamLisp.Env/add_refer namespace (elem declaration 0) target))))
       (doseq [form (rest forms)]
        (BeamLisp.Compiler/prelink_defn form namespace)
-       (BeamLisp.Compiler/prelink_type form namespace))))
+       (constructor_prelink_type! form namespace))))
     unit))))
 
 (defn- constructor_source_owner_uncached [namespace name]
@@ -7126,8 +7170,10 @@
    (let [[namespace binding] descriptor]
     (constructor_interpret (constructor_global_source namespace binding) {} state)))))
 
+; @compiler-component sdk-declarations
 (defn- constructor_check_sources! []
- (when-not (= (:compiler-key (:input (constructor_context!))) (BeamLisp.AOTCache/current_compiler_key))
+ (when-not (and (= (:compiler-key (:input (constructor_context!))) (BeamLisp.AOTCache/current_compiler_key))
+                (= (:sdk-key (:input (constructor_context!))) (BeamLisp.AOTCache/current_sdk_key)))
   (stage-refuse :sdk-constructor-compiler-changed))
  (Enum/each (Map/to_list (Map/get (constructor_context!) :source-paths {}))
   (fn [selection]
@@ -7230,6 +7276,7 @@
          :callable-kinds (Map/put kinds namespace (Enum/reduce bindings prior-kinds
            (fn [binding out] (Map/put out binding (sdk_callable_kind (stage-head form)))))))))))
 
+; @compiler-component sdk-declarations
 (defn- constructor_record_definition! [form namespace]
  (when-let [context (constructor_context)]
   (let [head (stage-head form)]
@@ -7239,6 +7286,7 @@
           declaration {:head head :form form}
           unit (Map/put unit :definitions (Map/put (:definitions unit) binding declaration))]
      (constructor_context_put! :units (Map/put (:units (constructor_context!)) namespace unit))
+     (constructor_shadow_staged_type! namespace binding)
      (when (= "defmacro" head)
       (constructor_context_put! :seen-macros (conj (:seen-macros (constructor_context!)) [namespace binding])))
      (constructor_context_put! :compiled (Map/delete (:compiled (constructor_context!)) [namespace binding]))
@@ -7261,6 +7309,7 @@
     (constructor_context_put! :clauses
       (Map/put (:clauses (constructor_context!)) ident [(first owner) (second owner)]))))))
 
+; @compiler-component sdk-declarations
 (defn- stage-sdk-forms! [forms namespace file values defined]
  (if (empty? forms) (tuple values defined)
   (let [form (first forms)
@@ -7280,7 +7329,7 @@
      (stage-sdk-forms! (erlang/++ (or parts (list expanded)) (rest forms)) namespace file values defined))
     (let [head (stage-head form)
           _ (do (BeamLisp.Compiler/prelink_defn form namespace)
-                (BeamLisp.Compiler/prelink_type form namespace))
+                (constructor_prelink_type! form namespace))
           value
            (case head
             "defn" (do (stage-function! form namespace file) values)

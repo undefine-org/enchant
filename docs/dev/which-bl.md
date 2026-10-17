@@ -132,12 +132,26 @@ scripts/check-runtime-hosts \
   test/bl/perf/spawn_cost_test.bl test/bl/lazy_clean_capture_test.bl
 ```
 
-Omit test paths to run the focused runtime regression set. Unchanged host
-beams are reused across runs; tests share one VM and each file has a 120-second
+Omit test paths to run the focused runtime regression set. Hosts whose source
+and compiler identities match the verified seed use its existing beams;
+other hosts reuse cached compilations across runs. Tests share one VM and each file has a 120-second
 ceiling. Use `--suite-timeout SECONDS` for a longer check. Empty results,
 failed assertions and timeouts fail the command.
 
 The checker keeps its image, cache, fixtures and manifest in its private work
-directory. Dependencies come from the configured XDG cache. When `HEAD`
+directory. Generated SDK caches belong to the exact floor and edited host
+sources, so each edit gets a separate cache. Dependencies come from the configured XDG cache. When `HEAD`
 contains the seed-matching host sources, `--bootstrap-hosts` is optional.
 After runtime checks pass, regenerate and qualify the real floor once.
+
+## Checkout startup caches
+
+Dependency path discovery runs in the native loader. Project loading-policy
+validation is independent of application preparation; JSON support loads when
+JSON output is requested.
+
+SDK inventory discovery is cached privately in each VM. Reuse checks current
+source bytes, loaded code, publication receipts, and native libraries.
+Namespace beams stamped with obsolete compiler generations are moved off the
+code path into `build/.stale-generations/`; their original bytes are retained.
+Current-generation, floor-owned, and unjudged objects stay in place.

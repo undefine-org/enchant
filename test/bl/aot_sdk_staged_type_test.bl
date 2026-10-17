@@ -1,0 +1,98 @@
+(ns aot-sdk-staged-type-test)
+
+(defn- in-scope-for [source-namespace action]
+ ;; Native component fixture: source forms below are synthetic test controls,
+ ;; confined to the disposable compiler view. They never become SDK receipts.
+ (let [previous (BeamLisp.Env/capture)
+       prior (Process/get :bl_sdk_constructor_context)
+       _ (when (or (:generation previous) (:application-identity previous))
+           (erlang/error :component-harness-requires-kernel-context))
+       path (BeamLisp.Loader/source_path source-namespace) source (BeamLisp.Loader/read_source path)
+       input (BeamLisp.AOT/constructor_source_input! source-namespace path source)
+       view (BeamLisp.Env/fork :global)]
+  (try
+   (BeamLisp.Loader/without_initialization
+    (fn [] (BeamLisp.Env/with_env view
+      (fn []
+       (Process/put :bl_sdk_constructor_context
+        {:input input :compiler-env view :units {} :compiled {} :compiling #{}
+         :clauses {} :seen-macros #{} :kernel-modules #{} :kernel-leases (list)
+         :macro-steps 16384 :new-atoms 128 :expanded 0})
+       (BeamLisp.AOT/constructor_install_kernel!)
+       (BeamLisp.AOT/constructor_unit! "core")
+       (action)))))
+   (finally
+    (doseq [handle (:kernel-leases (Process/get :bl_sdk_constructor_context))]
+     (BeamLisp.Env/release_code! handle))
+    (BeamLisp.Env/destroy view)
+    (if prior (Process/put :bl_sdk_constructor_context prior)
+              (Process/delete :bl_sdk_constructor_context))
+    (BeamLisp.Env/bind previous)))))
+
+(defn- in-scope [action] (in-scope-for "core" action))
+
+
+(defn- read-one [source] (first (BeamLisp.Reader/read_string source)))
+(defn- dispatch-tag [namespace source]
+ (let [compiled (BeamLisp.Compiler/compile (read-one source) (BeamLisp.Compiler/new_env namespace))]
+  (:val (nth (:args compiled) 2))))
+
+(deftest masked-sdk-types-resolve-through-exact-inert-class-metadata
+ (in-scope
+  (fn []
+   (doseq [[head name] [["defrecord" "StagedRecord"] ["deftype" "StagedType"]]]
+    (let [namespace "staged.type.provider" module (BeamLisp.Record/module_name namespace name)
+          form (read-one (str "(" head " " name " [value])"))]
+     (BeamLisp.Env/declare_ns namespace)
+     (BeamLisp.Env/intern namespace name nil)
+     (is (BeamLisp.AOT/constructor_prelink_type! form namespace))
+     (is (= module (dispatch-tag namespace (str "(extend-type " name " Protocol (method [x] x))"))))
+     (is (= module (dispatch-tag namespace (str "(extend-protocol Protocol " name " (method [x] x))"))))
+     (BeamLisp.Env/add_alias "staged.type.client" "provider" namespace)
+     (is (= module (dispatch-tag "staged.type.client"
+                     (str "(extend-type provider/" name " Protocol (method [x] x))"))))
+     (is (not (erlang/module_loaded module)))
+     (is (nil? (BeamLisp.Record/info module)))
+     (is (= :error (BeamLisp.Env/lookup (tuple namespace (str "->" name)))))
+     (is (= :error (BeamLisp.Env/lookup (tuple namespace (str "map->" name)))))))))
+ (is (= :error (BeamLisp.Env/lookup (tuple "staged.type.provider" "StagedRecord")))))
+
+(deftest a-later-source-definition-shadows-the-staged-class-symbol
+ (in-scope
+  (fn []
+   (let [namespace "core" name "StagedShadow"
+         form (read-one "(defrecord StagedShadow [value])")]
+    (BeamLisp.AOT/constructor_prelink_type! form namespace)
+    (BeamLisp.AOT/constructor_record_definition! (read-one "(def StagedShadow nil)") namespace)
+    (is (= (tuple :ok nil) (BeamLisp.Env/peek namespace name)))
+    (is (= :StagedShadow (dispatch-tag namespace "(extend-type StagedShadow Protocol (method [x] x))")))
+    ;; A real runtime class binding still wins over stale declaration metadata.
+    (let [other (BeamLisp.Record/define "staged.type.rebound" "Other" (list "value"))]
+     (BeamLisp.Env/intern namespace name other)
+     (is (= other (dispatch-tag namespace "(extend-type StagedShadow Protocol (method [x] x))"))))))))
+
+(deftest ordinary-prelink-does-not-replace-an-explicit-nil-binding
+ (let [namespace "staged.type.ordinary" form (read-one "(defrecord Ordinary [value])")]
+  (BeamLisp.Env/declare_ns namespace)
+  (BeamLisp.Env/intern namespace "Ordinary" nil)
+  (is (BeamLisp.AOT/constructor_prelink_type! form namespace))
+  (is (= (tuple :ok nil) (BeamLisp.Env/peek namespace "Ordinary")))
+  (is (= :Ordinary (dispatch-tag namespace "(extend-type Ordinary Protocol (method [x] x))")))))
+
+(deftest prelink-order-preserves-a-foreign-types-final-source-shadow
+ (in-scope
+  (fn []
+   (let [namespace "staged.type.final" form (read-one "(defrecord FinalType [value])")
+         shadow (read-one "(def FinalType nil)")
+         module (BeamLisp.Record/module_name namespace "FinalType")]
+    (BeamLisp.Env/declare_ns namespace)
+    (BeamLisp.AOT/constructor_prelink_type! form namespace)
+    (BeamLisp.AOT/constructor_prelink_type! shadow namespace)
+    (BeamLisp.Env/add_alias "staged.type.client" "final" namespace)
+    (is (= (tuple :ok nil) (BeamLisp.Env/peek namespace "FinalType")))
+    (is (= :final/FinalType (dispatch-tag "staged.type.client"
+                            "(extend-type final/FinalType Protocol (method [x] x))")))
+    ;; Reversing declaration order makes the final class authoritative again.
+    (BeamLisp.AOT/constructor_prelink_type! form namespace)
+    (is (= module (dispatch-tag "staged.type.client"
+                    "(extend-type final/FinalType Protocol (method [x] x))")))))))

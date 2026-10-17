@@ -298,7 +298,7 @@
       :else cached)))
 
 (defn- compute_build_key []
-  (hash_parts (lists/append (lst (compiler_key)) (build_source_contents))))
+  (hash_parts (lists/append (lst (current_sdk_key)) (build_source_contents))))
 
 (defn- build_source_contents
   "Content of every build-driver source, sorted by path. Read DIRECTLY (no
@@ -324,38 +324,236 @@
   ([path root]
    (cond
      (BeamLisp.Tiers/build_source? path root) (build_key)
-     :else (compiler_key))))
+     (or (BeamLisp.Tiers/boot_source? path root)
+         (erlang/== (Path/expand path) (Path/join (Path/expand root) "std/multi.bl"))) (compiler_key)
+     :else (sdk_key))))
 
 (defn key_for_ns
   "The key a NAMESPACE's beam is stamped with: `BeamLisp.Tiers.tier_of_ns/1`."
   [ns]
-  (key_for_tier (BeamLisp.Tiers/tier_of_ns ns)))
+  (if (bootstrap_namespace? ns) (compiler_key)
+   (key_for_tier (BeamLisp.Tiers/tier_of_ns ns))))
 
 (defn key_for_tier
   "The key for a tier: `:build` → `build_key/0`, anything else → `compiler_key/0`."
   [tier]
   (cond
     (erlang/== tier :build) (build_key)
-    :else (compiler_key)))
+    (erlang/== tier :boot) (compiler_key)
+    :else (sdk_key)))
 
 (defn reset_compiler_key
   "Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
    The key is a VM-constant in normal use, so this exists only for tests that
    mutate a hashed input in-process and must observe the new key."
   []
-  (persistent_term/erase (toolchain_key_pt)))
+  (persistent_term/erase (toolchain_key_pt))
+  (persistent_term/erase (sdk_key_pt)))
 
 (defn reset_keys
   "Drop BOTH memoized tier keys, so the next `compiler_key/0` and `build_key/0`
    recompute. Tests that mutate a hashed input in-process use this."
   []
   (persistent_term/erase (toolchain_key_pt))
+  (persistent_term/erase (sdk_key_pt))
   (persistent_term/erase (build_key_pt))
   :ok)
 
+; Selective inputs are read before Reader/Core exist. Parse only the closed
+; pinned-host container (ns and top-level defn forms); retain exact form bytes.
+; Unknown syntax, duplicate functions and incomplete inputs fail closed.
+(defn- component_error []
+ (erlang/error (Elixir.ArgumentError/exception "invalid compiler component source or certificate")))
+
+(defn- component_form [forms source start finish component]
+ (let [form (binary/part source start (erlang/- finish start))
+       matched (Regex/run (Regex/compile! "\\A\\(defn-?\\s+([^\\s\\[\\](){}]+)") form)
+       name (cond
+              (erlang/is_list matched) (erlang/hd (erlang/tl matched))
+              (Regex/match? (Regex/compile! "\\A\\(ns\\s+") form) "$namespace"
+              :else (component_error))]
+  (when (or (maps/is_key name forms)
+            (and (erlang/== name "$namespace") (erlang/not (erlang/== component :shared))))
+   (component_error))
+  (maps/put name (tup component form) forms)))
+
+(defn compiler_source_forms
+ "Exact top-level source forms and their declared input domains. SDK domain
+  markers are recognized only in inter-form comments, never strings or bodies."
+ [input]
+ (let [source (bcat input "\n") size (erlang/byte_size source)]
+  (loop [i 0 stack '() start 0 mode :code escaped false comment 0 component :shared forms {}]
+   (if (erlang/== i size)
+    (if (and (erlang/== stack '()) (erlang/== mode :code) (erlang/== component :shared)) forms (component_error))
+    (let [c (binary/at source i) next (erlang/+ i 1)]
+     (cond
+      (erlang/== mode :comment)
+      (if (erlang/== c 10)
+       (let [text (String/trim (binary/part source comment (erlang/- i comment)))
+             tagged (and (erlang/== stack '()) (String/starts_with? text "; @compiler-component"))
+             domain (if tagged
+                      (if (and (erlang/== text "; @compiler-component sdk-declarations")
+                               (erlang/== component :shared)) :sdk-declarations (component_error)) component)]
+        (recur next stack start :code false 0 domain forms))
+       (recur next stack start mode false comment component forms))
+      (erlang/== mode :string)
+      (cond escaped (recur next stack start mode false comment component forms)
+            (erlang/== c 92) (recur next stack start mode true comment component forms)
+            (erlang/== c 34) (recur next stack start :code false comment component forms)
+            :else (recur next stack start mode false comment component forms))
+      (erlang/== c 59) (recur next stack start :comment false i component forms)
+      (and (erlang/== stack '()) (Enum/member? '(9 10 13 32 44) c))
+       (recur next stack start :code false comment component forms)
+      (and (erlang/== stack '()) (erlang/not (erlang/== c 40))) (component_error)
+      (erlang/== c 34) (recur next stack start :string false comment component forms)
+      (erlang/== c 92)
+       (if (erlang/< next size)
+        (recur (erlang/+ next 1) stack start :code false comment component forms) (component_error))
+      (Enum/member? '(40 91 123) c)
+       (let [closing (cond (erlang/== c 40) 41 (erlang/== c 91) 93 :else 125)]
+        (recur next (erlang/++ (lst closing) stack) (if (erlang/== stack '()) i start)
+          :code false comment component forms))
+      (Enum/member? '(41 93 125) c)
+       (if (or (erlang/== stack '()) (erlang/not (erlang/== c (erlang/hd stack)))) (component_error)
+        (let [remaining (erlang/tl stack)]
+         (if (erlang/== remaining '())
+          (recur next remaining 0 :code false comment :shared
+            (component_form forms source start next component))
+          (recur next remaining start :code false comment component forms))))
+      :else (recur next stack start :code false comment component forms)))))))
+
+(defn aot_component_inputs
+ "Source-level input fingerprints. Overrides are used only when projecting a
+  verified legacy source through the new component declarations at migration."
+ ([source] (aot_component_inputs source {}))
+ ([source overrides]
+  (let [sha (hash_parts (lst source)) cache-key (tup (self_mod) :component_forms)
+        hit (persistent_term/get cache-key nil)
+        forms (if (and (erlang/is_tuple hit) (erlang/== sha (erlang/element 1 hit)))
+                (erlang/element 2 hit)
+                (let [parsed (compiler_source_forms source)]
+                 (persistent_term/put cache-key (tup sha parsed)) parsed))
+        rows (Enum/sort (Map/to_list forms))
+        domains (Map/new rows (fn [row]
+                  (tup (erlang/element 1 row)
+                   (maps/get (erlang/element 1 row) overrides (erlang/element 1 (erlang/element 2 row))))))
+        digest (fn [domain]
+                 (hash_parts (erlang/++ (lst "compiler-forms-v1")
+                  (Enum/flat_map rows (fn [row]
+                   (let [name (erlang/element 1 row) value (erlang/element 2 row)]
+                    (if (erlang/== (maps/get name domains) domain)
+                     (lst name (erlang/element 2 value)) '()))))))]
+   {:shared (digest :shared) :sdk-declarations (digest :sdk-declarations) :domains domains})))
+
+(defn compiler_component_inputs
+ "Complete source inputs for the shared bootstrap and SDK declaration stages."
+ ([] (compiler_component_inputs nil {}))
+ ([aot-source overrides]
+  (let [source (or aot-source (File/read! (codegen_source_path :Elixir.BeamLisp.AOT)))
+        aot (aot_component_inputs source overrides)
+        hosts (Enum/flat_map (codegen_modules)
+               (fn [mod]
+                (if (erlang/== mod :Elixir.BeamLisp.AOT) '()
+                 (lst (erlang/atom_to_binary mod :utf8)
+                  (hash_parts (lst (File/read! (codegen_source_path mod))))))))
+        common (hash_parts (lists/append
+          (lst "compiler-shared-v1" (System/version) (erlang/system_info :otp_release)
+           (erlang/atom_to_binary (aot_backend) :utf8) (maps/get :shared aot))
+          (lists/append hosts (toolchain_source_contents))))]
+   {:shared common :sdk-declarations (maps/get :sdk-declarations aot) :domains (maps/get :domains aot)})))
+
+(defn legacy_compiler_key_for_aot
+ "Recompute an old aggregate key from authenticated previous AOT source and
+  the unchanged remaining inputs; used only for one-time manifest migration."
+ [source]
+ (let [hosts (Enum/flat_map (codegen_modules)
+               (fn [mod] (lst (if (erlang/== mod :Elixir.BeamLisp.AOT) source
+                                 (File/read! (codegen_source_path mod)))
+                              (erlang/atom_to_binary mod :utf8))))
+       digest (hash_parts (erlang/++ (lst "codegen") hosts))]
+  (hash_parts (lists/append
+    (lst (bcat "elixir:" (System/version))
+         (bcat "otp:" (erlang/list_to_binary (erlang/system_info :otp_release)))
+         (bcat "aot_backend:" (erlang/atom_to_binary (aot_backend) :utf8))
+         (bcat "codegen-source:" digest)) (toolchain_source_contents)))))
+
+(defn refresh_compiler_inputs
+ "Certify unchanged shared inputs without relabeling any old artifact. The
+  caller must authenticate previous-source against the seed host source stamp.
+  Existing certificates can be refreshed only within the same shared ABI."
+ [manifest previous-source]
+ (let [live (compiler_component_inputs)
+       old (maps/get "compiler_inputs" manifest nil)
+       projected (compiler_component_inputs previous-source (maps/get :domains live))
+       base (maps/get "compiler_key" manifest)]
+  (when-not (and (erlang/== (maps/get :shared live) (maps/get :shared projected))
+    (if (erlang/== old nil)
+      (erlang/== base (legacy_compiler_key_for_aot previous-source))
+      (and (erlang/== 1 (maps/get "schema" old nil))
+           (erlang/== base (maps/get "base_key" old nil))
+           (erlang/== (maps/get :shared live) (maps/get "shared" old nil)))))
+   (erlang/error (Elixir.ArgumentError/exception "shared compiler inputs changed; bootstrap units require rebuilding")))
+  {"schema" 1 "base_key" base "shared" (maps/get :shared live)
+   "sdk_declarations" (maps/get :sdk-declarations live)}))
+
+(defn- compiler_input_certificate []
+ (let [path (Path/join (BeamLisp.Tiers/priv_root) "bootstrap/seed/manifest.term")]
+  (if (File/exists? path)
+   (let [result (file/consult (String/to_charlist path))]
+    (if (and (erlang/== :ok (erlang/element 1 result))
+             (erlang/== 1 (erlang/length (erlang/element 2 result))))
+     (let [manifest (erlang/hd (erlang/element 2 result))
+           certificate (maps/get "compiler_inputs" manifest nil)]
+      (when (erlang/not (erlang/== certificate nil))
+       (when-not (and (erlang/is_map certificate) (erlang/== 1 (maps/get "schema" certificate nil))
+                     (erlang/== (maps/get "base_key" certificate nil) (maps/get "compiler_key" manifest nil))
+                     (erlang/is_binary (maps/get "base_key" certificate nil))
+                     (erlang/is_binary (maps/get "shared" certificate nil))
+                     (erlang/is_binary (maps/get "sdk_declarations" certificate nil))
+                     (valid_compiler_key? (maps/get "base_key" certificate nil))
+                     (valid_compiler_key? (maps/get "shared" certificate nil))
+                     (valid_compiler_key? (maps/get "sdk_declarations" certificate nil))) (component_error)))
+      certificate)
+     (component_error))) nil)))
+
+(defn- sdk_key_pt [] (tup (self_mod) :sdk_key))
+(defn compiler_key_from_inputs [certificate inputs]
+ (let [shared (maps/get :shared inputs)]
+  (if (erlang/== shared (maps/get "shared" certificate))
+   (maps/get "base_key" certificate) (hash_parts (lst "compiler-shared-v1" shared)))))
+(defn current_sdk_key []
+ (let [certificate (compiler_input_certificate)]
+  (if (erlang/== nil certificate) (current_compiler_key)
+   (let [inputs (compiler_component_inputs)]
+    (hash_parts (lst "sdk-declarations-v1" (compiler_key_from_inputs certificate inputs)
+                 (maps/get :sdk-declarations inputs)))))))
+(defn sdk_key []
+ (let [key (sdk_key_pt) value (persistent_term/get key :undefined)]
+  (if (erlang/== value :undefined)
+   (let [value (current_sdk_key)] (persistent_term/put key value) value) value)))
+
+(defn bootstrap_namespace?
+ "The closed compiler prelude: boot namespaces and multi, without SDK staging."
+ [ns]
+ (or (erlang/== ns "multi") (Enum/member? (BeamLisp.Tiers/boot_namespaces) ns)))
+
+(defn compiler_input_manifest []
+ (let [inputs (compiler_component_inputs)]
+  {"schema" 1 "base_key" (compiler_key) "shared" (maps/get :shared inputs)
+   "sdk_declarations" (maps/get :sdk-declarations inputs)}))
+
+(defn compiler_inputs_for_ns [ns]
+ (if (bootstrap_namespace? ns) {:shared (compiler_key)}
+  {:shared (compiler_key) :sdk-declarations (sdk_key)}))
+
 ; ── the toolchain key computation ──────────────────────────────────────────
 
-(defn- compute_compiler_key
+(defn- compute_compiler_key []
+ (let [certificate (compiler_input_certificate)]
+  (if (erlang/== certificate nil) (legacy_compiler_key)
+   (compiler_key_from_inputs certificate (compiler_component_inputs)))))
+
+(defn- legacy_compiler_key
   "The key: the runtime triple, the codegen contribution and the tier-1 sources,
    NUL-joined and hashed. The app `:vsn` is DELIBERATELY NOT hashed — it is
    release METADATA, not a codegen input, and keying the generation on it

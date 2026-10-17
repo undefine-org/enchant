@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test runtime host edits against the existing compiler floor, in two VMs.
 
-The first VM compiles only AOT, Env and LazyMemo with the seeded compiler.
+The first VM prepares AOT, Env and LazyMemo with the seeded compiler, reusing
+verified seed beams or cached compilations when their identities match.
 The second starts those exact beams, including the NIF wrapper, and runs the
 requested tests. Everything is staged in a temporary image; neither the floor,
 build/, installed drops nor the shared cache is modified. This is a runtime
@@ -9,6 +10,7 @@ regression check, not a replacement for release/compiler bootstrap qualification
 """
 import argparse
 import contextlib
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -24,6 +26,7 @@ DEFAULT_TESTS = [
     "test/bl/aot_sdk_seed_snapshot_test.bl",
     "test/bl/proc/native_owned_start_test.bl",
     "test/bl/aot_sdk_constructor_staging_test.bl",
+    "test/bl/aot_sdk_staged_type_test.bl",
 ]
 
 DRIVER = r'''
@@ -66,8 +69,22 @@ case System.fetch_env!("HOST_CHECK_PHASE") do
       stamp = path <> ".stamp"
       want = manifest["compiler_key"] <> ":" <> digest
       if not (File.exists?(path) and File.read(stamp) == {:ok, want}) do
-        {^mod, ^path} = BeamLisp.AOT.compile_host_file(source,
-          module: mod, output_dir: output, source_hash: digest, load?: false)
+        seeded = Path.join(seed, Atom.to_string(mod) <> ".beam")
+        # The verified floor already contains unchanged hosts. Reuse their
+        # exact bytes only when both source and compiler identities agree.
+        reusable = case :beam_lib.chunks(String.to_charlist(seeded), [:attributes]) do
+          {:ok, {^mod, [attributes: attrs]}} ->
+            List.wrap(attrs[:bl_source_hash]) == [digest] and
+              List.wrap(attrs[:bl_compiler_key]) == [manifest["compiler_key"]]
+          _ -> false
+        end
+        if reusable do
+          File.cp!(seeded, path)
+          IO.puts("HOST-CHECK reused verified seed #{leaf}")
+        else
+          {^mod, ^path} = BeamLisp.AOT.compile_host_file(source,
+            module: mod, output_dir: output, source_hash: digest, load?: false)
+        end
         File.write!(stamp, want)
       end
       bytes = File.read!(path)
@@ -172,6 +189,15 @@ def main():
         edited.mkdir(exist_ok=True)
         for leaf in ("aot.bl", "env.bl", "lazy_memo.bl"):
             shutil.copy2(ROOT / "priv/host" / leaf, edited / leaf)
+        # AOT edits can change staged SDK output while this diagnostic image
+        # deliberately keeps its bootstrap compiler key. Keep generated caches
+        # separate for each exact floor and edited host set.
+        inputs = [ROOT / "priv/bootstrap/seed/manifest.term"] + [
+            edited / leaf for leaf in ("aot.bl", "env.bl", "lazy_memo.bl")
+        ]
+        cache_identity = hashlib.sha256(b"".join(
+            hashlib.sha256(path.read_bytes()).digest() for path in inputs
+        )).hexdigest()
         for leaf in ("aot.bl", "env.bl"):
             if args.bootstrap_hosts:
                 shutil.copy2(args.bootstrap_hosts / leaf, root / "priv/host" / leaf)
@@ -213,7 +239,7 @@ def main():
             print(f"HOST-CHECK {phase}: isolated image, existing compiler, 6G cap", flush=True)
             env = os.environ.copy()
             env.update(BL_ROOT=str(root), BL_DAEMON="off", HOST_CHECK_PHASE=phase,
-                       XDG_CACHE_HOME=str(root / "cache"), HOST_CHECK_TIMEOUT_MS=str(args.suite_timeout * 1000),
+                       XDG_CACHE_HOME=str(root / "cache" / cache_identity), HOST_CHECK_TIMEOUT_MS=str(args.suite_timeout * 1000),
                        ERL_FLAGS="+S 4:4 +SDcpu 2:2 +SDio 1:1 +sbwt none +sbwtdcpu none +sbwtdio none")
             env.pop("BEAM_LISP_DEV", None)
             cap = ["systemd-run", "--user", "--collect", "--wait", "--pipe",
