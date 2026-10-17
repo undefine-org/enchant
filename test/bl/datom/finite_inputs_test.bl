@@ -1,0 +1,61 @@
+;; Finite query argument/projection walks must not allocate optional lazy cells.
+(ns datom.finite-inputs-test (:require [datom :as d] [datom.query.engine :as engine]))
+
+(def schema [{:db/ident :finite/name :db/valueType :db.type/string}
+             {:db/ident :finite/flag :db/valueType :db.type/boolean}])
+(defn fixture []
+ (let [c (d/connect schema)]
+  (d/transact! c [{:db/id -1 :finite/name "A" :finite/flag false}
+                  {:db/id -2 :finite/name "B" :finite/flag true}]) c))
+
+(defn without-cache [compute]
+ (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)
+       depth (erlang/system_flag :backtrace_depth 64)]
+  (Application/put_env :beam_lisp :lazy_cache_budget_bytes 0)
+  (try {:value (compute)} (catch cause {:error (ex-message cause)
+         :stack (reduce (fn [out frame] (conj out [(str (elem frame 0)) (str (elem frame 1))
+           (let [arity (elem frame 2)] (if (number? arity) arity (count arity)))])) [] __STACKTRACE__)})
+   (finally
+    (erlang/system_flag :backtrace_depth depth)
+    (if (nil? previous) (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+     (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+
+(deftest finite-query-find-shapes-survive-without-optional-memo
+ (let [c (fixture) db (d/db c)]
+  (try
+   (doseq [query ['[:find ?n :where [?e :finite/name ?n]]
+                  '[:find ?n . :where [?e :finite/name ?n] [?e :finite/flag false]]
+                  '[:find [?n] :where [?e :finite/name ?n] [?e :finite/flag false]]
+                  '[:find [?n ...] :where [?e :finite/name ?n]]
+                  '[:find ?n :where [?e :finite/name ?n] [(= ?n "absent")]]
+                  '[:find ?n :where [?e :finite/name ?n] [:or [?e :finite/flag false] [?e :finite/flag false]]]
+                  '[:find ?n :where [?e :finite/name ?n] [:or-join [?e] [?e :finite/flag false] [?e :finite/flag false]]]]]
+    (let [expected (engine/q-uncached query db)
+          actual (without-cache (fn [] (engine/q-uncached query db)))]
+     (when (:error actual) (println :finite-query-failure actual))
+     (is (nil? (:error actual)) (str "Finite query must not request optional lazy admission: " (:error actual)))
+     (is (= expected (:value actual)))))
+   (finally (d/release! c)))))
+
+(deftest finite-core-map-is-eager-before-query-execution
+ (let [actual (without-cache (fn [] (mapv inc [1 2])))]
+  (when (:error actual) (println :finite-core-map-failure actual))
+  (is (nil? (:error actual)))
+  (is (= [2 3] (:value actual)))))
+
+(deftest finite-supplied-inputs-retain-nil-false-and-binding-shapes
+ (let [c (fixture) db (d/db c)]
+  (try
+   (doseq [[query supplied expected]
+            [['[:find ?n :in $ ?n :where [?e :finite/name ?n]] ["B"] #{["B"]}]
+             ['[:find ?n :in $ [?n ...] :where [?e :finite/name ?n]] [["B" "A"]] #{["B"] ["A"]}]
+             ['[:find ?n ?flag :in $ [?n ?flag] :where [?e :finite/name ?n]] [["B" nil]] #{["B" nil]}]
+             ['[:find ?n ?flag :in $ [[?n ?flag]] :where [?e :finite/name ?n]] [[["A" false] ["B" nil]]] #{["A" false] ["B" nil]}]]]
+    ;; Prepare the actual query, then force authoritative execution, never a
+    ;; retained result, while optional memo admission is disabled.
+    (is (= expected (apply engine/q-uncached query db supplied)))
+    (let [actual (without-cache (fn [] (apply engine/q-uncached query db supplied)))]
+     (when (:error actual) (println :finite-input-failure actual))
+     (is (nil? (:error actual)) (str "Finite binding inputs retain every supplied value: " (:error actual)))
+     (is (= expected (:value actual)))))
+   (finally (d/release! c)))))
