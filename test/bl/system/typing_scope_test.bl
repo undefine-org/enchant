@@ -1,0 +1,75 @@
+(ns system.typing-scope-test (:require [typed] [system.arity :as ar]))
+
+(defn warnings [source] (:warnings (typed/check-source source "sample.scope")))
+
+(deftest ordinary-source-functions-do-not-expand-as-core-macros
+  (is (empty? (warnings "(defn derived [label x u evidence] {:v x})
+                         (defn convert [x] (derived :convert x :mm {}))")))
+  (is (try (warnings "(defn f [] (derived :convert 1 :mm {}))") false (catch _ true))))
+
+(deftest local-callables-do-not-inherit-core-signatures
+  (let [source "(defn local [] (let [get (fn [x] x)] (get :valid)))
+                (defn bad [] (get))"
+        findings (ar/diagnostics source)]
+    (is (empty? (warnings "(defn local [] (let [get (fn [x] x)] (get :valid)))")))
+    (is (= 1 (count findings)))
+    (is (= "bad" (:fn (first findings)))))
+  (is (empty? (ar/diagnostics "(defn f [doc] (doc 1 2 3 4))")))
+  (is (empty? (ar/diagnostics "(defn f [] (let [doc (fn [a b c d] a)] (doc 1 2 3 4)))"))))
+
+(deftest a-false-value-predicate-does-not-exclude-an-entire-numeric-type
+  (doseq [predicate ["zero?" "pos?" "neg?"]]
+    (is (empty? (warnings (str "(defn f [n] (if (" predicate " n) 0 (dec n)))")))))
+  (is (some #(= :type-mismatch (:kind %))
+        (warnings "(defn f [n] (if (number? n) 0 (dec n)))"))))
+
+(deftest bottom-and-shadowed-guards-do-not-invent-type-mismatches
+  (let [ws (warnings "(defn f [n] (if (number? n) (if (string? n) (+ n 1) 0) 0))")]
+    (is (some #(= :unreachable-branch (:kind %)) ws))
+    (is (not (some #(= :type-mismatch (:kind %)) ws))))
+  (is (empty? (warnings "(defn f [] (let [number? (fn [x] true) n :ready]
+                                    (if (number? n) (name n) :none)))"))))
+
+(deftest syntaxquote-checks-unquoted-expressions-rather-than-template-data
+  (is (empty? (warnings "(defmacro make [spec] `(assoc (quote ~spec) :name :n))")))
+  (is (some #(= :type-mismatch (:kind %))
+        (warnings "(defmacro make [] `(~(+ :bad 1)))"))))
+
+(deftest an-ordinary-macro-name-cannot-hide-an-unrelated-invalid-call
+  (let [source "(defn derived [a b c d] b)
+                (defn good [] (derived :convert 1 :mm {}))
+                (defn bad [] (keep odd?))"
+        findings (ar/diagnostics source)]
+    (is (= 1 (count findings)))
+    (is (= "bad" (:fn (first findings))))))
+
+(deftest when-not-and-template-unquotes-retain-real-type-errors
+  (is (some #(= :type-mismatch (:kind %))
+        (warnings "(defn f [n] (when-not (number? n) (dec n)))")))
+  (is (some #(= :type-mismatch (:kind %))
+        (warnings "(defn f [] `{:nested `(~(+ :bad 1))})"))))
+
+
+(deftest caller-local-macros-and-qualified-core-calls-retain-independent-errors
+  (let [source "(defn good [derived] (derived :convert 1 :mm {}))
+                (defn bad [] (core/when true (keep odd?)))"
+        findings (ar/diagnostics source)]
+    (is (= 1 (count findings)))
+    (is (= "bad" (:fn (first findings))))))
+
+
+(deftest repeated-callee-contracts-keep-call-sites-and-refresh-next-check
+  (let [environment (BeamLisp.Env/fork)
+        source "(ns sample.contract)
+(defn bad [] (take-two 1))
+(defn bad-again [] (take-two 2))"]
+    (try
+      (BeamLisp.Env/with_env environment
+        (fn []
+          (BeamLisp.Env/intern "sample.contract" "take-two" (fn [a b] a))
+          (let [findings (ar/diagnostics source)]
+            (is (= 2 (count findings)))
+            (is (= ["bad" "bad-again"] (mapv :fn findings))))
+          (BeamLisp.Env/intern "sample.contract" "take-two" (fn [a] a))
+          (is (empty? (ar/diagnostics source)))))
+      (finally (BeamLisp.Env/destroy environment)))))

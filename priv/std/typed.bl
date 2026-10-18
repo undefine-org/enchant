@@ -227,6 +227,22 @@
 (defn list-node [items] (rn/list-node items))
 (defn meta-node [n pos] (rn/meta-node n pos))
 
+(defn ordinary-bound-names
+  "Ordinary top-level bindings shadow ambient macros and core signatures."
+  [forms]
+  (reduce (fn [out node]
+            (let [form (node-form node)]
+              (if (= :list (node-tag form))
+                (let [items (node-items form) head (node-form (first items))
+                      name (when (= :symbol (node-tag head)) (node-name head))]
+                  (if (and name (not= name "defmacro")
+                           (or (String/starts_with? name "def") (= name "declare")))
+                    (reduce (fn [acc n]
+                              (let [n (node-form n)]
+                                (if (= :symbol (node-tag n)) (conj acc (node-name n)) acc)))
+                            out (if (= name "declare") (rest items) (take 1 (rest items)))) out)) out)))
+          #{} forms))
+
 ; --- state --------------------------------------------------------------------
 
 ; Per-CALL state, stashed in the process dictionary. These atoms were VM-global
@@ -306,6 +322,29 @@
 ; --- the walker -----------------------------------------------------------------
 
 (declare walk)
+
+(defn- shadowed-call? [env name]
+  (or (contains? env name) (contains? (:source-bound (state)) name)))
+
+(defn- walk-template
+  "Template constructors are data; only unquoted expressions execute. Mirrors synq."
+  [sigs env node]
+  (let [form (node-form node) tag (node-tag form)]
+    (cond
+      (= tag :meta) (walk-template sigs env form)
+      (= tag :list)
+        (let [items (node-items form) head (node-form (first items))
+              name (when (= :symbol (node-tag head)) (node-name head))]
+          (if (contains? #{"unquote" "unquote-splicing"} name)
+            (walk sigs env (second items))
+            (reduce (fn [_ n] (walk-template sigs env n)) nil items)))
+      (contains? #{:vector :set} tag)
+        (reduce (fn [_ n] (walk-template sigs env n)) nil (node-items form))
+      (= tag :map)
+        (reduce (fn [_ pair]
+                  (walk-template sigs env (elem pair 0))
+                  (walk-template sigs env (elem pair 1))) nil (node-items form))
+      :else nil)))
 
 (defn eff-pos
   "Position for warnings: the node's own, else the enclosing meta
@@ -396,7 +435,7 @@
         nil)
       nil)
     (if (= :symbol (node-tag head))
-      (let [sig (call-sig sigs head)]
+      (let [sig (when-not (contains? env (node-name head)) (call-sig sigs head))]
         (if (nil? sig)
           (do (check-head-callable env head arg-types pos whole) any)
           (do
@@ -404,7 +443,7 @@
               (map-indexed
                 (fn [i declared]
                   (let [actual (get arg-types i nil)]
-                    (if (and (some? actual)
+                    (if (and (some? actual) (not (empty? actual))
                              (empty? (t-meet actual declared)))
                       (warn! :type-mismatch
                              (str (node-name head) ": argument " (+ i 1) " is "
@@ -429,12 +468,14 @@
                    (= :symbol (node-tag (node-form (second (node-items test))))))
             (let [pred (node-name (first (node-items test)))
                   x    (node-name (second (node-items test)))
-                  tags (get guard-tags (symbol pred) nil)]
+                  tags (when-not (shadowed-call? env pred) (get guard-tags (symbol pred) nil))]
               (if (nil? tags)
                 [env env]
                 (let [cur (get env x any)
                       in  (t-meet cur tags)
-                      out (t-diff cur tags)]
+                      ;; A nonzero number is still numeric. Only a full type
+                      ;; predicate licenses removing the whole type on false.
+                      out (if (contains? #{"zero?" "pos?" "neg?"} pred) cur (t-diff cur tags))]
                   (if (empty? in)
                     (warn! :unreachable-branch
                            (str "branch unreachable: " x " is provably not "
@@ -537,6 +578,10 @@
             (= hname "let")  (walk-let sigs env (second items) (rest (rest items)))
             (= hname "do")   (reduce (fn [_ b] (walk sigs env b)) never (rest items))
             (= hname "quote") #{:sym}
+            (= hname "syntax-quote")
+              (do (walk-template sigs env (second items)) any)
+
+            (shadowed-call? env hname) (walk-call sigs env items pos node)
 
             ; whitelisted macros — walked structurally, NEVER expanded
             (= hname "when")
@@ -549,7 +594,7 @@
                        pos node)
             (= hname "when-not")
               (walk-if sigs env
-                       (list head (second items)
+                       (list head (second items) nil
                              (list-node
                                (apply list
                                       (concat [(sym-node "do")]
@@ -763,12 +808,13 @@
   [src ns seeds]
   ; Install THIS call's atoms; restore the caller's (if any) on the way out, so
   ; a check nested inside another check resumes the outer one.
-  (let [st {:warnings (atom []) :evidence (atom {})}
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+        bound (ordinary-bound-names forms)
+        st {:warnings (atom []) :evidence (atom {}) :source-bound bound}
         prev (erlang/get state-key)]
     (erlang/put state-key st)
     (try
-      (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
-            sigs (merge core-sigs seeds (sigs-from-env ns))]
+      (let [sigs (merge (reduce dissoc (merge core-sigs seeds) bound) (sigs-from-env ns))]
     (doall
       (map
         (fn [form]

@@ -64,7 +64,7 @@
 ; through a local value carries no static callee and is not read.
 
 (ns system.arity
-  (:require [codebase :as cb]))
+  (:require [codebase :as cb] [typed]))
 
 ; The upper bound for ENUMERATING a callee's arities. It answers two questions:
 ; "is this a fn at all?" (a variadic fn is invocable at any high arity) and
@@ -82,22 +82,22 @@
     (catch _e "user")))
 
 (defn- source-facts
-  "The calls in `src`, and the names `src` defines.
-
-   One pass over the reader forms: `defn-form` says whether a top-level form
-   defines something (and what it is called), `walk-calls` records every call
-   under it with the head AS WRITTEN, its argument count and its line."
+  "Read calls with ordinary file bindings and conservative caller bindings.
+   Binding context travels through the existing walker; no environment setup
+   or source evaluation is needed to distinguish a local call from a macro."
   [in-ns src]
   (let [forms (BeamLisp.Reader/read_string src)
         defn-name (fn [form] (cb/defn-form form))
-        locals (into #{} (keep defn-name forms))
+        ordinary (typed/ordinary-bound-names forms)
+        bound (cb/call-bindings forms)
         calls (first
                 (reduce (fn [acc form]
-                          (cb/walk-calls (or (defn-name form) "<top>")
-                                         in-ns form (first acc) (second acc)))
-                        [[] 100000]
-                        forms))]
-    {:locals locals :calls calls}))
+                          (let [caller (or (defn-name form) "<top>")]
+                            (cb/walk-calls caller in-ns form
+                                           (first acc) (second acc)
+                                           (into ordinary (get bound caller #{})))))
+                        [[] 100000] forms))]
+    {:locals ordinary :bound bound :calls calls}))
 
 (defn- defined?
   "Whether namespace `ns` publicly defines `name` itself — no refer and no core
@@ -162,15 +162,20 @@
 (defn- consider
   "The finding for one call site, or nil when the oracle is satisfied — or when
    the oracle cannot be asked at all."
-  [in-ns locals site]
+  [in-ns locals bound resolved site]
   (let [callee (str (:call/callee site))
         n (:call/arity site)]
-    (if (contains? locals callee)
+    (if (or (contains? locals callee)
+            (contains? (get bound (str (:call/caller site)) #{}) callee))
       nil
-      (let [v (callee-value in-ns callee)]
-        (when (and (some? v)
-                   (some? (a-callable v))
-                   (not (invocable-at? v n)))
+      (let [entry (if (contains? @resolved callee)
+                    (get @resolved callee)
+                    (let [v (callee-value in-ns callee)
+                          contract {:value v :callable? (and (some? v) (some? (a-callable v)))}]
+                      (swap! resolved assoc callee contract)
+                      contract))
+            v (:value entry)]
+        (when (and (:callable? entry) (not (invocable-at? v n)))
           (finding site v))))))
 
 (defn diagnostics
@@ -186,8 +191,12 @@
     (let [in-ns (src-ns src)
           facts (source-facts in-ns src)
           locals (:locals facts)
-          calls (:calls facts)]
+          bound (:bound facts)
+          calls (:calls facts)
+          ;; A repeated call head shares one runtime contract in this check.
+          ;; The memo never escapes the request or survives a rebind/reload.
+          resolved (atom {})]
       (into []
-            (keep (fn [site] (consider in-ns locals site))
+            (keep (fn [site] (consider in-ns locals bound resolved site))
                   calls)))
     (catch _e [])))

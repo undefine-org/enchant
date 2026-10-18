@@ -257,14 +257,19 @@
   "Every (head …) call under `node`, as facts. `caller` is the
    enclosing fn name (string). Returns [facts next-id]. Meta wrappers
    carry the position; the inner list records against the WRAPPER's
-   line (via the :__pos env-style hint, same rule as typed)."
-  [caller ns-str node acc next-id]
-  (walk-calls-at caller ns-str node acc next-id nil))
+   line (via the :__pos env-style hint, same rule as typed). The optional
+   bound set prevents ambient macro expansion for source-local call heads."
+  ([caller ns-str node acc next-id]
+   (walk-calls-at caller ns-str node acc next-id nil))
+  ([caller ns-str node acc next-id bound]
+   (walk-calls-at caller ns-str node acc next-id nil 0 bound)))
 
 (defn walk-calls-at
   ([caller ns-str node acc next-id hint]
    (walk-calls-at caller ns-str node acc next-id hint 0))
   ([caller ns-str node acc next-id hint depth]
+   (walk-calls-at caller ns-str node acc next-id hint depth #{}))
+  ([caller ns-str node acc next-id hint depth bound]
   ; `depth` counts the per-element loops (LOOP-HEADS) enclosing `node`:
   ; the FUNCTION argument of the `map` family and the BODY of `for`/`doseq`
   ; are walked one level deeper; a loop's collection argument is not.
@@ -272,18 +277,18 @@
     (cond
       (= tag :meta)
         (walk-calls-at caller ns-str (second (erlang/tuple_to_list node))
-                       acc next-id (node-pos node) depth)
+                       acc next-id (node-pos node) depth bound)
 
       (contains? #{:vector :set} tag)
-        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth bound))
                 [acc next-id] (node-items node))
 
       (= tag :map)
         (reduce (fn [[a i] pair]
                   (let [[a2 i2] (walk-calls-at caller ns-str
-                                            (first (erlang/tuple_to_list pair)) a i hint depth)]
+                                            (first (erlang/tuple_to_list pair)) a i hint depth bound)]
                     (walk-calls-at caller ns-str
-                                (second (erlang/tuple_to_list pair)) a2 i2 hint depth)))
+                                (second (erlang/tuple_to_list pair)) a2 i2 hint depth bound)))
                 [acc next-id] (node-items node))
 
       (= tag :list)
@@ -294,7 +299,7 @@
             ; call target at all — so it contributes no call fact; its argument
             ; is still walked for the calls inside it.
             (= :keyword (node-tag head))
-              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth bound))
                       [acc next-id] (rest items))
             (not (= :symbol (node-tag head)))
             ; ((chooser) x) is an APPLICATION, not just a nested expression.
@@ -305,7 +310,7 @@
                   fact {:db/id next-id :call/caller caller
                         :call/callee "<dynamic>" :call/arity (count (rest items))
                         :call/line line :call/loop-depth depth}]
-              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth bound))
                       [(conj acc fact) (+ next-id 1)] items))
             :else
             (let [hname (node-name head)
@@ -345,7 +350,7 @@
                                                             :call/line (if p (:line p) 0)
                                                             :call/loop-depth inner-depth})
                                                   (inc i2)])
-                                               (walk-calls-at caller ns-str sub a2 i2 hint inner-depth))))
+                                               (walk-calls-at caller ns-str sub a2 i2 hint inner-depth bound))))
                                          [a i] (map-indexed (fn [k x] [k x]) (rest items))))]
               (cond
                 ; a loop head is walked as WRITTEN, never through its
@@ -370,9 +375,11 @@
                 ; it is a call.
                 :else
                   (let [orig   (typed/->tuple [:list items])
-                        grew?  (compiler/macroexpand-1 orig ns-str)]
+                        grew?  (if (contains? bound hname)
+                                 orig
+                                 (compiler/macroexpand-1 orig ns-str))]
                     (if (not (identical? grew? orig))
-                      (walk-calls-at caller ns-str grew? acc next-id hint depth)
+                      (walk-calls-at caller ns-str grew? acc next-id hint depth bound)
                       (let [p (node-pos node)
                             line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
                             fact {:db/id next-id
@@ -660,6 +667,12 @@
             (let [n (or (defn-form form) "<top>")]
               (assoc m n (into (get m n #{}) (form-bound-names form)))))
           {} forms))
+
+(defn call-bindings
+  "Conservative caller-scoped bindings shared by call attribution and arity.
+   A local name is unknown, never licensed to borrow a core function's arity."
+  [forms]
+  (bound-by-caller forms))
 
 (defn- qualified-callee
   "The fully-qualified name `written` denotes in this source, or nil when the
