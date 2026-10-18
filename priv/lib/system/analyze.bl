@@ -328,69 +328,14 @@
 (defn- ordinary-top-names [src]
   (typed/ordinary-bound-names (BeamLisp.Reader/read_string src)))
 
-(defn- literal-data?
-  "Reader data contains no function value or producer to apply. Never evaluate it."
-  [node]
-  (let [form (typed/node-form node) tag (typed/node-tag form)]
-    (cond
-      (= tag :meta) (literal-data? form)
-      (contains? #{:scalar :keyword} tag) true
-      (= tag :symbol) (contains? #{"nil" "true" "false"} (typed/node-name form))
-      (contains? #{:vector :set} tag) (every? literal-data? (typed/node-items form))
-      (= tag :map) (every? (fn [pair]
-                            (and (literal-data? (elem pair 0))
-                                 (literal-data? (elem pair 1)))) (typed/node-items form))
-      (= tag :list) (= "quote" (headname form))
-      :else false)))
-
-(defn- definition-bindings
-  "Find bindings even inside function bodies; quoted declarations are inert data."
-  [out node top?]
-  (let [form (typed/node-form node) tag (typed/node-tag form)]
-    (cond
-      (= tag :meta) (definition-bindings out form top?)
-      (= tag :list)
-        (let [head (headname form) items (typed/node-items form)]
-          (if (contains? #{"quote" "syntax-quote"} head) out
-            (let [binding? (contains? #{"def" "defonce" "defn" "defn-" "defmacro"
-                                       "defmulti" "defprotocol" "defrecord" "deftype"
-                                       "defnative" "defserver" "deflive" "declare"} head)
-                  names (if-not binding? []
-                          (if (= head "declare") (rest items) (take 1 (rest items))))
-                  next (reduce (fn [acc n]
-                                 (let [n (typed/node-form n)]
-                                   (if (= :symbol (typed/node-tag n))
-                                     (update acc (typed/node-name n)
-                                       (fn [prior] (conj (or prior [])
-                                         (and top? (= head "def") (>= (count items) 3)
-                                              (literal-data? (last items)))))) acc)))
-                               out names)]
-              (reduce #(definition-bindings %1 %2 false) next items))))
-      (contains? #{:vector :set} tag)
-        (reduce #(definition-bindings %1 %2 false) out (typed/node-items form))
-      (= tag :map)
-        (reduce (fn [acc pair]
-                  (definition-bindings (definition-bindings acc (elem pair 0) false)
-                                       (elem pair 1) false)) out (typed/node-items form))
-      :else out)))
-
-(defn- data-global-names
-  "Only a single plain def with a literal initializer supplies a data proof.
-   Duplicate bindings, defonce, computed values and callback-bearing maps stay opaque."
-  [src]
-  (let [bindings (reduce #(definition-bindings %1 %2 true)
-                         {} (BeamLisp.Reader/read_string src))]
-    (reduce (fn [out [name proofs]]
-              (if (and (= 1 (count proofs)) (= true (first proofs))) (conj out name) out))
-            #{} bindings)))
-
 (defn- core-pure-resolver
   "The program-aware half of the core purity table: a first-order core value
    name the program never binds resolves to `{}`; anything else is `:unknown`."
-  [shadowed data-globals]
+  [shadowed]
   (fn [name]
-    (if (or (contains? data-globals name)
-            (and (contains? fp/pure-value-globals name) (not (contains? shadowed name))))
+    ;; A literal initializer does not make a global immutable: templates,
+    ;; macros and runtime rebinding can replace it with an effectful value.
+    (if (and (contains? fp/pure-value-globals name) (not (contains? shadowed name)))
       {}
       :unknown)))
 
@@ -508,8 +453,7 @@
    bind reuse to both normalized bodies and the analysis implementation generation."
   [src]
   (let [bodies (fn-bodies src)]
-    {:bodies bodies :flow (flow-facts bodies) :shadowed (bound-top-names src)
-     :data-globals (data-global-names src)}))
+    {:bodies bodies :flow (flow-facts bodies) :shadowed (bound-top-names src)}))
 
 (defn- global-dependencies [n]
   (if-not (ir/node? n) #{}
@@ -550,7 +494,7 @@
   (let [defns (:bodies program)
         flow (:flow program)
         names (into [] (map first defns))
-        core (core-pure-resolver (:shadowed program) (:data-globals program))]
+        core (core-pure-resolver (:shadowed program))]
     (loop [returns (into {} (keep (fn [[name d]] (when (and (not (contains? dirty name)) (get previous name))
                                                    [name (:returns (get previous name))])) defns))
            fps (into {} (keep (fn [[name d]] (when (and (not (contains? dirty name)) (get previous name))
