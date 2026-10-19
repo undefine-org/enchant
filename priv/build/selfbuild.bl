@@ -267,16 +267,24 @@
           "run = BeamLisp.Env.fetch!(\"build\", \"run\")"
           "boot = Path.join(stage, \"boot\") <> \"/\""
           "sources = BeamLisp.Tiers.sources(stage) |> Enum.reject(fn p -> String.starts_with?(p, boot) end) |> Enum.reject(fn p -> String.ends_with?(p, \"-fixture.bl\") end)"
-          ;; NOT forced: a library beam whose tier key and require-closure key
-          ;; match is fetched from the shared AOT cache (the same provenance
-          ;; the runtime trusts), and every compiled one is stored there, so the
-          ;; next drop build compiles only what changed.
+          ;; Reuse is per SCRATCH: the build log, manifest and library beams
+          ;; persist in scratch (library-ebin, library-manifest), so build/run's
+          ;; own freshness check
+          ;; (log fact + tier key + closure key + beam provenance) skips every
+          ;; unchanged source. A source fetched from the shared AOT cache would
+          ;; be replayed without publishing its SDK compiler rows, which an SDK
+          ;; producer (vm.native) needs, so the cache stays off here.
+          "System.put_env(\"BEAM_LISP_AOT_CACHE\", \"0\")"
           "r = :erlang.apply(run, [%{sources: sources, root: stage, out: ebin, manifest: mpath, log_path: lpath, jobs: String.to_integer(jobs), log: nil}])"
           ;; A source can fail in a wide wave when a namespace it requires was
           ;; published by a sibling in flight. Retry only the failed sources,
           ;; one at a time, scoped so nothing else is pruned.
           "failed = r[:errors] |> Enum.flat_map(fn e -> case Regex.run(~r/^beam-lisp AOT: ([^ ]+?): /, to_string(e)) do [_, p] -> [p]; _ -> [] end end) |> Enum.uniq() |> Enum.filter(&(&1 in sources))"
           "r = if failed == [], do: r, else: (r2 = :erlang.apply(run, [%{sources: failed, scope: :scoped, root: stage, out: ebin, manifest: mpath, log_path: lpath, jobs: 1, log: nil}]); %{r2 | built: r[:built] + r2[:built]})"
+          ;; Last resort: an incremental run whose leftovers still fail (a
+          ;; changed source whose SDK producer was skipped as fresh, so this VM
+          ;; holds no compiler rows for it) is redone in full, forced.
+          "r = if Enum.count(r[:errors]) == 0, do: r, else: :erlang.apply(run, [%{sources: sources, root: stage, out: ebin, manifest: mpath, log_path: lpath, force?: true, jobs: String.to_integer(jobs), log: nil}])"
           "File.write!(result, :erlang.term_to_binary(Map.put(r, :sources, length(sources))))"
           "System.halt(if Enum.count(r[:errors]) == 0, do: 0, else: 1)")
     "\n"))
@@ -327,11 +335,18 @@
   (if (failed? acc)
     acc
     (let [root (library-root)
+          ;; The library beams live in scratch across drop builds, beside the
+          ;; build log that vouches for them, and are copied into the payload.
+          libs (Path/join scratch "library-ebin")
+          _ (File/mkdir_p! libs)
           payload (do (stage-library-root! root) ebin)
-          r (run-library-child! root payload scratch jobs)]
+          r (run-library-child! root libs scratch jobs)]
       (if-not (:ok? r)
         (reduce with-error acc (map (fn [e] (str "build: " e)) (:errors r)))
-        (let [inventory (BeamLisp.AOT/write_sdk_inventory! (Path/join root "priv") (:manifest r) payload
+        (let [_ (doseq [m (to-list (File/ls! libs))]
+                  (when (String/ends_with? m ".beam")
+                    (File/cp! (Path/join libs m) (Path/join payload m))))
+              inventory (BeamLisp.AOT/write_sdk_inventory! (Path/join root "priv") (:manifest r) payload
                         (Path/join (Path/dirname payload) "priv/sdk-code.term"))]
           (assoc acc :built (:built r)
                      :stages (assoc (:stages acc) :sources (:sources r)
