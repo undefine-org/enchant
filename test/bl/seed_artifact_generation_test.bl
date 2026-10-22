@@ -1,0 +1,83 @@
+(ns seed-artifact-generation-test (:require [seed]))
+
+(defn- refused [opts]
+ (try (seed/produce-artifacts opts) nil (catch error (:kind (ex-data error)))))
+
+(deftest generation-refuses-existing-output-and-links-before-any-production
+ (let [directory (str (System/tmp_dir!) "/seed-artifact-preflight-" (System/unique_integer (list :positive)))
+       out (str directory "/generation")]
+  (File/mkdir_p! out)
+  (try
+   (File/write! (str out "/manifest.term") "previous-manifest")
+   (File/write! (str out "/keep.beam") "previous-bytes")
+   (is (= :artifact-generation-output-exists (refused {:out out})))
+   (is (= "previous-manifest" (File/read! (str out "/manifest.term"))))
+   (is (= "previous-bytes" (File/read! (str out "/keep.beam"))))
+   (is (= false (File/exists? (str out ".lock"))))
+   (File/ln_s! (str directory "/absent") (str directory "/dangling"))
+   (is (= :artifact-generation-output-exists (refused {:out (str directory "/dangling")})))
+   (is (= :symlink (:type (File/lstat! (str directory "/dangling")))))
+   (finally (File/rm_rf! directory)))))
+
+(deftest generation-selects-current-physical-inventory-and-owns-no-foreign-output
+ (is (= :artifact-generation-options (refused {})))
+ (is (= :artifact-generation-options (refused {:out ""})))
+ (is (= :artifact-generation-options (refused {:out "/unused" :root 1})))
+ (is (= :artifact-generation-options (refused {:out "/unused" :root ""})))
+ (is (= :artifact-generation-options (refused {:out "/unused" :reuse-hosts ["/foreign"]})))
+ (is (= :artifact-generation-root (refused {:root "/unrelated" :out "generation"}))))
+
+(deftest another-producers-lock-is-preserved
+ (let [directory (str (System/tmp_dir!) "/seed-artifact-lock-" (System/unique_integer (list :positive)))
+       out (str directory "/generation") lock (str out ".lock")]
+  (File/mkdir_p! lock)
+  (File/write! (str lock "/owner") "another-producer")
+  (try
+   (is (= :artifact-generation-locked (refused {:out out})))
+   (is (= "another-producer" (File/read! (str lock "/owner"))))
+   (is (= false (File/exists? out)))
+   (finally (File/rm_rf! directory)))))
+
+(defn- with-stage [directory action]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "with-generation-stage!")
+                        (list directory action)))
+
+(deftest stage-cleanup-requires-ownership-and-preserves-the-original-error
+ (let [directory (str (System/tmp_dir!) "/seed-artifact-stage-" (System/unique_integer (list :positive)))
+       called (atom false)]
+  (File/mkdir_p! directory)
+  (File/write! (str directory "/owner") "other-stage")
+  (try
+   (is (= :refused (try (with-stage directory #(reset! called true)) :unexpected
+                       (catch error :refused))))
+   (is (= false @called))
+   (is (= "other-stage" (File/read! (str directory "/owner"))))
+   (finally (File/rm_rf! directory)))
+  (is (= :original (try (with-stage directory #(throw (ex-info "original" {:kind :original}))) :unexpected
+                        (catch error (:kind (ex-data error))))))
+  (is (= false (File/exists? directory)))))
+
+(deftest generation-rechecks-earlier-unit-inputs-and-project-before-publication
+ (let [directory (str (System/tmp_dir!) "/seed-artifact-inputs-" (System/unique_integer (list :positive)))
+       source (str directory "/earlier-unit.bl") project (str directory "/env.bl")
+       digest (crypto/hash :sha256 "selected")
+       compiler-key (BeamLisp.AOTCache/current_compiler_key)
+       build-key (BeamLisp.AOTCache/current_build_key)
+       verify (fn [inputs ck bk]
+                (try
+                 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "generation-inputs!")
+                   (list inputs ck bk project digest))
+                 :current
+                 (catch error (:kind (ex-data error)))))]
+  (File/mkdir_p! directory)
+  (try
+   (File/write! source "selected") (File/write! project "selected")
+   (let [inputs [{:file source :digest digest}]]
+    (is (= :current (verify inputs compiler-key build-key)))
+    (File/write! source "changed after its unit emitted")
+    (is (= :artifact-generation-source-changed (verify inputs compiler-key build-key)))
+    (is (= :artifact-generation-toolchain-changed (verify [] "another-compiler" build-key)))
+    (is (= :artifact-generation-toolchain-changed (verify [] compiler-key "another-driver")))
+    (File/write! project "changed app declaration")
+    (is (= :artifact-generation-toolchain-changed (verify [] compiler-key build-key))))
+   (finally (File/rm_rf! directory)))))

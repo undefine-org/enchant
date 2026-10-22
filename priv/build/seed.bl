@@ -1340,3 +1340,158 @@
                      :app (if (some? aw) (Path/basename (:path aw)) nil)
                      :modules (count entries) :namespaces (vec nss) :errors []}))))))
               (finally (File/rm_rf! scratch)))))))))
+
+;; Artifact production owns preparation through assembly. The exact host ABI
+;; comes from host-sources and stays in this call; a caller cannot relabel a
+;; directory of unrelated bytes with a purported host spec. Nothing here loads
+;; candidate modules, compiles a host through the legacy path, or installs a seed.
+(defn- generation-refuse! [kind data]
+ (throw (ex-info (str "Artifact generation refused: " kind) (assoc data :kind kind))))
+
+(defn- generation-path-present? [path]
+ (not= (tuple :error :enoent) (File/lstat path)))
+
+(defn- generation-app! [root]
+ (BeamLisp.Loader/ensure_loaded "bl.env")
+ (let [project (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "bl.env" "project") (list root))
+       app (ar/of-project project)]
+  (when-not (and (= root (:root project)) (= (str root "/env.bl") (:path project))
+                 (empty? (:errors project)) (:ok? app))
+   (generation-refuse! :artifact-generation-project {:errors (:errors project) :app-error (:why app)}))
+  app))
+
+(defn- generation-selection [file host]
+ (let [source (File/read! file) namespace (BeamLisp.Loader/declared_ns source)]
+  (when-not (erlang/is_binary namespace)
+   (generation-refuse! :artifact-generation-namespace {:file file}))
+  {:namespace (tuple :symbol namespace) :file file :digest (crypto/hash :sha256 source)
+   :host-spec (when host (assoc (dissoc host :source) :namespace (tuple :symbol namespace)))}))
+
+(defn- generation-unit! [selection directory]
+ (let [workspace (BeamLisp.AOT/open_workspace
+                  {:version 2 :phase-imports (list 'core 'sugar)
+                   :sources (list (Map/take selection (list :namespace :file)))} {})]
+  (try
+   (let [prepared (if (:host-spec selection)
+                    (BeamLisp.AOT/prepare_host_unit workspace (:host-spec selection))
+                    (BeamLisp.AOT/prepare_unit workspace (:namespace selection)))
+         emitted (BeamLisp.AOT/emit_unit prepared directory)
+         verified (BeamLisp.AOT/verify_unit directory)
+         input (Map/get (:inputs prepared) (:namespace emitted))]
+    (when-not (and (= emitted (:manifest verified)) (= (:digest selection) (:digest input))
+                   (= (:host-spec selection) (:host-spec prepared)))
+     (generation-refuse! :artifact-generation-unit-changed {:namespace (:namespace emitted)}))
+    (when (and (:host-spec selection)
+                (not= (list (Atom/to_string (:module (:host-spec selection))))
+                      (Enum/map (:modules emitted) (fn [row] (:module row)))))
+     (generation-refuse! :artifact-generation-host-members {:namespace (:namespace emitted)}))
+    {:beams (:beams verified) :inputs (:inputs prepared)
+     :receipt {:namespace (:namespace emitted) :target (:host-spec prepared)
+               :world (:id (:world prepared)) :phase-world (:id (:phase-world prepared))
+               :modules (:modules emitted)}})
+   (finally (BeamLisp.AOT/close_workspace! workspace)))))
+
+(defn- generation-inputs! [inputs compiler-key build-key project-file project-digest]
+ (when-not (and (= compiler-key (BeamLisp.AOTCache/current_compiler_key))
+                (= build-key (BeamLisp.AOTCache/current_build_key))
+                (= project-digest (crypto/hash :sha256 (File/read! project-file))))
+  (generation-refuse! :artifact-generation-toolchain-changed {}))
+ (doseq [input inputs]
+  (when-not (= (:digest input) (crypto/hash :sha256 (File/read! (:file input))))
+   (generation-refuse! :artifact-generation-source-changed {:file (:file input)}))))
+
+(defn- with-generation-stage! [directory action]
+ ;; Acquire ownership before installing cleanup. A collision belongs to someone
+ ;; else, including a prior interrupted producer, and must survive refusal.
+ (File/mkdir! directory)
+ (try (action) (finally (File/rm_rf! directory))))
+
+(defn produce-artifacts
+ "Produce a complete candidate floor from current physical source in one VM.
+  {:out absent-directory, :root optional-current-BL_ROOT}. Every canonical boot
+  unit and exact host ABI is prepared/emitted/verified without publication.
+  Publish the manifest last in a private sibling, then rename the generation.
+  Existing output, concurrent producers and changed inputs refuse. The returned
+  receipt is Source data; fresh boot/reproduction and installation are separate."
+ [opts]
+ (when-not (and (erlang/is_map opts)
+                (every? #(contains? #{:out :root} %) (keys opts))
+                (erlang/is_binary (:out opts)) (not= "" (:out opts))
+                (or (nil? (:root opts))
+                    (and (erlang/is_binary (:root opts)) (not= "" (:root opts)))))
+  (generation-refuse! :artifact-generation-options {}))
+ (let [physical-root (Path/expand (or (erlang/apply :Elixir.System :get_env (list "BL_ROOT")) (BeamLisp/cwd)))
+       root (Path/expand (or (:root opts) physical-root))
+       out (Path/expand (under root (:out opts)))
+       lock (str out ".lock")]
+  (when-not (= root physical-root)
+   (generation-refuse! :artifact-generation-root {:expected physical-root :actual root}))
+  (when (generation-path-present? out)
+   (generation-refuse! :artifact-generation-output-exists {:out out}))
+  (when-not (= (File/stat! (str root "/priv")) (File/stat! (BeamLisp.Tiers/priv_root)))
+   (generation-refuse! :artifact-generation-root {:root root}))
+  (let [project-file (str root "/env.bl") project-digest (crypto/hash :sha256 (File/read! project-file))
+        app (generation-app! root)
+        compiler-key (BeamLisp.AOTCache/current_compiler_key)
+        build-key (BeamLisp.AOTCache/current_build_key)
+        _ (when-not (= compiler-key (BeamLisp.AOTCache/compiler_key))
+            (generation-refuse! :artifact-generation-running-compiler-stale {}))
+        boot (str root "/priv/boot") hosts (host-sources (str root "/priv/host"))
+        selections (vec (concat
+                     (map #(generation-selection % nil) (Path/wildcard (str boot "/*.bl")))
+                     [(generation-selection (str root "/priv/std/multi.bl") nil)]
+                     (map #(generation-selection (:source %) %) hosts)))
+        scratch (str out ".stage-" (erlang/unique_integer (list :positive :monotonic)))
+        generation (str scratch "/generation")]
+   (File/mkdir_p! (Path/dirname out))
+   (when-not (= :ok (File/mkdir lock))
+    (generation-refuse! :artifact-generation-locked {:lock lock}))
+   (try
+    (when (generation-path-present? out)
+     (generation-refuse! :artifact-generation-output-exists {:out out}))
+    (with-generation-stage! scratch (fn []
+    (File/mkdir! generation)
+    (let [units (mapv (fn [pair]
+                        (let [selection (elem pair 0)
+                              unit (generation-unit! selection (str scratch "/unit-" (elem pair 1)))]
+                         (println {:artifact-unit (get-in unit [:receipt :namespace])
+                                   :modules (count (:beams unit))})
+                         unit)) (Enum/with_index selections))
+          beams (vec (mapcat :beams units))
+          names (mapv #(artifact-name! (elem % 0)) beams)
+          inputs (vec (concat (map #(select-keys % [:file :digest]) selections)
+                              (mapcat #(vals (:inputs %)) units)))]
+     (when-not (= (count names) (count (distinct names)))
+      (generation-refuse! :artifact-generation-overlapping-units {}))
+     (generation-inputs! inputs compiler-key build-key project-file project-digest)
+     (doseq [beam beams]
+      (File/write! (str generation "/" (artifact-name! (elem beam 0))) (elem beam 1) (list :exclusive)))
+     (let [inventory (boot-inventory (namespaces boot) generation)
+           expected (set (concat (:beams inventory) (host-names hosts)))]
+      (when-not (and (empty? (:errors inventory)) (= expected (set names)))
+       (generation-refuse! :artifact-generation-incomplete {:errors (:errors inventory)})))
+     (let [aw (ar/write! (str generation "/" (:name app) ".app")
+                         (:name app) (:vsn app) (list) (:applications app) (:mod app) (:env app))
+           _ (when-not (:ok? aw) (generation-refuse! :artifact-generation-app {:why (:why aw)}))
+           entries (into {} (map (fn [beam]
+                                  [(artifact-name! (elem beam 0))
+                                   (Base/encode16 (crypto/hash :sha256 (elem beam 1)) (list (tuple :case :lower)))]) beams))
+           manifest {"schema" schema "compiler_key" compiler-key "build_key" build-key
+                     "elixir" (System/version) "otp" (as-text (erlang/system_info :otp_release))
+                     "app" {"file" (str (:name app) ".app")
+                            "sha256" (d/sha256-hex-of (:path aw) 0 (d/file-size (:path aw)))}
+                     "modules" entries "hosts" (host-names hosts)}]
+      (generation-inputs! inputs compiler-key build-key project-file project-digest)
+      (File/write! (str generation "/manifest.term") (manifest-term-text manifest) (list :exclusive))
+      (let [checked (check {:root root :out generation})]
+       (when-not (:ok? checked)
+        (generation-refuse! :artifact-generation-floor-check {:check checked})))
+      (generation-inputs! inputs compiler-key build-key project-file project-digest)
+      (when (generation-path-present? out)
+       (generation-refuse! :artifact-generation-output-exists {:out out}))
+      (File/rename! generation out)
+      {:version 1 :kind :artifact-generation :out out :compiler-key compiler-key :build-key build-key
+       :modules (count beams) :units (mapv :receipt units) :native-admission false
+       :fresh-boot-qualified false :self-reproduction-qualified false}))))
+    (finally
+     (File/rmdir! lock))))))
