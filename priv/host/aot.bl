@@ -3748,13 +3748,14 @@
 (defn- phase_library_data [namespace definitions operations source-digest value-definitions]
  ;; Read the compiler's own initializer operands before macro partitioning.
  ;; Recipes are data: no initializer/factory or published macro Fn executes.
- (let [macro-names (MapSet/new (Enum/flat_map value-definitions
+ (let [macro-declarations (Map/new (Enum/flat_map value-definitions
                       (fn [definition]
                        (let [form (stage-unmeta (elem definition 2))
                              items (when (stage-tag? form :list 2) (elem form 1))
                              head (when (seq items) (stage-unmeta (first items)))]
                         (if (and (stage-tag? head :symbol 2) (= "defmacro" (elem head 1)))
-                         (list (elem definition 0)) (list))))))
+                         (list (tuple (elem definition 0) {:head "defmacro" :form (elem definition 2)})) (list))))))
+       macro-names (MapSet/new (Map/keys macro-declarations))
        values (Enum/reduce operations {}
                 (fn [node out]
                  (let [args (Map/get node :args (list))]
@@ -3771,8 +3772,8 @@
                   (if (and (= :tuple (:op node)) (= 2 (count elements))
                             (= :lit (:op (first elements))) (= :"$macro" (:val (first elements))))
                    (Map/put out (elem pair 0) (second elements)) out))))]
-  {:version 1 :namespace namespace :source-digest source-digest
-   :definitions definitions :initializers values :macros macros}))
+  {:version 2 :namespace namespace :source-digest source-digest
+   :definitions definitions :initializers values :macros macros :macro-declarations macro-declarations}))
 
 (defn- build_init_ast
   "`__bl_init__/0`'s clause and its value-initializer companion descriptor, as
@@ -7265,19 +7266,26 @@
   returns data, never runtime authority, a native macro Fn or a loaded target."
  [namespace-symbol]
  (let [namespace (artifact_namespace namespace-symbol)
-       module (BeamLisp.Emit/module_for namespace)
-       name (str (Atom/to_string module) ".beam")
+       module-name (str "Elixir.BeamLisp.Ns."
+                     (Enum/join (Enum/map (String/split namespace ".") (fn [segment] (Macro/camelize segment))) "."))
+       name (str module-name ".beam")
        manifest (BeamLisp.Bootstrap/manifest)
        expected (Map/get (Map/get manifest "modules" {}) name)]
   (when-not (and expected (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key)))
    (artifact_refuse :phase-library-not-in-seed))
-  (let [proof (seed_artifact_metadata! module name expected)
+  ;; Only authenticated manifest membership can introduce this bounded module
+  ;; atom. Unknown public read requests do not intern arbitrary namespaces.
+  (let [module (erlang/binary_to_atom module-name :utf8)
+        proof (seed_artifact_metadata! module name expected)
         library (:phase-library proof)]
-   (when-not (and (= 1 (:version library)) (= namespace (:namespace library))
+   (when-not (and (= 2 (:version library)) (= namespace (:namespace library))
                   (erlang/is_binary (:source-digest library)) (= 32 (erlang/byte_size (:source-digest library)))
                   (erlang/is_map (:definitions library)) (<= (erlang/map_size (:definitions library)) 8192)
                   (erlang/is_map (:initializers library)) (<= (erlang/map_size (:initializers library)) 8192)
-                  (erlang/is_map (:macros library)) (<= (erlang/map_size (:macros library)) 8192))
+                  (erlang/is_map (:macros library)) (<= (erlang/map_size (:macros library)) 8192)
+                  (erlang/is_map (:macro-declarations library))
+                  (= (MapSet/new (Map/keys (:macros library)))
+                     (MapSet/new (Map/keys (:macro-declarations library)))))
     (artifact_refuse :unsupported-phase-library))
    (assoc library :artifact-id (:sha256 proof) :compiler-key (:compiler-key proof)))))
 
@@ -7286,6 +7294,7 @@
   (or (:kernel-phase-state context)
    (let [names (Enum/sort (Enum/uniq (cons "core" (:phase-imports context))))
          libraries (Enum/map names (fn [name] (phase_library! (tuple :symbol name))))
+         providers (Map/new (Enum/map libraries (fn [library] (tuple (:namespace library) library))))
          definitions (Map/new (Enum/map libraries (fn [library] (tuple (:namespace library) (:definitions library)))))
          values (Enum/reduce libraries {}
                   (fn [library out]
@@ -7301,15 +7310,23 @@
          state (assoc (constructor_metadata definitions values)
                       :resolution-world :kernel-phase :world-id world-id)]
     (constructor_context_put! :kernel-phase-identity (assoc identity :id world-id))
+    (constructor_context_put! :kernel-phase-providers providers)
     (constructor_context_put! :kernel-phase-state state)
     state))))
 
 (defn- constructor_phase_macro [owner]
  (when (and owner (Enum/member? (Map/get (constructor_context!) :phase-imports (list)) (first owner)))
   (let [namespace (first owner) name (second owner)
-        library (phase_library! (tuple :symbol namespace))]
+        _ (constructor_kernel_phase_state!)
+        library (Map/get (:kernel-phase-providers (constructor_context!)) namespace)]
    (when-let [expression (Map/get (:macros library) name)]
     {:namespace namespace :name name :expression expression}))))
+
+(defn- constructor_phase_declaration [namespace name]
+ (let [context (constructor_context!)]
+  (when (Enum/member? (Map/get context :phase-imports (list)) namespace)
+   (constructor_kernel_phase_state!)
+   (get-in (constructor_context!) [:kernel-phase-providers namespace :macro-declarations name]))))
 
 (defn- constructor_context []
  (when-let [context (Process/get :bl_sdk_constructor_context)]
@@ -7454,13 +7471,14 @@
        parts (String/split name "/")
        maybe-definition
         (fn [target binding]
+         (or (constructor_phase_declaration target binding)
          (let [path (constructor_source_path! target)
                root (physical_sdk_path (BeamLisp.Tiers/priv_root))]
           ;; Ordinary native interop names have no SDK source declaration. They
           ;; remain ordinary calls and must pass the closed machine adapter.
           (when (and path (or (Map/has_key? (Map/get (constructor_context!) :artifact-inputs {}) target)
                               (and root (String/starts_with? path (str root "/")))))
-           (Map/get (:definitions (constructor_unit! target)) binding))))]
+           (Map/get (:definitions (constructor_unit! target)) binding)))))]
   (if (= 2 (count parts))
    (let [prefix (first parts) target (Map/get aliases prefix)
          target (or target (when (= "clojure.core" prefix) "core")
@@ -7468,7 +7486,7 @@
     (when target
      (when-let [definition (maybe-definition target (second parts))]
       (constructor_visible! namespace [target (second parts) definition]))))
-   (let [local (Map/get (:definitions unit) name)
+   (let [local (or (constructor_phase_declaration namespace name) (Map/get (:definitions unit) name))
          referred (Map/get refers name)
          local-declaration (constructor_source_declaration namespace name)]
     (cond local [namespace name local]
@@ -7481,7 +7499,8 @@
            (loop [providers (erlang/++ (Map/get metadata :refer_alls (list)) (list "core" "sugar"))]
             (when (seq providers)
              (let [provider (first providers)
-                   declaration (constructor_source_declaration provider name)
+                   phase-declaration (constructor_phase_declaration provider name)
+                   declaration (when-not phase-declaration (constructor_source_declaration provider name))
                    definition (maybe-definition provider name)]
               (cond
                (= :private declaration) (recur (rest providers))
