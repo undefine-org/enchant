@@ -64,7 +64,10 @@ defmodule StagingResearch do
     before = identities()
     generations = BeamLisp.Env.namespace_generations(Enum.map(rows, fn row -> elem(row.namespace, 1) end))
     environment = BeamLisp.Env.capture()
-    handle = AOT.open_workspace(%{version: 1, sources: rows}, %{})
+    manifest = if System.get_env("BL_RESEARCH_PHASE_AWARE") == "on",
+      do: %{:"phase-imports" => [{:symbol, "core"}, {:symbol, "sugar"}], version: 2, sources: rows},
+      else: %{version: 1, sources: rows}
+    handle = AOT.open_workspace(manifest, %{})
     started = System.monotonic_time(:microsecond)
     result = try do
       trace(fn ->
@@ -165,6 +168,9 @@ defmodule StagingResearch do
       "macro-forward" => "refused", "macro-first" => "emitted", "effect-refused" => "refused",
       "rt-available" => "emitted", "rt-unused-require" => "refused", "boot-core" => "refused", "boot-rt" => "refused"
     }
+    expected = if System.get_env("BL_RESEARCH_PHASE_AWARE") == "on",
+      do: Map.merge(expected, Map.new(["rt-cond-cycle", "rt-cond-missing", "rt-unused-require", "boot-core", "boot-rt"], &{&1, "emitted"})),
+      else: expected
     Enum.each(results, fn result ->
       unless result.status == Map.get(expected, result.id, "emitted"),
         do: raise "unexpected research observation: #{result.id}: #{result.status}"
@@ -181,7 +187,7 @@ defmodule StagingResearch do
                  "rt-invoke-source" => %{"answer" => 99}, "rt-invoke-implicit" => %{"answer" => 42},
                  "rt-selected-semantics" => %{"answer" => 2}, "macro-first" => %{"probe" => 42}}
     Enum.each(results, fn result ->
-      if Map.has_key?(kinds, result.id) and Map.get(result, :kind) != kinds[result.id],
+      if result.status == "refused" and Map.has_key?(kinds, result.id) and Map.get(result, :kind) != kinds[result.id],
         do: raise "refusal kind changed: #{result.id}"
       if Map.has_key?(literals, result.id) and result.literal_functions != literals[result.id],
         do: raise "literal result changed: #{result.id}"
@@ -189,6 +195,7 @@ defmodule StagingResearch do
     if ir.same_invoke_ir, do: raise "language invocation collapsed into a source remote"
     File.write!(Path.join(System.fetch_env!("BL_ARTIFACT_OUTPUT"), "result.json"), Jason.encode!(%{
       version: 1, scope: "staging-hypothesis-research", compiler_key: BeamLisp.AOTCache.current_compiler_key(),
+      phase_aware: System.get_env("BL_RESEARCH_PHASE_AWARE") == "on",
       cases: results, ir: ir, self_reproduction_qualified: false}, pretty: true))
   end
 end

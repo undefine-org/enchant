@@ -1,0 +1,103 @@
+(ns aot-phase-library-test)
+
+(defn- temporary [action]
+ (let [directory (Path/join (System/tmp_dir!) (str "phase-library-" (System/unique_integer (list :positive))))]
+  (File/mkdir_p! directory)
+  (try (action directory) (finally (File/rm_rf! directory)))))
+
+(defn- phase-manifest [namespace file]
+ {:version 2 :phase-imports (list 'core 'sugar)
+  :sources (list {:namespace namespace :file file})})
+
+(deftest canonical-phase-library-is-data-from-authenticated-bytes
+ (let [before (erlang/apply :Elixir.BeamLisp.Ns.Core :module_info (list :md5))
+       library (BeamLisp.AOT/phase_library! 'core)]
+  (is (= 1 (:version library)))
+  (is (= "core" (:namespace library)))
+  (is (contains? (:macros library) "cond"))
+  (is (contains? (:initializers library) "*assert*"))
+  (is (> (count (:definitions library)) 100))
+  (is (= 32 (erlang/byte_size (:artifact-id library))))
+  (is (= library (BeamLisp.AOT/phase_library! 'core)))
+  (is (= before (erlang/apply :Elixir.BeamLisp.Ns.Core :module_info (list :md5)))))
+ (is (= :phase-library-not-in-seed
+        (try (BeamLisp.AOT/phase_library! 'phase.nonexistent) nil (catch error (:kind (ex-data error)))))))
+
+(defn- prepare-actual-unit [directory namespace]
+ (let [name (str namespace) module (BeamLisp.Emit/module_for name)
+       file (Path/join (BeamLisp.Tiers/priv_root) (str "boot/" name ".bl"))
+       before (erlang/apply module :module_info (list :md5))
+       generations (BeamLisp.Env/namespace_generations (list name))
+       workspace (BeamLisp.AOT/open_workspace (phase-manifest namespace file) {})]
+  (try
+   (let [prepared (BeamLisp.AOT/prepare_unit workspace namespace)
+         manifest (BeamLisp.AOT/emit_unit prepared (Path/join directory name))]
+    (is (= name (:namespace manifest)))
+    (is (= :kernel-phase-world (get-in prepared [:phase-world :kind])))
+    (is (= :source-compilation-world (get-in prepared [:world :kind])))
+    (is (= 32 (erlang/byte_size (get-in prepared [:world :id]))))
+    (is (= false (:native-admission (BeamLisp.AOT/verify_unit (Path/join directory name))))))
+   (finally
+    (BeamLisp.AOT/close_workspace! workspace)
+    (is (= before (erlang/apply module :module_info (list :md5))))
+    (is (= generations (BeamLisp.Env/namespace_generations (list name))))))))
+
+(deftest preceding-phase-macros-prepare-the-actual-runtime-and-core
+ (temporary (fn [directory] (doseq [namespace (list 'rt 'core)]
+                             (prepare-actual-unit directory namespace)))))
+
+(deftest source-helper-semantics-stay-in-the-source-world
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "rt.bl")
+         _ (File/write! file "(ns rt) (defn empty? [x] false) (defmacro choose [] (if (empty? ()) '(defn answer [] 1) '(defn answer [] 2))) (choose)")
+         workspace (BeamLisp.AOT/open_workspace (phase-manifest 'rt file) {})]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'rt)
+           clause (elem (first (get (:definitions (first (:plans prepared))) "answer")) 3)]
+      (is (= 2 (get-in clause [:body :val]))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest phase-recipes-do-not-invoke-a-rebound-public-macro
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "plain.bl") marker (Path/join directory "never-written")
+         _ (File/write! file "(ns phase.hostile) (defn answer [] (cond :else 42))")
+         workspace (BeamLisp.AOT/open_workspace (phase-manifest 'phase.hostile file) {})
+         previous (BeamLisp.Env/fetch_exact! "core" "cond")
+         hostile (tuple :"$macro" (fn [& _] (File/write! marker "ran") nil))
+         prepared (try
+                    (BeamLisp.Env/intern "core" "cond" hostile)
+                    (BeamLisp.AOT/prepare_unit workspace 'phase.hostile)
+                    (finally
+                     (BeamLisp.Env/intern "core" "cond" previous)
+                     (BeamLisp.AOT/close_workspace! workspace)))
+         clause (elem (first (get (:definitions (first (:plans prepared))) "answer")) 3)]
+    (is (= 42 (get-in clause [:body :val])))
+    (is (= false (File/exists? marker)))))))
+
+(deftest phase-provider-selection-requires-an-explicit-versioned-contract
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "plain.bl") _ (File/write! file "(ns phase.plain) (defn value [] 42)")]
+    (is (= :invalid-artifact-phase-imports
+          (try (BeamLisp.AOT/open_workspace (assoc (phase-manifest 'phase.plain file) :version 1) {}) nil
+           (catch error (:kind (ex-data error))))))))))
+
+(deftest world-identity-records-providers-before-a-macro-is-demanded
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "plain.bl")
+         _ (File/write! file "(ns phase.plain) (defn value [] 42)")
+         prepare (fn [imports]
+                   (let [workspace (BeamLisp.AOT/open_workspace
+                                     (assoc (phase-manifest 'phase.plain file) :phase-imports imports) {})]
+                    (try (BeamLisp.AOT/prepare_unit workspace 'phase.plain)
+                     (finally (BeamLisp.AOT/close_workspace! workspace)))))
+         core-only (prepare (list 'core))
+         both (prepare (list 'core 'sugar))
+         reversed (prepare (list 'sugar 'core))]
+    (is (not= (get-in core-only [:world :id]) (get-in both [:world :id])))
+    (is (= (get-in both [:world :id]) (get-in reversed [:world :id])))
+    (is (= (get-in both [:phase-world :id]) (get-in reversed [:phase-world :id])))
+    (is (= (list "core" "sugar") (get-in both [:phase-world :macro-imports])))))))

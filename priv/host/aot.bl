@@ -166,7 +166,7 @@
  "Freeze finite explicitly selected files. Namespace fields are quoted symbols.
   Source inputs and memoized prepared units carry no runtime/SDK authority."
  [manifest limits]
- (when-not (and (erlang/is_map manifest) (= 1 (:version manifest))
+ (when-not (and (erlang/is_map manifest) (contains? #{1 2} (:version manifest))
                 (erlang/is_map limits) (erlang/is_list (:sources manifest))
                 (erlang/is_list (Map/get manifest :roots (list)))
                 (Enum/all? (Map/keys limits)
@@ -177,6 +177,11 @@
        total-limit (artifact_limit limits :max-total-bytes 16777216 16777216)
        macro-limit (artifact_limit limits :macro-steps 16384 16384)
        roots (Map/get manifest :roots (list))
+       raw-phase-imports (Map/get manifest :phase-imports (list))
+       _ (when-not (and (erlang/is_list raw-phase-imports) (<= (count raw-phase-imports) 16)
+                         (or (= 2 (:version manifest)) (= (list) raw-phase-imports)))
+           (artifact_refuse :invalid-artifact-phase-imports))
+       phase-imports (Enum/uniq (Enum/map raw-phase-imports (fn [value] (artifact_namespace value))))
        key (BeamLisp.AOTCache/compiler_key)]
   (when-not (and (< 0 (erlang/length (:sources manifest)))
                  (<= (erlang/length (:sources manifest)) maximum)
@@ -206,7 +211,8 @@
     (artifact_refuse :artifact-source-bound))
    (let [handle (erlang/make_ref)]
     (Process/put (tuple :bl_artifact_workspace handle)
-     {:inputs inputs :compiler-key key :roots (Enum/map roots (fn [root] (Path/expand root)))
+     {:inputs inputs :compiler-key key :phase-aware (= 2 (:version manifest)) :phase-imports phase-imports
+      :roots (Enum/map roots (fn [root] (Path/expand root)))
       :macro-steps macro-limit :expanded 0 :budget (artifact_budget (constructor_counters))
       :units {} :maximum maximum :source-limit source-limit :total-limit total-limit})
     handle))))
@@ -293,6 +299,8 @@
        (Process/put machine (Map/merge (constructor_counters) (:budget workspace)))
        (Process/put :bl_sdk_constructor_context
         {:input input :compiler-env view :artifact-inputs (:inputs workspace)
+         :phase-imports (:phase-imports workspace)
+         :phase-aware (:phase-aware workspace)
          :artifact-workspace handle :machine-frame machine :units {} :compiled {} :compiling #{}
          :maximum (:maximum workspace) :source-limit (:source-limit workspace)
          :total-limit (:total-limit workspace)
@@ -302,6 +310,7 @@
         (fn []
          (Enum/each (:roots workspace) (fn [root] (BeamLisp.Env/add_search_path root)))
          (constructor_install_kernel!)
+         (when (seq (:phase-imports workspace)) (constructor_kernel_phase_state!))
          (constructor_unit! namespace)
          (let [unit (stage-sdk-unit! (:source input) (list (tuple :file (:file input))))
                plans (artifact_describe_unit unit (:source input))
@@ -310,8 +319,16 @@
                         (fn [unit out]
                          (Map/put out (:namespace unit)
                           (Map/take unit (list :namespace :file :source :selection :digest :compiler-key)))))
+               source-world {:version 1 :kind :source-compilation-world
+                             :compiler-key (:compiler-key workspace)
+                             :phase-imports (Enum/sort (:phase-imports workspace))
+                             :phase-world (get-in (constructor_context!) [:kernel-phase-identity :id])
+                             :inputs (Enum/map (Enum/sort (Map/to_list inputs))
+                                       (fn [pair] {:namespace (elem pair 0) :digest (:digest (elem pair 1))}))}
                result {:version 1 :kind :prepared-artifact-unit :namespace namespace
                        :compiler-key (:compiler-key workspace) :inputs inputs :plans plans
+                       :world (assoc source-world :id (crypto/hash :sha256 (erlang/term_to_binary source-world)))
+                       :phase-world (Map/get (constructor_context!) :kernel-phase-identity)
                        :coverage {:scope :artifact-membership :source-staged true
                                   :execution-entry-inventory-complete false}}]
           (when (or (> (erlang/map_size inputs) (:maximum workspace))
@@ -1715,6 +1732,7 @@
                 ;; A previous pinned emitter can stamp new live source keys.
                 ;; Verify the actual replay format independently of that key.
                 (tuple :bl_aot_replay_version 1)
+                (tuple :bl_aot_phase_library (elem init_pair 3))
                 (tuple :bl_aot_replay_complete (erlang/== true (Map/get ns_meta :replay-complete)))
                 (tuple :bl_unit_source_digest input_digest)
                 (tuple :bl_aot_artifact_version 1)
@@ -2761,6 +2779,10 @@
         (let [proof (Map/merge {:role :stable-seed :seed? true
                                 ;; Canonical compiler data is read from authenticated bytes,
                                 ;; never by executing an extensible live Core shim.
+                                :phase-library
+                                  (normalized_attribute
+                                    (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+                                    :bl_aot_phase_library)
                                 :kernel-definitions (when (= mod :Elixir.BeamLisp.Ns.Core)
                                                       (sdk_stage_literal_definitions! mod bytes))
                                 :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
@@ -3714,6 +3736,44 @@
         (BeamLisp.Env/publish_binaries! (list beam) "beam_lisp_aot/generated")))
     mod))
 
+(defn- phase_initializer [node namespace name remaining]
+ (if (= 0 remaining) node
+  (let [candidate (if (= :let (:op node)) (:init node) node)
+        args (Map/get candidate :args (list))]
+   (if (and (= :remote (:op candidate)) (= :Elixir.BeamLisp.Env (:mod candidate))
+             (= :intern (:fun candidate)) (= 3 (count args))
+             (= namespace (:val (first args))) (= name (:val (second args))))
+    (phase_initializer (nth args 2) namespace name (dec remaining)) node))))
+
+(defn- phase_library_data [namespace definitions operations source-digest value-definitions]
+ ;; Read the compiler's own initializer operands before macro partitioning.
+ ;; Recipes are data: no initializer/factory or published macro Fn executes.
+ (let [macro-names (MapSet/new (Enum/flat_map value-definitions
+                      (fn [definition]
+                       (let [form (stage-unmeta (elem definition 2))
+                             items (when (stage-tag? form :list 2) (elem form 1))
+                             head (when (seq items) (stage-unmeta (first items)))]
+                        (if (and (stage-tag? head :symbol 2) (= "defmacro" (elem head 1)))
+                         (list (elem definition 0)) (list))))))
+       values (Enum/reduce operations {}
+                (fn [node out]
+                 (let [args (Map/get node :args (list))]
+                  (if (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                            (= :intern (:fun node)) (= 3 (count args))
+                            (= namespace (:val (first args)))
+                            (erlang/is_binary (:val (second args))))
+                   (let [name (:val (second args)) original (nth args 2)
+                         macro? (MapSet/member? macro-names name)]
+                    (Map/put out name (if macro? (phase_initializer original namespace name 4) original))) out))))
+       macros (Enum/reduce (Map/to_list values) {}
+                (fn [pair out]
+                 (let [node (elem pair 1) elements (Map/get node :elems (list))]
+                  (if (and (= :tuple (:op node)) (= 2 (count elements))
+                            (= :lit (:op (first elements))) (= :"$macro" (:val (first elements))))
+                   (Map/put out (elem pair 0) (second elements)) out))))]
+  {:version 1 :namespace namespace :source-digest source-digest
+   :definitions definitions :initializers values :macros macros}))
+
 (defn- build_init_ast
   "`__bl_init__/0`'s clause and its value-initializer companion descriptor, as
    bl-ANF data."
@@ -3870,7 +3930,8 @@
                       (list (BeamLisp.Emit/lit ns)))
                  {:op :let :name "$sdk_callables"
                   :init (BeamLisp.Emit/remote (ns_body_module ns) :__bl_callable_values__ (list))
-                  :body body :ann {}})))) companion_descriptor generated_beams)))
+                  :body body :ann {}})))) companion_descriptor generated_beams
+      (phase_library_data ns ns_defs value_ops (Keyword/get unit_attrs :bl_unit_source_digest) value_defs))))
 
 ; ── the runtime-side hook and boot ──────────────────────────────────────────
 
@@ -6985,7 +7046,7 @@
    :var (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
    :global (let [key [(:ns n) (:name n)]
                  alias (when-not (= :exact (:lookup n)) (get (:global-aliases state) key))
-                 source (when (constructor_context)
+                 source (when (and (not= :kernel-phase (:resolution-world state)) (constructor_context))
                           (constructor_global_source (:ns n) (:name n)))]
              (cond
               source (constructor_source_value source state)
@@ -6998,7 +7059,8 @@
                        (and (constructor_context) (not= :exact (:lookup n))))
                    (contains? (constructor_pure_core_names) (:name n))
                    (or (not (constructor_context))
-                       (and (constructor_core_owner? (:ns n) (:name n) (:lookup n))
+                       (and (or (and (= :kernel-phase (:resolution-world state)) (= "core" (:ns n)))
+                                (constructor_core_owner? (:ns n) (:name n) (:lookup n)))
                             (constructor_core_primitive! (:name n)))))
                (constructor_register_callable!
                 (fn [& arguments]
@@ -7008,7 +7070,7 @@
    :remote (let [args (Enum/map (:args n) #(constructor_interpret % env state))
                  target [(:mod n) (:fun n) (count args)]
                  entry (or (get (:remotes state) target)
-                           (when (constructor_context)
+                           (when (and (not= :kernel-phase (:resolution-world state)) (constructor_context))
                             (constructor_remote_source (:mod n) (:fun n) (count args))))]
              (if entry
               (constructor_invoke (constructor_interpret {:op :fn :clauses (:clauses entry) :constructor-binding (:constructor-binding entry)} {} state) args state)
@@ -7018,6 +7080,7 @@
             (constructor_primitive :erlang (:bif n) args state))
    :invoke (let [callee (constructor_interpret (:callee n) env state)
                  arguments (constructor_interpret (:arguments n) env state)]
+             (when-not (erlang/is_list arguments) (constructor_refuse :invocation-arguments))
              (constructor_invoke callee (constructor_sequence! arguments state) state))
    :apply (constructor_invoke (constructor_interpret (:fn n) env state) (Enum/map (:args n) #(constructor_interpret % env state)) state)
    :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
@@ -7196,6 +7259,57 @@
        (artifact_refuse :artifact-source-bound))
       (constructor_context_put! :artifact-inputs inputs))))
    input))))
+
+(defn phase_library!
+ "Read bounded phase recipes from manifest-authenticated floor bytes. This
+  returns data, never runtime authority, a native macro Fn or a loaded target."
+ [namespace-symbol]
+ (let [namespace (artifact_namespace namespace-symbol)
+       module (BeamLisp.Emit/module_for namespace)
+       name (str (Atom/to_string module) ".beam")
+       manifest (BeamLisp.Bootstrap/manifest)
+       expected (Map/get (Map/get manifest "modules" {}) name)]
+  (when-not (and expected (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key)))
+   (artifact_refuse :phase-library-not-in-seed))
+  (let [proof (seed_artifact_metadata! module name expected)
+        library (:phase-library proof)]
+   (when-not (and (= 1 (:version library)) (= namespace (:namespace library))
+                  (erlang/is_binary (:source-digest library)) (= 32 (erlang/byte_size (:source-digest library)))
+                  (erlang/is_map (:definitions library)) (<= (erlang/map_size (:definitions library)) 8192)
+                  (erlang/is_map (:initializers library)) (<= (erlang/map_size (:initializers library)) 8192)
+                  (erlang/is_map (:macros library)) (<= (erlang/map_size (:macros library)) 8192))
+    (artifact_refuse :unsupported-phase-library))
+   (assoc library :artifact-id (:sha256 proof) :compiler-key (:compiler-key proof)))))
+
+(defn- constructor_kernel_phase_state! []
+ (let [context (constructor_context!)]
+  (or (:kernel-phase-state context)
+   (let [names (Enum/sort (Enum/uniq (cons "core" (:phase-imports context))))
+         libraries (Enum/map names (fn [name] (phase_library! (tuple :symbol name))))
+         definitions (Map/new (Enum/map libraries (fn [library] (tuple (:namespace library) (:definitions library)))))
+         values (Enum/reduce libraries {}
+                  (fn [library out]
+                   (Enum/reduce (Map/to_list (:initializers library)) out
+                    (fn [pair out] (Map/put out [(:namespace library) (elem pair 0)] (elem pair 1))))))
+         identity {:version 1 :kind :kernel-phase-world
+                   :compiler-key (BeamLisp.AOTCache/compiler_key)
+                   :macro-imports (Enum/sort (:phase-imports context))
+                   :providers (Enum/map libraries
+                     (fn [library] {:namespace (:namespace library) :artifact-id (:artifact-id library)
+                                     :source-digest (:source-digest library)}))}
+         world-id (crypto/hash :sha256 (erlang/term_to_binary identity))
+         state (assoc (constructor_metadata definitions values)
+                      :resolution-world :kernel-phase :world-id world-id)]
+    (constructor_context_put! :kernel-phase-identity (assoc identity :id world-id))
+    (constructor_context_put! :kernel-phase-state state)
+    state))))
+
+(defn- constructor_phase_macro [owner]
+ (when (and owner (Enum/member? (Map/get (constructor_context!) :phase-imports (list)) (first owner)))
+  (let [namespace (first owner) name (second owner)
+        library (phase_library! (tuple :symbol namespace))]
+   (when-let [expression (Map/get (:macros library) name)]
+    {:namespace namespace :name name :expression expression}))))
 
 (defn- constructor_context []
  (when-let [context (Process/get :bl_sdk_constructor_context)]
@@ -7448,7 +7562,8 @@
 
 (defn- constructor_remote_source_uncached [module function arity]
  (let [units (:units (constructor_context!))
-       candidates (Enum/uniq (erlang/++ (Map/keys units)
+       candidates (Enum/uniq (erlang/++ (if (:phase-aware (constructor_context!))
+                                          (Map/keys (:artifact-inputs (constructor_context!))) (Map/keys units))
                      (Enum/flat_map (Map/values units) (fn [unit] (:requires (:header unit))))))
        namespace (Enum/find candidates (fn [ns] (= module (BeamLisp.Emit/module_for ns))))
        raw (Atom/to_string function)
@@ -7466,7 +7581,7 @@
       (stage-refuse :sdk-constructor-call-arity))))))))
 
 (defn- constructor_remote_source [module function arity]
- (let [context (constructor_context!) key [module function arity]
+   (let [context (constructor_context!) key [module function arity]
        cache (Map/get context :remote-entries {})]
   (if (Map/has_key? cache key) (Map/get cache key)
    (let [entry (constructor_remote_source_uncached module function arity)]
@@ -7491,11 +7606,14 @@
    (tuple :active
     (when (and owner (= "defmacro" (:head (nth owner 2))))
      (let [[target binding _] owner
-           _ (when (and (= target (:namespace (:input (constructor_context!))))
+           phase (constructor_phase_macro owner)
+           _ (when (and (nil? phase) (= target (:namespace (:input (constructor_context!))))
                          (not (contains? (:seen-macros (constructor_context!)) [target binding])))
                (stage-refuse :sdk-stage-local-macro-not-initialized))
-           compiled (constructor_compile_binding! target binding)
-           initializer (:expression compiled)]
+           compiled (when-not phase (constructor_compile_binding! target binding))
+           initializer (if phase
+                         {:op :tuple :elems (list {:op :lit :val :"$macro"} (:expression phase))}
+                         (:expression compiled))]
       (when-not (and (= :tuple (:op initializer)) (= 2 (count (:elems initializer)))
                      (= :"$macro" (:val (first (:elems initializer)))))
        (stage-refuse :unsupported-sdk-constructor-macro))
@@ -7508,7 +7626,8 @@
          (constructor_context_put! :diagnostic-macro [target binding])
          (interpret_constructor!
           {:op :apply :fn (second (:elems initializer))
-           :args (Enum/map (to-list arguments) (fn [value] {:op :lit :val value}))} {} {})
+           :args (Enum/map (to-list arguments) (fn [value] {:op :lit :val value}))}
+          {} (if phase (constructor_kernel_phase_state!) {}))
          (finally (constructor_context_put! :diagnostic-macro previous)))))))))))
 
 (defn- constructor_core_seed_rows! []
