@@ -1,0 +1,103 @@
+(ns execution-protocol.audit
+ (:require [codebase :as cb] [typed] [system.analyze :as analyze]
+           [system.model :as model] [system.step :as step] [datom]))
+
+(def root (or (System/get_env "BL_EXECUTION_AUDIT_SNAPSHOT")
+              "/home/user/code/undefine/beam-lisp/.local/execution-protocol-audit/snapshot/"))
+(defn emit [value] (println (str "AUDIT " (Jason/encode! value))))
+(defn source [path] (File/read! (str root path)))
+(def failures (atom 0))
+(def paths
+ ["priv/host/env.bl" "priv/host/refs.bl" "priv/host/server.bl"
+  "priv/host/loader_server.bl" "priv/host/aot.bl" "priv/host/aot_cache.bl"
+  "priv/std/proc/callback.bl" "priv/std/proc/framework.bl" "priv/std/proc/lifetime.bl"
+  "priv/std/proc/dispatch.bl" "priv/std/proc/evolve.bl" "priv/std/proc/queue.bl"
+  "priv/std/proc/queue-family.bl" "priv/std/proc/queue-family-root.bl"
+  "priv/std/reload/execution.bl" "priv/std/reload/generation.bl"
+  "priv/std/reload/source-producer.bl" "priv/std/reload/server-entry.bl"
+  "priv/lib/datom/conn.bl" "priv/lib/datom/store-ets.bl"
+  "priv/std/vm/exec.bl" "priv/host/test_rt.bl"])
+(defn native-boundary? [name]
+ (or (String/starts_with? name "BeamLisp.Env/")
+     (String/starts_with? name "env/")
+     (contains? #{"Process/put" "Process/delete" "erlang/spawn" "spawn"
+                  "Process/spawn" "GenServer/call" "Agent/get" "Agent/get_and_update"} name)))
+
+(emit {:phase "started" :mode "read-only source analysis; no target bodies executed"})
+(doseq [path paths]
+ (try
+  (let [src (source path) namespace (BeamLisp.Loader/declared_ns src)
+        forms (BeamLisp.Reader/read_string src)
+        calls (atom 0) boundaries (atom []) machines (atom [])]
+   (doseq [form forms]
+    (let [name (or (cb/defn-form form) "<top>")
+          sites (first (cb/walk-calls name namespace form [] 0))]
+     (swap! calls + (count sites))
+     (doseq [site sites]
+      (when (native-boundary? (:call/callee site))
+       (swap! boundaries conj {:caller (str namespace "/" name)
+                               :callee (:call/callee site)
+                               :line (:call/line site) :arity (:call/arity site)})))
+     (let [clauses (model/transitions form)]
+      (when (seq clauses)
+       (swap! machines conj {:name name :labels (mapv #(str (:label %)) clauses)})))))
+   (emit {:phase "calls" :path path :namespace namespace :calls @calls
+          :boundaries @boundaries :machines @machines}))
+  (catch error
+   (swap! failures inc)
+   (emit {:phase "error" :path path :message (ex-message error)}))))
+
+;; Exercise the real qualified corpus query on small adapters; full host source
+;; uses the cheaper shared codebase walker above, without type inference.
+(let [connection (cb/connect-codebase)]
+ (try
+  (doseq [[i path] (map-indexed vector ["priv/std/proc/callback.bl"
+                                      "priv/std/proc/framework.bl"
+                                      "priv/std/proc/lifetime.bl"])]
+   (let [src (source path) facts (cb/index-source {} (BeamLisp.Loader/declared_ns src) src)]
+    (datom/transact! connection
+     (mapv #(assoc % :db/id (+ (:db/id %) (* i 1000000)))
+      (concat (:fn facts) (:calls facts) (:instr facts) (:requires facts))))))
+  (doseq [name ["proc.callback/invoke!" "proc.callback/commit-transfer!" "proc.framework/adopt!"]]
+   (emit {:phase "cone" :result (cb/dependency-cone (datom/db connection) name)}))
+  (finally (datom/close! connection))))
+
+(doseq [path ["priv/std/proc/callback.bl" "priv/std/proc/framework.bl"]]
+ (try
+  (let [summaries (analyze/analyze (source path))]
+   (emit {:phase "system-analysis" :path path
+          :functions (mapv (fn [[name info]]
+                        {:name name :returns (mapv str (:returns info))
+                         :calls (mapv str (:calls info))
+                         :edges (vec (:edges info))
+                         :footprint (pr-str (:footprint info))
+                         :latent (pr-str (:latent info))
+                         :terminates (:terminates info)}) summaries)}))
+  (catch error
+   (swap! failures inc)
+   (emit {:phase "error" :path path :message (ex-message error)}))))
+
+;; Proposed finite abstraction ONLY, not a proof of the existing native runtime.
+(def labels [:accept :close :finish :owner-down])
+(def initial {:open true :owner-live true :executing 0 :effects 0})
+(defn enabled? [label s]
+ (case label
+  :accept (and (:open s) (:owner-live s) (= 0 (:executing s)) (= 0 (:effects s)))
+  :close (:open s)
+  :finish (= 1 (:executing s))
+  :owner-down (:owner-live s)))
+(defn transition [label s]
+ (case label
+  :accept (assoc s :executing 1 :effects 1)
+  :close (assoc s :open false)
+  :finish (assoc s :executing 0)
+  :owner-down (assoc s :owner-live false :open false)))
+(let [states (step/reachable-states labels transition enabled? initial)
+      bad (fn [s] (or (not (contains? #{0 1} (:executing s)))
+                      (> (:effects s) 1)
+                      (and (not (:owner-live s)) (:open s))))]
+ (emit {:phase "proposed-model" :states (count states)
+        :bad-path (step/path-to labels transition enabled? initial bad)
+        :limit "one registration/one accepted invocation; excludes receiver handoff and native refinement"}))
+(emit {:phase "finished" :errors @failures})
+(when (pos? @failures) (erlang/halt 1))
