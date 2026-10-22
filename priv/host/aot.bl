@@ -333,7 +333,11 @@
          (when (seq (:phase-imports workspace)) (constructor_kernel_phase_state!))
          (constructor_unit! namespace)
          (let [_ (when host-spec (validate_pinned_declarations! (:source input) (:file input)))
-               unit (stage-sdk-unit! (:source input) (list (tuple :file (:file input))))
+               ;; Attribute host reader nodes before compilation, as the legacy
+               ;; emitter does. Changing only the outer descriptor leaves
+               ;; absolute checkout paths in clause/guard/lambda annotations.
+               unit (stage-sdk-unit! (:source input)
+                       (list (tuple :file (if host-spec (floor_source (:file input)) (:file input)))))
                plans (if host-spec (artifact_describe_host_unit unit input host-spec)
                                    (artifact_describe_unit unit (:source input)))
                _ (constructor_check_sources!)
@@ -5826,11 +5830,12 @@
 ;; of 1.11M steps for proc.queue-runtime) and refused a finite program. They
 ;; are charged to their own :walk-steps budget instead; a frame without one
 ;; (hand-built fixtures) keeps the old shared accounting.
-(defn- constructor_walk_step! [state]
+(defn- constructor_walk_steps! [state steps]
  (let [counters (erlang/get (maps/get :counter-frame state nil))]
   (if (and (erlang/is_map counters) (erlang/is_map_key :walk-steps counters))
-   (when (erlang/< (constructor_counter! state :walk-steps -1) 0) (constructor_refuse :walk-budget))
-   (constructor_step! state))))
+   (when (erlang/< (constructor_counter! state :walk-steps (- steps)) 0) (constructor_refuse :walk-budget))
+   (when (erlang/< (constructor_counter! state :remaining (- steps)) 0) (constructor_refuse :step-budget)))))
+(defn- constructor_walk_step! [state] (constructor_walk_steps! state 1))
 
 (defn- constructor_container_cost! [value state]
  (let [frame (erlang/get (:counter-frame state))]
@@ -6393,8 +6398,7 @@
             extra (dec (:nodes cost)) nodes (+ nodes extra) bytes (+ bytes (:bytes cost))]
        (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
        (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
-       (when (neg? (constructor_counter! state :remaining (- extra)))
-        (constructor_refuse :step-budget))
+       (constructor_walk_steps! state extra)
        (recur rest-tasks nodes bytes))
      (erlang/is_map v)
       (do (constructor_map_shape! v state)
@@ -7187,6 +7191,24 @@
     (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
    (finally (when-not shared (erlang/erase key))))))
 
+(defn- interpret_phase_constructor! [expression metadata]
+ ;; Phase bundles accept and return first-order data. Their temporary recipes
+ ;; and interpreted callables belong to ONE expansion, not every later macro
+ ;; in the Source unit. Keep aggregate work/allocation/freshness fuel in the
+ ;; parent ledger; only ephemeral ownership tables have this shorter lifetime.
+ (let [parent (:machine-frame (constructor_context!))
+       frame (erlang/get parent)
+       child (tuple :phase-constructor-frame (erlang/make_ref))]
+  (erlang/put child (Map/merge (constructor_counters) (artifact_budget frame)))
+  (constructor_context_put! :machine-frame child)
+  (try
+   (interpret_constructor! expression {} metadata)
+   (finally
+    (let [spent (erlang/get child)]
+     (erlang/put parent (Map/merge (erlang/get parent) (artifact_budget spent))))
+    (erlang/erase child)
+    (constructor_context_put! :machine-frame parent)))))
+
 (defn constructor_metadata [definitions values]
  ;; Compiler implementation walks use native eager collection operations, never
  ;; late-bound public Core reduce/group-by/merge or an application predicate.
@@ -7653,10 +7675,10 @@
        (let [previous (Map/get (constructor_context!) :diagnostic-macro)]
         (try
          (constructor_context_put! :diagnostic-macro [target binding])
-         (interpret_constructor!
-          {:op :apply :fn (second (:elems initializer))
-           :args (Enum/map (to-list arguments) (fn [value] {:op :lit :val value}))}
-          {} (if phase (constructor_kernel_phase_state!) {}))
+         (let [expression {:op :apply :fn (second (:elems initializer))
+                           :args (Enum/map (to-list arguments) (fn [value] {:op :lit :val value}))}]
+          (if phase (interpret_phase_constructor! expression (constructor_kernel_phase_state!))
+                    (interpret_constructor! expression {} {})))
          (finally (constructor_context_put! :diagnostic-macro previous)))))))))))
 
 (defn- constructor_core_seed_rows! []

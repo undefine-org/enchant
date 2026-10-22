@@ -225,10 +225,14 @@ defmodule StagingResearch do
           do: raise "host artifact changed exact module membership"
         if verified[:"native-admission"], do: raise "host bytes acquired native admission"
         %{status: "emitted", module: Atom.to_string(entry.module),
-          sha256: Base.encode16(hd(manifest.modules).sha256, case: :lower)}
+          sha256: Base.encode16(hd(manifest.modules).sha256, case: :lower),
+          budget: Map.take(Process.get({:bl_artifact_workspace, handle}).budget,
+            [:remaining, :"walk-steps", :"allocation-nodes", :"allocation-bytes", :"fresh-symbols", :"new-atoms"])}
       rescue
         error -> %{status: "refused", module: Atom.to_string(entry.module),
-          message: Exception.message(error), data: inspect(Map.get(error, :data), limit: 40)}
+          message: Exception.message(error), data: inspect(Map.get(error, :data), limit: 40),
+          budget: Map.take(Process.get({:bl_artifact_workspace, handle}).budget,
+            [:remaining, :"walk-steps", :"allocation-nodes", :"allocation-bytes", :"fresh-symbols", :"new-atoms"])}
       after
         AOT.close_workspace!(handle)
       end
