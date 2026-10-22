@@ -1,0 +1,58 @@
+(ns aot-artifact-emission-test)
+
+(defn- target-state [namespace]
+ (let [module (BeamLisp.Emit/module_for namespace)]
+  {:binding (BeamLisp.Env/lookup (tuple namespace "answer"))
+   :definitions (BeamLisp.Env/ns_defs namespace)
+   :generations (BeamLisp.Env/namespace_generations (list namespace))
+   :ready (BeamLisp.Env/loaded_ns? namespace)
+   :emitted (BeamLisp.Env/lookup (tuple :emitted_definition namespace "answer"))
+   :module-md5 (when (erlang/module_loaded module) (erlang/apply module :module_info (list :md5)))}))
+
+(deftest complete-artifact-assembly-does-not-replace-running-definitions
+ (let [namespace "artifact.emission.running"
+       source "(ns artifact.emission.running) (defn answer [] 42) (def value (Process/put :artifact-emission-effect :ran))"
+       _ (BeamLisp/eval "(ns artifact.emission.running) (defn answer [] 7)")
+       before (target-state namespace)
+       view (BeamLisp.Env/fork)
+       result
+       (try
+        (BeamLisp.Env/with_env view
+         (fn []
+          (BeamLisp.Loader/without_initialization
+           (fn []
+            (let [unit (BeamLisp.AOT/stage-sdk-unit! source (list))
+                  plan (BeamLisp.AOT/describe_module namespace (BeamLisp.Env/ns_defs namespace)
+                         (Map/get (elem unit 1) namespace) (Map/get (elem unit 3) namespace)
+                         nil (crypto/hash :sha256 source) (elem unit 5) nil
+                         (BeamLisp.AOTCache/key_for_ns namespace))]
+             {:plan plan :beams (BeamLisp.AOT/compile_artifact_plan plan)})))))
+        (finally (BeamLisp.Env/destroy view)))]
+  ;; Private metadata writes may advance the global activity counter. The
+  ;; current scope's target generations and executable bytes must not change.
+  (is (= before (target-state namespace)))
+  (is (= 7 (BeamLisp.Ns.Rt/invoke (second (:binding before)) (list))))
+  (is (nil? (Process/get :artifact-emission-effect)))
+  (is (= 1 (get-in result [:plan :version])))
+  (is (= 4 (count (:beams result))))
+  (is (= (count (:beams result)) (count (distinct (map first (:beams result))))))
+  (is (every? (fn [beam]
+               (let [identity (beam_lib/md5 (second beam))]
+                (and (= :ok (first identity)) (= (first beam) (first (second identity))))))
+             (:beams result)))))
+
+(deftest artifact-compile-failure-does-not-publish-a-partial-unit
+ (let [namespace "artifact.emission.failure"
+       _ (BeamLisp/eval "(ns artifact.emission.failure) (defn answer [] 9)")
+       before (target-state namespace)
+       valid (BeamLisp.Emit/descriptor_for :Elixir.ArtifactEmissionPartial
+               (list (BeamLisp.Emit/function_clause :answer (BeamLisp.Emit/lit 42))) (list))
+       invalid (Map/put valid :clauses (list {:op :unsupported-artifact-clause}))
+       result (try
+               (BeamLisp.AOT/compile_artifact_plan
+                 {:generated-beams (list) :descriptors (list valid invalid)})
+               :unexpected-success
+               (catch _ :refused))]
+  (is (= :refused result))
+  (is (= before (target-state namespace)))
+  (is (= false (erlang/module_loaded :Elixir.ArtifactEmissionPartial)))))
