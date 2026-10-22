@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Stage macros/values without publication, then execute bytes in a fresh VM.
+
+Run under systemd-run with MemoryMax=6G, MemorySwapMax=0, RuntimeMaxSec=300.
+The output must be absent or empty. Producer and consumer run serially; the
+consumer image contains no fixture source files. No installed floor is changed.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+BOOT = '''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+BeamLisp.AOT.boot()
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+unless manifest["compiler_key"] == BeamLisp.AOTCache.current_compiler_key(),
+  do: raise "demo compiler sources do not match the candidate floor"
+for {name, _} <- manifest["modules"], String.ends_with?(name, ".beam") do
+  {:ok, {mod, expected}} = :beam_lib.md5(String.to_charlist(Path.join("priv/bootstrap/seed", name)))
+  if :erlang.module_loaded(mod) do
+    role = Keyword.get(mod.module_info(:attributes), :bl_aot_artifact_role)
+    unless role == [:"mutable-forwarder"] or mod.module_info(:md5) == expected,
+      do: raise "demo startup replaced stable candidate code: #{mod}"
+  end
+end
+BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--bootstrap-probe", action="store_true",
+                        help="also prepare actual protected rt.bl without loading its replacement")
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise SystemExit(f"output must be absent or empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    fixture = root / "test/fixtures/artifact-production"
+    watched = [root / "env.bl", root / "scripts/demo-artifact-production",
+               root / "test/scripts/artifact-production.bl",
+               *sorted((root / "priv/bootstrap/seed").iterdir()),
+               *sorted((root / "priv/boot").glob("*.bl")),
+               *sorted((root / "priv/host").glob("*.bl")),
+               *sorted(fixture.rglob("*.bl"))]
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    inputs = {str(path.relative_to(root)): digest(path) for path in watched}
+    # Use the same dependency roots as the checkout. OTP/Elixir themselves come
+    # from the executable runtime, rather than an installed drop's standard libs.
+    deps = sorted((root / "deps").glob("*/ebin"))
+    deps += sorted((root / "_build").glob("*/lib/*/ebin"))
+    deps = list(dict.fromkeys(path.resolve() for path in deps))
+    timings = {}
+    phases = ["producer", "consumer"] + (["bootstrap"] if args.bootstrap_probe else [])
+    for phase in phases:
+        with tempfile.TemporaryDirectory(prefix=f"bl-artifact-{phase}-") as temporary:
+            image = Path(temporary)
+            subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+            shutil.copy2(root / "env.bl", image / "env.bl")
+            app = image / ".bl/lib/beam_lisp-0.1.0"
+            app.mkdir(parents=True)
+            (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+            shutil.copytree(root / "priv/bootstrap/seed", app / "ebin")
+            driver = image / "demo.bl"
+            driver.write_bytes((root / "test/scripts/artifact-production.bl").read_bytes())
+            bootstrap = image / "demo.exs"
+            bootstrap.write_text(BOOT)
+            command = ["elixir"]
+            for dep in deps:
+                command += ["-pa", str(dep)]
+            command += ["-pa", str(app / "ebin"), str(bootstrap)]
+            env = {**os.environ, "BL_ROOT": str(image), "BL_DAEMON": "off",
+                   "BL_ARTIFACT_DRIVER": str(driver), "BL_ARTIFACT_OUTPUT": str(output),
+                   "BL_ARTIFACT_PHASE": phase, "XDG_CACHE_HOME": str(image / "cache"),
+                   "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+            if phase == "producer":
+                env["BL_ARTIFACT_SOURCES"] = str(fixture)
+            else:
+                env.pop("BL_ARTIFACT_SOURCES", None)
+                assert not (image / "test/fixtures").exists()
+            start = time.monotonic()
+            result = subprocess.run(command, cwd=image, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+            timings[phase] = round(time.monotonic() - start, 3)
+            (output / f"{phase}.log").write_text(result.stdout)
+            print(result.stdout[-16000:], end="", flush=True)
+            if result.returncode:
+                (output / "failure.json").write_text(json.dumps({
+                    "status": "error", "failed_phase": phase,
+                    "completed_phases": phases[:phases.index(phase)],
+                    "full_bootstrap_qualified": False, "inputs": inputs}, indent=2) + "\n")
+                raise SystemExit(result.returncode)
+    for path, expected in inputs.items():
+        if digest(root / path) != expected:
+            raise SystemExit(f"input changed during demo: {path}")
+    receipt = {"version": 1, "status": "passed", "scope": "artifact-production-demonstration",
+               "inputs": inputs, "seconds": timings,
+               "producer": json.loads((output / "producer.json").read_text()),
+               "consumer": json.loads((output / "consumer.json").read_text()),
+               "full_bootstrap_qualified": False, "native_execution_admission": False}
+    if args.bootstrap_probe:
+        receipt["bootstrap_probe"] = json.loads((output / "bootstrap.json").read_text())
+    (output / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    print(f"Passed. Artifacts and receipts: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
