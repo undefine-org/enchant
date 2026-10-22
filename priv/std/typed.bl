@@ -384,6 +384,22 @@
  (when-not (or (contains? env name) (contains? (:shadowed (state)) name))
   (get guard-tags (symbol name))))
 
+(defn- observe-call! [head actual signature pos]
+ (when-let [collector (:obligations (state))]
+  (let [declared (:args signature)
+        pairs (map (fn [a d] [a d]) actual declared)
+        refused (some (fn [[a d]] (and (seq a) (empty? (t-meet a d)))) pairs)
+        proved (and signature (= (count actual) (count declared))
+                    (every? (fn [[a d]] (t-sub? a d)) pairs))]
+   (swap! collector conj
+    {:status (cond refused :refused proved :proved :else :unknown)
+     :reason (cond refused :disjoint-argument-type proved :signature-constraint
+                    (nil? signature) :signature-unavailable
+                    (not= (count actual) (count declared)) :arity-required
+                    :else :argument-type)
+     :callee (if (= :symbol (node-tag head)) (node-name head) "<dynamic>")
+     :position (diag/whole pos) :actual actual :declared declared}))))
+
 (defn walk-call [sigs env items pos whole]
   (let [head (first items)
         arg-types (into [] (map (fn [a] (walk sigs env a)) (rest items)))]
@@ -398,6 +414,7 @@
       nil)
     (if (= :symbol (node-tag head))
       (let [sig (when-not (contains? env (node-name head)) (call-sig sigs head))]
+        (observe-call! head arg-types sig pos)
         (if (nil? sig)
           (do (check-head-callable env head arg-types pos whole) any)
           (do
@@ -416,7 +433,7 @@
                       nil)))
                 (:args sig)))
             (:ret sig))))
-      any)))
+      (do (observe-call! head arg-types nil pos) any))))
 
 (defn walk-if [sigs env items pos whole]
   (let [test (second items)
@@ -727,6 +744,8 @@
                                (first (:args sig)))
                  (reduce (fn [e p] (bind-pattern e p any))
                          {} (:params c))))]
+    (when-let [definitions (:definitions (state))]
+      (swap! definitions assoc name {:clauses (count clauses)}))
     (loop [cs clauses claimed #{}]
       (if (empty? cs)
         nil
@@ -748,7 +767,10 @@
                               (guard-narrow (:guard c) pname
                                             (get env0 pname any) env0))
                        env0)]
-            (doall (map (fn [b] (walk sigs env1 b)) (:body c))))
+            (let [returns (doall (map (fn [b] (walk sigs env1 b)) (:body c)))]
+             (when-let [definitions (:definitions (state))]
+              (swap! definitions update-in [name :returns]
+                     #(conj (or % []) (or (last returns) #{:nil}))))))
           (recur (rest cs)
                  (if single-sym
                    (t-union claimed (guard-claim (:guard c) pname (base c)))
@@ -779,10 +801,12 @@
 
 (defn check-source-with
   "check-source with an explicit seed table (P6 measures with/without)."
-  [src ns seeds]
+  ([src ns seeds] (check-source-with src ns seeds {}))
+  ([src ns seeds options]
   ; Install THIS call's atoms; restore the caller's (if any) on the way out, so
   ; a check nested inside another check resumes the outer one.
-  (let [st {:warnings (atom []) :evidence (atom {})}
+  (let [st (cond-> {:warnings (atom []) :evidence (atom {})}
+             (:coverage options) (assoc :obligations (atom []) :definitions (atom {})))
         prev (erlang/get state-key)]
     (erlang/put state-key st)
     (try
@@ -816,8 +840,45 @@
 
               :else (walk sigs {} form))))
           forms))
-      {:warnings (deref (:warnings st)) :evidence (deref (:evidence st))})
-      (finally (erlang/put state-key prev)))))
+      (cond-> {:warnings (deref (:warnings st)) :evidence (deref (:evidence st))}
+       (:coverage options) (assoc :obligations @(:obligations st)
+                                 :definitions @(:definitions st))))
+      (finally (erlang/put state-key prev))))))
+
+(defn check-source-result
+ "Explicit signature/type evidence, not permission to execute or a proof of
+  effects or ownership. Missing signatures, partial argument types and unknown
+  inferred values remain obligations. Editor check-source keeps its interface."
+ ([src ns] (check-source-result src ns (merge core-seeds-v2 host-seeds)))
+ ([src ns seeds]
+  (try
+   (let [result (check-source-with src ns seeds {:coverage true})
+         unknown-values (into [] (keep (fn [[position tags]]
+                              (when (= any tags)
+                               {:status :unknown :reason :inferred-any :position position}))
+                            (:evidence result)))
+         unknown-returns (mapcat (fn [[name definition]]
+                            (keep (fn [tags]
+                                    (when (= any tags)
+                                     {:status :unknown :reason :return-type :definition name}))
+                                  (:returns definition))) (:definitions result))
+         obligations (into (into (:obligations result) unknown-values) unknown-returns)
+         counts (frequencies (map :status obligations))
+         unknown (get counts :unknown 0)
+         refused (or (pos? (get counts :refused 0))
+                      (some #(contains? #{:type-mismatch :not-callable :arity :keyword-call} (:kind %))
+                            (:warnings result)))]
+    (assoc result :status (cond refused :refused (pos? unknown) :unknown :else :proved)
+                  :obligations obligations :diagnostics (:warnings result)
+                  :coverage {:scope :signature-and-inferred-types
+                             :definitions (count (:definitions result))
+                             :clauses (reduce + 0 (map :clauses (vals (:definitions result))))
+                             :constraints (count obligations) :unknown unknown
+                             :complete (= 0 unknown)}))
+   (catch error
+    {:status :error :coverage {:complete false} :obligations []
+     :diagnostics [(diag/error :type-analysis-error
+                      (str "Type analysis failed: " (ex-message error)) {} {})]}))))
 
 (defn hover
   "The L1/L12 demo: type at [line col], delaborated for a human."
