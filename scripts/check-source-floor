@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Boot a generated floor in a fresh, private source image before installation."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+DRIVER = r'''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+unless BeamLisp.AOTCache.current_compiler_key() == manifest["compiler_key"],
+  do: raise "candidate floor does not match the physical compiler inputs"
+{:ok, _} = Application.ensure_all_started(:beam_lisp)
+# Stable compiler bodies must still be the candidate bytes after startup.
+# Mutable forwarders may extend legitimately; their stable bodies may not.
+for {name, _} <- manifest["modules"], String.ends_with?(name, ".beam") do
+  path = Path.join("priv/bootstrap/seed", name)
+  {:ok, {mod, md5}} = :beam_lib.md5(String.to_charlist(path))
+  if :erlang.module_loaded(mod) do
+    attrs = mod.module_info(:attributes)
+    unless Keyword.get(attrs, :bl_aot_artifact_role) == [:"mutable-forwarder"] or
+           mod.module_info(:md5) == md5,
+      do: raise "startup replaced candidate compiler code: #{mod}"
+  end
+end
+# Exercise the early publication path, rather than merely loading ANF exports.
+BeamLisp.eval("(ns floor.fresh.probe) (defn identity [x] x) (defn dispatch [f] (f))")
+{:ok, row} = BeamLisp.Env.lookup({:emitted_definition, "floor.fresh.probe", "identity"})
+unless row.execution.status == :bound and length(row.execution.entries) == 1 do
+  IO.inspect(row.execution, label: "SOURCE-FLOOR publication", limit: 30)
+  body = elem(hd(row.entries), 4)
+  IO.inspect(Keyword.get(body.module_info(:attributes), :bl_execution_clauses),
+             label: "SOURCE-FLOOR clause attributes", limit: 10)
+  raise "fresh publication did not bind its execution descriptor"
+end
+{:ok, dynamic} = BeamLisp.Env.lookup({:emitted_definition, "floor.fresh.probe", "dispatch"})
+unless dynamic.execution.status == :bound and
+       Enum.any?(dynamic.execution.entries, fn entry ->
+         entry[:"dependencies-complete"] == false and
+           Enum.any?(entry.edges, &(&1.kind == :"callable-argument" and is_nil(&1.target)))
+       end), do: raise "compiler callable ABI lost its unresolved execution obligation"
+IO.puts("SOURCE-FLOOR fresh application and descriptor publication passed")
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--seed", type=Path, required=True)
+    args = parser.parse_args()
+    root, seed = args.root.resolve(), args.seed.resolve()
+    with tempfile.TemporaryDirectory(prefix="bl-source-floor-") as temporary:
+        image = Path(temporary)
+        subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+        shutil.rmtree(image / "priv/bootstrap/seed")
+        shutil.copytree(seed, image / "priv/bootstrap/seed")
+        shutil.copy2(root / "env.bl", image / "env.bl")
+        app = image / ".bl/lib/beam_lisp-0.1.0"
+        app.mkdir(parents=True)
+        (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+        shutil.copytree(seed, app / "ebin")
+        driver = image / "check.exs"
+        driver.write_text(DRIVER)
+        deps = sorted((root / "deps").glob("*/ebin"))
+        deps += sorted((root / "_build").glob("*/lib/*/ebin"))
+        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        # The actual Elixir runtime selects compatible cache entries, as bin/bl does.
+        tag = subprocess.check_output(["elixir", "-e", 'IO.write("erts#{:erlang.system_info(:version)}-elixir#{System.version()}")'], text=True)
+        deps += sorted((cache / "beam_lisp/ebin").glob(f"*-{tag}/ebin"))
+        command = ["elixir"]
+        for dep in dict.fromkeys(path.resolve() for path in deps):
+            command += ["-pa", str(dep)]
+        command += ["-pa", str(app / "ebin"), str(driver)]
+        env = os.environ.copy()
+        env.update(BL_ROOT=str(image), BL_DAEMON="off", BL_BUILD_ID="floor-check",
+                   XDG_CACHE_HOME=str(image / "cache"),
+                   ELIXIR_ERL_OPTIONS="+S 4:4 +SDcpu 2:2 +SDio 1:1")
+        try:
+            result = subprocess.run(command, cwd=image, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise SystemExit("SOURCE-FLOOR fresh boot exceeded 120 seconds")
+        if result.returncode:
+            print(result.stdout[-16000:], end="")
+            raise SystemExit(result.returncode)
+        print(json.dumps({"kind": "fresh-source-floor", "status": "passed",
+                          "seed": str(seed), "runtime": tag}))
+
+
+if __name__ == "__main__":
+    main()

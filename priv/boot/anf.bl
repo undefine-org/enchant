@@ -101,6 +101,14 @@
 (defn structt [mod fields] {:op :struct :mod mod :fields fields :ann {}})
 (defn clause [pats guard body] {:pats pats :guard guard :body body})
 
+(defn callable-invocation
+ "Read the compiler's callable ABI without consulting mutable annotations or
+  namespace vars. The packed argument list may itself be computed."
+ [node]
+ (when (and (map? node) (= :remote (:op node)) (= :Elixir.BeamLisp.Ns.Rt (:mod node))
+             (= :invoke (:fun node)) (= 2 (count (:args node))))
+  {:callee (first (:args node)) :arguments (second (:args node))}))
+
 ;; The grammar owns executable children for both production and analysis.
 ;; Literal payloads and patterns are inert. Every result is an eager proper
 ;; list, so describing dependencies cannot introduce a runtime continuation.
@@ -141,7 +149,7 @@
         (= :cons op) (list (:head node) (:tail node))
         :else (throw (ex-info "Unknown executable ANF operation"
                        {:kind :unknown-executable-operation :op op})))]
-  (BeamLisp.CompilerData/eager_filter some? children)))
+  (BeamLisp.CompilerData/eager_filter (fn [child] (erlang/not (erlang/== nil child))) children)))
 
 ;; pattern constructors
 (defn pvar [name] {:pop :pvar :name name})
@@ -163,8 +171,8 @@
                   {:module (:name m) :function f :path path :value value})))
 
 (defn- exact-keys? [m ks]
-  (and (map? m) (= (count (maps/keys m)) (count ks))
-       (every? (fn [k] (contains? m k)) ks)))
+  (and (map? m) (= (erlang/map_size m) (erlang/length (to-list ks)))
+       (Enum/all? ks (fn [k] (maps/is_key k m)))))
 
 (defn- eager-list [x field]
   (if (or (erlang/is_list x) (BeamLisp.Ns.Rt/vector? x))
@@ -175,11 +183,11 @@
 (defn- literal-data? [v]
   (cond
     (erlang/is_function v) false
-    (erlang/is_tuple v) (every? (fn [value] (literal-data? value)) (erlang/tuple_to_list v))
-    (erlang/is_list v) (every? (fn [value] (literal-data? value)) v)
-    (BeamLisp.Ns.Rt/vector? v) (every? (fn [value] (literal-data? value)) (to-list v))
+    (erlang/is_tuple v) (Enum/all? (erlang/tuple_to_list v) (fn [value] (literal-data? value)))
+    (erlang/is_list v) (Enum/all? v (fn [value] (literal-data? value)))
+    (BeamLisp.Ns.Rt/vector? v) (Enum/all? (to-list v) (fn [value] (literal-data? value)))
     ; is_map-ok: Core literals include plain data structs, but never resources or thunks.
-    (erlang/is_map v) (every? (fn [k] (and (literal-data? k) (literal-data? (maps/get k v)))) (maps/keys v))
+    (erlang/is_map v) (Enum/all? (maps/keys v) (fn [k] (and (literal-data? k) (literal-data? (maps/get k v)))))
     :else (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_bitstring v))))
 
 (declare validate-node!)
@@ -495,7 +503,7 @@
 (defn- normalize-grammar [x]
   (cond
     (and (map? x) (or (= :lit (:op x)) (= :plit (:pop x)))) x
-    (map? x) (reduce (fn [out k] (assoc out k (normalize-grammar (get x k)))) {} (maps/keys x))
+    (map? x) (Enum/reduce (maps/keys x) {} (fn [k out] (assoc out k (normalize-grammar (get x k)))))
     (BeamLisp.Ns.Rt/vector? x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) (to-list x)))
     (erlang/is_list x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) x))
     :else x))
@@ -537,28 +545,135 @@
   (entry-error :body-identity))
  (when-not (contains? (execution-entry-kinds) (:kind entry)) (entry-error :kind))
  (when-not (and (map? (:arity entry)) (exact-keys? (:arity entry) [:kind :count])
-                (contains? #{:fixed :variadic} (get-in entry [:arity :kind]))
-                (int? (get-in entry [:arity :count])) (<= 0 (get-in entry [:arity :count]) 255))
+                (contains? #{:fixed :variadic} (:kind (:arity entry)))
+                (int? (:count (:arity entry)))
+                (erlang/>= (:count (:arity entry)) 0)
+                (erlang/=< (:count (:arity entry)) 255))
   (entry-error :arity))
  (when-not (and (map? (:span entry)) (literal-data? (:span entry))) (entry-error :span))
  (when-not (or (= true (:dependencies-complete entry)) (= false (:dependencies-complete entry)))
   (entry-error :dependencies-complete))
  (when-not (erlang/is_list (:edges entry)) (entry-error :edges))
- (doseq [edge (:edges entry)]
+ (Enum/each (:edges entry) (fn [edge]
   (when-not (and (map? edge) (exact-keys? edge [:kind :target :evidence :span])
                  (contains? (execution-edge-kinds) (:kind edge))
                  (literal-data? (:target edge))
                  (some? (:evidence edge)) (literal-data? (:evidence edge))
                  (map? (:span edge)) (literal-data? (:span edge)))
-   (entry-error :edge)))
+   (entry-error :edge))))
  entry)
 
 (defn execution-entry
  "Construct the canonical finite entry schema. Omitted dependency coverage is
   false. Missing identities still refuse; no declaration gets inferred trust."
  [fields]
- (let [entry (merge {:version 1 :span {} :edges (list) :dependencies-complete false} fields)
+ (let [entry (maps/merge {:version 1 :span {} :edges (list) :dependencies-complete false} fields)
        edges (eager-list (:edges entry) "$.execution-entry.edges")
        edges (BeamLisp.CompilerData/eager_map
-               (fn [edge] (merge {:span {} :target nil} edge)) edges)]
+               (fn [edge] (maps/merge {:span {} :target nil} edge)) edges)]
   (validate-execution-entry! (assoc entry :edges edges))))
+
+(defn- execution-span [node]
+ (maps/with (list :file :line :col :offset :end-line :end-col :end-offset)
+            (or (:ann node) {})))
+
+(defn- dependency-edge [node kind target evidence]
+ {:kind kind :target target :evidence evidence :span (execution-span node)})
+
+(defn- node-dependencies [node]
+ (let [op (:op node) invocation (callable-invocation node)]
+  (cond
+   invocation
+   (list (dependency-edge node :direct-call
+           (tuple :mfa (:mod node) (:fun node) 2) [:anf :remote])
+         (dependency-edge node :callable-argument nil
+           [:anf :invoke (:op (:callee invocation))]))
+   (= :remote op)
+   (if (and (erlang/is_atom (:mod node)) (erlang/is_atom (:fun node)))
+    (list (dependency-edge node :direct-call
+            (tuple :mfa (:mod node) (:fun node) (count (:args node))) [:anf :remote]))
+    (list (dependency-edge node :direct-call nil [:anf :dynamic-remote])))
+   (= :global op)
+   ;; A binding is not a physical entry, even for :exact lookups. Resolution
+   ;; must authenticate its actual published provider and retained value.
+   (list (dependency-edge node :captured-value nil
+           [:anf :global (:ns node) (:name node) (:lookup node)]))
+   (= :apply op)
+   ;; Lowering adds the callable dispatcher. Do not pretend a syntax walk
+   ;; inventories backend-generated dependencies or resolves lexical values.
+   (list (dependency-edge node :callable-argument nil
+           [:anf :apply (:op (:fn node)) (count (:args node))]))
+   (contains? #{:arith :struct :js} op)
+   (list (dependency-edge node :native-adapter nil [:anf :backend-dependencies op]))
+   (and (= :lit op) (not (literal-data? (:val node))))
+   (list (dependency-edge node :captured-value nil [:anf :opaque-literal]))
+   :else (list))))
+
+(defn execution-dependencies
+ "Inventory canonical ANF dependencies, including guards and latent bodies.
+  Collection is bounded and eager. Binding/value resolution and backend-added
+  calls remain explicit obligations; this is not a dependency-closure proof."
+ [roots]
+ (loop [pending (eager-list roots "$.execution-roots") edges (list) nodes 0 complete true]
+  (if (empty? pending)
+   {:edges (lists/reverse edges) :nodes nodes :complete complete}
+   (let [node (first pending)
+         _ (when (>= nodes 32768)
+             (throw (ex-info "Execution dependency inventory exceeded its node budget"
+                             {:kind :execution-dependency-limit :limit 32768})))
+         children (executable-children node)
+         found (node-dependencies node)]
+    (recur (finite-concat children (rest pending))
+           (Enum/reduce found edges (fn [edge out] (cons edge out)))
+           (inc nodes) (and complete (Enum/all? found #(some? (:target %)))))))))
+
+(defn- emitted-entry-key [entry]
+ (when-not (and (tuple? entry) (= 5 (erlang/tuple_size entry))
+                (contains? #{:fixed :variadic} (elem entry 0))
+                (int? (elem entry 1)) (erlang/>= (elem entry 1) 0) (erlang/=< (elem entry 1) 255)
+                (erlang/is_atom (elem entry 2)) (erlang/is_atom (elem entry 4))
+                (map? (elem entry 3)) (= :defn-clause (:op (elem entry 3)))
+                (= (elem entry 2) (:fname (elem entry 3)))
+                (= (+ (elem entry 1) (if (= :variadic (elem entry 0)) 1 0))
+                   (count (:params (elem entry 3)))))
+  (entry-error :emitted-clause))
+ (tuple :mfa (elem entry 4) (elem entry 2) (count (:params (elem entry 3)))))
+
+(defn execution-entries
+ "Describe the actual five-field emitted clauses with loaded body MD5s.
+  Multiple clauses for one physical MFA form one entry. Source/AOT replay use
+  this same producer. Origin stays :source until native artifact evidence
+  authenticates another domain; annotations cannot nominate SDK/control code."
+ [ns name entries body-hashes]
+ (when-not (and (string? ns) (string? name) (not (Enum/empty? entries)))
+  (entry-error :emitted-inventory))
+ (let [groups (Enum/group_by entries (fn [entry] (emitted-entry-key entry)))]
+  (finite-map
+   (fn [id]
+    (let [clauses (get groups id) entry (first clauses)
+          body (elem entry 4) md5 (get body-hashes body)
+          _ (when-not (and (erlang/is_binary md5) (= 16 (erlang/byte_size md5)))
+              (entry-error :body-md5))
+          roots (BeamLisp.CompilerData/eager_mapcat
+                  (fn [e]
+                   (when-not (= (elem entry 0) (elem e 0)) (entry-error :dispatch))
+                   (let [clause (elem e 3)]
+                    (if (:guard clause) (list (:guard clause) (:body clause))
+                     (list (:body clause))))) clauses)
+          dependencies (execution-dependencies roots)]
+     (execution-entry
+      {:id id :definition (erlang/iolist_to_binary (list ns "/" name)) :body-identity (tuple body md5)
+       :kind :source :arity {:kind (elem entry 0) :count (elem entry 1)}
+       :span (execution-span (elem entry 3)) :edges (:edges dependencies)
+       :dependencies-complete (:complete dependencies)})))
+   (Enum/sort (maps/keys groups)))))
+
+(defn execution-clause-identities
+ "Per-MFA identities embedded by Emit in the same artifact as its code.
+  Normalize compiler grammar collections exactly as module construction does.
+  Retain full SHA256 identities, never source declarations or a hash hint."
+ [clauses]
+ (let [canonical (finite-map (fn [clause] (normalize-grammar clause)) clauses)
+       groups (Enum/group_by canonical (fn [clause] (tuple (:fname clause) (count (:params clause)))))]
+  (Enum/reduce (maps/keys groups) {} (fn [key out]
+            (assoc out key (crypto/hash :sha256 (erlang/term_to_binary (get groups key))))))))
