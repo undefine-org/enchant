@@ -178,7 +178,7 @@ defmodule StagingResearch do
     }
     literals = %{"rt-cond-leaf" => %{"probe" => 42}, "neutral-cond" => %{"probe" => 42},
                  "recursive-helper" => %{"answer" => 42}, "mutual-helpers" => %{"answer" => 42},
-                 "rt-invoke-source" => %{"answer" => 99}, "rt-invoke-implicit" => %{"answer" => 99},
+                 "rt-invoke-source" => %{"answer" => 99}, "rt-invoke-implicit" => %{"answer" => 42},
                  "rt-selected-semantics" => %{"answer" => 2}, "macro-first" => %{"probe" => 42}}
     Enum.each(results, fn result ->
       if Map.has_key?(kinds, result.id) and Map.get(result, :kind) != kinds[result.id],
@@ -186,7 +186,7 @@ defmodule StagingResearch do
       if Map.has_key?(literals, result.id) and result.literal_functions != literals[result.id],
         do: raise "literal result changed: #{result.id}"
     end)
-    unless ir.same_invoke_ir, do: raise "invoke representation observation changed"
+    if ir.same_invoke_ir, do: raise "language invocation collapsed into a source remote"
     File.write!(Path.join(System.fetch_env!("BL_ARTIFACT_OUTPUT"), "result.json"), Jason.encode!(%{
       version: 1, scope: "staging-hypothesis-research", compiler_key: BeamLisp.AOTCache.current_compiler_key(),
       cases: results, ir: ir, self_reproduction_qualified: false}, pretty: true))

@@ -1,0 +1,72 @@
+(ns compiler-invocation-test
+ (:require [anf :as anf] [system.ir :as ir] [system.tier :as tier]))
+
+(defn- compile-expression [source]
+ (BeamLisp.Compiler/compile (first (BeamLisp.Reader/read_string source))
+   (assoc (BeamLisp.Compiler/new_env "user") :locals {"f" "f" "arguments" "arguments"})))
+
+(deftest language-invocation-and-explicit-runtime-call-have-different-semantics
+ (let [implicit (compile-expression "(f)")
+       explicit (compile-expression "(BeamLisp.Ns.Rt/invoke f ())")]
+  (is (= :invoke (:op implicit)))
+  (is (= :remote (:op explicit)))
+  (is (= :invoke (:mode (ir/call-site implicit))))
+  (is (= :remote (:mode (ir/call-site explicit))))
+  (is (nil? (anf/callable-invocation explicit)))
+  (is (= false (tier/alpha= implicit explicit)))
+  (is (= implicit (tier/map-children identity implicit)))
+  (is (= [(anf/var "f") (anf/empty-list-node)] (vec (anf/executable-children implicit))))))
+
+(deftest packed-argument-expression-is-executed-once-and-in-order
+ (let [function (anf/fnn (list (anf/clause (list (anf/pvar "a") (anf/pvar "b")) nil
+                               (anf/remote :erlang :+ (list (anf/var "a") (anf/var "b"))))))
+       node (anf/invoke function (anf/var "arguments"))
+       locals {"arguments" (list 10 32)}]
+  (is (= 42 (BeamLisp.AOT/interpret_constructor! node locals {})))
+  (is (nil? (:arity (ir/call-site node)))))
+ (is (= 42 (BeamLisp/eval "(let [f (fn [a b] (+ a b))] (f 10 32))")))
+ (is (= [:callee :first :second]
+        (BeamLisp/eval "(let [seen (atom []) f (do (swap! seen conj :callee) (fn [a b] nil))] (f (swap! seen conj :first) (swap! seen conj :second)) @seen)"))))
+
+(deftest constructed-list-elements-preserve-source-order
+ (is (= [:first :second :third]
+        (BeamLisp/eval "(let [seen (atom [])] (list (swap! seen conj :first) (swap! seen conj :second) (swap! seen conj :third)) @seen)")))
+ (is (= [:first :second :third]
+        (BeamLisp/eval "(let [seen (atom [])] [(swap! seen conj :first) (swap! seen conj :second) (swap! seen conj :third)] @seen)"))))
+
+(deftest language-callable-kinds-retain-runtime-behavior
+ (is (= 42 (BeamLisp/eval "(:answer {:answer 42})")))
+ (is (= 42 (BeamLisp/eval "({:answer 42} :answer)")))
+ (is (= 42 (BeamLisp/eval "([10 42] 1)")))
+ (is (= 42 (BeamLisp/eval "((fn [x & more] (+ x (first more))) 10 32)")))
+ (is (= 42 (BeamLisp/eval "(((fn [x] (fn [y] (+ x y))) 10) 32)"))))
+
+(deftest canonical-invoke-validates-both-operands-and-refuses-lookalike-tags
+ (let [node (anf/invoke (anf/var "f") (anf/empty-list-node))
+       descriptor (fn [body]
+                    (BeamLisp.Emit/descriptor_for :Elixir.CompilerInvocationProbe
+                     (list (BeamLisp.Emit/function_clause :run body (list (anf/pvar "f")))) (list)))
+       literal (anf/lit {:op :invoke :callee :not-code :arguments :not-code})]
+  (is (= :module (:op (anf/validate-module! (descriptor node)))))
+  (is (thrown? (anf/validate-module! (descriptor (assoc node :callee :not-code)))))
+  (is (thrown? (anf/validate-module! (descriptor (assoc node :arguments :not-code)))))
+  (is (= [] (vec (anf/executable-children literal))))
+  (is (nil? (anf/callable-invocation (assoc (anf/remote :example :invoke (list)) :ann {:kernel true}))))))
+
+(deftest source-runtime-invoke-cannot-intercept-the-constructor-machines-call
+ (let [directory (Path/join (System/tmp_dir!) (str "invocation-world-" (System/unique_integer (list :positive))))
+       file (Path/join directory "rt.bl")]
+  (File/mkdir_p! directory)
+  (try
+   (File/write! file "(ns rt) (defn invoke [f args] '(defn explicit [] 99)) (defmacro make-implicit [] ((fn [] '(defn implicit [] 42)))) (defmacro make-explicit [] (BeamLisp.Ns.Rt/invoke (fn [] '(defn ignored [] 0)) ())) (make-implicit) (make-explicit)")
+   (let [workspace (BeamLisp.AOT/open_workspace {:version 1 :sources (list {:namespace 'rt :file file})} {})
+         module :Elixir.BeamLisp.Ns.Rt before (erlang/apply module :module_info (list :md5))]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'rt)
+           definitions (:definitions (first (:plans prepared)))
+           body (fn [name] (:body (elem (first (get definitions name)) 3)))]
+      (is (= 42 (:val (body "implicit"))))
+      (is (= 99 (:val (body "explicit"))))
+      (is (= before (erlang/apply module :module_info (list :md5)))))
+     (finally (BeamLisp.AOT/close_workspace! workspace))))
+   (finally (File/rm_rf! directory)))))
