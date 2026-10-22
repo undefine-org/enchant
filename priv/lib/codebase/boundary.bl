@@ -1,0 +1,113 @@
+;; Boundary facts are a projection of the shared source index and emitted
+;; descriptors. They describe obligations; no fact or descriptor grants entry.
+(ns codebase.boundary (:require [datom]))
+
+(def VERSION 1)
+(def ENTRY-KINDS #{:source :sdk :actor :native-adapter :control})
+(def EDGE-KINDS #{:direct-call :captured-value :callable-argument :native-adapter
+                  :fixed-sdk-lookup :start :message :control :handoff :cleanup})
+(def SCHEMA
+ [{:db/ident :entry/id :db/valueType :db.type/term :db/index true}
+  {:db/ident :entry/definition :db/valueType :db.type/string :db/index true}
+  {:db/ident :entry/body-identity :db/valueType :db.type/term}
+  {:db/ident :entry/kind :db/valueType :db.type/keyword :db/index true}
+  {:db/ident :entry/arity-kind :db/valueType :db.type/keyword}
+  {:db/ident :entry/arity :db/valueType :db.type/long}
+  {:db/ident :entry/version :db/valueType :db.type/long}
+  {:db/ident :entry/span :db/valueType :db.type/term}
+  {:db/ident :edge/caller :db/valueType :db.type/term :db/index true}
+  {:db/ident :edge/target :db/valueType :db.type/term :db/index true}
+  {:db/ident :edge/written :db/valueType :db.type/string}
+  {:db/ident :edge/kind :db/valueType :db.type/keyword :db/index true}
+  {:db/ident :edge/status :db/valueType :db.type/keyword :db/index true}
+  {:db/ident :edge/origin :db/valueType :db.type/keyword}
+  {:db/ident :edge/span :db/valueType :db.type/term}
+  {:db/ident :edge/evidence :db/valueType :db.type/term}])
+
+(defn descriptor?
+ "Shape only. A well-shaped declaration remains unauthenticated data."
+ [entry]
+ (and (map? entry) (= VERSION (:version entry)) (some? (:id entry))
+      (string? (:definition entry)) (some? (:body-identity entry))
+      (contains? ENTRY-KINDS (:kind entry))
+      (contains? #{:fixed :variadic} (get-in entry [:arity :kind]))
+      (int? (get-in entry [:arity :count])) (<= 0 (get-in entry [:arity :count]) 255)
+      (vector? (:edges entry))
+      (every? #(and (map? %) (contains? EDGE-KINDS (:kind %))
+                    (some? (:evidence %))) (:edges entry))))
+
+(defn- entry-fact [entry]
+ {:entry/id (:id entry) :entry/definition (:definition entry)
+  :entry/body-identity (:body-identity entry) :entry/kind (:kind entry)
+  :entry/arity-kind (get-in entry [:arity :kind]) :entry/arity (get-in entry [:arity :count])
+  :entry/version (:version entry) :entry/span (or (:span entry) {})})
+
+(defn- source-edge [entries site]
+ (let [target (:call/callee-qualified site)
+       caller (:call/caller-qualified site)]
+  {:edge/caller caller :edge/target (or target [:unresolved (:call/callee site)])
+   :edge/written (:call/callee site) :edge/kind :direct-call :edge/origin :source
+   :edge/status (cond (nil? target) :unresolved
+                       (contains? entries target) :indexed :else :unindexed)
+   :edge/span {:line (or (:call/line site) 0) :col 0}
+   :edge/evidence [:source-call (:db/id site)]}))
+
+(defn- emitted-edge [ids entry edge]
+ {:edge/caller (:id entry) :edge/target (or (:target edge) [:unresolved (:kind edge)])
+  :edge/kind (:kind edge) :edge/origin :emitted
+  :edge/status (cond (nil? (:target edge)) :unresolved
+                      (contains? ids (:target edge)) :indexed :else :unindexed)
+  :edge/span (or (:span edge) (:span entry) {}) :edge/evidence (:evidence edge)})
+
+(defn project
+ "Join source call facts to emitted entry descriptors without parsing again.
+  Missing definitions, unresolved calls and incomplete emitted dependencies
+  remain in coverage. Empty or malformed input never certifies an inventory.
+  Actual publication authentication belongs to system.execution/check."
+ [index descriptors]
+ (when-not (and (map? index) (sequential? (:fn index)) (sequential? (:calls index))
+                (sequential? descriptors) (every? descriptor? descriptors))
+  (throw (ex-info "Invalid execution boundary input" {:kind :invalid-boundary-input})))
+ (let [ids (set (map :id descriptors))
+       _ (when-not (= (count ids) (count descriptors))
+           (throw (ex-info "Duplicate emitted entry identity" {:kind :duplicate-entry})))
+       definitions (set (map :fn/qualified (:fn index)))
+       emitted (set (map :definition descriptors))
+       missing (vec (sort (filter #(not (contains? emitted %)) definitions)))
+       missing-callers (vec (sort (set (keep (fn [site]
+                                   (let [caller (:call/caller-qualified site)]
+                                    (when-not (contains? emitted caller) caller))) (:calls index)))))
+       unindexed (vec (sort (filter #(not (contains? definitions %)) emitted)))
+       entries (mapv entry-fact descriptors)
+       source (mapv #(source-edge emitted %) (:calls index))
+       edges (into source (mapcat (fn [entry] (map #(emitted-edge ids entry %) (:edges entry))) descriptors))
+       unresolved (count (filter #(not= :indexed (:edge/status %)) edges))
+       dependencies (every? #(= true (:dependencies-complete %)) descriptors)
+       coverage {:scope :indexed-definitions-and-call-sites
+                 :definitions (count definitions) :entries (count entries)
+                 :source-calls (count source) :edges (count edges) :unresolved unresolved
+                 :missing missing :missing-callers missing-callers
+                 :unindexed unindexed :dependencies-complete dependencies
+                 :complete (and (seq definitions) (seq entries) (empty? missing)
+                                (empty? missing-callers) (empty? unindexed) (= 0 unresolved) dependencies)}]
+  {:version VERSION :entries entries :edges edges
+   :coverage (update coverage :complete boolean)
+   :facts (mapv (fn [i fact] (assoc fact :db/id (+ 900000 i)))
+                (range (+ (count entries) (count edges))) (concat entries edges))}))
+
+(defn impact
+ "Reverse emitted-entry closure, including changed roots. Source-only or
+  unresolved edges remain explicit coverage obligations in the projection.
+  Tests are attached by their qualification manifest, never guessed by name."
+ [db changed-entry-ids]
+ (let [rows (datom/q '[:find ?from ?to :where
+                       [?edge :edge/origin :emitted]
+                       [?edge :edge/status :indexed]
+                       [?edge :edge/caller ?from] [?edge :edge/target ?to]] db)
+       reverse (reduce (fn [graph row]
+                         (update graph (get row 1) #(conj (or % #{}) (get row 0)))) {} rows)]
+  (loop [frontier (set changed-entry-ids) seen #{}]
+   (if (empty? frontier) seen
+    (let [seen (into seen frontier)
+          next (set (mapcat #(get reverse % #{}) frontier))]
+     (recur (set (filter #(not (contains? seen %)) next)) seen))))))
