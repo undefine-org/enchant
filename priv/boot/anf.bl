@@ -101,6 +101,48 @@
 (defn structt [mod fields] {:op :struct :mod mod :fields fields :ann {}})
 (defn clause [pats guard body] {:pats pats :guard guard :body body})
 
+;; The grammar owns executable children for both production and analysis.
+;; Literal payloads and patterns are inert. Every result is an eager proper
+;; list, so describing dependencies cannot introduce a runtime continuation.
+(defn- executable-clause-children [clauses]
+ (BeamLisp.CompilerData/eager_mapcat
+  (fn [clause]
+   (if (nil? (:guard clause)) (list (:body clause))
+    (list (:guard clause) (:body clause)))) clauses))
+
+(defn- executable-pair-children [pairs]
+ (BeamLisp.CompilerData/eager_mapcat (fn [pair] (list (first pair) (second pair))) pairs))
+
+(defn executable-children
+ "Immediate executable operands in grammar order, including latent function
+  bodies and clause guards. This describes syntax, not unconditional execution
+  of every branch. Unknown operations refuse; they never look effect-free."
+ [node]
+ (when-not (map? node)
+  (throw (ex-info "Executable child traversal requires an ANF node" {:kind :invalid-executable-node})))
+ (let [op (:op node)
+       children
+       (cond
+        (contains? #{:lit :var :global :enil} op) (list)
+        (contains? #{:js :arith :remote} op) (:args node)
+        (= :apply op) (cons (:fn node) (:args node))
+        (= :let op) (list (:init node) (:body node))
+        (= :if op) (list (:test node) (:then node) (:else node))
+        (= :do op) (:stmts node)
+        (= :case op) (cons (:subj node) (executable-clause-children (:clauses node)))
+        (= :fn op) (executable-clause-children (:clauses node))
+        (= :try op) (finite-concat (list (:body node))
+                      (executable-clause-children (:catch node)) (list (:after node)))
+        (= :recv op) (finite-concat (executable-clause-children (:clauses node))
+                       (list (:timeout node) (:after node)))
+        (= :tuple op) (:elems node)
+        (= :map op) (executable-pair-children (:pairs node))
+        (= :struct op) (executable-pair-children (:fields node))
+        (= :cons op) (list (:head node) (:tail node))
+        :else (throw (ex-info "Unknown executable ANF operation"
+                       {:kind :unknown-executable-operation :op op})))]
+  (BeamLisp.CompilerData/eager_filter some? children)))
+
 ;; pattern constructors
 (defn pvar [name] {:pop :pvar :name name})
 (defn plit [v] {:pop :plit :val v})
@@ -467,3 +509,56 @@
                       :clauses (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) (eager-list clauses "$.clauses")))
                       :exports (eager-list exports "$.exports")
                       :attrs (eager-list attrs "$.attrs") :ann ann})))
+
+;; Versioned executable-entry DATA. Authentication of an SDK/control origin
+;; belongs to native publication/admission, never this constructor or a tag.
+(defn- execution-entry-kinds [] (quote #{:source :sdk :actor :native-adapter :control}))
+(defn- execution-edge-kinds []
+ (quote #{:direct-call :captured-value :callable-argument :native-adapter
+           :fixed-sdk-lookup :start :message :control :handoff :cleanup}))
+
+(defn- entry-error [field]
+ (throw (ex-info "Invalid execution entry descriptor"
+          {:kind :invalid-execution-entry :field field})))
+
+(defn validate-execution-entry!
+ "Validate the closed version-1 entry schema. Entries are finite literal maps;
+  edge collections are proper native lists. Passing this shape check supplies
+  no runtime origin, context, graph custody or resource capability."
+ [entry]
+ (when-not (and (map? entry)
+                (exact-keys? entry [:version :id :definition :body-identity :kind
+                                    :arity :span :edges :dependencies-complete]))
+  (entry-error :fields))
+ (when-not (= 1 (:version entry)) (entry-error :version))
+ (when-not (and (some? (:id entry)) (literal-data? (:id entry))) (entry-error :id))
+ (when-not (string? (:definition entry)) (entry-error :definition))
+ (when-not (and (some? (:body-identity entry)) (literal-data? (:body-identity entry)))
+  (entry-error :body-identity))
+ (when-not (contains? (execution-entry-kinds) (:kind entry)) (entry-error :kind))
+ (when-not (and (map? (:arity entry)) (exact-keys? (:arity entry) [:kind :count])
+                (contains? #{:fixed :variadic} (get-in entry [:arity :kind]))
+                (int? (get-in entry [:arity :count])) (<= 0 (get-in entry [:arity :count]) 255))
+  (entry-error :arity))
+ (when-not (and (map? (:span entry)) (literal-data? (:span entry))) (entry-error :span))
+ (when-not (or (= true (:dependencies-complete entry)) (= false (:dependencies-complete entry)))
+  (entry-error :dependencies-complete))
+ (when-not (erlang/is_list (:edges entry)) (entry-error :edges))
+ (doseq [edge (:edges entry)]
+  (when-not (and (map? edge) (exact-keys? edge [:kind :target :evidence :span])
+                 (contains? (execution-edge-kinds) (:kind edge))
+                 (literal-data? (:target edge))
+                 (some? (:evidence edge)) (literal-data? (:evidence edge))
+                 (map? (:span edge)) (literal-data? (:span edge)))
+   (entry-error :edge)))
+ entry)
+
+(defn execution-entry
+ "Construct the canonical finite entry schema. Omitted dependency coverage is
+  false. Missing identities still refuse; no declaration gets inferred trust."
+ [fields]
+ (let [entry (merge {:version 1 :span {} :edges (list) :dependencies-complete false} fields)
+       edges (eager-list (:edges entry) "$.execution-entry.edges")
+       edges (BeamLisp.CompilerData/eager_map
+               (fn [edge] (merge {:span {} :target nil} edge)) edges)]
+  (validate-execution-entry! (assoc entry :edges edges))))
