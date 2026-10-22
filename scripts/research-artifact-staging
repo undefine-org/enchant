@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Probe staging hypotheses in one private, serial, capped compiler VM.
+
+Run under systemd-run with MemoryMax=6G, MemorySwapMax=0, RuntimeMaxSec=300.
+Requires Elixir/OTP on PATH. Never installs or changes the checkout floor.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--untraced", action="store_true", help="check observations without Erlang tracing")
+    parser.add_argument("--reverse", action="store_true", help="reverse minimal probe order to check cache/history dependence")
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    output = args.out.resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise SystemExit(f"output must be absent or empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    driver = root / "research/execution-protocol-audit/staging-probes.exs"
+    watched = sorted({root / "env.bl", Path(__file__).resolve(), driver,
+                      root / "scripts/demo-artifact-production",
+                      *[p for p in (root / "priv").rglob("*.bl")],
+                      *[p for p in (root / "priv/bootstrap/seed").iterdir() if p.is_file()]})
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    inputs = {str(path.relative_to(root)): digest(path) for path in watched}
+    boot = runpy.run_path(str(root / "scripts/demo-artifact-production"))["BOOT"]
+    boot = boot.replace('BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))',
+                        'Code.require_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))')
+    deps = sorted((root / "deps").glob("*/ebin"))
+    deps += sorted((root / "_build").glob("*/lib/*/ebin"))
+    with tempfile.TemporaryDirectory(prefix="bl-staging-research-") as temporary:
+        image = Path(temporary)
+        subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+        shutil.copy2(root / "env.bl", image / "env.bl")
+        shutil.copy2(driver, image / "probes.exs")
+        app = image / ".bl/lib/beam_lisp-0.1.0"
+        app.mkdir(parents=True)
+        (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+        shutil.copytree(root / "priv/bootstrap/seed", app / "ebin")
+        (image / "boot.exs").write_text(boot)
+        command = ["elixir"]
+        for dep in dict.fromkeys(path.resolve() for path in deps):
+            command += ["-pa", str(dep)]
+        command += ["-pa", str(app / "ebin"), str(image / "boot.exs")]
+        env = {**os.environ, "BL_ROOT": str(image), "BL_DAEMON": "off",
+               "BL_ARTIFACT_DRIVER": str(image / "probes.exs"),
+               "BL_ARTIFACT_OUTPUT": str(output), "XDG_CACHE_HOME": str(image / "cache"),
+               "BL_RESEARCH_TRACE": "off" if args.untraced else "on",
+               "BL_RESEARCH_REVERSE": "on" if args.reverse else "off",
+               "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+        start = time.monotonic()
+        result = subprocess.run(command, cwd=image, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
+        elapsed = time.monotonic() - start
+        (output / "probes.log").write_text(result.stdout)
+        print(result.stdout[-16000:], end="", flush=True)
+    for path, expected in inputs.items():
+        if digest(root / path) != expected:
+            raise SystemExit(f"research input changed: {path}")
+    (output / "inputs.json").write_text(json.dumps({
+        "version": 1, "inputs": inputs, "exit_code": result.returncode,
+        "seconds": round(elapsed, 3), "floor_installed": False}, indent=2) + "\n")
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
