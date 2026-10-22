@@ -105,7 +105,7 @@
   "The version of the fact schema OR call-edge meaning these indexers emit.
    Part of every cache key beside the source hash: unchanged source still needs
    re-indexing when fact columns or call classification change."
-  "facts-6")
+  "facts-7")
 
 ;; The N+1 vocabulary lives in ONE home (`datalog-shape`, which both this
 ;; namespace and `deodorant` read), and this is the door to it.
@@ -282,7 +282,9 @@
   "Facts for one defn/defn- form: fn entities (one per arity), ret-tag
    facts (annotated wins over inferred), every call in the bodies, and the
    colocated ^{:instr …} instruction fragment when the name carries one."
-  [sigs ns-str form next-fn-id next-call-id next-instr-id]
+  ([sigs ns-str form next-fn-id next-call-id next-instr-id]
+   (defn-facts sigs ns-str form next-fn-id next-call-id next-instr-id {}))
+  ([sigs ns-str form next-fn-id next-call-id next-instr-id options]
   (let [f (typed/node-form form)
         items (node-items f)
         name-node (second items)
@@ -310,7 +312,7 @@
         ; ret facts: annotation or inference. An `any` ret records
         ; NOTHING — unknown stays silent, and does not flood
         ; find-by-type with every tag.
-        inferred (if (some? aret)
+        inferred (if (or (some? aret) (= :calls (:mode options)))
                    nil
                    (reduce (fn [acc c]
                              (typed/t-union acc (infer-clause-ret sigs c aargs)))
@@ -341,7 +343,7 @@
      :instr (if (nil? ifact) [] [ifact])
      :next-fn fid2
      :next-call cid
-     :next-instr (if (nil? ifact) next-instr-id (+ next-instr-id 1))}))
+     :next-instr (if (nil? ifact) next-instr-id (+ next-instr-id 1))})))
 
 ; --- other def-bearing forms ------------------------------------------------------
 
@@ -386,140 +388,6 @@
 ;; defines nor `:refer`s is core, a `:refer :all` import, or a dynamic call: left
 ;; unattributed, which the cone reports as explicit evidence rather than a claim.
 
-(defn- pattern-names
-  "Every symbol a binding PATTERN introduces, per `typed/bind-pattern` — so the
-   two agree on destructuring (vector, map, `:keys`, `:as`)."
-  [pat]
-  (set (keys (typed/bind-pattern {} pat nil))))
-
-(def ^:private binding-heads
-  "Forms that introduce local bindings. A `:refer`red or locally defined name is
-   only canonicalized when it is NOT among the names these bind: a shadowing
-   `let`/param makes the call DYNAMIC, and a dynamic call is not a static edge."
-  #{"fn" "fn*" "defn" "defn-" "let" "loop" "for" "doseq" "when-let" "if-let"
-    "when-some" "if-some" "letfn" "catch" "receive" "defmethod" "extend-type"
-    "extend-protocol" "defprotocol" "reify" "defrecord" "deftype" "defserver"})
-
-(defn- fn-params-names
-  "Names a `fn`/`defn` clause shape binds: the params vector, or every
-   `([params] …)` arity list. Scanning STOPS at the params, so a body's own call
-   `(helper [q])` is never mistaken for a parameter list."
-  [nodes]
-  (let [nodes (drop-while (fn [n]
-                            (let [t (node-tag (node-form n))]
-                              (or (= :symbol t) (= :scalar t))))
-                          nodes)]
-    (if (empty? nodes)
-      #{}
-      (let [h (first nodes)]
-        (if (= :vector (node-tag (node-form h)))
-          (pattern-names (node-form h))
-          (reduce (fn [s n]
-                    (let [p (first (node-items (node-form n)))]
-                      (if (and (some? p) (= :vector (node-tag (node-form p))))
-                        (into s (pattern-names (node-form p))) s)))
-                  #{} nodes))))))
-
-(defn- method-spec-names
-  "Names bound by `(name [params] body…)` method specs — `extend-type`, `reify`,
-   `defprotocol`, `defrecord`, … — the first vector among a spec list's first two
-   items; a bare vector is a record's field list."
-  [nodes]
-  (reduce (fn [s n]
-            (let [t (node-tag (node-form n))]
-              (cond
-                (= :vector t) (into s (pattern-names (node-form n)))
-                (= :list t)
-                  (reduce (fn [s2 x]
-                            (if (= :vector (node-tag (node-form x)))
-                              (into s2 (pattern-names (node-form x))) s2))
-                          s (take 2 (node-items (node-form n))))
-                :else s)))
-          #{} nodes))
-
-(defn- receive-bound-names
-  "A receive is pattern [optional :when guard] body per clause, followed by
-   optional (after ms body). Its pattern locals can shadow a referenced fn.
-   A malformed tail remains conservative: never attribute a name bound by a
-   pattern to a static namespace call."
-  [forms]
-  (loop [fs forms bound #{}]
-    (if (empty? fs)
-      bound
-      (let [pattern (first fs)
-            f (node-form pattern)
-            items (if (= :list (node-tag f)) (node-items f) [])
-            after? (and (not (empty? items)) (form-sym? (first items) "after"))]
-        (if after?
-          (recur (rest fs) bound)
-          (let [tail (rest fs)
-                guarded? (and (not (empty? tail))
-                              (= :keyword (node-tag (node-form (first tail))))
-                              (= "when" (node-name (node-form (first tail)))))
-                body-and-more (if guarded? (drop 2 tail) tail)]
-            (recur (rest body-and-more)
-                   (into bound (pattern-names f)))))))))
-
-(defn- form-bound-names
-  "Every symbol bound by a binding form under `node`. An OVER-approximation is
-   the safe direction: a name wrongly thought bound is only left unattributed,
-   never falsely attributed to a namespace that shares its spelling."
-  [node]
-  (let [f (node-form node) t (node-tag f)]
-    (cond
-      (= :list t)
-        (let [items (node-items f)
-              h (first items)
-              hn (if (and (some? h) (= :symbol (node-tag (node-form h))))
-                   (node-name (node-form h)) nil)
-              here (cond
-                     (or (nil? hn) (not (contains? binding-heads hn))) #{}
-                     (= "catch" hn) (pattern-names (nth items 2 nil))
-                     (= "receive" hn) (receive-bound-names (rest items))
-                     (= "letfn" hn)
-                       (let [v (second items)]
-                         (if (and (some? v) (= :vector (node-tag (node-form v))))
-                           (reduce (fn [s spec]
-                                     (let [its (node-items (node-form spec))
-                                           hd (first its)]
-                                       (into (into s (if (and (some? hd)
-                                                              (= :symbol (node-tag (node-form hd))))
-                                                       #{(node-name (node-form hd))} #{}))
-                                             (fn-params-names (rest its)))))
-                                   #{} (node-items (node-form v)))
-                           #{}))
-                     (contains? #{"let" "loop" "for" "doseq" "when-let" "if-let"
-                                  "when-some" "if-some"} hn)
-                       (let [v (second items)]
-                         (if (and (some? v) (= :vector (node-tag (node-form v))))
-                           (pattern-names (node-form v)) #{}))
-                     (contains? #{"fn" "fn*" "defn" "defn-"} hn)
-                       (fn-params-names (rest items))
-                     :else (method-spec-names (rest items)))]
-          (reduce (fn [s x] (into s (form-bound-names x))) here items))
-      (contains? #{:vector :set} t)
-        (reduce (fn [s x] (into s (form-bound-names x))) #{} (node-items f))
-      (= :map t)
-        (reduce (fn [s pair]
-                  (into (into s (form-bound-names (first (erlang/tuple_to_list pair))))
-                        (form-bound-names (second (erlang/tuple_to_list pair)))))
-                #{} (node-items f))
-      :else #{})))
-
-(defn- bound-by-caller
-  "`{caller-name #{bound …}}`: the names bound where each caller's calls live. A
-   `defn`'s calls are judged against ITS OWN params and nested `let`/`loop`/…, so
-   a shadowing `let` in one function never hides a `:refer` in another. Calls in
-   a non-`defn` top-level form — `extend-type`/`defmethod`/`defserver` bodies —
-   are reported under `<top>`, so every such form's bindings pool there; a coarse
-   bucket is the safe direction (a name wrongly thought bound is only left
-   unattributed)."
-  [forms]
-  (reduce (fn [m form]
-            (let [n (or (defn-form form) "<top>")]
-              (assoc m n (into (get m n #{}) (form-bound-names form)))))
-          {} forms))
-
 (defn- qualified-callee
   "The fully-qualified name `written` denotes in this source, or nil when the
    header cannot say:
@@ -556,11 +424,13 @@
    (`reachable-qualified`, `dependency-cone`)."
   ([sigs ns-str forms] (index-forms sigs ns-str forms nil))
   ([sigs ns-str forms header]
+   (index-forms sigs ns-str forms header {}))
+  ([sigs ns-str forms header options]
   (let [h (or header [nil nil (maps/new) (maps/new) nil])
         aliases (nth h 2)
         refers (nth h 3)
         locals (set (keep defn-form forms))
-        bound-of (bound-by-caller forms)
+        bound-of (source/bound-by-caller forms)
         annotate (fn [c]
                    (let [cq (qualified-callee aliases refers locals
                                               (get bound-of (:call/caller c) #{})
@@ -575,7 +445,7 @@
             f (node-form form)
             defd (defn-form form)]
         (if (some? defd)
-          (let [r (defn-facts sigs ns-str form fid cid iid)]
+          (let [r (defn-facts sigs ns-str form fid cid iid options)]
             (recur (rest fs) (:next-fn r) (:next-call r) (:next-instr r)
                    (concat fn-acc (:fn r)) (concat call-acc (:calls r))
                    (concat instr-acc (:instr r))))
@@ -649,12 +519,22 @@
    file — got a `function_clause` from deep inside the reader, which named
    neither the namespace nor the path. Fail here instead, where both are
    still known."
-  [sigs ns-str src]
+  ([sigs ns-str src] (index-source sigs ns-str src {}))
+  ([sigs ns-str src options]
   (when-not (string? src)
     (throw (ex-info "codebase/index-source: source is not a string"
                     {:ns ns-str :source src})))
-  (assoc (loop-context ns-str (index-forms sigs ns-str (BeamLisp.Reader/read_string src) (sg/header* src)))
-         :requires (requires-facts ns-str src)))
+  (when-not (and (map? options) (contains? #{:full :calls} (:mode options :full)))
+    (throw (ex-info "codebase/index-source: unsupported indexing mode" {:options options})))
+  (let [forms (BeamLisp.Reader/read_string src)
+        header (sg/header*-nodes forms)
+        requires (vec (map-indexed (fn [i dependency]
+                         {:db/id (+ 700000 i) :ns/name ns-str :ns/requires dependency})
+                         (nth header 1)))
+        facts (assoc (loop-context ns-str (index-forms sigs ns-str forms header options))
+                     :requires requires)]
+    (if (= :calls (:mode options))
+      (assoc facts :index-mode :calls :coverage {:returns :not-requested}) facts))))
 
 (defn connect-codebase
   "A fresh datom conn with the codebase schema, plus `extra` definitions.
