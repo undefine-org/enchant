@@ -132,6 +132,293 @@
   ([source opts]
    (isolated_definition_collection (fn [] (compile_source_unit source opts)))))
 
+; Artifact production handles name process-local compiler DATA, never an SDK
+; origin, native command or publication grant. No resource survives an active
+; preparation: open workspaces retain only bounded frozen inputs/results.
+(defn- artifact_refuse [kind]
+ (throw (ex-info "Artifact production refused" {:kind kind})))
+
+(defn- artifact_namespace [value]
+ (when-not (symbol? value) (artifact_refuse :artifact-namespace-symbol-required))
+ (let [namespace (str value)]
+  (when (or (= "" namespace) (String/contains? namespace "/"))
+   (artifact_refuse :invalid-artifact-namespace))
+  namespace))
+
+(defn- artifact_limit [limits key default maximum]
+ (let [value (Map/get limits key default)]
+  (when-not (and (erlang/is_integer value) (< 0 value) (<= value maximum))
+   (artifact_refuse :invalid-artifact-limits))
+  value))
+
+(defn- artifact_inputs_valid! [inputs compiler-key]
+ (when-not (and (= compiler-key (BeamLisp.AOTCache/compiler_key))
+                 (= compiler-key (BeamLisp.AOTCache/current_compiler_key)))
+  (artifact_refuse :artifact-compiler-changed))
+ (Enum/each (Map/values inputs)
+  (fn [input]
+   (when-not (and (= (:source input) (BeamLisp.Loader/read_source (:file input)))
+                  (or (= :explicit (:selection input))
+                      (= (:file input) (physical_sdk_path (BeamLisp.Loader/source_path (:namespace input))))))
+    (artifact_refuse :artifact-source-changed)))))
+
+(defn open_workspace
+ "Freeze finite explicitly selected files. Namespace fields are quoted symbols.
+  Source inputs and memoized prepared units carry no runtime/SDK authority."
+ [manifest limits]
+ (when-not (and (erlang/is_map manifest) (= 1 (:version manifest))
+                (erlang/is_map limits) (erlang/is_list (:sources manifest))
+                (erlang/is_list (Map/get manifest :roots (list)))
+                (Enum/all? (Map/keys limits)
+                  (fn [key] (Enum/member? (list :max-sources :max-source-bytes :max-total-bytes :macro-steps) key))))
+  (artifact_refuse :invalid-artifact-inputs))
+ (let [maximum (artifact_limit limits :max-sources 256 256)
+       source-limit (artifact_limit limits :max-source-bytes 1048576 1048576)
+       total-limit (artifact_limit limits :max-total-bytes 16777216 16777216)
+       macro-limit (artifact_limit limits :macro-steps 16384 16384)
+       roots (Map/get manifest :roots (list))
+       key (BeamLisp.AOTCache/compiler_key)]
+  (when-not (and (< 0 (erlang/length (:sources manifest)))
+                 (<= (erlang/length (:sources manifest)) maximum)
+                 (<= (erlang/length roots) 64)
+                 (Enum/all? roots (fn [root] (and (erlang/is_binary root) (File/dir? root)))))
+   (artifact_refuse :invalid-artifact-inputs))
+  (let [inputs
+        (Enum/reduce (:sources manifest) {}
+         (fn [row output]
+          (when-not (and (erlang/is_map row) (erlang/is_binary (:file row)))
+           (artifact_refuse :invalid-artifact-inputs))
+          (let [namespace (artifact_namespace (:namespace row))
+                file (physical_sdk_path (:file row))
+                _ (when-not (and file (File/regular? file)
+                                 (<= (:size (File/stat! file)) source-limit))
+                    (artifact_refuse :artifact-source-bound))
+                source (BeamLisp.Loader/read_source file)]
+           (when-not (and (not (Map/has_key? output namespace))
+                          (<= (erlang/byte_size source) source-limit)
+                          (= namespace (BeamLisp.Loader/declared_ns source)))
+            (artifact_refuse :invalid-artifact-source))
+           (Map/put output namespace
+            {:namespace namespace :file file :source source :selection :explicit
+             :digest (crypto/hash :sha256 source) :compiler-key key}))))]
+   (when (> (Enum/reduce (Map/values inputs) 0
+              (fn [input total] (+ total (erlang/byte_size (:source input))))) total-limit)
+    (artifact_refuse :artifact-source-bound))
+   (let [handle (erlang/make_ref)]
+    (Process/put (tuple :bl_artifact_workspace handle)
+     {:inputs inputs :compiler-key key :roots (Enum/map roots (fn [root] (Path/expand root)))
+      :macro-steps macro-limit :expanded 0 :budget (artifact_budget (constructor_counters))
+      :units {} :maximum maximum :source-limit source-limit :total-limit total-limit})
+    handle))))
+
+(defn close_workspace! [handle]
+ (when-not (erlang/is_reference handle) (artifact_refuse :invalid-artifact-workspace))
+ (Process/delete (tuple :bl_artifact_workspace handle))
+ :ok)
+
+(defn- artifact_workspace! [handle]
+ (let [workspace (when (erlang/is_reference handle)
+                   (Process/get (tuple :bl_artifact_workspace handle)))]
+  (when-not workspace (artifact_refuse :invalid-artifact-workspace))
+  (artifact_inputs_valid! (:inputs workspace) (:compiler-key workspace))
+  workspace))
+
+(defn- artifact_reaper [owner token]
+ ;; Monitor BEFORE allocation. If the caller dies before receiving readiness,
+ ;; its scope still has a live cleanup owner. No supplied thunk executes here.
+ (let [monitor (erlang/monitor :process owner)
+       view (BeamLisp.Env/fork :global)]
+  (try
+   (erlang/send owner (tuple :artifact-scope-ready token (erlang/self) view))
+   (receive
+    [:artifact-preparation-closed seen] :when (= token seen) :ok
+    [:DOWN seen :process departed _] :when (and (= monitor seen) (= owner departed)) :ok)
+   (finally
+    (BeamLisp.Env/destroy view)
+    (Process/demonitor monitor (list :flush))))))
+
+(defn- artifact_open_scope []
+ (let [owner (erlang/self) token (erlang/make_ref)
+       spawned (erlang/spawn_monitor (fn [] (artifact_reaper owner token)))
+       reaper (elem spawned 0) monitor (elem spawned 1)]
+  (receive
+   [:artifact-scope-ready seen pid view] :when (and (= token seen) (= reaper pid))
+    {:view view :reaper reaper :monitor monitor :token token}
+   [:DOWN seen :process pid reason] :when (and (= monitor seen) (= reaper pid))
+    (erlang/error (tuple :artifact-scope-failed reason)))))
+
+(defn- artifact_close_scope! [scope]
+ (let [reaper (:reaper scope) monitor (:monitor scope)]
+  (erlang/send reaper (tuple :artifact-preparation-closed (:token scope)))
+  (receive
+   [:DOWN seen :process pid reason] :when (and (= monitor seen) (= reaper pid))
+    (when-not (= :normal reason) (erlang/error (tuple :artifact-scope-cleanup-failed reason))))))
+
+(defn- artifact_describe_unit [unit source]
+ (let [defined (elem unit 0) values (elem unit 1) touched (elem unit 2)
+       metadata (elem unit 3) file (elem unit 4) declarations (elem unit 5)]
+  (Enum/map (Enum/sort (MapSet/to_list touched))
+   (fn [namespace]
+    (describe_module namespace (unit_defs namespace (Map/get defined namespace))
+     (Map/get values namespace (list))
+     (Map/put_new (Map/get metadata namespace {}) :native-declaration nil)
+     file (crypto/hash :sha256 source) declarations
+     (if file (ns_closure_hash namespace file) nil)
+     (when-not (floor_file? file) (BeamLisp.AOTCache/key_for_ns namespace)))))))
+
+(defn- artifact_budget [counters]
+ (Map/take counters (list :remaining :walk-steps :allocation-nodes :allocation-bytes :new-atoms :fresh-symbols)))
+
+(defn prepare_unit
+ "Prepare one selected namespace without publishing target code or running
+  initializers. Macro/value execution uses the existing bounded ANF constructor."
+ [handle namespace-symbol]
+ (let [workspace (artifact_workspace! handle)
+       namespace (artifact_namespace namespace-symbol)
+       input (Map/get (:inputs workspace) namespace)]
+  (when-not input (artifact_refuse :artifact-namespace-not-selected))
+  (or (Map/get (:units workspace) namespace)
+   (let [previous (BeamLisp.Env/capture)
+         previous-context (Process/get :bl_sdk_constructor_context)
+         previous-attempt (Process/get :bl_initializer_attempt)
+         token (erlang/make_ref) machine (tuple :constructor-machine-frame token)
+         scope (artifact_open_scope)
+         view (:view scope)]
+    (try
+     (BeamLisp.Loader/without_initialization
+      (fn []
+       (BeamLisp.Env/bind (Map/merge previous
+         {:generation nil :application-identity nil :admission nil :query-functions nil}))
+       (Process/delete :bl_initializer_attempt)
+       (Process/put machine (Map/merge (constructor_counters) (:budget workspace)))
+       (Process/put :bl_sdk_constructor_context
+        {:input input :compiler-env view :artifact-inputs (:inputs workspace)
+         :artifact-workspace handle :machine-frame machine :units {} :compiled {} :compiling #{}
+         :maximum (:maximum workspace) :source-limit (:source-limit workspace)
+         :total-limit (:total-limit workspace)
+         :clauses {} :seen-macros #{} :kernel-modules #{} :kernel-leases (list)
+         :macro-steps (:macro-steps workspace) :new-atoms 128 :expanded (:expanded workspace)})
+       (BeamLisp.Env/with_env view
+        (fn []
+         (Enum/each (:roots workspace) (fn [root] (BeamLisp.Env/add_search_path root)))
+         (constructor_install_kernel!)
+         (constructor_unit! namespace)
+         (let [unit (stage-sdk-unit! (:source input) (list (tuple :file (:file input))))
+               plans (artifact_describe_unit unit (:source input))
+               _ (constructor_check_sources!)
+               inputs (Enum/reduce (Map/values (:units (constructor_context!))) (:inputs workspace)
+                        (fn [unit out]
+                         (Map/put out (:namespace unit)
+                          (Map/take unit (list :namespace :file :source :selection :digest :compiler-key)))))
+               result {:version 1 :kind :prepared-artifact-unit :namespace namespace
+                       :compiler-key (:compiler-key workspace) :inputs inputs :plans plans
+                       :coverage {:scope :artifact-membership :source-staged true
+                                  :execution-entry-inventory-complete false}}]
+          (when (or (> (erlang/map_size inputs) (:maximum workspace))
+                    (> (Enum/reduce (Map/values inputs) 0
+                         (fn [input total] (+ total (erlang/byte_size (:source input)))))
+                       (:total-limit workspace)))
+           (artifact_refuse :artifact-source-bound))
+          (artifact_inputs_valid! inputs (:compiler-key workspace))
+          (Process/put (tuple :bl_artifact_workspace handle)
+           (assoc workspace :inputs inputs :units (Map/put (:units workspace) namespace result)))
+          result)))))
+     (finally
+      (try
+       (doseq [lease (Map/get (Process/get :bl_sdk_constructor_context {}) :kernel-leases (list))]
+        (BeamLisp.Env/release_code! lease))
+       (finally
+        (when-let [live (Process/get (tuple :bl_artifact_workspace handle))]
+         (when-let [counters (Process/get machine)]
+          (let [context (Process/get :bl_sdk_constructor_context {})]
+           (Process/put (tuple :bl_artifact_workspace handle)
+            (assoc live :budget (artifact_budget counters)
+                        :macro-steps (Map/get context :macro-steps (:macro-steps live))
+                        :expanded (Map/get context :expanded (:expanded live)))))))
+        (Process/delete machine)
+        (if previous-context (Process/put :bl_sdk_constructor_context previous-context)
+          (Process/delete :bl_sdk_constructor_context))
+        (BeamLisp.Env/bind previous)
+        (if previous-attempt (Process/put :bl_initializer_attempt previous-attempt)
+          (Process/delete :bl_initializer_attempt))
+        (artifact_close_scope! scope)))))))))
+
+(defn emit_unit
+ "Compile a prepared unit's complete plans, then write bytes with manifest last.
+  This operation never loads code or registers runtime/SDK publication evidence."
+ [prepared output]
+ (when-not (and (erlang/is_map prepared) (= 1 (:version prepared))
+                (= :prepared-artifact-unit (:kind prepared))
+                (erlang/is_list (:plans prepared)) (seq (:plans prepared))
+                (erlang/is_binary output))
+  (artifact_refuse :invalid-prepared-artifact-unit))
+ (when (and (File/exists? output)
+             (or (not (File/dir? output)) (not= (list) (File/ls! output))))
+  (artifact_refuse :artifact-output-not-empty))
+ (artifact_inputs_valid! (:inputs prepared) (:compiler-key prepared))
+ (let [beams (Enum/flat_map (:plans prepared) (fn [plan] (compile_artifact_plan plan)))
+       modules (Enum/map beams (fn [beam] (elem beam 0)))]
+  (when-not (= (Enum/uniq modules) modules) (artifact_refuse :duplicate-artifact-module))
+  (let [inventory (Enum/map beams
+                    (fn [beam] {:module (Atom/to_string (elem beam 0))
+                                :sha256 (crypto/hash :sha256 (elem beam 1))}))
+        inputs (Enum/map (Enum/sort (Map/to_list (:inputs prepared)))
+                 (fn [pair] {:namespace (elem pair 0) :sha256 (:digest (elem pair 1))}))
+        manifest {:version 1 :namespace (:namespace prepared) :compiler-key (:compiler-key prepared)
+                  :inputs inputs
+                  :modules inventory :coverage (:coverage prepared)}]
+   (Enum/each beams (fn [beam] (write_beam (elem beam 0) (elem beam 1) output)))
+   (artifact_inputs_valid! (:inputs prepared) (:compiler-key prepared))
+   (File/write! (Path/join output "artifact-unit.term") (erlang/term_to_binary manifest))
+   manifest)))
+
+(defn verify_unit
+ "Read a bounded complete artifact directory, binding its manifest to actual
+  module bytes. The result is ordinary Source data, never an SDK admission grant."
+ [directory]
+ (when-not (erlang/is_binary directory) (artifact_refuse :invalid-artifact-directory))
+ (let [root (physical_sdk_path directory)
+       encoded (sdk_cache_read_bounded! (Path/join directory "artifact-unit.term") 1048576)
+       _ (when (and (>= (erlang/byte_size encoded) 2) (= 80 (binary/at encoded 1)))
+           (artifact_refuse :compressed-artifact-manifest))
+       manifest (erlang/binary_to_term encoded (list :safe))]
+  (when-not (and (= 1 (:version manifest)) (erlang/is_binary (:namespace manifest))
+                 (= (:compiler-key manifest) (BeamLisp.AOTCache/compiler_key))
+                 (erlang/is_list (:modules manifest))
+                 (<= 1 (erlang/length (:modules manifest)) 256))
+   (artifact_refuse :invalid-artifact-manifest))
+  (let [names (Enum/map (:modules manifest)
+                (fn [row]
+                 (let [name (:module row) digest (:sha256 row)]
+                  (when-not (and (erlang/is_binary name) (<= 1 (erlang/byte_size name) 512)
+                                 (= name (Path/basename name)) (not (Enum/member? (list "." "..") name))
+                                 (not (String/contains? name "\\"))
+                                 (not (String/contains? name (erlang/list_to_binary (list 0))))
+                                 (erlang/is_binary digest) (= 32 (erlang/byte_size digest)))
+                   (artifact_refuse :invalid-artifact-manifest))
+                  name)))
+        expected (cons "artifact-unit.term" (Enum/map names (fn [name] (str name ".beam"))))]
+   (when-not (and (= names (Enum/uniq names))
+                  (= (Enum/sort expected) (Enum/sort (File/ls! directory))))
+    (artifact_refuse :artifact-membership-changed))
+   (let [captured
+         (Enum/map_reduce (:modules manifest) 268435456
+          (fn [row remaining]
+           (let [file (Path/join directory (str (:module row) ".beam"))
+                 actual (physical_sdk_path file)]
+            (when-not (= actual (Path/join root (str (:module row) ".beam")))
+             (artifact_refuse :artifact-path-changed))
+            (let [bytes (sdk_cache_read_bounded! file (erlang/min remaining 33554432))
+                  _ (when-not (= (:sha256 row) (crypto/hash :sha256 bytes))
+                      (artifact_refuse :artifact-bytes-changed))
+                  chunks (beam_lib/chunks bytes (list :attributes))]
+             (when-not (and (= :ok (elem chunks 0))
+                            (= (:module row) (Atom/to_string (elem (elem chunks 1) 0))))
+              (artifact_refuse :artifact-module-changed))
+             (tuple (tuple (elem (elem chunks 1) 0) bytes)
+                    (- remaining (erlang/byte_size bytes)))))))]
+    {:version 1 :manifest manifest :beams (elem captured 0) :native-admission false}))))
+
 (defn- compile_source_unit [source opts]
   ;; Even an already initialized namespace cannot evaluate source while an
   ;; enclosing declaration compilation holds the no-initialization restriction.
@@ -3465,7 +3752,8 @@
                 (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :add_refer_all
                   (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit t)))))))
         native_ops
-        (let [d (or (Map/get ns_meta :native-declaration) (native_declaration ns))]
+        (let [d (if (Map/has_key? ns_meta :native-declaration)
+                  (Map/get ns_meta :native-declaration) (native_declaration ns))]
           (if (nil? d)
             (list)
             (list
@@ -4816,7 +5104,10 @@
   ;; complete current-input emission receipt. A caller flag is never proof.
   ;; Loader.declare_require is deliberately NOT called: it can run source.
   (doseq [target (:requires header)]
-   (when-not (or (BeamLisp.Env/loaded_ns? target) (sdk_unit_compiled? target))
+   (when-not (or (and (constructor_context)
+                      (:artifact-workspace (constructor_context!))
+                      (constructor_source_path! target))
+                 (BeamLisp.Env/loaded_ns? target) (sdk_unit_compiled? target))
     (stage-refuse :sdk-stage-dependency-not-ready)))
   (doseq [form (rest forms)]
    (let [items (stage-items form :list) head (stage-symbol (first items))]
@@ -5047,7 +5338,8 @@
  (when-not (and (erlang/is_binary source) (<= (erlang/byte_size source) 1048576))
   (stage-refuse :sdk-stage-source-bound))
  (let [file (Keyword/get opts :file nil)
-       forms (BeamLisp.Reader/read_string source file)
+       attribution (if (floor_file? file) (floor_source file) file)
+       forms (BeamLisp.Reader/read_string source attribution)
        header (stage-preflight! forms) ns (:ns header)
        previous (BeamLisp.Env/current_ns)
        prior-declarations (Process/get :bl_sdk_stage_declarations)]
@@ -5064,7 +5356,7 @@
    (doseq [form (rest forms)]
     (BeamLisp.Compiler/prelink_defn form ns)
     (BeamLisp.Compiler/prelink_type form ns))
-   (let [staged (stage-sdk-forms! (rest forms) ns file {} {})
+   (let [staged (stage-sdk-forms! (rest forms) ns attribution {} {})
          values (elem staged 0) defined (elem staged 1)]
     (tuple defined values (MapSet/new (list ns))
            (let [metadata (capture_ns_decl {} (first forms))
@@ -6662,6 +6954,23 @@
                    (contains? #{"list" "vector" "concat" "merge" "str"} name)))]
   (when-not accepted (constructor_refuse {:unsupported-primitive-arity [name arity]}))))
 
+(defn- constructor_source_value [source state]
+ (if-let [binding (:constructor-value-binding source)]
+  (let [key (:counter-frame state) frame (erlang/get key)
+        values (Map/get frame :source-values {}) stack (Map/get frame :value-stack (list))]
+   (if (Map/has_key? values binding) (Map/get values binding)
+    (do
+     (when (Enum/member? stack binding)
+      (constructor_refuse {:compile-time-value-cycle (Enum/reverse (cons binding stack))}))
+     (erlang/put key (Map/put frame :value-stack (cons binding stack)))
+     (try
+      (let [value (constructor_interpret source {} state) current (erlang/get key)]
+       (erlang/put key (Map/put current :source-values
+                        (Map/put (Map/get current :source-values {}) binding value)))
+       value)
+      (finally (erlang/put key (Map/put (erlang/get key) :value-stack stack)))))))
+  (constructor_interpret source {} state)))
+
 (defn constructor_interpret
  "Effect-denying, bounded actual-ANF interpreter. Caller
   supplies only compiler metadata; it supplies no runtime callback/host grant.
@@ -6679,7 +6988,7 @@
                  source (when (constructor_context)
                           (constructor_global_source (:ns n) (:name n)))]
              (cond
-              source (constructor_interpret source {} state)
+              source (constructor_source_value source state)
               (contains? (:globals state) key) (constructor_interpret (get (:globals state) key) {} state)
               alias (constructor_interpret {:op :global :ns (first alias) :name (second alias) :lookup :exact} {} state)
               (and (constructor_context) (= "cpp" (:ns n))
@@ -6780,20 +7089,26 @@
   value)
  (finally (constructor_counter! state :depth -1))))
 
+(defn- constructor_counters []
+ {:remaining 1000000 :walk-steps 16000000 :depth 0 :allocation-nodes 1000000
+  :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096
+  :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
+
 (defn interpret_constructor!
  [expression locals metadata]
  (let [limits (constructor_data_limits)
        _ (BeamLisp.CompilerData/check_first_order! locals limits)
-       key (tuple :constructor-machine-frame (erlang/make_ref))
+       shared (when (constructor_context) (:machine-frame (constructor_context!)))
+       key (or shared (tuple :constructor-machine-frame (erlang/make_ref)))
        state (Map/merge metadata {:counter-frame key :max-collection 16384 :data-limits limits})]
-  (erlang/put key {:remaining 1000000 :walk-steps 16000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096 :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
+  (when-not shared (erlang/put key (constructor_counters)))
   (try
    (let [result (constructor_interpret expression locals state)]
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
     (BeamLisp.CompilerData/check_first_order! result (Map/get state :data-limits {})) result)
    (catch error
     (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
-   (finally (erlang/erase key)))))
+   (finally (when-not shared (erlang/erase key))))))
 
 (defn constructor_metadata [definitions values]
  ;; Compiler implementation walks use native eager collection operations, never
@@ -6851,6 +7166,13 @@
 ; ── authenticated compile-only SDK macro/source context ───────────────────
 ; AOT-owned compiler context: source data only, no runtime macro Fn values.
 (defn- constructor_source_input! [namespace path content]
+ (if-let [input (when-let [context (constructor_context)]
+                 (Map/get (Map/get context :artifact-inputs {}) namespace))]
+  (do
+   (when-not (and (= (:file input) (physical_sdk_path path)) (= (:source input) content)
+                  (= content (BeamLisp.Loader/read_source (:file input))))
+    (artifact_refuse :artifact-source-changed))
+   input)
  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
        selected (physical_sdk_path (BeamLisp.Loader/source_path namespace))
        actual (physical_sdk_path path)]
@@ -6860,8 +7182,17 @@
                  (= namespace (BeamLisp.Loader/declared_ns content)))
    (throw (ex-info "SDK declaration staging refused"
                    {:kind :unattested-sdk-constructor-source :namespace namespace})))
-  {:namespace namespace :file actual :source content :digest (crypto/hash :sha256 content)
-   :compiler-key (BeamLisp.AOTCache/compiler_key)}))
+  (let [input {:namespace namespace :file actual :source content :digest (crypto/hash :sha256 content)
+               :selection :sdk :compiler-key (BeamLisp.AOTCache/compiler_key)}]
+   (when-let [context (constructor_context)]
+    (when (:artifact-workspace context)
+     (let [inputs (Map/put (:artifact-inputs context) namespace input)]
+      (when (or (> (erlang/map_size inputs) (:maximum context))
+                (> (Enum/reduce (Map/values inputs) 0
+                     (fn [input total] (+ total (erlang/byte_size (:source input))))) (:total-limit context)))
+       (artifact_refuse :artifact-source-bound))
+      (constructor_context_put! :artifact-inputs inputs))))
+   input))))
 
 (defn- constructor_context []
  (when-let [context (Process/get :bl_sdk_constructor_context)]
@@ -6910,9 +7241,23 @@
  ;; Context-local cache is an acceleration, never new inspection authority.
  (let [context (constructor_context) cache (if context (Map/get context :source-paths {}) {})]
   (if (and context (Map/has_key? cache namespace)) (Map/get cache namespace)
-   (let [path (physical_sdk_path (BeamLisp.Loader/source_path namespace))]
+   (let [input (when context (Map/get (Map/get context :artifact-inputs {}) namespace))
+         path (if input (:file input) (physical_sdk_path (BeamLisp.Loader/source_path namespace)))]
     (when context (constructor_context_put! :source-paths (Map/put cache namespace path)))
     path))))
+
+(defn- constructor_source_declarations [namespace]
+ (let [context (constructor_context!) cache (Map/get context :source-declarations {})]
+  (if (Map/has_key? cache namespace) (Map/get cache namespace)
+   (let [declarations
+         (if-let [input (Map/get (Map/get context :artifact-inputs {}) namespace)]
+          (BeamLisp.Loader/source_decls_from namespace (:source input) (:file input))
+          (BeamLisp.Loader/source_decls namespace))]
+    (constructor_context_put! :source-declarations (Map/put cache namespace declarations))
+    declarations))))
+
+(defn- constructor_source_declaration [namespace binding]
+ (Map/get (constructor_source_declarations namespace) binding))
 
 (defn- constructor_binding_metadata! [namespace binding compiled]
  ;; This stores actual ANF DATA, never a runtime binding, Fn or frame capability.
@@ -6927,11 +7272,16 @@
  (let [context (constructor_context!)]
   (or (Map/get (:units context) namespace)
    (let [path (constructor_source_path! namespace)
+         _ (when (:artifact-workspace context)
+             (when-not (and path (File/regular? path)
+                            (<= (:size (File/stat! path)) (:source-limit context)))
+              (artifact_refuse :artifact-source-bound)))
          content (when path (BeamLisp.Loader/read_source path))
          source (constructor_source_input! namespace path content)
-         forms (BeamLisp.Reader/read_string content path)
+         attribution (if (floor_file? path) (floor_source path) path)
+         forms (BeamLisp.Reader/read_string content attribution)
          header (stage-requires (first forms))
-         unit (Map/merge source {:forms forms :header header
+         unit (Map/merge source {:forms forms :header header :attribution attribution
                                 :definitions (constructor_source_definitions forms)})]
     (when (>= (erlang/map_size (:units context)) 256) (stage-refuse :sdk-constructor-unit-budget))
     (constructor_context_put! :units (Map/put (:units (constructor_context!)) namespace unit))
@@ -6947,7 +7297,7 @@
       ;; Core, even when they have no ordinary defn body to interpret.
       (let [module (BeamLisp.Emit/module_for namespace)
             kernel (:kernel-values (constructor_context!))]
-       (Enum/each (Map/keys (BeamLisp.Loader/source_decls namespace))
+       (Enum/each (Map/keys (constructor_source_declarations namespace))
         (fn [binding]
          ;; Compiled Compiler helpers keep canonical attested Core callables;
          ;; Source ownership never reads them. Never blank the iterator's own
@@ -6969,7 +7319,7 @@
        (BeamLisp.Env/add_refer namespace (elem pair 0) (elem pair 1)))
       (doseq [target (Map/get (:metadata header) :refer_alls)]
        (constructor_unit! target)
-       (doseq [declaration (Map/to_list (BeamLisp.Loader/source_decls target))]
+       (doseq [declaration (Map/to_list (constructor_source_declarations target))]
         (when-not (= :private (elem declaration 1))
          (BeamLisp.Env/add_refer namespace (elem declaration 0) target))))
       (doseq [form (rest forms)]
@@ -6991,7 +7341,8 @@
                root (physical_sdk_path (BeamLisp.Tiers/priv_root))]
           ;; Ordinary native interop names have no SDK source declaration. They
           ;; remain ordinary calls and must pass the closed machine adapter.
-          (when (and root path (String/starts_with? path (str root "/")))
+          (when (and path (or (Map/has_key? (Map/get (constructor_context!) :artifact-inputs {}) target)
+                              (and root (String/starts_with? path (str root "/")))))
            (Map/get (:definitions (constructor_unit! target)) binding))))]
   (if (= 2 (count parts))
    (let [prefix (first parts) target (Map/get aliases prefix)
@@ -7002,7 +7353,7 @@
       (constructor_visible! namespace [target (second parts) definition]))))
    (let [local (Map/get (:definitions unit) name)
          referred (Map/get refers name)
-         local-declaration (BeamLisp.Loader/source_decl namespace name)]
+         local-declaration (constructor_source_declaration namespace name)]
     (cond local [namespace name local]
           ;; An opaque source-owned native/protocol declaration still owns its
           ;; lexical name. It may not fall through to a Core source helper.
@@ -7013,7 +7364,7 @@
            (loop [providers (erlang/++ (Map/get metadata :refer_alls (list)) (list "core" "sugar"))]
             (when (seq providers)
              (let [provider (first providers)
-                   declaration (BeamLisp.Loader/source_decl provider name)
+                   declaration (constructor_source_declaration provider name)
                    definition (maybe-definition provider name)]
               (cond
                (= :private declaration) (recur (rest providers))
@@ -7056,11 +7407,12 @@
              (let [previous (BeamLisp.Env/current_ns)]
               (try
                (BeamLisp.Env/in_ns namespace)
-               (let [env (Map/put (BeamLisp.Compiler/new_env namespace) :file (:file unit))]
+               (let [attribution (Map/get unit :attribution (:file unit))
+                     env (Map/put (BeamLisp.Compiler/new_env namespace) :file attribution)]
                 (case (:head declaration)
-                 "defn" (do (stage-function! (:form declaration) namespace (:file unit))
+                 "defn" (do (stage-function! (:form declaration) namespace attribution)
                              {:kind :function :entries (BeamLisp.Env/ns_definition namespace binding)})
-                 "defn-" (do (stage-function! (:form declaration) namespace (:file unit))
+                 "defn-" (do (stage-function! (:form declaration) namespace attribution)
                               {:kind :function :entries (BeamLisp.Env/ns_definition namespace binding)})
                  "defmacro" {:kind :macro
                               :expression (constructor_initializer!
@@ -7087,7 +7439,7 @@
    (if contextual contextual
    (case (:kind compiled)
     :function (constructor_function_expression target binding compiled)
-    :value (:expression compiled)
+    :value (Map/put (:expression compiled) :constructor-value-binding [target binding])
     :macro (stage-refuse :sdk-macro-used-as-runtime-value)
     (stage-refuse :unsupported-sdk-constructor-binding))))))
 
@@ -7360,8 +7712,12 @@
   (stage-refuse :sdk-constructor-compiler-changed))
  (Enum/each (Map/to_list (Map/get (constructor_context!) :source-paths {}))
   (fn [selection]
-   (when-not (= (elem selection 1) (physical_sdk_path (BeamLisp.Loader/source_path (elem selection 0))))
-    (stage-refuse :sdk-constructor-source-selection-changed))))
+   (let [namespace (elem selection 0)
+         input (Map/get (Map/get (constructor_context!) :artifact-inputs {}) namespace)
+         selected (if (= :explicit (:selection input)) (:file input)
+                    (physical_sdk_path (BeamLisp.Loader/source_path namespace)))]
+    (when-not (= (elem selection 1) selected)
+     (stage-refuse :sdk-constructor-source-selection-changed)))))
  (doseq [unit (Map/values (:units (constructor_context!)))]
   (constructor_source_input! (:namespace unit) (:file unit) (:source unit))
   (when-not (= (:compiler-key unit) (BeamLisp.AOTCache/compiler_key))
@@ -7475,6 +7831,13 @@
      (constructor_context_put! :compiled (Map/delete (:compiled (constructor_context!)) [namespace binding]))
      (constructor_context_put! :binding-metadata
       (Map/delete (Map/get (constructor_context!) :binding-metadata {}) [namespace binding]))
+     ;; A value demanded by an earlier expansion is memoized within its machine
+     ;; frame. A later authored definition changes that binding's value; retain
+     ;; other already evaluated values, matching ordered def initialization.
+     (when-let [key (:machine-frame (constructor_context!))]
+      (let [frame (erlang/get key)]
+       (erlang/put key (Map/put frame :source-values
+                        (Map/delete (Map/get frame :source-values {}) [namespace binding])))))
      (constructor_context_put! :source-owners {})
      (constructor_context_put! :remote-entries {}))))))
 
@@ -7565,6 +7928,6 @@
     (let [unit (constructor_unit! namespace) metadata (:metadata (:header unit))
           refers (Map/new (Map/get metadata :refers (list)))]
      (and (not (Map/has_key? refers name))
-          (nil? (BeamLisp.Loader/source_decl namespace name))
+          (nil? (constructor_source_declaration namespace name))
           (not (Enum/any? (Map/get metadata :refer_alls (list))
-                 (fn [target] (some? (BeamLisp.Loader/source_decl target name))))))))))
+                 (fn [target] (some? (constructor_source_declaration target name))))))))))

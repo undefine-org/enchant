@@ -1,0 +1,174 @@
+(ns aot-artifact-workspace-test)
+
+(defn- fixture-root []
+ (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+            "test/fixtures/artifact-production"))
+
+(defn- inputs []
+ (let [root (fixture-root)]
+  {:version 1 :roots (list root)
+   :sources (list {:namespace 'artifact.demo.values :file (Path/join root "artifact/demo/values.bl")}
+                  {:namespace 'artifact.demo.consumer :file (Path/join root "artifact/demo/consumer.bl")})}))
+
+(defn- temporary [action]
+ (let [root (str (System/tmp_dir!) "/bl-artifact-" (System/unique_integer (list :positive)))]
+  (File/mkdir_p! root)
+  (try (action root) (finally (File/rm_rf! root)))))
+
+(deftest imported-macro-and-computed-values-prepare-without-replacing-running-code
+ (temporary
+  (fn [root]
+   (BeamLisp/eval "(ns artifact.demo.consumer) (defn answer [] 7)")
+   (let [namespace "artifact.demo.consumer"
+         binding (BeamLisp.Env/lookup (tuple namespace "answer"))
+         generations (BeamLisp.Env/namespace_generations (list namespace))
+         module (BeamLisp.Emit/module_for namespace)
+         identity (erlang/apply module :module_info (list :md5))
+         provider-before (BeamLisp.Env/loaded_ns? "artifact.demo.values")
+         workspace (BeamLisp.AOT/open_workspace (inputs) {})]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.consumer)
+           emitted (BeamLisp.AOT/emit_unit prepared (Path/join root "consumer"))]
+      (is (= :prepared-artifact-unit (:kind prepared)))
+      (is (= "artifact.demo.consumer" (:namespace prepared)))
+      (is (= prepared (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.consumer)))
+      (is (= 7 (BeamLisp.Ns.Rt/invoke (second binding) (list))))
+      (is (= binding (BeamLisp.Env/lookup (tuple namespace "answer"))))
+      (is (= generations (BeamLisp.Env/namespace_generations (list namespace))))
+      (is (= identity (erlang/apply module :module_info (list :md5))))
+      (is (= provider-before (BeamLisp.Env/loaded_ns? "artifact.demo.values")))
+      (is (nil? (Process/get :artifact-demo-initialized)))
+      (is (= :inactive (BeamLisp.AOT/staged_macro_kind "user" "when")))
+      (is (= 4 (count (:modules emitted))))
+      (is (= emitted (:manifest (BeamLisp.AOT/verify_unit (Path/join root "consumer")))))
+      (is (File/regular? (Path/join root "consumer/artifact-unit.term"))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest compile-time-effects-refuse-and-restore-the-caller
+ (temporary
+  (fn [root]
+   (let [file (Path/join root "bad.bl") marker (Path/join root "never-written")
+         source (str "(ns artifact.badmacro) (defmacro touch [] (File/write! "
+                     (pr-str marker) " \"bad\")) (touch)")
+         _ (File/write! file source)
+         workspace (BeamLisp.AOT/open_workspace
+                     {:version 1 :sources (list {:namespace 'artifact.badmacro :file file})} {})
+         before (BeamLisp.Env/capture)]
+    (try
+     (is (= :constructor-machine-refused
+           (try (BeamLisp.AOT/prepare_unit workspace 'artifact.badmacro) nil
+                (catch error (:kind (ex-data error))))))
+     (is (= false (File/exists? marker)))
+     (is (= before (BeamLisp.Env/capture)))
+     (is (= :inactive (BeamLisp.AOT/staged_macro_kind "user" "when")))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest cyclic-compile-time-values-report-the-demand-cycle
+ (temporary
+  (fn [root]
+   (let [file (Path/join root "cycle.bl")
+         _ (File/write! file "(ns artifact.cycle) (def a b) (def b a) (defmacro demand [] a) (demand)")
+         workspace (BeamLisp.AOT/open_workspace
+                     {:version 1 :sources (list {:namespace 'artifact.cycle :file file})} {})]
+    (try
+     (let [result (try (BeamLisp.AOT/prepare_unit workspace 'artifact.cycle) nil
+                      (catch error (ex-data error)))]
+      (is (= :constructor-machine-refused (:kind result)))
+      (is (seq (get-in result [:detail :compile-time-value-cycle]))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest artifact-manifest-binds-exact-bytes-and-complete-membership
+ (temporary
+  (fn [root]
+   (let [workspace (BeamLisp.AOT/open_workspace (inputs) {})
+         directory (Path/join root "unit")]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.values)
+           manifest (BeamLisp.AOT/emit_unit prepared directory)
+           first-module (:module (first (:modules manifest)))
+           file (Path/join directory (str first-module ".beam"))
+           bytes (File/read! file)]
+      (is (= false (:native-admission (BeamLisp.AOT/verify_unit directory))))
+      (File/write! file (str bytes "changed"))
+      (is (= :artifact-bytes-changed
+            (try (BeamLisp.AOT/verify_unit directory) nil (catch error (:kind (ex-data error))))))
+      (File/write! file bytes)
+      (File/write! (Path/join directory "extra.beam") bytes)
+      (is (= :artifact-membership-changed
+            (try (BeamLisp.AOT/verify_unit directory) nil (catch error (:kind (ex-data error)))))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest artifact-workspace-requires-symbols-and-live-process-local-handles
+ (let [workspace (BeamLisp.AOT/open_workspace (inputs) {})]
+  (is (= :artifact-namespace-symbol-required
+        (try (BeamLisp.AOT/prepare_unit workspace "artifact.demo.consumer") nil
+             (catch error (:kind (ex-data error))))))
+  (BeamLisp.AOT/close_workspace! workspace)
+  (is (= :invalid-artifact-workspace
+        (try (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.consumer) nil
+             (catch error (:kind (ex-data error))))))))
+
+(deftest selected-source-drift-refuses-before-preparation
+ (temporary
+  (fn [root]
+   (let [file (Path/join root "drift.bl")
+         _ (File/write! file "(ns artifact.drift) (defn answer [] 1)")
+         workspace (BeamLisp.AOT/open_workspace
+                     {:version 1 :sources (list {:namespace 'artifact.drift :file file})} {})]
+    (try
+     (File/write! file "(ns artifact.drift) (defn answer [] 2)")
+     (is (= :artifact-source-changed
+           (try (BeamLisp.AOT/prepare_unit workspace 'artifact.drift) nil
+                (catch error (:kind (ex-data error))))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest artifact-output-must-be-empty
+ (temporary
+  (fn [root]
+   (let [workspace (BeamLisp.AOT/open_workspace (inputs) {})]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.values)
+           marker (Path/join root "preserve")]
+      (File/write! marker "existing")
+      (is (= :artifact-output-not-empty
+            (try (BeamLisp.AOT/emit_unit prepared root) nil
+                 (catch error (:kind (ex-data error))))))
+      (is (= "existing" (File/read! marker))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest compile-time-value-redefinition-preserves-expansion-order
+ (temporary
+  (fn [root]
+   (let [file (Path/join root "order.bl")
+         _ (File/write! file
+             "(ns artifact.order) (def base 1) (defmacro define-number [name] (list 'defn name [] base)) (define-number first-answer) (def base 2) (define-number second-answer)")
+         workspace (BeamLisp.AOT/open_workspace
+                     {:version 1 :sources (list {:namespace 'artifact.order :file file})} {})]
+    (try
+     (let [unit (BeamLisp.AOT/prepare_unit workspace 'artifact.order)
+           definitions (:definitions (first (:plans unit)))
+           first-clause (elem (first (Map/get definitions "first-answer")) 3)
+           second-clause (elem (first (Map/get definitions "second-answer")) 3)]
+      (is (= 1 (get-in first-clause [:body :val])))
+      (is (= 2 (get-in second-clause [:body :val]))))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(deftest compiler-scope-is-reclaimed-after-untrappable-owner-death
+ (let [owner (erlang/self)
+       worker (erlang/spawn
+                (fn []
+                 (let [scope (BeamLisp.AOT/artifact_open_scope)]
+                  (erlang/send owner (tuple :compiler-scope (:view scope) (:reaper scope)))
+                  (receive :never :ok))))]
+  (try
+   (let [ready (receive [:compiler-scope view reaper] (tuple view reaper) (after 5000 :timeout))]
+    (is (not= :timeout ready))
+    (when (erlang/is_tuple ready)
+     (let [view (elem ready 0) reaper (elem ready 1) monitor (Process/monitor reaper)]
+      (is (= 0 (BeamLisp.Env/definition_revision view)))
+      (Process/exit worker :kill)
+      (is (= :normal
+            (receive [:DOWN seen :process pid reason] :when (and (= seen monitor) (= pid reaper))
+              reason (after 5000 :timeout))))
+      (is (nil? (BeamLisp.Env/definition_revision view))))))
+   (finally (when (erlang/is_process_alive worker) (Process/exit worker :kill))))))
