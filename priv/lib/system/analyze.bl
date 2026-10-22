@@ -247,13 +247,15 @@
                 f1 (into [] targets)))
     :else (reduce (fn [fl ch] (flow-step defns fl fname ch)) flow (ir/child-nodes node))))
 
-(defn- flow-facts [defns]
+(defn- flow-facts [defns limit]
   (loop [flow {} n 0]
     (let [next (reduce (fn [fl [fname d]]
                          (reduce (fn [fl2 b] (flow-step defns fl2 fname b))
                                  fl (map :body (clauses-of d))))
                        flow (into [] defns))]
-      (if (or (= next flow) (> n 8)) next (recur next (inc n))))))
+      (cond (= next flow) {:facts next :complete true :rounds (inc n)}
+            (>= n limit) {:facts next :complete false :rounds (inc n)}
+            :else (recur next (inc n))))))
 
 ; ── the summary fixpoint ─────────────────────────────────────────────────
 ;
@@ -426,11 +428,26 @@
 (defn prepare-program
   "Compile once and collect whole-program flow/shadowing evidence. Callers must
    bind reuse to both normalized bodies and the analysis implementation generation."
-  [src]
-  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
-        bodies (fn-bodies forms)]
-    {:forms forms :bodies bodies :flow (flow-facts bodies)
-     :shadowed (bound-top-names forms)}))
+  ([src] (prepare-program src {}))
+  ([src options]
+  (let [limit (:flow-limit options 8)]
+    (when-not (and (int? limit) (<= 0 limit 256))
+      (throw (ex-info "Invalid analysis flow limit" {:flow-limit limit})))
+    (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+          bodies (fn-bodies forms)
+          flow (flow-facts bodies limit)
+          expected (set (keep (fn [form]
+                          (when (contains? #{"defn" "defn-"} (headname form))
+                            (typed/node-name (typed/node-form (second (typed/node-items (typed/node-form form))))))) forms))
+          missing (vec (sort (filter #(not (contains? bodies %)) expected)))
+          top? (some #(not (contains? top-skip-heads (or (headname %) ""))) forms)
+          top-complete (or (not top?) (ir/node? (:body (get bodies top-name))))]
+      {:forms forms :bodies bodies :flow (:facts flow)
+       :flow-complete? (:complete flow) :flow-rounds (:rounds flow)
+       :coverage {:definitions (count expected) :missing missing
+                  :top-level-complete (boolean top-complete)
+                  :complete (and (empty? missing) top-complete (:complete flow))}
+       :shadowed (bound-top-names forms)}))))
 
 (defn- global-dependencies [n]
   (if-not (ir/node? n) #{}
@@ -509,7 +526,10 @@
                                       (contains? fps2 callee-name) (get fps2 callee-name)
                                       :else (core callee-name)))
                 lat (latent-table defns final-resolve)]
-            {:locals locals :rounds (inc n) :summaries
+            {:locals locals :rounds (inc n) :converged? converged
+             :coverage (assoc (:coverage program) :summaries-complete converged
+                         :complete (and (= true (get-in program [:coverage :complete])) converged))
+             :summaries
              (reduce (fn [m name]
                       (let [loc (settle-applied (get locals name) (get lat name))
                             resolved (reduce (fn [s k] (into s (resolve-calls defns flow k)))
