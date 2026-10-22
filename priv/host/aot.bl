@@ -279,11 +279,30 @@
  "Prepare one selected namespace without publishing target code or running
   initializers. Macro/value execution uses the existing bounded ANF constructor."
  [handle namespace-symbol]
+ (prepare_artifact_unit handle namespace-symbol nil))
+
+(defn prepare_host_unit
+ "Prepare a pinned host descriptor without evaluating Source or loading code.
+  The spec names a selected quoted namespace, exact module atom and optional
+  struct-fields, macro-exports or behaviour. It grants no runtime authority."
+ [handle spec]
+ (when-not (and (erlang/is_map spec)
+                (Enum/all? (Map/keys spec)
+                 (fn [key] (contains? #{:namespace :module :struct-fields :macro-exports :behaviour} key))))
+  (artifact_refuse :invalid-artifact-host-spec))
+ (validate_host_module! (:module spec))
+ (validate_struct_fields! (Map/get spec :struct-fields))
+ (prepare_artifact_unit handle (:namespace spec) spec))
+
+(defn- prepare_artifact_unit [handle namespace-symbol host-spec]
  (let [workspace (artifact_workspace! handle)
        namespace (artifact_namespace namespace-symbol)
+       cache-key (if host-spec [namespace :pinned-host] namespace)
        input (Map/get (:inputs workspace) namespace)]
   (when-not input (artifact_refuse :artifact-namespace-not-selected))
-  (or (Map/get (:units workspace) namespace)
+  (when-let [cached (Map/get (:units workspace) cache-key)]
+   (when-not (= host-spec (:host-spec cached)) (artifact_refuse :artifact-host-spec-changed)))
+  (or (Map/get (:units workspace) cache-key)
    (let [previous (BeamLisp.Env/capture)
          previous-context (Process/get :bl_sdk_constructor_context)
          previous-attempt (Process/get :bl_initializer_attempt)
@@ -301,6 +320,7 @@
         {:input input :compiler-env view :artifact-inputs (:inputs workspace)
          :phase-imports (:phase-imports workspace)
          :phase-aware (:phase-aware workspace)
+         :host-spec host-spec
          :artifact-workspace handle :machine-frame machine :units {} :compiled {} :compiling #{}
          :maximum (:maximum workspace) :source-limit (:source-limit workspace)
          :total-limit (:total-limit workspace)
@@ -312,8 +332,10 @@
          (constructor_install_kernel!)
          (when (seq (:phase-imports workspace)) (constructor_kernel_phase_state!))
          (constructor_unit! namespace)
-         (let [unit (stage-sdk-unit! (:source input) (list (tuple :file (:file input))))
-               plans (artifact_describe_unit unit (:source input))
+         (let [_ (when host-spec (validate_pinned_declarations! (:source input) (:file input)))
+               unit (stage-sdk-unit! (:source input) (list (tuple :file (:file input))))
+               plans (if host-spec (artifact_describe_host_unit unit input host-spec)
+                                   (artifact_describe_unit unit (:source input)))
                _ (constructor_check_sources!)
                inputs (Enum/reduce (Map/values (:units (constructor_context!))) (:inputs workspace)
                         (fn [unit out]
@@ -321,12 +343,14 @@
                           (Map/take unit (list :namespace :file :source :selection :digest :compiler-key)))))
                source-world {:version 1 :kind :source-compilation-world
                              :compiler-key (:compiler-key workspace)
+                             :target (or host-spec {:kind :namespace})
                              :phase-imports (Enum/sort (:phase-imports workspace))
                              :phase-world (get-in (constructor_context!) [:kernel-phase-identity :id])
                              :inputs (Enum/map (Enum/sort (Map/to_list inputs))
                                        (fn [pair] {:namespace (elem pair 0) :digest (:digest (elem pair 1))}))}
                result {:version 1 :kind :prepared-artifact-unit :namespace namespace
                        :compiler-key (:compiler-key workspace) :inputs inputs :plans plans
+                       :host-spec host-spec
                        :world (assoc source-world :id (crypto/hash :sha256 (erlang/term_to_binary source-world)))
                        :phase-world (Map/get (constructor_context!) :kernel-phase-identity)
                        :coverage {:scope :artifact-membership :source-staged true
@@ -338,7 +362,7 @@
            (artifact_refuse :artifact-source-bound))
           (artifact_inputs_valid! inputs (:compiler-key workspace))
           (Process/put (tuple :bl_artifact_workspace handle)
-           (assoc workspace :inputs inputs :units (Map/put (:units workspace) namespace result)))
+           (assoc workspace :inputs inputs :units (Map/put (:units workspace) cache-key result)))
           result)))))
      (finally
       (try
@@ -526,79 +550,65 @@
  (doseq [form (BeamLisp.Reader/read_string source file)]
   (pinned_declaration_walk! form true 0 file)))
 
+(defn- pinned_unit_descriptor [unit opts]
+ ;; One ABI constructor for legacy compilation and artifact-only preparation.
+ ;; It consumes the actual compiler collection in its isolated metadata view.
+ (let [module (Keyword/fetch! opts :module)
+       _ (validate_host_module! module)
+       fields (validate_struct_fields! (Keyword/get opts :struct_fields nil))
+       defined (elem unit 0) namespace (pinned_namespace! defined)
+       names (Map/fetch! defined namespace)
+       values (Enum/reject (Map/get (elem unit 1) namespace (list))
+                (fn [value] (and (= 5 (erlang/tuple_size value))
+                                  (= :forward-declaration (elem value 4)))))
+       _ (when (seq values)
+           (erlang/error (Elixir.ArgumentError/exception
+             (str "pinned host module " (Kernel/inspect module) " cannot yet carry value definitions ("
+                  namespace "); only top-level `defn`s are emitted"))))
+       clauses (Enum/map
+                 (Enum/flat_map (BeamLisp.Env/selected_ns_definitions namespace (MapSet/to_list names))
+                   (fn [pair] (elem pair 1)))
+                 (fn [definition]
+                  (retarget_host (elem definition 3) (BeamLisp.Emit/module_for namespace) module namespace names)))
+       _ (when (= (list) clauses)
+           (erlang/error (Elixir.ArgumentError/exception (str "pinned host module " module " would export no functions"))))
+       macros (validate_macro_exports! (Keyword/get opts :macro_exports (list)) clauses)
+       collision (when (or (some? fields) (seq macros))
+                   (Enum/find clauses (fn [clause] (contains? #{:__struct__ :__info__} (:fname clause)))))
+       _ (when collision
+           (erlang/error (Elixir.ArgumentError/exception
+             (str "pinned host module " (Kernel/inspect module) " defines " (:fname collision)
+                  " itself; :struct_fields/:macro_exports would duplicate it"))))]
+  (BeamLisp.Emit/descriptor_for module (erlang/++ clauses (struct_clauses module fields clauses macros))
+   (host_attrs opts) {:file (Keyword/fetch! opts :file)})))
+
+(defn- artifact_describe_host_unit [unit input spec]
+ (let [namespace (pinned_namespace! (elem unit 0))
+       _ (when-not (= namespace (:namespace input)) (artifact_refuse :artifact-host-namespace-changed))
+       opts (list (tuple :module (:module spec)) (tuple :file (floor_source (:file input)))
+              (tuple :source_hash (Base/encode16 (:digest input) (list (tuple :case :lower))))
+              (tuple :struct_fields (Map/get spec :struct-fields))
+              (tuple :macro_exports (Map/get spec :macro-exports (list)))
+              (tuple :behaviour (Map/get spec :behaviour)))
+       descriptor (pinned_unit_descriptor unit opts)]
+  (list {:version 1 :namespace namespace :module (:module spec) :definitions (unit_defs namespace (Map/get (elem unit 0) namespace))
+         :descriptors (list descriptor) :generated-beams (list) :body-modules (MapSet/new)})))
+
 (defn- compile_host_file_unit [path opts]
-   (let [module (Keyword/fetch! opts :module)]
-     (validate_host_module! module)
-     (let [output_dir (Keyword/fetch! opts :output_dir)
-           ;; A pinned HOST beam is a floor artifact: root-relative source
-           ;; attribution, so a rebuild from another worktree is byte-identical.
-           file (floor_source (Keyword/get opts :file path))
-           load? (Keyword/get opts :load? true)
-           struct_fields (validate_struct_fields! (Keyword/get opts :struct_fields nil))]
-       (BeamLisp.Loader/with_load_path (Path/dirname path)
-         (fn []
-           (let [source (BeamLisp.Loader/read_source path)
-                 _ (validate_pinned_declarations! source file)
-                 unit (load_unit source (Keyword/put opts :file file))
-                 defined (elem unit 0)
-                 ;; Pinned hosts emit native clauses and have no namespace
-                 ;; initializer. Forward declarations are compile-time scaffolding
-                 ;; here; ordinary namespace emission retains their guarded replay.
-                 value_defs (Map/new (Enum/map (Map/to_list (elem unit 1))
-                              (fn [entry] (tuple (elem entry 0)
-                                (Enum/reject (elem entry 1)
-                                  (fn [value] (and (erlang/== 5 (erlang/tuple_size value))
-                                                   (erlang/== :forward-declaration (elem value 4)))))))))]
-             (let [ns (pinned_namespace! defined)
-                   shim (BeamLisp.Emit/module_for ns)]
-               (if (erlang/not (erlang/== (list) (Map/get value_defs ns (list))))
-                 (erlang/error
-                   (Elixir.ArgumentError/exception
-                     (erlang/iolist_to_binary
-                       (list "pinned host module " (Kernel/inspect module)
-                             " cannot yet carry value definitions (" ns
-                             "); only top-level `defn`s are emitted"))))
-                 (let [clauses
-                       (Enum/map
-                         (Enum/flat_map
-                           (BeamLisp.Env/selected_ns_definitions ns
-                                     (MapSet/to_list (Map/fetch! defined ns)))
-                           (fn [pair] (elem pair 1)))
-                         (fn [d] (retarget_host (elem d 3) shim module ns (Map/fetch! defined ns))))]
-                   (if (erlang/== (list) clauses)
-                     (erlang/error
-                       (Elixir.ArgumentError/exception
-                         (erlang/iolist_to_binary
-                           (list "pinned host module " (Kernel/inspect module)
-                                 " would export no functions (" path ")"))))
-                     (let [macro_exports
-                           (validate_macro_exports! (Keyword/get opts :macro_exports (list)) clauses)
-                           collision
-                           (if (and (nil? struct_fields) (erlang/== (list) macro_exports))
-                             nil
-                             (Enum/find clauses
-                               (fn [c]
-                                 (or (erlang/== :__struct__ (get c :fname))
-                                     (erlang/== :__info__ (get c :fname))))))]
-                       (if (erlang/not (nil? collision))
-                         (erlang/error
-                           (Elixir.ArgumentError/exception
-                             (erlang/iolist_to_binary
-                               (list "pinned host module " (Kernel/inspect module) " defines "
-                                     (get collision :fname) " itself; "
-                                     ":struct_fields/:macro_exports would duplicate it"))))
-                         (let [clauses2 (erlang/++ clauses
-                                          (struct_clauses module struct_fields clauses macro_exports))
-                               descriptor (BeamLisp.Emit/descriptor_for
-                                            module clauses2 (host_attrs opts) {:file file})
-                               compiled (BeamLisp.Emit/compile_descriptor descriptor)
-                               mod (elem compiled 0)
-                               beam (elem compiled 1)]
-                           (do
-                             (if load?
-                               (BeamLisp.Emit/load_binary! compiled (or file "beam_lisp_host"))
-                               nil)
-                             (write_beam mod beam output_dir)))))))))))))))
+ (let [module (Keyword/fetch! opts :module)
+       _ (validate_host_module! module)
+       output (Keyword/fetch! opts :output_dir)
+       file (floor_source (Keyword/get opts :file path))
+       _ (validate_struct_fields! (Keyword/get opts :struct_fields nil))]
+  (BeamLisp.Loader/with_load_path (Path/dirname path)
+   (fn []
+    (let [source (BeamLisp.Loader/read_source path)
+          _ (validate_pinned_declarations! source file)
+          options (Keyword/put opts :file file)
+          unit (load_unit source options)
+          compiled (BeamLisp.Emit/compile_descriptor (pinned_unit_descriptor unit options))]
+     (when (Keyword/get opts :load? true) (BeamLisp.Emit/load_binary! compiled (or file "beam_lisp_host")))
+     (write_beam (elem compiled 0) (elem compiled 1) output))))))
 
 ; `nil`/`true`/`false` are atoms but not modules, and `module_info` is the
 ; introspection pair every module already carries.
@@ -7996,6 +8006,15 @@
     (constructor_context_put! :clauses
       (Map/put (:clauses (constructor_context!)) ident [(first owner) (second owner)]))))))
 
+(defn- constructor_host_declaration? [form namespace]
+ ;; Pinned hosts have no namespace initializer. The authenticated Core phase
+ ;; declaration is compile-time scaffolding, as in the legacy host collector.
+ ;; Resolve its actual owner: a Source macro named declare is not this case.
+ (when (and (:host-spec (constructor_context)) (= "declare" (stage-head form)))
+  (let [owner (constructor_source_owner namespace "declare")]
+   (and owner (= "core" (first owner)) (= "declare" (second owner))
+        (some? (constructor_phase_macro owner))))))
+
 (defn- stage-sdk-forms! [forms namespace file values defined]
  (if (empty? forms) (tuple values defined)
   (let [form (first forms)
@@ -8004,7 +8023,8 @@
             (let [owner (constructor_source_owner namespace (stage-head form))]
              (when (and owner (= "proc.server" (first owner)) (= "extend-clause!" (second owner)))
               (constructor_record_clause! form namespace))))
-        expanded (if (constructor_context) (BeamLisp.Compiler/macroexpand_1 form namespace) form)]
+        expanded (if (and (constructor_context) (not (constructor_host_declaration? form namespace)))
+                   (BeamLisp.Compiler/macroexpand_1 form namespace) form)]
    (if (not= expanded form)
     (let [context (constructor_context!) size (inc (:expanded context))
           node (stage-unmeta expanded)

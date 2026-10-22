@@ -193,10 +193,56 @@ defmodule StagingResearch do
         do: raise "literal result changed: #{result.id}"
     end)
     if ir.same_invoke_ir, do: raise "language invocation collapsed into a source remote"
+    hosts = if System.get_env("BL_RESEARCH_HOSTS") == "on", do: host_probes(), else: []
     File.write!(Path.join(System.fetch_env!("BL_ARTIFACT_OUTPUT"), "result.json"), Jason.encode!(%{
       version: 1, scope: "staging-hypothesis-research", compiler_key: BeamLisp.AOTCache.current_compiler_key(),
       phase_aware: System.get_env("BL_RESEARCH_PHASE_AWARE") == "on",
-      cases: results, ir: ir, self_reproduction_qualified: false}, pretty: true))
+      cases: results, hosts: hosts, ir: ir, self_reproduction_qualified: false}, pretty: true))
+    if Enum.any?(hosts, &(&1.status != "emitted")), do: raise "some pinned host artifacts refused; see per-host receipts"
+  end
+
+  def host_probes do
+    # The actual seed inventory supplies exact native names and ABI options.
+    # This is ordinary producer-side tooling; candidate hosts are never loaded.
+    BeamLisp.Loader.ensure_loaded("seed")
+    entries = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch_exact!("seed", "host-sources"),
+      [Path.join(BeamLisp.Tiers.priv_root(), "host")]) |> BeamLisp.CompilerData.eager_to_list()
+    Enum.map(entries, fn entry ->
+      namespace = BeamLisp.Loader.declared_ns(File.read!(entry.source))
+      before = identities()
+      generations = BeamLisp.Env.namespace_generations([namespace])
+      environment = BeamLisp.Env.capture()
+      handle = AOT.open_workspace(%{:"phase-imports" => [{:symbol, "core"}, {:symbol, "sugar"}],
+        version: 2, sources: [%{namespace: {:symbol, namespace}, file: entry.source}]}, %{})
+      spec = Map.drop(entry, [:source]) |> Map.put(:namespace, {:symbol, namespace})
+      started = System.monotonic_time(:microsecond)
+      directory = Path.join(System.fetch_env!("BL_ARTIFACT_OUTPUT"), "host-" <> Atom.to_string(entry.module))
+      result = try do
+        prepared = AOT.prepare_host_unit(handle, spec)
+        manifest = AOT.emit_unit(prepared, directory)
+        verified = AOT.verify_unit(directory)
+        unless Enum.map(manifest.modules, & &1.module) == [Atom.to_string(entry.module)],
+          do: raise "host artifact changed exact module membership"
+        if verified[:"native-admission"], do: raise "host bytes acquired native admission"
+        %{status: "emitted", module: Atom.to_string(entry.module),
+          sha256: Base.encode16(hd(manifest.modules).sha256, case: :lower)}
+      rescue
+        error -> %{status: "refused", module: Atom.to_string(entry.module),
+          message: Exception.message(error), data: inspect(Map.get(error, :data), limit: 40)}
+      after
+        AOT.close_workspace!(handle)
+      end
+      after_identity = identities()
+      unchanged = Enum.all?(before, fn {mod, digest} -> Map.get(after_identity, mod) == digest end) and
+        environment == BeamLisp.Env.capture() and generations == BeamLisp.Env.namespace_generations([namespace])
+      unless unchanged, do: raise "host artifact preparation changed running code/environment: #{namespace}"
+      result = Map.merge(result, %{running_state_unchanged: unchanged,
+        source_sha256: Base.encode16(:crypto.hash(:sha256, File.read!(entry.source)), case: :lower),
+        microseconds: System.monotonic_time(:microsecond) - started})
+      File.write!(directory <> ".json", Jason.encode!(result, pretty: true))
+      IO.puts("host #{entry.module}: #{result.status}")
+      result
+    end)
   end
 end
 
