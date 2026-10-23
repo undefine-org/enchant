@@ -1,0 +1,61 @@
+(ns contextual-constructor-session-test)
+
+(defn- detail [action]
+ (try (action) nil (catch error (:detail (ex-data error)))))
+
+(defn- owned-keys []
+ (set (Enum/filter (erlang/get_keys)
+        #(or (= :bl_contextual_constructor_sessions %)
+             (and (erlang/is_tuple %) (> (erlang/tuple_size %) 0)
+                  (= :contextual-constructor-frame (elem % 0)))))))
+
+(deftest requests-share-fuel-and-release-temporary-ownership
+ (let [before (owned-keys) session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (is (= 42 (BeamLisp.AOT/eval_constructor_session! session {:op :lit :val 42} {})))
+   (let [first (BeamLisp.AOT/constructor_session_status session)]
+    (is (= 1 (:calls first)))
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session {:op :lit :val 42} {})))
+    (let [second (BeamLisp.AOT/constructor_session_status session)]
+     (is (= 2 (:calls second)))
+     (is (< (get-in second [:budget :remaining]) (get-in first [:budget :remaining])))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))
+  (is (= before (owned-keys)))
+  (is (= :ok (BeamLisp.AOT/close_constructor_session! session)))
+  (is (= :constructor-session-not-owned
+         (detail #(BeamLisp.AOT/eval_constructor_session! session {:op :lit :val 0} {}))))))
+
+(deftest failure-is-terminal-and-effects-never-run
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (is (= {:remote [:erlang :put 2]}
+          (detail #(BeamLisp.AOT/eval_constructor_session! session
+                    {:op :remote :mod :erlang :fun :put
+                     :args [{:op :lit :val :session-effect} {:op :lit :val true}]} {}))))
+   (is (= :undefined (erlang/get :session-effect)))
+   (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session))))
+   (is (= :constructor-session-not-open
+          (detail #(BeamLisp.AOT/eval_constructor_session! session {:op :lit :val 42} {}))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest foreign-process-cannot-borrow-an-open-session
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [task (Task/async
+               (fn [] (detail #(BeamLisp.AOT/eval_constructor_session! session {:op :lit :val 42} {}))))]
+    (is (= :constructor-session-not-owned (Task/await task))))
+   (is (= 0 (:calls (BeamLisp.AOT/constructor_session_status session))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest allocation-ceiling-is-aggregate-across-individually-legal-requests
+ (let [session (BeamLisp.AOT/open_constructor_session!) text (binary/copy "x" 262144)
+       request {:op :remote :mod :Elixir.BeamLisp.Ns.Core :fun :str
+                :args [{:op :lit :val text} {:op :lit :val text}]}]
+  (try
+   (let [refusal (loop [n 0]
+                   (if (= 40 n) :budget-not-enforced
+                    (let [failure (detail #(BeamLisp.AOT/eval_constructor_session! session request {}))]
+                     (if failure failure (recur (+ n 1))))))]
+    (is (= :allocation-byte-budget refusal))
+    (is (> (:calls (BeamLisp.AOT/constructor_session_status session)) 1)))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
