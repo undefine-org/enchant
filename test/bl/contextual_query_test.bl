@@ -1,0 +1,76 @@
+(ns contextual-query-test
+ (:require [expand :as x] [lower :as lower] [system.phase :as phase]
+           [codebase.phase :as code] [codebase.refactor :as refactor]))
+
+(defn- provider []
+ {:namespace 'query :revision 'current :file "query.bl"
+  :source (File/read! "test/fixtures/contextual-query/query.bl")})
+(defn- client [source]
+ {:namespace 'client :revision 'current :file "client.bl"
+  :source (str "(ns client) (import-world 'query 'current :only [query]) " source)})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualQuery." (erlang/unique_integer (list :positive))))
+                 (:node program)))
+
+(deftest vector-query-is-hygienic-fused-and-does-not-link-compile-time-helpers-at-runtime
+ (let [program (x/program [(provider)
+                          (client (str "(let [input 2 filtermap 100 user 999] "
+                                   "(query [row '(1 2 3)] [:where (erlang/> row 1)] "
+                                   "[:select (erlang/+ (erlang/* row input) (erlang/- user 999))]))"))]
+                         ['client 'current])
+       checker (phase/check program)
+       helpers (Enum/filter (Map/values (get-in program [:selection :by-id]))
+                  #(and (= 'query (:namespace %)) (= 1 (:phase %)) (= :function (:kind %))))]
+  (is (= '(4 6) (execute program)))
+  (is (= :proved (:status checker)))
+  (is (= 1 (count (:expansions program))))
+  (is (empty? (:linked program)))
+  (is (= 3 (count helpers)))
+  (is (:entry-affected (code/impact program [(:id (first helpers))])))
+  (is (some #(= 'erlang/make_fun (:name %)) (:native-obligations program)))
+  (is (= :unknown (get-in checker [:native-effects :status])))))
+
+(deftest query-input-runs-once-and-projection-only-runs-for-selected-rows-in-order
+ (let [key :contextual-query-count
+       program (x/program [(provider)
+                 (client
+                  (str "(query [row (do (erlang/put :contextual-query-count 1) '(1 2 3))] "
+                       "[:where (erlang/> row 1)] "
+                       "[:select (do (erlang/put :contextual-query-count "
+                       "(erlang/+ (erlang/get :contextual-query-count) row)) (erlang/* row 2))])"))]
+                ['client 'current])]
+  (try
+   (is (= '(4 6) (execute program)))
+   (is (= 6 (erlang/get key)))
+   (finally (erlang/erase key)))))
+
+(deftest query-binder-can-be-renamed-through-an-archived-macro-without-provider-source
+ (let [library (x/decode-phase-library (x/encode-phase-library (x/phase-library [(provider)])))
+       sources [(client "(query [row '(1 2 3)] [:where (erlang/> row 1)] [:select (erlang/* row 2)])")]
+       program (x/program sources ['client 'current] [library])
+       target (Enum/find (Map/values (get-in program [:selection :by-id]))
+                 #(and (= 'row (:name %)) (= :local (:visibility %))))
+       result (refactor/rename-program sources ['client 'current] [library] (:id target) 'item)]
+  (is (= '(4 6) (execute (:program result))))
+  (is (= 3 (count (:edits result))))
+  (is (String/contains? (:source (first (:sources result))) "(query [item '(1 2 3)]"))))
+
+(deftest fused-pass-preserves-predicate-and-projection-interleaving
+ (let [key :contextual-query-order
+       event (fn [digit] (str "(erlang/put :contextual-query-order (erlang/+ "
+                             "(erlang/* (erlang/get :contextual-query-order) 10) " digit "))"))
+       program (x/program [(provider)
+                 (client (str "(query [row '(1 2 3)] [:where (do " (event "row") " (erlang/> row 1))] "
+                           "[:select (do " (event "(erlang/+ row 5)") " row)])"))]
+                ['client 'current])]
+  (try
+   (erlang/put key 1)
+   (is (= '(2 3) (execute program)))
+   (is (= 112738 (erlang/get key)))
+   (finally (erlang/erase key)))))
+
+(deftest malformed-query-clauses-refuse-during-expansion
+ (doseq [body ["(query [row '(1 2)] [:wher true] [:select row])"
+               "(query [row '(1 2)] [:where true] [:select row] :extra)"
+               "(query [_ '(1 2)] [:where true] [:select 42])"]]
+  (is (thrown? (x/program [(provider) (client body)] ['client 'current])))))
