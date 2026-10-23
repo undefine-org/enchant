@@ -1,0 +1,102 @@
+(ns native-execution-test (:require [proc.callback :as callback]))
+
+(deftest native-registration-retains-private-callable-and-context-with-an-opaque-ticket
+ (let [registration (BeamLisp.Execution/register! (fn [x] (erlang/+ x 40)))]
+  (try
+   (is (= :bl-execution (elem registration 0)))
+   (is (erlang/is_reference (elem registration 2)))
+   (is (= {:version 1 :kind :execution-registration :status :active}
+          (BeamLisp.Execution/observe registration)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [2])))
+   (is (= :ok (BeamLisp.Execution/close! registration)))
+   (is (= :ok (BeamLisp.Execution/close! registration)))
+   (is (= :cancelled (:status (BeamLisp.Execution/observe registration))))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! registration [2])))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest fabricated-and-legacy-tickets-cannot-create-native-registrations
+ (let [fake (tuple :bl-execution (erlang/self) (erlang/make_ref))
+       legacy (callback/register! (fn [] :should-not-enter))
+       lease (:lease legacy)
+       fabricated (tuple :bl-execution (elem lease 1) (elem lease 2))]
+  (try
+   (is (= :cancelled (:status (BeamLisp.Execution/observe fake))))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! fake [])))
+   (is (= :cancelled (:status (BeamLisp.Execution/observe fabricated))))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! fabricated [])))
+   (is (thrown? (BeamLisp.Execution/invoke! {:function (fn [] 42) :context {}} [])))
+   (is (BeamLisp.Env/source_critical_target? :Elixir.BeamLisp.Execution :invoke!))
+   (finally (callback/unregister! legacy)))))
+
+(deftest native-invocation-does-not-realize-a-lazy-argument-collection
+ (let [touched (atom false) registration (BeamLisp.Execution/register! (fn [x] x))
+       arguments (lazy-seq (do (reset! touched true) '(42)))]
+  (try
+   (is (thrown? (BeamLisp.Execution/invoke! registration arguments)))
+   (is (= false @touched))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [42])))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest an-execution-borrow-cannot-be-upgraded-to-a-registration
+ (let [registration
+       (BeamLisp.Execution/register!
+        (fn []
+         (let [borrow (Process/get :bl_executing_code_lease)
+               forged (tuple :bl-execution (elem borrow 1) (elem borrow 2))]
+          (:status (BeamLisp.Execution/observe forged)))))]
+  (try
+   (is (= {:status :completed :value :cancelled} (BeamLisp.Execution/invoke! registration [])))
+   (is (= :active (:status (BeamLisp.Execution/observe registration))))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest oversized-eager-collections-refuse-before-callback-entry
+ (let [called (atom false) registration (BeamLisp.Execution/register! (fn [& args] (reset! called true)))
+       arguments (vec (repeat 16385 :argument))]
+  (try
+   (is (= :execution_argument_capacity
+          (try (BeamLisp.Execution/invoke! registration arguments) nil (catch e (:original e)))))
+   (is (= false @called))
+   (is (= :active (:status (BeamLisp.Execution/observe registration))))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest accepted-native-invocations-drain-after-close
+ (let [parent (erlang/self)
+       registration (BeamLisp.Execution/register!
+                      (fn []
+                       (erlang/send parent [:native-execution-entered (erlang/self)])
+                       (receive :finish 42 (after 10000 (throw :native-execution-deadline)))))
+       worker (spawn #(erlang/send parent [:native-execution-completed
+                                           (BeamLisp.Execution/invoke! registration [])]))]
+  (try
+   (is (= worker (receive [:native-execution-entered pid] pid (after 10000 (throw :missing-entry)))))
+   (BeamLisp.Execution/close! registration)
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! registration [])))
+   (erlang/send worker :finish)
+   (is (= {:status :completed :value 42}
+          (receive [:native-execution-completed value] value (after 10000 (throw :missing-completion)))))
+   (finally (erlang/send worker :finish) (BeamLisp.Execution/close! registration)))))
+
+(deftest registration-owner-death-cancels-future-entry
+ (let [parent (erlang/self)
+       owner (spawn (fn []
+                (let [registration (BeamLisp.Execution/register! (fn [] 42))]
+                 (erlang/send parent [:native-registration registration])
+                 (receive :finish nil (after 10000 nil)))))
+       monitor (Process/monitor owner)]
+  (try
+   (let [registration (receive [:native-registration value] value (after 10000 (throw :missing-registration)))]
+    (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [])))
+    (erlang/send owner :finish)
+    (is (receive [:DOWN ref :process pid _] :when (and (= ref monitor) (= pid owner)) true (after 10000 false)))
+    (is (= :cancelled (:status (BeamLisp.Execution/observe registration))))
+    (is (= {:status :cancelled} (BeamLisp.Execution/invoke! registration []))))
+   (finally (erlang/send owner :finish) (Process/demonitor monitor (list :flush))))))
+
+(deftest callback-values-and-callback-errors-are-not-admission-statuses
+ (let [value (BeamLisp.Execution/register! (fn [] :cancelled))
+       error (BeamLisp.Execution/register! (fn [] (throw (ex-info "entered" {:kind :busy}))))]
+  (try
+   (is (= {:status :completed :value :cancelled} (BeamLisp.Execution/invoke! value [])))
+   (is (= :busy (try (BeamLisp.Execution/invoke! error []) nil (catch e (:kind (ex-data e))))))
+   (is (= :active (:status (BeamLisp.Execution/observe error))))
+   (finally (BeamLisp.Execution/close! value) (BeamLisp.Execution/close! error)))))

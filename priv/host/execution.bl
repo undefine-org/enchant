@@ -1,0 +1,57 @@
+;; Native execution commands. Env remains the single custody/fence owner.
+;; Opaque registrations contain neither callable nor nominated context data.
+(ns host.execution)
+
+(defn- own-module [] (elem (erlang/fun_info (fn [] nil) :module) 1))
+
+(defn- finite-arguments [arguments]
+ (when-not (or (erlang/is_list arguments) (vector? arguments))
+  (erlang/error :execution_arguments_must_be_eager))
+ (when (> (if (vector? arguments) (BeamLisp.Vector/count arguments) (erlang/length arguments)) 16384)
+  (erlang/error :execution_argument_capacity))
+ (BeamLisp.CompilerData/eager_to_list arguments))
+
+(defn register!
+ "Retain and privately bind an executable to its actual native context before
+  publishing the registration. Managed graphs include their complete module
+  set; unmanaged captured dependencies must be listed explicitly. No supplied
+  evaluator/context callback or second registry is accepted."
+ ([function] (register! function (list)))
+ ([function dependencies]
+  (BeamLisp.Env/execution_registration_preflight! function)
+  (let [dependencies (finite-arguments dependencies)
+        _ (when-not (Enum/all? dependencies (fn [module] (erlang/is_atom module)))
+            (erlang/error :invalid_execution_dependencies))
+        modules (Enum/concat (BeamLisp.Env/callback_modules function)
+                  (Enum/concat dependencies
+                    (cons (own-module) (BeamLisp.CompilerData/eager_to_list
+                                         (:modules (Process/get :bl_generation))))))
+        lease (BeamLisp.Env/retain_code! modules)]
+   (try
+    (BeamLisp.Env/execution_registration! lease (BeamLisp.Env/register_code_callback! lease function))
+    (catch error (BeamLisp.Env/release_code! lease)
+     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))
+
+(defn invoke!
+ "Accept once under native custody, returning completed/cancelled/busy. An
+  accepted callback's own exception propagates and is never a retry signal.
+  Argument collection conversion cannot run a lazy caller continuation."
+ [registration arguments]
+ (let [arguments (finite-arguments arguments)
+       ticket (BeamLisp.Env/execution_registration_ticket registration)]
+  (if ticket (BeamLisp.Env/run_code_callback! (elem ticket 0) (elem ticket 1) arguments)
+      {:status :cancelled})))
+
+(defn close!
+ "Idempotently close future admission. Independently accepted work drains."
+ [registration]
+ (when-let [ticket (BeamLisp.Env/execution_registration_ticket registration)]
+  (BeamLisp.Env/release_code! (elem ticket 0))) :ok)
+
+(defn observe
+ "Read-only registration state, without function, context or physical lease."
+ [registration]
+ (let [ticket (BeamLisp.Env/execution_registration_ticket registration)]
+  {:version 1 :kind :execution-registration
+   :status (if (and ticket (BeamLisp.Env/code_callback_active? (elem ticket 0) (elem ticket 1)))
+             :active :cancelled)}))
