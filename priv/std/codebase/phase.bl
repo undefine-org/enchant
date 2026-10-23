@@ -1,5 +1,5 @@
 ;; Codebase projection of the compiler-owned contextual snapshot.
-(ns codebase.phase (:require [binding :as b] [expand-source :as source]))
+(ns codebase.phase (:require [binding :as b] [expand-source :as source] [anf :as anf]))
 
 (defn catalog
  ([sources] (source/catalog sources))
@@ -21,3 +21,109 @@
    :references (:occurrences program) :expansions (:expansions program)
    :imports (:imports selection) :native-obligations (:native-obligations program)
    :coverage (:coverage program) :native-admission false}))
+
+(defn uses
+ "All recorded uses of an original declaration, including aliases and phases.
+  Locations and contexts are retained; display names are never the join key."
+ [program declaration]
+ (Enum/filter (:references (facts program))
+   #(= declaration (get-in % [:reference :declaration]))))
+
+(defn- anf-nodes [root maximum]
+ (loop [todo (list root) out (list) left maximum]
+  (if (empty? todo) (Enum/reverse out)
+   (do
+    (when (<= left 0) (refuse! :phase-dependency-budget nil))
+    (let [node (first todo)]
+     (recur (Enum/concat (anf/executable-children node) (rest todo))
+            (cons node out) (- left 1)))))))
+
+(defn- variable-references [nodes]
+ (Enum/reduce nodes {}
+  (fn [node out]
+   (if-let [reference (when (= :var (:op node)) (get-in node [:ann :binding-reference]))]
+    (do
+     (when (and (contains? out (:name node)) (not= reference (get out (:name node))))
+      (refuse! :phase-inconsistent-variable-identity nil))
+     (assoc out (:name node) reference)) out))))
+
+(defn- image-edges [root owner references maximum]
+ (let [nodes (anf-nodes root maximum) variables (variable-references nodes)]
+  (loop [todo (list (tuple root owner)) edges (list) left maximum]
+   (if (empty? todo) (tuple (Enum/reverse edges) (count nodes))
+    (do
+     (when (<= left 0) (refuse! :phase-dependency-budget nil))
+     (let [item (first todo) node (elem item 0) caller (elem item 1)
+           reference (get-in node [:ann :binding-reference])
+           _ (when (and reference (not= reference (get-in references [(:id reference) :reference])))
+               (refuse! :phase-unindexed-reference nil))
+           edge (when reference {:from caller :to (:id reference) :kind :reference
+                                 :phase (:phase reference) :origin (:ann node)})
+           invocation (anf/callable-invocation node)
+           callee (get-in invocation [:callee :ann :binding-reference])
+           call (when callee {:from caller :to (:id callee) :kind :call
+                              :phase (:phase callee) :origin (:ann node)})
+           binding (when (= :let (:op node)) (get variables (:name node)))
+           definition (when binding {:from caller :to (:id binding) :kind :definition
+                                      :phase (:phase binding) :origin (:ann node)})
+           children (if binding
+                      (list (tuple (:init node) (:id binding)) (tuple (:body node) caller))
+                      (Enum/map (anf/executable-children node) #(tuple % caller)))
+           edges (Enum/reduce (list edge call definition) edges
+                   (fn [entry out] (if entry (cons entry out) out)))]
+      (recur (Enum/concat children (rest todo)) edges (- left 1))))))))
+
+(defn dependencies
+ "Project dependency/call edges from actual annotated ANF, including latent
+  closure bodies and compile-time transformer images. SSA variable names join
+  definitions to their recorded references; Source spelling is never guessed.
+  This is a dependency view, not an effect or native-admission proof."
+ [program]
+ (let [facts (facts program)
+       entry [:program (:entry program) (:snapshot facts)]
+       references (Map/new (Enum/map (Map/values (:references program))
+                             #(tuple (get-in % [:reference :id]) %)))
+       references (Enum/reduce (:expansions program) references
+                    (fn [expansion out]
+                     (let [reference (:transformer expansion)]
+                      (assoc out (:id reference)
+                        {:reference reference
+                         :declaration (get-in facts [:selection :by-id (:declaration reference)])}))))
+       images (cons (tuple entry (:node program)) (Enum/sort (Map/to_list (:transformers program))))
+       projected (Enum/map_reduce images 100000
+                    (fn [image remaining]
+                     (let [result (image-edges (elem image 1) (elem image 0) references remaining)]
+                      (tuple (elem result 0) (- remaining (elem result 1))))))
+       demands (Enum/map (:expansions program)
+                  #(hash-map :from entry :to (get-in % [:transformer :id]) :kind :expansion
+                             :phase (get-in % [:transformer :phase]) :origin (:origin %)))
+       edges (Enum/uniq (Enum/concat (Enum/flat_map (elem projected 0) (fn [edges] edges)) demands))]
+  {:version 1 :kind :contextual-dependencies :status :indexed :entry entry
+   :snapshot (:snapshot facts) :references references :edges edges
+   :coverage {:runtime true :transformer-images true :effects false :native false}
+   :native-admission false}))
+
+(defn impact
+ "Reverse dependency cone of original declaration IDs. Different revisions
+  of one namespace stay distinct; every selected reference phase participates."
+ [program declarations]
+ (when-not (or (vector? declarations) (erlang/is_list declarations))
+  (refuse! :phase-impact-input nil))
+ (let [declarations (BeamLisp.CompilerData/eager_to_list declarations)
+       _ (when (> (count declarations) 16384) (refuse! :phase-dependency-budget nil))
+       graph (dependencies program) selection (:selection program)
+       _ (Enum/each declarations
+           #(when-not (contains? (:by-id selection) %) (refuse! :phase-impact-declaration nil)))
+       selected (Map/new (Enum/map declarations #(tuple % true)))
+       roots (Enum/map
+               (Enum/filter (Map/values (:references graph))
+                 #(contains? selected (get-in % [:reference :declaration])))
+               #(get-in % [:reference :id]))
+       reverse (Enum/group_by (:edges graph) #(:to %))
+       affected (Enum/sort (Enum/uniq
+                  (Enum/flat_map roots
+                    #(BeamLisp.SourceGraph/closure %
+                       (fn [id] (Enum/map (Map/get reverse id (list)) (fn [edge] (:from edge))))))))]
+  {:version 1 :status :indexed :scope :contextual-dependencies :snapshot (:snapshot graph)
+   :declarations declarations :references affected :entry-affected (Enum/member? affected (:entry graph))
+   :native-admission false}))
