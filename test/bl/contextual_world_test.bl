@@ -1,0 +1,78 @@
+(ns contextual-world-test (:require [binding :as b] [syntax :as s]))
+
+(defn- make-world [namespace revision]
+ (let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace namespace :digest (crypto/hash :sha256 revision)}]}
+       module (b/scope selection namespace [0] :module)
+       import (b/scope selection namespace [1] :import)
+       intro (b/scope selection namespace [2] :introduction)
+       declaration (fn [name path visibility]
+                     {:namespace namespace :name name :path [path] :scopes [(:id module)]
+                      :phase 0 :space 'value :kind :function :visibility visibility :available-from 0})]
+  {:world (b/world selection [module import intro]
+           [(declaration 'answer 0 :public) (declaration 'helper 1 :private)])
+   :module (:id module) :import (:id import) :intro (:id intro) :namespace namespace}))
+
+(defn- identifier [w name phase scopes]
+ (s/identifier name {:world (:key (:world w)) :namespace (:namespace w) :space 'value :scopes {phase scopes}}))
+
+(defn- edge [provider consumer alias shift]
+ {:from-world (:key (:world provider)) :into-world (:key (:world consumer))
+  :from (:namespace provider) :into (:namespace consumer) :scope (:import consumer)
+  :phase-shift shift :only ['answer] :space 'value :alias alias})
+
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest same-namespace-revisions-remain-distinct-through-cross-world-phase-imports
+ (let [old (make-world 'provider "old") new (make-world 'provider "new") client (make-world 'client "client")
+       graph (b/select [(:world old) (:world new) (:world client)]
+                       [(edge old client 'old 1) (edge new client 'new 0)])
+       old-use (b/resolve graph (identifier client 'old/answer 1 [(:import client)]) 1 0)
+       new-use (b/resolve graph (identifier client 'new/answer 0 [(:import client)]) 0 0)]
+  (is (= :resolved (:status old-use)))
+  (is (= :resolved (:status new-use)))
+  (is (= (:key (:world old)) (get-in old-use [:reference :world])))
+  (is (= (:key (:world new)) (get-in new-use [:reference :world])))
+  (is (= 0 (get-in old-use [:declaration :phase])))
+  (is (= 1 (get-in old-use [:reference :phase])))
+  (is (not= (get-in old-use [:reference :id]) (get-in new-use [:reference :id])))
+  (is (= graph (b/validate-selection graph)))))
+
+(deftest definition-site-context-keeps-the-original-private-helper-across-worlds
+ (let [old (make-world 'provider "old") new (make-world 'provider "new") client (make-world 'client "client")
+       graph (b/select [(:world old) (:world new) (:world client)] [])
+       template (s/from-datum ['helper 'body]
+                  {:world (:key (:world old)) :namespace 'provider :space 'value :scopes {:all [(:module old)]}})
+       user (identifier client 'answer 0 [(:module client)])
+       output (s/template template {'body user} (:intro client))
+       definition-use (b/resolve graph (first (:children output)) 0 0)
+       user-use (b/resolve graph (second (:children output)) 0 0)]
+  (is (= :resolved (:status definition-use)))
+  (is (= (:key (:world old)) (get-in definition-use [:reference :world])))
+  (is (= :resolved (:status user-use)))
+  (is (= (:key (:world client)) (get-in user-use [:reference :world])))
+  (is (= user (second (:children output))))))
+
+(deftest graph-identity-is-canonical-and-changed-providers-invalidate-it
+ (let [a (make-world 'provider "a") z (make-world 'provider "z") client (make-world 'client "client")
+       ea (edge a client 'a 1) ez (edge z client 'z 0)
+       forward (b/select [(:world a) (:world z) (:world client)] [ea ez])
+       reverse (b/select [(:world client) (:world z) (:world a)] [ez ea])]
+  (is (= forward reverse))
+  (is (not= (:key forward) (:key (b/select [(:world a) (:world client)] [ea]))))
+  (is (= :binding-invalid-selection (kind-of #(b/validate-selection (assoc forward :index {})))))
+  (is (= :binding-world-not-selected
+         (kind-of #(b/select [(:world client)] [ea]))))
+  (is (= :binding-import-private
+         (kind-of #(b/select [(:world a) (:world client)] [(assoc ea :only ['helper])]))))))
+
+(deftest unscoped-foreign-locals-and-unselected-contexts-cannot-leak-into-a-selection
+ (let [a (make-world 'provider "a") client (make-world 'client "client")
+       local {:namespace 'provider :name 'unscoped :phase 0 :space 'value :kind :value
+              :visibility :local :available-from 0 :path [3] :scopes []}
+       w (b/world (:selection (:world a)) (Map/values (:scopes (:world a))) [local])
+       graph (b/select [w (:world client)] [])
+       absent (make-world 'absent "absent")]
+  (is (= :unbound (:status (b/resolve graph (identifier client 'unscoped 0 []) 0 0))))
+  (is (= :binding-world-not-selected (kind-of #(b/resolve graph (identifier absent 'answer 0 []) 0 0))))))
