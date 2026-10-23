@@ -1,0 +1,80 @@
+#+TITLE: Measure managed graph custody before changing its representation
+
+* Existing behavior and measured cost
+
+Opaque registrations already keep the callable and captured context in native
+custody. Preparing a handoff creates an inactive target; acceptance consumes
+the source epoch and permits the exact target to execute. Closing a registration
+prevents future admission while independently accepted work drains.
+
+#+begin_src beam-lisp :id native-handoff-remains-owned
+(ns execution.graph.retention.walkthrough)
+(let [source (BeamLisp.Execution/register! (fn [] 42))
+      offer (BeamLisp.Execution/prepare-handoff! source (erlang/self))
+      target (:accepted offer)]
+ (try
+  (assert (= {:status :pending} (BeamLisp.Execution/handoff-status offer)))
+  (assert (= {:status :cancelled} (BeamLisp.Execution/invoke! target [])))
+  (assert (= :accepted (:status (BeamLisp.Execution/accept-handoff! offer))))
+  (assert (= {:status :cancelled} (BeamLisp.Execution/invoke! source [])))
+  (assert (= {:status :completed :value 42} (BeamLisp.Execution/invoke! target [])))
+  {:inactive-target :cancelled :source-after-accept :cancelled :accepted-value 42}
+  (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target))))
+#+end_src
+#+RESULTS: native-handoff-remains-owned
+: {:inactive-target :cancelled, :source-after-accept :cancelled, :accepted-value 42}
+
+
+This is not yet constant-size managed-graph retention. =Execution/register!=
+currently concatenates the actual callback modules, explicit dependencies and
+managed graph module list. =Env/retain_code!= sorts that list, takes its module
+fences and inserts one physical row per module. Invocation borrows another
+complete lease before entering the captured context.
+
+The native probe creates actual prepared graphs, then measures24 registrations
+and24 real invocations per graph. Every invocation returns42. Registrations close
+in cleanup, every graph must retire, and the command exits its VM. One serial
+capped VM produced this baseline on this host:
+
+| Graph modules | Rows per registration | Registration median/us | Invocation median/us | Graph ETF bytes |
+|---------------+-----------------------+------------------------+----------------------+-----------------|
+|             4 |                     5 |                     93 |                  230 |            6768 |
+|            10 |                    11 |                    153 |                  279 |            7541 |
+|            34 |                    35 |                    318 |                  453 |           10950 |
+
+Timings are observations, not portable thresholds or an asymptotic proof. The
+row counts directly expose the representation's module-count dependence. ETF
+size measures the public graph term; it is not measured message-copy traffic.
+The first graph preparation includes lazy SDK warmup. VM startup is outside the
+registration/invocation timers. No native pin optimization is claimed here.
+
+#+begin_example
+systemd-run --user --collect --wait --pipe --working-directory="$PWD" \
+ --property=MemoryMax=6G --property=MemorySwapMax=0 --property=RuntimeMaxSec=300 \
+ ./bin/bl --cold run test/scripts/execution-graph-cost.bl
+#+end_example
+
+* Constraints on the next migration
+
+The native owner must retain a validated immutable module graph once and issue
+small registration/borrow pins against that graph's identity. Graph membership
+and admission epochs must remain in native custody; a supplied scope/module map
+cannot establish them. Actual callback/explicit dependency retention remains
+necessary, including modules outside the managed graph.
+
+Module publication and retirement must see graph pins before replacing code.
+Closing graph admission and admitting a pin need one serialized native decision.
+Existing registrations, handoffs and accepted borrows must preserve their drain
+semantics through retirement and owner death. Capacity, cancellation and cleanup
+must account for pins as well as legacy physical leases. Private custody turns
+must never wait for module locks or execute supplied callbacks.
+
+A graph pin alone does not eliminate captured-context copying. Native graph,
+context and frame IDs require their own migration of actual capture/bind and
+Source entry consumers. Existing public generation views must not become a
+second authority. A constant number of pin rows cannot stand in for these
+separate lifetime, code-publication and context checks.
+
+See [[file:graph-retention-checks.json][scoped receipt]]. The current native implementation remains the baseline;
+actor/frame/context IDs, graph pins, deadline/target grants, affine analysis and
+full historical-family qualification remain unfinished.
