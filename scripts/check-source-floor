@@ -15,6 +15,14 @@ for app <- Application.spec(:beam_lisp, :applications) || [],
 {:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
 unless BeamLisp.AOTCache.current_compiler_key() == manifest["compiler_key"],
   do: raise "candidate floor does not match the physical compiler inputs"
+# This host is needed before language runtime modules exist. Keep the emitted
+# dependency gate here, so bootstrap recovery catches a generic callable route
+# before a complete B/C production run pays for it.
+{:ok, {_, [atoms: atoms]}} = :beam_lib.chunks(~c"priv/bootstrap/seed/Elixir.BeamLisp.AOTCache.beam", [:atoms])
+for forbidden <- [BeamLisp.Ns.Rt, BeamLisp.Ns.Core, BeamLisp.Vector] do
+  if Enum.any?(atoms, fn {_, atom} -> atom == forbidden end),
+    do: raise "preboot cache host depends on language runtime: #{forbidden}"
+end
 {:ok, _} = Application.ensure_all_started(:beam_lisp)
 # Stable compiler bodies must still be the candidate bytes after startup.
 # Mutable forwarders may extend legitimately; their stable bodies may not.
@@ -56,7 +64,30 @@ receive do
   {^tag, ^ref, :process, ^pid, :floor_child_completed} -> :ok
   after 3000 -> raise "candidate owned start lost its tagged monitor exit"
 end
-IO.puts("SOURCE-FLOOR fresh application, descriptor publication and owned starts passed")
+# Exercise protected operands and native/interpreted guard agreement against
+# the candidate itself. A recovery compiler can prepare this candidate, but
+# its precompiled host bytes are not a substitute for these fresh semantics.
+escaped = BeamLisp.eval("(try (erlang/=:= true (erlang/throw :floor_operand_probe)) " <>
+                       "(catch-raw [kind reason stack] [kind reason]))")
+[:throw, :floor_operand_probe] = BeamLisp.Vector.to_list(escaped)
+for guard <- ["42", ":yes", "(+ 1 2)", "(> (tuple-size x) 0)",
+              "(= (tuple-size x) false)", "(= (rem x 0) 1)"] do
+  source = "((fn ([x] :when " <> guard <> " 0) ([x] 42)) 42)"
+  node = BeamLisp.Compiler.compile(BeamLisp.Reader.read_one(source), BeamLisp.Compiler.new_env("user"))
+  42 = BeamLisp.eval(source)
+  42 = BeamLisp.AOT.interpret_constructor!(node, %{}, %{})
+end
+position_source = "(ns floor.position.probe)\n(defn fail [xs]\n  (erlang/tuple_size\n" <>
+                  "    (erlang/hd xs)))\n(try (fail '(42)) (catch-raw [kind reason stack] stack))"
+env = BeamLisp.Compiler.new_env("user")
+frames = Enum.reduce(BeamLisp.Reader.read_string(position_source, "floor-position.bl"), nil,
+                    fn form, _ -> BeamLisp.Compiler.eval_form(form, env) end)
+frame = Enum.find(frames, fn {_, _, _, location} ->
+  to_string(Keyword.get(location, :file, "")) == "floor-position.bl"
+end)
+unless frame && Keyword.get(elem(frame, 3), :line) == 3,
+  do: raise "operand binding lost the failing call's source location"
+IO.puts("SOURCE-FLOOR fresh application, descriptors, owned starts, protected operands and guard parity passed")
 '''
 
 

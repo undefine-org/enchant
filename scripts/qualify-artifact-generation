@@ -24,9 +24,20 @@ def sha(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--seed", type=Path,
+                        help="explicit initial bootstrap compiler floor; defaults to the checkout floor")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     root, output = args.root.resolve(), args.out.absolute()
+    initial_seed = (args.seed or root / "priv/bootstrap/seed").resolve()
+    if not initial_seed.is_dir() or any(
+            not p.is_file() or p.is_symlink() or
+            (p.name != "manifest.term" and p.suffix not in (".beam", ".app"))
+            for p in initial_seed.iterdir()):
+        parser.error("initial seed must be a directory of regular artifact files")
+    initial_seed_files = {p.name: sha(p) for p in sorted(initial_seed.iterdir())}
+    if "manifest.term" not in initial_seed_files:
+        parser.error("initial seed must contain manifest.term")
     # lexists also refuses dangling links; mkdir owns a new directory exclusively.
     if os.path.lexists(output):
         parser.error(f"output must be absent: {output}")
@@ -43,6 +54,7 @@ def main():
     deps += sorted((root / "_build").glob("*/lib/*/ebin"))
     deps = list(dict.fromkeys(p.resolve() for p in deps))
     report = {"version": 1, "kind": "artifact-generation-qualification", "stages": [],
+              "initial_seed": str(initial_seed), "initial_seed_files": initial_seed_files,
               "floor_installed": False, "native_execution_admission": False,
               "self_reproduction_qualified": False}
 
@@ -53,8 +65,12 @@ def main():
         for path, digest in inputs.items():
             if sha(root / path) != digest:
                 raise RuntimeError(f"qualification input changed: {path}")
+        if initial_seed_files != {p.name: sha(p) for p in sorted(initial_seed.iterdir())
+                                  if p.is_file() and not p.is_symlink()} or any(
+                not p.is_file() or p.is_symlink() for p in initial_seed.iterdir()):
+            raise RuntimeError("initial bootstrap compiler floor changed during qualification")
 
-    source = root / "priv/bootstrap/seed"
+    source = initial_seed
     save()
     try:
         for label in ("B", "C"):
@@ -83,6 +99,20 @@ def main():
                        "BL_ARTIFACT_DRIVER": str(image / "produce.bl"),
                        "BL_GENERATION_OUTPUT": str(target), "XDG_CACHE_HOME": str(image / "cache"),
                        "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+                # Refuse drift before starting code, as well as after it exits.
+                # Check the bytes actually copied into both compiler locations;
+                # a source that changes and changes back during cp is not a
+                # coherent compiler snapshot merely because its final hash fits.
+                expected_seed = initial_seed_files if label == "B" else report["stages"][-2]["files"]
+                for copied in (image / "priv/bootstrap/seed", app / "ebin"):
+                    if expected_seed != {p.name: sha(p) for p in sorted(copied.iterdir()) if p.is_file()}:
+                        raise RuntimeError(f"copied compiler floor differs from generation {label} inputs")
+                for path, digest in inputs.items():
+                    if path == "env.bl" or (path.startswith("priv/") and
+                                            not path.startswith("priv/bootstrap/seed/")):
+                        if sha(image / path) != digest:
+                            raise RuntimeError(f"copied source differs from qualification input: {path}")
+                unchanged()
                 started = time.monotonic()
                 result = subprocess.run(command, cwd=image, env=env, text=True,
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)

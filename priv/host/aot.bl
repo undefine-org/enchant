@@ -4376,7 +4376,7 @@
            (Enum/empty? (maps/get :shadow (or (maps/get :decl realm nil) (maps/new)) (list))))
     (let [closure (ns_closure_hash ns)
           context (BeamLisp.Env/namespace_generations
-                    (list "core" "sugar" "rt" "compiler" "lower" "anf"))
+                    (list "core" "sugar" "rt" "compiler" "lower" "lower-core" "anf"))
           context (if (and context
                          (Enum/all? context (fn [row]
                            (or (erlang/== :global (elem row 0)) (erlang/== 0 (elem row 2))))))
@@ -6591,6 +6591,35 @@
 
 (defn- constructor_truthy? [v] (and (not (nil? v)) (not (= false v))))
 
+(defn- constructor_guard_pass? [guard env state]
+ ;; Clause guards require exactly true. A private control message belongs to
+ ;; the existing machine frame; no Source value can manufacture its nonce.
+ ;; Refusals, budgets and every other error keep their original class/stack.
+ (let [ticket (:counter-frame state)]
+  (try
+   (erlang/=:= true (constructor_interpret guard env (assoc state :guard-failure-ticket ticket)))
+   (catch-raw [kind reason stack]
+    (if (and (= :throw kind)
+             (erlang/=:= reason (tuple :bl_constructor_guard_failed ticket)))
+     false (erlang/raise kind reason stack))))))
+
+(defn- constructor_admitted_bif [module function args state]
+ ;; Only already admitted primitives reach this call. Ask the VM which are
+ ;; guard operations; do not maintain another primitive or purity inventory.
+ ;; Failure of one subexpression fails the whole guard, never returns false
+ ;; into a surrounding comparison. Outside a guard the native error escapes.
+ (try (erlang/apply module function args)
+  (catch-raw [kind reason stack]
+   (let [ticket (:guard-failure-ticket state) arity (count args)]
+    (if (and ticket (erlang/=:= ticket (:counter-frame state))
+             (= :error kind) (contains? #{:badarg :badarith} reason)
+             (= :erlang module)
+             (or (erl_internal/guard_bif function arity)
+                 (erl_internal/arith_op function arity)
+                 (erl_internal/comp_op function arity)))
+     (erlang/throw (tuple :bl_constructor_guard_failed ticket))
+     (erlang/raise kind reason stack))))))
+
 (defn- constructor_pmatch
   "Match value `v` against pattern `p`, extending bindings `b` (a map) or
    returning :nomatch. Mirrors Core/Erlang clause semantics."
@@ -6634,7 +6663,7 @@
 
 (defn- constructor_match_clauses
   "Try each clause against args (a list of values); run the first whose
-   patterns match AND whose guard is truthy. `on-fail` is called with no args."
+   patterns match AND whose guard returns true. `on-fail` is called with no args."
   [clauses args env on-fail state]
   (let [hit (Enum/find_value clauses
               (fn [cl]
@@ -6642,7 +6671,7 @@
                              (Enum/reduce (Enum/zip (:pats cl) args) {}
                                (fn [pair acc] (constructor_pmatch (elem pair 0) (elem pair 1) acc state))) :nomatch)
                      b (when-not (= :nomatch bound) (Map/merge env bound))]
-                (when (and b (or (nil? (:guard cl)) (constructor_truthy? (constructor_interpret (:guard cl) b state))))
+                (when (and b (or (nil? (:guard cl)) (constructor_guard_pass? (:guard cl) b state)))
                  [cl b]))))]
     (if (nil? hit) (on-fail) (constructor_interpret (:body (first hit)) (second hit) state))))
 
@@ -6728,7 +6757,7 @@
         (contains? #{[:erlang :== 2] [:erlang :=:= 2] [:erlang :/= 2] [:erlang :=/= 2]} target)
         (or (nil? (first args)) (nil? (second args))))
     (erlang/apply module function args)
-   (contains? pure-bifs target) (erlang/apply module function args)
+   (contains? pure-bifs target) (constructor_admitted_bif module function args state)
    ;; Literal string substitution is pure. Macros such as `defrelation` build var
    ;; names with it at load; regex/function patterns stay refused.
    (and (= target [:Elixir.String :replace 3]) (every? (fn [x] (erlang/is_binary x)) args)

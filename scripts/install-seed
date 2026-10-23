@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Install a completed floor without starting the application being repaired.
+
+Uses the checkout image and the existing install-seed.bl source/inventory/digest
+judge and manifest-last publisher. It never hotloads candidate code. Run under
+a process-tree memory/time cap, as for other bootstrap commands.
+"""
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+DRIVER = '''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+BeamLisp.AOT.boot()
+compiler_root = System.fetch_env!("BL_ROOT")
+{:ok, [manifest]} = :file.consult(String.to_charlist(Path.join(compiler_root, "priv/bootstrap/seed/manifest.term")))
+unless manifest["compiler_key"] == BeamLisp.AOTCache.current_compiler_key(),
+  do: raise "installation compiler image does not match its source snapshot"
+root = System.fetch_env!("BL_INSTALL_TARGET")
+# Keep the coherent compiler's code while the existing judge reads the target
+# tree's actual Source. This application path changes no loaded module or byte.
+System.put_env("BL_ROOT", root)
+Code.prepend_path(System.fetch_env!("BL_INSTALL_IMAGE"))
+BeamLisp.with_argv([root], fn -> BeamLisp.run_file(Path.join(root, "scripts/install-seed.bl")) end)
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("seed", type=Path)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--compiler-root", type=Path,
+                        help="coherent compiler/source image when the target tree cannot boot")
+    args = parser.parse_args()
+    root, seed = args.root.resolve(), args.seed.resolve()
+    compiler_root = (args.compiler_root or root).resolve()
+    image = compiler_root / ".bl/lib/beam_lisp-0.1.0/ebin"
+    if not image.is_dir() or not (seed / "manifest.term").is_file():
+        parser.error("a checkout application image and completed candidate manifest are required")
+    env = {**os.environ, "BL_ROOT": str(compiler_root), "BL_INSTALL_TARGET": str(root),
+           "BL_BOOTSTRAP_SEED": str(seed), "BL_DAEMON": "off"}
+    env.setdefault("ELIXIR_ERL_OPTIONS", "+S 4:4 +SDcpu 2:2 +SDio 1:1")
+    tag = subprocess.check_output(
+        ["elixir", "-e", 'IO.write("erts#{:erlang.system_info(:version)}-elixir#{System.version()}")'],
+        env=env, text=True)
+    cache = Path(env.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "beam_lisp/ebin"
+    paths = [*sorted((compiler_root / "deps").glob("*/ebin")),
+             *sorted((compiler_root / "_build").glob("*/lib/*/ebin")),
+             *sorted(cache.glob(f"*-{tag}/ebin"))]
+    command = ["elixir"]
+    for path in dict.fromkeys(p.resolve() for p in paths):
+        command += ["-pa", str(path)]
+    command += ["-pa", str(image)]
+    with tempfile.TemporaryDirectory(prefix="bl-install-seed-") as temporary:
+        target_image = Path(temporary) / "beam_lisp-0.1.0"
+        target_image.mkdir()
+        (target_image / "ebin").symlink_to(image, target_is_directory=True)
+        (target_image / "priv").symlink_to(root / "priv", target_is_directory=True)
+        env["BL_INSTALL_IMAGE"] = str(target_image / "ebin")
+        driver = Path(temporary) / "install.exs"
+        driver.write_text(DRIVER)
+        return subprocess.run([*command, str(driver)], cwd=compiler_root, env=env).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
