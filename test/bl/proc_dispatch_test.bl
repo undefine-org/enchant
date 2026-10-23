@@ -27,7 +27,7 @@
    (is (= {:running 1 :queued 1} (dispatch/stats server)))
    (let [entry (elem (first (ets/lookup :dispatch-capacity-test :second)) 1)
          before (ets/info :beam_lisp_code_leases :size)]
-    (is (map? (:registration entry)))
+    (is (= :bl-execution (elem (:registration entry) 0)))
     (is (nil? (:registrations entry)))
     (is (= :duplicate (:status (dispatch/submit! server (make-job :second)))))
     (is (= :busy (:status (dispatch/submit! server (make-job :third)))))
@@ -137,7 +137,7 @@
    (throw (ex-info "fixture did not index" {})))
   {:prepared prepared :request request :reserved reserved}))
 
-(deftest handoff-refuses-noncallable-invokers-before-indexing
+(deftest handoff-refuses-fabricated-native-targets-before-indexing
  (let [server (start dispatch/dispatcher (opts :dispatch-invoker-shape-test))
        request (admission/token (erlang/self) 10000)
        reserved (call server [:reserve {:id :shape :request request :replay-safe? false
@@ -147,8 +147,8 @@
   (try
    (is (= :invalid-dispatch-handoff
         (:kind (call server [:prepare :shape (:ticket reserved)
-                 (-> prepared (assoc-in [:source :invoke] nil)
-                              (assoc-in [:accepted :invoke] nil))]))))
+                 (assoc prepared :accepted
+                   (tuple :bl-execution (:owner reserved) (erlang/make_ref)))]))))
    (is (nil? (:registration (elem (first (ets/lookup :dispatch-invoker-shape-test :shape)) 1))))
    (is (= :cancelled (:status (call server [:abort :shape (:ticket reserved)]))))
    (is (= 0 (ets/info :dispatch-invoker-shape-test :size)))
@@ -236,7 +236,7 @@
 (defn- fault-reached [stage]
  (receive [:handoff-fault seen] :when (= seen stage) true (after 10000 false)))
 
-(deftest killed-native-move-recovers-after-target-insert-and-partial-source-delete
+(deftest killed-native-move-distinguishes-unaccepted-target-from-accepted-payload
  (let [directory (str (System/get_env "HOME") "/tmp/bl-dispatch-fault-"
                      (erlang/unique_integer (list :positive)))
        env-path (code/which :Elixir.BeamLisp.Env)]
@@ -251,15 +251,18 @@
                                   (fn [[event _]] (when (= :run event) (swap! runs inc))))
                            prepared (:prepared slot)]
                       (erlang/apply PROBE :handoff_code!
-                        (list (get-in prepared [:source :lease]) (get-in prepared [:accepted :lease])
+                        (list (:lease (BeamLisp.Env/execution_registration_state (:source prepared)))
+                              (:lease (BeamLisp.Env/execution_registration_state (:accepted prepared)))
                           (assoc (:request slot) :observer parent :fault-stage stage))))))]
      (try
       (is (fault-reached stage))
       (is (await #(not (Process/alive? producer))))
-      (is (await #(= 1 @runs)))
+      ;; Physical scratch rows alone do not admit a callback. Promotion of
+      ;; the private pending payload is the native acceptance boundary.
+      (is (await #(= (if (= :after-target stage) 0 1) @runs)))
       (is (await #(idle? server)))
       (is (= 0 (ets/info table :size)))
-      (is (= 1 @runs))
+      (is (= (if (= :after-target stage) 0 1) @runs))
       (is (= env-path (code/which :Elixir.BeamLisp.Env)))
       (finally (when (Process/alive? producer) (Process/exit producer :kill)) (stop server)))))
    (finally (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))

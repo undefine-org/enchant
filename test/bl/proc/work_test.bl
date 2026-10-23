@@ -15,6 +15,8 @@
     (is (wait-for (fn [] (= :cancelled (:status (first (work/snapshot owner)))))))
     (let [row (first (work/snapshot owner))]
      (is (not (contains? row :pid))) (is (not (contains? row :secret)))
+     (is (not (contains? row :source-registration)))
+     (is (not (contains? row :target-registration)))
      (is (number? (:cancel-ms row))))
     (is (= false (:ok (work/cancel! owner "foreign")))))
    (finally (work/stop! owner)))
@@ -74,3 +76,32 @@
    (is (wait-for (fn [] (= 2 (count (owner/members realm))))))
    (finally (work/stop! controller)))
   (is (wait-for (fn [] (empty? (owner/members realm)))))))
+
+(deftest submitter-death-before-receiver-acceptance-cannot-start-private-work
+ (let [controller (work/start!) called (atom false)
+       producer (atom nil) suspended (atom true)]
+  (try
+   (erlang/apply :sys :suspend (list controller))
+   (reset! producer (spawn #(work/submit! controller {} (fn [_] (reset! called true)))))
+   ;; Suspend the actual receiver so the queued offer is observable before
+   ;; its acceptance turn. No fabricated receipt or sleep-based race fixture.
+   (is (wait-for (fn []
+         (some (fn [envelope]
+                 (and (tuple? envelope) (= 3 (erlang/tuple_size envelope))
+                      (= :"$gen_call" (elem envelope 0))
+                      (= :submit (first (elem envelope 2)))))
+               (elem (Process/info controller :messages) 1)))))
+   (let [source @producer monitor (Process/monitor source)]
+    (erlang/exit source :kill)
+    (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid source)) true
+          (after 5000 false))))
+   (erlang/apply :sys :resume (list controller))
+   (reset! suspended false)
+   ;; This call follows the queued submit in the receiver's mailbox.
+   (is (= [] (work/snapshot controller)))
+   (is (= false @called))
+   (is (Process/alive? controller))
+   (finally
+    (when @suspended (erlang/apply :sys :resume (list controller)))
+    (when (and @producer (Process/alive? @producer)) (erlang/exit @producer :kill))
+    (work/stop! controller)))))
