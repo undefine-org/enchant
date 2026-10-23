@@ -5841,7 +5841,7 @@
  (let [frame (erlang/get (:counter-frame state))]
   (BeamLisp.CompilerData/constructor_data_cost! value
    {:callables (Map/get frame :callables {}) :recipe-frame (:counter-frame state)
-    :recipes (Map/get frame :recipes {})})))
+    :recipes (Map/get frame :recipes {}) :exceptions (Map/get frame :exceptions {})})))
 
 (defn- constructor_map_shape! [value state]
  ;; A plain map may contain machine-owned callables. Struct-backed containers
@@ -6589,6 +6589,145 @@
 (declare constructor_interpret)
 (declare constructor_primitive)
 
+(defn- constructor_source_exception? [kind reason state]
+ (and (= :throw kind) (erlang/is_tuple reason) (= 3 (erlang/tuple_size reason))
+      (= :bl_constructor_source_exception (elem reason 0))
+      (erlang/=:= (:counter-frame state) (elem reason 1))))
+
+(defn- constructor_guard_signal? [kind reason state]
+ (and (= :throw kind)
+      (erlang/=:= reason (tuple :bl_constructor_guard_failed (:counter-frame state)))))
+
+(defn- constructor_abort! [state]
+ (let [key (:counter-frame state) frame (erlang/get key)]
+  (when (erlang/is_map frame) (erlang/put key (Map/put frame :aborted true)))))
+
+(defn- constructor_exception_cost! [value state]
+ ;; A raised datum may contain finite tuples, owned pure callables and this
+ ;; frame's normalized exceptions, never recipes or foreign resources.
+ (when (constructor_recipe_present! value state) (constructor_refuse :opaque-exception-recipe))
+ (let [frame (erlang/get (:counter-frame state))
+       cost (BeamLisp.CompilerData/constructor_data_cost! value
+              {:callables (Map/get frame :callables {}) :recipes {} :recipe-frame nil
+               :exceptions (Map/get frame :exceptions {})})]
+  (constructor_walk_steps! state (:nodes cost)) cost))
+
+(defn- constructor_exception_frames [frames state]
+ ;; Retain actual VM module/function/arity and file/line. Arguments and
+ ;; error_info can contain callbacks or drive Exception's format_error hook.
+ ;; They never become Source-visible exception data or normalizer inputs.
+ (when-not (and (erlang/is_list frames) (<= (erlang/length frames) 64))
+  (constructor_refuse :exception-stack-budget))
+ (let [projected (Enum/map frames
+                  (fn [frame]
+                   (when-not (and (erlang/is_tuple frame) (= 4 (erlang/tuple_size frame))
+                                  (erlang/is_atom (elem frame 0)) (erlang/is_atom (elem frame 1))
+                                  (or (erlang/is_integer (elem frame 2)) (erlang/is_list (elem frame 2)))
+                                  (erlang/is_list (elem frame 3)))
+                    (constructor_refuse :exception-stack-domain))
+                   (tuple (elem frame 0) (elem frame 1)
+                     (if (erlang/is_integer (elem frame 2)) (elem frame 2) (erlang/length (elem frame 2)))
+                     (Keyword/take (elem frame 3) (list :file :line)))))]
+  (constructor_exception_cost! projected state) projected))
+
+(defn- constructor_signal_exception! [kind reason frames state]
+ (when-not (contains? #{:error :throw :exit} kind) (constructor_refuse :exception-class))
+ (constructor_exception_cost! reason state)
+ (let [projected (constructor_exception_frames frames state)]
+  (erlang/throw (tuple :bl_constructor_source_exception (:counter-frame state)
+                       (tuple kind reason projected)))))
+
+(defn- constructor_control_exception! [kind reason state]
+ ;; Capture the actual interpreter VM site without executing Source's exit or
+ ;; error operation natively. The only native error here has a fixed reason.
+ (let [frames (try (erlang/error :constructor_source_site)
+               (catch-raw [k r stack] stack))]
+  (constructor_signal_exception! kind reason frames state)))
+
+(defn- constructor_register_exception! [value state]
+ (when-not (and (erlang/is_map value) (erlang/is_atom (Map/get value :__struct__))
+                (= true (Map/get value :__exception__)))
+  (constructor_refuse :exception-normalization-domain))
+ (let [key (:counter-frame state) owned (Map/get (erlang/get key) :exceptions {})]
+  (when-not (Map/has_key? owned value)
+   (when (>= (erlang/map_size owned) 4096) (constructor_refuse :exception-value-budget))
+   (constructor_exception_cost! (Map/delete value :__struct__) state)
+   (constructor_allocation! 2 0 state)
+   (erlang/put key (Map/put (erlang/get key) :exceptions (Map/put owned value true)))))
+ value)
+
+(defn- constructor_raise_payload! [value state]
+ ;; This exact language operation deliberately raises Source data. It is not
+ ;; an infrastructure failure even if its ExInfo data resembles a refusal.
+ (let [owned (Map/get (erlang/get (:counter-frame state)) :exceptions {})]
+  (when-not (Map/has_key? owned value)
+   (BeamLisp.CompilerData/check_first_order! value (Map/get state :data-limits {}))
+   (let [cost (constructor_exception_cost! value state)]
+    (constructor_allocation! (+ 16 (* 8 (:nodes cost))) (+ 16 (* 8 (:bytes cost))) state)))
+  (try (BeamLisp.ExInfo/raise_payload value)
+   (catch-raw [kind reason frames]
+    (constructor_register_exception! reason state)
+    (constructor_signal_exception! kind reason frames state)))))
+
+(defn- constructor_native_failure! [kind reason frames state]
+ (let [data (when (erlang/is_map reason) (BeamLisp.ExInfo/ex_data reason))
+       refused? (and (erlang/is_map data)
+                     (contains? #{:constructor-machine-refused :unsafe-first-order-data} (:kind data)))
+       frame (erlang/get (:counter-frame state))]
+  (cond
+   (or (:aborted frame) (constructor_source_exception? kind reason state)
+       (constructor_guard_signal? kind reason state)) (erlang/raise kind reason frames)
+   refused? (do (constructor_abort! state) (erlang/raise kind reason frames))
+   :else (do
+           (when (and (erlang/is_map reason) (= true (Map/get reason :__exception__)))
+            (constructor_register_exception! reason state))
+           (constructor_signal_exception! kind reason frames state)))))
+
+(defn- constructor_native_operation [operation state]
+ (try (operation)
+  (catch-raw [kind reason frames] (constructor_native_failure! kind reason frames state))))
+
+(defn- constructor_capture [operation state]
+ ;; Only an owned Source exception reaches a user handler or cleanup. Every
+ ;; machine failure propagates immediately, skipping Source control flow.
+ (try (let [value (operation)]
+        (when (:aborted (erlang/get (:counter-frame state))) (constructor_refuse :constructor-aborted))
+        (tuple :ok value))
+  (catch-raw [kind reason frames]
+   (if (and (not (:aborted (erlang/get (:counter-frame state))))
+            (constructor_source_exception? kind reason state))
+    (tuple :raised (elem reason 2))
+    (erlang/raise kind reason frames)))))
+
+(defn- constructor_resume [outcome state]
+ (if (= :ok (elem outcome 0)) (elem outcome 1)
+  (let [exception (elem outcome 1)]
+   (constructor_signal_exception! (elem exception 0) (elem exception 1) (elem exception 2) state))))
+
+(defn- constructor_normalize_exception [kind reason frames state]
+ (if (not= :error kind) reason
+  (let [key (:counter-frame state) frame (erlang/get key)
+        owned (Map/get frame :exceptions {})]
+   (if (Map/has_key? owned reason) reason
+    (let [cost (constructor_exception_cost! reason state)
+          projected (constructor_exception_frames frames state)]
+     (when (>= (erlang/map_size owned) 4096) (constructor_refuse :exception-value-budget))
+     ;; Conservative formatting/allocation reserve, before the normalizer can
+     ;; inspect bounded data. The projected stack contains no format hook.
+     (constructor_allocation! (+ 32 (* 8 (:nodes cost))) (+ 32 (* 8 (:bytes cost))) state)
+     (constructor_register_exception! (Elixir.Exception/normalize kind reason projected) state))))))
+
+(defn- constructor_boundary_raise! [kind reason frames state]
+ (if (constructor_source_exception? kind reason state)
+  (let [exception (elem reason 2)]
+   ;; No owned callable or internal exception object crosses a failed request
+   ;; as data. Ordinary first-order Source failures retain their catch class.
+   (BeamLisp.CompilerData/constructor_data_cost! (elem exception 1)
+    {:callables {} :recipes {} :recipe-frame nil
+     :exceptions (Map/get (erlang/get (:counter-frame state)) :exceptions {})})
+   (erlang/raise (elem exception 0) (elem exception 1) (elem exception 2)))
+  (erlang/raise kind (constructor_diagnostic_error reason nil) frames)))
+
 (defn- constructor_truthy? [v] (and (not (nil? v)) (not (= false v))))
 
 (defn- constructor_guard_pass? [guard env state]
@@ -6612,7 +6751,7 @@
   (catch-raw [kind reason stack]
    (let [ticket (:guard-failure-ticket state) arity (count args)]
     (if (and ticket (erlang/=:= ticket (:counter-frame state))
-             (= :error kind) (contains? #{:badarg :badarith} reason)
+             (= :error kind)
              (= :erlang module)
              (or (erl_internal/guard_bif function arity)
                  (erl_internal/arith_op function arity)
@@ -6675,6 +6814,21 @@
                  [cl b]))))]
     (if (nil? hit) (on-fail) (constructor_interpret (:body (first hit)) (second hit) state))))
 
+(defn- constructor_try [node env state]
+ (let [body (constructor_capture (fn [] (constructor_interpret (:body node) env state)) state)
+       caught (if (or (= :ok (elem body 0)) (empty? (:catch node))) body
+                (let [exception (elem body 1)
+                      handler-env (assoc env "__STACKTRACE__" (elem exception 2)
+                                             "__STACKTRACE_RAW__" (elem exception 2))]
+                 (constructor_capture
+                  (fn [] (constructor_match_clauses (:catch node)
+                           (list (elem exception 0) (elem exception 1)) handler-env
+                           (fn [] (constructor_resume body state)) state)) state)))]
+  ;; A machine refusal never became an outcome, so it cannot reach this Source
+  ;; cleanup. A handler's Source exception can; cleanup may replace it normally.
+  (when (some? (:after node)) (constructor_interpret (:after node) env state))
+  (constructor_resume caught state)))
+
 (defn- constructor_invoke [function args state]
  (when (and (not (erlang/is_function function))
              (not (and (erlang/is_tuple function) (= 3 (erlang/tuple_size function))
@@ -6724,6 +6878,7 @@
          [:erlang :is_atom 1] [:erlang :is_binary 1] [:erlang :is_integer 1]
          [:erlang :is_number 1] [:erlang :is_list 1] [:erlang :is_map 1] [:erlang :is_tuple 1]
          [:erlang :tuple_size 1] [:erlang :map_size 1] [:erlang :length 1]
+         [:erlang :is_map_key 2] [:erlang :map_get 2]
          [:erlang :element 2] [:erlang :hd 1] [:erlang :tl 1]
          [:erlang :tuple_to_list 1] [:erlang :list_to_tuple 1]}
        primitive-name (Atom/to_string function) rest? (String/ends_with? primitive-name "__bl_v")
@@ -6758,6 +6913,14 @@
         (or (nil? (first args)) (nil? (second args))))
     (erlang/apply module function args)
    (contains? pure-bifs target) (constructor_admitted_bif module function args state)
+   (= target [:Elixir.BeamLisp.ExInfo :raise_payload 1]) (constructor_raise_payload! (first args) state)
+   (= target [:erlang :throw 1]) (constructor_control_exception! :throw (first args) state)
+   (= target [:erlang :error 1]) (constructor_control_exception! :error (first args) state)
+   (= target [:erlang :exit 1]) (constructor_control_exception! :exit (first args) state)
+   (= target [:erlang :raise 3])
+    (constructor_signal_exception! (first args) (second args) (nth args 2) state)
+   (= target [:Elixir.Exception :normalize 3])
+    (constructor_normalize_exception (first args) (second args) (nth args 2) state)
    ;; Literal string substitution is pure. Macros such as `defrelation` build var
    ;; names with it at load; regex/function patterns stay refused.
    (and (= target [:Elixir.String :replace 3]) (every? (fn [x] (erlang/is_binary x)) args)
@@ -6771,6 +6934,10 @@
     (String/starts_with? (first args) (second args))
    (= module :Elixir.BeamLisp.Ns.Core)
     (case primitive-name
+     "ex-info" (do (constructor_allocation! 40 0 state)
+                   (constructor_register_exception! (BeamLisp.ExInfo/ex_info (first args) (second args)) state))
+     "ex-data" (BeamLisp.ExInfo/ex_data (first args))
+     "ex-original" (BeamLisp.ExInfo/ex_original (first args))
      "identity" (first args) "not" (not (constructor_truthy? (first args)))
      "nil?" (nil? (first args)) "some?" (some? (first args))
      "list?" (erlang/is_list (first args))
@@ -7022,11 +7189,11 @@
    (= target [:Elixir.BeamLisp.Vector :new 1]) (vec (constructor_sequence! (first args) state))
    (= target [:Elixir.BeamLisp.Set :new 1]) (BeamLisp.Set/new (constructor_sequence! (first args) state))
    :else (constructor_refuse {:remote target})))
-  (catch error
-   (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error target) __STACKTRACE__)))))
+  (catch-raw [kind reason frames]
+   (constructor_native_failure! kind (constructor_diagnostic_error reason target) frames state)))))
 
 (defn- constructor_pure_core_names []
- #{"identity" "not" "nil?" "some?" "list?" "seq?" "vector?" "map?" "set?"
+ #{"ex-info" "ex-data" "ex-original" "identity" "not" "nil?" "some?" "list?" "seq?" "vector?" "map?" "set?"
    "symbol?" "keyword?" "string?" "int?" "even?" "odd?" "zero?" "pos?" "neg?"
    "number?" "float?" "sorted?" "reduced?" "reduced" "deref" "gensym" "=" "not=" "inc" "dec" "first"
    "second" "rest" "next" "last" "nth" "count" "empty?" "seq" "vec" "to-list"
@@ -7036,7 +7203,7 @@
    "some" "every?" "reduce" "apply" "run!" "join"})
 
 (defn- constructor_core_arity! [name arity]
- (let [fixed {"identity" #{1} "not" #{1} "nil?" #{1} "some?" #{1} "list?" #{1}
+ (let [fixed {"ex-info" #{2} "ex-data" #{1} "ex-original" #{1} "identity" #{1} "not" #{1} "nil?" #{1} "some?" #{1} "list?" #{1}
               "vector?" #{1} "map?" #{1} "set?" #{1} "symbol?" #{1} "keyword?" #{1} "seq?" #{1}
               "string?" #{1} "int?" #{1} "even?" #{1} "odd?" #{1} "zero?" #{1}
               "pos?" #{1} "neg?" #{1} "number?" #{1} "float?" #{1} "sorted?" #{1} "reduced?" #{1} "reduced" #{1} "deref" #{1} "gensym" #{0 1} "not=" #{2} "inc" #{1} "dec" #{1}
@@ -7125,8 +7292,11 @@
    :invoke (let [callee (constructor_interpret (:callee n) env state)
                  arguments (constructor_interpret (:arguments n) env state)]
              (when-not (erlang/is_list arguments) (constructor_refuse :invocation-arguments))
-             (constructor_invoke callee (constructor_sequence! arguments state) state))
-   :apply (constructor_invoke (constructor_interpret (:fn n) env state) (Enum/map (:args n) #(constructor_interpret % env state)) state)
+             (constructor_native_operation
+              (fn [] (constructor_invoke callee (constructor_sequence! arguments state) state)) state))
+   :apply (let [callee (constructor_interpret (:fn n) env state)
+                arguments (Enum/map (:args n) #(constructor_interpret % env state))]
+            (constructor_native_operation (fn [] (constructor_invoke callee arguments state)) state))
    :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
    :if (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
    :do (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state)))
@@ -7147,11 +7317,13 @@
               (when-not (and (= :items key) (erlang/is_tuple value)) (constructor_refuse :vector-scaffold))
               (BeamLisp.Vector/new (erlang/tuple_to_list value)))
              (constructor_refuse :opaque-struct))
-   :case (constructor_match_clauses (:clauses n) (list (constructor_interpret (:subj n) env state)) env
-            (fn [] (constructor_refuse :case-clause)) state)
+   :try (constructor_try n env state)
+   :case (let [subject (constructor_interpret (:subj n) env state)]
+           (constructor_match_clauses (:clauses n) (list subject) env
+            (fn [] (constructor_control_exception! :error (tuple :case_clause subject) state)) state))
    :fn (let [_ (constructor_charge! env state) clauses (:clauses n) arity (count (:pats (first clauses)))
              run (fn [args]
-              (try (constructor_match_clauses clauses args env (fn [] (constructor_refuse :function-clause)) state)
+              (try (constructor_match_clauses clauses args env (fn [] (constructor_control_exception! :error :function_clause state)) state)
                (catch error
                 (let [data (ex-data error) binding (:constructor-binding n)
                       context (constructor_context)
@@ -7197,12 +7369,17 @@
   (when (and (or (erlang/is_number value) (erlang/is_binary value))
              (> (erlang/external_size value) 1048576)) (constructor_refuse :scalar-size-budget))
   value)
+ (catch-raw [kind reason frames]
+  (when-not (or (constructor_source_exception? kind reason state)
+                (constructor_guard_signal? kind reason state))
+   (constructor_abort! state))
+  (erlang/raise kind reason frames))
  (finally (constructor_counter! state :depth -1))))
 
 (defn- constructor_counters []
  {:remaining 1000000 :walk-steps 16000000 :depth 0 :allocation-nodes 1000000
   :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096
-  :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
+  :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {} :exceptions {} :aborted false})
 
 (defn interpret_constructor!
  [expression locals metadata]
@@ -7214,10 +7391,11 @@
   (when-not shared (erlang/put key (constructor_counters)))
   (try
    (let [result (constructor_interpret expression locals state)]
+    (when (:aborted (erlang/get (:counter-frame state))) (constructor_refuse :constructor-aborted))
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
     (BeamLisp.CompilerData/check_first_order! result (Map/get state :data-limits {})) result)
-   (catch error
-    (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
+   (catch-raw [kind reason frames]
+    (constructor_boundary_raise! kind reason frames state))
    (finally (when-not shared (erlang/erase key))))))
 
 (defn- constructor_sessions []
@@ -7274,12 +7452,13 @@
    (constructor_walk_steps! state (:nodes (BeamLisp.CompilerData/first_order_cost! expression limits)))
    (constructor_walk_steps! state (:nodes (BeamLisp.CompilerData/first_order_cost! locals limits)))
    (let [result (constructor_interpret expression locals state)]
+    (when (:aborted (erlang/get (:counter-frame state))) (constructor_refuse :constructor-aborted))
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
     (BeamLisp.CompilerData/check_first_order! result limits)
     (Process/put :bl_contextual_constructor_sessions
      (Map/put (constructor_sessions) handle (assoc session :status :succeeded))) result)
-   (catch error
-    (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
+   (catch-raw [kind reason frames]
+    (constructor_boundary_raise! kind reason frames state))
    (finally
     (let [spent (erlang/erase child) current (constructor_session! handle)]
      (Process/put :bl_contextual_constructor_sessions

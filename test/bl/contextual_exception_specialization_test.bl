@@ -1,0 +1,50 @@
+(ns contextual-exception-specialization-test
+ (:require [expand :as x] [lower :as lower] [anf :as anf] [system.phase :as phase]
+           [codebase.refactor :as refactor]))
+
+(defn- provider []
+ {:namespace 'validation :revision 'current :file "validation.bl"
+  :source (File/read! "test/fixtures/contextual-validation/validation.bl")})
+(defn- client []
+ {:namespace 'showcase :revision 'current :file "main.bl"
+  :source (File/read! "test/fixtures/contextual-validation/main.bl")})
+(defn- nodes [node] (cons node (Enum/flat_map (anf/executable-children node) nodes)))
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ExceptionSpecialization." (erlang/unique_integer (list :positive))))
+  (:node program)))
+
+(deftest archived-private-values-and-handlers-specialize-bracket-literals
+ (let [archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [(provider)])))
+       program (x/program [(client)] ['showcase 'current] [archive])
+       runtime (nodes (:node program))
+       biases (Enum/filter (Map/values (get-in program [:selection :by-id])) #(= 'bias (:name %)))]
+  (is (= [42 99 42] (execute program)))
+  (is (= :proved (:status (phase/check program))))
+  (is (= 3 (count (:expansions program))))
+  (is (= :closed (get-in program [:constructor :status])))
+  (is (= 4 (get-in program [:constructor :calls])))
+  (is (empty? (:linked program)))
+  (is (= #{0 1} (set (Enum/map biases #(:phase %)))))
+  (is (= 2 (count (set (Enum/map biases #(:id %))))))
+  (is (not (some #(= :try (:op %)) runtime)))
+  (is (not (some #(and (= :remote (:op %)) (= :erlang (:mod %)) (= :div (:fun %))) runtime)))
+  (is (= false (get-in (phase/check program) [:native-admission])))))
+
+(deftest checked-renaming-cannot-change-the-providers-phase-one-bias
+ (let [sources [(provider) (client)]
+       program (x/program sources ['showcase 'current])
+       target (Enum/find (Map/values (get-in program [:selection :by-id]))
+                #(and (= 'bias (:name %)) (= :local (:visibility %)) (= 0 (:phase %))))
+       renamed (refactor/rename-program sources ['showcase 'current] (:id target) 'adjustment)]
+  (is (= :verified (:status renamed)))
+  (is (= 2 (count (:edits renamed))))
+  (is (= [42 99 42] (execute (:program renamed))))))
+
+(deftest malformed-bracket-input-produces-a-source-exception
+ (doseq [call ["(ratio [80 2] 99 :discarded)" "(ratio [80] 99)" "(ratio [:bad 2] 99)"]]
+  (let [source {:namespace 'client :revision 'current :file "client.bl"
+                :source (str "(ns client) (import-world 'validation 'current :only [ratio]) " call)}
+        outcome (try (x/program [(provider) source] ['client 'current]) :accepted
+                  (catch error [(:__struct__ error) (:message error)]))]
+   (is (= :Elixir.BeamLisp.ExInfo (first outcome)))
+   (is (String/contains? (second outcome) "ratio")))))
