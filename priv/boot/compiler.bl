@@ -2100,11 +2100,34 @@
             after-pat (rest fs)
             gb (split-when after-pat env)      ; [guard-or-nil rest]
             guard (first gb)
+            guarded? (nth gb 2)
             body-and-more (second gb)
             _ (when (and (some? guard) (empty? body-and-more)) (compile-error env "a receive clause needs a body after its `:when` guard"))
             body (first body-and-more)]
         (recur (rest body-and-more)
-               (cons {:pattern pattern :guard guard :body body} acc))))))
+               (cons {:pattern pattern :guard guard :guarded? guarded? :body body} acc))))))
+
+(defn receive-layout
+  "Project the canonical receive grammar onto original Reader item indexes.
+   Contextual expansion uses these roles to scope syntax without reparsing
+   clauses. Compilation consumes the same parsed pattern/guard/body records."
+  [forms env]
+  (let [indexed (Enum/map (Enum/with_index forms) (fn [pair] [(elem pair 1) (elem pair 0)]))
+        afters (Enum/filter indexed (fn [pair] (after-clause-form? (second pair))))
+        normal (Enum/filter indexed (fn [pair] (not (after-clause-form? (second pair)))))
+        parsed (receive-clause-forms (apply list (map second normal)) env)
+        clauses
+        (loop [remaining parsed positions normal output (list)]
+          (if (empty? remaining) (reverse output)
+            (let [clause (first remaining) guarded? (:guarded? clause)
+                  body-offset (if guarded? 3 1)]
+              (recur (rest remaining) (Enum/drop positions (inc body-offset))
+                (cons (assoc clause
+                        :pattern-index (first (first positions))
+                        :guard-index (when guarded? (first (nth positions 2)))
+                        :body-index (first (nth positions body-offset nil))) output)))))]
+    {:clauses clauses :after-forms (apply list (map second afters))
+     :after-indexes (apply list (map first afters))}))
 
 (defn- compile-receive
   "Compile (receive pattern body... (after ms body)) into an Elixir receive.
@@ -2114,16 +2137,16 @@
    sharing the clause's body. A `:when` guard rides on the clause head. An
    optional `(after ms body)` becomes the receive timeout."
   [forms env]
-  (let [after-forms (filter (fn [form] (after-clause-form? form)) forms)
-        normal (filter (fn [f] (not (after-clause-form? f))) forms)
-        clauses (receive-clause-forms normal env)
+  (let [layout (receive-layout forms env)
+        after-forms (:after-forms layout)
+        clauses (:clauses layout)
         ; each clause -> one ANF clause per pattern alternative
         do-clauses (apply list
                      (mapcat (fn [cl]
                                (let [pr (compile-pattern (:pattern cl) env)
                                      pats (first pr)
                                      pat-env (second pr)
-                                     guard-node (if (nil? (:guard cl)) nil
+                                     guard-node (when (:guarded? cl)
                                                   (compile-guard (:guard cl) pat-env))
                                      body-node (compile-node (:body cl) pat-env)]
                                  (map (fn [pat]
@@ -2378,6 +2401,13 @@
    guard-special."
   (kernel-guard-bifs-literal))
 
+(defn guard-operator?
+  "The canonical restricted guard dialect; these are compiler operators,
+   not ordinary variable references or macro calls."
+  [name]
+  (or (contains? #{"and" "or" "not"} name)
+      (contains? (kernel-guard-bifs-literal) name)))
+
 (defn- g-and
   "Strict boolean AND of two guard nodes (the if-chain the normaliser uses
    for quoted `and`)."
@@ -2531,7 +2561,7 @@
     (cond
       (= tag :symbol)
         (if (local? env (rn/node-name f))
-          (a/var (local-var env (rn/node-name f)))
+          (compile-symbol (rn/node-name f) env)
           (compile-error env (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
       (= tag :keyword) (a/lit (erlang/binary_to_atom (rn/node-name f)))
       (= tag :list) (compile-guard-list (rn/node-items f) env)
@@ -2700,7 +2730,8 @@
 (defn- split-when
   "Split a clause's forms into [guard body] at a leading `:when`.
 
-   `(:when g rest...)` -> [g (rest...)]; forms with no `:when` -> [nil forms].
+   `(:when g rest...)` -> [g (rest...) true]; otherwise [nil forms false].
+   The flag distinguishes a literal nil guard from the absence of a guard.
    The guard is the test that must hold before the body runs. A DANGLING
    `:when` — one with no guard expression after it — is refused here (rather
    than silently read as a body form) so `(defn f [x] :when)` is a clear
@@ -2712,8 +2743,8 @@
            (= "when" (rn/node-name (rn/node-form (first forms)))))
     (if (empty? (rest forms))
       (compile-error env "`:when` must be followed by a guard expression")
-      (list (server-clause/guard-node (second forms) (rn/node-pos (first forms))) (rest (rest forms))))
-    (list nil forms)))
+      (list (server-clause/guard-node (second forms) (rn/node-pos (first forms))) (rest (rest forms)) true))
+    (list nil forms false)))
 
 (defn- parse-fn-clauses
   "Pull the clauses out of a (fn ...) form's arguments.

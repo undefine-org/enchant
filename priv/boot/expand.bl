@@ -146,6 +146,78 @@
  ;; The initial expression adapter admits only the existing erlang qualifier.
  (let [name (spelling node)] (and name (String/starts_with? name "erlang/"))))
 
+(defn- match-node [node state]
+ ;; Matching and parameter destructuring have different map grammars. Keep
+ ;; this adapter literal: actual pattern alternatives stay in Compiler.
+ (let [state (tick state)]
+  (cond
+   (s/identifier? node)
+    (if (= "&" (spelling node)) (refuse! :unsupported-contextual-match node)
+      (bind-symbol node state))
+   (contains? #{:scalar :keyword} (:tag node)) (tuple (as-reader node) state)
+   (= :vector (:tag node))
+    (let [r (Enum/map_reduce (:children node) state match-node)]
+     (tuple (tuple :vector (elem r 0)) (elem r 1)))
+   (= :map (:tag node))
+    (let [r (Enum/map_reduce (:children node) state
+              (fn [pair current]
+               (when-not (= :keyword (:tag (first pair)))
+                (refuse! :unsupported-contextual-match-key (first pair)))
+               (let [r (match-node (second pair) current)]
+                (tuple (tuple (as-reader (first pair)) (elem r 0)) (elem r 1)))))]
+     (tuple (tuple :map (elem r 0)) (elem r 1)))
+   :else (refuse! :unsupported-contextual-match node))))
+
+(defn- guard-node [node state]
+ (let [state (tick state)]
+  (cond
+   (s/identifier? node) (reference-reader node (resolve-symbol node state) state false)
+   (contains? #{:scalar :keyword} (:tag node)) (tuple (as-reader node) state)
+   (= :list (:tag node))
+    (let [head (first (:children node)) name (spelling head)]
+     (when-not (compiler/guard-operator? name)
+      (refuse! :unsupported-contextual-guard head))
+     (let [r (Enum/map_reduce (rest (:children node)) state guard-node)]
+      (tuple (list-reader node (cons (as-reader head) (elem r 0)))
+        (update (elem r 1) :native-obligations
+          #(cons {:name (:value head) :origin (:origin head) :kind :guard-intrinsic
+                  :phase (+ (:phase state) (Map/get state :reference-shift 0))} %)))))
+   :else (refuse! :unsupported-contextual-guard node))))
+
+(defn- receive-node [node state]
+ (let [forms (vec (rest (:children node)))
+       layout (compiler/receive-layout (Enum/map forms as-reader) (:origin node))
+       _ (when (> (count (:after-indexes layout)) 1)
+           (refuse! :contextual-receive-timeout-count node))
+       clauses
+       (Enum/reduce (:clauses layout) (tuple {} state)
+        (fn [clause acc]
+         (when (nil? (:body-index clause)) (refuse! :contextual-receive-body node))
+         (let [allocated (fresh-scope (elem acc 1) :lexical) scope (elem allocated 0)
+               contextual (fn [index] (s/add-scope (nth forms index) (:id scope) :all))
+               pattern (match-node (contextual (:pattern-index clause)) (elem allocated 1))
+               guard (if (some? (:guard-index clause))
+                       (guard-node (contextual (:guard-index clause)) (elem pattern 1))
+                       (tuple nil (elem pattern 1)))
+               body (expression-node (contextual (:body-index clause)) (elem guard 1))
+               output (-> (elem acc 0)
+                          (assoc (:pattern-index clause) (elem pattern 0))
+                          (assoc (:body-index clause) (elem body 0)))
+               output (if (some? (:guard-index clause))
+                        (assoc output (:guard-index clause) (elem guard 0)) output)]
+          (tuple output (elem body 1)))))
+       timeout
+       (Enum/reduce (:after-indexes layout) clauses
+        (fn [index acc]
+         (let [form (nth forms index) children (:children form)]
+          (when-not (= 3 (count children)) (refuse! :contextual-receive-timeout-arity form))
+          (let [r (expression-nodes (rest children) (elem acc 1))]
+           (tuple (assoc (elem acc 0) index
+                    (list-reader form (cons (as-reader (first children)) (elem r 0)))) (elem r 1))))))
+       output (Enum/map (Enum/with_index forms)
+                (fn [pair] (Map/get (elem timeout 0) (elem pair 1) (as-reader (elem pair 0)))))]
+  (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem timeout 1))))
+
 (defn- macro-node [node result state]
  (when (or (<= (Map/get state :macro-budget 0) 0) (>= (Map/get state :macro-depth 0) 64))
   (refuse! :contextual-macro-budget node))
@@ -253,6 +325,7 @@
       (and kernel? (= "syntax-literal" name)) (literal-node node state)
       (and kernel? (contains? #{"let" "let*" "loop" "loop*"} name)) (let-node node state)
       (and kernel? (contains? #{"fn" "fn*"} name)) (fn-node node state)
+      (and kernel? (= "receive" name)) (receive-node node state)
       (and kernel? (contains? #{"if" "do" "recur" "throw"} name))
        (let [r (expression-nodes (rest children) state)]
         (tuple (list-reader node (cons (as-reader head) (elem r 0))) (elem r 1)))
