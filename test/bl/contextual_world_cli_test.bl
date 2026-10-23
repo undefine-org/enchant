@@ -1,0 +1,185 @@
+(ns contextual-world-cli-test
+ (:require [bl.world :as world] [expand :as expand] [bl.cli :as cli]))
+
+(defn- fixture [action]
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-world-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try (action dir) (finally (File/rm_rf! dir)))))
+(defn- write-manifest [dir manifest]
+ (let [path (Path/join dir "world.bl")]
+  ;; Whole-map quote and per-field quotes use the same actual compiler owner.
+  (File/write! path (str "'" (pr-str manifest))) path))
+(defn- manifest [sources libraries]
+ {:version 1 :profile 'syntax-v1 :entry ['showcase 'current] :sources sources :libraries libraries})
+(defn- client [] {:namespace 'showcase :revision 'current :file "main.bl"})
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- capture [action]
+ (let [previous (Process/group_leader) device (elem (StringIO/open "") 1)]
+  (try
+   (Process/group_leader (erlang/self) device)
+   (let [value (action)] [value (elem (StringIO/contents device) 1)])
+   (finally (Process/group_leader (erlang/self) previous) (StringIO/close device)))))
+
+(deftest ordinary-cli-prepares-the-quoted-world-bracket-showcase
+ (let [path "test/fixtures/contextual-validation/world.bl"
+       prepared (world/prepare path) report (world/describe prepared)
+       result (capture #(cli/run-argv (list "world" "run" path)))
+       checked (capture #(cli/run-argv (list "world" "check" path "--json")))]
+  (is (= ['showcase 'current] (get-in prepared [:manifest :entry])))
+  (is (= "proved" (:phase-check report)))
+  (is (= 2 (:worlds report)))
+  (is (= 3 (:expansions report)))
+  (is (= true (:constructor-closed report)))
+  (is (= false (:native-admission report)))
+  (is (= "unknown" (:native-effects report)))
+  (is (= "contextual-binding-resolution" (:phase-scope report)))
+  (is (= (get-in prepared [:phase :snapshot]) (get-in prepared [:facts :snapshot])))
+  (is (= 0 (first result)))
+  (is (= "[42 99 42]\n" (second result)))
+  (is (= 0 (first checked)))
+  (is (= "proved" (get (Jason/decode! (second checked)) "phase-check")))))
+
+(deftest archive-only-provider-is-a-normal-file-selection
+ (fixture
+  (fn [dir]
+   (let [provider {:namespace 'validation :revision 'current :file "validation.bl"
+                   :source (File/read! "test/fixtures/contextual-validation/validation.bl")}
+         archive (expand/encode-phase-library (expand/phase-library [provider]))
+         _ (File/write! (Path/join dir "validation.phase") archive)
+         _ (File/cp! "test/fixtures/contextual-validation/main.bl" (Path/join dir "main.bl"))
+         path (write-manifest dir (manifest [(client)] ["validation.phase"]))
+         prepared (world/prepare path)
+         module :Elixir.WorldCliArchiveFixture
+         _ (assert (= false (erlang/module_loaded module)))
+         pair (world/artifact prepared module)
+         attrs (Keyword/get (elem (elem (beam_lib/chunks (elem pair 1) (list :attributes)) 1) 1) :attributes)
+         bindings (erlang/binary_to_term (BeamLisp.AOT/normalized_attribute attrs :bl_contextual_bindings) (list :safe))]
+    (is (= false (File/exists? (Path/join dir "validation.bl"))))
+    (is (= [42 99 42] (world/execute prepared [])))
+    (is (= false (erlang/module_loaded module)))
+    (is (= module (elem pair 0)))
+    (is (= (get-in prepared [:facts :snapshot]) (:snapshot bindings)))
+    (is (= 3 (count (:expansions bindings))))))))
+
+(deftest every-bracket-showcase-has-an-ordinary-cli-entry
+ (try
+  (doseq [row [["language" "[42 102 42 42]\n"] ["query" "(4 6)\n"]
+               ["mailbox" "[42 107 99]\n"] ["cleanup" "[42 100 40 200]\n"]]]
+   (let [path (str "test/fixtures/contextual-" (first row) "/world.bl")
+         result (capture #(cli/run-argv (list "world" "run" path)))]
+    (is (= 0 (first result)))
+    (is (= (second row) (second result)))))
+  (finally (erlang/erase :contextual-cleanup-log))))
+
+(deftest checking-and-emitting-never-run-the-native-program
+ (fixture
+  (fn [dir]
+   (erlang/erase :world-cli-effect)
+   (try
+    (File/write! (Path/join dir "main.bl") "(ns showcase) (do (erlang/put :world-cli-effect 42) 42)")
+    (let [prepared (world/prepare (write-manifest dir (manifest [(client)] [])))
+          pair (world/artifact prepared :Elixir.WorldCliEffectFixture)]
+     (is (= "proved" (:phase-check (world/describe prepared))))
+     (is (= :undefined (erlang/get :world-cli-effect)))
+     (is (= false (erlang/module_loaded (elem pair 0))))
+     (is (= 42 (world/execute prepared ["argument"])))
+     (is (= 42 (erlang/get :world-cli-effect))))
+    (finally (erlang/erase :world-cli-effect))))))
+
+(deftest two-revisions-of-one-namespace-survive-the-file-adapter
+ (fixture
+  (fn [dir]
+   (File/write! (Path/join dir "old.bl") "(ns library) (defn answer [] 42)")
+   (File/write! (Path/join dir "new.bl") "(ns library) (defn answer [] 102)")
+   (File/write! (Path/join dir "main.bl")
+    (str "(ns showcase) (import-world 'library 'old :as old :only [answer]) "
+         "(import-world 'library 'new :as new :only [answer]) [(old/answer) (new/answer)]"))
+   (let [path (write-manifest dir (manifest
+                [{:namespace 'library :revision 'old :file "old.bl"}
+                 {:namespace 'library :revision 'new :file "new.bl"} (client)] []))
+         prepared (world/prepare path)]
+    (is (= 3 (:worlds (world/describe prepared))))
+    (is (= [42 102] (world/execute prepared [])))))))
+
+(deftest request-cwd-and-argv-remain-request-local
+ (fixture
+  (fn [dir]
+   (File/write! (Path/join dir "main.bl") "(ns showcase) (erlang/get :bl_argv)")
+   (write-manifest dir (manifest [(client)] []))
+   (let [before (BeamLisp/argv)
+         prepared (BeamLisp/with_cwd dir (fn [] (world/prepare "world.bl")))]
+    (is (= (list "first" "second") (world/execute prepared ["first" "second"])))
+    (is (= before (BeamLisp/argv)))))))
+
+(deftest changed-files-refuse-before-native-execution-or-emission
+ (fixture
+  (fn [dir]
+   (File/write! (Path/join dir "main.bl") "(ns showcase) 42")
+   (let [prepared (world/prepare (write-manifest dir (manifest [(client)] [])))]
+    (File/write! (Path/join dir "main.bl") "(ns showcase) 99")
+    (is (= :world-input-changed (kind-of #(world/execute prepared []))))
+    (is (= :world-input-changed (kind-of #(world/artifact prepared :Elixir.WorldCliChangedFixture))))
+    (is (= false (erlang/module_loaded :Elixir.WorldCliChangedFixture)))))))
+
+(deftest captured-file-bytes-use-the-existing-literate-and-shebang-adapter
+ (fixture
+  (fn [dir]
+   (doseq [row [["main.bl" "#!/usr/bin/env bl\n(ns showcase) 42"]
+                ["main.bl.org" "* Example\n#+begin_src beam-lisp\n(ns showcase) 42\n#+end_src\nOutside code.\n"]]]
+    (let [file (first row) raw (second row) source (Path/join dir file)
+          _ (File/write! source raw)
+          path (write-manifest dir (manifest [(assoc (client) :file file)] []))
+          prepared (world/prepare path)
+          captured (Enum/find (:inputs prepared) #(= source (:path %)))]
+     (is (= (crypto/hash :sha256 raw) (:digest captured)))
+     (is (= 42 (world/execute prepared [])))
+     (File/write! source (str raw "\n"))
+     (is (= :world-input-changed (kind-of #(world/execute prepared [])))))))))
+
+(deftest manifest-expressions-have-no-ambient-or-effect-authority
+ (fixture
+  (fn [dir]
+   (let [path (Path/join dir "world.bl")]
+    (erlang/erase :world-cli-manifest-effect)
+    (File/write! path "(erlang/put :world-cli-manifest-effect true)")
+    (is (= :constructor-machine-refused (kind-of #(world/read-manifest path))))
+    (is (= :undefined (erlang/get :world-cli-manifest-effect)))
+    (doseq [text ["42" "(fn [] 42)" "ambient-world-manifest" "{:version 1}" (str (String/duplicate " " 65536) "42")]]
+     (File/write! path text)
+     (is (thrown? (world/read-manifest path))))))))
+
+(deftest the-file-schema-does-not-coerce-string-worlds-or-accept-policy-flags
+ (fixture
+  (fn [dir]
+   (doseq [value [(assoc (manifest [] []) :entry ["showcase" "current"])
+                  (assoc (manifest [] []) :profile 'unknown)
+                  (assoc (manifest [] []) :trusted true)]]
+    (is (= :world-manifest (kind-of #(world/read-manifest (write-manifest dir value))))))
+   (is (= :world-source-row
+          (kind-of #(world/prepare (write-manifest dir (manifest [{:namespace "showcase" :revision 'current :file "missing.bl"}] []))))))
+   (is (= :world-file-table
+          (kind-of #(world/prepare (write-manifest dir (manifest :not-a-table [])))))))))
+
+(deftest manifest-forms-cannot-enter-namespace-or-declaration-compilation
+ (fixture
+  (fn [dir]
+   (let [path (Path/join dir "world.bl") before (BeamLisp.Env/current_ns)]
+    (doseq [text ["(ns world.manifest.unexpected)" "(require 'unavailable.world.manifest)"
+                  "(defrecord WorldManifestUnexpected [])"]]
+     (File/write! path text)
+     (is (= :unbound-identifier (kind-of #(world/read-manifest path)))))
+    (is (= before (BeamLisp.Env/current_ns)))))))
+
+(deftest cli-emission-is-exclusive-and-usage-errors-stay-usage-errors
+ (fixture
+  (fn [dir]
+   (let [output (Path/join dir "program.beam") path "test/fixtures/contextual-validation/world.bl"
+         emitted (capture #(cli/run-argv (list "world" "emit" path "--out" output)))
+         before (File/read! output)
+         second (capture #(cli/run-argv (list "world" "emit" path "--out" output)))]
+    (is (= 0 (first emitted)))
+    (is (= 1 (first second)))
+    (is (= before (File/read! output)))
+    (is (= 2 (first (capture #(cli/run-argv (list "world" "emit" path))))))
+    (is (= 2 (first (capture #(cli/run-argv (list "world" "check" path "discarded"))))))))))
