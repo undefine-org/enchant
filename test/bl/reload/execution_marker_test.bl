@@ -1,0 +1,83 @@
+(ns reload.execution-marker-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [proc.callback :as callback] [test.support.source-fixtures :as fixtures]))
+
+(fixtures/effects!)
+
+(defn- graph []
+ (generation/prepare!
+  {:application-id "native-execution-marker" :stable-namespaces #{"reload.execution"}
+   :native-modules #{"erlang" "SourceEffectObserverFixture"}
+   :sources {"marker.fixture"
+     (str "(ns marker.fixture (:require [reload.execution :as execution])) "
+          "(defn owner [] (execution/owned?)) "
+          "(defn callback [] (fn [] (execution/owned?))) "
+          "(defn value [] 42) "
+          "(defn blocked [] (fn [parent] "
+          "(SourceEffectObserverFixture/notify parent [:marker-entered (erlang/self)]) "
+          "(receive :finish nil (after 30000 (throw :marker-deadline))) "
+          "(execution/invoke! (execution/current) \"marker.fixture/value\" [])))")}}))
+
+(deftest a-source-marker-and-bound-graph-do-not-establish-native-ownership
+ (let [graph (graph) before (BeamLisp.Env/capture)
+       key :reload.generation/execution previous (Process/get key)]
+  (try
+   (BeamLisp.Env/bind (:context graph))
+   (Process/put :bl_generation graph)
+   (Process/put key (tuple (:scope graph) (:digest graph) (:state graph)))
+   (is (not (execution/owned?)))
+   (is (not (BeamLisp.Env/executing_generation? graph)))
+   ;; The named entry must enter the native boundary. A forged Source marker
+   ;; must not select the shortcut that invokes a raw cached callable.
+   (is (= 42 (generation/invoke! graph "marker.fixture/value" [])))
+   (is (not (execution/owned?)))
+   (is (empty? (:tickets @(:state graph))))
+   (finally
+    (if (nil? previous) (Process/delete key) (Process/put key previous))
+    (BeamLisp.Env/bind before)
+    (generation/retire! graph)))))
+
+(deftest a-real-native-frame-preserves-the-existing-ticket-for-nested-named-entry
+ (let [graph (graph)]
+  (try
+   (generation/with! graph
+    (fn []
+     (let [tickets (:tickets @(:state graph))]
+      (is (execution/owned?))
+      (is (= 1 (count tickets)))
+      (is (= true (generation/invoke! graph "marker.fixture/owner" [])))
+      (is (= tickets (:tickets @(:state graph)))))))
+   (is (not (execution/owned?)))
+   (is (empty? (:tickets @(:state graph))))
+   (finally (generation/retire! graph)))))
+
+(deftest a-retained-callback-establishes-native-ownership-without-the-source-marker
+ (let [graph (graph)
+       registration (generation/with! graph
+                      #(callback/register! (generation/invoke! graph "marker.fixture/callback" [])))]
+  (try
+   (is (not (execution/owned?)))
+   (is (= true (callback/invoke! registration [])))
+   (is (not (execution/owned?)))
+   (finally (callback/unregister! registration) (generation/retire! graph)))))
+
+(deftest accepted-callbacks-can-make-nested-named-calls-after-registration-close
+ (let [graph (graph) parent (erlang/self)
+       registration (generation/with! graph
+                      #(callback/register! (generation/invoke! graph "marker.fixture/blocked" [])))
+       worker (spawn (fn []
+                (let [result (try (callback/invoke! registration [parent])
+                               (catch e (tuple :failed (ex-data e))))]
+                 (erlang/send parent [:marker-finished result]))))]
+  (try
+   (let [entered (receive [:marker-entered pid] pid (after 10000 (throw :missing-marker-entry)))]
+    (is (= worker entered))
+    (callback/unregister! registration)
+    (is (= :waiting (:status (generation/retire! graph))))
+    (erlang/send worker :finish)
+    (is (= 42 (receive [:marker-finished value] value (after 10000 (throw :missing-marker-completion)))))
+    (is (= :retired (:status (generation/retire! graph)))))
+   (finally
+    (erlang/send worker :finish)
+    (callback/unregister! registration)
+    (generation/retire! graph)))))
