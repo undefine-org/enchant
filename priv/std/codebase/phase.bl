@@ -9,17 +9,49 @@
 (defn- refuse! [kind node]
  (throw (ex-info "Invalid contextual facts" {:kind kind :origin (:origin node)})))
 
+(defn- finite-rows [rows]
+ (when-not (or (erlang/is_list rows) (vector? rows)) (refuse! :phase-reference-collection nil))
+ (let [rows (BeamLisp.CompilerData/eager_to_list rows)]
+  (when (> (count rows) 100000) (refuse! :phase-reference-budget nil)) rows))
+
+(defn reference-occurrences
+ "Value and transformer uses share the same lookup/effective phase contract.
+  Transformer call-list spans remain in the trace; uses point at head tokens."
+ [program]
+ (let [values (finite-rows (:occurrences program)) transformers (finite-rows (:expansions program))]
+  (when (> (+ (count values) (count transformers)) 100000) (refuse! :phase-reference-budget nil))
+ (Enum/concat values
+  (Enum/map transformers
+   #(hash-map :reference (:transformer %) :name (:name %) :origin (:head-origin %)
+              :context (:context %) :definition false :occurrence-kind :transformer
+              :lookup-phase (:lookup-phase %) :position (:position %)
+              :reference-shift (:reference-shift %) :instance-shift (:instance-shift %)
+              :lookup-shift (:lookup-shift %))))))
+
 (defn facts
  "Project one expanded snapshot. Consumers use declaration/reference IDs and
   recorded contexts, never reparse Source or resolve through current Env.
   These are analysis data, not native execution admission."
  [program]
- (when-not (= :expanded-program (:kind program)) (refuse! :phase-expanded-program nil))
- (let [selection (b/validate-selection (:selection program))]
-  {:version 1 :kind :contextual-facts :selection selection :snapshot (:state-key selection)
+ (when-not (and (= :expanded-program (:kind program)) (= 1 (:version program))
+                (= 'syntax-v1 (:profile program))) (refuse! :phase-expanded-program nil))
+ (let [selection (b/validate-selection (:selection program))
+       references (reference-occurrences program) expansions (finite-rows (:expansions program))
+       obligations (finite-rows (:native-obligations program))
+       image {:version 2 :profile (:profile program) :entry (:entry program)
+              :binding-snapshot (:state-key selection) :node (:node program)
+              :transformers (:transformers program) :reference-table (:references program)
+              :linked (:linked program) :references references :expansions expansions
+              :provenance (:provenance program) :coverage (:coverage program)
+              :native-obligations obligations}
+       _ (BeamLisp.CompilerData/check_first_order! image
+            {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+       snapshot (crypto/hash :sha256 (erlang/term_to_binary image (list :deterministic)))]
+  {:version 2 :kind :contextual-facts :selection selection :snapshot snapshot
+   :binding-snapshot (:state-key selection)
    :declarations (Enum/sort_by (Map/values (:by-id selection)) #(:id %))
-   :references (:occurrences program) :expansions (:expansions program)
-   :imports (:imports selection) :native-obligations (:native-obligations program)
+   :references references :expansions expansions
+   :imports (:imports selection) :native-obligations obligations
    :coverage (:coverage program) :native-admission false}))
 
 (defn uses
@@ -98,7 +130,7 @@
                   #(hash-map :from entry :to (get-in % [:transformer :id]) :kind :expansion
                              :phase (get-in % [:transformer :phase]) :origin (:origin %)))
        edges (Enum/uniq (Enum/concat (Enum/flat_map (elem projected 0) (fn [edges] edges)) demands))]
-  {:version 1 :kind :contextual-dependencies :status :indexed :entry entry
+  {:version 2 :kind :contextual-dependencies :status :indexed :entry entry
    :snapshot (:snapshot facts) :references references :edges edges
    :coverage {:runtime true :transformer-images true :effects false :native false}
    :native-admission false}))
@@ -124,6 +156,6 @@
                   (Enum/flat_map roots
                     #(BeamLisp.SourceGraph/closure %
                        (fn [id] (Enum/map (Map/get reverse id (list)) (fn [edge] (:from edge))))))))]
-  {:version 1 :status :indexed :scope :contextual-dependencies :snapshot (:snapshot graph)
+  {:version 2 :status :indexed :scope :contextual-dependencies :snapshot (:snapshot graph)
    :declarations declarations :references affected :entry-affected (Enum/member? affected (:entry graph))
    :native-admission false}))

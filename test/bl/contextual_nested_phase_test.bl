@@ -1,0 +1,113 @@
+(ns contextual-nested-phase-test
+ (:require [expand :as x] [lower :as lower] [system.phase :as phase] [codebase.phase :as code]))
+
+(defn- unit [namespace source]
+ {:namespace namespace :revision 'current :file (str namespace ".bl") :source source})
+(defn- sources []
+ [(unit 'inner
+    "(ns inner) (defsyntax leaf [form ctx] (syntax-literal (:phase ctx)))")
+  (unit 'outer
+    (str "(ns outer) (begin-for-syntax (import-world 'inner 'current :only [leaf])) "
+         "(defsyntax outer [form ctx] (syntax-literal (leaf)))"))
+  (unit 'client
+    (str "(ns client) (begin-for-syntax (import-world 'outer 'current :only [outer])) "
+         "(defsyntax answer [form ctx] (syntax-literal (outer))) (answer)"))])
+
+(deftest nested-transformers-retain-effective-phases-through-shifted-definition-bodies
+ (let [program (x/program (sources) ['client 'current])
+       phases (Enum/sort (Enum/map (:expansions program) #(get-in % [:transformer :phase])))
+       leaf (Enum/find (:expansions program) #(= 'leaf (:name %)))]
+  (is (= 3 (lower/eval-anf :Elixir.NestedContextualPhase (:node program))))
+  (is (= '(0 1 2) phases))
+  (is (= 1 (:lookup-phase leaf)))
+  (is (= 1 (:reference-shift leaf)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest analysis-occurrence-collections-cannot-execute-lazy-user-code
+ (let [program (x/program (sources) ['client 'current]) touched (atom false)]
+  (doseq [field [:occurrences :expansions]]
+   (let [rows (lazy-seq (do (reset! touched true) (get program field)))
+         changed (assoc program field rows)]
+    (is (thrown? (code/facts changed)))
+    (is (= :error (:status (phase/check changed))))
+    (is (= false @touched))))
+  (is (= 2 (:version (code/facts program))))
+  (is (= 2 (:version (phase/check program))))))
+
+(deftest an-expanded-snapshot-includes-observable-origins-beyond-binding-identity
+ (let [text (str "(ns client) (defsyntax file [form ctx] "
+                 "(syntax-literal (:file (:origin ctx)))) (file)")
+       a (x/program [(assoc (unit 'client text) :file "a.bl")] ['client 'current])
+       b (x/program [(assoc (unit 'client text) :file "b.bl")] ['client 'current])]
+  (is (= "a.bl" (lower/eval-anf :Elixir.OriginSnapshotA (:node a))))
+  (is (= "b.bl" (lower/eval-anf :Elixir.OriginSnapshotB (:node b))))
+  (is (= (get-in a [:selection :state-key]) (get-in b [:selection :state-key])))
+  (is (not= (:snapshot (code/facts a)) (:snapshot (code/facts b))))
+  (is (= (:snapshot (code/facts a)) (:snapshot (phase/check a))))
+  (doseq [malformed [nil {}]]
+   (is (thrown? (code/facts (assoc a :occurrences malformed)))))))
+
+(deftest macro-heads-participate-in-the-same-recorded-resolution-check
+ (let [program (x/program (sources) ['client 'current])
+       changed (assoc program :expansions
+                  (cons (assoc-in (first (:expansions program)) [:transformer :id] (crypto/hash :sha256 "wrong"))
+                        (rest (:expansions program))))]
+  (is (= :refused (:status (phase/check changed))))))
+
+(deftest nested-transformer-helpers-follow-the-effective-instance-without-changing-source-lookup
+ (let [sources (cons (unit 'inner
+                       (str "(ns inner) (begin-for-syntax (def offset 39)) "
+                            "(defsyntax leaf [form ctx] (syntax-literal (erlang/+ offset (:phase ctx))))"))
+                     (rest (sources)))
+       program (x/program sources ['client 'current])
+       offset (Enum/find (:occurrences program) #(= 'offset (:name %)))
+       leaf (Enum/find (:expansions program) #(= 'leaf (:name %)))]
+  (is (= 42 (lower/eval-anf :Elixir.NestedContextualHelper (:node program))))
+  (is (= 3 (get-in offset [:reference :phase])))
+  (is (= 1 (:lookup-phase offset)))
+  (is (= 2 (:reference-shift offset)))
+  (is (= 2 (:instance-shift leaf)))
+  (is (= 1 (:lookup-shift leaf)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest recorded-macro-availability-and-instance-shifts-cannot-be-forged
+ (let [program (x/program (sources) ['client 'current])
+       change (fn [key value]
+                (assoc program :expansions
+                 (Enum/map (:expansions program)
+                  #(if (= 'answer (:name %)) (assoc % key value) %))))]
+  (is (= :refused (:status (phase/check (change :position 0)))))
+  (is (= :refused (:status (phase/check (change :instance-shift 1)))))
+  (is (= :refused (:status (phase/check (change :lookup-shift 1)))))))
+
+(deftest one-transformer-used-at-two-effective-phases-has-distinct-cached-images
+ (let [sources (Enum/take (sources) 2)
+       sources (Enum/concat sources
+                 (list (unit 'client
+                   (str "(ns client) (begin-for-syntax "
+                        "(import-world 'inner 'current :only [leaf]) "
+                        "(import-world 'outer 'current :only [outer])) "
+                        "(defsyntax answer [form ctx] (syntax-literal [(leaf) (outer)])) (answer)"))))
+       program (x/program sources ['client 'current])
+       leaves (Enum/filter (:expansions program) #(= 'leaf (:name %)))]
+  (is (= [2 3] (lower/eval-anf :Elixir.TwoContextualPhases (:node program))))
+  (is (= '(1 2) (Enum/sort (Enum/map leaves #(get-in % [:transformer :phase])))))
+  (is (= 2 (count (Enum/uniq (Enum/map leaves #(get-in % [:transformer :id]))))))
+  (is (= 4 (erlang/map_size (:transformers program))))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest a-negative-import-shift-preserves-the-providers-original-helper-lookup
+ (let [program (x/program
+                 [(unit 'library
+                    (str "(ns library) (begin-for-syntax (begin-for-syntax (def amount 42)) "
+                         "(defsyntax leaf [form ctx] (syntax-literal amount)))"))
+                  (unit 'client
+                    "(ns client) (import-world 'library 'current :shift -1 :only [leaf]) (leaf)")]
+                 ['client 'current])
+       macro (first (:expansions program))
+       amount (Enum/find (:occurrences program) #(= 'amount (:name %)))]
+  (is (= 42 (lower/eval-anf :Elixir.NegativeContextualPhase (:node program))))
+  (is (= -1 (:instance-shift macro)))
+  (is (= 1 (get-in amount [:reference :phase])))
+  (is (= 2 (:lookup-phase amount)))
+  (is (= :proved (:status (phase/check program))))))
