@@ -152,9 +152,8 @@
     (tuple (list-reader node (Enum/concat prefix (elem r 0))) (elem r 1))))))
 
 (defn- native-name? [node]
- ;; Native escapes are explicit obligations; they are not inferred bindings.
- ;; The initial expression adapter admits only the existing erlang qualifier.
- (let [name (spelling node)] (and name (String/starts_with? name "erlang/"))))
+ ;; The compiler owns the closed escape grammar as well as its target.
+ (compiler/contextual-native-name? (spelling node)))
 
 (defn- match-node [node state]
  ;; Matching and parameter destructuring have different map grammars. Keep
@@ -228,6 +227,67 @@
                 (fn [pair] (Map/get (elem timeout 0) (elem pair 1) (as-reader (elem pair 0)))))]
   (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem timeout 1))))
 
+(defn- raw-catch-node [node state]
+ (let [children (:children node) binder (second children)
+       _ (when-not (and (= :vector (:tag binder)) (= 3 (count (:children binder)))
+                       (every? s/identifier? (:children binder)))
+           (refuse! :contextual-raw-catch-bindings binder))
+       allocated (fresh-scope state :lexical) scope (elem allocated 0)
+       bound (pattern-node (s/add-scope binder (:id scope) :all) (elem allocated 1))
+       body (expression-nodes (scoped (Enum/drop children 2) scope) (elem bound 1))]
+  (tuple (list-reader node (cons (as-reader (first children)) (cons (elem bound 0) (elem body 0))))
+         (elem body 1))))
+
+(defn- catch-node [node state]
+ (let [children (:children node) layout (compiler/catch-layout (as-reader node) (:origin node))
+       allocated (fresh-scope state :lexical) scope (elem allocated 0)
+       bound (bind-symbol (s/add-scope (nth children (:binder-index layout)) (:id scope) :all)
+                          (elem allocated 1))
+       implicit-scope (fresh-scope (elem bound 1) :lexical) inner (elem implicit-scope 0)
+       aliases (Enum/map_reduce (list :stack :kind) (elem implicit-scope 1)
+                 (fn [role current]
+                  (let [name (get-in layout [:implicit-locals role])
+                        identifier (-> (s/identifier (symbol name) (:context node))
+                                       (s/add-scope (:id scope) :all)
+                                       (s/add-scope (:id inner) :all))
+                        binding (bind-symbol identifier current)]
+                   ;; These RHS names are exact locals supplied by Compiler's
+                   ;; catch handler, never an Env or contextual lookup fallback.
+                   (tuple (list (elem binding 0) (tuple :symbol name)) (elem binding 1)))))
+       body (expression-nodes (scoped (scoped (Enum/drop children (:body-offset layout)) scope) inner)
+                              (elem aliases 1))
+       bridge (tuple :list
+                (cons (tuple :symbol "let")
+                  (cons (tuple :vector (Enum/concat (elem aliases 0))) (elem body 0))))
+       prefix (if (some? (:type-index layout))
+                (list (as-reader (first children)) (as-reader (nth children (:type-index layout))) (elem bound 0))
+                (list (as-reader (first children)) (elem bound 0)))]
+  (tuple (list-reader node (Enum/concat prefix (list bridge)))
+   (if (some? (:type-index layout))
+    (let [type (nth children (:type-index layout))]
+     (update (elem body 1) :native-obligations
+       #(cons {:name (:value type) :origin (:origin type) :kind :catch-type
+               :phase (+ (:phase state) (Map/get state :reference-shift 0))} %)))
+    (elem body 1)))))
+
+(defn- try-node [node state]
+ (let [forms (vec (rest (:children node)))
+       layout (compiler/try-layout (Enum/map forms as-reader) (:origin node))
+       expand-indexes (fn [indexes action acc]
+                       (Enum/reduce indexes acc
+                         (fn [index current]
+                          (let [r (action (nth forms index) (elem current 1))]
+                           (tuple (assoc (elem current 0) index (elem r 0)) (elem r 1))))))
+       body (expand-indexes (:body-indexes layout) expression-node (tuple {} state))
+       catches (expand-indexes (:catch-indexes layout) catch-node body)
+       raw (expand-indexes (:raw-indexes layout) raw-catch-node catches)
+       after (expand-indexes (:finally-indexes layout)
+               (fn [form current]
+                (let [r (expression-nodes (rest (:children form)) current)]
+                 (tuple (list-reader form (cons (as-reader (first (:children form))) (elem r 0))) (elem r 1)))) raw)
+       output (Enum/map (Enum/with_index forms) #(get (elem after 0) (elem % 1)))]
+  (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem after 1))))
+
 (defn- macro-node [node result state]
  (when (or (<= (Map/get state :macro-budget 0) 0) (>= (Map/get state :macro-depth 0) 64))
   (refuse! :contextual-macro-budget node))
@@ -295,7 +355,7 @@
                  (erlang/is_integer (:value index)) (<= 0 (:value index) 64))
    (refuse! :syntax-argument-index node))
   (let [form (expression-node (second children) state)
-        items (tuple :list (list (tuple :symbol "BeamLisp.Ns.Rt/get") (elem form 0) (tuple :keyword "children")))
+        items (tuple :list (list (tuple :keyword "children") (elem form 0)))
         tail (Enum/reduce (List/duplicate nil (:value index)) items
                (fn [_ value] (tuple :list (list (tuple :symbol "erlang/tl") value))))]
    (tuple (tuple :list (list (tuple :symbol "erlang/hd") tail)) (elem form 1)))))
@@ -336,6 +396,7 @@
       (and kernel? (contains? #{"let" "let*" "loop" "loop*"} name)) (let-node node state)
       (and kernel? (contains? #{"fn" "fn*"} name)) (fn-node node state)
       (and kernel? (= "receive" name)) (receive-node node state)
+      (and kernel? (= "try" name)) (try-node node state)
       (and kernel? (contains? #{"if" "do" "recur" "throw"} name))
        (let [r (expression-nodes (rest children) state)]
         (tuple (list-reader node (cons (as-reader head) (elem r 0))) (elem r 1)))

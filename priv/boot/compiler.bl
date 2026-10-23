@@ -530,6 +530,12 @@
       (a/lit (nth answer 1))
       (a/global-exact (nth answer 1) (nth answer 2)))))
 
+(defn contextual-native-name?
+  "Closed contextual-profile escape grammar. Source expansion and native
+   target selection share it; ambient aliases/imports never extend this set."
+  [name]
+  (and (erlang/is_binary name) (starts-with? name "erlang/")))
+
 (defn- slash-target
   "Decide what a qualified name `prefix/member` refers to.
 
@@ -543,8 +549,13 @@
   (let [[written-prefix member] (split-slash name)
         canonical-core? (= "clojure.core" written-prefix)
         prefix (if canonical-core? "core" written-prefix)
-        alias (when-not canonical-core? (BeamLisp.Env/alias_target (:ns env) prefix))]
+        alias (when-not (or canonical-core? (:contextual-bindings env))
+                (BeamLisp.Env/alias_target (:ns env) prefix))]
     (cond
+      (:contextual-bindings env)
+        (if (contextual-native-name? name)
+          (gate-remote! env :erlang (erlang/binary_to_atom member))
+          (compile-error env "Unlinked qualifier in contextual compilation"))
       ; an alias or an existing beam-lisp namespace resolves to a VAR — not a
       ; host escape — so it is never capability-gated.
       (some? alias) (list :var alias member)
@@ -1941,6 +1952,47 @@
   [x y]
   (a/iff x y (a/lit false)))
 
+(defn- catch-implicit-locals []
+  {:stack "__STACKTRACE__" :kind "__EXCEPTION_KIND__"})
+
+(defn catch-layout
+  "Canonical normalized-catch roles. The optional type is a compiler literal;
+   the exception binder and the two implicit locals belong to its handler."
+  [form env]
+  (let [items (rn/node-items (rn/node-form form))
+        first-node (rn/node-form (second items))
+        _ (when-not (= :symbol (rn/node-tag first-node))
+            (compile-error env "catch requires a variable or Module.Name"))
+        name (rn/node-name first-node)
+        typed? (or (uppercase-first? name) (java-spelled? name))
+        binder-index (if typed? 2 1)]
+    (when-not (= :symbol (rn/node-tag (rn/node-form (nth items binder-index nil))))
+      (compile-error env "catch requires an exception binding symbol"))
+    {:binder-index binder-index :type-index (when typed? 1)
+     :body-offset (if typed? 3 2) :implicit-locals (catch-implicit-locals)}))
+
+(defn try-layout
+  "Canonical try grouping over original Reader indexes. Both compilation and
+   contextual expansion consume these roles; exception semantics stay here."
+  [forms env]
+  (let [parts (Enum/map (Enum/with_index forms)
+                (fn [pair]
+                  (let [form (elem pair 0)]
+                    {:index (elem pair 1)
+                     :kind (cond (catch-clause-form? form) :catch
+                                 (catch-raw-clause-form? form) :catch-raw
+                                 (finally-clause-form? form) :finally
+                                 :else :body)})))
+        indexes (fn [kind] (Enum/map (Enum/filter parts #(= kind (:kind %))) #(:index %)))
+        raw-indexes (indexes :catch-raw) catches (indexes :catch)
+        finallies (indexes :finally)]
+    (when (and (seq raw-indexes) (or (seq catches) (next raw-indexes)))
+      (compile-error env "try: a catch-raw clause is the ONLY catch of its try (no other catch, at most one catch-raw)"))
+    (when (> (count finallies) 1)
+      (compile-error env "try accepts at most one finally clause"))
+    {:body-indexes (indexes :body) :raw-indexes raw-indexes
+     :catch-indexes catches :finally-indexes finallies}))
+
 (defn- catch-handler-node
   "Build the body a catch clause runs once it matches: bind the handler's name
    to the normalized exception value AND bind `__STACKTRACE__` to the frame
@@ -1970,9 +2022,10 @@
   [e-name handler-forms e-var kind-var env]
   (let [handler-var (fresh-var e-name)
         stk-var (fresh-var "stacktrace")
+        implicit (catch-implicit-locals)
         handler-env (put-local (put-local (put-local env e-name handler-var)
-                                          "__STACKTRACE__" stk-var)
-                               "__EXCEPTION_KIND__" kind-var)
+                                          (:stack implicit) stk-var)
+                               (:kind implicit) kind-var)
         handler-body (compile-body handler-forms handler-env)]
     (a/lett handler-var (a/var e-var)
             (a/lett stk-var (a/var "__STACKTRACE__")
@@ -1991,13 +2044,14 @@
    (e.g. `(catch :bad e …)`) is refused with the same message the genesis
    compiler raises, because a keyword/literal names no catchable shape."
   [catch-form e-var kind-var env]
-  (let [items (rn/node-items (rn/node-form catch-form))
+  (let [layout (catch-layout catch-form env)
+        items (rn/node-items (rn/node-form catch-form))
         first-node (rn/node-form (second items))
         first-tag (rn/node-tag first-node)]
     (if-not (= :symbol first-tag) (compile-error env (str "catch requires a variable or Module.Name, got a " (rn/node-tag first-node))) (let [name (rn/node-name first-node)]
         ; a typed catch: `Module.Name`, or a Java class spelled in full
         ; (`java.io.IOException`) which is lowercase-first but a class
-        (if (or (uppercase-first? name) (java-spelled? name))
+        (if (some? (:type-index layout))
           ; typed: (catch Module.Name e handler…)
           (let [rest-items (rest (rest items))
                 e-name (rn/node-name (rn/node-form (first rest-items)))
@@ -2010,7 +2064,8 @@
                 ; an Elixir module, as before. A name that LOOKS Java
                 ; (imported, or `java.`/`clojure.lang.`-qualified) but is not in
                 ; the table is refused with the table's list.
-                imported (let [t (BeamLisp.Env/import_target (:ns env) name)] (if (erlang/is_binary t) t nil))
+                imported (when-not (:contextual-bindings env)
+                           (let [t (BeamLisp.Env/import_target (:ns env) name)] (if (erlang/is_binary t) t nil)))
                 java-ish? (or (some? imported) (java-spelled? name)
                               (contains? #{"Exception" "Throwable" "RuntimeException" "ExceptionInfo"
                                            "NumberFormatException" "ArithmeticException"
@@ -2167,15 +2222,11 @@
    `try` with a single catch-all clause (normalizing the caught value) and an
    optional `after` block."
   [forms env]
-  (let [raws (filter (fn [form] (catch-raw-clause-form? form)) forms)
-        catches (filter (fn [form] (catch-clause-form? form)) forms)
-        finallies (filter (fn [form] (finally-clause-form? form)) forms)
-        body (filter (fn [f] (not (or (catch-clause-form? f) (catch-raw-clause-form? f)
-                                      (finally-clause-form? f)))) forms)]
+  (let [forms (vec forms) layout (try-layout forms env)
+        selected (fn [key] (Enum/map (get layout key) #(nth forms %)))
+        raws (selected :raw-indexes) catches (selected :catch-indexes)
+        finallies (selected :finally-indexes) body (selected :body-indexes)]
     (cond
-      (and (seq raws) (or (seq catches) (next raws)))
-      (compile-error env "try: a catch-raw clause is the ONLY catch of its try (no other catch, at most one catch-raw)")
-
       (seq raws)
       (compile-try-raw (first raws) body finallies env)
 

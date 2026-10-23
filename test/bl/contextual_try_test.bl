@@ -1,0 +1,148 @@
+(ns contextual-try-test
+ (:require [compiler :as compiler] [reader-node :as rn] [expand :as x] [lower :as lower]
+           [system.phase :as phase] [codebase.refactor :as refactor] [anf :as anf]))
+
+(defn- unit [source]
+ {:namespace 'client :revision 'current :file "client.bl" :source (str "(ns client) " source)})
+(defn- program [source] (x/program [(unit source)] ['client 'current]))
+(defn- execute [p]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualTry." (erlang/unique_integer (list :positive))))
+  (:node p)))
+(defn- refused [action] (try (action) nil (catch e (:kind (ex-data e)))))
+(defn- nodes [node] (cons node (Enum/flat_map (anf/executable-children node) nodes)))
+
+(deftest compiler-layout-retains-catch-and-cleanup-reader-roles
+ (let [form (BeamLisp.Reader/read_one "(try 1 (catch ArgumentError error error) 2 (finally 3))")
+       forms (rest (rn/node-items form)) layout (compiler/try-layout forms (compiler/new-env "client"))
+       handler (compiler/catch-layout (nth forms 1) (compiler/new-env "client"))]
+  (is (= [0 2] (vec (:body-indexes layout)))))
+ (let [form (BeamLisp.Reader/read_one "(catch ArgumentError error error)")
+       layout (compiler/catch-layout form (compiler/new-env "client"))]
+  (is (= [2 1 3] [(:binder-index layout) (:type-index layout) (:body-offset layout)]))
+  (is (= {:stack "__STACKTRACE__" :kind "__EXCEPTION_KIND__"} (:implicit-locals layout))))
+ (is (thrown? (compiler/compile (BeamLisp.Reader/read_one "(try 42 (finally 1) (finally 2))")
+                              (compiler/new-env "client")))))
+
+(deftest normalized-and-typed-catches-use-the-canonical-exception-semantics
+ (is (= :payload (execute (program "(try (erlang/throw :payload) (catch error error))"))))
+ (is (= 42 (execute (program "(try (erlang/error :badarg) (catch ArithmeticError error 0) (catch ArgumentError error 42))"))))
+ (is (= (tuple :exit :bye) (execute (program "(try (erlang/exit :bye) (catch error error))"))))
+ (let [p (program "(try (erlang/error :badarg) (catch ArgumentError error 42))")]
+  (is (= :proved (:status (phase/check p))))
+  (is (some #(= :catch-type (:kind %)) (:native-obligations p)))))
+
+(deftest implicit-handler-locals-have-real-lexical-binding-identities
+ (doseq [[operation kind] [["(erlang/throw 42)" :throw] ["(erlang/error :badarg)" :error]]]
+  (let [p (program (str "(try " operation " (catch error [__EXCEPTION_KIND__ (erlang/is_list __STACKTRACE__)]))"))
+        declarations (Enum/filter (Map/values (get-in p [:selection :by-id]))
+                       #(contains? #{'__EXCEPTION_KIND__ '__STACKTRACE__} (:name %)))
+        refs (Enum/filter (nodes (:node p)) #(some? (get-in % [:ann :binding-reference])))]
+   (is (= [kind true] (execute p)))
+   (is (= 2 (count declarations)))
+   (is (>= (count refs) 2))
+   (is (= :proved (:status (phase/check p)))))))
+
+(deftest catch-locals-neither-leak-nor-capture-another-clause
+ (is (= :unbound-identifier (refused #(program "(do (try 1 (catch error error)) error)"))))
+ (is (= :unbound-identifier (refused #(program "(try 1 (catch ArgumentError error error) (catch ArithmeticError other error))"))))
+ (is (= :unbound-identifier (refused #(program "(try 1 (catch error error) (finally error))"))))
+ (is (= :unbound-identifier (refused #(program "(try __STACKTRACE__ (catch error 42))"))))
+ (is (= :unbound-identifier (refused #(program "(try 42 (finally __EXCEPTION_KIND__))"))))
+ (is (= [:throw true] (execute (program
+             "(try (erlang/throw 42) (catch __STACKTRACE__ [__EXCEPTION_KIND__ (erlang/is_list __STACKTRACE__)]))")))))
+
+(deftest raw-catches-preserve-class-value-and-frame-list-without-normalization
+ (is (= [:throw 42 true] (execute (program
+             "(try (erlang/throw 42) (catch-raw [kind reason stack] [kind reason (erlang/is_list stack)]))"))))
+ (is (= [:error :badarg] (execute (program
+             "(try (erlang/error :badarg) (catch-raw [kind reason stack] [kind reason]))"))))
+ (is (= [:exit :bye] (execute (program
+             "(try (erlang/exit :bye) (catch-raw [kind reason stack] [kind reason]))"))))
+ (is (thrown? (program "(try 42 (catch-raw [kind reason stack] reason) (catch error error))")))
+ (is (thrown? (program "(try 42 (catch-raw [kind reason] reason))"))))
+
+(deftest cleanup-runs-on-success-failure-and-unmatched-typed-reraise
+ (is (= [42 1] (execute (program
+             "[(try 42 (finally (erlang/put :contextual-try-cleanup 1))) (erlang/get :contextual-try-cleanup)]"))))
+ (is (= [:payload 2] (execute (program
+             "[(try (try (erlang/throw :payload) (finally (erlang/put :contextual-try-cleanup 2))) (catch error error)) (erlang/get :contextual-try-cleanup)]"))))
+ (is (= [:payload 3] (execute (program
+             "[(try (try (erlang/throw :payload) (catch ArgumentError error 0) (finally (erlang/put :contextual-try-cleanup 3))) (catch error error)) (erlang/get :contextual-try-cleanup)]"))))
+ (is (= :cleanup (execute (program
+             "(try (try 42 (finally (erlang/throw :cleanup))) (catch error error))")))))
+
+(deftest catch-binding-rename-retains-identity-and-implicit-names-cannot-be-renamed
+ (let [sources [(unit "(try (erlang/throw 42) (catch error error))")]
+       p (x/program sources ['client 'current])
+       target (Enum/find (Map/values (get-in p [:selection :by-id])) #(= 'error (:name %)))
+       result (refactor/rename-program sources ['client 'current] (:id target) 'failure)]
+  (is (= :verified (:status result)))
+  (is (= 2 (count (:edits result))))
+  (is (= 42 (execute (:program result)))))
+ (let [sources [(unit "(try (erlang/throw 42) (catch error __EXCEPTION_KIND__))")]
+       p (x/program sources ['client 'current])
+       target (Enum/find (Map/values (get-in p [:selection :by-id])) #(= '__EXCEPTION_KIND__ (:name %)))]
+  (is (= :rename-inexact-definition
+         (refused #(refactor/rename-program sources ['client 'current] (:id target) 'kind))))))
+
+(deftest archived-bracket-cleanup-macro-preserves-user-binding-and-unwinding
+ (let [provider {:namespace 'control :revision 'current :file "control.bl"
+                 :source (File/read! "test/fixtures/contextual-cleanup/control.bl")}
+       archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       client {:namespace 'showcase :revision 'current :file "main.bl"
+               :source (File/read! "test/fixtures/contextual-cleanup/main.bl")}
+       p (x/program [client] ['showcase 'current] [archive])]
+  (is (= [42 100 40 200] (execute p)))
+  (is (= 2 (count (:expansions p))))
+  (is (= :proved (:status (phase/check p))))
+  (is (empty? (:linked p)))))
+
+(deftest runtime-cleanup-support-does-not-silently-expand-constructor-authority
+ (let [p (program "(try 42 (finally nil))")
+       failure (try (BeamLisp.AOT/interpret_constructor! (:node p) {} {}) nil
+                 (catch error (ex-data error)))]
+  (is (= 42 (execute p)))
+  (is (= :constructor-machine-refused (:kind failure)))
+  (is (= {:operation :try} (:detail failure)))))
+
+(deftest bracket-cleanup-grammar-never-silently-discards-extra-source
+ (let [provider {:namespace 'control :revision 'current :file "control.bl"
+                 :source (File/read! "test/fixtures/contextual-cleanup/control.bl")}]
+  (doseq [call ["(ensuring [resource 42] resource nil :discarded)"
+                "(ensuring [resource 42] resource)"
+                "(ensuring [resource] resource nil)"
+                "(ensuring [_ 42] 1 nil)"]]
+   (is (thrown? (x/program [provider (unit (str "(import-world 'control 'current :only [ensuring]) " call))]
+                 ['client 'current]))))))
+
+(deftest contextual-catch-types-cannot-be-redirected-by-ambient-class-imports
+ (let [source "(try (erlang/throw 42) (catch ArgumentError error 0) (catch error 42))"
+       previous (BeamLisp.Env/import_target "client" "ArgumentError")
+       baseline (program source)]
+  (is (= 42 (execute baseline)))
+  (try
+   (BeamLisp.Env/add_import "client" "ArgumentError" "java.lang.Throwable")
+   (let [changed (program source)]
+    (is (= 42 (execute changed)))
+    (is (= (:node baseline) (:node changed))))
+   (is (= 0 (lower/eval-anf :Elixir.ClassicCatchImportControl
+              (compiler/compile (BeamLisp.Reader/read_one source) (compiler/new-env "client")))))
+   (finally
+    (if previous (BeamLisp.Env/add_import "client" "ArgumentError" previous)
+      (BeamLisp.Env/delete_key (tuple :import "client" "ArgumentError")))))))
+
+(deftest explicit-native-qualifiers-cannot-be-rebound-by-ambient-namespace-aliases
+ (let [previous (BeamLisp.Env/alias_target "client" "erlang")
+       baseline (program "(erlang/+ 40 2)")]
+  (try
+   (BeamLisp.Env/add_alias "client" "erlang" "core")
+   (let [changed (program "(erlang/+ 40 2)")]
+    (is (= 42 (execute changed)))
+    (is (= (:node baseline) (:node changed))))
+   (is (compiler/contextual-native-name? "erlang/+"))
+   (is (not (compiler/contextual-native-name? "File/read!")))
+   (is (thrown? (compiler/compile-contextual (BeamLisp.Reader/read_one "(File/read! :source)")
+                               (compiler/new-env "client") {})))
+   (finally
+    (if previous (BeamLisp.Env/add_alias "client" "erlang" previous)
+      (BeamLisp.Env/delete_key (tuple :alias "client" "erlang")))))))
