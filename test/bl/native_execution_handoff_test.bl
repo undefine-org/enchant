@@ -1,0 +1,173 @@
+(ns native-execution-handoff-test)
+
+(defn- owner [] (spawn (fn [] (receive :stop nil (after 30000 nil)))))
+(defn- stop! [pid] (erlang/send pid :stop))
+(defn- wait-down! [pid monitor]
+ (receive [:DOWN ref :process process _] :when (and (= ref monitor) (= pid process)) true
+  (after 10000 (throw :missing-owner-death))))
+
+(deftest native-preparation-is-inactive-and-acceptance-retokenizes-the-exact-target
+ (let [receiver (owner) calls (atom 0)
+       source (BeamLisp.Execution/register! #(swap! calls inc))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver) target (:accepted prepared)]
+  (try
+   (is (= :active (:status (BeamLisp.Execution/observe source))))
+   (is (= :pending (:status (BeamLisp.Execution/observe target))))
+   (is (= {:status :pending} (BeamLisp.Execution/handoff-status prepared)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! target [])))
+   (is (= 0 @calls))
+   (is (= {:status :accepted :registration target} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+   (is (= :active (:status (BeamLisp.Execution/observe target))))
+   (BeamLisp.Execution/close! source)
+   (is (= {:status :completed :value 1} (BeamLisp.Execution/invoke! target [])))
+   (is (= {:status :accepted :registration target} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= :active (:status (BeamLisp.Execution/observe target))))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target) (stop! receiver)))))
+
+(deftest closing-an-inactive-target-leaves-its-source-intact
+ (let [receiver (owner) source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (BeamLisp.Execution/close! (:accepted prepared))
+   (is (= {:status :cancelled} (BeamLisp.Execution/handoff-status prepared)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! source [])))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! (:accepted prepared)) (stop! receiver)))))
+
+(deftest source-data-cannot-substitute-a-different-native-pending-record
+ (let [receiver (owner) source (BeamLisp.Execution/register! (fn [] :source))
+       other (BeamLisp.Execution/register! (fn [] :other))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)
+       forged (assoc prepared :source other)]
+  (try
+   (is (= {:status :cancelled} (BeamLisp.Execution/handoff-status forged)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! forged)))
+   (is (= :pending (:status (BeamLisp.Execution/observe (:accepted prepared)))))
+   (is (= :active (:status (BeamLisp.Execution/observe source))))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! other)
+    (BeamLisp.Execution/close! (:accepted prepared)) (stop! receiver)))))
+
+(deftest an-invocation-borrow-cannot-prepare-ownership-handoff
+ (let [receiver (owner)
+       source (BeamLisp.Execution/register!
+                (fn []
+                 (let [lease (Process/get :bl_executing_code_lease)
+                       borrowed (tuple :bl-execution (elem lease 1) (elem lease 2))]
+                  (BeamLisp.Execution/prepare-handoff! borrowed receiver))))]
+  (try
+   (is (= {:status :completed :value :cancelled} (BeamLisp.Execution/invoke! source [])))
+   (is (= :active (:status (BeamLisp.Execution/observe source))))
+   (finally (BeamLisp.Execution/close! source) (stop! receiver)))))
+
+(deftest receiver-death-before-acceptance-does-not-consume-the-source
+ (let [receiver (owner) monitor (Process/monitor receiver)
+       source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (stop! receiver)
+   (is (wait-down! receiver monitor))
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! source [])))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! (:accepted prepared))
+    (Process/demonitor monitor (list :flush)) (stop! receiver)))))
+
+(deftest source-death-before-acceptance-cancels-the-indexed-target
+ (let [parent (erlang/self)
+       sender (spawn (fn []
+                (let [source (BeamLisp.Execution/register! (fn [] 42))]
+                 (erlang/send parent [:prepared (BeamLisp.Execution/prepare-handoff! source parent)])
+                 (receive :stop nil (after 10000 nil)))))
+       monitor (Process/monitor sender)
+       prepared (receive [:prepared value] value (after 10000 (throw :missing-preparation)))]
+  (try
+   (stop! sender)
+   (is (wait-down! sender monitor))
+   (is (= {:status :cancelled} (BeamLisp.Execution/handoff-status prepared)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (finally (BeamLisp.Execution/close! (:accepted prepared)) (stop! sender)
+    (Process/demonitor monitor (list :flush))))))
+
+(deftest accepted-target-survives-sender-death-without-an-acknowledgement
+ (let [parent (erlang/self)
+       sender (spawn (fn []
+                (let [source (BeamLisp.Execution/register! (fn [] 42))
+                      prepared (BeamLisp.Execution/prepare-handoff! source parent)]
+                 (erlang/send parent [:lost-ack-prepared prepared])
+                 (receive :accept (BeamLisp.Execution/accept-handoff! prepared) (after 10000 nil)))))
+       monitor (Process/monitor sender)
+       prepared (receive [:lost-ack-prepared value] value (after 10000 (throw :missing-preparation)))]
+  (try
+   (erlang/send sender :accept)
+   (is (wait-down! sender monitor))
+   (is (= {:status :accepted :registration (:accepted prepared)} (BeamLisp.Execution/handoff-status prepared)))
+   (is (= {:status :accepted :registration (:accepted prepared)} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (finally (BeamLisp.Execution/close! (:accepted prepared)) (stop! sender)
+    (Process/demonitor monitor (list :flush))))))
+
+(deftest only-a-prepared-participant-can-accept-the-transfer
+ (let [receiver (owner) parent (erlang/self) source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (spawn #(erlang/send parent [:outsider-result
+                (try (BeamLisp.Execution/accept-handoff! prepared) :unexpected
+                  (catch e (:original e)))]))
+   (is (= :execution_handoff_participant_required
+          (receive [:outsider-result result] result (after 10000 (throw :missing-outsider-result)))))
+   (is (= :pending (:status (BeamLisp.Execution/observe (:accepted prepared)))))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! (:accepted prepared)) (stop! receiver)))))
+
+(deftest the-indexed-receiver-can-accept-without-a-sender-round-trip
+ (let [parent (erlang/self)
+       receiver (spawn (fn []
+                  (receive [:accept prepared]
+                   (do (erlang/send parent [:receiver-accepted (BeamLisp.Execution/accept-handoff! prepared)])
+                       (receive :stop nil (after 10000 nil)))
+                   (after 10000 nil))))
+       source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (erlang/send receiver [:accept prepared])
+   (is (= {:status :accepted :registration (:accepted prepared)}
+          (receive [:receiver-accepted value] value (after 10000 (throw :missing-acceptance)))))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! source [])))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! (:accepted prepared)) (stop! receiver)))))
+
+(deftest only-one-competing-native-target-can-consume-the-source
+ (let [a (owner) b (owner) source (BeamLisp.Execution/register! (fn [] 42))
+       first (BeamLisp.Execution/prepare-handoff! source a)
+       second (BeamLisp.Execution/prepare-handoff! source b)]
+  (try
+   (is (= :accepted (:status (BeamLisp.Execution/accept-handoff! first))))
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! second)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! (:accepted second) [])))
+   (BeamLisp.Execution/close! (:accepted second))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! (:accepted first) [])))
+   (finally (BeamLisp.Execution/close! source)
+    (BeamLisp.Execution/close! (:accepted first)) (BeamLisp.Execution/close! (:accepted second))
+    (stop! a) (stop! b)))))
+
+(deftest a-closed-source-cannot-be-resurrected-by-an-inactive-target
+ (let [receiver (owner) source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (BeamLisp.Execution/close! source)
+   (is (= {:status :cancelled} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (finally (BeamLisp.Execution/close! (:accepted prepared)) (stop! receiver)))))
+
+(deftest accepted-target-owner-death-cancels-without-restoring-the-source
+ (let [receiver (owner) monitor (Process/monitor receiver)
+       source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source receiver)]
+  (try
+   (is (= :accepted (:status (BeamLisp.Execution/accept-handoff! prepared))))
+   (stop! receiver)
+   (is (wait-down! receiver monitor))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! source [])))
+   (is (= {:status :cancelled} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! (:accepted prepared))
+    (Process/demonitor monitor (list :flush)) (stop! receiver)))))
