@@ -172,9 +172,12 @@
    copy of INNER — the shape system.linear now forbids.)"
   [n]
   (and (map? n) (= :let (:op n)) (self-fn? (:init n))
-       (let [b (:body n)]
-         (and (map? b) (= :apply (:op b)) (map? (:fn b)) (= :var (:op (:fn b)))
-              (= (:name n) (:name (:fn b)))))))
+       (let [b (:body n) cl (first (:clauses (:init n))) p (first (:pats cl))]
+         (and (nil? (:guard cl)) (= :pvar (:pop p)) (= (:name n) (:name p))
+              (= :fn (:op (:body cl)))
+              (map? b) (= :apply (:op b)) (map? (:fn b)) (= :var (:op (:fn b)))
+              (= (:name n) (:name (:fn b))) (= 1 (count (:args b)))
+              (= :var (:op (first (:args b)))) (= (:name n) (:name (first (:args b))))))))
 
 (defn scaffold-inner
   "The INNER fn of a self scaffold (the compiled fn/loop body-fn)."
@@ -356,34 +359,75 @@
   [f k n]
   (rewrite (fn [node] (ann-put node k (f node))) n))
 
+(defn- literal-count? [node]
+ (and (= :lit (:op node)) (erlang/is_integer (:val node)) (>= (:val node) 0)))
+
+(defn- dispatch-layout [node]
+ (when (and (= :tuple (:op node)) (= 3 (count (:elems node))))
+  (let [[head fixed variadic] (:elems node) pairs (:pairs fixed)]
+   (when (and (= :lit (:op head)) (erlang/=:= :"$blfn" (:val head))
+               (= :map (:op fixed)) (erlang/is_list pairs)
+               (every? (fn [pair] (and (or (erlang/is_list pair) (vector? pair))
+                                      (= 2 (count pair)) (literal-count? (first pair)))) pairs)
+               (or (and (= :lit (:op variadic)) (nil? (:val variadic)))
+                   (and (= :tuple (:op variadic)) (= 2 (count (:elems variadic)))
+                        (literal-count? (first (:elems variadic))))))
+    (let [keys (mapv (fn [pair] (:val (first pair))) pairs)]
+     (when (= keys (vec (distinct keys)))
+      {:fixed pairs :variadic (when (= :tuple (:op variadic))
+                               {:minimum (:val (first (:elems variadic)))
+                                :function (second (:elems variadic))})}))))))
+
 (defn blfn-value?
-  "The compiler's single multi-arity/variadic callable-value encoding."
-  [node]
-  (and (= :tuple (:op node))
-       (let [head (first (:elems node))]
-         (and (= :lit (:op head)) (= "$blfn" (str (:val head)))))))
+ "Recognize the exact tagged dispatch container, not a printed tag spelling.
+  function-shape separately checks that each slot has its required native arity."
+ [node] (some? (dispatch-layout node)))
+
+(defn- native-function-shape [node remaining]
+ (when (> remaining 0)
+  (cond
+   (= :fn (:op node))
+    (when (and (erlang/is_list (:clauses node))
+                (every? (fn [cl] (erlang/is_list (:pats cl))) (:clauses node)))
+     (let [arities (set (map (fn [cl] (count (:pats cl))) (:clauses node)))]
+      (when (= 1 (count arities)) {:arities arities})))
+   (self-scaffold? node) (native-function-shape (scaffold-inner node) (dec remaining))
+   (= :let (:op node)) (native-function-shape (:body node) (dec remaining))
+   (= :do (:op node)) (native-function-shape (last (:stmts node)) (dec remaining))
+   :else nil)))
+
+(defn- function-shape-bounded [node remaining]
+ (when (> remaining 0)
+   (cond
+    (= :fn (:op node)) (native-function-shape node remaining)
+    (self-scaffold? node) (native-function-shape (scaffold-inner node) (dec remaining))
+    (= :tuple (:op node))
+     (when-let [layout (dispatch-layout node)]
+      (let [fixed (:fixed layout) variadic (:variadic layout)
+           valid? (fn [value arity]
+                    (= {:arities #{arity}} (native-function-shape value (dec remaining))))]
+      (when (and (every? (fn [pair] (valid? (second pair) (:val (first pair)))) fixed)
+                  (or (nil? variadic) (valid? (:function variadic) (inc (:minimum variadic)))))
+       (cond-> {:arities (set (map (fn [pair] (:val (first pair))) fixed))}
+        (some? variadic) (assoc :variadic-min (:minimum variadic))))))
+    (= :let (:op node)) (function-shape-bounded (:body node) (dec remaining))
+    (= :do (:op node)) (function-shape-bounded (last (:stmts node)) (dec remaining))
+    :else nil)))
 
 (defn function-shape
   "Static callable arities over canonical ANF. Nil means unknown, never zero
    arities. Binding a closure does not execute its initialization. Both actor and
-   native linking use this contract instead of re-reading source signatures."
+   native linking use this contract instead of re-reading source signatures.
+   Malformed dispatch, inconsistent native clauses or more than 256 wrappers
+   return unknown. Counts prove arity only, not purity or successful matching."
   [node]
-  (cond
-    (= :fn (:op node)) {:arities (set (map (fn [cl] (count (:pats cl))) (:clauses node)))}
-    (self-scaffold? node) (function-shape (scaffold-inner node))
-    (blfn-value? node)
-      (let [[_ fixed variadic] (:elems node)]
-        (merge {:arities (set (map (fn [pair] (:val (first pair))) (:pairs fixed)))}
-               (when (= :tuple (:op variadic))
-                 {:variadic-min (:val (first (:elems variadic)))})))
-    (= :let (:op node)) (function-shape (:body node))
-    (= :do (:op node)) (function-shape (last (:stmts node)))
-    :else nil))
+  (function-shape-bounded node 256))
 
 (defn accepts-arity?
   "Whether a known callable contract accepts n arguments. Unknown shapes fail
    closed; fixed and variadic entrypoints share this decision at every linker."
   [shape n]
-  (and (some? shape)
+  (and (erlang/is_integer n) (>= n 0) (some? shape)
        (or (contains? (:arities shape) n)
-           (and (some? (:variadic-min shape)) (>= n (:variadic-min shape))))))
+           (and (erlang/is_integer (:variadic-min shape)) (>= (:variadic-min shape) 0)
+                (>= n (:variadic-min shape))))))
