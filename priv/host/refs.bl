@@ -422,81 +422,82 @@
 ; ── futures ───────────────────────────────────────────────────────────────
 
 (defn- await_owned_start
-  "A start barrier closes the publication gap: the parent acquires before
-   spawning, transfers under Env's module fence, then publishes the handle.
-   Parent death before publication cannot leave an orphan waiting forever."
-  [parent token thunk_fn ticket]
+  "Receive a native indexed offer before accepting. No function, context or
+   physical lease arrives in the bootstrap message. Parent death before
+   acceptance cancels; independently accepted unlinked work drains."
+  [parent ticket]
   (let [ref (erlang/monitor :process parent)]
     (erlang/send parent (tuple :bl_owned_waiting ticket (erlang/self)))
-    (receive
-      [:bl_owned_cancel seen handle] :when (= seen ticket)
-      (do (erlang/demonitor ref (list :flush))
-          (when handle (BeamLisp.Env/release_code! handle)) :cancelled)
-      [:bl_owned_start seen handle] :when (= seen ticket)
-      (do (erlang/demonitor ref (list :flush))
-          (try
-            (BeamLisp.Env/bind token)
-            (apply_heap_bound)
-            ;; Exact task start ticket already transferred to SELF before this
-            ;; branch; execution proof is private and survives context binding.
-            (BeamLisp.Env/with_owned_code_execution handle
-              (fn [] (BeamLisp.Env/with_owned_generation_execution thunk_fn)))
-            (finally (BeamLisp.Env/release_code! handle))))
-      [:DOWN observed :process _ _]
-      (if (erlang/== ref observed) :cancelled
-        (erlang/error :unexpected_start_monitor)))))
+    (try
+     (receive
+      [:bl_owned_cancel seen] :when (= seen ticket) :cancelled
+      [:bl_owned_start seen prepared] :when (= seen ticket)
+       (let [target (:accepted prepared)]
+        (try
+         (let [accepted (BeamLisp.Execution/accept-start! prepared ticket)]
+          (if (not= :accepted (:status accepted))
+           (if (= :busy (:status accepted)) (erlang/error :code_lease_capacity) :cancelled)
+           (do
+            (erlang/demonitor ref (list :flush))
+            (erlang/send parent (tuple :bl_owned_started ticket (erlang/self)))
+            (let [result (BeamLisp.Execution/invoke-start! target ticket)]
+             (case (:status result)
+              :completed (:value result)
+              :busy (erlang/error :code_lease_capacity)
+              (erlang/error :execution_start_cancelled))))))
+         (finally (BeamLisp.Execution/close! target))))
+      [:DOWN seen :process owner _] :when (and (= seen ref) (= owner parent)) :cancelled)
+     (finally (erlang/demonitor ref (list :flush))))))
 
-(defn- publish_owned_start [handle pid ticket]
-  ;; Child's immutable await_owned_start frame is present before native proof.
-  ;; A supplied PID/Task map or copied message cannot create that frame/custody.
-  (let [waiting (receive
-                  [:bl_owned_waiting seen child] :when (and (= seen ticket) (= child pid)) true
-                  (after 5000 false))]
-    (if (erlang/not waiting)
-      (do (erlang/send pid (tuple :bl_owned_cancel ticket nil)) :cancelled)
-      (let [accepted (BeamLisp.Env/transfer_code! handle pid)]
-        (if (erlang/== :cancelled accepted)
-          (do (erlang/send pid (tuple :bl_owned_cancel ticket nil)) :cancelled)
-          (try
-            (BeamLisp.Env/record_owned_start! pid ticket accepted)
-            (erlang/send pid (tuple :bl_owned_start ticket accepted)) :ok
-            (catch error
-              ;; The action was NEVER published. Only actual native child
-              ;; cancellation releases its transferred, unentered code lease.
-              (erlang/send pid (tuple :bl_owned_cancel ticket accepted))
-              (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))))
+(defn- publish_owned_start [registration pid ticket]
+  (let [monitor (erlang/monitor :process pid)]
+   (try
+    (let [waiting (receive
+                   [:bl_owned_waiting seen child] :when (and (= seen ticket) (= child pid)) true
+                   [:DOWN seen :process child _] :when (and (= seen monitor) (= child pid)) false
+                   (after 5000 false))]
+     (if (not waiting)
+      (do (erlang/send pid (tuple :bl_owned_cancel ticket)) :cancelled)
+      (let [prepared (BeamLisp.Execution/prepare-start! registration pid ticket)]
+       (if (= :cancelled prepared)
+        (do (erlang/send pid (tuple :bl_owned_cancel ticket)) :cancelled)
+        (try
+         (erlang/send pid (tuple :bl_owned_start ticket prepared))
+         (receive
+          [:bl_owned_started seen child] :when (and (= seen ticket) (= child pid)) :ok
+          [:DOWN seen :process child _] :when (and (= seen monitor) (= child pid)) :cancelled
+          (after 5000
+           ;; The offer was published. Return its Task/PID even if its ack is
+           ;; delayed. Closing only the old source epoch in the caller's finally
+           ;; atomically cancels an unaccepted offer; accepted work drains.
+           ;; Never force-kill or close the target based on an observation race.
+           :ok))
+         (catch error
+          (erlang/send pid (tuple :bl_owned_cancel ticket))
+          (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))))
+    (catch error
+     (erlang/send pid (tuple :bl_owned_cancel ticket))
+     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+    (finally (erlang/demonitor monitor (list :flush))))))
 
 (defn task_exec
-  "Start an env-conveying native Task with retained executable ownership.
-   :link preserves Task.async link semantics; :plain unlinks BEFORE publication
-   so accepted work outlives caller death. Only actual completion releases its
-   code lease. Task.yield/await/shutdown retain their ordinary OTP contracts."
+  "Start a native Task through the common registration/offer/entry protocol.
+   Link, unlink, yield/await/shutdown retain their ordinary OTP contracts."
   ([action] (task_exec action :link))
   ([action kind]
    (BeamLisp.Env/assert_execution_context!)
-   (when (or (erlang/not (BeamLisp.Ns.Rt/invocable? action 0))
-             (erlang/not (erlang/or (erlang/== :link kind) (erlang/== :plain kind))))
+   (when (or (not (BeamLisp.Ns.Rt/invocable? action 0))
+             (not (or (= :link kind) (= :plain kind))))
      (erlang/error :invalid_owned_task))
-   (let [token (BeamLisp.Env/capture) parent (erlang/self) ticket (erlang/make_ref)
-         generation (Process/get :bl_generation)
-         graph_modules (if (erlang/== nil generation) (list)
-                         (BeamLisp.Vector/to_list (erlang/map_get :modules generation)))
-         handle (BeamLisp.Env/retain_code!
-                  (erlang/++ graph_modules
-                    (erlang/++ (BeamLisp.Env/callback_modules action)
-                      (list (erlang/element 2 (erlang/fun_info (fn [] nil) :module))))))]
-     (try
-       (let [task (Task/async
-                    (fn [] (await_owned_start parent token
-                             (fn [] (BeamLisp.Ns.Rt/invoke action (list))) ticket)))]
-         (when (erlang/== :plain kind) (Process/unlink (erlang/map_get :pid task)))
-         (when (erlang/== :cancelled (publish_owned_start handle (erlang/map_get :pid task) ticket))
-           ;; No start ticket was published, so no user action was entered.
-           ;; Dispose the ordinary Task monitor before reporting refusal.
-           (Task/shutdown task :brutal_kill)
-           (erlang/error :task_start_cancelled))
-         task)
-       (finally (BeamLisp.Env/release_code! handle))))))
+   (let [parent (erlang/self) ticket (erlang/make_ref)
+         registration (BeamLisp.Execution/register-start! action (list))]
+    (try
+     (let [task (Task/async (fn [] (await_owned_start parent ticket)))]
+      (when (= :plain kind) (Process/unlink (erlang/map_get :pid task)))
+      (when (= :cancelled (publish_owned_start registration (erlang/map_get :pid task) ticket))
+       (Task/shutdown task :brutal_kill)
+       (erlang/error :task_start_cancelled)) task)
+     (finally (BeamLisp.Execution/close! registration))))))
 
 (defn future_exec
   "An env-conveying Task with executable ownership acquired before spawning.
@@ -509,37 +510,27 @@
       (maps/put :task task (maps/new)))))
 
 (defn spawn_owned
-  "Env-conveying process with explicit extra physical module dependencies.
-   Runtime boundaries retaining another callback list that callback's module
-   here; managed tasks automatically retain their complete sealed graph.
-   Outside managed graphs, arbitrary values hidden in closures are not traced."
+  "Env-conveying process using the native indexed execution start. Explicit
+   dependencies remain eager; metadata does not nominate execution origin."
   ([thunk_fn kind modules] (spawn_owned thunk_fn kind modules (list)))
   ([thunk_fn kind modules monitor_options]
-  (when-not (and (erlang/is_list monitor_options)
-                 (or (erlang/== :monitor kind) (erlang/== (list) monitor_options)))
-   (erlang/error :invalid_owned_monitor_options))
-  (BeamLisp.Env/assert_execution_context!)
-  (let [token (BeamLisp.Env/capture) parent (erlang/self) ticket (erlang/make_ref)
-        generation (Process/get :bl_generation)
-        graph_modules (if (erlang/== nil generation) (list)
-                        (BeamLisp.Vector/to_list (erlang/map_get :modules generation)))
-        modules (erlang/++ graph_modules
-                  (erlang/++ modules
-                    (list (erlang/element 2 (erlang/fun_info thunk_fn :module))
-                          (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))))
-        handle (BeamLisp.Env/retain_code! modules)
-        wrapped (fn [] (await_owned_start parent token thunk_fn ticket))]
+   (when-not (and (erlang/is_list monitor_options)
+                  (or (= :monitor kind) (= (list) monitor_options)))
+    (erlang/error :invalid_owned_monitor_options))
+   (when-not (Enum/member? (list :plain :link :monitor) kind)
+    (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term kind)))))
+   (let [parent (erlang/self) ticket (erlang/make_ref)
+         registration (BeamLisp.Execution/register-start! thunk_fn modules)
+         wrapped (fn [] (await_owned_start parent ticket))]
     (try
-      (let [result (cond
-                     (erlang/== :plain kind) (erlang/spawn wrapped)
-                     (erlang/== :link kind) (erlang/spawn_link wrapped)
-                     (erlang/== :monitor kind)
-                       (erlang/spawn_opt wrapped (list (tuple :monitor monitor_options)))
-                     :else (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term kind)))))
-            pid (if (erlang/== :monitor kind) (erlang/element 1 result) result)]
-        (publish_owned_start handle pid ticket)
-        result)
-      (finally (BeamLisp.Env/release_code! handle))))))
+     (let [result (cond
+                    (= :plain kind) (erlang/spawn wrapped)
+                    (= :link kind) (erlang/spawn_link wrapped)
+                    (= :monitor kind) (erlang/spawn_opt wrapped (list (tuple :monitor monitor_options)))
+                    :else (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term kind)))))
+           pid (if (= :monitor kind) (erlang/element 1 result) result)]
+      (publish_owned_start registration pid ticket) result)
+     (finally (BeamLisp.Execution/close! registration))))))
 
 (defn spawn_exec
   "Spawn with env conveyance and automatic executable lifetime transfer.

@@ -35,8 +35,9 @@
 ;     and writable by the live module and vice versa, because both spell the
 ;     same production tag and the same cell;
 ;   * the PRODUCTION-atom stand-in: the pinned beam loaded over
-;     `Elixir.BeamLisp.Refs` answers the whole corpus identically, then the live
-;     beam is restored.
+;     `Elixir.BeamLisp.Refs` preserves the data ABI. Startup also requires the
+;     original image identity: a different emitted executable is refused until
+;     its matching image is booted. The live beam is restored.
 ;
 ; EVERY READ HERE IS `maps/get`/`maps/keys`/`erlang/map_get`, never `(:f x)`:
 ; beam-lisp's keyword lookup is a COLLECTION read, and the runtime refuses one
@@ -508,24 +509,46 @@
         orig-path (erlang/apply :code :which (list live))
         orig-bin (File/read! (erlang/list_to_binary orig-path))
         beam (Path/join dir "Elixir.BeamLisp.Refs.beam")
+        original-md5 (erlang/apply live :module_info (list :md5))
         d (BeamLisp.Deferred/delay (fn [] 41))
         dr (BeamLisp.Reactive/derive (list) (fn [] 7))
         corpus (fn [] (list (atom-corpus live live) (watch-corpus live)
-                            (volatile-corpus live) (future-corpus live)
+                            (volatile-corpus live)
                             (promise-corpus live) (native-corpus live d dr)))
-        before (corpus)]
+        before (corpus) futures-before (future-corpus live)]
     (when (= :non_existing orig-path)
       (throw (ex-info "The live Refs beam must be a readable file" {})))
     (try
       ; Compile at the EXACT production atom, load over it, compare the whole
       ; actual corpus, then restore. This deliberately bypasses code leases and
       ; therefore belongs in its own OS VM with no owned Refs execution frame.
-      (BeamLisp.AOT/compile_host_file (refs-source)
-        (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)))
+      (let [workspace (BeamLisp.AOT/open_workspace
+                        {:version 2 :phase-imports (list 'core 'sugar)
+                         :sources (list {:namespace 'host.refs :file (refs-source)})} {})]
+       (try
+        (let [unit (BeamLisp.AOT/prepare_host_unit workspace {:namespace 'host.refs :module live})
+              output (Path/join dir "unit")]
+         (BeamLisp.AOT/emit_unit unit output)
+         (let [verified (BeamLisp.AOT/verify_unit output)]
+          (when-not (= 1 (count (:beams verified))) (throw (ex-info "Unexpected host unit members" {})))
+          (File/write! beam (elem (first (:beams verified)) 1))))
+        (finally (BeamLisp.AOT/close_workspace! workspace))))
       (drop! live)
       (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
       (when (not= before (corpus))
         (throw (ex-info "Pinned production Refs ABI changed" {})))
+      (if (= original-md5 (erlang/apply live :module_info (list :md5)))
+       (when-not (= futures-before (future-corpus live))
+        (throw (ex-info "Qualified Refs startup ABI changed" {})))
+       ;; Emission is not runtime admission. A different executable needs its
+       ;; complete matching image manifest and fresh boot, even for identical
+       ;; physical source. Never stamp a receipt to bless this replacement.
+       (let [entered (atom false)
+             refused (try (BeamLisp.Refs/future_exec #(reset! entered true)) nil
+                       (catch error (:original error)))]
+        (when-not (and (tuple? refused) (= :missing_sdk_dependency_unit_owner (elem refused 0))
+                       (= false @entered))
+         (throw (ex-info "Unapproved Refs replacement acquired startup authority" {})))))
       (finally
         (drop! live)
         (code/load_binary live orig-path orig-bin)))
