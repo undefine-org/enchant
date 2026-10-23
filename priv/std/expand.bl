@@ -1,6 +1,6 @@
 ;; Ordered contextual elaboration. Reader, binding lookup, macro evaluation and
 ;; ANF compilation each retain their existing owner. No alternate evaluator.
-(ns expand (:require [syntax :as s] [binding :as b]))
+(ns expand (:require [syntax :as s] [binding :as b] [codebase.phase :as catalog]))
 
 (defn- refuse! [kind node]
  (throw (ex-info (str "Contextual expansion: " kind)
@@ -32,11 +32,18 @@
  (str "__bl_binding_" (Base/encode16 (:id reference) (list (tuple :case :lower)))))
 
 (defn- reference-reader [node result state definition?]
- (let [reference (:reference result) name (internal-name reference)
+ (let [original (:reference result) shift (Map/get state :reference-shift 0)
+       reference (if (= 0 shift) original
+                   (assoc original :phase (+ (:phase original) shift)
+                     :id (b/reference-id (:selection state) (:declaration original) (+ (:phase original) shift))))
+       name (internal-name reference)
        syntax (assoc node :value (symbol name))
        occurrence {:reference reference :name (:value node) :origin (:origin node)
-                   :definition definition?}
-       descriptor {:reference reference :declaration (:declaration result)}]
+                   :context (:context node) :lookup-phase (:phase state) :position (:position state)
+                   :reference-shift shift :definition definition?}
+       descriptor {:reference reference :declaration (:declaration result)}
+       state (if (= :local (get-in result [:declaration :visibility])) state
+                 (assoc-in state [:dependencies name] descriptor))]
   (tuple (as-reader syntax)
          (-> state (assoc-in [:references name] descriptor)
                    (update :occurrences #(cons occurrence %))))))
@@ -63,6 +70,7 @@
 
 (declare expression-node)
 (declare pattern-node)
+(declare demand-transformer)
 
 (defn- expression-nodes [nodes state]
  (Enum/map_reduce nodes state (fn [node current] (expression-node node current))))
@@ -129,21 +137,68 @@
  (let [name (spelling node)] (and name (String/starts_with? name "erlang/"))))
 
 (defn- macro-node [node result state]
- (let [allocated (fresh-scope state :introduction) scope (elem allocated 0) state (elem allocated 1)
+ (when (or (<= (Map/get state :macro-budget 0) 0) (>= (Map/get state :macro-depth 0) 64))
+  (refuse! :contextual-macro-budget node))
+ (let [depth (Map/get state :macro-depth 0)
+       state (-> state (update :macro-budget dec) (assoc :macro-depth (+ 1 depth)))
+       allocated (fresh-scope state :introduction) scope (elem allocated 0) state (elem allocated 1)
        reference (:reference result) declaration (:declaration result)
        context {:version 1 :definition-context
                  {:world (:world reference) :namespace (:namespace declaration) :space (:space declaration)
                   :scopes {:all (:scopes declaration)}}
                 :use-context (:context (first (:children node))) :introduction-scope (:id scope)
                 :use-phase (:phase state) :phase (+ 1 (:phase state)) :origin (:origin node)}]
-  (when-not (and (:controller state)
-                 (erlang/function_exported :Elixir.BeamLisp.AOT :contextual_macro! 4))
+  (when-not (:catalog state)
    (refuse! :contextual-macro-controller-unavailable node))
   ;; Fixed compiler interface. No caller-supplied evaluator or runtime macro Fn.
-  (let [expanded (BeamLisp.AOT/contextual_macro! (:controller state) reference node context)
-        syntax (s/validate (:syntax expanded))
-        trace {:transformer reference :origin (:origin node) :protocol (:protocol expanded)}]
-   (expression-node syntax (update state :expansions #(cons trace %))))))
+  (let [demand (demand-transformer reference state)
+        expanded (BeamLisp.AOT/interpret_constructor!
+                   {:op :apply :fn (elem demand 0)
+                    :args [{:op :lit :val node} {:op :lit :val context}]} {}
+                   {:resolution-world :kernel-phase})
+        materialize (fn [value]
+                      (if (= :contextual-literal (:kind value))
+                        (s/from-datum (:value value) (:definition-context context)) value))
+        syntax (s/validate
+                 (if (= :contextual-template (:kind expanded))
+                   (s/template (:template expanded)
+                     (Map/new (Enum/map (Map/to_list (:holes expanded))
+                                #(tuple (elem % 0) (materialize (elem % 1))))) (:id scope))
+                   (materialize expanded)))
+        trace {:transformer reference :origin (:origin node) :protocol 'syntax-v1}]
+   (let [r (expression-node syntax (update (elem demand 1) :expansions #(cons trace %)))]
+    (tuple (elem r 0) (assoc (elem r 1) :macro-depth depth))))))
+
+(defn- quote-reader [value context]
+ (tuple :list (list (tuple :symbol "quote") (s/to-reader (s/from-datum value context)))))
+
+(defn- template-node [node state]
+ (when-not (:transformer state) (refuse! :syntax-template-outside-transformer node))
+ (let [children (:children node)]
+  (when-not (= 3 (count children)) (refuse! :syntax-template-arity node))
+  (let [holes (expression-node (nth children 2) state)]
+   (tuple (tuple :map
+            (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-template"))
+                  (tuple (tuple :keyword "template") (quote-reader (second children) (:context node)))
+                  (tuple (tuple :keyword "holes") (elem holes 0)))) (elem holes 1)))))
+
+(defn- argument-node [node state]
+ (let [children (:children node) index (nth children 2 nil)]
+  (when-not (and (= 3 (count children)) (= :scalar (:tag index))
+                 (erlang/is_integer (:value index)) (<= 0 (:value index) 64))
+   (refuse! :syntax-argument-index node))
+  (let [form (expression-node (second children) state)
+        items (tuple :list (list (tuple :symbol "BeamLisp.Ns.Rt/get") (elem form 0) (tuple :keyword "children")))
+        tail (Enum/reduce (List/duplicate nil (:value index)) items
+               (fn [_ value] (tuple :list (list (tuple :symbol "erlang/tl") value))))]
+   (tuple (tuple :list (list (tuple :symbol "erlang/hd") tail)) (elem form 1)))))
+
+(defn- literal-node [node state]
+ (when-not (and (:transformer state) (= 2 (count (:children node))))
+  (refuse! :syntax-literal-contract node))
+ (let [r (expression-node (second (:children node)) state)]
+  (tuple (tuple :map (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-literal"))
+                           (tuple (tuple :keyword "value") (elem r 0)))) (elem r 1))))
 
 (defn- expression-node [node state]
  (let [state (tick state) tag (:tag node)]
@@ -161,19 +216,25 @@
                 (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
      (tuple (tuple :map (elem r 0)) (elem r 1)))
    (= :list tag)
-    (let [children (:children node) head (first children) name (spelling head)]
+    (let [children (:children node) head (first children) name (spelling head)
+          binding (when (s/identifier? head)
+                    (b/resolve (:selection state) head (:phase state) (:position state)))
+          kernel? (or (nil? binding) (= :unbound (:status binding)))]
      (cond
       (empty? children) (tuple (list-reader node (list)) state)
-      (= "quote" name) (tuple (as-reader node) state)
-      (contains? #{"let" "let*" "loop" "loop*"} name) (let-node node state)
-      (contains? #{"fn" "fn*"} name) (fn-node node state)
-      (contains? #{"if" "do" "recur" "throw"} name)
+      (and kernel? (= "quote" name)) (tuple (as-reader node) state)
+      (and kernel? (= "syntax-template" name)) (template-node node state)
+      (and kernel? (= "syntax-arg" name)) (argument-node node state)
+      (and kernel? (= "syntax-literal" name)) (literal-node node state)
+      (and kernel? (contains? #{"let" "let*" "loop" "loop*"} name)) (let-node node state)
+      (and kernel? (contains? #{"fn" "fn*"} name)) (fn-node node state)
+      (and kernel? (contains? #{"if" "do" "recur" "throw"} name))
        (let [r (expression-nodes (rest children) state)]
         (tuple (list-reader node (cons (as-reader head) (elem r 0))) (elem r 1)))
       (native-name? head)
        (let [r (expression-nodes (rest children) state)]
         (tuple (list-reader node (cons (as-reader head) (elem r 0)))
-               (update (elem r 1) :native-obligations #(cons {:name (:value head) :origin (:origin head)} %))))
+               (update (elem r 1) :native-obligations #(cons {:name (:value head) :origin (:origin head) :phase (:phase state)} %))))
       :else
        (let [result (when (s/identifier? head) (resolve-symbol head state))]
         (if (contains? #{:macro :syntax} (get-in result [:declaration :kind]))
@@ -184,11 +245,12 @@
 
 (defn expression
  "Elaborate one actual Reader expression against selected logical worlds.
-  Actual source bytes must match the selected root revision. The optional
-  controller is a private AOT handle, never an arbitrary evaluation function."
+  Actual source bytes must match the selected root revision. Source transformer
+  demands are owned by program, which derives its catalog from actual Reader
+  units; this expression adapter accepts no evaluator callback."
  [source file options]
  (when-not (and (erlang/is_map options)
-                (every? #(contains? #{:selection :world :namespace :phase :controller} %) (keys options)))
+                (every? #(contains? #{:selection :world :namespace :phase} %) (keys options)))
   (refuse! :invalid-expansion-options nil))
  (let [graph (b/validate-selection (:selection options))
        w (Map/get (:worlds graph) (:world options)) namespace (:namespace options)
@@ -202,7 +264,7 @@
        forms (s/read source file context)
        _ (when-not (= 1 (count forms)) (refuse! :expansion-expression-count nil))
        state {:selection graph :world (:key w) :namespace namespace :phase phase :position 0
-              :controller (:controller options) :next-scope 0 :next-declaration 0 :remaining 1000000
+              :next-scope 0 :next-declaration 0 :remaining 1000000
               :references {} :occurrences (list) :expansions (list) :native-obligations (list)}
        result (expression-node (first forms) state) state (elem result 1)]
   {:version 1 :kind :expanded-expression :reader (elem result 0)
@@ -223,3 +285,120 @@
   (assoc expanded :node
     (BeamLisp.Compiler/compile (:reader expanded)
       (assoc (BeamLisp.Compiler/new_env (str (:namespace options))) :file file)))))
+
+(defn- contextualize [node unit]
+ (Enum/reduce (get-in unit [:context :scopes :all]) node #(s/add-scope %2 %1 :all)))
+
+(defn- definition-node [recipe unit]
+ (let [node (contextualize (:node recipe) unit) children (:children node)
+       declaration (:declaration recipe)]
+  (if (= :value (:kind declaration))
+   (do (when-not (= 3 (count children)) (refuse! :contextual-value-arity node))
+       (nth children 2))
+   (assoc node :children
+     (cons (s/identifier 'fn (:context node)) (rest children))))))
+
+(declare link-reference)
+
+(defn- link-dependencies [dependencies state]
+ (Enum/reduce (Enum/sort (Map/to_list dependencies)) state
+  (fn [entry current] (link-reference (elem entry 0) (elem entry 1) current))))
+
+(defn- wrap-links [reader state]
+ (if (empty? (:link-order state)) reader
+  (tuple :list
+   (list (tuple :symbol "let")
+         (tuple :vector (Enum/flat_map (Enum/reverse (:link-order state))
+                           (fn [name] (list (symbol name) (get (:linked state) name))))) reader))))
+
+(defn- in-definition [recipe reference state transformer?]
+ (let [unit (Map/fetch! (get-in state [:catalog :worlds]) (:world recipe))
+       declaration (:declaration recipe)
+       phase (+ (:phase declaration) (if transformer? 1 0))
+       target-phase (+ (:phase reference) (if transformer? 1 0))
+       current (assoc state :world (:world recipe) :namespace (:namespace declaration)
+                            :phase phase :position (:position recipe)
+                            :reference-shift (- target-phase phase) :transformer transformer? :dependencies {})
+       r (expression-node (definition-node recipe unit) current)
+       fields [:world :namespace :phase :position :reference-shift :transformer :dependencies]
+       restored (Enum/reduce fields (elem r 1)
+                  (fn [key out] (assoc out key (get state key))))]
+  (tuple (elem r 0) (:dependencies (elem r 1)) restored)))
+
+(defn- link-reference [name descriptor state]
+ (if (contains? (:linked state) name) state
+  (do
+   (when (contains? (:link-active state) name) (refuse! :contextual-initialization-cycle nil))
+   (when (>= (erlang/map_size (:link-active state)) 128) (refuse! :contextual-link-depth nil))
+   (let [reference (:reference descriptor)
+         recipe (get-in state [:catalog :recipes (:declaration reference)])]
+    (when-not recipe (refuse! :contextual-definition-missing nil))
+    (when-not (contains? #{:function :value} (get-in recipe [:declaration :kind]))
+     (refuse! :contextual-runtime-transformer nil))
+    (let [r (in-definition recipe reference (assoc-in state [:link-active name] true) false)
+          state (link-dependencies (elem r 1) (elem r 2))]
+     (-> state (assoc-in [:linked name] (elem r 0))
+               (update :link-order #(cons name %))
+               (update :link-active #(dissoc % name))))))))
+
+(defn- compile-reader [reader namespace file]
+ (BeamLisp.Compiler/compile reader
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file)))
+
+(defn- demand-transformer [reference state]
+ (let [key (:id reference)]
+  (if-let [cached (get-in state [:transformers key])]
+   (tuple cached state)
+   (let [recipe (get-in state [:catalog :recipes (:declaration reference)])]
+    (when-not (= :syntax (get-in recipe [:declaration :kind]))
+     (refuse! :contextual-transformer-missing nil))
+    (when (contains? (:transformer-active state) key) (refuse! :contextual-transformer-cycle nil))
+    (let [r (in-definition recipe reference
+              (assoc state :linked {} :link-order (list) :link-active {}
+                           :transformer-active (assoc (:transformer-active state) key true)) true)
+          linked (link-dependencies (elem r 1) (elem r 2))
+          unit (get-in state [:catalog :worlds (:world recipe)])
+          node (compile-reader (wrap-links (elem r 0) linked) (:namespace unit) (:file unit))
+          restored (-> linked (assoc :linked (:linked state) :link-order (:link-order state)
+                                     :link-active (:link-active state)
+                                     :transformer-active (:transformer-active state))
+                              (assoc-in [:transformers key] node))]
+     (tuple node restored))))))
+
+(defn program
+ "Compile a closed syntax-v1 source catalog. :entry is [namespace revision],
+  both quoted symbols. Source imports select revisions explicitly. Global
+  definitions link lexically from those exact Reader-derived recipes; Env is
+  never a fallback. Transformers use the existing bounded ANF constructor."
+ [sources entry]
+ (let [catalog (catalog/catalog sources)
+       entry (BeamLisp.CompilerData/eager_to_list entry)
+       _ (when-not (= 2 (count entry)) (refuse! :contextual-entry nil))
+       unit (catalog/unit catalog (first entry) (second entry))
+       _ (Enum/each (Map/values (:units catalog))
+           (fn [other]
+            (when (and (not= (tuple (:namespace other) (:revision other))
+                              (tuple (:namespace unit) (:revision unit)))
+                       (not (empty? (:expressions other))))
+             (refuse! :contextual-provider-expression (:node (first (:expressions other)))))))
+       expressions (:expressions unit)
+       _ (when-not (and (= 1 (count expressions)) (= 0 (:phase (first expressions))))
+           (refuse! :contextual-entry-expression-count nil))
+       expression (first expressions)
+       state {:catalog catalog :selection (:selection catalog) :world (get-in unit [:world :key])
+              :namespace (:namespace unit) :phase 0 :position (:position expression) :reference-shift 0
+              :next-scope 0 :next-declaration 0 :remaining 1000000 :macro-budget 128 :macro-depth 0 :transformer false
+              :references {} :dependencies {} :occurrences (list) :expansions (list)
+              :native-obligations (list) :linked {} :link-order (list) :link-active {}
+              :transformers {} :transformer-active {}}
+       r (expression-node (contextualize (:node expression) unit) state)
+       state (link-dependencies (:dependencies (elem r 1)) (elem r 1))
+       reader (wrap-links (elem r 0) state)
+       node (compile-reader reader (:namespace unit) (:file unit))]
+  {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node
+   :selection (b/freeze (:selection state)) :references (:references state)
+   :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
+   :native-obligations (Enum/reverse (:native-obligations state))
+   :linked (Enum/reverse (:link-order state)) :transformers (:transformers state)
+   :coverage {:contextual-bindings true :closed-global-linking true :bound-ir false
+              :native-effects-complete false :legacy-datum-macros false}}))
