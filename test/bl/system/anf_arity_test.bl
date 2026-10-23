@@ -1,0 +1,136 @@
+(ns system.anf-arity-test
+ (:require [system.arity.anf :as arity] [compiler :as compiler]
+           [expand :as expand] [anf :as a] [lower :as lower]))
+(defn- compiled [source]
+ (compiler/compile (BeamLisp.Reader/read_one source) (compiler/new-env "anf.arity.fixture")))
+(defn- checked [source] (arity/check (compiled source)))
+(defn- statuses [report] (mapv :status (:obligations report)))
+(defn- native [source]
+ (let [module (erlang/binary_to_atom (str "Elixir.AnfArityControl" (erlang/unique_integer (list :positive))))]
+  (try (lower/eval-anf module (compiled source))
+   (catch error (:__struct__ error))
+   (finally (code/delete module) (code/soft_purge module)))))
+
+(deftest local-fixed-multi-and-variadic-callees-have-real-contracts
+ (doseq [[source status result]
+  [["(let [f (fn [x] x)] (f 42))" :proved 42]
+   ["(let [f (fn [x] x)] (f))" :refused :Elixir.BadArityError]
+   ["(let [f (fn ([x] x) ([x y] y))] (f 1 42))" :proved 42]
+   ["(let [f (fn ([x] x) ([x y] y))] (f))" :refused :Elixir.ArgumentError]
+   ["(let [f (fn [x & xs] x)] (f 42 1 2))" :proved 42]
+   ["(let [f (fn [x & xs] x)] (f))" :refused :Elixir.ArgumentError]]]
+  (let [report (checked source)]
+   (is (= result (native source)))
+   (is (= status (:status report)))
+   (is (= [status] (statuses report)))
+   (is (= true (get-in report [:coverage :complete]))))))
+
+(deftest aliases-and-captures-use-lexical-values
+ (is (= :refused (:status (checked "(let [f (fn [x] x) alias f] (alias))"))))
+ (is (= :refused (:status (checked "(let [f (fn [x] x) g (fn [] (f)) f (fn [] 42)] (g))"))))
+ (let [report (checked "(let [f (fn [] 42) g (fn [f] (f))] (g f))")]
+  (is (= :unknown (:status report)))
+  (is (= #{:unknown :proved} (set (statuses report))))))
+
+(deftest branches-preserve-alternatives-and-precision-loss
+ (let [one (a/fnn (list (a/clause (list (a/pvar "x")) nil (a/lit 42))))
+       zero (a/fnn (list (a/clause (list) nil (a/lit 42))))
+       call (fn [left right]
+             (a/lett "f" (a/iff (a/var "test") left right)
+              (a/invoke (a/var "f") (a/empty-list-node))))]
+  (is (= :refused (:status (arity/check (call one one)))))
+  (is (= :proved (:status (arity/check (call zero zero)))))
+  (is (= :unknown (:status (arity/check (call zero one)))))
+  (is (= :unknown (:status (arity/check (call zero (a/var "external"))))))))
+
+(deftest named-recursion-uses-the-exact-lexical-self-factory
+ (let [report (checked "(let [f (fn f [x] (if x (f) 42))] (f false))")]
+  (is (= 42 (native "(let [f (fn f [x] (if x (f) 42))] (f false))")))
+  (is (= :refused (:status report)))
+  (is (= 1 (count (:findings report))))
+  (is (= 0 (:arity (first (:findings report)))))))
+
+(deftest native-application-is-distinct-from-language-dispatch
+ (let [dispatch (compiled "(fn ([x] x) ([x y] y))")
+       invoke (a/invoke dispatch (a/cons-cell (a/lit 42) (a/empty-list-node)))
+       apply (a/app dispatch (list (a/lit 42)))]
+  (is (= :proved (:status (arity/check invoke))))
+  (is (= :refused (:status (arity/check apply))))))
+
+(deftest unresolved-and-computed-calls-are-explicit-obligations
+ (doseq [node [(a/invoke (a/var "unknown") (a/empty-list-node))
+               (a/invoke (compiled "(fn [] 42)") (a/var "args"))
+               (a/remote :erlang :self (list))
+               (a/invoke (a/global-exact "fixture" "value") (a/empty-list-node))]]
+  (let [report (arity/check node)]
+   (is (= :unknown (:status report)))
+   (is (= false (get-in report [:coverage :complete])))
+   (is (= 1 (get-in report [:coverage :unknown])))))
+ (is (= :computed-argument-list
+        (:reason (first (:obligations (arity/check
+           (a/invoke (compiled "(fn [] 42)") (a/var "args")))))))))
+
+(deftest inert-annotations-and-literals-cannot-introduce-calls-or-signatures
+ (let [fake {:op :invoke :callee (a/var "fake") :arguments (a/empty-list-node)}
+       node (assoc (a/lit fake) :ann {:nested fake})]
+  (is (= 0 (get-in (arity/check node) [:coverage :sites]))))
+ (let [node (assoc (a/invoke (a/var "fake") (a/empty-list-node))
+             :ann {:binding-reference {:id "forged"} :arities #{0}})]
+  (is (= :unknown (:status (arity/check node))))))
+
+(deftest invalid-grammar-and-exhausted-budgets-never-become-empty-proofs
+ (is (= :error (:status (arity/check {:op :not-an-op}))))
+ (is (= false (get-in (arity/check {:op :not-an-op}) [:coverage :complete])))
+ (doseq [options [{:node-limit 1} {:depth-limit 1}]]
+  (let [report (arity/check (compiled "(let [f (fn [] 42)] (f))") options)]
+   (is (= :unknown (:status report)))
+   (is (= :call-shape-budget (:kind report)))
+   (is (= false (get-in report [:coverage :complete])))
+   (is (nil? (get-in report [:coverage :sites])))))
+ (is (= :error (:status (arity/check (a/lit 42) {:node-limit -1}))))
+ (is (= :error (:status (arity/check (a/lit 42) {:signatures {}})))))
+
+(deftest phase-qualified-worlds-are-checked-from-compiled-identities
+ (let [program (expand/program
+                [{:namespace 'library :revision 'old :file "old.bl"
+                  :source "(ns library) (defn answer [] 42)"}
+                 {:namespace 'library :revision 'new :file "new.bl"
+                  :source "(ns library) (defn answer [x] x)"}
+                 {:namespace 'client :revision 'current :file "client.bl"
+                  :source (str "(ns client) (import-world 'library 'old :as old :only [answer]) "
+                               "(import-world 'library 'new :as new :only [answer]) "
+                               "[(old/answer) (new/answer)]")}]
+                ['client 'current])
+       report (arity/check (:node program))]
+  (is (= :refused (:status report)))
+  (is (= 1 (get-in report [:coverage :proved])))
+  (is (= 1 (get-in report [:coverage :refused])))
+  (is (= 0 (:arity (first (:findings report)))))))
+
+(deftest clause-bindings-shadow-captured-contracts
+ (let [zero (compiled "(fn [] 42)")
+       clause (a/clause (list (a/pvar "f")) nil (a/invoke (a/var "f") (a/empty-list-node)))
+       node (a/lett "f" zero (a/casee (a/var "external") (list clause)))]
+  (is (= :unknown (:status (arity/check node))))))
+
+(deftest exception-and-receive-results-retain-only-conservative-contracts
+ (let [zero (compiled "(fn [] 42)") one (compiled "(fn [x] x)")
+       call (fn [value] (a/lett "f" value (a/invoke (a/var "f") (a/empty-list-node))))
+       caught (a/clause (list (a/pvar "error")) nil one)
+       try-value (a/tryy zero (list caught) (a/lit nil))
+       receive-value (a/recv (list (a/clause (list (a/pvar "message")) nil zero)) (a/lit 0) one)
+       no-catch-value (a/tryy zero (list) (a/lit nil))]
+  (is (= :unknown (:status (arity/check (call try-value)))))
+  (is (= :unknown (:status (arity/check (call receive-value)))))
+  (is (= :proved (:status (arity/check (call no-catch-value)))))))
+
+(deftest too-many-branch-contracts-widen-to-an-explicit-obligation
+ (let [branch (reduce
+               (fn [else n]
+                (a/iff (a/var "condition")
+                 (a/fnn (list (a/clause (apply list (map #(a/pvar (str "arg" %)) (range n))) nil (a/lit 42))))
+                 else))
+               (a/fnn (list (a/clause (apply list (map #(a/pvar (str "base" %)) (range 9))) nil (a/lit 42)))) (range 9))
+       report (arity/check (a/lett "f" branch (a/invoke (a/var "f") (a/empty-list-node))))]
+  (is (= :unknown (:status report)))
+  (is (= :dynamic-callee (:reason (first (:obligations report)))))))
