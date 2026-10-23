@@ -1,43 +1,105 @@
-; Pure IR identity; no analyzer, database, solver or runtime owner dependency.
-(ns system.ir.identity)
+;; Pure lexical ANF identity; hashes are hints, never reuse authority.
+(ns system.ir.identity (:require [system.ir :as ir]))
 
 (defn- walkable? [x]
-  (and (map? x) (or (contains? x :op) (contains? x :pats) (contains? x :pop))))
-
-(defn- normalize
-  "One traversal, threading the persistent binding map within this process.
-   Literal values are opaque even when a quoted map happens to resemble IR."
-  [node bindings rename?]
-  (cond
-    (walkable? node)
-    (let [local? (and rename? (or (= :var (:op node)) (= :pvar (:pop node)) (= :let (:op node))))
-          original (:name node)
-          bindings (if (and local? (not (contains? bindings original)))
-                     (assoc bindings original (str "v" (count bindings))) bindings)
-          initial (cond-> (dissoc node :ann) local? (assoc :name (get bindings original)))]
-      (reduce (fn [[out env] [k v]]
-                (if (or (= k :val) (and local? (= k :name)))
-                  [out env]
-                  (let [[value env] (normalize v env rename?)] [(assoc out k value) env])))
-              [initial bindings] initial))
-
-    (or (list? node) (vector? node))
-    (let [[items env] (reduce (fn [[out env] x]
-                                (let [[value env] (normalize x env rename?)] [(conj out value) env]))
-                              [[] bindings] node)]
-      [(if (list? node) (apply list items) items) env])
-
-    :else [node bindings]))
+ (and (map? x) (or (contains? x :op) (contains? x :pats) (contains? x :pop))))
 
 (defn strip-ann
-  "Remove IR positions through nodes, clauses and patterns, preserving literals."
-  [node]
-  (first (normalize node {} false)))
+ "Remove IR positions through nodes, clauses and patterns, preserving literals."
+ [node]
+ (cond
+  (walkable? node)
+   (reduce (fn [out [key value]]
+             (if (= key :val) out (assoc out key (strip-ann value))))
+           (dissoc node :ann) (Map/to_list (dissoc node :ann)))
+  (erlang/is_list node) (apply list (map strip-ann node))
+  (vector? node) (mapv strip-ann node)
+  :else node))
+
+(declare canonical pattern)
+(defn- sequence [items env next]
+ (let [[out next] (reduce (fn [[out next] item]
+                          (let [[value next] (canonical item env next)] [(conj out value) next]))
+                        [[] next] items)]
+  [(if (erlang/is_list items) (apply list out) out) next]))
+(defn- fields [node env next]
+ (reduce (fn [[out next] [key value]]
+           (if (= key :val) [out next]
+            (let [[value next] (canonical value env next)] [(assoc out key value) next])))
+         [(dissoc node :ann) next] (Map/to_list (dissoc node :ann))))
+(defn- bound-name [env name]
+ (if (contains? env name) [:bound (get env name)] name))
+(defn- bind [names env next]
+ (reduce (fn [[env next] name]
+           (if (= "_" name) [env next]
+            [(assoc env name [:local next]) (inc next)]))
+         [env next] (distinct names)))
+
+(defn- pattern
+ ;; Map/struct keys are expressions in the enclosing scope. Pattern variables
+ ;; and repeated-variable constraints share the clause's new binding scope.
+ [node outer scope next]
+ (let [op (:pop node) initial (dissoc node :ann)]
+  (cond
+   (= :pvar op) [(assoc initial :name (if (= "_" (:name node)) "_" (bound-name scope (:name node)))) next]
+   (contains? #{:plit :pnil} op) [initial next]
+   (contains? #{:pmap :pstruct} op)
+    (let [field (if (= :pmap op) :pairs :fields)
+          [pairs next]
+          (reduce (fn [[out next] pair]
+                    (let [[key next] (canonical (first pair) outer next)
+                          [value next] (pattern (second pair) outer scope next)]
+                     [(conj out (if (erlang/is_list pair) (list key value) [key value])) next]))
+                  [[] next] (get node field))]
+     [(assoc initial field (if (erlang/is_list (get node field)) (apply list pairs) pairs)) next])
+   (= :ptuple op)
+    (let [[items next] (reduce (fn [[out next] p]
+                                (let [[p next] (pattern p outer scope next)] [(conj out p) next]))
+                              [[] next] (:elems node))]
+     [(assoc initial :elems (if (erlang/is_list (:elems node)) (apply list items) items)) next])
+   (contains? #{:pcons :palias} op)
+    (let [[left right] (if (= :pcons op) [:head :tail] [:a :b])
+          [a next] (pattern (get node left) outer scope next)
+          [b next] (pattern (get node right) outer scope next)]
+     [(assoc initial left a right b) next])
+   :else (throw (ex-info "Unknown ANF identity pattern" {:kind :identity-pattern :pop op})))))
+
+(defn- clause [node env next]
+ (let [[scope next] (bind (ir/clause-pattern-vars node) env next)
+       [pats next] (reduce (fn [[out next] p]
+                            (let [[p next] (pattern p env scope next)] [(conj out p) next]))
+                          [[] next] (:pats node))
+       [guard next] (canonical (:guard node) scope next)
+       [body next] (canonical (:body node) scope next)]
+  [(assoc (dissoc node :ann) :pats (if (erlang/is_list (:pats node)) (apply list pats) pats)
+                            :guard guard :body body) next]))
+
+(defn- canonical [node env next]
+ (cond
+  (and (map? node) (= :var (:op node)))
+   [(assoc (dissoc node :ann) :name (bound-name env (:name node))) next]
+  (and (map? node) (= :let (:op node)))
+   (let [[init next] (canonical (:init node) env next)
+         [scope next] (bind (list (:name node)) env next)
+         [body next] (canonical (:body node) scope next)]
+    [(assoc (dissoc node :ann) :name (bound-name scope (:name node)) :init init :body body) next])
+  (and (map? node) (contains? node :pats)) (clause node env next)
+  (and (map? node) (contains? node :pop)) (pattern node env env next)
+  (walkable? node)
+   (do (when (contains? node :op) (ir/child-nodes node)) (fields node env next))
+  (or (erlang/is_list node) (vector? node)) (sequence node env next)
+  :else [node next]))
 
 (defn body-identity
-  "Exact position-free, alpha-normalized IR identity. Hashes are lookup hints;
-   reuse and duplicate detection compare this complete identity."
-  ([body] (body-identity body {}))
-  ([body bindings] (first (normalize body bindings true))))
+ "Exact position-free lexical identity. Only actual binders are renamed;
+  free variable names, literal payloads and qualified globals retain identity.
+  Optional parameter bindings map actual names to caller-shared seed tokens.
+  Generated local tokens cannot collide with free names or supplied seeds.
+  This is an identity term, not executable ANF. Captured VALUE evidence and
+  implementation generations must still participate in cache validation."
+ ([body] (body-identity body {}))
+ ([body bindings]
+  (let [env (Map/new (Enum/map (Map/to_list bindings) (fn [pair] (tuple (elem pair 0) [:seed (elem pair 1)]))))]
+   (first (canonical body env 0)))))
 
 (defn body-hash [body] (erlang/phash2 (body-identity body)))

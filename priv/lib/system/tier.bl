@@ -26,7 +26,7 @@
 ; is no scaffold shape at this tier to keep up with.
 
 (ns system.tier
-  (:require [system.ir :as ir]))
+  (:require [system.ir :as ir] [system.ir.identity :as identity]))
 
 
 ; ── the traversal pair ──────────────────────────────────────────────────
@@ -82,127 +82,16 @@
 ; patterns extend the same paired environment; repeated pattern variables
 ; preserve their equality constraints.
 
-(declare alpha=)
-(declare alpha-pattern)
-
-(defn- alpha-patterns [xs ys state]
- (when (= (count xs) (count ys))
-  (Enum/reduce (Enum/zip xs ys) state
-   (fn [pair current] (when current (alpha-pattern (elem pair 0) (elem pair 1) current))))))
-
-(defn- alpha-pattern [x y state]
- (when (= (:pop x) (:pop y))
-  (case (:pop x)
-   :pvar
-    (let [a (:name x) b (:name y) seen-a (contains? (:seen-a state) a) seen-b (contains? (:seen-b state) b)
-          ma (first (:env state)) mb (second (:env state))]
-     (cond
-      (and seen-a seen-b) (when (= (get ma a) (get mb b)) state)
-      (or seen-a seen-b) nil
-      :else (let [token (erlang/make_ref)]
-             (assoc state :env (list (assoc ma a token) (assoc mb b token))
-                          :seen-a (assoc (:seen-a state) a true) :seen-b (assoc (:seen-b state) b true)))))
-   :plit (when (= (:val x) (:val y)) state)
-   :pnil state
-   :ptuple (alpha-patterns (:elems x) (:elems y) state)
-   :pcons (alpha-patterns (list (:head x) (:tail x)) (list (:head y) (:tail y)) state)
-   :palias (alpha-patterns (list (:a x) (:b x)) (list (:a y) (:b y)) state)
-   :pmap
-    (when (= (count (:pairs x)) (count (:pairs y)))
-     (Enum/reduce (Enum/zip (:pairs x) (:pairs y)) state
-      (fn [pair current]
-       (let [a (elem pair 0) b (elem pair 1)]
-        (when (and current (alpha= (first a) (first b) (:env current)))
-         (alpha-pattern (second a) (second b) current))))))
-   :pstruct
-    (when (and (= (:mod x) (:mod y)) (= (count (:fields x)) (count (:fields y))))
-     (Enum/reduce (Enum/zip (:fields x) (:fields y)) state
-      (fn [pair current]
-       (let [a (elem pair 0) b (elem pair 1)]
-        (when (and current (= (first a) (first b)))
-         (alpha-pattern (second a) (second b) current))))))
-   nil)))
-
-(defn- alpha-args
-  "Pairwise alpha= over two child lists under the same environment."
-  [xs ys env]
-  (and (= (count xs) (count ys))
-       (every? (fn [pr] (alpha= (first pr) (second pr) env))
-               (map list xs ys))))
-
-(defn- alpha-clauses
-  "Pair clause patterns and extend the lexical renaming environment. Repeated
-   variables must repeat on both sides; each clause has its own fresh scope."
-  [xs ys env]
-  (and (= (count xs) (count ys))
-       (every? (fn [pr]
-                 (let [cx (first pr) cy (second pr)]
-                   (let [paired (alpha-patterns (:pats cx) (:pats cy)
-                                  {:env env :seen-a {} :seen-b {}})]
-                    (and paired (alpha= (:guard cx) (:guard cy) (:env paired))
-                         (alpha= (:body cx) (:body cy) (:env paired))))))
-               (map list xs ys))))
-
-(defn- alpha-maybe
-  "alpha= over an optional child (nil :after/:timeout/:guard)."
-  [x y env]
-  (if (nil? x) (nil? y) (and (some? y) (alpha= x y env))))
-
 (defn alpha=
-  "Alpha-equivalence of two ANF trees: same op structure, same literals,
-   same globals and free names, lexical locals equal up to consistent
-   renaming, :ann ignored everywhere. env is [ma mb], renaming tokens for
-   each side's bound names."
+  "Lexical alpha-equivalence through the shared identity owner. Free names,
+   repeated pattern constraints and semantic node fields retain meaning.
+   Unknown executable grammar refuses equivalence. Optional paired environments
+   map corresponding outer variables to shared tokens."
   ([x y] (alpha= x y [{} {}]))
   ([x y env]
-   (if (or (nil? x) (nil? y))
-     (= x y)
-     (if (not (and (ir/node? x) (ir/node? y)))
-       (= x y)
-       (and
-         (= (:op x) (:op y))
-         (let [o (:op x)
-               ma (first env) mb (second env)]
-           (cond
-             (= o :lit)    (= (:val x) (:val y))
-             (contains? #{:enil} o) true
-             (= o :var)    (= (get ma (:name x) (:name x)) (get mb (:name y) (:name y)))
-             (= o :global) (and (= (:name x) (:name y)) (= (:ns x) (:ns y)) (= (:lookup x) (:lookup y)))
-             (= o :arith)  (and (= (:fun x) (:fun y)) (= (:bif x) (:bif y))
-                                (alpha-args (:args x) (:args y) env))
-             (= o :remote) (and (= (dissoc x :ann :args) (dissoc y :ann :args))
-                                (alpha-args (:args x) (:args y) env))
-             (= o :apply)  (and (alpha= (:fn x) (:fn y) env)
-                                (alpha-args (:args x) (:args y) env))
-             (= o :invoke) (and (alpha= (:callee x) (:callee y) env)
-                                 (alpha= (:arguments x) (:arguments y) env))
-             (= o :let)    (and (alpha= (:init x) (:init y) env)
-                                (let [token (erlang/make_ref)]
-                                  (alpha= (:body x) (:body y)
-                                          (list (assoc ma (:name x) token)
-                                                (assoc mb (:name y) token)))))
-             (= o :if)     (and (alpha= (:test x) (:test y) env)
-                                (alpha= (:then x) (:then y) env)
-                                (alpha= (:else x) (:else y) env))
-             (= o :do)     (alpha-args (:stmts x) (:stmts y) env)
-             (= o :case)   (and (alpha= (:subj x) (:subj y) env)
-                                (alpha-clauses (:clauses x) (:clauses y) env))
-             (= o :fn)     (alpha-clauses (:clauses x) (:clauses y) env)
-             (= o :try)    (and (alpha= (:body x) (:body y) env)
-                                (alpha-clauses (:catch x) (:catch y) env)
-                                (alpha-maybe (:after x) (:after y) env))
-             (= o :recv)   (and (alpha-clauses (:clauses x) (:clauses y) env)
-                                (alpha-maybe (:timeout x) (:timeout y) env)
-                                (alpha-maybe (:after x) (:after y) env))
-             (= o :tuple)  (alpha-args (:elems x) (:elems y) env)
-             (= o :map)    (alpha-args (mapcat identity (:pairs x))
-                                       (mapcat identity (:pairs y)) env)
-             (= o :cons)   (and (alpha= (:head x) (:head y) env)
-                                (alpha= (:tail x) (:tail y) env))
-             (= o :struct) (and (= (dissoc x :ann :fields) (dissoc y :ann :fields))
-                                (alpha-args (mapcat identity (:fields x))
-                                            (mapcat identity (:fields y)) env))
-             :else false)))))))
+   (try (= (identity/body-identity x (first env))
+           (identity/body-identity y (second env)))
+    (catch _ false))))
 
 ; ── the showcase: analysis on the raised tier ───────────────────────────
 
