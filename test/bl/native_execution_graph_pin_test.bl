@@ -1,0 +1,97 @@
+(ns native-execution-graph-pin-test
+ (:require [reload.generation :as generation] [anf :as a] [lower :as lower]))
+
+(defn- graph [tag count]
+ (let [root (str "graph.pin." tag)
+       sources (into {root (str "(ns " root ") (defn callback [] (fn [] 42))")}
+                 (map (fn [i] (let [name (str root ".leaf" i)]
+                                [name (str "(ns " name ") (defn value [] " i ")")])) (range count)))]
+  [(generation/prepare! {:application-id (str "graph-pin-" tag) :sources sources}) root]))
+(defn- registration [g root]
+ (generation/with! g #(BeamLisp.Execution/register! (generation/invoke! g (str root "/callback") []))))
+(defn- kind-of [action]
+ (try (action) nil (catch error
+  (let [value (or (:original error) error)]
+   (cond (tuple? value) (elem value 0)
+         (erlang/is_atom value) value
+         :else (:kind (ex-data error)))))))
+
+(deftest managed-registrations-retain-one-graph-pin-and-one-sdk-module
+ (doseq [size [1 8]]
+  (let [[g root] (graph (str "size" size) size) held (registration g root)]
+   (try
+    (is (> (count (:modules g)) 2))
+    (is (= 2 (BeamLisp.Execution/observe held 'code-rows)))
+    (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! held [])))
+    (finally (BeamLisp.Execution/close! held) (generation/retire! g))))))
+
+(deftest logical-pins-preserve-handoff-and-retirement-drain
+ (let [[g root] (graph "drain" 4) held (registration g root)
+       prepared (BeamLisp.Execution/prepare-handoff! held (erlang/self)) target (:accepted prepared)]
+  (try
+   (is (= :accepted (:status (BeamLisp.Execution/accept-handoff! prepared))))
+   (is (= 2 (BeamLisp.Execution/observe target 'code-rows)))
+   (is (= :waiting (:status (generation/retire! g))))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! target [])))
+   (BeamLisp.Execution/close! target)
+   (is (= {:status :retired} (generation/retire! g)))
+   (finally (BeamLisp.Execution/close! held) (BeamLisp.Execution/close! target) (generation/retire! g)))))
+
+(deftest first-code-replacement-sees-logical-pins-and-closes-fresh-admission
+ (let [[g root] (graph "publish" 2) held (registration g root)
+       module (BeamLisp.Emit/module_for (get (:mapping g) root))
+       pair (lower/descriptor->beam
+              (a/module module
+               (list {:op :defn-clause :fname :replacement :params (list) :guard nil :body (a/lit 99) :ann {}})
+               (list [:replacement 0]) (list)) {})]
+  (try
+   (is (= :code_leased (kind-of #(BeamLisp.Env/publish_binaries! (list pair) "graph-pin-replacement.bl"))))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! held [])))
+   (is (= :execution_graph_closed
+          (kind-of #(generation/with! g (fn [] :unexpected-fresh-admission)))))
+   (finally (BeamLisp.Execution/close! held) (generation/retire! g)))))
+
+(deftest modules-outside-the-graph-keep-independent-physical-retention
+ (let [[g root] (graph "outside" 3) module :graph_pin_outside_dependency
+       _ (lower/reload-descriptor!
+           (a/module module
+            (list {:op :defn-clause :fname :run :params (list) :guard nil :body (a/lit 1) :ann {}})
+            (list [:run 0]) (list)))
+       held (generation/with! g #(BeamLisp.Execution/register!
+               (generation/invoke! g (str root "/callback") []) [module]))]
+  (try
+   (is (= 3 (BeamLisp.Execution/observe held 'code-rows)))
+   (is (= false (BeamLisp.Env/retire_module! module)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! held [])))
+   (BeamLisp.Execution/close! held)
+   (is (= true (BeamLisp.Env/retire_module! module)))
+   (finally (BeamLisp.Execution/close! held) (generation/retire! g) (BeamLisp.Env/retire_module! module)))))
+
+(deftest a-dead-registration-owner-cannot-keep-a-graph-pinned
+ (let [[g root] (graph "owner-death" 3) parent (erlang/self) context (BeamLisp.Env/capture)
+       child (erlang/spawn
+               (fn [] (BeamLisp.Env/bind context)
+                (let [held (registration g root)]
+                 (erlang/send parent (tuple :graph-pin-ready (erlang/self) held))
+                 (receive :stop nil))))
+       monitor (Process/monitor child)]
+  (try
+   (let [held (receive [:graph-pin-ready pid value] :when (= pid child) value
+                (after 15000 (throw :graph-pin-owner-unavailable)))]
+    (is (= 2 (BeamLisp.Execution/observe held 'code-rows)))
+    (erlang/exit child :kill)
+    (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid child)) true
+          (after 5000 false)))
+    (is (= :cancelled (:status (BeamLisp.Execution/invoke! held []))))
+    (is (= :retired (:status (generation/retire! g)))))
+   (finally
+    (Process/demonitor monitor (list :flush))
+    (when (Process/alive? child) (erlang/exit child :kill))
+    (generation/retire! g)))))
+
+(deftest public-physical-retention-cannot-nominate-a-graph-marker
+ (let [forged (tuple :bl-execution-graph :invented-scope (erlang/make_ref))]
+  (is (= :invalid_code_lease_modules
+         (kind-of #(BeamLisp.Env/retain_code! (list forged)))))
+  (is (= :invalid_code_lease_modules
+         (kind-of #(BeamLisp.Env/retain_code! (map identity [forged])))))))
