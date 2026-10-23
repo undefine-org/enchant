@@ -1,0 +1,165 @@
+#+TITLE: Same spelling, different bindings
+
+* A name needs a context
+
+A quoted symbol such as ='temporary= is name data. An identifier combines that
+symbol with lexical context. Two identifiers can print the same name and refer
+to different declarations. That is how a macro introduces its own temporary
+without capturing a temporary supplied by its caller.
+
+The =syntax= and =binding= namespaces implement a bounded, pure model over the
+actual Reader. They currently live in =priv/std/= while their compiler adapters
+are developed. The running Compiler still uses its existing frontend; these
+tables do not authorize artifacts or implement =defsyntax= by themselves.
+
+The scope rule follows [[https://docs.racket-lang.org/reference/syntax-model.html#%28part._.Identifiers__Binding__and_.Scopes%29][Racket's syntax model]]: a declaration applies when its
+scopes are a subset of the identifier's scopes. Its binding must have a scope
+set containing every other applicable candidate's scopes. Otherwise lookup is
+ambiguous. This model also makes binding space explicit in the lookup key.
+
+| Owner | Responsibility |
+|-------+----------------|
+| =syntax= | Reader-backed trees, contexts, source spans, explicit datum conversion and template substitution |
+| =binding= | Canonical input/scope/declaration keys, immutable indexes, phase/space lookup and availability |
+| expansion controller, next | Derive actual declarations, allocate scope coordinates and drive existing bounded macro evaluation |
+
+* Watch a template avoid capture
+
+Run from the repository root:
+
+#+begin_example
+./bin/bl --cold doc run research/phase-compiler/contextual-bindings.bl.org
+#+end_example
+
+This fixture gives one =temporary= a caller scope and the other an introduction
+scope. Template substitution preserves the supplied syntax exactly. The table
+is explicit fixture data; this cell tests name resolution, rather than claiming
+that the production compiler already consumes contextual bindings.
+
+#+begin_src beam-lisp :id avoid-capture
+(ns phase.contextual.walkthrough (:require [binding :as b] [syntax :as s]))
+
+(let [source "[temporary supplied]"
+      selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                 :sources [{:namespace 'example :digest (crypto/hash :sha256 source)}]}
+      module (b/scope selection 'example [0] :module)
+      caller (b/scope selection 'example [1] :lexical)
+      intro (b/scope selection 'example [2] :introduction)
+      context {:world (b/world-key selection) :namespace 'example :space 'value
+               :scopes {:all [(:id module)]}}
+      supplied (s/identifier 'temporary
+                 (assoc context :scopes {:all [(:id module)] 0 [(:id caller)]}))
+      template (first (s/read source "template.bl" context))
+      expanded (s/template template {'supplied supplied} (:id intro))
+      declaration (fn [path scopes]
+                    {:namespace 'example :name 'temporary :phase 0 :space 'value
+                     :kind :value :visibility :local :available-from 0
+                     :path [path] :scopes scopes})
+      world (b/world selection [module caller intro]
+              [(declaration 1 [(:id module) (:id caller)])
+               (declaration 2 [(:id module) (:id intro)])])
+      introduced (b/resolve world (first (:children expanded)) 0 0)
+      substituted (b/resolve world (second (:children expanded)) 0 0)]
+  (assert (= ['temporary 'temporary] (s/to-datum expanded)))
+  (assert (= supplied (second (:children expanded))))
+  (assert (= :resolved (:status introduced)))
+  (assert (= :resolved (:status substituted)))
+  (assert (= '(2) (get-in introduced [:declaration :path])))
+  (assert (= '(1) (get-in substituted [:declaration :path])))
+  (assert (not= (get-in introduced [:reference :id]) (get-in substituted [:reference :id])))
+  {:same-spelling true :same-binding false :caller-context :preserved})
+#+end_src
+#+RESULTS: avoid-capture
+: {:same-spelling true, :same-binding false, :caller-context :preserved}
+
+
+* Phase, space and position answer different questions
+
+=binding/resolve(world, identifier, phase, position)= first looks in the
+=name/phase/space= bucket, then checks scopes and declaration availability.
+A runtime value at phase 0 and a helper at phase 1 are distinct bindings.
+A type and a value can also use the same symbol in separate spaces.
+
+Syntax contexts carry separate scope sets for each phase, plus =:all= scopes
+that apply at every phase. An introduction scope therefore survives a phase
+shift, while each module phase can retain its own context.
+
+Lookup returns =:resolved=, =:unbound=, =:ambiguous= or =:not-yet-available=.
+Selecting an inner declaration before its authored availability point returns
+=:not-yet-available=. It does not silently choose a less-specific outer binding.
+No lookup consults Env, reads a file or executes a transformer.
+
+* Import a provider into another phase
+
+This core's import views connect modules in one selected logical world.
+An import view preserves the original declaration. =:alias= and =:rename=
+change its visible spelling; =:phase-shift= changes the reference's phase.
+The consumer must carry the explicit import scope. Only public declarations
+can enter this view. Two aliases at the same phase refer to the same binding;
+a reference at a different phase has a different reference key.
+
+#+begin_src beam-lisp :id phase-import
+(let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                 :sources [{:namespace 'provider :digest (crypto/hash :sha256 "provider")}
+                           {:namespace 'client :digest (crypto/hash :sha256 "client")}]}
+      provider (b/scope selection 'provider [0] :module)
+      import (b/scope selection 'client [0] :import)
+      declarations [{:namespace 'provider :name 'answer :phase 0 :space 'value
+                     :kind :function :visibility :public :available-from 0
+                     :path [0] :scopes [(:id provider)]}
+                    {:namespace 'provider :name 'helper :phase 0 :space 'value
+                     :kind :function :visibility :private :available-from 0
+                     :path [1] :scopes [(:id provider)]}]
+      world (b/world selection [provider import] declarations)
+      request {:from 'provider :into 'client :scope (:id import) :phase-shift 1
+               :space 'value :only ['answer] :alias 'p}
+      imported (b/import-view world request)
+      identifier (s/identifier 'p/answer
+                   {:world (:key world) :namespace 'client :space 'value
+                    :scopes {1 [(:id import)]}})
+      result (b/resolve imported identifier 1 0)]
+  (assert (= :resolved (:status result)))
+  (assert (= 'provider (get-in result [:declaration :namespace])))
+  (assert (= 0 (get-in result [:declaration :phase])))
+  (assert (= 1 (get-in result [:reference :phase])))
+  (assert (= :unbound (:status (b/resolve imported identifier 0 0))))
+  (assert (= imported (b/validate-world imported)))
+  (assert (= :binding-import-private
+             (try (b/import-view world (assoc request :only ['helper])) nil
+               (catch error (:kind (ex-data error))))))
+  {:visible-name 'p/answer :provider 'provider :definition-phase 0 :reference-phase 1})
+#+end_src
+#+RESULTS: phase-import
+: {:provider provider, :visible-name p/answer, :definition-phase 0, :reference-phase 1}
+
+
+Declarations and import views are controller inputs. The core does not yet
+derive them from =ns= declarations, expand transformers or change Compiler
+lookup. Serialization validation checks their structure and indexes; it does
+not claim that a caller's table matches arbitrary source text.
+Cross-world views between a preceding compiler phase and candidate source
+remain a separate integration gate; they must retain both namespace revisions.
+
+* Keys describe logical inputs; attestations bind physical bytes
+
+=binding/world-key= accepts source namespace/revision pairs, profile and target.
+It normalizes finite collections and ordering. Physical artifact hashes and
+receipts belong to the separate production attestation, so repackaging does not
+alter a binding key. Changed source revisions do alter the logical world.
+
+Scope keys use owner, structural expansion path and role. Declaration keys also
+include phase, space, kind and authored coordinates. Process counters, native
+references and absolute file locations have no place in these keys. Source
+spans remain on syntax nodes for diagnostics and Reader roundtripping.
+
+=binding/validate-world= rebuilds every serialized index before repeated lookup.
+Lookup uses the matching bucket and a scope union, avoiding a scan of all
+declarations or all pairs of candidates. Inputs are eager and finite. Syntax
+work accounts for tree depth, metadata and repeated scope references; template
+holes and total substituted output have aggregate bounds.
+
+=syntax/to-datum= explicitly forgets context. Reconstructing syntax with
+=syntax/from-datum= requires a chosen context. A map resembling ANF stays
+ordinary map data. Record Reader nodes roundtrip through =syntax/to-reader=;
+materializing record values belongs to the expander/compiler and is refused
+by the pure datum conversion.
