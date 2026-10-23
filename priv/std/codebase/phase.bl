@@ -1,115 +1,13 @@
-;; Source-derived catalog for the closed syntax-v1 profile. No evaluation.
-(ns codebase.phase (:require [syntax :as s] [binding :as b]))
-
-(defn- refuse! [kind node]
- (throw (ex-info "Invalid contextual source unit" {:kind kind :origin (:origin node)})))
-(defn- spelling [node] (when (s/identifier? node) (elem (:value node) 1)))
-(defn- head [node] (when (= :list (:tag node)) (spelling (first (:children node)))))
-(defn- quoted-symbol [node]
- (when-not (and (= "quote" (head node)) (= 2 (count (:children node)))
-                 (s/identifier? (second (:children node))))
-  (refuse! :phase-quoted-symbol node))
- (:value (second (:children node))))
-
-(defn- flatten-forms [forms phase prefix]
- (Enum/flat_map (Enum/with_index forms)
-  (fn [pair]
-   (let [node (elem pair 0) path (Enum/concat prefix (list (elem pair 1)))]
-    (if (= "begin-for-syntax" (head node))
-     (do (when (>= phase 32) (refuse! :phase-depth node))
-         (flatten-forms (rest (:children node)) (+ phase 1) path))
-     (list {:node node :phase phase :path path}))))))
-
-(defn- import-row [entry]
- (let [node (:node entry) args (rest (:children node)) options (Enum/drop args 2)]
-  (when-not (and (>= (count args) 2) (even? (count options))) (refuse! :phase-import node))
-  (let [pairs (Enum/chunk_every options 2)
-        names (Enum/map pairs #(when (= :keyword (:tag (first %))) (keyword (:value (first %)))))
-        _ (when-not (and (= names (Enum/uniq names))
-                         (every? #(contains? #{:as :only :shift} %) names))
-            (refuse! :phase-import node))
-        opts (Map/new (Enum/map pairs #(tuple (keyword (:value (first %))) (second %))))
-        only (:only opts) alias (:as opts) shift (:shift opts)]
-   (when-not (and (= :vector (:tag only)) (every? s/identifier? (:children only))
-                  (or (nil? alias) (s/identifier? alias))
-                  (or (nil? shift) (and (= :scalar (:tag shift)) (erlang/is_integer (:value shift)))))
-    (refuse! :phase-import node))
-   {:provider (quoted-symbol (first args)) :revision (quoted-symbol (second args))
-    :phase (:phase entry) :shift (+ (:phase entry) (if shift (:value shift) 0))
-    :only (Enum/map (:children only) #(:value %)) :alias (when alias (:value alias)) :path (:path entry)})))
-
-(defn- describe [descriptor]
- (when-not (and (erlang/is_map descriptor)
-                (= #{:namespace :revision :source :file} (set (keys descriptor)))
-                (symbol? (:namespace descriptor)) (symbol? (:revision descriptor))
-                (erlang/is_binary (:source descriptor)) (erlang/is_binary (:file descriptor)))
-  (refuse! :phase-source-descriptor nil))
- (let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
-                  :sources [{:namespace (:namespace descriptor)
-                             :digest (crypto/hash :sha256 (:source descriptor))}]}
-       module (b/scope selection (:namespace descriptor) [0] :module)
-       context {:world (b/world-key selection) :namespace (:namespace descriptor) :space 'value
-                :scopes {:all [(:id module)]}}
-       forms (s/read (:source descriptor) (:file descriptor) context)
-       ns (first forms)
-       _ (when-not (and (= "ns" (head ns)) (= 2 (count (:children ns)))
-                        (= (:namespace descriptor) (:value (second (:children ns)))))
-           (refuse! :phase-namespace ns))
-       entries (Enum/map (Enum/with_index (flatten-forms (rest forms) 0 (list)))
-                  #(assoc (elem % 0) :position (+ 1 (elem % 1))))
-       imports (Enum/map (Enum/filter entries #(= "import-world" (head (:node %)))) import-row)
-       import-scopes (Enum/map imports #(b/scope selection (:namespace descriptor) (cons 0 (:path %)) :import))
-       scopes (cons module import-scopes)
-       scope-ids (Enum/map scopes #(:id %))
-       definitions (Enum/filter entries #(contains? #{"def" "defn" "defn-" "defsyntax"} (head (:node %))))
-       declarations (Enum/map definitions
-        (fn [entry]
-         (let [node (:node entry) name (second (:children node)) kind (head node)]
-          (when-not (s/identifier? name) (refuse! :phase-declaration node))
-          {:namespace (:namespace descriptor) :name (:value name) :phase (:phase entry) :space 'value
-           :kind (case kind "def" :value "defsyntax" :syntax :function)
-           :visibility (if (= "defn-" kind) :private :public)
-           :available-from (if (= "defsyntax" kind) (+ 1 (:position entry)) 0)
-           :path (cons 0 (:path entry)) :scopes scope-ids})))
-       world (b/world selection scopes declarations)
-       by-path (Map/new (Enum/map (:declarations world) #(tuple (:path %) %)))
-       recipes (Map/new (Enum/map definitions
-                  (fn [entry]
-                   (let [declaration (Map/fetch! by-path (cons 0 (:path entry)))]
-                    (tuple (:id declaration) (assoc entry :declaration declaration :world (:key world)))))))
-       expressions (Enum/filter entries
-                     #(not (contains? #{"import-world" "def" "defn" "defn-" "defsyntax"} (head (:node %))))) ]
-  (assoc descriptor :world world :module module :imports imports :import-scopes import-scopes
-                    :recipes recipes :expressions expressions :context (assoc context :scopes {:all scope-ids}))))
+;; Codebase projection of the compiler-owned contextual snapshot.
+(ns codebase.phase (:require [binding :as b] [expand-source :as source]))
 
 (defn catalog
- "Read finite source revisions once. Multiple revisions of one namespace are
-  independent worlds. Imports and declarations come from actual Reader nodes;
-  no Env links, file search, executable callbacks or fabricated fixture rows."
- [sources]
- (when-not (or (vector? sources) (erlang/is_list sources)) (refuse! :phase-source-collection nil))
- (let [sources (BeamLisp.CompilerData/eager_to_list sources)
-       _ (when (> (count sources) 128) (refuse! :phase-source-bound nil))
-       units (Enum/map sources describe)
-       keys (Enum/map units #(tuple (:namespace %) (:revision %)))
-       _ (when-not (= keys (Enum/uniq keys)) (refuse! :phase-source-duplicate nil))
-       named (Map/new (Enum/zip keys units))
-       edges (Enum/flat_map units
-        (fn [unit]
-         (Enum/map (Enum/zip (:imports unit) (:import-scopes unit))
-          (fn [pair]
-           (let [request (elem pair 0) provider (get named (tuple (:provider request) (:revision request)))]
-            (when-not provider (refuse! :phase-provider-missing nil))
-            {:from-world (get-in provider [:world :key]) :into-world (get-in unit [:world :key])
-             :from (:provider request) :into (:namespace unit) :scope (:id (elem pair 1))
-             :only (:only request) :space 'value :phase-shift (:shift request) :alias (:alias request)})))))
-       worlds (Map/new (Enum/map units #(tuple (get-in % [:world :key]) %)))
-       recipes (Enum/reduce units {} #(Map/merge %2 (:recipes %1)))]
-  {:version 1 :kind :phase-catalog :selection (b/select (Enum/map units #(:world %)) edges)
-   :units named :worlds worlds :recipes recipes}))
+ ([sources] (source/catalog sources))
+ ([sources libraries] (source/catalog sources libraries)))
+(defn unit [catalog namespace revision] (source/unit catalog namespace revision))
 
-(defn unit [catalog namespace revision]
- (or (get (:units catalog) (tuple namespace revision)) (refuse! :phase-entry-missing nil)))
+(defn- refuse! [kind node]
+ (throw (ex-info "Invalid contextual facts" {:kind kind :origin (:origin node)})))
 
 (defn facts
  "Project one expanded snapshot. Consumers use declaration/reference IDs and

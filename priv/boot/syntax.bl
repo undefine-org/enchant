@@ -1,4 +1,4 @@
-;; Contextual syntax over the actual Reader. No parser, resolver or evaluator.
+;; Boot-owned contextual syntax over the actual Reader. No second parser.
 (ns syntax (:require [reader-node :as rn]))
 
 (defn- refuse! [kind]
@@ -94,7 +94,7 @@
                (refuse! :syntax-reader-node))
               (let [left (recur-node (elem pair 0) budget)
                     right (recur-node (elem pair 1) (elem left 1))]
-               (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
      (tuple (cond-> (assoc base :children (elem r 0)) (= :record tag) (assoc :value (elem form 1))) (elem r 1)))
    (= :symbol tag)
     (tuple (assoc base :value (symbol! form)) remaining)
@@ -153,11 +153,11 @@
            (contains? #{:map :record} tag)
             (Enum/map_reduce (finite! (:children node) 50000) remaining
              (fn [pair budget]
-              (when-not (and (erlang/is_tuple pair) (= 2 (erlang/tuple_size pair)))
+              (when-not (and (erlang/is_list pair) (= 2 (erlang/length pair)))
                (refuse! :syntax-node))
-              (let [left (visit (elem pair 0) action budget (+ depth 1))
-                    right (visit (elem pair 1) action (elem left 1) (+ depth 1))]
-               (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))
+              (let [left (visit (first pair) action budget (+ depth 1))
+                    right (visit (second pair) action (elem left 1) (+ depth 1))]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))
            (contains? #{:symbol :keyword :scalar} tag) (tuple nil remaining)
            :else (refuse! :syntax-node))
         normalized (cond-> (assoc node :context ctx) (some? (elem r 0)) (assoc :children (elem r 0)))]
@@ -177,7 +177,9 @@
                        (= :symbol tag) (:value n)
                        (= :scalar tag) (:value n)
                        (= :keyword tag) (tuple :keyword (:value n))
-                       (= :record tag) (tuple :record (:value n) (:children n))
+                       (= :record tag) (tuple :record (:value n)
+                                         (Enum/map (:children n) #(tuple (first %) (second %))))
+                       (= :map tag) (tuple :map (Enum/map (:children n) #(tuple (first %) (second %))))
                        :else (tuple tag (:children n)))]
            (if (:origin n) (tuple :meta form (:origin n)) form))) 100000 0) 0))
 
@@ -194,7 +196,7 @@
             (= :list tag) (:children n)
             (= :vector tag) (BeamLisp.Vector/new (:children n))
             (= :set tag) (BeamLisp.Set/new (:children n))
-            (= :map tag) (Map/new (:children n))
+            (= :map tag) (Map/new (Enum/map (:children n) #(tuple (first %) (second %))))
             :else (refuse! :syntax-record-datum)))) 100000 0) 0))
 
 (defn- datum-node [value remaining depth]
@@ -266,8 +268,8 @@
     (assoc node :children (Enum/map (:children node) #(attribute-node % file inherited)))
    (contains? #{:map :record} (:tag node))
     (assoc node :children (Enum/map (:children node)
-                            #(tuple (attribute-node (elem % 0) file inherited)
-                                    (attribute-node (elem % 1) file inherited))))
+                            #(list (attribute-node (first %) file inherited)
+                                   (attribute-node (second %) file inherited))))
    :else node)))
 
 (defn with-file
@@ -278,3 +280,26 @@
  (when-not (and (erlang/is_binary file) (<= (erlang/byte_size file) 4096))
   (refuse! :syntax-source))
  (attribute-node (validate node) file nil))
+
+(defn for-compiler
+ "Use inherited Reader positions, and refuse runtime author-metadata
+  expressions in the closed profile. Type hints remain compiler advice."
+ [node file]
+ (elem (visit (with-file node file)
+         (fn [n]
+          (when (Enum/any? (Map/keys (or (:origin n) {}))
+                  #(not (contains? #{:file :line :col :offset :end-line :end-col :end-offset :tag} %)))
+           (refuse! :syntax-profile-metadata)) n) 100000 0) 0))
+
+(defn shift-context
+ "Shift phase-specific module scopes. Lexical/introduction scopes in :all
+  remain shared. This is representation, not module instantiation or lookup."
+ [explicit-context delta]
+ (when-not (and (erlang/is_integer delta) (<= -4096 delta 4096)) (refuse! :syntax-phase))
+ (let [ctx (context explicit-context)]
+  (context (assoc ctx :scopes
+             (Map/new (Enum/map (Map/to_list (:scopes ctx))
+                        #(tuple (if (= :all (elem % 0)) :all (+ delta (elem % 0))) (elem % 1))))))))
+
+(defn shift-phase [node delta]
+ (elem (visit node #(assoc % :context (shift-context (:context %) delta)) 100000 0) 0))

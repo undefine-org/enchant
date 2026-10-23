@@ -1,6 +1,6 @@
 ;; Ordered contextual elaboration. Reader, binding lookup, macro evaluation and
 ;; ANF compilation each retain their existing owner. No alternate evaluator.
-(ns expand (:require [syntax :as s] [binding :as b] [codebase.phase :as catalog] [compiler :as compiler]))
+(ns expand (:require [syntax :as s] [binding :as b] [expand-source :as catalog] [compiler :as compiler]))
 
 (defn- refuse! [kind node]
  (throw (ex-info (str "Contextual expansion: " kind)
@@ -15,7 +15,8 @@
 
 (defn- fresh-scope [state role]
  (let [w (source-world state) n (:next-scope state)
-       scope (b/scope (:selection w) (:namespace state) [1 n] role)]
+       scope (b/scope (:selection w) (:namespace state)
+               (Enum/concat (or (:coordinate-prefix state) (list 1)) (list n)) role)]
   (tuple scope (assoc state :next-scope (+ n 1)
                            :selection (b/register-scope (:selection state) scope)))))
 
@@ -31,6 +32,10 @@
 (defn- internal-name [reference]
  (str "__bl_binding_" (Base/encode16 (:id reference) (list (tuple :case :lower)))))
 
+(defn- lookup-result [node state]
+ (b/resolve (:selection state) node (:phase state)
+   (if (= (:world state) (get-in node [:context :world])) (:position state) 1073741823)))
+
 (defn- reference-reader [node result state definition?]
  (let [original (:reference result) shift (Map/get state :reference-shift 0)
        reference (if (= 0 shift) original
@@ -39,7 +44,7 @@
        name (internal-name reference)
        syntax (assoc node :value (symbol name))
        occurrence {:reference reference :name (:value node) :origin (:origin node)
-                   :context (:context node) :lookup-phase (:phase state) :position (:position state)
+                   :context (:context node) :lookup-phase (:phase state) :position (:position result)
                    :reference-shift shift :definition definition?}
        descriptor {:reference reference :declaration (:declaration result)}
        state (if (= :local (get-in result [:declaration :visibility])) state
@@ -49,7 +54,7 @@
                    (update :occurrences #(cons occurrence %))))))
 
 (defn- resolve-symbol [node state]
- (let [result (b/resolve (:selection state) node (:phase state) (:position state))]
+ (let [result (lookup-result node state)]
   (when-not (= :resolved (:status result))
    (throw (ex-info "Identifier does not have a unique available binding"
             {:kind (case (:status result) :unbound :unbound-identifier :ambiguous :ambiguous-identifier
@@ -63,7 +68,9 @@
    (let [n (:next-declaration state)
          declaration {:namespace (:namespace state) :name (:value node) :phase (:phase state)
                       :space (get-in node [:context :space]) :kind :value :visibility :local
-                      :available-from 0 :path [1 n] :scopes (s/scopes node (:phase state))}
+                      :available-from 0
+                      :path (Enum/concat (or (:coordinate-prefix state) (list 1)) (list n))
+                      :scopes (s/scopes node (:phase state))}
          state (assoc state :next-declaration (+ n 1)
                             :selection (b/bind (:selection state) (:world state) declaration))]
     (reference-reader node (resolve-symbol node state) state true)))))
@@ -143,9 +150,11 @@
        state (-> state (update :macro-budget dec) (assoc :macro-depth (+ 1 depth)))
        allocated (fresh-scope state :introduction) scope (elem allocated 0) state (elem allocated 1)
        reference (:reference result) declaration (:declaration result)
+       delta (- (:phase reference) (:phase declaration))
+       state (assoc state :selection (b/instantiate (:selection state) (:world reference) delta))
+       unit (get-in state [:catalog :worlds (:world reference)])
        context {:version 1 :definition-context
-                 {:world (:world reference) :namespace (:namespace declaration) :space (:space declaration)
-                  :scopes {:all (:scopes declaration)}}
+                 (s/shift-context (:context unit) delta)
                 :use-context (:context (first (:children node))) :introduction-scope (:id scope)
                 :use-phase (:phase state) :phase (+ 1 (:phase state)) :origin (:origin node)}]
   (when-not (:catalog state)
@@ -160,11 +169,12 @@
                         (s/from-datum (:value value) (:definition-context context)) value))
         syntax (s/validate
                  (if (= :contextual-template (:kind expanded))
-                   (s/template (:template expanded)
+                   (s/template (s/shift-phase (:template expanded) delta)
                      (Map/new (Enum/map (Map/to_list (:holes expanded))
                                 #(tuple (elem % 0) (materialize (elem % 1))))) (:id scope))
                    (materialize expanded)))
-        trace {:transformer reference :origin (:origin node) :protocol 'syntax-v1}]
+        syntax (s/for-compiler syntax (get-in state [:catalog :worlds (:world state) :file]))
+        trace {:transformer reference :origin (:origin node) :protocol 'syntax-v1 :instance-shift delta}]
    (let [r (expression-node syntax (update (elem demand 1) :expansions #(cons trace %)))]
     (tuple (elem r 0) (assoc (elem r 1) :macro-depth depth))))))
 
@@ -210,14 +220,14 @@
    (= :map tag)
     (let [r (Enum/map_reduce (:children node) state
               (fn [pair current]
-               (let [left (expression-node (elem pair 0) current)
-                     right (expression-node (elem pair 1) (elem left 1))]
+               (let [left (expression-node (first pair) current)
+                     right (expression-node (second pair) (elem left 1))]
                 (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
      (tuple (tuple :map (elem r 0)) (elem r 1)))
    (= :list tag)
     (let [children (:children node) head (first children) name (spelling head)
           binding (when (s/identifier? head)
-                    (b/resolve (:selection state) head (:phase state) (:position state)))
+                    (lookup-result head state))
           kernel? (or (nil? binding) (= :unbound (:status binding)))]
      (cond
       (empty? children) (tuple (list-reader node (list)) state)
@@ -233,7 +243,9 @@
       (native-name? head)
        (let [r (expression-nodes (rest children) state)]
         (tuple (list-reader node (cons (as-reader head) (elem r 0)))
-               (update (elem r 1) :native-obligations #(cons {:name (:value head) :origin (:origin head) :phase (:phase state)} %))))
+               (update (elem r 1) :native-obligations
+                 #(cons {:name (:value head) :origin (:origin head)
+                         :phase (+ (:phase state) (Map/get state :reference-shift 0))} %))))
       :else
        (let [result (when (s/identifier? head) (resolve-symbol head state))]
         (if (contains? #{:macro :syntax} (get-in result [:declaration :kind]))
@@ -265,7 +277,7 @@
        state {:selection graph :world (:key w) :namespace namespace :phase phase :position 0
               :next-scope 0 :next-declaration 0 :remaining 1000000
               :references {} :occurrences (list) :expansions (list) :native-obligations (list)}
-       result (expression-node (if file (s/with-file (first forms) file) (first forms)) state) state (elem result 1)]
+       result (expression-node (s/for-compiler (first forms) (or file "<expression>")) state) state (elem result 1)]
   {:version 1 :kind :expanded-expression :reader (elem result 0)
    :selection (b/freeze (:selection state)) :references (:references state)
    :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
@@ -286,7 +298,7 @@
       (assoc (BeamLisp.Compiler/new_env (str (:namespace options))) :file file) (:references expanded)))))
 
 (defn- contextualize [node unit]
- (Enum/reduce (get-in unit [:context :scopes :all]) (s/with-file node (:file unit)) #(s/add-scope %2 %1 :all)))
+ (Enum/reduce (get-in unit [:context :scopes :all]) (s/for-compiler node (:file unit)) #(s/add-scope %2 %1 :all)))
 
 (defn- definition-node [recipe unit]
  (let [node (contextualize (:node recipe) unit) children (:children node)
@@ -295,7 +307,8 @@
    (do (when-not (= 3 (count children)) (refuse! :contextual-value-arity node))
        (nth children 2))
    (assoc node :children
-     (cons (s/identifier 'fn (:context node)) (rest children))))))
+     (cons (s/identifier 'fn (:context node))
+           (if (= :syntax (:kind declaration)) (Enum/drop children 2) (rest children)))))))
 
 (declare link-reference)
 
@@ -317,15 +330,20 @@
        target-phase (+ (:phase reference) (if transformer? 1 0))
        current (assoc state :world (:world recipe) :namespace (:namespace declaration)
                             :phase phase :position (:position recipe)
-                            :reference-shift (- target-phase phase) :transformer transformer? :dependencies {})
+                            :reference-shift (- target-phase phase) :transformer transformer? :dependencies {}
+                            :coordinate-prefix (Enum/concat (list 3 (+ phase 4096)) (:path declaration))
+                            :next-scope 0 :next-declaration 0)
        r (expression-node (definition-node recipe unit) current)
-       fields [:world :namespace :phase :position :reference-shift :transformer :dependencies]
+       fields [:world :namespace :phase :position :reference-shift :transformer :dependencies
+               :coordinate-prefix :next-scope :next-declaration]
        restored (Enum/reduce fields (elem r 1)
                   (fn [key out] (assoc out key (get state key))))]
   (tuple (elem r 0) (:dependencies (elem r 1)) restored)))
 
 (defn- link-reference [name descriptor state]
  (if (contains? (:linked state) name) state
+  (if-let [constant (get-in state [:constant-readers name])]
+   (-> state (assoc-in [:linked name] constant) (update :link-order #(cons name %)))
   (do
    (when (contains? (:link-active state) name) (refuse! :contextual-initialization-cycle nil))
    (when (>= (erlang/map_size (:link-active state)) 128) (refuse! :contextual-link-depth nil))
@@ -345,9 +363,11 @@
                     (BeamLisp.AOT/eval_constructor_session! (:constructor-session state)
                      (compile-reader (wrap-links (elem r 0) state) (:namespace unit) (:file unit) (:references state)) {})
                     (:context unit)) (elem r 0))]
-     (-> state (assoc-in [:linked name] reader)
+     (-> (if (= :value (get-in recipe [:declaration :kind]))
+           (assoc-in state [:constant-readers name] reader) state)
+               (assoc-in [:linked name] reader)
                (update :link-order #(cons name %))
-               (update :link-active #(dissoc % name))))))))
+               (update :link-active #(dissoc % name)))))))))
 
 (defn- compile-reader [reader namespace file references]
  (compiler/compile-contextual reader
@@ -373,13 +393,18 @@
                               (assoc-in [:transformers key] node))]
      (tuple node restored))))))
 
+(defn phase-library
+ "Produce portable first-order contextual recipes for source-free imports."
+ [sources] (catalog/library sources))
+
 (defn program
  "Compile a closed syntax-v1 source catalog. :entry is [namespace revision],
   both quoted symbols. Source imports select revisions explicitly. Global
   definitions link lexically from those exact Reader-derived recipes; Env is
   never a fallback. Transformers use the existing bounded ANF constructor."
- [sources entry]
- (let [catalog (catalog/catalog sources)
+ ([sources entry] (program sources entry []))
+ ([sources entry libraries]
+ (let [catalog (catalog/catalog sources libraries)
        entry (BeamLisp.CompilerData/eager_to_list entry)
        _ (when-not (= 2 (count entry)) (refuse! :contextual-entry nil))
        unit (catalog/unit catalog (first entry) (second entry))
@@ -413,4 +438,4 @@
    :constructor (assoc (BeamLisp.AOT/constructor_session_status session) :status :closed)
    :coverage {:contextual-bindings true :closed-global-linking true :binding-annotations true
               :native-effects-complete false :legacy-datum-macros false}})
-   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+   (finally (BeamLisp.AOT/close_constructor_session! session))))))
