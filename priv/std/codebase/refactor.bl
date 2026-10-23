@@ -1,0 +1,152 @@
+;; Source edits are derived from compiler-owned identities and physical tokens.
+(ns codebase.refactor
+ (:require [expand :as expand] [syntax :as syntax] [system.tier :as tier]))
+
+(defn- refuse! [kind details]
+ (throw (ex-info "Contextual rename refused" (assoc details :kind kind))))
+
+(defn- unit-key [source] (list (:namespace source) (:revision source)))
+(defn- source-table [sources]
+ (Map/new (Enum/map (BeamLisp.CompilerData/eager_to_list sources) #(tuple (unit-key %) %))))
+(defn- unit-of [program world] (get-in program [:provenance :units world :unit]))
+(defn- declaration [program id] (get-in program [:selection :by-id id]))
+
+(defn- coordinate [program id]
+ (let [d (declaration program id)]
+  (when-not d (refuse! :rename-missing-declaration {:declaration id}))
+  (list (unit-of program (:owner-world d)) (:phase d) (:space d) (:kind d) (:visibility d) (:path d))))
+
+(defn- occurrences [program]
+ (Enum/concat (:occurrences program)
+  (Enum/map (:expansions program)
+   #(hash-map :reference (:transformer %) :name (:name %) :origin (:head-origin %)
+              :context (:context %) :definition false))))
+
+(defn- anchor [unit origin]
+ (when (and unit (erlang/is_integer (:offset origin)) (erlang/is_integer (:end-offset origin)))
+  (list unit (:offset origin) (:end-offset origin))))
+
+(defn- definitions [program]
+ (Enum/concat
+  (Enum/map (Map/to_list (get-in program [:provenance :declarations]))
+   #(hash-map :id (elem % 0) :anchor (anchor (:unit (elem % 1)) (:origin (elem % 1)))
+              :origin (:origin (elem % 1)) :name (:name (elem % 1))))
+  (Enum/map (Enum/filter (:occurrences program) #(:definition %))
+   #(hash-map :id (get-in % [:reference :declaration])
+              :anchor (anchor (unit-of program (get-in % [:context :world])) (:origin %))
+              :origin (:origin %) :name (:name %)))))
+
+(defn- editable! [program id]
+ (let [d (declaration program id)]
+  (when (some #(= :introduction (get-in program [:selection :scopes % :role])) (:scopes d))
+   (refuse! :rename-generated-binding {:declaration id}))))
+
+(defn- global-coverage! [program target]
+ ;; Runtime ANF covers every branch of linked functions. Unexpanded recipes and
+ ;; arbitrary syntax constructors need a wider refactoring protocol: refuse.
+ (when-not (= :local (:visibility target))
+  (let [globals (Enum/filter (Map/values (get-in program [:selection :by-id]))
+                  #(not= :local (:visibility %)))
+        used (set (Enum/map (Map/values (:references program)) #(get-in % [:reference :declaration])))]
+   (when (some #(= :syntax (:kind %)) globals)
+    (refuse! :rename-syntax-coverage {}))
+   (when-not (every? #(contains? used (:id %)) globals)
+    (refuse! :rename-unexpanded-definition {}))
+   (when (some #(and (= (:owner-world target) (:owner-world %))
+                     (= (:name target) (:name %)) (not= (:id target) (:id %))) globals)
+    (refuse! :rename-shared-phase-export {})))))
+
+(defn- new-name! [name context]
+ (when-not (symbol? name) (refuse! :rename-quoted-symbol {}))
+ (let [text (elem name 1)
+       _ (when-not (<= 1 (erlang/byte_size text) 512) (refuse! :rename-identifier {:name name}))
+       forms (syntax/read text "<rename>" context)]
+  (when-not (and (= 1 (count forms)) (syntax/identifier? (first forms))
+                 (= name (:value (first forms)))
+                 (not (String/contains? text "/")) (not (contains? #{"_" "&"} text)))
+   (refuse! :rename-identifier {:name name}))))
+
+(defn- spelling [old new-name]
+ (let [text (elem old 1) parts (String/split text "/")]
+  (if (= 1 (count parts)) (elem new-name 1)
+      (str (Enum/join (Enum/drop parts -1) "/") "/" (elem new-name 1)))))
+
+(defn- edit [sources unit origin expected replacement]
+ (let [source (get sources unit) start (:offset origin) end (:end-offset origin)]
+  (when-not source (refuse! :rename-source-unavailable {:unit unit}))
+  (when-not (and (erlang/is_integer start) (erlang/is_integer end) (<= 0 start) (< start end)
+                 (<= end (erlang/byte_size (:source source))))
+   (refuse! :rename-inexact-token {:unit unit :origin origin :expected expected}))
+  {:unit unit :start start :end end :before expected :after replacement}))
+
+(defn- apply-edits [source edits]
+ (let [size (Enum/reduce edits (erlang/byte_size (:source source))
+               (fn [entry size] (+ size (- (erlang/byte_size (:after entry)) (erlang/byte_size (:before entry))))))
+       _ (when (> size 1048576) (refuse! :rename-source-budget {:unit (unit-key source)}))
+       characters (String/codepoints (:source source))
+       sorted (Enum/sort_by edits #(:start %))
+       result (Enum/reduce sorted {:position 0 :remaining characters :pieces (list)}
+                (fn [entry state]
+                 (when (< (:start entry) (:position state)) (refuse! :rename-overlapping-edits entry))
+                 (let [prefix (Enum/split (:remaining state) (- (:start entry) (:position state)))
+                       token (Enum/split (elem prefix 1) (- (:end entry) (:start entry)))]
+                  (when-not (= (:before entry) (Enum/join (elem token 0) ""))
+                   (refuse! :rename-inexact-token entry))
+                  {:position (:end entry) :remaining (elem token 1)
+                   :pieces (cons (:after entry) (cons (Enum/join (elem prefix 0) "") (:pieces state)))})))]
+  (assoc source :source
+   (Enum/join (Enum/reverse
+     (cons (Enum/join (:remaining result) "") (:pieces result))) ""))))
+
+(defn- binding-shape [program]
+ (Enum/map (occurrences program)
+  #(list (coordinate program (get-in % [:reference :declaration]))
+          (get-in % [:reference :phase]) (boolean (:definition %)))))
+
+(defn rename-program
+ "Return edited Source and a recompiled snapshot; perform no file writes.
+  Target is a declaration ID from this exact Source/entry snapshot. Local
+  bindings may pass through hygienic user holes. Global renames require all
+  selected definitions to be analyzed and refuse syntax constructors or shared
+  phase exports. Every edit uses an exact Reader token. The result must retain
+  binding coordinates and alpha-equivalent runtime ANF. This proves the closed
+  entry transformation, not native effects, source-text observers or admission."
+ ([sources entry target name] (rename-program sources entry [] target name))
+ ([sources entry libraries target name]
+ (let [before (expand/program sources entry libraries) d (declaration before target)
+       _ (when-not d (refuse! :rename-missing-declaration {:declaration target}))
+       _ (global-coverage! before d)
+       defs (definitions before) selected (Enum/filter defs #(= target (:id %)))
+       _ (when (empty? selected) (refuse! :rename-definition-unavailable {:declaration target}))
+       anchors (set (Enum/map selected #(:anchor %)))
+       _ (when (contains? anchors nil) (refuse! :rename-inexact-definition {}))
+       related (set (Enum/map (Enum/filter defs #(contains? anchors (:anchor %))) #(:id %)))
+       _ (Enum/each related #(editable! before %))
+       context {:world (:owner-world d) :namespace (:namespace d) :space (:space d) :scopes {}}
+       _ (new-name! name context)
+       table (source-table sources)
+       uses (Enum/filter (occurrences before) #(contains? related (get-in % [:reference :declaration])))
+       edits (Enum/map uses
+               #(edit table (unit-of before (get-in % [:context :world])) (:origin %)
+                       (elem (:name %) 1) (spelling (:name %) name)))
+       edits (Enum/concat edits
+               (Enum/map selected
+                #(edit table (first (:anchor %)) (:origin %) (elem (:name %) 1) (elem name 1))))
+       imports (when-not (= :local (:visibility d))
+                 (Enum/filter (get-in before [:provenance :imports])
+                   #(and (= (:owner-world d) (:from-world %)) (Enum/member? (:only %) (:name d)))))
+       edits (Enum/uniq (Enum/concat edits
+                (Enum/map (or imports (list))
+                 #(edit table (:unit %) (get-in % [:only-origins (:name d)])
+                         (elem (:name d) 1) (elem name 1)))))
+       _ (when (> (count edits) 100000) (refuse! :rename-edit-budget {}))
+       grouped (Enum/group_by edits #(:unit %))
+       sources (Enum/map (BeamLisp.CompilerData/eager_to_list sources)
+                 #(apply-edits % (Map/get grouped (unit-key %) (list))))
+       after (expand/program sources entry libraries)]
+  (when-not (= (binding-shape before) (binding-shape after)) (refuse! :rename-changed-bindings {}))
+  (when-not (tier/alpha= (:node before) (:node after)) (refuse! :rename-changed-program {}))
+  {:version 1 :status :verified :scope :closed-program-renaming :sources sources :program after
+   :edits (Enum/sort_by edits #(list (:unit %) (:start %)))
+   :before-snapshot (get-in before [:selection :state-key])
+   :after-snapshot (get-in after [:selection :state-key]) :native-admission false})))

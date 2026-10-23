@@ -78,16 +78,50 @@
 ; The compiler invents fresh names for let-bound locals, so raw `=` can
 ; never certify "same program" — compiling one source twice already fails
 ; it. The honest statement is alpha-equivalence: same tree modulo the
-; names of let-bound locals and the :ann metadata. Only :let names need
-; the environment (patterns are compared literally: a meaning-preserving
-; transform renames no pattern), so pattern-bearing nodes extend nothing.
-
-(defn- fresh
-  "A name no source program can carry — unique per BEAM, no state to reset."
-  [base]
-  (str base "_" (erlang/unique_integer (list :positive))))
+; names of lexical locals and the :ann metadata. Let bindings and clause
+; patterns extend the same paired environment; repeated pattern variables
+; preserve their equality constraints.
 
 (declare alpha=)
+(declare alpha-pattern)
+
+(defn- alpha-patterns [xs ys state]
+ (when (= (count xs) (count ys))
+  (Enum/reduce (Enum/zip xs ys) state
+   (fn [pair current] (when current (alpha-pattern (elem pair 0) (elem pair 1) current))))))
+
+(defn- alpha-pattern [x y state]
+ (when (= (:pop x) (:pop y))
+  (case (:pop x)
+   :pvar
+    (let [a (:name x) b (:name y) seen-a (contains? (:seen-a state) a) seen-b (contains? (:seen-b state) b)
+          ma (first (:env state)) mb (second (:env state))]
+     (cond
+      (and seen-a seen-b) (when (= (get ma a) (get mb b)) state)
+      (or seen-a seen-b) nil
+      :else (let [token (erlang/make_ref)]
+             (assoc state :env (list (assoc ma a token) (assoc mb b token))
+                          :seen-a (assoc (:seen-a state) a true) :seen-b (assoc (:seen-b state) b true)))))
+   :plit (when (= (:val x) (:val y)) state)
+   :pnil state
+   :ptuple (alpha-patterns (:elems x) (:elems y) state)
+   :pcons (alpha-patterns (list (:head x) (:tail x)) (list (:head y) (:tail y)) state)
+   :palias (alpha-patterns (list (:a x) (:b x)) (list (:a y) (:b y)) state)
+   :pmap
+    (when (= (count (:pairs x)) (count (:pairs y)))
+     (Enum/reduce (Enum/zip (:pairs x) (:pairs y)) state
+      (fn [pair current]
+       (let [a (elem pair 0) b (elem pair 1)]
+        (when (and current (alpha= (first a) (first b) (:env current)))
+         (alpha-pattern (second a) (second b) current))))))
+   :pstruct
+    (when (and (= (:mod x) (:mod y)) (= (count (:fields x)) (count (:fields y))))
+     (Enum/reduce (Enum/zip (:fields x) (:fields y)) state
+      (fn [pair current]
+       (let [a (elem pair 0) b (elem pair 1)]
+        (when (and current (= (first a) (first b)))
+         (alpha-pattern (second a) (second b) current))))))
+   nil)))
 
 (defn- alpha-args
   "Pairwise alpha= over two child lists under the same environment."
@@ -97,16 +131,16 @@
                (map list xs ys))))
 
 (defn- alpha-clauses
-  "Pairwise over clauses: patterns literal, guard/body under the shared env
-   (patterns bind the SAME names on both sides — the transform under test
-   never touches them)."
+  "Pair clause patterns and extend the lexical renaming environment. Repeated
+   variables must repeat on both sides; each clause has its own fresh scope."
   [xs ys env]
   (and (= (count xs) (count ys))
        (every? (fn [pr]
                  (let [cx (first pr) cy (second pr)]
-                   (and (= (:pats cx) (:pats cy))
-                        (alpha= (:guard cx) (:guard cy) env)
-                        (alpha= (:body cx) (:body cy) env))))
+                   (let [paired (alpha-patterns (:pats cx) (:pats cy)
+                                  {:env env :seen-a {} :seen-b {}})]
+                    (and paired (alpha= (:guard cx) (:guard cy) (:env paired))
+                         (alpha= (:body cx) (:body cy) (:env paired))))))
                (map list xs ys))))
 
 (defn- alpha-maybe
@@ -116,7 +150,7 @@
 
 (defn alpha=
   "Alpha-equivalence of two ANF trees: same op structure, same literals,
-   same globals and free names, let-bound locals equal up to consistent
+   same globals and free names, lexical locals equal up to consistent
    renaming, :ann ignored everywhere. env is [ma mb], renaming tokens for
    each side's bound names."
   ([x y] (alpha= x y [{} {}]))
@@ -143,7 +177,7 @@
              (= o :invoke) (and (alpha= (:callee x) (:callee y) env)
                                  (alpha= (:arguments x) (:arguments y) env))
              (= o :let)    (and (alpha= (:init x) (:init y) env)
-                                (let [token (fresh "alpha")]
+                                (let [token (erlang/make_ref)]
                                   (alpha= (:body x) (:body y)
                                           (list (assoc ma (:name x) token)
                                                 (assoc mb (:name y) token)))))
