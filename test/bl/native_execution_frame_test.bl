@@ -1,0 +1,111 @@
+(ns native-execution-frame-test)
+
+(defn- observation []
+ (try (BeamLisp.Execution/observe) (catch _ {:status :unsupported})))
+
+(deftest invocation-uses-an-opaque-nonconveyed-native-frame
+ (let [before (observation) registration (BeamLisp.Execution/register!
+                      (fn []
+                       (let [frame (observation) capture (BeamLisp.Env/capture)]
+                        {:status (:status frame) :kind (:kind frame)
+                         :id? (some? (:id frame)) :context? (some? (:context-id frame))
+                         :graph (:graph-id frame) :parent (:parent frame) :depth (:depth frame)
+                         :proof (Process/get :bl_executing_generation)
+                         :conveyed? (or (contains? capture :execution-frame) (contains? capture :bl_executing_generation))})))]
+  (try
+   (let [value (:value (BeamLisp.Execution/invoke! registration []))]
+    (is (= :active (:status value)))
+    (is (= :execution-frame (:kind value)))
+    (is (= true (:id? value)))
+    (is (= true (:context? value)))
+    (is (= nil (:graph value)))
+    (is (= (:id before) (:parent value)))
+    (is (= (inc (:depth before 0)) (:depth value)))
+    (is (= :bl-execution-frame (elem (:proof value) 0)))
+    (is (= false (:conveyed? value))))
+   (is (= (:id before) (:id (observation))))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest nested-native-frames-restore-the-parent-even-after-an-exception
+ (let [inner (BeamLisp.Execution/register! #(observation))
+       failing (BeamLisp.Execution/register! #(throw (ex-info "frame fixture" {:kind :frame-fixture})))
+       outer (BeamLisp.Execution/register!
+               (fn []
+                (let [before (observation) child (:value (BeamLisp.Execution/invoke! inner []))]
+                 (try (BeamLisp.Execution/invoke! failing []) (catch _ nil))
+                 {:before before :child child :after (observation)})))]
+  (try
+   (let [{:keys [before child after]} (:value (BeamLisp.Execution/invoke! outer []))]
+    (is (some? (:id before)))
+    (is (not= (:id before) (:id child)))
+    (is (= (:id before) (:parent child)))
+    (is (= (inc (:depth before)) (:depth child)))
+    (is (= (:id before) (:id after)))
+    (is (= (:depth before) (:depth after))))
+   (finally (doseq [registration [inner failing outer]] (BeamLisp.Execution/close! registration))))))
+
+(defn- nesting [remaining]
+ (if (<= remaining 0) :unexpected-success
+  (BeamLisp.Env/with_owned_generation_execution #(nesting (dec remaining)))))
+
+(deftest unmanaged-frame-depth-is-bounded-and-unwinds-to-the-original-frame
+ (let [registration (BeamLisp.Execution/register!
+                      (fn []
+                       (let [before (observation)
+                             result (try (nesting 260) :unexpected-success
+                                      (catch error (:original error)))]
+                        {:before before :after (observation) :result result})))]
+  (try
+   (let [value (:value (BeamLisp.Execution/invoke! registration []))]
+    (is (= :execution_frame_depth (:result value)))
+    (is (= (get-in value [:before :id]) (get-in value [:after :id])))
+    (is (= (get-in value [:before :depth]) (get-in value [:after :depth]))))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest an-invalid-frame-token-cannot-become-an-unmanaged-native-entry
+ (let [registration (BeamLisp.Execution/register!
+                      (fn []
+                       (let [before (Process/get :bl_executing_generation)]
+                        (try
+                         (Process/put :bl_executing_generation
+                          (tuple :bl-execution-frame (erlang/self) (erlang/make_ref)))
+                         (try (BeamLisp.Env/assert_execution_context!) :unexpected-success
+                          (catch error (:original error)))
+                         (finally (Process/put :bl_executing_generation before))))))]
+  (try
+   (is (= {:status :completed :value :unadmitted_execution_origin}
+          (BeamLisp.Execution/invoke! registration [])))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(defn- frame-gone? [identity attempts]
+ (cond (nil? (BeamLisp.Env/execution_frame_row identity)) true
+       (<= attempts 0) false
+       :else (do (Process/sleep 5) (frame-gone? identity (dec attempts)))))
+
+(deftest worker-death-reclaims-its-frame-and-the-frames-context-reference
+ (let [parent (erlang/self)
+       registration (BeamLisp.Env/with_ns "native.frame.death.fixture"
+                      #(BeamLisp.Execution/register!
+                        (fn []
+                         (erlang/send parent (tuple :frame-worker-ready (observation)))
+                         (receive :stop nil))))
+       worker (erlang/spawn #(BeamLisp.Execution/invoke! registration []))
+       monitor (Process/monitor worker)]
+  (try
+   (let [frame (receive [:frame-worker-ready frame] frame (after 10000 (throw :frame-worker-unavailable)))
+         context (:context-id frame)]
+    (is (some? (:id frame)))
+    (erlang/exit worker :kill)
+    (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid worker)) true
+          (after 10000 false)))
+    (is (frame-gone? (:id frame) 1000))
+    ;; The original registration still owns its distinct reference.
+    (is (map? (BeamLisp.Env/execution_context_value! context)))
+    (BeamLisp.Execution/close! registration)
+    (is (= :retired_execution_context
+         (try (BeamLisp.Env/execution_context_value! context) :unexpected
+          (catch error (:original error))))))
+   (finally
+    (Process/demonitor monitor (list :flush))
+    (when (Process/alive? worker) (erlang/exit worker :kill))
+    (BeamLisp.Execution/close! registration)))))

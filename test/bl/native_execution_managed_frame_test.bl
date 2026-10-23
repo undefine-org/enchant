@@ -1,0 +1,48 @@
+(ns native-execution-managed-frame-test (:require [reload.generation :as generation] [reload.execution :as execution]))
+
+(defn- graph [application]
+ (generation/prepare!
+  {:application-id application :stable-namespaces #{"reload.execution"}
+   :sources {"frame.managed"
+    (str "(ns frame.managed (:require [reload.execution :as execution])) "
+         "(defn callback [] (fn [] {:frame (execution/frame) :graph (execution/selected-graph-id) "
+         ":application (execution/graph-field 'application-id) :owned (execution/owned?)}))")}}))
+(defn- registered [graph]
+ (generation/with! graph #(BeamLisp.Execution/register! (generation/invoke! graph "frame.managed/callback" []))))
+
+(deftest source-observes-real-native-frame-and-bounded-selected-fields
+ (let [g (graph "managed-frame") registration (registered g)]
+  (try
+   (let [value (:value (BeamLisp.Execution/invoke! registration [])) frame (:frame value)]
+    (is (= :active (:status frame)))
+    (is (some? (:id frame)))
+    (is (some? (:context-id frame)))
+    (is (= (:graph-id frame) (:graph value)))
+    (is (= "managed-frame" (:application value)))
+    (is (= true (:owned value))))
+   (is (= :waiting (:status (generation/retire! g))))
+   (is (= "managed-frame" (:application (:value (BeamLisp.Execution/invoke! registration [])))))
+   (BeamLisp.Execution/close! registration)
+   (is (= :retired (:status (generation/retire! g))))
+   (finally (BeamLisp.Execution/close! registration) (generation/retire! g)))))
+
+(deftest a-public-bound-generation-does-not-select-a-native-graph
+ (let [g (graph "bound-frame") before (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.Env/bind (:context g)) (Process/put :bl_generation g)
+   (is (= :unadmitted_execution_origin
+          (try (execution/selected-graph-id) :unexpected (catch error (:original error)))))
+   (finally (BeamLisp.Env/bind before) (generation/retire! g)))))
+
+(deftest editing-a-generation-map-cannot-reuse-a-genuine-native-pin
+ (let [g (graph "original-frame") ticket (generation/with! g #(BeamLisp.Env/retain_generation_code! g))
+       before (BeamLisp.Env/capture) entered (atom false)]
+  (try
+   (BeamLisp.Env/bind (:context g))
+   (Process/put :bl_generation (assoc g :application-id "forged-frame"))
+   (is (= :source_execution_context_mismatch
+          (try (BeamLisp.Env/with_owned_code_execution ticket
+                 #(BeamLisp.Env/with_owned_generation_execution (fn [] (reset! entered true))))
+               :unexpected (catch error (:original error)))))
+   (is (= false @entered))
+   (finally (BeamLisp.Env/bind before) (BeamLisp.Env/release_code! ticket) (generation/retire! g)))))

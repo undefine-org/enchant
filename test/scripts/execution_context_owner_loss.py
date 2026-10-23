@@ -41,6 +41,8 @@ value = BeamLisp.eval("""
 """)
 [registration, context, marker] = BeamLisp.Vector.to_list(value)
 %{status: :completed, value: 42} = BeamLisp.Execution.invoke!(registration, [])
+guard = BeamLisp.Execution.register!(fn ->
+%{:"graph-id" => nil, status: :active} = BeamLisp.Execution.observe()
 old = Process.whereis(BeamLisp.Env)
 key = {:bl_execution_graph_snapshot, old, marker}
 true = is_map(:persistent_term.get(key))
@@ -68,7 +70,15 @@ try do
 rescue error in ErlangError -> :retired_execution_context = error.original
 end
 nil = BeamLisp.Env.execution_origin()
-IO.puts("PASS: actual Env restart erased orphan graph storage and refused old registration/context IDs")
+try do
+  BeamLisp.Env.assert_execution_context!()
+  raise "lost frame custody was downgraded to unmanaged execution"
+rescue error in ErlangError -> :unadmitted_execution_origin = error.original
+end
+:stale_frame_refused
+end)
+%{status: :completed, value: :stale_frame_refused} = BeamLisp.Execution.invoke!(guard, [])
+IO.puts("PASS: actual Env restart erased orphan graph storage and refused old registration/context IDs and blocked stale unmanaged frame authority")
 '''
 
 
