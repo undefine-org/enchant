@@ -286,14 +286,81 @@
        ;; Scope/declaration coordinates do not refer back to this graph key.
        ;; Hashing the finite canonical graph therefore has no recursive equation.
        key (crypto/hash :sha256 (erlang/term_to_binary (tuple :binding-selection-v1 ordered requests)))]
-  {:version 1 :kind :binding-selection :key key :worlds worlds :imports requests
+  {:version 1 :kind :binding-selection :key key :state-key key :worlds worlds :imports requests
+   :introduced-scopes (list) :introduced-declarations (list)
    :scopes registry :index index :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))
+   :coordinates (Map/new (Enum/map rows
+                  #(tuple (tuple (:owner-world %) (:namespace %) (:phase %) (:space %) (:path %)) (:id %))))
+   :binding-coordinates (Map/new (Enum/map rows
+                  #(tuple (tuple (:owner-world %) (:namespace %) (:phase %) (:space %) (:name %) (:scopes %)) (:id %))))
    :entry-count (- 131072 (elem projected-budget 1))}))
 
+(defn register-scope
+ "Extend an expansion snapshot with a controller-allocated scope. Repeating
+  the exact registration is idempotent. Logical world keys remain unchanged."
+ [selection record]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [w (selected-world! (:worlds selection) (:world record))
+       expected (scope-record (:key w) (owner! (:owners w) (:owner record)) (path! (:path record)) (:role record))]
+  (when-not (erlang/=:= record expected) (refuse! :binding-scope-record {}))
+  (if-let [existing (Map/get (:scopes selection) (:id record))]
+   (if (erlang/=:= existing record) selection (refuse! :binding-identity-collision {}))
+   (do
+    (when (>= (erlang/map_size (:scopes selection)) 65536) (refuse! :binding-bound {:maximum 65536}))
+    (assoc selection :scopes (Map/put (:scopes selection) (:id record) record)
+                     :introduced-scopes (cons record (:introduced-scopes selection)) :state-key nil)))))
+
+(defn bind
+ "Add an actual expanded declaration to its origin world. Its lexical context
+  may contain selected scopes from other worlds, as introduced macro code does.
+  Persistent indexes make each addition independent of unrelated declarations."
+ [selection origin declaration]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [w (selected-world! (:worlds selection) origin)
+       d (declaration! (:owners w) origin (:scopes selection) declaration)
+       entry (origin-entry d origin)
+       coordinate (tuple origin (:namespace d) (:phase d) (:space d) (:path d))
+       binding-coordinate (tuple origin (:namespace d) (:phase d) (:space d) (:name d) (:scopes d))]
+  (if-let [existing (Map/get (:by-id selection) (:id d))]
+   (if (erlang/=:= existing entry) selection (refuse! :binding-identity-collision {}))
+   (do
+    (when (or (contains? (:coordinates selection) coordinate)
+              (contains? (:binding-coordinates selection) binding-coordinate))
+     (refuse! :binding-duplicate-declaration {}))
+    (when (or (>= (:entry-count selection) 131072) (>= (erlang/map_size (:by-id selection)) 65536))
+     (refuse! :binding-bound {:maximum 65536}))
+    (assoc selection :by-id (Map/put (:by-id selection) (:id d) entry)
+                     :index (insert-entries (:index selection) (list entry))
+                     :coordinates (Map/put (:coordinates selection) coordinate (:id d))
+                     :binding-coordinates (Map/put (:binding-coordinates selection) binding-coordinate (:id d))
+                     :introduced-declarations (cons entry (:introduced-declarations selection))
+                     :entry-count (+ 1 (:entry-count selection)) :state-key nil)))))
+
+(defn freeze
+ "Fingerprint a complete expansion snapshot once. Declaration/reference IDs
+  depend on logical origin coordinates, not this output fingerprint."
+ [selection]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [scopes (Enum/sort_by (:introduced-scopes selection) (fn [s] (:id s)))
+       declarations (Enum/sort_by (:introduced-declarations selection) (fn [d] (:id d)))
+       state-key (if (and (empty? scopes) (empty? declarations)) (:key selection)
+                   (crypto/hash :sha256
+                    (erlang/term_to_binary (tuple :binding-expansion-v1 (:key selection) scopes declarations))))]
+  (assoc selection :introduced-scopes scopes :introduced-declarations declarations :state-key state-key)))
+
 (defn validate-selection [value]
- (fields! value #{:version :kind :key :worlds :imports :scopes :index :by-id :entry-count}
-                [:version :kind :key :worlds :imports :scopes :index :by-id :entry-count])
- (let [expected (select (Map/values (:worlds value)) (:imports value))]
+ (fields! value #{:version :kind :key :state-key :worlds :imports :scopes :index :by-id :entry-count
+                  :introduced-scopes :introduced-declarations :coordinates :binding-coordinates}
+                [:version :kind :key :state-key :worlds :imports :scopes :index :by-id :entry-count
+                 :introduced-scopes :introduced-declarations :coordinates :binding-coordinates])
+ (let [base (select (Map/values (:worlds value)) (:imports value))
+       scoped (Enum/reduce (finite! (:introduced-scopes value) 65536) base
+                 (fn [record out] (register-scope out record)))
+       declared (Enum/reduce (finite! (:introduced-declarations value) 65536) scoped
+                   (fn [entry out] (bind out (:owner-world entry) (dissoc entry :owner-world :id))))
+       expected (if (:state-key value) (freeze declared)
+                    (assoc declared :introduced-scopes (:introduced-scopes value)
+                                    :introduced-declarations (:introduced-declarations value)))]
   (when-not (erlang/=:= expected value) (refuse! :binding-invalid-selection {})) value))
 
 (defn- subset? [left right]

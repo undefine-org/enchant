@@ -1,0 +1,225 @@
+;; Ordered contextual elaboration. Reader, binding lookup, macro evaluation and
+;; ANF compilation each retain their existing owner. No alternate evaluator.
+(ns expand (:require [syntax :as s] [binding :as b]))
+
+(defn- refuse! [kind node]
+ (throw (ex-info (str "Contextual expansion: " kind)
+          {:kind kind :origin (:origin node)})))
+
+(defn- tick [state]
+ (when (<= (:remaining state) 0) (refuse! :expansion-budget nil))
+ (update state :remaining dec))
+
+(defn- source-world [state]
+ (Map/fetch! (get-in state [:selection :worlds]) (:world state)))
+
+(defn- fresh-scope [state role]
+ (let [w (source-world state) n (:next-scope state)
+       scope (b/scope (:selection w) (:namespace state) [1 n] role)]
+  (tuple scope (assoc state :next-scope (+ n 1)
+                           :selection (b/register-scope (:selection state) scope)))))
+
+(defn- as-reader [node] (s/to-reader node))
+
+(defn- list-reader [node children]
+ (let [form (tuple :list children)]
+  (if (:origin node) (tuple :meta form (:origin node)) form)))
+
+(defn- spelling [node]
+ (when (s/identifier? node) (elem (:value node) 1)))
+
+(defn- internal-name [reference]
+ (str "__bl_binding_" (Base/encode16 (:id reference) (list (tuple :case :lower)))))
+
+(defn- reference-reader [node result state definition?]
+ (let [reference (:reference result) name (internal-name reference)
+       syntax (assoc node :value (symbol name))
+       occurrence {:reference reference :name (:value node) :origin (:origin node)
+                   :definition definition?}
+       descriptor {:reference reference :declaration (:declaration result)}]
+  (tuple (as-reader syntax)
+         (-> state (assoc-in [:references name] descriptor)
+                   (update :occurrences #(cons occurrence %))))))
+
+(defn- resolve-symbol [node state]
+ (let [result (b/resolve (:selection state) node (:phase state) (:position state))]
+  (when-not (= :resolved (:status result))
+   (throw (ex-info "Identifier does not have a unique available binding"
+            {:kind (case (:status result) :unbound :unbound-identifier :ambiguous :ambiguous-identifier
+                         :not-yet-available :binding-not-yet-available :invalid-binding-result)
+             :name (:value node) :origin (:origin node) :resolution result})))
+  result))
+
+(defn- bind-symbol [node state]
+ (let [name (spelling node)]
+  (if (contains? #{"&" "_"} name) (tuple (as-reader node) state)
+   (let [n (:next-declaration state)
+         declaration {:namespace (:namespace state) :name (:value node) :phase (:phase state)
+                      :space (get-in node [:context :space]) :kind :value :visibility :local
+                      :available-from 0 :path [1 n] :scopes (s/scopes node (:phase state))}
+         state (assoc state :next-declaration (+ n 1)
+                            :selection (b/bind (:selection state) (:world state) declaration))]
+    (reference-reader node (resolve-symbol node state) state true)))))
+
+(declare expression-node)
+(declare pattern-node)
+
+(defn- expression-nodes [nodes state]
+ (Enum/map_reduce nodes state (fn [node current] (expression-node node current))))
+
+(defn- pattern-node [node state]
+ (cond
+  (s/identifier? node) (bind-symbol node state)
+  (= :vector (:tag node))
+   (let [r (Enum/map_reduce (:children node) state
+             (fn [child current]
+              (if (= :keyword (:tag child)) (tuple (as-reader child) current)
+                  (pattern-node child current))))]
+    (tuple (tuple :vector (elem r 0)) (elem r 1)))
+  :else (refuse! :unsupported-contextual-pattern node)))
+
+(defn- scoped [nodes scope]
+ (Enum/map nodes #(s/add-scope % (:id scope) :all)))
+
+(defn- let-node [node state]
+ (let [children (:children node) head (first children) bindings (second children)
+       _ (when-not (and (= :vector (:tag bindings)) (even? (count (:children bindings))))
+           (refuse! :invalid-contextual-bindings bindings))]
+  (loop [items (:children bindings) body (Enum/drop children 2) current state output (list)]
+   (if (empty? items)
+    (let [r (expression-nodes body current)]
+     (tuple (list-reader node
+              (cons (as-reader head) (cons (tuple :vector (Enum/reverse output)) (elem r 0)))) (elem r 1)))
+    (let [initial (expression-node (second items) current)
+          allocated (fresh-scope (elem initial 1) :lexical) scope (elem allocated 0)
+          pattern (pattern-node (s/add-scope (first items) (:id scope) :all) (elem allocated 1))]
+     ;; Scope the rest of the SOURCE before expanding any macro inside it.
+     (recur (scoped (Enum/drop items 2) scope) (scoped body scope) (elem pattern 1)
+            (cons (elem initial 0) (cons (elem pattern 0) output))))))))
+
+(defn- fn-clause [parameters body state]
+ (when-not (= :vector (:tag parameters)) (refuse! :invalid-contextual-parameters parameters))
+ (let [allocated (fresh-scope state :lexical) scope (elem allocated 0)
+       params (pattern-node (s/add-scope parameters (:id scope) :all) (elem allocated 1))
+       r (expression-nodes (scoped body scope) (elem params 1))]
+  (tuple (cons (elem params 0) (elem r 0)) (elem r 1))))
+
+(defn- fn-node [node state]
+ (let [children (:children node) head (first children)
+       named? (s/identifier? (second children))
+       allocated (when named? (fresh-scope state :lexical))
+       self (when named? (bind-symbol (s/add-scope (second children) (:id (elem allocated 0)) :all)
+                                      (elem allocated 1)))
+       forms (if named? (scoped (Enum/drop children 2) (elem allocated 0)) (rest children))
+       current (if named? (elem self 1) state)
+       prefix (if named? (list (as-reader head) (elem self 0)) (list (as-reader head)))]
+  (if (= :vector (:tag (first forms)))
+   (let [r (fn-clause (first forms) (rest forms) current)]
+    (tuple (list-reader node (Enum/concat prefix (elem r 0))) (elem r 1)))
+   (let [r (Enum/map_reduce forms current
+             (fn [clause current]
+              (when-not (= :list (:tag clause)) (refuse! :invalid-contextual-clause clause))
+              (let [r (fn-clause (first (:children clause)) (rest (:children clause)) current)]
+               (tuple (list-reader clause (elem r 0)) (elem r 1)))))]
+    (tuple (list-reader node (Enum/concat prefix (elem r 0))) (elem r 1))))))
+
+(defn- native-name? [node]
+ ;; Native escapes are explicit obligations; they are not inferred bindings.
+ ;; The initial expression adapter admits only the existing erlang qualifier.
+ (let [name (spelling node)] (and name (String/starts_with? name "erlang/"))))
+
+(defn- macro-node [node result state]
+ (let [allocated (fresh-scope state :introduction) scope (elem allocated 0) state (elem allocated 1)
+       reference (:reference result) declaration (:declaration result)
+       context {:version 1 :definition-context
+                 {:world (:world reference) :namespace (:namespace declaration) :space (:space declaration)
+                  :scopes {:all (:scopes declaration)}}
+                :use-context (:context (first (:children node))) :introduction-scope (:id scope)
+                :use-phase (:phase state) :phase (+ 1 (:phase state)) :origin (:origin node)}]
+  (when-not (and (:controller state)
+                 (erlang/function_exported :Elixir.BeamLisp.AOT :contextual_macro! 4))
+   (refuse! :contextual-macro-controller-unavailable node))
+  ;; Fixed compiler interface. No caller-supplied evaluator or runtime macro Fn.
+  (let [expanded (BeamLisp.AOT/contextual_macro! (:controller state) reference node context)
+        syntax (s/validate (:syntax expanded))
+        trace {:transformer reference :origin (:origin node) :protocol (:protocol expanded)}]
+   (expression-node syntax (update state :expansions #(cons trace %))))))
+
+(defn- expression-node [node state]
+ (let [state (tick state) tag (:tag node)]
+  (cond
+   (s/identifier? node) (reference-reader node (resolve-symbol node state) state false)
+   (contains? #{:scalar :keyword} tag) (tuple (as-reader node) state)
+   (contains? #{:vector :set} tag)
+    (let [r (expression-nodes (:children node) state)]
+     (tuple (tuple tag (elem r 0)) (elem r 1)))
+   (= :map tag)
+    (let [r (Enum/map_reduce (:children node) state
+              (fn [pair current]
+               (let [left (expression-node (elem pair 0) current)
+                     right (expression-node (elem pair 1) (elem left 1))]
+                (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (tuple :map (elem r 0)) (elem r 1)))
+   (= :list tag)
+    (let [children (:children node) head (first children) name (spelling head)]
+     (cond
+      (empty? children) (tuple (list-reader node (list)) state)
+      (= "quote" name) (tuple (as-reader node) state)
+      (contains? #{"let" "let*" "loop" "loop*"} name) (let-node node state)
+      (contains? #{"fn" "fn*"} name) (fn-node node state)
+      (contains? #{"if" "do" "recur" "throw"} name)
+       (let [r (expression-nodes (rest children) state)]
+        (tuple (list-reader node (cons (as-reader head) (elem r 0))) (elem r 1)))
+      (native-name? head)
+       (let [r (expression-nodes (rest children) state)]
+        (tuple (list-reader node (cons (as-reader head) (elem r 0)))
+               (update (elem r 1) :native-obligations #(cons {:name (:value head) :origin (:origin head)} %))))
+      :else
+       (let [result (when (s/identifier? head) (resolve-symbol head state))]
+        (if (contains? #{:macro :syntax} (get-in result [:declaration :kind]))
+         (macro-node node result state)
+         (let [r (expression-nodes children state)]
+          (tuple (list-reader node (elem r 0)) (elem r 1)))))))
+   :else (refuse! :unsupported-contextual-expression node))))
+
+(defn expression
+ "Elaborate one actual Reader expression against selected logical worlds.
+  Actual source bytes must match the selected root revision. The optional
+  controller is a private AOT handle, never an arbitrary evaluation function."
+ [source file options]
+ (when-not (and (erlang/is_map options)
+                (every? #(contains? #{:selection :world :namespace :phase :controller} %) (keys options)))
+  (refuse! :invalid-expansion-options nil))
+ (let [graph (b/validate-selection (:selection options))
+       w (Map/get (:worlds graph) (:world options)) namespace (:namespace options)
+       input (when w (Enum/find (get-in w [:selection :sources]) #(= namespace (:namespace %))))
+       _ (when-not (and (erlang/is_binary source) input (= (:digest input) (crypto/hash :sha256 source)))
+           (refuse! :expansion-source-mismatch nil))
+       phase (Map/get options :phase 0)
+       module (b/scope (:selection w) namespace [0] :module)
+       graph (b/register-scope graph module)
+       context {:world (:key w) :namespace namespace :space 'value :scopes {:all [(:id module)]}}
+       forms (s/read source file context)
+       _ (when-not (= 1 (count forms)) (refuse! :expansion-expression-count nil))
+       state {:selection graph :world (:key w) :namespace namespace :phase phase :position 0
+              :controller (:controller options) :next-scope 0 :next-declaration 0 :remaining 1000000
+              :references {} :occurrences (list) :expansions (list) :native-obligations (list)}
+       result (expression-node (first forms) state) state (elem result 1)]
+  {:version 1 :kind :expanded-expression :reader (elem result 0)
+   :selection (b/freeze (:selection state)) :references (:references state)
+   :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
+   :native-obligations (Enum/reverse (:native-obligations state))
+   :coverage {:contextual-bindings true :bound-ir false :native-effects-complete false}}))
+
+(defn compile-expression
+ "Compile elaborated local expressions through the existing ANF compiler.
+  Global binding lowering is gated until the canonical bound-reference adapter
+  can retain selected world identity; it never falls back to ambient Env."
+ [source file options]
+ (let [expanded (expression source file options)]
+  (when (Enum/any? (Map/values (:references expanded))
+          #(not= :local (get-in % [:declaration :visibility])))
+   (refuse! :contextual-global-lowering-unavailable nil))
+  (assoc expanded :node
+    (BeamLisp.Compiler/compile (:reader expanded)
+      (assoc (BeamLisp.Compiler/new_env (str (:namespace options))) :file file)))))
