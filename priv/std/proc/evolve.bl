@@ -34,20 +34,10 @@
 (defn- put-registration-meta! [registration value]
  (BeamLisp.Execution/put-metadata! registration value))
 
-(defn- control-spec [spec]
- ;; Only lease/token identities cross the older Source ingress. The receiver
- ;; borrows the private data and code before it claims the native conversion.
- (let [value (select-keys spec [:version :digest :handler :accept? :check-state :migrate-state
-                               :upcast :downcast :check-reply :environment :modules :message-proof])
-       modules (vec (distinct (conj (:modules spec []) (BeamLisp.Emit/module_for "proc.evolve"))))
-       lease (BeamLisp.Env/retain_code! (to-list modules))]
-  (try {:lease lease :invoke (BeamLisp.Env/register_code_metadata! lease value)}
-   (catch error (BeamLisp.Env/release_code! lease) (throw error)))))
-(defn- with-receiver-spec [payload action]
- (when-not (and (erlang/is_map payload) (not (maps/is_key :__struct__ payload))
-                (= 2 (maps/size payload)) (maps/is_key :lease payload) (maps/is_key :invoke payload))
-  (throw (ex-info "Invalid native evolution payload" {:kind :invalid-evolution})))
- (BeamLisp.Env/with_code_metadata! (maps/get :lease payload) (maps/get :invoke payload) action))
+(defn- control-spec [grant spec]
+ (BeamLisp.Execution/register-bundle! grant 'proc.evolve/spec
+   (select-keys spec [:version :digest :handler :accept? :check-state :migrate-state
+                     :upcast :downcast :check-reply :environment :modules :message-proof])))
 
 (defn- retain-selected! [spec]
  (let [held (atom [])]
@@ -303,9 +293,8 @@
           receipt {:ticket ticket :version (get-in after [:current :version]) :revision (:revision after)}]
      [(assoc (dissoc receipt :ticket) :status :applied) (assoc after :publication receipt)]))))
 
-(defn- automatic-prepare [st grant expected payload samples]
+(defn- automatic-prepare-spec [st grant expected spec samples]
  (try
-  (with-receiver-spec payload (fn [spec]
   (BeamLisp.Env/with_owner_transition! grant :prepare
    (fn []
     (let [conversion-entered (atom false)]
@@ -333,7 +322,10 @@
       (catch error
        (if @conversion-entered (throw error)
         (do (BeamLisp.Env/finish_owner_transition! grant nil :refused)
-            [{:status :refused :kind (or (:kind (ex-data error)) :unproved-message-migration)} st])))))))))
+            [{:status :refused :kind (or (:kind (ex-data error)) :unproved-message-migration)} st])))))))
+  (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
+(defn- automatic-prepare [st grant expected payload samples]
+ (try (BeamLisp.Execution/invoke-bundle! payload grant 'proc.evolve/prepare [st expected samples])
   (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
 (defn- automatic-observation [st grant]
  (cond
@@ -376,11 +368,11 @@
      :revision (:revision st 0)} st])
   (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
 
+(defn- automatic-current-rehearsal-spec [st grant spec]
+ (BeamLisp.Env/with_owner_transition_observation! grant
+  (fn [] (current-rehearsal st grant spec))))
 (defn- automatic-current-rehearsal [st grant payload]
- (try
-  (with-receiver-spec payload (fn [spec]
-   (BeamLisp.Env/with_owner_transition_observation! grant
-    (fn [] (current-rehearsal st grant spec)))))
+ (try (BeamLisp.Execution/invoke-bundle! payload grant 'proc.evolve/current-rehearsal [st])
   (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
 
 (defn- automatic-commit [st grant]
@@ -717,11 +709,17 @@
  (some? (:application-id (owner-evidence pid))))
 (defn- public-refusal [error]
  ;; Caller-context/native authority errors never expose a captured graph/token.
- (let [kind (or (:kind (ex-data error))
+ (let [native (:original error)
+       role-error? (and (tuple? native) (= 2 (erlang/tuple_size native))
+                        (= :invalid_execution_bundle_role (elem native 0)))
+       kind (or (:kind (ex-data error))
+                (when role-error? :invalid-evolution)
+                (when (= :invalid_execution_bundle_dependencies native) :invalid-evolution)
                 (when (= :native_context_capacity (:original error)) :owner-context-capacity)
                 :owner-transition-authority-required)]
-  {:status (if (= kind :owner-transition-outcome-unknown) :uncertain :refused)
-   :kind kind :scope :retained-old-owner}))
+  (cond-> {:status (if (= kind :owner-transition-outcome-unknown) :uncertain :refused)
+           :kind kind :scope :retained-old-owner}
+   role-error? (assoc :callback (elem native 1)))))
 (defn- public-owner-call [pid message timeout]
  (try (GenServer/call pid message timeout)
   (catch _
@@ -733,9 +731,15 @@
    (throw (ex-info "Owner transition outcome is unconfirmed"
                    {:kind :owner-transition-outcome-unknown})))))
 (defn- public-spec-call [pid prefix spec suffix timeout]
- (let [payload (control-spec spec)]
+ (let [grant (nth prefix 1)
+       payload (try (control-spec grant spec)
+                (catch error
+                 ;; A constructor refusal published no carrier. Release only
+                 ;; an unclaimed native grant; accepted work remains intact.
+                 (try (BeamLisp.Env/abandon_owner_transition! grant) (catch _ nil))
+                 (throw error)))]
   (try (public-owner-call pid (into (conj prefix payload) suffix) timeout)
-   (finally (BeamLisp.Env/release_code! (:lease payload))))))
+   (finally (BeamLisp.Execution/close! payload)))))
 (defn- public-grant! [pid ticket]
  (when-not (erlang/is_reference ticket)
   (throw (ex-info "Unknown owner preparation" {:kind :unknown-preparation})))

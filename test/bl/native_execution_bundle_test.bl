@@ -1,0 +1,87 @@
+(ns native-execution-bundle-test
+ (:require [reload.generation :as g] [reload.state :as state]
+           [proc.evolve :as evolve] [proc.callback :as callback] [anf :as a] [lower]))
+
+(def DEPENDENCY :native_control_bundle_dependency)
+(def SOURCE
+ "(ns bundle.business)
+  (defn accepts [message] (erlang/is_binary message))
+  (defn valid [value] (erlang/is_integer value))
+  (defn identity-value [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [version digest]
+   {:version version :digest digest :handler handler :accept? accepts :check-state valid
+    :migrate-state identity-value :upcast identity-value})")
+(defn- graph [revision]
+ (g/prepare! {:application-id "native-control-bundle" :native-modules #{"erlang"}
+              :resources {:revision revision} :sources {"bundle.business" SOURCE}}))
+(defn- spec [graph version]
+ (g/with! graph #(evolve/prepare-spec (g/invoke! graph "bundle.business/spec" [version (:digest graph)]))))
+(defn- own-rows []
+ (set (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ (erlang/self) :_) :_))))
+
+(deftest native-control-bundles-check-roles-and-address-only-fixed-native-receivers
+ (let [old (graph 1) fresh (graph 2) owner (atom nil) held (atom nil) grant (atom nil)]
+  (try
+   (g/with! old #(state/bind! {}))
+   (g/inherit-runtime! fresh old)
+   (lower/reload-descriptor! (a/module DEPENDENCY
+     (list {:op :defn-clause :fname :run :params (list) :guard nil :body (a/lit 1) :ann {}})
+     (list [:run 0]) (list)))
+   (let [before (spec old 1) candidate (spec fresh 2)
+         value (update candidate :modules conj DEPENDENCY)]
+    (reset! owner (g/with! old #(evolve/start! before 7 {:managed true})))
+    (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @owner)))
+    (let [rows (own-rows) handler (:handler value)
+          mfa (tuple (elem (erlang/fun_info handler :module) 1)
+                     (elem (erlang/fun_info handler :name) 1)
+                     (elem (erlang/fun_info handler :arity) 1))]
+     (erlang/trace_pattern mfa true (list :call_count))
+     (try
+      (is (thrown? (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant "proc.evolve/spec" value))))
+      (is (thrown? (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec
+                                   (assoc value :handler (:upcast value))))))
+      (is (thrown? (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec
+                                   (assoc value :handler (:handler before))))))
+      (let [forced (atom false) modules (lazy-seq (do (reset! forced true) '(:Elixir.String)))]
+       (is (thrown? (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec
+                                    (assoc value :modules modules)))))
+       (is (= false @forced)))
+      (is (= rows (own-rows)))
+      (reset! held (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec value)))
+      (is (= {:version 1 :kind :execution-bundle :status :active} (BeamLisp.Execution/observe @held)))
+      (is (= false (callback/active? @held)))
+      (is (not (BeamLisp.Env/retire_module! DEPENDENCY)))
+      (is (= {:status :cancelled} (BeamLisp.Execution/invoke! @held [])))
+      (is (= :cancelled (BeamLisp.Execution/prepare-handoff! @held (erlang/self))))
+      (is (thrown? (BeamLisp.Execution/invoke-bundle! @held @grant 'proc.evolve/prepare [{} 1 []])))
+      (is (thrown? (BeamLisp.Execution/invoke-bundle! @held @grant 'arbitrary/evaluator [])))
+      (is (thrown? (BeamLisp.Execution/invoke-bundle! @held @grant 'proc.evolve/prepare [])))
+      (is (= :pending (:phase (BeamLisp.Env/owner_transition_observation @grant))))
+      (is (= 0 (elem (erlang/trace_info mfa :call_count) 1)))
+      (let [fake (tuple :bl_owner_transition (erlang/self) (erlang/make_ref))]
+       (is (= :refused (:status (GenServer/call @owner [:proc.evolve/automatic-prepare fake 1 @held []])))))
+      (is (= 1 (:version (evolve/status @owner))))
+      (is (= :prepared (:status (GenServer/call @owner [:proc.evolve/automatic-prepare @grant 1 @held []] 31000))))
+      (is (= :prepared (:phase (BeamLisp.Env/owner_transition_observation @grant))))
+      (is (= 0 (elem (erlang/trace_info mfa :call_count) 1)))
+      (is (= :cancelled (:status (evolve/cancel-transition! @owner @grant))))
+      (reset! grant nil)
+      (BeamLisp.Execution/close! @held)
+      (is (= :cancelled (:status (BeamLisp.Execution/observe @held))))
+      (is (= rows (own-rows)))
+      (is (BeamLisp.Env/retire_module! DEPENDENCY))
+      ;; Public construction failures must abandon only their still-unclaimed
+      ;; grant. A subsequent actual request must not find a stuck pending head.
+      (is (= {:status :refused :kind :invalid-evolution :scope :retained-old-owner :callback :handler}
+             (g/with! fresh #(evolve/prepare-upgrade! @owner 1 (assoc value :handler (:upcast value))))))
+      (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @owner)))
+      (is (= :pending (:phase (BeamLisp.Env/owner_transition_observation @grant))))
+      (BeamLisp.Env/abandon_owner_transition! @grant)
+      (reset! grant nil)
+      (finally (erlang/trace_pattern mfa false (list :call_count))))))
+   (finally
+    (when @held (BeamLisp.Execution/close! @held))
+    (when @grant (try (BeamLisp.Env/abandon_owner_transition! @grant) (catch _ nil)))
+    (when (and @owner (Process/alive? @owner)) (GenServer/stop @owner))
+    (g/retire! fresh) (g/retire! old) (BeamLisp.Env/retire_module! DEPENDENCY)))))
