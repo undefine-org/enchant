@@ -176,3 +176,13 @@ is installed. Real outline/metrics tests and the admitted font set are described
 in `priv/lib/scene/README.md`. These additions are implementation references after
 the original 30-entry API inspiration retrieval manifest; that earlier manifest
 remains a historical record rather than being silently relabeled as current.
+
+## Camera-led presentation implementation
+
+[RESEARCH-MAP.md](RESEARCH-MAP.md) consolidates the complete inspiration/API record
+and the newer continuous-atlas brief. The Cairo source-surface, pattern-filter,
+matrix, and pixel-ownership references at its end were inspected for the packed
+camera worker. Those references establish native graphics contracts; the camera
+path, quintic timing, logarithmic zoom, atlas story, and quality policy are our
+authored design choices. This adds an explicit static-raster camera backend, not
+an assertion that the original reference video used this technique.

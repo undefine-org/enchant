@@ -244,3 +244,33 @@ conservative dash-length budgets, not a general curve-trimming implementation.
 The reveal uses geometric clips; arbitrary alpha masks and blend/effect isolation
 remain future work. The film is silent. These are deliberate evidence boundaries.
 See `research/scene-renderer-and-bend/scene-renderer/TRACKS.md` for the two tracks.
+
+## The program is the sketchbook: camera-led presentation
+
+`scene_demo/atlas.bl` authors a persistent six-plate illustrated world and a
+56-second camera journey. All content exists throughout. Pans, curved travel,
+proportional zoom, restrained roll, and reading holds supply the motion; this
+film has no entrance/exit, fade, stroke-reveal, or animated-mask effects.
+
+```sh
+# Inspect scripts/bl-mem; use the documented cgroup cap and configured toolchain.
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/atlas.bl -- /tmp/bl-atlas-review
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/atlas.bl -- /tmp/bl-atlas-film film
+```
+
+Review mode creates six lossless reading frames. Film mode produces 1344 frames
+at 24/1 fps, 1920×1080, silent H.264, as `OUT/presentation.mp4`. Each revision
+retains `world.svg`, the 2x world atlas, `camera.json`, source/font/license bytes,
+shaping provenance, selected PNGs, and `camera-report.json`. The report records
+filter/density, native library identity, frame/media checks, hashes, and timing.
+The worker streams packed BGRA directly to one encoder; it does not create a
+Python or BEAM collection for each pixel, or store all uncompressed film frames.
+
+This is an explicit camera-only raster-cache backend. Native Cairo resamples the
+static atlas with BEST filtering; output is not promised pixel-identical to
+rerasterizing vectors at arbitrary zoom. The authored track's maximum zoom is
+1.08 over a 2px/world-unit atlas. Preview/export use the same camera sampler.
+Use one publisher per output directory. Source-change publication guards retain
+the existing startup executable-capture qualification. No general GPU/compiler
+work is involved. `scene_camera.py` checks packed sampling/encoding and validation;
+`camera_test.bl` and `atlas_test.bl` cover clocks, geometry, text fit, and persistence.

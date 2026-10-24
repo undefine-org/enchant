@@ -1,0 +1,58 @@
+(ns scene-demo.atlas-build
+  (:require [scene-demo.atlas :as art] [scene.core :as scene] [interop]))
+(defn digest [bytes] (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes))))
+(def sources ["examples/scene-renderer/atlas.bl" "examples/scene-renderer/scene_demo/atlas.bl"
+              "examples/scene-renderer/scene_demo/growth.bl" "examples/scene-renderer/camera_worker.py"
+              "examples/scene-renderer/raster.py" "priv/lib/scene/text_worker.py" "priv/lib/scene/text.bl"
+              "priv/lib/scene/geometry.bl" "priv/lib/scene/camera.bl" "priv/lib/scene/motion.bl"
+              "priv/lib/scene/clip.bl" "priv/lib/scene/core.bl" "priv/lib/scene/material.bl"
+              "priv/lib/scene/atelier.bl" "priv/lib/live/hiccup.bl"])
+(defn command! [program args]
+  (let [result (System/cmd program (to-list args) (list (tuple :stderr_to_stdout true)))]
+    (when (not= 0 (erlang/element 2 result)) (scene/fail "Atlas graphics failed" {:output (erlang/element 1 result)}))
+    (erlang/element 1 result)))
+(let [args (clojure.io/current-command-line-args)
+      out (Path/expand (or (first args) "/tmp/bl-atlas")) mode (or (second args) "review")
+      _ (when (not (contains? #{"review" "film"} mode)) (scene/fail "Choose review or film" {:mode mode}))
+      captured (mapv (fn [p] [p (File/read! p)]) sources)
+      fonts (mapv (fn [p] [p (File/read! (str "examples/scene-renderer/assets/fonts/" p))])
+                  ["DMSans.ttf" "InstrumentSerif-Regular.ttf" "InstrumentSerif-Italic.ttf" "PatrickHand-Regular.ttf"
+                   "DMSans-OFL.txt" "InstrumentSerif-OFL.txt" "PatrickHand-OFL.txt"])
+      rsvg (or (System/get_env "SCENE_RSVG") "rsvg-convert")
+      identity {:sources (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) captured)
+                :fonts (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) fonts)
+                :backend (String/trim (command! rsvg ["--version"])) :mode mode
+                :quality "2px/world-unit static atlas / Cairo BEST camera / 1920x1080"}
+      revision (digest (interop/->json identity)) final-dir (str out "/" revision)
+      dir (str out "/.pending-" revision "-" (System/pid))]
+  (when (not (File/dir? final-dir))
+    (File/mkdir_p! (str dir "/font")) (File/mkdir_p! (str dir "/sources"))
+    (doseq [[p bytes] fonts] (File/write! (str dir "/font/" p) bytes))
+    (doseq [[p bytes] captured] (File/write! (str dir "/sources/" (replace-str p "/" "__")) bytes))
+    (let [prepared (art/prepare {:font-dir (str dir "/font") :worker (str dir "/sources/priv__lib__scene__text_worker.py")})
+          world (art/world prepared)
+          plan {:version 1 :viewport art/viewport :world [art/width art/height] :density 2 :fps [24 1] :duration 56
+                :frames (mapv (fn [k] (assoc (art/frame-plan (scene/frame-time k 24 1)) :frame k)) (range 1344))}]
+      (File/write! (str dir "/world.svg") (scene/svg world))
+      (File/write! (str dir "/camera.json") (interop/->json plan))
+      (File/write! (str dir "/provenance.json")
+        (interop/->json (assoc identity :shaping (:shaping prepared) :camera-track art/camera-track
+                              :motion "camera only; persistent world; no object entrance/exit animations"
+                              :capture "startup environment; documented load-before-capture qualification remains")))
+      (when (not= (art/frame-plan 31) (last (mapv art/frame-plan [55 0 12 40 31])))
+        (scene/fail "Camera sampling depends on playback history" {})))
+    (command! "python3" (into [(str dir "/sources/examples__scene-renderer__camera_worker.py") dir
+                              "--rsvg" rsvg "--text-worker" (str dir "/sources/priv__lib__scene__text_worker.py")
+                              "--raster-worker" (str dir "/sources/examples__scene-renderer__raster.py")]
+                             (if (= mode "film") ["--film"] [])))
+    (when (not= captured (mapv (fn [p] [p (File/read! p)]) sources))
+      (scene/fail "Sources changed during atlas render; publication held" {}))
+    (File/rename! dir final-dir))
+  (when (= mode "film")
+    (File/cp! (str final-dir "/presentation.mp4") (str out "/.presentation.mp4.tmp"))
+    (File/rename! (str out "/.presentation.mp4.tmp") (str out "/presentation.mp4")))
+  (File/write! (str out "/manifest.json.tmp")
+    (interop/->json {:revision revision :frames 1344 :fps [24 1] :duration 56 :width 1920 :height 1080 :mode mode
+                    :selected [72 283 518 754 989 1248] :quality (:quality identity)}))
+  (File/rename! (str out "/manifest.json.tmp") (str out "/manifest.json"))
+  (println (str "Published " mode " / 56-second camera atlas: " final-dir)))

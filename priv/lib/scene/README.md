@@ -81,6 +81,29 @@ do not implicitly hold a picture: author an explicit content clip for a hold.
 Property blending, generalized signals, repeat, event tracks, and simulation
 remain open. The growth study demonstrates scheduling and retiming.
 
+## Camera-led composition
+
+`scene.camera/track` takes a nonempty ordered vector of segments with unique
+`:id`, positive `:duration`, and matching `:from`/`:to` poses. A pose declares
+`:center [x y]`, positive `:zoom` (up to 64), and optional `:roll` in degrees.
+Optional `:controls [point point]` defines a cubic spatial path. `:pullback`
+(0–1) gives a temporary logarithmic widening during travel. Segment starts and
+total duration are derived; discontinuous endpoint poses are rejected.
+
+`sample` is an arbitrary-time pure query, holding endpoint poses outside the
+track. Timing is quintic with zero endpoint velocity/acceleration; zoom is
+logarithmic. `matrix` maps world coordinates into a declared positive viewport,
+placing the sampled center at its midpoint. No objects are hidden, introduced,
+or removed by a camera track. This is a deterministic editorial path, not a
+stateful physical-camera simulator. Roll is explicit, without angle-wrap guessing.
+
+The atlas presentation is a camera-only example. Its graphics worker captures a
+static world at two pixels per world unit and resamples through the BL matrices
+with Cairo BEST filtering. The finite raster density is a declared quality limit;
+this route does not promise arbitrary-zoom vector equivalence. Selected lossless
+frames and streamed video use the same packed-surface sampler. Python does not
+plan the camera or author the world.
+
 ## Verification and resource ownership
 
 Focused BL tests are in `test/bl/scene/layout_test.bl`. Real shaping tests are in
