@@ -316,7 +316,8 @@
   (let [demand (demand-transformer reference state)
         expanded (BeamLisp.AOT/eval_constructor_session! (:constructor-session state)
                    {:op :apply :fn (elem demand 0)
-                    :args [{:op :lit :val node} {:op :lit :val context}]} {})
+                    :args [{:op :lit :val node} {:op :lit :val context}]} {}
+                   (get-in (elem demand 1) [:transformer-bindings (:id reference)] {}))
         materialize (fn [value]
                       (if (= :contextual-literal (:kind value))
                         (s/from-datum (:value value) (:definition-context context)) value))
@@ -482,11 +483,12 @@
   (fn [entry current] (link-reference (elem entry 0) (elem entry 1) current))))
 
 (defn- wrap-links [reader state]
- (if (empty? (:link-order state)) reader
+ (let [order (Enum/reject (:link-order state) #(= :phase-value (get-in state [:linked %])))]
+ (if (empty? order) reader
   (tuple :list
    (list (tuple :symbol "let")
-         (tuple :vector (Enum/flat_map (Enum/reverse (:link-order state))
-                           (fn [name] (list (symbol name) (get (:linked state) name))))) reader))))
+         (tuple :vector (Enum/flat_map (Enum/reverse order)
+                           (fn [name] (list (symbol name) (get (:linked state) name))))) reader)))))
 
 (defn- in-definition [recipe reference state transformer?]
  (let [unit (Map/fetch! (get-in state [:catalog :worlds]) (:world recipe))
@@ -505,10 +507,23 @@
                   (fn [key out] (assoc out key (get state key))))]
   (tuple (elem r 0) (:dependencies (elem r 1)) restored)))
 
+(defn- phase-bindings [state]
+ (Map/new (Enum/flat_map (:link-order state)
+             (fn [name] (if (= :phase-value (get-in state [:linked name]))
+                          (list (tuple name (get-in state [:phase-values name]))) (list))))))
+
+(defn- compile-phase-reader [reader unit state]
+ (let [locals (Map/new (Enum/map (maps/keys (phase-bindings state)) #(tuple % %)))]
+  (compiler/compile-contextual reader
+   (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit) :locals locals)
+   (:references state))))
+
 (defn- link-reference [name descriptor state]
  (if (contains? (:linked state) name) state
   (if-let [constant (get-in state [:constant-readers name])]
    (-> state (assoc-in [:linked name] constant) (update :link-order #(cons name %)))
+  (if-let [identity (when (:evaluation-phase state) (get-in state [:phase-values name]))]
+   (-> state (assoc-in [:linked name] :phase-value) (update :link-order #(cons name %)))
   (do
    (when (contains? (:link-active state) name) (refuse! :contextual-initialization-cycle nil))
    (when (>= (erlang/map_size (:link-active state)) 128) (refuse! :contextual-link-depth nil))
@@ -520,19 +535,20 @@
     (let [r (in-definition recipe reference (assoc-in state [:link-active name] true) false)
           state (link-dependencies (elem r 1) (elem r 2))
           unit (get-in state [:catalog :worlds (:world recipe)])
-          ;; Closed profile values are first-order constants. Evaluate once,
-          ;; under the same effect-denying budget as transformers, then embed
-          ;; literal data. No duplicated module initialization or hidden effects.
-          reader (if (= :value (get-in recipe [:declaration :kind]))
-                   (quote-reader
-                    (BeamLisp.AOT/eval_constructor_session! (:constructor-session state)
-                     (compile-reader (wrap-links (elem r 0) state) (:namespace unit) (:file unit) (:references state)) {})
-                    (:context unit)) (elem r 0))]
-     (-> (if (= :value (get-in recipe [:declaration :kind]))
-           (assoc-in state [:constant-readers name] reader) state)
+          value? (= :value (get-in recipe [:declaration :kind]))
+          phase-value? (and value? (:evaluation-phase state))
+          node (when value?
+                 (compile-phase-reader (wrap-links (elem r 0) state) unit state))
+          result (when value?
+                  (if phase-value?
+                   (BeamLisp.AOT/bind_constructor_session! (:constructor-session state) node {} (phase-bindings state))
+                   (BeamLisp.AOT/eval_constructor_session! (:constructor-session state) node {} (phase-bindings state))))
+          reader (cond phase-value? :phase-value value? (quote-reader result (:context unit)) :else (elem r 0))]
+     (-> (cond phase-value? (assoc-in state [:phase-values name] result)
+               value? (assoc-in state [:constant-readers name] reader) :else state)
                (assoc-in [:linked name] reader)
                (update :link-order #(cons name %))
-               (update :link-active #(dissoc % name)))))))))
+               (update :link-active #(dissoc % name))))))))))
 
 (defn- compile-reader [reader namespace file references]
  (compiler/compile-contextual reader
@@ -548,13 +564,16 @@
     (when (contains? (:transformer-active state) key) (refuse! :contextual-transformer-cycle nil))
     (let [r (in-definition recipe reference
               (assoc state :linked {} :link-order (list) :link-active {}
+                           :evaluation-phase true
                            :transformer-active (assoc (:transformer-active state) key true)) true)
           linked (link-dependencies (elem r 1) (elem r 2))
           unit (get-in state [:catalog :worlds (:world recipe)])
-          node (compile-reader (wrap-links (elem r 0) linked) (:namespace unit) (:file unit) (:references linked))
+          node (compile-phase-reader (wrap-links (elem r 0) linked) unit linked)
           restored (-> linked (assoc :linked (:linked state) :link-order (:link-order state)
                                      :link-active (:link-active state)
-                                     :transformer-active (:transformer-active state))
+                                     :transformer-active (:transformer-active state)
+                                     :evaluation-phase (:evaluation-phase state))
+                              (assoc-in [:transformer-bindings key] (phase-bindings linked))
                               (assoc-in [:transformers key] node))]
      (tuple node restored))))))
 
@@ -593,7 +612,8 @@
               :next-scope 0 :next-declaration 0 :remaining 1000000 :macro-budget 128 :macro-depth 0 :transformer false
               :references {} :dependencies {} :occurrences (list) :expansions (list)
               :native-obligations (list) :linked {} :link-order (list) :link-active {}
-              :transformers {} :transformer-active {}}
+              :transformers {} :transformer-active {} :transformer-bindings {} :phase-values {}
+              :evaluation-phase false}
        r (expression-node (contextualize (:node expression) unit) state)
        state (link-dependencies (:dependencies (elem r 1)) (elem r 1))
        reader (wrap-links (elem r 0) state)

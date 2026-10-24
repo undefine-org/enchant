@@ -7419,64 +7419,123 @@
    (constructor_refuse :constructor-session-not-owned)) session))
 
 (defn open_constructor_session!
- "Open one process-owned aggregate budget for contextual expansion. The
-  handle is opaque, carries no SDK/native admission, and must be closed."
+ "Open one process-owned aggregate budget for contextual expansion. Stored
+  values stay in this private interpreter frame and never grant native admission."
  []
  (let [sessions (constructor_sessions)]
   (when (>= (erlang/map_size sessions) 16) (constructor_refuse :constructor-session-bound))
-  (let [handle (erlang/make_ref)]
+  (let [handle (erlang/make_ref) frame (tuple :contextual-constructor-frame (erlang/make_ref))]
+   (erlang/put frame (constructor_counters))
    (Process/put :bl_contextual_constructor_sessions
-    (Map/put sessions handle {:owner (erlang/self) :status :open :calls 0
+    (Map/put sessions handle {:owner (erlang/self) :status :open :calls 0 :frame frame
+                             :values {} :retained-bytes 0
                              :budget (artifact_budget (constructor_counters))})) handle)))
 
 (defn constructor_session_status
- "Resource counters only. No temporary recipes, callables or private frames."
+ "Resource counters only. No stored values, callables or private frames."
  [handle]
  (let [session (constructor_session! handle)]
   {:version 1 :status (:status session) :calls (:calls session) :budget (:budget session)
+   :values (erlang/map_size (:values session)) :retained-bytes (:retained-bytes session)
    :native-admission false}))
 
 (defn close_constructor_session!
- "Release this process's session. Repeating cleanup after close is harmless."
+ "Release this process's values and interpreter frame. Repeating close is safe."
  [handle]
  (let [sessions (constructor_sessions) session (Map/get sessions handle)]
   (when session
    (when-not (= (erlang/self) (:owner session)) (constructor_refuse :constructor-session-not-owned))
    (when (= :running (:status session)) (constructor_refuse :constructor-session-running))
+   (erlang/erase (:frame session))
    (let [remaining (Map/delete sessions handle)]
     (if (= 0 (erlang/map_size remaining)) (Process/delete :bl_contextual_constructor_sessions)
       (Process/put :bl_contextual_constructor_sessions remaining)))) :ok))
 
-(defn eval_constructor_session!
- "One fixed effect-denying operation. Fuel is shared across requests; recipe
-  and callable ownership ends after each response. Failure poisons the session.
-  No evaluator callback, source lookup or caller-selected primitive policy."
- [handle expression locals]
+(defn- constructor_session_locals! [session locals bindings limits state]
+ (when-not (and (erlang/is_map locals) (not (maps/is_key :__struct__ locals))
+                (erlang/is_map bindings) (not (maps/is_key :__struct__ bindings))
+                (<= (erlang/map_size bindings) 128))
+  (constructor_refuse :constructor-session-bindings))
+ (constructor_walk_steps! state (:nodes (BeamLisp.CompilerData/first_order_cost! locals limits)))
+ (Enum/reduce (maps/to_list bindings) locals
+  (fn [entry out]
+   (let [name (elem entry 0) identity (elem entry 1) found (maps/find identity (:values session))]
+    (when-not (and (erlang/is_binary name) (<= (erlang/byte_size name) 256)
+                   (not (maps/is_key name locals)) (erlang/is_reference identity)
+                   (not= :error found))
+     (constructor_refuse :constructor-session-value-not-owned))
+    (Map/put out name (elem found 1))))))
+
+(defn- constructor_session_request! [handle expression locals bindings retain?]
  (let [session (constructor_session! handle)
        _ (when-not (= :open (:status session)) (constructor_refuse :constructor-session-not-open))
-       child (tuple :contextual-constructor-frame (erlang/make_ref))
+       frame (:frame session) previous (erlang/get frame)
        limits {:max-nodes 65536 :max-bytes 1048576 :max-depth 128}
-       state {:counter-frame child :max-collection 16384 :data-limits limits :resolution-world :kernel-phase}]
+       state {:counter-frame frame :max-collection 16384 :data-limits limits :resolution-world :kernel-phase}]
   (Process/put :bl_contextual_constructor_sessions
    (Map/put (constructor_sessions) handle (assoc session :status :running)))
-  (erlang/put child (Map/merge (constructor_counters) (:budget session)))
   (try
-   (constructor_walk_steps! state (:nodes (BeamLisp.CompilerData/first_order_cost! expression limits)))
-   (constructor_walk_steps! state (:nodes (BeamLisp.CompilerData/first_order_cost! locals limits)))
-   (let [result (constructor_interpret expression locals state)]
-    (when (:aborted (erlang/get (:counter-frame state))) (constructor_refuse :constructor-aborted))
+   (let [syntax-cost (BeamLisp.CompilerData/first_order_cost! expression limits)
+         _ (constructor_walk_steps! state (:nodes syntax-cost))
+         env (constructor_session_locals! session locals bindings limits state)
+         result (constructor_interpret expression env state)]
+    (when (:aborted (erlang/get frame)) (constructor_refuse :constructor-aborted))
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
-    (BeamLisp.CompilerData/check_first_order! result limits)
-    (Process/put :bl_contextual_constructor_sessions
-     (Map/put (constructor_sessions) handle (assoc session :status :succeeded))) result)
+    (if retain?
+     (do
+      ;; Same raw internal owner witness as every primitive boundary. Foreign
+      ;; functions, handles and forged containers do not become phase values.
+      (when (>= (erlang/map_size (:values session)) 128) (constructor_refuse :constructor-session-value-bound))
+      (let [value-cost (constructor_container_cost! result state)
+            current (erlang/get frame)
+            ;; Do not serialize a native closure's captured function graph:
+            ;; repeated shared captures can expand exponentially in ETF. Charge
+            ;; validated syntax/storage and work already measured by this frame.
+            bytes (+ (:bytes syntax-cost) (* 16 (:nodes syntax-cost))
+                     (:bytes value-cost) (* 16 (:nodes value-cost))
+                     (- (:allocation-bytes previous) (:allocation-bytes current))
+                     (* 16 (- (:allocation-nodes previous) (:allocation-nodes current))))
+            total (+ (:retained-bytes session) bytes)
+            identity (erlang/make_ref)]
+       (when (> total 16777216) (constructor_refuse :constructor-session-value-bytes))
+       (Process/put :bl_contextual_constructor_sessions
+        (Map/put (constructor_sessions) handle
+         (assoc session :status :succeeded :values (Map/put (:values session) identity result)
+                        :retained-bytes total))) identity))
+     (do
+      (BeamLisp.CompilerData/check_first_order! result limits)
+      (Process/put :bl_contextual_constructor_sessions
+       (Map/put (constructor_sessions) handle (assoc session :status :succeeded))) result)))
    (catch-raw [kind reason frames]
     (constructor_boundary_raise! kind reason frames state))
    (finally
-    (let [spent (erlang/erase child) current (constructor_session! handle)]
+    (let [spent (erlang/get frame) current (constructor_session! handle)
+          succeeded? (= :succeeded (:status current))
+          ;; Normal responses discard temporary ownership. Binding commits keep
+          ;; their interpreted closure witnesses, bounded by existing ceilings.
+          owned (if (and retain? succeeded?) spent previous)
+          next (Map/merge (constructor_counters)
+                 (Map/merge (select-keys owned [:callables :recipes :recipe-serial :exceptions])
+                            (artifact_budget spent)))]
+     (erlang/put frame next)
      (Process/put :bl_contextual_constructor_sessions
       (Map/put (constructor_sessions) handle
-       (assoc session :status (if (= :succeeded (:status current)) :open :failed)
+       (assoc current :status (if succeeded? :open :failed)
                       :calls (+ 1 (:calls session)) :budget (artifact_budget spent)))))))))
+
+(defn eval_constructor_session!
+ "Evaluate using fixed effect-denying semantics and shared fuel. Optional
+  bindings map ANF local names to values owned by this exact session. Only
+  first-order results leave the machine; failure poisons the session."
+ ([handle expression locals] (eval_constructor_session! handle expression locals {}))
+ ([handle expression locals bindings]
+  (constructor_session_request! handle expression locals bindings false)))
+
+(defn bind_constructor_session!
+ "Evaluate once and retain a bounded machine-owned value, returning only an
+  opaque ID. No native function, Source lookup or evaluator callback is accepted."
+ [handle expression locals bindings]
+ (constructor_session_request! handle expression locals bindings true))
 
 (defn- interpret_phase_constructor! [expression metadata]
  ;; Phase bundles accept and return first-order data. Their temporary recipes

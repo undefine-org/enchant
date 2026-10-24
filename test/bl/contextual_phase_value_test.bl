@@ -1,0 +1,73 @@
+(ns contextual-phase-value-test
+ (:require [expand :as x] [lower :as lower] [system.phase :as phase]))
+
+(defn- unit [namespace revision source]
+ {:namespace namespace :revision revision :file (str namespace ".bl") :source source})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom
+                  (str "Elixir.ContextualPhaseValue." (erlang/unique_integer (list :positive))))
+                (:node program)))
+(defn- provider [revision offset]
+ (unit 'forms revision
+  (str "(ns forms) (begin-for-syntax "
+       " (def specialise (let [offset " offset "] (fn [value] (erlang/+ offset value))))) "
+       "(defsyntax answer [form ctx] "
+       " (syntax-literal (specialise (:value (syntax-arg form 1)))))")))
+
+(deftest compile-time-values-can-close-over-lexical-data-without-runtime-functions-escaping
+ (let [program (x/program
+                [(provider 'old 40)
+                 (unit 'client 'current
+                  "(ns client) (import-world 'forms 'old :only [answer]) [(answer 2) (answer 3)]")]
+                ['client 'current])]
+  (is (= [42 43] (execute program)))
+  (is (= 2 (count (:expansions program))))
+  (is (= 1 (get-in program [:constructor :values])))
+  (is (= 3 (get-in program [:constructor :calls])))
+  (is (= (:node program) (BeamLisp.CompilerData/check_first_order! (:node program))))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest archived-closure-recipes-keep-revisions-and-private-captures-separate
+ (let [archive (x/decode-phase-library
+                (x/encode-phase-library
+                 (x/phase-library [(provider 'old 40) (provider 'new 50)])))
+       program (x/program
+                [(unit 'client 'current
+                  (str "(ns client) (import-world 'forms 'old :as old :only [answer]) "
+                       "(import-world 'forms 'new :as new :only [answer]) "
+                       "[(old/answer 2) (new/answer 2) (old/answer 3)]"))]
+                ['client 'current] [archive])]
+  (is (= [42 52 43] (execute program)))
+  (is (every? #(not (contains? % :source)) (:units archive)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest closure-valued-phase-bindings-follow-shifted-transformer-instances
+ (let [archive (x/phase-library [(provider 'old 40)])
+       program (x/program
+                 [(unit 'client 'current
+                   (str "(ns client) (begin-for-syntax (import-world 'forms 'old :only [answer])) "
+                        "(defsyntax literal [form ctx] (syntax-literal (answer 2))) (literal)"))]
+                 ['client 'current] [archive])]
+  (is (= 42 (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest phase-values-can-capture-earlier-owned-closures-and-store-them-in-data
+ (let [provider (unit 'forms 'current
+                  (str "(ns forms) (begin-for-syntax "
+                       " (def add (let [offset 40] (fn [x] (erlang/+ offset x)))) "
+                       " (def table {:run (let [f add] (fn [x] (f x)))})) "
+                       "(defsyntax answer [form ctx] (syntax-literal ((:run table) 2)))"))
+       archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       program (x/program [(unit 'client 'current
+                            "(ns client) (import-world 'forms 'current :only [answer]) [(answer) (answer)]")]
+                          ['client 'current] [archive])]
+  (is (= [42 42] (execute program)))
+  (is (= 2 (get-in program [:constructor :values])))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest a-phase-closure-cannot-be-inserted-into-the-runtime-literal-output
+ (is (thrown?
+       (x/program [(unit 'client 'current
+                     (str "(ns client) (begin-for-syntax (def function (fn [x] x))) "
+                          "(defsyntax leak [form ctx] (syntax-literal function)) (leak)"))]
+                  ['client 'current]))))

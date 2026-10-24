@@ -59,3 +59,86 @@
     (is (= :allocation-byte-budget refusal))
     (is (> (:calls (BeamLisp.AOT/constructor_session_status session)) 1)))
    (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(defn- compiled [source]
+ (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source) (BeamLisp.Compiler/new_env "user")))
+
+(deftest bound-phase-values-stay-owned-and-share-one-fuel-ledger
+ (let [before (owned-keys) session (BeamLisp.AOT/open_constructor_session!)
+       closure (compiled "(let [offset 40] (fn [value] (erlang/+ offset value)))")
+       call {:op :apply :fn {:op :var :name "specialise"} :args [{:op :lit :val 2}]}]
+  (try
+   (let [identity (BeamLisp.AOT/bind_constructor_session! session closure {} {})
+         bound (BeamLisp.AOT/constructor_session_status session)]
+    (is (erlang/is_reference identity))
+    (is (= 1 (:values bound)))
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session call {} {"specialise" identity})))
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session call {} {"specialise" identity})))
+    (is (< (get-in (BeamLisp.AOT/constructor_session_status session) [:budget :remaining])
+           (get-in bound [:budget :remaining])))
+    (is (= 1 (:values (BeamLisp.AOT/constructor_session_status session)))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))
+  (is (= before (owned-keys)))))
+
+(deftest phase-value-identities-cannot-be-borrowed-by-another-session
+ (let [a (BeamLisp.AOT/open_constructor_session!) b (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [identity (BeamLisp.AOT/bind_constructor_session! a {:op :lit :val 42} {} {})]
+    (is (= :constructor-session-value-not-owned
+           (detail #(BeamLisp.AOT/eval_constructor_session! b {:op :var :name "value"} {} {"value" identity}))))
+    (is (= :failed (:status (BeamLisp.AOT/constructor_session_status b))))
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! a {:op :var :name "value"} {} {"value" identity}))))
+   (finally (BeamLisp.AOT/close_constructor_session! a) (BeamLisp.AOT/close_constructor_session! b)))))
+
+(deftest an-owned-phase-closure-still-cannot-escape-a-data-response
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [identity (BeamLisp.AOT/bind_constructor_session! session (compiled "(fn [value] value)") {} {})]
+    (is (thrown? (BeamLisp.AOT/eval_constructor_session! session {:op :var :name "function"} {} {"function" identity})))
+    (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session)))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest retained-values-have-a-finite-count-and-no-native-input-route
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (dotimes [n 128]
+    (BeamLisp.AOT/bind_constructor_session! session {:op :lit :val n} {} {}))
+   (is (= 128 (:values (BeamLisp.AOT/constructor_session_status session))))
+   (is (= :constructor-session-value-bound
+          (detail #(BeamLisp.AOT/bind_constructor_session! session {:op :lit :val 129} {} {}))))
+   (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session))))
+   (finally (BeamLisp.AOT/close_constructor_session! session))))
+ (let [session (BeamLisp.AOT/open_constructor_session!) touched (atom false)]
+  (try
+   (is (thrown? (BeamLisp.AOT/bind_constructor_session! session
+                  {:op :var :name "native"} {"native" #(reset! touched true)} {})))
+   (is (= false @touched))
+   (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest stored-closures-remain-effect-denying-when-called-later
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [identity (BeamLisp.AOT/bind_constructor_session! session
+                    (compiled "(fn [] (erlang/put :stored-phase-effect true))") {} {})]
+    (is (= {:remote [:erlang :put 2]}
+           (detail #(BeamLisp.AOT/eval_constructor_session! session
+                     {:op :apply :fn {:op :var :name "effect"} :args []} {} {"effect" identity}))))
+    (is (= :undefined (erlang/get :stored-phase-effect)))
+    (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session)))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest repeated-shared-closure-captures-do-not-require-serialized-environment-copies
+ (let [session (BeamLisp.AOT/open_constructor_session!)
+       function {:op :fn :clauses [{:pats [] :guard nil :body {:op :lit :val 42}}]}]
+  (try
+   (let [identity (loop [left 14 previous nil]
+                    (if (zero? left) previous
+                     (recur (dec left)
+                       (BeamLisp.AOT/bind_constructor_session! session function {}
+                         (if previous {"left" previous "right" previous} {})))))]
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session
+                  {:op :apply :fn {:op :var :name "value"} :args []} {} {"value" identity})))
+    (is (= 14 (:values (BeamLisp.AOT/constructor_session_status session))))
+    (is (< (:retained-bytes (BeamLisp.AOT/constructor_session_status session)) 262144)))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
