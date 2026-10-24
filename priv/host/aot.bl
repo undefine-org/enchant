@@ -5176,7 +5176,7 @@
                   (erlang/function_exported (ns_body_module ns) :__bl_callable_values__ 0))))))
 
 (defn- sdk_image_preload_unit [ns root bytes]
-  (let [shim (BeamLisp.Emit/module_for ns)
+  (let [shim (BeamLisp.Emit/base_module_for ns)
         raw (BeamLisp.Env/sdk_inventory_metadata! bytes (Atom/to_string shim))]
     (when raw
       (let [selected (sdk_native_source_path ns)
@@ -5204,7 +5204,7 @@
               (Enum/map identities (fn [identity]
                 (let [row (BeamLisp.Env/sdk_inventory_metadata! bytes identity)
                       file (sdk_image_artifact_path root identity)
-                      object (File/read! file)]
+                      object (BeamLisp.AOTCache/read_precompiled_bytes! file 33554432)]
                   (when-not (and row (erlang/== (Map/get raw :source) (Map/get row :source))
                                  (erlang/== (Map/get raw :source-digest) (Map/get row :source-digest))
                                  (erlang/== (crypto/hash :sha256 object) (Map/get row :sha256)))
@@ -5220,6 +5220,65 @@
                                        (if (erlang/is_binary name) (String/to_existing_atom name) name)))) metadata)]
                     {:module (elem decoded 0) :row metadata :file file :bytes object}))))]
           {:namespace ns :requires requires :members members})))))
+
+
+(defn sdk_pipeline_identity!
+ "Capture the dependency closure of an actual sealed SDK compiler pipeline.
+  Reuse byte-bound unit metadata, including floor requires. This never loads
+  modules, evaluates initializers, inspects ambient vars or grants admission."
+ [namespace]
+ (when-not (and (erlang/is_binary namespace) (erlang/=< 1 (erlang/byte_size namespace))
+                (erlang/=< (erlang/byte_size namespace) 512))
+  (erlang/error :invalid_sdk_pipeline_namespace))
+ (let [input (sdk_inventory_input) root (elem input 0) bytes (elem input 1)
+       _ (when (erlang/== nil bytes) (erlang/error :sdk_pipeline_image_missing))
+       keys (BeamLisp.Bootstrap/packaged_keys!)
+       manifest (BeamLisp.Bootstrap/manifest)
+       floor (Map/get manifest "modules")
+       target (runtime_image_key)
+       units
+       (loop [pending (list namespace) seen (MapSet/new) result (list) total 0 count 0]
+        (when (or (erlang/> (MapSet/size seen) 1024) (erlang/> total 67108864) (erlang/> count 8192))
+         (erlang/error :sdk_pipeline_budget))
+        (if (erlang/== pending (list)) (Enum/sort_by result (fn [unit] (Map/get unit :namespace)))
+         (let [name (erlang/hd pending) rest (erlang/tl pending)]
+          (if (MapSet/member? seen name) (recur rest seen result total count)
+           (let [module (BeamLisp.Emit/base_module_for name)
+                 identity (Atom/to_string module)
+                 file (erlang/iolist_to_binary (list identity ".beam"))
+                 expected (Map/get floor file)
+                 unit (when (erlang/== nil expected) (sdk_image_preload_unit name root bytes))
+                 _ (when (and (erlang/== nil expected) (erlang/== nil unit))
+                     (erlang/error (tuple :sdk_pipeline_unit_missing name)))
+                 object (when expected (BeamLisp.AOTCache/read_precompiled_bytes!
+                                         (Path/join (BeamLisp.Bootstrap/seed_dir) file) 33554432))
+                 _ (when (and expected (erlang/not (erlang/== expected
+                       (String/downcase (Base/encode16 (crypto/hash :sha256 object))))))
+                     (erlang/error :sdk_pipeline_floor_changed))
+                 attrs (when object (Keyword/get (elem (elem
+                          (beam_lib/chunks object (list :attributes)) 1) 1) :attributes))
+                 requires (if expected (sdk_unit_requires attrs) (Map/get unit :requires))
+                 _ (when-not (erlang/is_list requires)
+                     (erlang/error (tuple :sdk_pipeline_requirements_missing name)))
+                 members (if expected (list {:identity identity :sha256 (crypto/hash :sha256 object)})
+                           (Enum/sort_by (Enum/map (Map/get unit :members)
+                             (fn [member] {:identity (Atom/to_string (Map/get member :module))
+                                            :sha256 (Map/get (Map/get member :row) :sha256)}))
+                             (fn [member] (Map/get member :identity))))
+                 size (if object (erlang/byte_size object)
+                        (Enum/reduce (Map/get unit :members) 0
+                         (fn [member size] (erlang/+ size (erlang/byte_size (Map/get member :bytes))))))]
+            (recur (erlang/++ requires rest) (MapSet/put seen name)
+             (cons {:namespace name :members members} result)
+             (erlang/+ total size) (erlang/+ count (erlang/length members))))))))]
+  ;; The inventory is a captured input, not a mutable global cache identity.
+  ;; Unrelated rows do not enter the result; drift during capture still refuses.
+  (when-not (and (erlang/== input (sdk_inventory_input))
+                 (erlang/== keys (BeamLisp.Bootstrap/packaged_keys!))
+                 (erlang/== target (runtime_image_key)))
+   (erlang/error :sdk_pipeline_inputs_changed))
+  {:version 1 :kind :sealed-sdk-pipeline :compiler-key (elem keys 0)
+   :build-key (elem keys 1) :runtime-image target :units units}))
 
 (defn- sdk_image_load_unit! [namespace root inventory]
  (let [unit (sdk_image_preload_unit namespace root inventory)

@@ -1,0 +1,111 @@
+(ns sdk.contextual.consumer (:require [compile.world :as world] [build :as build]))
+
+(defn refused [action]
+ (try (action) :accepted (catch error (BeamLisp.ExInfo/ex_original error))))
+(defn macro-count [action]
+ (let [pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4)]
+  (erlang/trace_pattern pattern true (list :local :call_count))
+  (try
+   (let [value (action)] [value (elem (erlang/trace_info pattern :call_count) 1)])
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(let [output (System/fetch_env! "BL_SDK_ARTIFACT_OUT")
+      root (BeamLisp.Tiers/priv_root) manifest (BeamLisp.Bootstrap/manifest)
+      project (Path/join output "contextual-project")
+      out (Path/join project "out") file (Path/join project "world.bl")
+      opts {:world file :out out}]
+ (assert (BeamLisp.AOTCache/packaged_compiler?))
+ (assert (= (get manifest "compiler_key") (BeamLisp.AOTCache/current_compiler_key)))
+ (assert (= (get manifest "build_key") (BeamLisp.AOTCache/current_build_key)))
+ (let [previous (Application/get_env :beam_lisp :aot_backend :core)]
+  (try
+   (Application/put_env :beam_lisp :aot_backend :elixir)
+   (assert (= :Elixir.ArgumentError
+     (try (BeamLisp.AOTCache/current_compiler_key) :accepted
+      (catch error (Map/get error :__struct__)))))
+   (finally (Application/put_env :beam_lisp :aot_backend previous))))
+ ;; Every supported suffix participates in Source-absence classification.
+ (doseq [suffix (BeamLisp.Tiers/source_extensions)]
+  (let [sentinel (Path/join root (str "std/partial-source-probe" suffix))]
+   (try
+    (File/write! sentinel "(ns partial.source.probe)")
+    (assert (= false (BeamLisp.AOTCache/packaged_compiler?)))
+    (assert (not= (get manifest "compiler_key") (BeamLisp.AOTCache/current_compiler_key)))
+    (finally (File/rm! sentinel)))))
+ ;; Pure identity capture must not publish or initialize selected code.
+ (let [before (BeamLisp.Env/loaded_ns? "sdk.artifact.consumer")
+       pattern (tuple :Elixir.BeamLisp.Env :publish_binaries! 1)]
+  (erlang/trace_pattern pattern true (list :local :call_count))
+  (try
+   (let [identity (BeamLisp.AOT/sdk_pipeline_identity! "sdk.artifact.consumer")
+         calls (elem (erlang/trace_info pattern :call_count) 1)]
+    (assert (= :sealed-sdk-pipeline (:kind identity)))
+    (assert (seq (:units identity)))
+    (let [scope (BeamLisp.Env/fork :global)]
+     (try
+      (BeamLisp.Env/with_env scope
+       (fn []
+        ;; Ordinary caller naming metadata may shadow this namespace. It does
+        ;; not select a different physical SDK unit or create SDK ownership.
+        (BeamLisp.Env/put_key (tuple :realm_local "sdk.artifact.consumer") :RUntrusted)
+        (assert (= identity (BeamLisp.AOT/sdk_pipeline_identity! "sdk.artifact.consumer")))))
+      (finally (BeamLisp.Env/destroy scope))))
+    (assert (= 0 calls))
+    (assert (= before (BeamLisp.Env/loaded_ns? "sdk.artifact.consumer"))))
+   (finally (erlang/trace_pattern pattern false (list :local :call_count)))))
+ (let [file (Path/join root "sdk-code.term") bytes (File/read! file)
+       before (BeamLisp.AOT/sdk_pipeline_identity! "compile.world")
+       inventory (erlang/binary_to_term bytes (list :safe))]
+  (try
+   ;; Removing unrelated membership is a denial control, never a new grant.
+   ;; Pipeline identity depends on its own complete units, not VM-wide state.
+   (File/write! file (erlang/term_to_binary
+    (update inventory :modules dissoc "Elixir.BeamLisp.Ns.Sdk.Artifact.Consumer")))
+   (assert (= before (BeamLisp.AOT/sdk_pipeline_identity! "compile.world")))
+   (finally (File/write! file bytes))))
+ (File/mkdir_p! project)
+ (File/write! (Path/join project "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 42))")
+ (File/write! (Path/join project "main.bl") "(ns main) (import-world 'forms 'current :only [answer]) (answer)")
+ (File/write! file "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'forms :revision 'current :file \"forms.bl\"} {:namespace 'main :revision 'current :file \"main.bl\"}] :libraries []}")
+ (let [[first-run first-calls] (macro-count #(build/run opts))
+       [warm warm-calls] (macro-count #(build/run opts))]
+  (doseq [result [first-run warm]] (assert (= [] (:errors result))))
+  (assert (= 1 (:compiled first-run))) (assert (> first-calls 0))
+  (assert (= 0 (:built warm))) (assert (= 0 warm-calls))
+  (assert (= 42 (world/run-unit (:out warm) [])))
+  (File/rm_rf! out)
+  (let [[restored restored-calls] (macro-count #(build/run opts))]
+   (assert (= [] (:errors restored))) (assert (= 1 (:cached restored)))
+   (assert (= 0 restored-calls)))
+  (let [inventory-file (Path/join root "sdk-code.term") original (File/read! inventory-file)
+        inventory (erlang/binary_to_term original (list :safe))
+        identity (Atom/to_string (BeamLisp.Emit/base_module_for "system.phase"))]
+   ;; Denial only: remove real membership, retaining loaded and on-disk code.
+   (try
+    (File/write! inventory-file (erlang/term_to_binary (update inventory :modules dissoc identity)))
+    (assert (not= :accepted (refused #(BeamLisp.AOT/sdk_pipeline_identity! "compile.world"))))
+    (assert (seq (:errors (build/run opts))))
+    (finally (File/write! inventory-file original))))
+  (let [victim (Path/join (Path/dirname root) "ebin/Elixir.BeamLisp.Ns.Body.System.Phase.beam")
+        original (File/read! victim)]
+   (try
+    (File/write! victim (str original "changed selected body"))
+    (assert (not= :accepted (refused #(BeamLisp.AOT/sdk_pipeline_identity! "compile.world"))))
+    (assert (seq (:errors (build/run opts))))
+    (finally (File/write! victim original))))
+  (File/write! (Path/join project "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 43))")
+  (let [[changed changed-calls] (macro-count #(build/run opts))]
+   (assert (= [] (:errors changed))) (assert (= 1 (:compiled changed)))
+   (assert (> changed-calls 0)) (assert (= 43 (world/run-unit (:out changed) []))))
+  (let [source-root (System/fetch_env! "BL_SDK_CONTEXTUAL_ROOT")
+        result (BeamLisp.TestRT/run_suite
+          (list (Path/join source-root "test/bl/contextual_import_test.bl")
+                (Path/join source-root "test/bl/contextual_phase_value_test.bl")))]
+   (assert (= 40 (:pass result))) (assert (= 0 (:fail result))) (assert (= 0 (:error result))))
+  (File/write! (Path/join output "contextual-consumer.json")
+   (Jason/encode! {:status "passed" :source-free true :warm-macros warm-calls
+                  :cold-macros first-calls :cache-restored true :provider-edit true
+                  :changed-pipeline-body-refused true :missing-pipeline-unit-refused true
+                  :source-suffixes-checked 5 :source-free-import-and-phase-assertions 40
+                  :scope-independent true :unrelated-inventory-independent true :native-admission false})))
+ (println "SDK-CONTEXTUAL-CONSUMER passed"))
