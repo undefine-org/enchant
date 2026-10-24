@@ -90,3 +90,50 @@ nine focused assertions passed across the original core and new editorial tests.
 The contact sheet was inspected for staged assembly, clipping and stable texture.
 Lossless keyframe, motion study, checks and exact export provenance are retained
 in `evidence/editorial/`. No preview service or compiler VM was left running.
+
+## A1 measurable cards and selected-frame studio
+
+The user authorized autonomous implementation and incremental commits. The earlier
+renderer and research were committed first, followed by the canonical-text/layout
+slice. New code adds `scene.text`, `scene.geometry`, `scene.picture`, `scene.layout`,
+`scene.motion`, `scene.inspect`, and `scene.styles.editorial`. The library README
+identifies the actual implemented surface; the larger API research remains a plan.
+
+Pango now measures and wraps paragraphs, and Cairo extracts the same shaped glyphs
+as vector outlines. Layout and rendering therefore share glyph geometry instead
+of relying on matching browser/librsvg text guesses. Packaged font hashes and
+actual shared-library versions/paths are recorded. Six native text tests passed,
+including wrapping, explicit breaks, missing resources/glyphs, and outline bounds.
+Fifty-five focused BL assertions passed across the original core/editorial and
+new layout/postcard tests. They exercise growth/reflow, stable local identities,
+transform order, finite timing, arbitrary seeking, inspection, and cue edits that
+reuse shaping even when a worker invocation would fail.
+
+The new studio (`examples/scene-renderer/studio.sh`) lets a user change text,
+reorder/insert cards, switch warm/blueprint styles, change paper seed/cue/stagger,
+seek/step/play, and inspect logical/ink/effect bounds and anchors. It renders only
+requested frames at 540px over an unchanged 1080-unit layout. Immutable prepared
+scenes are sampled at arbitrary time. Content errors preserve the last valid
+revision and picture. A dedicated retained task owns the scene state; an admission
+slot remains held until actual render completion. Eight simultaneous requests
+produced one success and seven busy responses. A file lock excludes a second
+publisher for the same output directory. Code, worker, and font bytes are captured
+at session startup; complete leaf hashes and JSON, rather than a bounded printer,
+key source/config identities.
+
+Real HTTP checks passed text growth/reflow, stable identity under reorder, coherent
+style changes, invalid-edit retention, and exact repeated PNG bytes after shuffled
+seeks. Chromium passed bounds overlays, seek/step, style editing, playback, rapid
+scrubbing, and closing. Selected evidence is in `evidence/a1/`. In one local run,
+first frame was 2.295s, a text edit 0.964s, and selected seeks had a 0.236s median
+with four uncached samples and one cached sample. These are small observed samples,
+not a claim that the p95 product target is achieved. Timing evidence predates the
+final cue-only shaping-cache optimization, which has separate correctness tests.
+
+A1 remains partly open: BL source changes require restarting the studio, rather
+than coherent hot replacement. Snapshot source identity still has the documented
+load-before-capture qualification. Property inspection records font/color role
+origins, not arbitrary source-form traces. Broad sequence/parallel/event-track and
+simulation APIs are not implemented. A one-shot six-second export entrypoint is
+being checked separately; don't infer completion from the interactive preview.
+All owned studio/browser test services were stopped; unrelated VMs were preserved.

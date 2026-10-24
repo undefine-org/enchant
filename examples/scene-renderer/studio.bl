@@ -1,0 +1,107 @@
+(ns scene-demo.studio
+  (:require [scene-demo.postcard :as postcard] [scene.core :as scene] [scene.inspect :as inspect]
+            [scene.layout :as layout] [web] [interop] [proc.task :as task]))
+(def out (Path/expand (or (first (clojure.io/current-command-line-args)) "/tmp/bl-postcard-studio")))
+(def source-paths ["examples/scene-renderer/studio.bl" "examples/scene-renderer/scene_demo/postcard.bl"
+                   "examples/scene-renderer/studio.html" "examples/scene-renderer/raster.py"
+                   "priv/lib/scene/core.bl" "priv/lib/scene/material.bl" "priv/lib/scene/atelier.bl"
+                   "priv/lib/scene/layout.bl" "priv/lib/scene/geometry.bl" "priv/lib/scene/text.bl"
+                   "priv/lib/scene/text_worker.py" "priv/lib/scene/styles/editorial.bl"
+                   "priv/lib/scene/motion.bl" "priv/lib/scene/inspect.bl" "priv/lib/live/hiccup.bl"])
+(defn digest [bytes] (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes))))
+(def captured (mapv (fn [p] [p (File/read! p)]) source-paths))
+(def font-bytes
+  (mapv (fn [name] [name (File/read! (str "examples/scene-renderer/assets/fonts/" name))])
+    ["DMSans.ttf" "InstrumentSerif-Regular.ttf" "InstrumentSerif-Italic.ttf" "PatrickHand-Regular.ttf"]))
+(def font-hashes (mapv (fn [[name bytes]] [name (digest bytes)]) font-bytes))
+(def renderer (or (System/get_env "SCENE_RSVG") "rsvg-convert"))
+(def backend (System/cmd renderer (list "--version")))
+;; Hash complete bytes through explicit leaf hashes, never a bounded printer.
+(def code-id (digest (interop/->json
+  {:sources (mapv (fn [[path bytes]] [path (digest bytes)]) captured)
+   :fonts font-hashes :backend (erlang/element 1 backend)})))
+(def snapshot (str out "/code-" code-id))
+(File/mkdir_p! snapshot)
+(doseq [[path bytes] captured] (File/write! (str snapshot "/" (replace-str path "/" "__")) bytes))
+(def font-dir (str snapshot "/font"))
+(File/mkdir_p! font-dir)
+(doseq [[name bytes] font-bytes] (File/write! (str font-dir "/" name) bytes))
+(defn config-from-json [value]
+  (let [cards (get value "cards") theme (get value "theme") cue (get value "cue") step (get value "step") seed (get value "seed")]
+    (when (not (and (vector? cards) (<= 1 (count cards) 4))) (scene/fail "Choose one to four cards" {}))
+    (when (not (contains? #{"warm" "blueprint"} theme)) (scene/fail "Unknown style" {}))
+    (when (not (and (scene/finite? cue) (<= 0 cue) (<= cue 4) (scene/finite? step) (<= 0 step) (<= step 1)
+                    (integer? seed) (<= 0 seed) (< seed 100000))) (scene/fail "Invalid cue, spacing, or seed" {}))
+    {:title (get value "title") :subtitle (get value "subtitle") :theme (if (= theme "blueprint") :blueprint :warm)
+     :seed seed :cue cue :step step
+     :cards (mapv (fn [card]
+        (let [id (get card "id") title (get card "title") body (get card "body")]
+          (when (not (and (string? id) (<= 1 (count id) 64) (not (includes? id "/"))
+                          (string? title) (string? body))) (scene/fail "Each card needs a stable id and text" {}))
+          {:id id :title title :body body})) cards)}))
+(defn command! [args]
+  (let [result (System/cmd "python3" (to-list args) (list (tuple :stderr_to_stdout true)))]
+    (when (not= 0 (erlang/element 2 result)) (scene/fail "Graphics worker failed" {:diagnostic (erlang/element 1 result)}))))
+(defn render-request [state request]
+  (let [config (config-from-json (get request "config"))
+        k (get request "frame")
+        revision (digest (interop/->json {:code code-id :config config}))]
+    (when (not (and (integer? k) (<= 0 k) (< k 144))) (scene/fail "Frame must be between 0 and 143" {}))
+    (let [prepared (if (= revision (:revision state)) (:prepared state)
+                     (postcard/prepare config {:previous (:prepared state) :font-dir font-dir :worker (str snapshot "/priv__lib__scene__text_worker.py")}))
+          frame (postcard/frame prepared (scene/frame-time k 24 1))
+          dir (str out "/" revision) preview (str dir "/preview")
+          png (str preview "/" k ".png")]
+      (File/mkdir_p! preview)
+      (when (not (File/regular? png))
+        (File/write! (str preview "/" k ".svg") (scene/svg (:scene frame)))
+        (command! [(str snapshot "/examples__scene-renderer__raster.py") "raster" preview "--start" (str k)
+                   "--count" "1" "--font-dir" font-dir "--font" (str font-dir "/InstrumentSerif-Regular.ttf")
+                   "--pixel-width" "540" "--rsvg" renderer]))
+      (File/write! (str dir "/config.json") (interop/->json config))
+      (File/write! (str dir "/provenance.json")
+        (interop/->json {:code-id code-id :sources (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) captured)
+                        :fonts font-hashes :shaping (:shaping prepared) :backend (erlang/element 1 backend)
+                        :logical [1080 1080] :preview [540 540] :quality "cached paper tile v1"}))
+      (File/write! (str out "/manifest.json.tmp")
+        (interop/->json {:revision revision :code-id code-id :frames 144 :fps [24 1] :duration 6 :width 1080 :height 1080}))
+      (File/rename! (str out "/manifest.json.tmp") (str out "/manifest.json"))
+      [(assoc state :revision revision :prepared prepared)
+       {:ok true :revision revision :frame k :time (scene/frame-time k 24 1)
+        :image (str "data:image/png;base64," (Base/encode64 (File/read! png))) :objects (:objects frame)}])))
+(def gate (ets/new :postcard_gate (list :set :public)))
+(def owner
+  (task/async (fn []
+    (loop [state {}]
+      (receive
+        [:request caller ref request]
+          (let [result (try (render-request state request)
+                           (catch error [state {:ok false :revision (:revision state) :diagnostic (str (ex-message error)
+                             (when (:diagnostic (ex-data error)) (str "\n" (:diagnostic (ex-data error)))))}]))]
+            (ets/delete gate :render)
+            (erlang/send caller [ref (second result)])
+            (recur (first result)))
+        :stop nil)))))
+(defn route-frame [conn]
+  (let [body (web/read-body-limited* conn 65536 10000) c (:conn body)]
+    (cond
+      (:error body) (web/json c 413 {:ok false :diagnostic "Postcard request exceeds its body budget"})
+      (not (ets/insert_new gate (tuple :render true))) (web/json c 429 {:ok false :busy true})
+      :else
+      (try
+        (let [request (interop/json-> (:body body)) ref (erlang/make_ref)]
+          (erlang/send (task/pid owner) [:request (erlang/self) ref request])
+          (receive [ref response] (web/json c response)
+            (after 30000 (web/json c 503 {:ok false :diagnostic "Render is still running; retain the previous frame"}))))
+        (catch error
+          (ets/delete gate :render)
+          (web/json c 400 {:ok false :diagnostic (ex-message error)}))))))
+(defn router [conn]
+  (web/route conn
+    [:get "/"] (web/html conn (File/read! (str snapshot "/examples__scene-renderer__studio.html")))
+    [:get "/api/config"] (web/json conn postcard/defaults)
+    [:post "/api/frame"] (route-frame conn)
+    :else (web/text conn 404 "not found")))
+(web/serve {:port 4048 :ip (tuple 127 0 0 1) :log :off :plug router})
+(println "Living postcard studio: http://127.0.0.1:4048 — stop this process to close")
+(receive :stop nil)

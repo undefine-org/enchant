@@ -68,7 +68,7 @@ def lower_materials(source, folder, rsvg, env):
     return lowered
 
 
-def raster(folder, count, font, rsvg, font_dir=None, scale=1):
+def raster(folder, count, font, rsvg, font_dir=None, scale=1, start=0, pixel_width=None):
     # Use only the captured font. Browser preview displays these same PNGs.
     with tempfile.TemporaryDirectory(prefix='bl-scene-font-') as tmp:
         config = Path(tmp) / 'fonts.conf'
@@ -76,9 +76,11 @@ def raster(folder, count, font, rsvg, font_dir=None, scale=1):
                           '<fontconfig><dir>' + xml.sax.saxutils.escape(str((font_dir or font.parent).resolve()))
                           + '</dir><cachedir>' + tmp + '/cache</cachedir></fontconfig>')
         env = {**os.environ, 'FONTCONFIG_FILE': str(config)}
-        for k in range(count):
+        for k in range(start, start + count):
             source = lower_materials(folder / f'{k}.svg', folder, rsvg, env)
-            if scale == 1:
+            if pixel_width:
+                run([rsvg, "--width", str(pixel_width), "-o", folder / f"{k}.png", source], env=env)
+            elif scale == 1:
                 run([rsvg, '-o', folder / f'{k}.png', source], env=env)
             else:
                 run([rsvg, '--zoom', str(scale), '-o', folder / 'supersampled.png', source], env=env)
@@ -88,7 +90,7 @@ def raster(folder, count, font, rsvg, font_dir=None, scale=1):
         if (folder / 'supersampled.png').exists():
             (folder / 'supersampled.png').unlink()
     (folder / 'pixels.json').write_text(json.dumps({str(k): digest(folder / f'{k}.png')
-                                                  for k in range(count)}, indent=2) + '\n')
+                                                  for k in range(start, start + count)}, indent=2) + '\n')
 
 
 def encode(root, output, ffmpeg, ffprobe):
@@ -118,6 +120,8 @@ def main():
     p.add_argument('mode', choices=['raster', 'export'])
     p.add_argument('folder', type=Path)
     p.add_argument('--count', type=int)
+    p.add_argument('--start', type=int, default=0)
+    p.add_argument('--pixel-width', type=int)
     p.add_argument('--font', type=Path)
     p.add_argument('--font-dir', type=Path)
     p.add_argument('--scale', type=int, choices=[1, 2, 3], default=1)
@@ -127,7 +131,7 @@ def main():
     p.add_argument('--ffprobe', default='ffprobe')
     a = p.parse_args()
     if a.mode == 'raster':
-        raster(a.folder, a.count, a.font, a.rsvg, a.font_dir, a.scale)
+        raster(a.folder, a.count, a.font, a.rsvg, a.font_dir, a.scale, a.start, a.pixel_width)
     else:
         encode(a.folder, a.out, a.ffmpeg, a.ffprobe)
 

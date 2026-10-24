@@ -132,3 +132,55 @@ static seeded paper texture is resolved once per revision, with no texture flick
 The second build's frame/asset provenance is independent from the earlier demo.
 For the design reasoning and evidence boundaries, see `ART-DIRECTION.md` in the
 renderer research folder. Use the lossless PNG to judge fine texture; MP4 is lossy.
+
+## Living postcard studio
+
+The A1 playground now has options-map cards, canonical Pango wrapping and vector
+text outlines, measured layout, keyed local identities, attached connectors,
+cue-relative entrances, theme variants, selected-frame rendering, and an inspector.
+The larger proposed motion algebra and arbitrary source-property tracing remain
+future work. See `priv/lib/scene/README.md` for the actual implemented surface.
+
+```sh
+scripts/bl-mem
+systemd-run --user --collect --wait --pipe --working-directory="$PWD" \
+  --setenv=PATH="$PATH" --property=MemoryMax=4G --property=MemorySwapMax=512M \
+  examples/scene-renderer/studio.sh /tmp/bl-postcard-studio
+# Open http://127.0.0.1:4048
+```
+
+The studio uses Python's standard library with shared Pango/Cairo libraries,
+preferably discovered from the selected `rsvg-convert` closure via `ldd`. It shapes
+only when content changes, samples an immutable evaluated tree on seek, and keeps
+one render admitted globally. Its 540px preview uses the same 1080-unit layout.
+Playback coalesces pending times; it does not promise 24 rasterized frames per
+second. The displayed timestamp reports the frame actually shown. Content errors
+keep the last valid picture and revision. The inspector exposes semantic IDs,
+logical/ink/effect bounds, anchors, and the recorded font/color origin.
+
+Text, cards, style, seed, cue, and stagger edits are supported in the page. BL
+source changes require restarting this studio session: it freezes code/resources
+at startup and does not yet implement coherent hot replacement of authored code.
+The wrapper takes an exclusive output-directory lock and drains processes carrying
+its private runtime environment on exit. Use one studio per output directory.
+The loopback endpoint has no authentication and is intended for a local developer
+session, not public hosting.
+
+Each code snapshot retains worker/source bytes and font bytes. Each content revision
+retains its normalized config, provenance, and only the requested preview frames.
+The manifest publishes after a successful render. The source snapshot still has
+the load-before-capture qualification documented in the research; it is not a new
+proof of arbitrary executable capture. Cold startup loads the BL code once, and
+all accepted requests in that session use its retained task environment.
+
+A selected still can also be authored without a service:
+
+```sh
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/postcard.bl -- /tmp/bl-postcard
+# Add 'long' or 'blueprint' after the output directory for those specimens.
+```
+
+Run these BL commands under the same resource cap. Focused checks are
+`test/bl/scene/layout_test.bl`, `test/bl/scene/postcard_test.bl`,
+`test/scripts/scene_text.py`, and (against an owned studio)
+`test/scripts/scene_studio.py` / `scene_studio_browser.mjs`.

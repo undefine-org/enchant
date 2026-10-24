@@ -98,3 +98,13 @@ small inspector. The user wants to refine the plan through playful experiments.
 These documents do not implement A1 or turn the illustrative syntax into a
 working public API. Preserve the distinction between existing prototype behavior
 and proposed design. The renderer remains separate from Bend/compiler research.
+
+## Autonomous A1 implementation
+
+The user agreed to the plan and explicitly authorized autonomous work and commits
+as implementation proceeds. The measurable text/layout slice and selected-frame
+studio now exist; read the latest PROGRESS.md and `priv/lib/scene/README.md` before
+assuming an API is only proposed or fully delivered. Existing code uses canonical
+Pango shaping plus Cairo vector outlines, and a BL-owned task coordinates the
+studio. Source hot replacement and full source-form explanations remain open.
+Keep making concrete, visually checked progress and commit completed slices.
