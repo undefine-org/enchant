@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Audit historical bindings, or run explicit case regressions in one cold VM.
+
+Run under a process-tree memory/time cap, as documented in AGENTS.md. A selected
+regression pass is not historical case closure or final artifact qualification.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+FINDINGS = 'research/execution-protocol-audit/findings.json'
+MANIFEST = 'research/execution-protocol-audit/cases.json'
+DRIVER = 'test/scripts/execution-history-driver.bl'
+ROLES = {'positive', 'original-negative'}
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_manifest(root, path):
+    findings = json.loads((root / FINDINGS).read_text())
+    manifest = json.loads(path.read_text())
+    if manifest.get('version') != 1 or manifest.get('findings_sha256') != digest(root / FINDINGS):
+        raise ValueError('unsupported manifest or changed original findings')
+    cases = manifest.get('cases', [])
+    expected = {row['id']: row for row in findings}
+    if len(findings) != 86 or set(expected) != {f'E{i:02}' for i in range(1, 87)}:
+        raise ValueError('original findings inventory must be exactly E01-E86')
+    ids = [row['id'] for row in cases]
+    if len(ids) != 86 or len(set(ids)) != 86 or set(ids) != set(expected):
+        raise ValueError('manifest must cover each original E01-E86 exactly once')
+    for case in cases:
+        original = expected[case['id']]
+        if case['family'] != original['gate_family'] or case['issue'] != original['issue']:
+            raise ValueError('finding identity changed: ' + case['id'])
+        selectors = case.get('selectors', [])
+        seen = set()
+        for selector in selectors:
+            key = (selector['path'], selector['namespace'], selector['test'])
+            path = (root / selector['path']).resolve()
+            if (key in seen or not path.is_relative_to(root.resolve()) or not path.is_file()
+                    or not all(isinstance(x, str) and x for x in key)
+                    or not selector.get('roles') or not set(selector['roles']) <= ROLES
+                    or not selector.get('rationale')):
+                raise ValueError('invalid, missing or duplicate selector: ' + case['id'])
+            seen.add(key)
+        if not isinstance(case.get('remaining'), list) or not all(
+                isinstance(x, str) and x for x in case['remaining']):
+            raise ValueError('missing explicit remaining obligations: ' + case['id'])
+    return cases
+
+
+def audit(cases):
+    bound = [c['id'] for c in cases if c['selectors']]
+    open_cases = []
+    for case in cases:
+        roles = {role for s in case['selectors'] for role in s['roles']}
+        if not case['selectors'] or roles != ROLES or case['remaining']:
+            open_cases.append({'id': case['id'], 'missing_roles': sorted(ROLES - roles),
+                               'remaining': case['remaining']})
+    return {'status': 'incomplete' if open_cases else 'bindings-complete',
+            'cases': len(cases), 'bound_cases': bound, 'open': open_cases,
+            'executed': False, 'complete_goal': False}
+
+
+def capture(root, manifest):
+    paths = {root / 'env.bl', root / FINDINGS, manifest, root / DRIVER,
+             root / 'scripts/check-execution-history'}
+    suffixes = ('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.py', '.exs',
+                '.rs', '.toml', '.lock', '.so')
+    for directory in ['priv', 'test', 'scripts', 'native']:
+        paths.update(p for p in (root / directory).rglob('*') if p.is_file()
+                     and (p.name.endswith(suffixes) or directory == 'scripts')
+                     and 'target' not in p.parts and '__pycache__' not in p.parts)
+    floor = root / 'priv/bootstrap/seed'
+    return {'inputs': {str(p.relative_to(root)): digest(p) for p in sorted(paths)},
+            'floor': {p.name: digest(p) for p in sorted(floor.iterdir()) if p.is_file()}}
+
+
+def validate_execution(files, plan):
+    expected_files = {row['path']: row for row in plan}
+    if not isinstance(files, list) or len(files) != len(expected_files):
+        raise ValueError('missing or unexpected file receipts')
+    seen = set()
+    actual = {}
+    for result in files:
+        path = result.get('path')
+        if path not in expected_files or path in seen or result.get('status') != 'passed':
+            raise ValueError('failed, duplicate or unexpected file receipt')
+        seen.add(path)
+        expected = {(s['namespace'], s['test']) for s in expected_files[path]['selectors']}
+        tests = result.get('tests', [])
+        found = set()
+        for test in tests:
+            key = (test.get('namespace'), test.get('test'))
+            if key not in expected or key in found:
+                raise ValueError('duplicate or unexpected test receipt')
+            if (any(type(test.get(k)) is not int for k in ['pass', 'fail', 'error']) or test['pass'] <= 0
+                    or test.get('fail') != 0 or test.get('error') != 0):
+                raise ValueError('zero assertions, failing or incomplete test')
+            found.add(key)
+            actual[(path, *key)] = test
+        if found != expected:
+            raise ValueError('requested selector did not execute')
+    return actual
+
+
+def validate_identity(image, root, frozen):
+    if (not isinstance(image, dict) or not isinstance(image.get('priv-root'), str)
+            or Path(image['priv-root']).resolve() != (root / 'priv').resolve()
+            or image.get('manifest-sha256') != frozen['floor']['manifest.term']
+            or not isinstance(image.get('compiler-key'), str) or len(image['compiler-key']) != 64):
+        raise ValueError('child selected another runtime root or compiler floor')
+
+
+def run(root, manifest, cases, selected, output, timeout):
+    if output.exists() or output.is_symlink():
+        raise ValueError('output must be absent; preserve previous receipts')
+    by_id = {row['id']: row for row in cases}
+    if not selected or len(set(selected)) != len(selected) or any(x not in by_id for x in selected):
+        raise ValueError('select distinct known case IDs explicitly')
+    chosen = [by_id[x] for x in selected]
+    if any(not row['selectors'] for row in chosen):
+        raise ValueError('selected case has no executable selector')
+    groups = {}
+    for case in chosen:
+        for selector in case['selectors']:
+            group = groups.setdefault(selector['path'], [])
+            entry = {k: selector[k] for k in ['namespace', 'test']}
+            if entry not in group:
+                group.append(entry)
+    plan = [{'path': path, 'selectors': selectors} for path, selectors in groups.items()]
+    output.mkdir(parents=True)
+    frozen = capture(root, manifest)
+    (output / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
+    (output / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+    receipt = {'version': 1, 'status': 'running', 'cases': selected,
+               'scope': 'selected historical regressions; not baseline or whole-goal qualification',
+               'complete_goal': False, 'full_sdk_build': False}
+    start = time.monotonic()
+    try:
+        command = [str(root / 'bin/bl'), '--cold', 'run', str(root / DRIVER)]
+        environment = dict(os.environ, BL_EXECUTION_HISTORY_ROOT=str(root),
+                           BL_EXECUTION_HISTORY_OUT=str(output))
+        with (output / 'run.log').open('w') as log:
+            result = subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT,
+                                    timeout=timeout, env=environment)
+        receipt['child_exit'] = result.returncode
+        if result.returncode:
+            raise ValueError('child failed; see retained run.log')
+        if capture(root, manifest) != frozen:
+            raise ValueError('frozen source/test/tool/native/floor inputs changed')
+        execution = json.loads((output / 'execution.json').read_text())
+        validate_identity(execution.get('image'), root, frozen)
+        actual = validate_execution(execution.get('files'), plan)
+        receipt.update(status='regressions-passed', frozen_inputs_unchanged=True,
+                       image=execution['image'],
+                       assertions=sum(t['pass'] for t in actual.values()),
+                       files=len(plan), tests=len(actual),
+                       case_results=[{'id': c['id'], 'status': 'regressions-passed',
+                                      'historical_case_closed': False,
+                                      'remaining': c['remaining'],
+                                      'selectors': c['selectors']} for c in chosen])
+    except Exception as error:
+        receipt.update(status='failed', error=str(error))
+        raise
+    finally:
+        receipt['seconds'] = round(time.monotonic() - start, 3)
+        (output / 'result.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    return receipt
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=ROOT)
+    parser.add_argument('--manifest', type=Path)
+    parser.add_argument('--cases', nargs='+')
+    parser.add_argument('--out', type=Path)
+    parser.add_argument('--timeout', type=int, default=240)
+    args = parser.parse_args()
+    root = args.root.resolve()
+    manifest = (args.manifest or root / MANIFEST).resolve()
+    try:
+        if not 30 <= args.timeout <= 900 or not manifest.is_relative_to(root):
+            raise ValueError('timeout must be 30..900s and manifest must be inside root')
+        cases = read_manifest(root, manifest)
+        if not args.cases:
+            if args.out:
+                raise ValueError('--out requires explicit --cases')
+            report = audit(cases)
+            print(json.dumps(report, indent=2))
+            return 1 if report['open'] else 0
+        if not args.out:
+            raise ValueError('--cases requires --out')
+        report = run(root, manifest, cases, args.cases, args.out.absolute(), args.timeout)
+        print(json.dumps({k: report[k] for k in ['status', 'cases', 'assertions', 'files', 'tests', 'seconds']}))
+        return 0
+    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        parser.exit(1, str(error) + '\n')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

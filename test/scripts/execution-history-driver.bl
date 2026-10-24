@@ -1,0 +1,71 @@
+;; Execute exact registered tests with the ordinary TestRT executor. The parent
+;; owns the manifest and frozen identity; this child owns discovery and results.
+(ns execution.history-driver)
+
+(defn- run-file [root request]
+ (let [base (BeamLisp.Env/fork :global)]
+  (try
+   (BeamLisp.Env/with_env base
+    (fn []
+     (BeamLisp.Compiler/eval_string (BeamLisp.TestRT/test_lib_source)
+                                   (BeamLisp.Compiler/new_env "core"))
+     (BeamLisp.TestRT/clear_registry)
+     (let [path (Path/join root (:path request))]
+      (BeamLisp.Env/in_ns "user")
+      (BeamLisp.Loader/with_load_path (Path/dirname path)
+       (fn [] (BeamLisp.TestRT/declarations
+                (fn [] (BeamLisp.Compiler/eval_string (BeamLisp.Loader/read_source path)))))))
+     (let [available (Enum/flat_map (BeamLisp.TestRT/test_namespaces)
+                       (fn [ns]
+                        (Enum/map (BeamLisp.TestRT/registered_tests ns)
+                         (fn [pair] {:namespace ns :test (erlang/element 1 pair)
+                                     :body (erlang/element 2 pair)}))))
+           selected (Enum/map (:selectors request)
+                       (fn [selector]
+                        (let [found (Enum/filter available
+                                      #(and (= (:namespace selector) (:namespace %))
+                                            (= (:test selector) (:test %))))]
+                         (when-not (= 1 (count found))
+                          (throw (ex-info "Historical selector missing or ambiguous" selector)))
+                         (first found))))]
+      ;; Only this file's fresh Env is changed. Retain the actual declared
+      ;; thunks and normal TestRT execution/exception/assertion semantics.
+      (BeamLisp.TestRT/clear_registry)
+      (Enum/each selected
+        #(BeamLisp.TestRT/register_test (:namespace %) (:test %) (:body %)))
+      (let [results (Enum/map (BeamLisp.TestRT/test_namespaces) #(BeamLisp.TestRT/run_ns %))
+            tests (Enum/flat_map results
+                    (fn [result]
+                     (Enum/map (Enum/filter selected #(= (:ns result) (:namespace %)))
+                      (fn [selector]
+                       (let [reports (Enum/filter (:reports result) #(= (:test selector) (:test %)))
+                             counts (reduce (fn [out report] (update out (:type report) inc))
+                                            {:pass 0 :fail 0 :error 0} reports)]
+                        (assoc counts :namespace (:namespace selector) :test (:test selector)))))))
+            passed (every? #(and (> (:pass %) 0) (= 0 (:fail %)) (= 0 (:error %))) tests)]
+       {:path (:path request) :status (if passed :passed :failed) :tests tests}))))
+   (catch error
+    {:path (:path request) :status :failed :kind :history-file-error
+     :message (ex-message error) :tests (list)})
+   (finally (BeamLisp.Env/destroy base)))))
+
+(let [root (System/fetch_env! "BL_EXECUTION_HISTORY_ROOT")
+      output (System/fetch_env! "BL_EXECUTION_HISTORY_OUT")
+      actual-root (Path/expand (BeamLisp.Tiers/priv_root))
+      identity (fn [path] (select-keys (File/stat! path) [:inode :major_device :minor_device]))
+      _ (when-not (= (identity actual-root) (identity (Path/join root "priv")))
+          (throw (ex-info "Historical child selected another runtime root" {})))
+      packaged (BeamLisp.Bootstrap/packaged_keys!)
+      key (BeamLisp.AOTCache/current_compiler_key)
+      _ (when-not (= key (erlang/element 1 packaged))
+          (throw (ex-info "Historical child selected a mixed compiler floor" {})))
+      image {:priv-root actual-root :compiler-key key
+             :manifest-sha256
+              (Base/encode16 (crypto/hash :sha256 (File/read! (Path/join actual-root "bootstrap/seed/manifest.term")))
+                             (list (tuple :case :lower)))}
+      plan (Jason/decode! (File/read! (Path/join output "plan.json"))
+                          (list (tuple :keys :atoms)))
+      results (Enum/map plan #(run-file root %))]
+ (File/write! (Path/join output "execution.json") (Jason/encode! {:image image :files results}))
+ (when-not (and (seq results) (every? #(= :passed (:status %)) results))
+  (throw (ex-info "Historical regression selection failed" {:files (vec results)}))))
