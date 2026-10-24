@@ -133,3 +133,11 @@ The new film must use no entrance or exit animations: persistent content with
 natural, deliberate pans/zooms/holds. Earlier films remain historical. A static
 atlas with a BL-authored sampled camera is an admitted backend experiment; record
 density/zoom/filtering limits honestly and keep graphics buffers packed.
+
+The 56-second camera-only atlas presentation now exists, with source in
+`scene_demo/atlas.bl`, `scene.camera`, and the captured builder `atlas.bl`.
+Read CAMERA-PRESENTATION.md and the newest PROGRESS.md section. Retained media,
+camera plan, reports, and review UI are in `evidence/atlas/`. Use the range-aware
+`review_server.py` for chapter seeking; plain Python http.server was insufficient.
+The new film preserves all content and animates only its camera. Continue that
+direction when extending this presentation unless the user changes it.

@@ -9,6 +9,7 @@ The renderer remains independent of the Bend comparison and compiler programme.
 | Read | Purpose |
 |---|---|
 | [Inspiration and API map](RESEARCH-MAP.md) | Complete research navigation, implemented/proposed crosswalk, and camera-led presentation brief |
+| [Camera-led presentation](CAMERA-PRESENTATION.md) | Script, actual camera API, motion policy, graphics boundary, and verification |
 | [Two implementation tracks](TRACKS.md) | Approved split: studio workflow and the advancing visual/clip language |
 | [API research](API-RESEARCH.md) | Detailed inspirations, design practices, bolder connections, and decisions to preserve |
 | [Proposed API contract](API-CONTRACT.md) | Value model, module boundaries, identity, layout, time, rendering, and extension rules |
@@ -36,6 +37,13 @@ measurable-card and selected-frame studio slices are now implemented. See
 examples still describe a broader API; they are not all available signatures.
 
 ## Current implementation and retained artifacts
+
+The newest presentation is [The program is the sketchbook](evidence/atlas/index.html):
+a [56-second 1080p film](evidence/atlas/presentation.mp4) through six connected
+ideas, with camera-only motion and persistent content. Its [checks](evidence/atlas/checks.json)
+and [camera/script documentation](CAMERA-PRESENTATION.md) distinguish demonstrated
+behavior from the open research programme. The full inspiration/API record is
+indexed in [RESEARCH-MAP.md](RESEARCH-MAP.md).
 
 The next visual-language study is the [twelve-second botanical film](evidence/growth/a-seed-of-possibility.mp4),
 with a [review page](evidence/growth/index.html), [lossless master](evidence/growth/master-264.png),

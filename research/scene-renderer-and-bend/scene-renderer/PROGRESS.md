@@ -231,3 +231,57 @@ coherent BL source refresh and stronger executable capture, save/load, richer
 dependency/source inspection, and a playback/quality workflow. Export has phase
 status, not fine-grained per-frame progress. It currently serves postcard content;
 the new botanical film intentionally leads the studio's generic composition API.
+
+## Longer camera-led presentation and consolidated research
+
+The user requested recording every inspiration/API discussion, committing it,
+then extending the film into a more complete presentation with no entrance/exit
+animations. The existing detailed notes/sources/examples were audited and a new
+RESEARCH-MAP.md crosswalk committed first (`eac8718f`). CAMERA-PRESENTATION.md
+records the script, actual camera API, timing, graphics policy, and limitations.
+The source implementation was committed as `7fb3d243` before full rendering.
+
+The new presentation, `scene_demo/atlas.bl`, visits six connected plates in one
+persistent illustrated world: Lisp pictures, semantic measurement, reusable
+instances, sampleable time, inspection, and shared preview/export meaning. All
+content exists throughout. Only the camera changes: quiet reading pushes, curved
+travel paths, logarithmic zoom widening, restrained roll, and settled endpoints.
+There are no fades, arrivals/departures, scale-from-zero, stroke reveals, animated
+masks, or cuts. `scene.camera` supplies validated finite tracks, independently
+sampled poses, and world-to-viewport matrices. Quintic timing gives zero endpoint
+velocity/acceleration; this is an authored path rather than a stateful simulation.
+
+BL shapes the typography once, authors the static vector world, samples all 1344
+camera matrices, and owns capture/publication. The graphics worker rasterizes a
+5600x2400 world at 2px/world-unit, samples it with native Cairo BEST filtering, and
+streams opaque packed BGRA to one FFmpeg encoder. Python does not author scenes,
+interpolate the camera, or create per-pixel Python/BEAM terms. This explicit
+static-atlas backend has finite zoom resolution; it does not promise arbitrary
+vector-raster equivalence. Actual sampled zoom is approximately 0.8336–1.08.
+
+The completed silent film is 56 seconds, 1344 decoded frames at 24/1 fps,
+1920x1080. Full build took 453.698s; systemd reported a 914.5M process-tree peak.
+The new focused tests pass: 14 camera + 9 atlas BL assertions, six native graphics
+tests, and six review-server tests. Checks cover continuous endpoint poses,
+logarithmic zoom, arbitrary seek, persistent world, text fit, all frame matrices,
+real packed sampling, frame/media validation, and native resource ownership.
+A selected frame 518 was independently rasterized and exactly matches the full
+export PNG without requiring frame zero. Media/source hashes were verified.
+
+Six full-size reading frames and decoded reading/travel samples were inspected.
+The repeated leaves were restyled so hatching remains visible across card colors.
+Actual browser playback, chapter navigation, and forward/backward seeking pass.
+Browser testing exposed that the initial simple HTTP server did not support byte
+ranges; the new range-aware review server fixes seeking and has real GET/HEAD,
+bounded/open/suffix/invalid-range tests. The owned browser was stopped and its
+profile removed. The atlas review service remains time-bounded for the user's
+Tailscale review; unrelated VMs/services were left alone.
+
+Retained evidence is in `evidence/atlas/`: the MP4, lossless reading frames,
+camera plan/report, provenance, checks, decoded motion contact sheet, browser
+screenshot, and review page with chapter navigation/transcript. Inspection was of
+full-size stills, decoded motion samples, and automated playback, not a claim of
+complete audiovisual viewing. Startup executable capture retains its documented
+qualification. The postcard studio is still separate; generic composition inputs,
+source hot replacement, richer effects/materials, and broader typography remain
+open work rather than claims implied by this presentation.

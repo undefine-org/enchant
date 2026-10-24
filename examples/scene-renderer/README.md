@@ -274,3 +274,17 @@ Use one publisher per output directory. Source-change publication guards retain
 the existing startup executable-capture qualification. No general GPU/compiler
 work is involved. `scene_camera.py` checks packed sampling/encoding and validation;
 `camera_test.bl` and `atlas_test.bl` cover clocks, geometry, text fit, and persistence.
+
+For the retained review page, use the range-aware developer server so browser
+chapter seeking works (plain `python -m http.server` does not serve byte ranges):
+
+```sh
+python3 examples/scene-renderer/review_server.py \
+  research/scene-renderer-and-bend/scene-renderer/evidence/atlas --port 4050
+# Open http://127.0.0.1:4050; Ctrl-C closes the owned server.
+```
+
+The optional `--bind` selects an explicit interface for an authorized review.
+This is a developer file viewer, with single-range GET/HEAD support; it is not
+a public hosting/authentication product. `scene_review_server.py` tests full,
+bounded, suffix, open-ended, HEAD, and invalid-range behavior.
