@@ -56,3 +56,13 @@ unknown result may decline an optimization, but must not satisfy a required law.
 All APIs and milestones in the design documents are proposals unless explicitly
 identified as present in source. No BL runtime, benchmark, or proof check was run
 for this documentation task. Existing retained results are historical evidence.
+
+## Independent follow-up research tracks
+
+- [Logic: proof expressiveness, trust, and required-law enforcement](bend-comparison/logic/RESEARCH.md).
+- [Compute: Mojo/MAX feasibility, ABI, lifecycle, licensing, and experiments](bend-comparison/compute/MOJO-MAX.md).
+
+These are independent investigations. The logic follow-up corrects the initial
+comparison: BL already supports inductive transition-system safety arguments.
+The gap is broader structural proofs and uniform checked-law enforcement, not
+the absence of induction altogether.
