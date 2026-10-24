@@ -443,14 +443,14 @@
    :artifact-membership :source-staged :execution-entry-inventory-complete
    :contextual-artifact-membership :phase-library :contextual-binding-resolution :proved
    :restored-from-cache :contextual-runtime-membership :phase-companion
-   :role :runtime :phase :profile :entry :snapshot :program-module :phase-module :phase-digest
+   :role :runtime :phase :profile :entry :snapshot :program-module :phase-module :phase-digest :runtime-image
    :input-selection :manifest :pipeline :sources :libraries :revision :file :digest :bytes
    :build-key :ns :hash :iface))
 
-(defn verify_unit
+(defn- capture_unit!
  "Read a bounded complete artifact directory, binding its manifest to actual
   module bytes. The result is ordinary Source data, never an SDK admission grant."
- [directory]
+ [directory expected-compiler-key]
  (when-not (erlang/is_binary directory) (artifact_refuse :invalid-artifact-directory))
  (let [root (physical_sdk_path directory)
        encoded (sdk_cache_read_bounded! (Path/join directory "artifact-unit.term") 1048576)
@@ -460,7 +460,8 @@
        manifest (BeamLisp.CompilerData/decode_closed_etf! encoded
                   {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
   (when-not (and (= 1 (:version manifest)) (erlang/is_binary (:namespace manifest))
-                 (= (:compiler-key manifest) (BeamLisp.AOTCache/compiler_key))
+                 (erlang/is_binary (:compiler-key manifest)) (= 64 (erlang/byte_size (:compiler-key manifest)))
+                 (or (nil? expected-compiler-key) (= (:compiler-key manifest) expected-compiler-key))
                  (erlang/is_list (:modules manifest))
                  (<= 1 (erlang/length (:modules manifest)) 256))
    (artifact_refuse :invalid-artifact-manifest))
@@ -496,6 +497,69 @@
                     (- remaining (erlang/byte_size bytes)))))))]
     {:version 1 :manifest manifest :beams (elem captured 0) :native-admission false}))))
 
+(defn verify_unit
+ "Verify complete artifact bytes against this Source compiler's producer key.
+  Ordinary captured data never grants SDK admission."
+ [directory] (capture_unit! directory (BeamLisp.AOTCache/compiler_key)))
+
+(defn capture_runtime_unit
+ "Capture bounded complete artifact bytes without equating producer identity
+  with receiver compatibility. The native Loader separately requires the exact
+  actual runtime target. This record is ordinary data, not SDK admission."
+ [directory] (capture_unit! directory nil))
+
+(defn- runtime_image_key_for [manifest]
+ ;; Producer identity is deliberately separate. This conservative target ABI
+ ;; pins the actual support image's bytes and native runtime triple. There is
+ ;; no equation involving the program BEAM that will carry this identity.
+ (crypto/hash :sha256 (erlang/term_to_binary
+  (tuple :exact_runtime_image_v1 (Map/get manifest "otp") (Map/get manifest "elixir")
+         (Map/get manifest "modules")) (list :deterministic))))
+
+(defn runtime_image_key
+ "Selected exact runtime target identity. This is ordinary compatibility data;
+  runtime_floor! separately verifies every selected byte before activation."
+ [] (runtime_image_key_for (BeamLisp.Bootstrap/manifest)))
+
+(defn runtime_floor!
+ "Capture the installed runtime floor without recomputing compiler Source
+  identities. This is byte identity, not SDK admission or an ABI equivalence
+  proof between different runtime images. Every member is checked before use."
+ []
+ (let [manifest (BeamLisp.Bootstrap/manifest) directory (BeamLisp.Bootstrap/seed_dir)
+       modules (Map/get manifest "modules") compiler-key (Map/get manifest "compiler_key")]
+  (when-not (and (erlang/== "beam-lisp-bootstrap-seed-v2" (Map/get manifest "schema"))
+                 (erlang/== (System/version) (Map/get manifest "elixir"))
+                 (erlang/== (erlang/list_to_binary (erlang/system_info :otp_release)) (Map/get manifest "otp"))
+                 (erlang/is_binary compiler-key) (erlang/== 64 (erlang/byte_size compiler-key))
+                 (erlang/is_map modules) (and (erlang/=< 1 (erlang/map_size modules)) (erlang/=< (erlang/map_size modules) 256))
+                 ;; Fixed entry roots of this bootstrap ABI, not a second
+                 ;; support-file inventory. The floor owns all member bytes.
+                 (Enum/all? '(:Elixir.BeamLisp :Elixir.BeamLisp.AOT :Elixir.BeamLisp.Env
+                              :Elixir.BeamLisp.Loader :Elixir.BeamLisp.CompilerData
+                              :Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core)
+                  (fn [module] (Map/has_key? modules
+                    (erlang/iolist_to_binary (list (Atom/to_string module) ".beam"))))))
+   (erlang/error :invalid-runtime-floor))
+  (let [captured (Enum/map_reduce (Enum/sort (Map/to_list modules)) 268435456
+                (fn [entry remaining]
+                 (let [name (elem entry 0) expected (elem entry 1)]
+                  (when-not (and (erlang/is_binary name) (erlang/== name (Path/basename name))
+                                 (String/ends_with? name ".beam") (erlang/=< (erlang/byte_size name) 512)
+                                 (not (String/contains? name "\\")))
+                   (erlang/error :invalid-runtime-floor-member))
+                  (let [path (Path/join directory name) bytes (sdk_cache_read_bounded! path (erlang/min remaining 33554432))
+                        parsed (beam_lib/md5 bytes)]
+                   (when-not (and (erlang/== expected (Base/encode16 (crypto/hash :sha256 bytes) (list (tuple :case :lower))))
+                                  (erlang/== :ok (elem parsed 0))
+                                  (erlang/== name (erlang/iolist_to_binary (list (Atom/to_string (elem (elem parsed 1) 0)) ".beam"))))
+                    (erlang/error :runtime-floor-bytes-changed))
+                   (passive_binary_functions! (elem (elem parsed 1) 0) bytes)
+                   (tuple (tuple (tuple (elem (elem parsed 1) 0) bytes) path)
+                          (erlang/- remaining (erlang/byte_size bytes)))))))]
+   {:compiler-key compiler-key :identity (runtime_image_key_for manifest)
+    :prepared (elem captured 0) :native-admission false})))
+
 (defn contextual_unit_members!
  "Validate roles and shared identities of captured contextual artifact data.
   Accept runtime-only packages or complete runtime/phase pairs. No code loads,
@@ -521,12 +585,14 @@
   (let [runtime (erlang/hd runtimes) phase (when (seq phases) (erlang/hd phases))
         identity (:metadata runtime)
         archive (when phase (normalized_attribute (:attributes phase) :bl_contextual_phase_library))]
-   (when-not (and (= 1 (:version identity)) (= 'syntax-v1 (:profile identity))
+   (when-not (and (= 2 (:version identity)) (= 'syntax-v1 (:profile identity))
+                  (erlang/is_binary (:runtime-image identity)) (= 32 (erlang/byte_size (:runtime-image identity)))
+                  (= (:runtime-image identity) (get-in identity [:input-selection :runtime-image]))
                   (= (:compiler-key identity) (get-in verified [:manifest :compiler-key]))
                   (= (:program-module identity) (Atom/to_string (elem (:beam runtime) 0)))
                   (Enum/all? rows (fn [row]
                     (and (= (dissoc identity :role) (dissoc (:metadata row) :role))
-                         (= 1 (normalized_attribute (:attributes row) :bl_contextual_unit_version))
+                         (= 2 (normalized_attribute (:attributes row) :bl_contextual_unit_version))
                          (= (:compiler-key identity) (normalized_attribute (:attributes row) :bl_compiler_key)))))
                   (or (nil? phase)
                       (and (= (:phase-module identity) (Atom/to_string (elem (:beam phase) 0)))
