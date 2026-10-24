@@ -57,7 +57,9 @@
  ;; The lifetime attests loaded forwarders. Exercise this actual forwarder
  ;; before inspecting its receipt; requiring a namespace may initialize only
  ;; its callable body, without loading the dispatch module.
- (erlang/apply (BeamLisp.Emit/module_for "proc.attempt") :current (list :framework.test/attempt))
+ (BeamLisp.Env/with_env :global
+  #(do (BeamLisp.Loader/ensure_loaded "proc.attempt")
+       (erlang/apply (BeamLisp.Emit/module_for "proc.attempt") :current (list :framework.test/attempt))))
  (BeamLisp.Env/ensure_sdk_runtime!)
  (let [app "framework-membership" old (graph app 1) fresh (atom nil)
        initializer (start-initializer! old) primary (atom nil) secondary (atom nil)
@@ -315,10 +317,32 @@
      (is (= :lazy-call (BeamLisp.Ns.Rt/invoke callback (list :lazy-check (fn [] :lazy-call)))))))
    (finally (stop dispatcher) (Process/exit initializer :kill) (generation/retire! g)))))
 
+(defn- sdk-object! [namespace]
+ ;; OTP cannot return object bytes for a module loaded from a staging path
+ ;; that has since been removed. Read its real complete keyed cache entry,
+ ;; checking both inventory membership and the currently loaded module MD5.
+ (BeamLisp.Env/with_env :global
+  (fn []
+   (BeamLisp.Loader/ensure_loaded namespace)
+   (let [module (BeamLisp.Emit/module_for namespace)
+         object (code/get_object_code module)]
+    (if (tuple? object) object
+     (let [key (BeamLisp.AOTCache/key_for_ns namespace)
+           closure (BeamLisp.AOT/ns_closure_hash namespace)
+           directory (BeamLisp.AOTCache/entry_dir key closure)
+           modules (BeamLisp.AOTCache/valid_keyed_entry directory key closure)
+           path (Path/join directory (str (Atom/to_string module) ".beam"))]
+      (when-not (some #(= module %) modules)
+       (throw (ex-info "SDK test requires its actual complete cached unit" {:namespace namespace})))
+      (let [bytes (File/read! path) digest (elem (elem (beam_lib/md5 bytes) 1) 1)]
+       (when-not (= digest (erlang/apply module :module_info (list :md5)))
+        (throw (ex-info "SDK cached object differs from loaded module" {:namespace namespace})))
+       (tuple module bytes path))))))))
+
 (deftest fixed-sdk-forwarder-can-gain-unrelated-exports-without-borrowing-application-code
  (let [app "framework-forwarder" g (graph app 1) initializer (start-initializer! g)
        dispatcher (atom nil) mod (BeamLisp.Emit/module_for "proc.attempt")
-       original (code/get_object_code mod)]
+       original (sdk-object! "proc.attempt")]
   (try
    (reset! dispatcher (start-dispatch! g :framework.test/table-a))
    (is (= 3 (erlang/tuple_size original)))
