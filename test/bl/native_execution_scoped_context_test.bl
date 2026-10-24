@@ -1,0 +1,92 @@
+(ns native-execution-scoped-context-test (:require [reload.generation :as g]))
+
+(defn- payload [token]
+ (BeamLisp.Env/source_private
+  #(elem (first (ets/lookup :beam_lisp_source_lease_domains
+                 (tuple (elem token 1) :native_context (elem token 2)))) 1)))
+(defn- expired? [id]
+ (try (BeamLisp.Env/execution_context_value! id) false
+  (catch error (= :retired_execution_context (:original error)))))
+
+(deftest scoped-native-context-shares-callback-storage-and-releases-it-with-scope
+ (let [graph (g/prepare! {:application-id "scoped-native-context"
+                         :sources {"scope.context" "(ns scope.context) (defn value [] 42)"}})
+       selected (g/with! graph
+                  #(let [token (BeamLisp.Env/capture_native_context!)
+                         registration (BeamLisp.Execution/register! (fn [] 42))]
+                     [token registration]))
+       token (first selected) registration (second selected)
+       stored (payload token) id (:context-id stored)
+       state (BeamLisp.Env/execution_registration_state registration)]
+  (try
+   (is (some? id))
+   (is (= id (:context-id (BeamLisp.Env/code_callback_payload (:lease state)))))
+   (is (not (contains? stored :generation)))
+   (is (not (contains? stored :env)))
+   (is (= token (g/with! graph #(BeamLisp.Env/capture_native_context!))))
+   (let [resolved (BeamLisp.Env/resolve_native_context! token)
+         marker (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))
+         caller (BeamLisp.Env/capture)]
+    (is (= graph (:generation resolved)))
+    (is (erts_debug/same (:generation resolved) (BeamLisp.Env/execution_graph_generation! marker)))
+    (try
+     (BeamLisp.Env/bind resolved)
+     (is (not (BeamLisp.Env/executing_generation? graph)))
+     (finally (BeamLisp.Env/bind caller))))
+   (BeamLisp.Execution/close! registration)
+   (when id (is (= graph (:generation (BeamLisp.Env/execution_context_value! id)))))
+   (is (= :retired (:status (g/retire! graph))))
+   (is (= :retired_native_context
+          (try (BeamLisp.Env/resolve_native_context! token) :unexpected (catch error (:original error)))))
+   (when id (is (expired? id)))
+   (finally (BeamLisp.Execution/close! registration) (g/retire! graph)))))
+
+(deftest scoped-overlay-identities-stay-distinct-and-restore-the-caller
+ (let [graph (g/prepare! {:application-id "scoped-native-overlays"
+                         :sources {"scope.overlay" "(ns scope.overlay) (defn value [] 42)"}})
+       caller (BeamLisp.Env/capture)]
+  (try
+   (let [[a b] (g/with! graph
+                 #(let [a (BeamLisp.Env/with_ns "scoped.left" (fn [] (BeamLisp.Env/capture_native_context!)))
+                        b (BeamLisp.Env/with_ns "scoped.right" (fn [] (BeamLisp.Env/capture_native_context!)))]
+                    [a b]))]
+    (is (not= a b))
+    (is (not= (:context-id (payload a)) (:context-id (payload b))))
+    (is (= "scoped.left" (:ns (BeamLisp.Env/resolve_native_context! a))))
+    (is (= "scoped.right" (:ns (BeamLisp.Env/resolve_native_context! b))))
+    (is (= caller (BeamLisp.Env/capture))))
+   (finally (g/retire! graph)))))
+
+(deftest oversize-scoped-capture-preserves-native-refusal-and-publishes-nothing
+ (let [graph (g/prepare! {:application-id "scoped-native-capacity"
+                         :sources {"scope.capacity" "(ns scope.capacity) (defn value [] 42)"}})]
+  (try
+   (g/with! graph
+    (fn []
+     (let [before (Process/get :bl-cli-project)
+           rows (ets/info :beam_lisp_source_lease_domains :size)
+           leases (ets/info :beam_lisp_code_leases :size)]
+      (try
+       (Process/put :bl-cli-project (String/duplicate "x" 8388608))
+       (is (= :native_context_capacity
+              (try (BeamLisp.Env/capture_native_context!) :unexpected
+               (catch error (:original error)))))
+       (finally (if (nil? before) (Process/delete :bl-cli-project) (Process/put :bl-cli-project before))))
+      (is (= rows (ets/info :beam_lisp_source_lease_domains :size)))
+      (is (= leases (ets/info :beam_lisp_code_leases :size))))))
+   (finally (g/retire! graph)))))
+
+(deftest sdk-code-version-evidence-is-independent-of-the-selected-application
+ (let [options {:application-id "scoped-sdk-version-worlds"
+                :sources {"scope.sdk.versions" "(ns scope.sdk.versions) (defn value [] 42)"}}
+       left (g/prepare! (assoc options :resources {:revision 1}))
+       right (g/prepare! (assoc options :resources {:revision 2}))
+       observe (fn [] {:sdk (BeamLisp.Env/sdk_namespace_generations (list "core"))
+                       :selected (BeamLisp.Env/namespace_generations (list "core"))})]
+  (try
+   (let [global (BeamLisp.Env/sdk_namespace_generations (list "core"))
+         a (g/with! left observe) b (g/with! right observe)]
+    (is (= global (:sdk a)))
+    (is (= (:sdk a) (:sdk b)))
+    (is (not= (:selected a) (:selected b))))
+   (finally (g/retire! right) (g/retire! left)))))

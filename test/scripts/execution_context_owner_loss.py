@@ -42,15 +42,16 @@ value = BeamLisp.eval("""
       pending (generation/with! graph
                 #(BeamLisp.Env/begin_server_start!
                    (generation/invoke! graph "context.owner.loss/pending-class" [])))
-      pending-row (BeamLisp.Env/server_start_row (elem pending 2))]
+      pending-row (BeamLisp.Env/server_start_row (elem pending 2))
+      scoped (generation/with! graph #(BeamLisp.Env/capture_native_context!))]
  (assert (some? (:context-id pending-row)))
  (assert (not (contains? pending-row :generation)))
  (assert (not (contains? pending-row :context)))
  [registration (:context-id (BeamLisp.Env/code_callback_payload (:lease state)))
   (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))
-  pending (:context-id pending-row)])
+  pending (:context-id pending-row) scoped])
 """)
-[registration, context, marker, pending, pending_context] = BeamLisp.Vector.to_list(value)
+[registration, context, marker, pending, pending_context, scoped] = BeamLisp.Vector.to_list(value)
 %{status: :completed, value: 42} = BeamLisp.Execution.invoke!(registration, [])
 guard = BeamLisp.Execution.register!(fn ->
 %{:"graph-id" => nil, status: :active} = BeamLisp.Execution.observe()
@@ -80,6 +81,11 @@ try do
   raise "old context ID survived native owner replacement"
 rescue error in ErlangError -> :retired_execution_context = error.original
 end
+try do
+  BeamLisp.Env.resolve_native_context!(scoped)
+  raise "old scoped SDK context survived native owner replacement"
+rescue error in ErlangError -> :retired_native_context = error.original
+end
 nil = BeamLisp.Env.server_start_observation(elem(pending, 2))
 try do
   BeamLisp.Env.execution_context_value!(pending_context)
@@ -95,7 +101,7 @@ end
 :stale_frame_refused
 end)
 %{status: :completed, value: :stale_frame_refused} = BeamLisp.Execution.invoke!(guard, [])
-IO.puts("PASS: actual Env restart erased orphan graph storage, refused old callback/pending-start context IDs, erased pending custody, and blocked stale unmanaged frame authority")
+IO.puts("PASS: actual Env restart erased orphan graph storage, refused old callback/pending/scoped context IDs, erased pending custody, and blocked stale unmanaged frame authority")
 '''
 
 

@@ -5,6 +5,15 @@
 
 (def ^:private closures (atom {}))
 
+(defn- source-inputs-current? [inputs]
+ (try
+  (every? (fn [[namespace expected]]
+            (let [source (BeamLisp.Loader/source_path namespace)]
+             (and (= source (:path expected))
+                  (BeamLisp.AOT/sdk_library_source? namespace source)
+                  (= (:sha expected) (crypto/hash :sha256 (BeamLisp.Loader/read_source source)))))) inputs)
+  (catch _ false)))
+
 (defn reference [node]
  (cond
   (= :global (:op node)) [:binding (:ns node) (:name node)]
@@ -36,6 +45,7 @@
  (BeamLisp.Env/assert_native_framework_execution!)
  (let [frame (tuple :sdk-readiness (erlang/make_ref))
        inventory (BeamLisp.AOT/sdk_inventory_input)
+       preparation-revision (BeamLisp.Env/definition_revision :global)
        image-key (when (elem inventory 1) (crypto/hash :sha256 (elem inventory 1)))]
   ;; Invocation-local compiler data must not live in native memo cells: every
   ;; read/write there copies and scans the growing descriptor graph. This frame
@@ -75,7 +85,8 @@
                                      (BeamLisp.AOT/sdk_library_source? namespace source))
                            (BeamLisp.Env/load_sdk_library! namespace)
                            (write! :initialized (conj (read :initialized) namespace)))
-                          (let [definitions (BeamLisp.Env/ns_defs namespace)
+                          (let [content (BeamLisp.Loader/read_source source)
+                                definitions (BeamLisp.Env/ns_defs namespace)
                                 shim (BeamLisp.Emit/module_for namespace)
                                 routes (Enum/reduce definitions {}
                                  (fn [pair out]
@@ -89,8 +100,8 @@
                                         (assoc out [module (elem entry 2) (count (:params clause))] (elem pair 0))
                                         out))))))))]
                            {:definitions (Map/new definitions) :routes routes
-                            :requires (second (BeamLisp.SourceGraph/header
-                                               (BeamLisp.Loader/read_source source)))}))]
+                            :source-input {:path source :sha (crypto/hash :sha256 content)}
+                            :requires (second (BeamLisp.SourceGraph/header content))}))]
               (write! :namespaces (maps/put namespace info (read :namespaces))) info)))
           (module-namespace [module]
             (if (contains? (read :modules) module) (get (read :modules) module)
@@ -120,10 +131,13 @@
          ;; binding. A loader readiness guard adds no dependency beside it.
          roots (vec (sort (set (remove
                   #(and (= :namespace (first %)) (contains? bound-namespaces (second %))) canonical))))
-         key (when image-key [(elem inventory 0) (BeamLisp.AOTCache/compiler_key) image-key roots])
-         cached (when key (get @closures key))]
+         key [(elem inventory 0) (BeamLisp.AOTCache/compiler_key) (or image-key :source-checkout) roots]
+         cached (get @closures key)]
     (if (and cached
-             (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) cached))
+             (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) (:namespaces cached))
+             (or image-key
+                 (and (= (:generations cached) (BeamLisp.Env/sdk_namespace_generations (to-list (:namespaces cached))))
+                      (source-inputs-current? (:sources cached)))))
      true
      (do
       (write! :pending roots)
@@ -158,8 +172,17 @@
       ;; This memo is dependency DATA, never invocation/lifetime authority.
       ;; SDK source/byte validation still runs before every preparation, and
       ;; each miss initializes through the ordinary verified SDK loader.
-      (when key
-       (let [value (vec (sort (read :initialized)))]
+      (let [namespaces (vec (sort (read :initialized)))
+            sources (when-not image-key
+                      (Map/new (Enum/map namespaces
+                        (fn [namespace]
+                         (tuple namespace (:source-input (get (read :namespaces) namespace)))))))
+            value {:namespaces namespaces :sources sources
+                   :generations (when-not image-key (BeamLisp.Env/sdk_namespace_generations (to-list namespaces)))}]
+       ;; Namespace publication during traversal cannot certify the data read
+       ;; earlier in that traversal. A later stable preparation can memoize it.
+       (when (and preparation-revision
+                  (= preparation-revision (BeamLisp.Env/definition_revision :global)))
         (swap! closures
          (fn [entries] (assoc (if (>= (count entries) 128) {} entries) key value)))))
       true))))
