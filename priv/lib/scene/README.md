@@ -64,8 +64,22 @@ a style/role. It does not yet provide arbitrary source-form dependency traces.
 `scene.motion/enter` attaches finite cue-relative rise/fade parameters to an
 authored node. `sample` applies them to an evaluated tree at any time; it never
 mutates the base tree or replays previous frames. `tween` has finite validation,
-clamped endpoints, and explicit zero-duration behavior. The broad sequence,
-parallel, repeat, event-track, and simulation API is not implemented yet.
+clamped endpoints, and explicit zero-duration behavior.
+
+`scene.clip` adds temporal composition independently of layout. `clip` takes
+`{:id "local-name" :duration seconds :cues {"name" seconds}}` and data content.
+`sequence` derives duration by summing children; `parallel` takes the maximum
+unless an explicit longer duration reserves a trailing gap. `delay` adds `:by`
+seconds; `retime` gives a positive-duration child a new positive `:duration`.
+All combinators take options first and an ordered child vector (or one child).
+Sibling IDs are unique local string names without slashes. `schedule` returns
+serializable leaf intervals, scoped cues, and local-clock rates; `sample` returns
+active leaves with local time. Activity is half-open, zero-duration leaves are
+inactive, and outside the schedule sampling returns no active content. Sampling
+does not invoke content functions or perform side effects. Empty tail intervals
+do not implicitly hold a picture: author an explicit content clip for a hold.
+Property blending, generalized signals, repeat, event tracks, and simulation
+remain open. The growth study demonstrates scheduling and retiming.
 
 ## Verification and resource ownership
 

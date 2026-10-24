@@ -108,3 +108,12 @@ assuming an API is only proposed or fully delivered. Existing code uses canonica
 Pango shaping plus Cairo vector outlines, and a BL-owned task coordinates the
 studio. Source hot replacement and full source-form explanations remain open.
 Keep making concrete, visually checked progress and commit completed slices.
+
+## Two-track continuation
+
+The user approved separating studio workflow from visual/clip-language development.
+Read TRACKS.md. Visual capabilities should progress through standalone authored
+films, then the studio adopts their inputs/inspection. The next approved study is
+a twelve-second illustrated transformation with clip clocks, path drawing,
+geometric reveals, camera movement, and procedural botanical composition. Continue
+autonomously and commit completed slices; do not spawn sub-agents.

@@ -8,6 +8,7 @@ The renderer remains independent of the Bend comparison and compiler programme.
 
 | Read | Purpose |
 |---|---|
+| [Two implementation tracks](TRACKS.md) | Approved split: studio workflow and the advancing visual/clip language |
 | [API research](API-RESEARCH.md) | Detailed inspirations, design practices, bolder connections, and decisions to preserve |
 | [Proposed API contract](API-CONTRACT.md) | Value model, module boundaries, identity, layout, time, rendering, and extension rules |
 | [API examples](API-EXAMPLES.bl.md) | Original conversational example plus proposed authoring, inspection, and experiment code |
