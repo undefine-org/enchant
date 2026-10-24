@@ -213,32 +213,12 @@
                         :contextual-binding-resolution :proved :execution-entry-inventory-complete false}}]
   (check-inputs! prepared) unit))
 
-(defn- unit-metadata [beam]
- (let [parsed (beam_lib/chunks (elem beam 1) (list :attributes))
-       attrs (Keyword/get (elem (elem parsed 1) 1) :attributes)
-       encoded (BeamLisp.AOT/normalized_attribute attrs :bl_contextual_unit)
-       metadata (BeamLisp.CompilerData/decode_closed_etf! encoded
-                 {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
-  {:beam beam :attributes attrs :metadata metadata}))
-
 (defn- decode-unit [verified]
- (when-not (= 2 (count (:beams verified))) (refuse! :world-artifact-membership nil))
- (let [rows (mapv unit-metadata (:beams verified))
-       runtime (first (filter #(= :runtime (get-in % [:metadata :role])) rows))
-       phase (first (filter #(= :phase (get-in % [:metadata :role])) rows))
-       metadata (:metadata runtime) phase-metadata (:metadata phase)
-       archive (when phase (BeamLisp.AOT/normalized_attribute (:attributes phase) :bl_contextual_phase_library))]
-  (when-not (and (= 2 (count rows)) runtime phase (= 1 (:version metadata))
-                 (= 'syntax-v1 (:profile metadata))
-                 (= (:compiler-key metadata) (get-in verified [:manifest :compiler-key]))
-                 (= (dissoc metadata :role) (dissoc phase-metadata :role))
-                 (= (:program-module metadata) (Atom/to_string (elem (:beam runtime) 0)))
-                 (= (:phase-module metadata) (Atom/to_string (elem (:beam phase) 0)))
-                 (erlang/is_binary archive) (= (:phase-digest metadata) (crypto/hash :sha256 archive)))
-   (refuse! :world-artifact-membership nil))
+ (let [members (BeamLisp.AOT/contextual_unit_members! verified)]
+  (when-not (:phase members) (refuse! :world-artifact-membership nil))
   {:version 1 :kind :contextual-artifact-unit :manifest (:manifest verified)
-   :metadata metadata :phase-library (expand/decode-phase-library archive)
-   :runtime-beams (list (:beam runtime)) :beams (:beams verified) :native-admission false}))
+   :metadata (:metadata members) :phase-library (expand/decode-phase-library (:phase-library-bytes members))
+   :runtime-beams (list (get-in members [:runtime :beam])) :beams (:beams verified) :native-admission false}))
 
 (defn read-unit
  "Verify complete AOT artifact membership and decode phase data without loading
@@ -375,3 +355,42 @@
   (when-not (:ok? acquired) (refuse! :build-workspace-held (:held acquired)))
   (try (build-unclaimed path out force?)
    (finally (when-not ours (claim/release! out))))))
+
+
+(defn run-unit
+ "Run a complete paired or runtime-only contextual unit through the ordinary
+  native Loader. No Source capture, expansion or phase initialization occurs."
+ [directory argv]
+ (BeamLisp.Loader/run_artifact_unit (Path/expand directory (BeamLisp/cwd))
+                                  (BeamLisp.CompilerData/eager_to_list argv)))
+
+(defn package-runtime!
+ "Publish an absent runtime-only artifact directory using the existing AOT
+  unit manifest, emitter/verifier and workspace claim. Phase data stays out."
+ [directory output]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [verified (read-unit directory) output (Path/expand output (BeamLisp/cwd))]
+  (when (File/exists? output) (refuse! :world-runtime-output-exists output))
+  (let [acquired (claim/acquire! output "contextual runtime package")]
+   (when-not (:ok? acquired) (refuse! :build-workspace-held (:held acquired)))
+   (try
+    (when-not (= (list ".claim") (File/ls! output))
+     (refuse! :world-runtime-output-exists output))
+    (let [staged (Path/join output (str ".runtime-stage-" (temporary-suffix)))
+          unit {:version 1 :kind :prepared-artifact-unit
+                :namespace (get-in verified [:manifest :namespace])
+                :compiler-key (get-in verified [:manifest :compiler-key]) :inputs {}
+                :plans (list {:generated-beams (:runtime-beams verified) :descriptors (list)})
+                :coverage {:scope :contextual-runtime-membership :phase-companion false
+                           :execution-entry-inventory-complete false}}]
+     (File/mkdir! staged)
+     (try
+      (BeamLisp.AOT/emit_unit unit staged)
+      (let [captured (BeamLisp.AOT/verify_unit staged)]
+       (doseq [beam (:beams captured)]
+        (atomic-bytes! (Path/join output (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
+       (atomic-bytes! (Path/join output "artifact-unit.term") (File/read! (Path/join staged "artifact-unit.term")))
+       {:version 1 :kind :contextual-runtime-package :output output :modules (mapv first (:beams captured))
+        :phase-companion false :native-admission false})
+      (finally (File/rm_rf! staged))))
+    (finally (claim/release! output))))))

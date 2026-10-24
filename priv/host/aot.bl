@@ -436,6 +436,17 @@
    (File/write! (Path/join output "artifact-unit.term") (erlang/term_to_binary manifest))
    manifest)))
 
+(defn- artifact_wire_vocabulary []
+ ;; Cold readers own their fixed wire vocabulary. Producer-only namespaces
+ ;; must not have to load (or run) merely to make :safe ETF decoding succeed.
+ '(:version :namespace :compiler-key :inputs :modules :module :sha256 :coverage :scope
+   :artifact-membership :source-staged :execution-entry-inventory-complete
+   :contextual-artifact-membership :phase-library :contextual-binding-resolution :proved
+   :restored-from-cache :contextual-runtime-membership :phase-companion
+   :role :runtime :phase :profile :entry :snapshot :program-module :phase-module :phase-digest
+   :input-selection :manifest :pipeline :sources :libraries :revision :file :digest :bytes
+   :build-key :ns :hash :iface))
+
 (defn verify_unit
  "Read a bounded complete artifact directory, binding its manifest to actual
   module bytes. The result is ordinary Source data, never an SDK admission grant."
@@ -445,7 +456,9 @@
        encoded (sdk_cache_read_bounded! (Path/join directory "artifact-unit.term") 1048576)
        _ (when (and (>= (erlang/byte_size encoded) 2) (= 80 (binary/at encoded 1)))
            (artifact_refuse :compressed-artifact-manifest))
-       manifest (erlang/binary_to_term encoded (list :safe))]
+       _ (artifact_wire_vocabulary)
+       manifest (BeamLisp.CompilerData/decode_closed_etf! encoded
+                  {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
   (when-not (and (= 1 (:version manifest)) (erlang/is_binary (:namespace manifest))
                  (= (:compiler-key manifest) (BeamLisp.AOTCache/compiler_key))
                  (erlang/is_list (:modules manifest))
@@ -482,6 +495,44 @@
              (tuple (tuple (elem (elem chunks 1) 0) bytes)
                     (- remaining (erlang/byte_size bytes)))))))]
     {:version 1 :manifest manifest :beams (elem captured 0) :native-admission false}))))
+
+(defn contextual_unit_members!
+ "Validate roles and shared identities of captured contextual artifact data.
+  Accept runtime-only packages or complete runtime/phase pairs. No code loads,
+  Source parsing, SDK origin or execution admission comes from this record."
+ [verified]
+ (artifact_wire_vocabulary)
+ (let [beams (Map/get verified :beams)
+       _ (when-not (and (erlang/is_list beams) (<= 1 (erlang/length beams) 2))
+           (artifact_refuse :world-artifact-membership))
+       rows (Enum/map beams
+              (fn [beam]
+               (let [parsed (beam_lib/chunks (elem beam 1) (list :attributes :exports))
+                     chunks (elem (elem parsed 1) 1) attrs (Keyword/get chunks :attributes)
+                     metadata (BeamLisp.CompilerData/decode_closed_etf!
+                                (normalized_attribute attrs :bl_contextual_unit)
+                                {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
+                {:beam beam :attributes attrs :exports (Keyword/get chunks :exports) :metadata metadata})))
+       runtimes (Enum/filter rows (fn [row] (= :runtime (get-in row [:metadata :role]))))
+       phases (Enum/filter rows (fn [row] (= :phase (get-in row [:metadata :role]))))]
+  (when-not (and (= 1 (count runtimes)) (<= (count phases) 1)
+                 (= (count rows) (+ (count runtimes) (count phases))))
+   (artifact_refuse :world-artifact-membership))
+  (let [runtime (erlang/hd runtimes) phase (when (seq phases) (erlang/hd phases))
+        identity (:metadata runtime)
+        archive (when phase (normalized_attribute (:attributes phase) :bl_contextual_phase_library))]
+   (when-not (and (= 1 (:version identity)) (= 'syntax-v1 (:profile identity))
+                  (= (:compiler-key identity) (get-in verified [:manifest :compiler-key]))
+                  (= (:program-module identity) (Atom/to_string (elem (:beam runtime) 0)))
+                  (Enum/all? rows (fn [row]
+                    (and (= (dissoc identity :role) (dissoc (:metadata row) :role))
+                         (= 1 (normalized_attribute (:attributes row) :bl_contextual_unit_version))
+                         (= (:compiler-key identity) (normalized_attribute (:attributes row) :bl_compiler_key)))))
+                  (or (nil? phase)
+                      (and (= (:phase-module identity) (Atom/to_string (elem (:beam phase) 0)))
+                           (erlang/is_binary archive) (= (:phase-digest identity) (crypto/hash :sha256 archive)))))
+    (artifact_refuse :world-artifact-membership))
+   {:runtime runtime :phase phase :phase-library-bytes archive :metadata identity :native-admission false})))
 
 (defn- compile_source_unit [source opts]
   ;; Even an already initialized namespace cannot evaluate source while an
@@ -5622,11 +5673,14 @@
     parsed))
 
 ; Compile-only cache admission. No ordinary cached loader or initializer API.
-(defn- sdk_stage_literal_definitions! [mod bytes]
+(defn passive_binary_functions!
+ "Inspect executable instructions before publication. Attributes alone do not
+  reveal on_load, which OTP lowers into code. This operation loads nothing."
+ [mod bytes]
   (let [disassembly (beam_disasm/file bytes)
         _ (when-not (and (erlang/is_tuple disassembly) (erlang/== 6 (erlang/tuple_size disassembly))
                          (erlang/== :beam_file (elem disassembly 0)) (erlang/== mod (elem disassembly 1)))
-            (erlang/error :invalid_sdk_stage_cached_disassembly))
+            (erlang/error :invalid_compiled_binary_disassembly))
         functions (elem disassembly 5)]
     ;; Native code loading itself can execute on_load. Defer/init names are not
     ;; sufficient: OTP removes the on_load attribute and emits an instruction.
@@ -5636,7 +5690,11 @@
                 (or (erlang/== :on_load instruction)
                     (and (erlang/is_tuple instruction) (erlang/> (erlang/tuple_size instruction) 0)
                          (erlang/== :on_load (elem instruction 0))))))))
-      (erlang/error :sdk_stage_cached_on_load_refused))
+      (erlang/error :compiled_binary_on_load_refused))
+    functions))
+
+(defn- sdk_stage_literal_definitions! [mod bytes]
+  (let [functions (passive_binary_functions! mod bytes)]
     (let [definition (Enum/find functions
                        (fn [function] (and (erlang/== :__bl_ns_defs__ (elem function 1))
                                            (erlang/== 0 (elem function 2)))))]

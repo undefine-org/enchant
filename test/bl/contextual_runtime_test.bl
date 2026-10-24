@@ -1,0 +1,151 @@
+(ns contextual-runtime-test
+ (:require [compile.world :as world] [bl.cli :as cli] [proc.task :as task]))
+
+(defn- fixture [action]
+ (let [root (Path/join (System/tmp_dir!) (str "contextual-runtime-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! root)
+  (try (action root) (finally (File/rm_rf! root)))))
+
+(defn- emit [root name module expression]
+ (let [directory (Path/join root name) main (Path/join root (str name ".bl"))
+       manifest (Path/join root (str name ".world.bl"))]
+  (File/write! main (str "(ns main) " expression))
+  (File/write! manifest
+   (str "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'main :revision 'current :file "
+        (pr-str (Path/basename main)) "}] :libraries []}"))
+  (BeamLisp.AOT/emit_unit (world/prepare-unit (world/prepare manifest) module) directory)
+  directory))
+
+(defn- original [root]
+ (let [directory (Path/join root "original")]
+  (BeamLisp.AOT/emit_unit
+   (world/prepare-unit (world/prepare "test/fixtures/contextual-validation/world.bl") :Elixir.ContextualRuntimeOriginal)
+   directory) directory))
+
+(deftest packaged-runtime-loads-through-the-ordinary-file-api-without-phase-data
+ (fixture
+  (fn [root]
+   (let [unit (original root) package (Path/join root "package")
+         published (world/package-runtime! unit package)]
+    (is (= false (:phase-companion published)))
+    (is (= 2 (count (File/ls! package))))
+    (File/rm_rf! unit)
+    (is (= [42 99 42] (BeamLisp/run_file package)))
+    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal.PhaseLibrary)))
+    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal)))))))
+
+(deftest compiled-entry-preserves-argv-and-reclaims-closure-free-code
+ (fixture
+  (fn [root]
+   (let [unit (emit root "argv" :Elixir.ContextualRuntimeArgv "(erlang/get :bl_argv)")
+         previous (BeamLisp/argv)]
+    (is (= (list "first" "second") (world/run-unit unit ["first" "second"])))
+    (is (= previous (BeamLisp/argv)))
+    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeArgv)))
+    (is (= (list "again") (world/run-unit unit ["again"])))))))
+
+(deftest returned-closures-keep-their-code-and-conflicting-bytes-refuse-before-replacement
+ (fixture
+  (fn [root]
+   (let [unit (emit root "closure" :Elixir.ContextualRuntimeClosure "(fn [x] (erlang/+ x 40))")
+         other (emit root "other" :Elixir.ContextualRuntimeClosure "(fn [x] (erlang/+ x 50))")
+         closure (world/run-unit unit [])]
+    (try
+     (is (= 42 (closure 2)))
+     (is (erlang/module_loaded :Elixir.ContextualRuntimeClosure))
+     (is (= :compiled_module_identity_conflict
+            (try (world/run-unit other []) :unexpected
+             (catch error (elem (:original error) 0)))))
+     (is (= 42 (closure 2)))
+     (finally (BeamLisp.Env/retire_module! :Elixir.ContextualRuntimeClosure)))))))
+
+(deftest actual-running-entry-retains-code-and-identical-concurrent-entry-is-safe
+ (fixture
+  (fn [root]
+   (let [unit (emit root "held" :Elixir.ContextualRuntimeHeld
+               "(let [owner (erlang/hd (erlang/get :bl_argv))] (erlang/send owner [:runtime-held (erlang/self)]) (receive :finish 42))")
+         owner (erlang/self) first-worker (task/async-nolink #(world/run-unit unit [owner]))
+         first-child (receive [:runtime-held pid] pid (after 10000 (throw :runtime-entry-timeout)))
+         second-worker (task/async-nolink #(world/run-unit unit [owner]))
+         second-child (receive [:runtime-held pid] pid (after 10000 (throw :runtime-entry-timeout)))]
+    (try
+     (is (= false (BeamLisp.Env/retire_module! :Elixir.ContextualRuntimeHeld)))
+     (is (not= first-child second-child))
+     (erlang/send first-child :finish)
+     (is (= 42 (task/await first-worker 10000)))
+     (is (erlang/module_loaded :Elixir.ContextualRuntimeHeld))
+     (erlang/send second-child :finish)
+     (is (= 42 (task/await second-worker 10000)))
+     (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeHeld)))
+     (finally
+      (when (Process/alive? first-child) (erlang/send first-child :finish))
+      (when (Process/alive? second-child) (erlang/send second-child :finish))))))))
+
+(deftest runtime-tampering-and-extra-members-refuse-before-entry-effects
+ (fixture
+  (fn [root]
+   (let [unit (emit root "effect" :Elixir.ContextualRuntimeEffect "(erlang/put :runtime-entry-effect :ran)")
+         package (Path/join root "package")]
+    (world/package-runtime! unit package)
+    (erlang/erase :runtime-entry-effect)
+    (try
+     (File/write! (Path/join package "extra.bl") "preserve")
+     (is (= :artifact-membership-changed
+            (try (world/run-unit package []) :unexpected (catch error (:kind (ex-data error))))))
+     (is (= :undefined (erlang/get :runtime-entry-effect)))
+     (is (= "preserve" (File/read! (Path/join package "extra.bl"))))
+     (File/rm! (Path/join package "extra.bl"))
+     (File/write! (Path/join package "Elixir.ContextualRuntimeEffect.beam") "damaged")
+     (is (= :artifact-bytes-changed
+            (try (world/run-unit package []) :unexpected (catch error (:kind (ex-data error))))))
+     (is (= :undefined (erlang/get :runtime-entry-effect)))
+     (finally (erlang/erase :runtime-entry-effect)))))))
+
+(deftest ordinary-cli-can-pack-and-run-compiled-units
+ (fixture
+  (fn [root]
+   (let [unit (original root) package (Path/join root "package")]
+    (is (= 0 (cli/run-argv ["world" "pack" unit "--out" package])))
+    (is (= 0 (cli/run-argv ["run" package])))
+    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal.PhaseLibrary)))))))
+
+(deftest real-on-load-instructions-refuse-before-publication-or-initializer-effects
+ (fixture
+  (fn [root]
+   (let [module :Elixir.ContextualRuntimeOnLoad unit (emit root "passive" module "42")
+         verified (BeamLisp.AOT/verify_unit unit)
+         runtime (first (filter #(= module (first %)) (:beams verified)))
+         parsed (beam_lib/chunks (second runtime) (list :attributes))
+         attrs (Keyword/get (elem (elem parsed 1) 1) :attributes)
+         carried (map (fn [key] (tuple :attribute 1 key (BeamLisp.AOT/normalized_attribute attrs key)))
+                    [:bl_contextual_unit :bl_contextual_unit_version :bl_compiler_key :bl_source_hash])
+         forms (to-list
+                 (concat (list (tuple :attribute 1 :module module)
+                               (tuple :attribute 1 :export (list (tuple :run 0)))
+                               (tuple :attribute 1 :on_load (tuple :init 0)))
+                         carried
+                         (list
+                          (tuple :function 1 :run 0
+                           (list (tuple :clause 1 (list) (list) (list (tuple :integer 1 42)))))
+                          (tuple :function 1 :init 0
+                           (list (tuple :clause 1 (list) (list)
+                            (list
+                             (tuple :call 1 (tuple :remote 1 (tuple :atom 1 :erlang) (tuple :atom 1 :send))
+                              (list (tuple :atom 1 :contextual_runtime_probe) (tuple :atom 1 :runtime-onload-ran)))
+                             (tuple :atom 1 :ok))))))))
+         compiled (erlang/apply :compile :forms (list forms (list :binary :return_errors)))
+         _ (assert (= :ok (elem compiled 0)))
+         modified (map (fn [beam] (if (= module (first beam)) (tuple module (elem compiled 2)) beam)) (:beams verified))
+         out (Path/join root "on-load")]
+    ;; A genuine negative BEAM probe carries ordinary program metadata, not a
+    ;; fabricated SDK origin, native admission or successful execution receipt.
+    (BeamLisp.AOT/emit_unit {:version 1 :kind :prepared-artifact-unit :namespace "main"
+                            :compiler-key (BeamLisp.AOTCache/compiler_key) :inputs {}
+                            :plans (list {:generated-beams (to-list modified) :descriptors (list)}) :coverage {}} out)
+    (erlang/register :contextual_runtime_probe (erlang/self))
+    (try
+     (is (= :compiled_binary_on_load_refused
+            (try (world/run-unit out []) :unexpected (catch error (:original error)))))
+     (is (= false (erlang/module_loaded module)))
+     (is (= :absent (receive :runtime-onload-ran :ran (after 0 :absent))))
+     (finally (erlang/unregister :contextual_runtime_probe)))))))
