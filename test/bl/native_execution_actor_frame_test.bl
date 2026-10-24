@@ -1,0 +1,62 @@
+(ns native-execution-actor-frame-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]))
+
+(defn- graph [notify]
+ (try (generation/prepare!
+  {:application-id "native-actor-frame" :stable-namespaces #{"reload.execution"}
+   :native-modules #{(String/replace_prefix (Atom/to_string (elem (erlang/fun_info notify :module) 1)) "Elixir." "")}
+   :sources {"actor.frame"
+    (str "(ns actor.frame (:require [reload.execution :as execution])) "
+     "(defserver owner "
+     " (init [notify] (ok {:notify notify :init-frame (execution/frame)})) "
+     " (handle-call :frame [_ st] (reply (execution/frame) st)) "
+     " (handle-call :init-frame [_ st] (reply (:init-frame st) st)) "
+     " (handle-call :owned [_ st] (reply (execution/owned?) st)) "
+     " (handle-call :nested [_ st] (reply ((:notify st) :nested) st)) "
+     " (terminate [_ st] ((:notify st) {:frame (execution/frame) :owned (execution/owned?)}))) "
+     "(defn start-owner [notify] (start owner notify))")}})
+  (catch error
+   (println "Actor frame preparation:" (ex-data error))
+   (throw error))))
+
+(deftest actual-managed-actor-lifecycle-enters-native-frames
+ (let [parent (erlang/self)
+       notify (fn [result]
+                (if (= :nested result)
+                 (let [before (BeamLisp.Execution/observe)
+                       registration (BeamLisp.Execution/register! #(BeamLisp.Execution/observe))]
+                  (try
+                   {:before before :child (:value (BeamLisp.Execution/invoke! registration []))
+                    :after (BeamLisp.Execution/observe)}
+                   (finally (BeamLisp.Execution/close! registration))))
+                 (erlang/send parent (tuple :actor-frame-terminated result))))
+       g (graph notify)
+       pid (generation/invoke! g "actor.frame/start-owner" [notify])]
+  (try
+   (let [initial (call pid :init-frame) first (call pid :frame) second (call pid :frame)]
+    (is (= :active (:status initial)))
+    (is (= :init (:entry initial)))
+    (is (= :active (:status first)))
+    (is (= :handle_call (:entry first)))
+    (is (some? (:graph-id first)))
+    (is (some? (:context-id first)))
+    (is (not= (:id first) (:id second)))
+    (is (= (:graph-id first) (:graph-id second)))
+    (is (= true (call pid :owned))))
+   (let [nested (call pid :nested)]
+    (is (= :handle_call (get-in nested [:before :entry])))
+    (is (= (get-in nested [:before :id]) (get-in nested [:child :parent])))
+    (is (= 2 (get-in nested [:child :depth])))
+    (is (= (get-in nested [:before :id]) (get-in nested [:after :id]))))
+   (let [dictionary (elem (Process/info pid :dictionary) 1)]
+    (is (nil? (Keyword/get dictionary :bl_executing_generation)))
+    (is (nil? (Keyword/get dictionary :bl_executing_code_lease)))
+    (is (nil? (Keyword/get dictionary :bl_server_execution_extent))))
+   (stop pid)
+   (let [result (receive [:actor-frame-terminated result] result (after 10000 :missing-termination))]
+    (is (= true (:owned result)))
+    (is (= :active (get-in result [:frame :status])))
+    (is (= :terminate (get-in result [:frame :entry]))))
+   (finally
+    (when (Process/alive? pid) (stop pid))
+    (generation/retire! g)))))
