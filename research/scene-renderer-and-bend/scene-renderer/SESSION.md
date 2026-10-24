@@ -124,3 +124,12 @@ export of the accepted edited postcard revision. Read the latest PROGRESS.md and
 retained `evidence/growth/` / `evidence/studio-export/`. The film uses geometric
 clips and conservative dash reveals; do not claim general masks/path trimming.
 Studio generic-composition inputs and source hot replacement remain open.
+
+## Longer camera-led presentation
+
+The user requested recording/committing all inspiration/API notes and then a
+longer presentation explaining the distinctive medium. Read RESEARCH-MAP.md.
+The new film must use no entrance or exit animations: persistent content with
+natural, deliberate pans/zooms/holds. Earlier films remain historical. A static
+atlas with a BL-authored sampled camera is an admitted backend experiment; record
+density/zoom/filtering limits honestly and keep graphics buffers packed.
