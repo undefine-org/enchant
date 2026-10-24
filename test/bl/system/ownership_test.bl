@@ -1,0 +1,130 @@
+(ns system.ownership-test
+ (:require [system.ownership :as o] [system.phase :as phase] [anf :as a] [expand :as x]
+           [compile.world :as world]))
+
+;; These are declared logical contracts, not claims about an installed adapter.
+(def protocol
+ {:version 1 :id 'logical-resource-v1
+  :rules
+  {[:remote :Elixir.OwnershipTest :acquire 0] {:action :acquire :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :release 1] {:action :release :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :use 1] {:action :use :arg 0 :result :scalar :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :borrow 1] {:action :borrow :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :move 1] {:action :move :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :accept 1] {:action :accept :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :escape 1] {:action :escape :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :coin 0] {:action :pure :result :scalar :throws :never :runtime []}
+   [:remote :Elixir.OwnershipTest :may-fail 0] {:action :pure :result :scalar :throws :before :runtime []}}})
+(defn- compile-node [source]
+ (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source)
+                           (BeamLisp.Compiler/new_env "ownership.fixture")))
+(defn- report
+ ([source] (report source protocol))
+ ([source contracts] (o/check [{:id 'fixture :body (compile-node source)}] contracts)))
+(defn- status [source] (:status (report source)))
+(defn- kinds [report] (set (map :kind (:issues report))))
+(defn- owned [body] (str "(let [r (OwnershipTest/acquire)] " body ")"))
+
+(deftest real-native-anf-closure-creation-and-finally
+ (let [good (report "(let [r (BeamLisp.Execution/register! (fn [] 42))] (try 42 (finally (BeamLisp.Execution/close! r))))"
+                    (o/execution-protocol))
+       leak (report "(let [r (BeamLisp.Execution/register! (fn [] 42))] 42)" (o/execution-protocol))]
+  (is (= :conditional (:status good)) (pr-str good))
+  (is (pos? (:states good)))
+  (is (empty? (:issues good)))
+  (is (= #{:native-registration-context :native-context :close-and-drain}
+         (set (map :kind (:runtime-obligations good)))))
+  (is (= false (:native-admission good)))
+  (is (= :refused (:status leak)))
+  (is (contains? (kinds leak) :ownership-unfinished-lifetime))
+  (is (= :conditional (:status
+        (report "(let [r (BeamLisp.Execution/register! (fn [] 42))] (do (BeamLisp.Execution/close! r) (BeamLisp.Execution/close! r)))"
+                (o/execution-protocol)))))))
+
+(deftest aliases-branches-and-throwing-cleanup
+ (is (= :proved (status (owned "(let [alias r] (OwnershipTest/release alias))"))))
+ (is (= :proved (status (owned "(if (OwnershipTest/coin) (OwnershipTest/release r) (OwnershipTest/release r))"))))
+ (is (= :refused (status (owned "(if (OwnershipTest/coin) (OwnershipTest/release r) 0)"))))
+ (is (= :proved (status (owned "(try (OwnershipTest/may-fail) (finally (OwnershipTest/release r)))"))))
+ (is (= :refused (status (owned "(do (OwnershipTest/may-fail) (OwnershipTest/release r))"))))
+ (is (= :proved (status (owned "(try (+ 1 2) (finally (OwnershipTest/release r)))"))))
+ (is (= :refused (status (owned "(do (+ 1 2) (OwnershipTest/release r))"))))
+ (is (= :refused (status (owned "(do (OwnershipTest/release r) (OwnershipTest/use r))")))))
+
+(deftest borrowing-transfer-and-explicit-escape
+ (is (= :proved (status (owned "(let [b (OwnershipTest/borrow r)] (do (OwnershipTest/use b) (OwnershipTest/release b) (OwnershipTest/release r)))"))))
+ (is (= :refused (status (owned "(let [b (OwnershipTest/borrow r)] (do (OwnershipTest/release r) (OwnershipTest/release b)))"))))
+ (is (= :proved (status (owned "(let [ticket (OwnershipTest/move r) target (OwnershipTest/accept ticket)] (OwnershipTest/release target))"))))
+ (is (= :refused (status (owned "(let [ticket (OwnershipTest/move r) target (OwnershipTest/accept ticket)] (do (OwnershipTest/use r) (OwnershipTest/release target)))"))))
+ (is (= :refused (status (owned "(let [ticket (OwnershipTest/move r) target (OwnershipTest/accept ticket) again (OwnershipTest/accept ticket)] (OwnershipTest/release target))"))))
+ (is (= :refused (status (owned "(OwnershipTest/move r)"))))
+ (is (= :proved (status (owned "(OwnershipTest/escape r)"))))
+ (doseq [body ["r" "(fn [] r)"]]
+  (let [r (report (owned body))]
+   (is (= :refused (:status r)) body)
+   (is (contains? (kinds r) :ownership-returned-resource) body))))
+
+(deftest canonical-aggregates-preserve-resource-aliases
+ (doseq [out [(a/tup [(a/var "r")])
+              (a/mapp [[(a/lit :resource) (a/var "r")]])
+              (a/cons-cell (a/var "r") (a/empty-list-node))]]
+  (let [node (a/lett "r" (a/remote :Elixir.OwnershipTest :acquire []) out)
+        r (o/check [{:id 'aggregate :body node}] protocol)]
+   (is (= :refused (:status r)))
+   (is (contains? (kinds r) :ownership-returned-resource)))))
+
+(deftest opacity-and-budgets-never-prove
+ (doseq [body ["(unknown r)" "(loop [n 0] (recur n))" "ambient" "[r]" "{:resource r}"]]
+  (is (= :unknown (status (owned body))) body))
+ (is (= :unknown (:status (o/check [{:id 'tiny :body (compile-node (owned "(OwnershipTest/release r)"))}]
+                                  protocol {:max-steps 1}))))
+ (is (= :ownership-state-budget (:kind (o/check [{:id 'tiny :body (a/lit 1)}] protocol {:max-states 1}))))
+ (is (= :ownership-path-budget
+        (:kind (o/check [{:id 'branches :body (compile-node "(if (OwnershipTest/coin) 1 2)")}]
+                        protocol {:max-paths 1}))))
+ (doseq [bad [(assoc protocol :callback (fn [] true))
+              (assoc-in protocol [:rules [:remote :Elixir.OwnershipTest :use 1] :arg] 1)
+              (assoc-in protocol [:rules [:remote :Elixir.OwnershipTest :use 1] :idempotent] :yes)
+              (assoc-in protocol [:rules [:remote :Elixir.OwnershipTest :use 1] :adapter] :authority)]]
+  (is (= :unknown (:status (o/check [{:id 'data :body (a/lit 1)}] bad)))))
+ (is (= :ownership-budget-options (:kind (o/check [{:id 'data :body (a/lit 1)}] protocol {:max-paths 257}))))
+ (is (= :unknown (status "(try (OwnershipTest/may-fail) (catch exception e [e]))"))))
+
+(deftest malformed-anf-cannot-prove
+ (doseq [node [(dissoc (a/lit 42) :val)
+              (assoc (a/lit 42) :hidden-effects (compile-node "(OwnershipTest/acquire)"))
+              (a/doo [])
+              (a/tryy (a/lit 42) [{:pats [] :guard nil :body (a/lit 0) :extra :bad}] nil)]]
+  (is (= :unknown (:status (o/check [{:id 'malformed :body node}] protocol))))))
+
+;; Independent language oracle: with one acquisition and only use/release,
+;; exactly the traces consisting of zero or more uses followed by ONE final
+;; release are balanced. Enumerate all traces of lengths 0..5 (63 candidates).
+(defn- words [n]
+ (if (zero? n) [[]]
+  (vec (mapcat (fn [prefix] (map #(conj prefix %) [:use :release])) (words (dec n))))))
+(deftest exhaustive-single-resource-trace-language
+ (let [traces (mapcat words (range 6))]
+  (is (= 63 (count traces)))
+  (doseq [trace traces]
+   (let [expected (and (= :release (last trace)) (every? #{:use} (butlast trace)))
+         body (str "(do " (apply str (map #(str "(OwnershipTest/" (name %) " r) ") trace)) "0)")
+         r (report (owned body))]
+    (is (= (if expected :proved :refused) (:status r)) (pr-str [trace r]))))))
+
+(deftest contextual-snapshot-is-the-existing-binding-facts
+ (let [program (x/program [{:namespace 'plain :revision 'current :file "plain.bl" :source "(ns plain) 42"}]
+                          ['plain 'current])
+       r (o/analyze program) shared (phase/analyze program)
+       description (world/describe {:program program :manifest {:entry ['plain 'current]}
+                                    :phase (:report shared) :facts (:facts shared)
+                                    :ownership (:ownership shared) :arity {:status :proved :scope :arity}})]
+  (is (= :proved (:status r)))
+  (is (some? (:snapshot r)))
+  (is (some? (:binding-snapshot r)))
+  (is (= :proved (get-in shared [:report :status])))
+  (is (= (:snapshot r) (get-in shared [:ownership :snapshot]) (get-in shared [:facts :snapshot])))
+  (is (= "proved" (:ownership-check description)))
+  (is (= "finite-anf-entry-lifecycle" (:ownership-scope description)))
+  (is (= 0 (:ownership-obligations description)))
+  (is (= false (:native-admission description)))))
