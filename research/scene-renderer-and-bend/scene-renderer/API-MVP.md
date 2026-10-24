@@ -1,8 +1,9 @@
 # A1 living postcard studio
 
-Status: proposed first authoring-API milestone, 2026-10-24. This is the recommended
-next experiment for user review. The studio described here is not implemented by
-writing this plan. The existing editorial frame, four-second film, and prototype
+Status: approved first authoring-API milestone, 2026-10-24. The user authorized
+autonomous implementation and incremental commits. The measurable-card and
+selected-frame studio slices now run; the acceptance programme below is not yet
+closed in full. Read PROGRESS.md and the library README for the implemented subset. The existing editorial frame, four-second film, and prototype
 preview/export remain available as evidence and a visual reference.
 
 ## 1. The first result
@@ -232,7 +233,14 @@ should not depend on a particular aesthetic preference.
 
 ## 9. What can be tried today
 
-The new A1 authoring surface is not implemented yet. The retained editorial
+The implemented A1 studio is started with
+`examples/scene-renderer/studio.sh /tmp/bl-postcard-studio` under the documented
+resource cap. It supports content/style/timing edits, selected-frame preview,
+and bounds/anchor inspection. BL source changes currently require a restart;
+full source hot replacement and the broader temporal algebra remain open.
+See [the implemented library surface](../../../priv/lib/scene/README.md) and
+[studio commands](../../../examples/scene-renderer/README.md#living-postcard-studio).
+The retained editorial
 [MP4](evidence/editorial/field-notes.mp4) and
 [lossless frame](evidence/editorial/frame-060.png) can be viewed now. Existing
 prototype source can already be edited through

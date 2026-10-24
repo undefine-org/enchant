@@ -24,6 +24,15 @@ claim that the illustrative functions, inspector, or new studio already run.
 Existing code is explicitly identified below and in the contract. The first API
 milestone is A1, extending the existing R-series delivery rather than restarting it.
 
+## A1 implementation continuation
+
+The user approved the plan and authorized autonomous work and commits. The first
+measurable-card and selected-frame studio slices are now implemented. See
+[the actual library surface](../../../priv/lib/scene/README.md),
+[studio commands](../../../examples/scene-renderer/README.md#living-postcard-studio),
+[A1 evidence](evidence/a1/checks.json), and [PROGRESS.md](PROGRESS.md). The design
+examples still describe a broader API; they are not all available signatures.
+
 ## Current implementation and retained artifacts
 
 - [Authored editorial scene](../../../examples/scene-renderer/scene_demo/editorial.bl).

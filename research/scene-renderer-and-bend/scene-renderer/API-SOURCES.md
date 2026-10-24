@@ -156,3 +156,23 @@ benchmarked, or claimed to have APIs identical to the sketches here. Search-only
 mirrors and third-party explanations were not used to establish technical claims.
 The substantive sources from the conversation are covered above; incidental
 search-result suggestions are not endorsements or implementation dependencies.
+
+## Canonical text implementation references
+
+The A1 measurement spike inspected these primary references on 2026-10-24:
+
+- [Pango logical and ink extents](https://docs.gtk.org/Pango/method.Layout.get_extents.html):
+  separate layout/ink rectangles in Pango units, with a layout-relative origin.
+- [Pango wrapping width](https://docs.gtk.org/Pango/method.Layout.set_width.html):
+  explicit line-wrapping width rather than character-count estimates.
+- [PangoCairo layout outlines](https://docs.gtk.org/PangoCairo/func.layout_path.html):
+  outline geometry can come from the same shaped layout used for measurement.
+- [Cairo path ownership and iteration](https://www.cairographics.org/manual/cairo-Paths.html#cairo-copy-path):
+  copy/inspect the vector path and release the owned native resource.
+
+The worker records the installed library versions (Pango 1.57.1 and Cairo 1.18.4
+in the retained run), rather than assuming the documentation site's newer version
+is installed. Real outline/metrics tests and the admitted font set are described
+in `priv/lib/scene/README.md`. These additions are implementation references after
+the original 30-entry API inspiration retrieval manifest; that earlier manifest
+remains a historical record rather than being silently relabeled as current.
