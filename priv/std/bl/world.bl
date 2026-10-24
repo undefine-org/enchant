@@ -86,12 +86,14 @@
        archive-inputs (elem archive-capture 0)
        inputs (cons (:input read) (Enum/map (Enum/concat source-inputs archive-inputs) #(:input %)))
        _ (check-inputs! {:inputs inputs})
-       program (expand/program (Enum/map source-inputs #(:source %)) (:entry manifest)
-                 (Enum/map archive-inputs #(:library %)))
+       expansion (expand/prepare-program (Enum/map source-inputs #(:source %)) (:entry manifest)
+                   (Enum/map archive-inputs #(:library %)))
+       program (:program expansion)
        analysis (phase/analyze program) report (:report analysis)
        _ (when-not (= :proved (:status report)) (refuse! :world-phase-check (:status report)))
        facts (:facts analysis)]
-  (check-inputs! {:manifest manifest :inputs inputs :program program :phase report :facts facts
+  (check-inputs! {:manifest manifest :inputs inputs :program program :phase-library (:phase-library expansion)
+                  :phase report :facts facts
                   :arity (assoc (arity/check (:node program)) :snapshot (:snapshot facts))})))
 
 (defn describe [prepared]
@@ -111,21 +113,91 @@
   :constructor-closed (= :closed (get-in prepared [:program :constructor :status]))
   :native-admission false})
 
+(defn- program-descriptor [prepared module attrs]
+ (let [program (:program prepared)
+       bindings {:version 1 :profile 'syntax-v1 :snapshot (get-in prepared [:facts :snapshot])
+                 :references (:references program) :expansions (:expansions program)}]
+  (anf/module module
+   (list {:op :defn-clause :fname :run :params (list) :guard nil :body (:node program) :ann {}})
+   (list [:run 0])
+   (cons [:bl_contextual_bindings (erlang/term_to_binary bindings (list :deterministic))] attrs))))
+
 (defn artifact
- "Emit run/0 and the existing contextual binding metadata without loading the
-  target. These bytes/reports do not grant native execution admission."
+ "Emit run/0 and contextual binding metadata without loading the target."
  [prepared module]
  (check-inputs! prepared)
  (when-not (erlang/is_atom module) (refuse! :world-target-module nil))
- (let [program (:program prepared)
-       bindings {:version 1 :profile 'syntax-v1 :snapshot (get-in prepared [:facts :snapshot])
-                 :references (:references program) :expansions (:expansions program)}
-       descriptor (anf/module module
-                    (list {:op :defn-clause :fname :run :params (list) :guard nil
-                           :body (:node program) :ann {}})
-                    (list [:run 0])
-                    (list [:bl_contextual_bindings (erlang/term_to_binary bindings (list :deterministic))]))]
-  (lower/descriptor->beam descriptor {})))
+ (lower/descriptor->beam (program-descriptor prepared module (list)) {}))
+
+(defn prepare-unit
+ "Adapt one prepared world to the existing AOT artifact-unit protocol. Runtime
+  code and a phase-only companion are complete members of the same unit. No
+  expansion is repeated and neither module is loaded or initialized."
+ [prepared module]
+ (check-inputs! prepared)
+ (when-not (erlang/is_atom module) (refuse! :world-target-module nil))
+ (let [key (BeamLisp.AOTCache/current_compiler_key)
+       _ (when-not (= key (BeamLisp.AOTCache/compiler_key)) (refuse! :world-compiler-changed nil))
+       phase-module (Module/concat module :PhaseLibrary)
+       snapshot (get-in prepared [:facts :snapshot])
+       archive (expand/encode-phase-library (:phase-library prepared))
+       identity {:version 1 :profile 'syntax-v1 :compiler-key key
+                 :entry (get-in prepared [:manifest :entry]) :snapshot snapshot
+                 :program-module (Atom/to_string module) :phase-module (Atom/to_string phase-module)
+                 :phase-digest (crypto/hash :sha256 archive)}
+       metadata (fn [role] [:bl_contextual_unit
+                            (erlang/term_to_binary (assoc identity :role role) (list :deterministic))])
+       runtime (program-descriptor prepared module (list (metadata :runtime)))
+       phase (anf/module phase-module
+               (list {:op :defn-clause :fname :__bl_phase_identity__ :params (list) :guard nil
+                      :body (anf/lit snapshot) :ann {}})
+               (list [:__bl_phase_identity__ 0])
+               (list (metadata :phase) [:bl_contextual_phase_library archive]))
+       inputs (Map/new (map-indexed
+                (fn [index input]
+                 (let [source (bytes! (:path input) 16777216) name (str "world-input-" index)]
+                  (tuple name {:namespace name :file (:path input) :source source :selection :explicit
+                               :content-kind :bytes :digest (crypto/hash :sha256 source) :compiler-key key})))
+                (:inputs prepared)))
+       unit {:version 1 :kind :prepared-artifact-unit :namespace (str (first (:entry identity)))
+             :compiler-key key :inputs inputs :host-spec nil
+             :world (:selection (:program prepared))
+             :plans (list {:generated-beams (list) :descriptors (list runtime phase)})
+             :coverage {:scope :contextual-artifact-membership :phase-library true
+                        :contextual-binding-resolution :proved :execution-entry-inventory-complete false}}]
+  (check-inputs! prepared) unit))
+
+(defn- unit-metadata [beam]
+ (let [parsed (beam_lib/chunks (elem beam 1) (list :attributes))
+       attrs (Keyword/get (elem (elem parsed 1) 1) :attributes)
+       encoded (BeamLisp.AOT/normalized_attribute attrs :bl_contextual_unit)
+       metadata (BeamLisp.CompilerData/decode_closed_etf! encoded
+                 {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
+  {:beam beam :attributes attrs :metadata metadata}))
+
+(defn read-unit
+ "Verify complete artifact membership through AOT, then decode the phase
+  companion as bounded data without loading either module. Runtime packaging
+  selects only :runtime-beams; phase providers need not ship with the program.
+  All returned records are data, never native admission or SDK authority."
+ [directory]
+ (let [verified (BeamLisp.AOT/verify_unit directory)
+       rows (mapv unit-metadata (:beams verified))
+       runtime (first (filter #(= :runtime (get-in % [:metadata :role])) rows))
+       phase (first (filter #(= :phase (get-in % [:metadata :role])) rows))
+       metadata (:metadata runtime) phase-metadata (:metadata phase)
+       archive (when phase (BeamLisp.AOT/normalized_attribute (:attributes phase) :bl_contextual_phase_library))]
+  (when-not (and (= 2 (count rows)) runtime phase (= 1 (:version metadata))
+                 (= 'syntax-v1 (:profile metadata))
+                 (= (:compiler-key metadata) (get-in verified [:manifest :compiler-key]))
+                 (= (dissoc metadata :role) (dissoc phase-metadata :role))
+                 (= (:program-module metadata) (Atom/to_string (elem (:beam runtime) 0)))
+                 (= (:phase-module metadata) (Atom/to_string (elem (:beam phase) 0)))
+                 (erlang/is_binary archive) (= (:phase-digest metadata) (crypto/hash :sha256 archive)))
+   (refuse! :world-artifact-membership nil))
+  {:version 1 :kind :contextual-artifact-unit :manifest (:manifest verified)
+   :metadata metadata :phase-library (expand/decode-phase-library archive)
+   :runtime-beams (list (:beam runtime)) :native-admission false}))
 
 (defn execute
  "Ordinary native evaluation, with the existing framework check and Lower's
