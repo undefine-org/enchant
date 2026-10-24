@@ -8,6 +8,55 @@ import shutil
 import subprocess
 import tempfile
 
+PREBOOT = r'''
+{:ok, _} = Application.ensure_all_started(:crypto)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+# Execute packaged identity recovery before any language runtime is loaded.
+# Corrupt actual bytes, and independently replace loaded stable code. Restore
+# both in this private image before ordinary startup; no fake manifest is used.
+preboot_unloaded = fn ->
+  for module <- [BeamLisp.Ns.Core, BeamLisp.Ns.Rt, BeamLisp.Env] do
+    if :erlang.module_loaded(module), do: raise "preboot loaded #{module}"
+  end
+end
+preboot_unloaded.()
+expected_keys = {manifest["compiler_key"], manifest["build_key"]}
+^expected_keys = BeamLisp.Bootstrap.packaged_keys!()
+true = BeamLisp.Bootstrap.packaged_member?(BeamLisp.CompilerData)
+preboot_unloaded.()
+victim = "priv/bootstrap/seed/Elixir.BeamLisp.CompilerData.beam"
+original = File.read!(victim)
+refused = fn operation ->
+  try do
+    operation.()
+    false
+  catch
+    _, _ -> true
+  end
+end
+try do
+  File.write!(victim, "changed preboot bytes")
+  unless refused.(fn -> BeamLisp.Bootstrap.packaged_keys!() end),
+    do: raise "preboot accepted changed floor bytes"
+after
+  File.write!(victim, original)
+end
+try do
+  Code.compile_string("defmodule BeamLisp.CompilerData do\n def changed_preboot_probe, do: :changed\nend")
+  unless refused.(fn -> BeamLisp.Bootstrap.packaged_keys!() end),
+    do: raise "preboot accepted replaced loaded stable code"
+  unless refused.(fn -> true = BeamLisp.Bootstrap.packaged_member?(BeamLisp.CompilerData) end),
+    do: raise "preboot member accepted replaced loaded stable code"
+after
+  :code.purge(BeamLisp.CompilerData)
+  {:module, BeamLisp.CompilerData} = :code.load_binary(BeamLisp.CompilerData, String.to_charlist(victim), original)
+  :code.purge(BeamLisp.CompilerData)
+end
+^expected_keys = BeamLisp.Bootstrap.packaged_keys!()
+preboot_unloaded.()
+IO.puts("SOURCE-FLOOR preboot keys/member, corrupt bytes, replaced loaded code and native proof instructions passed")
+'''
+
 DRIVER = r'''
 Application.load(:beam_lisp)
 for app <- Application.spec(:beam_lisp, :applications) || [],
@@ -52,6 +101,21 @@ for instruction <- naming_instructions, is_tuple(instruction),
   {:extfunc, target, _, _} = elem(instruction, 2)
   if target == BeamLisp.Ns.Rt,
     do: raise "native actor naming re-enters Source invocation"
+end
+# Native SDK proof helpers run under a private Source frame with a temporary
+# global Env. Inspect their actual emitted code, including local helper calls.
+{:beam_file, _, _, _, _, aot_functions} = :beam_disasm.file(~c"priv/bootstrap/seed/Elixir.BeamLisp.AOT.beam")
+for name <- [:sdk_unit_source_path, :sdk_source_current?, :physical_sdk_path,
+             :physical_dir_cached, :lstat_identity, :physical_sdk_path_walk] do
+  functions = Enum.filter(aot_functions, fn {:function, n, _, _, _} -> n == name end)
+  if functions == [], do: raise "missing native SDK proof helper: #{name}"
+  for {:function, _, _, _, instructions} <- functions,
+      instruction <- instructions, is_tuple(instruction),
+      elem(instruction, 0) in [:call_ext, :call_ext_only, :call_ext_last] do
+    {:extfunc, target, _, _} = elem(instruction, 2)
+    if target == BeamLisp.Ns.Rt,
+      do: raise "native SDK proof re-enters Source invocation: #{name}"
+  end
 end
 {:ok, _} = Application.ensure_all_started(:beam_lisp)
 # Stable compiler bodies must still be the candidate bytes after startup.
@@ -137,6 +201,8 @@ def main():
     parser.add_argument("--seed", type=Path, required=True)
     parser.add_argument("--test", type=Path, nargs="+", default=[],
                         help="run actual CLI tests against this private candidate before installation")
+    parser.add_argument("--test-timeout", type=int, choices=range(120, 901), default=600,
+                        metavar="SECONDS", help="bounded CLI test budget (120..900; default 600)")
     args = parser.parse_args()
     root, seed = args.root.resolve(), args.seed.resolve()
     tests = [path.resolve() for path in args.test]
@@ -158,6 +224,8 @@ def main():
         shutil.copytree(seed, app / "ebin")
         driver = image / "check.exs"
         driver.write_text(DRIVER)
+        preboot = image / "preboot.exs"
+        preboot.write_text(PREBOOT)
         deps = sorted((root / "deps").glob("*/ebin"))
         deps += sorted((root / "_build").glob("*/lib/*/ebin"))
         cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -174,15 +242,19 @@ def main():
         env.update(BL_ROOT=str(image), BL_DAEMON="off", BL_BUILD_ID="floor-check",
                    XDG_CACHE_HOME=str(image / "cache"),
                    ELIXIR_ERL_OPTIONS="+S 4:4 +SDcpu 2:2 +SDio 1:1")
+        # Compile this driver in a separate VM: Elixir can load remote call
+        # targets while compiling the ordinary runtime driver itself.
+        preboot_command = command[:command.index(str(driver))] + [str(preboot)]
+        subprocess.run(preboot_command, cwd=image, env=env, check=True, timeout=120)
         try:
             result = subprocess.run(command, cwd=image, env=env, text=True,
                                     stdout=None if tests else subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, timeout=600 if tests else 120)
+                                    stderr=subprocess.STDOUT, timeout=args.test_timeout if tests else 120)
         except subprocess.TimeoutExpired as error:
             if error.stdout:
                 output = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout
                 print(output[-16000:], end="")
-            scope = "candidate CLI tests exceeded 600 seconds" if tests else "fresh boot exceeded 120 seconds"
+            scope = f"candidate CLI tests exceeded {args.test_timeout} seconds" if tests else "fresh boot exceeded 120 seconds"
             raise SystemExit(f"SOURCE-FLOOR {scope}")
         if result.returncode:
             if result.stdout:

@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Run the consumer matrix and genuine small sealed image on one frozen input set.
+
+Run under systemd-run --user --collect --wait --pipe --property=MemoryMax=4G
+--property=MemorySwapMax=0 --property=RuntimeMaxSec=1500. No installed files change.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--out', required=True, type=Path)
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    if os.path.lexists(output):
+        parser.error('output must be absent; keep earlier receipts')
+    matrix_path = root / 'research/phase-compiler/sdk-boundary-consumers.json'
+    matrix = json.loads(matrix_path.read_text())
+    # Refuse new/unmapped consumers before paying for any BEAM startup.
+    for boundary in matrix['boundaries']:
+        search = ['rg', '-n']
+        for pattern in matrix['source_globs']:
+            search += ['--glob', pattern]
+        found = subprocess.run(search + [boundary['search'], 'priv'],
+                               cwd=root, text=True, stdout=subprocess.PIPE, check=False)
+        if found.returncode not in (0, 1):
+            parser.error('consumer discovery failed: ' + boundary['id'])
+        references = []
+        for line in found.stdout.splitlines():
+            path, number, text = line.split(':', 2)
+            references.append({'path': path, 'line': int(number), 'text': text.strip()})
+        if sorted(references, key=lambda x: (x['path'], x['line'])) != sorted(boundary['references'], key=lambda x: (x['path'], x['line'])):
+            parser.error('consumer map drift: update ' + boundary['id'])
+    tests = list(dict.fromkeys(test for boundary in matrix['boundaries'] for test in boundary['tests']))
+    if not tests or any(not (root / test).is_file() for test in tests):
+        parser.error('empty or missing consumer tests')
+    output.mkdir(parents=True)
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def capture():
+        # Freeze the entire language/runtime source inventory, not just paths
+        # known before a run; new/removed files also invalidate the candidate.
+        paths = [root / 'env.bl', matrix_path, Path(__file__).resolve()]
+        for directory in ['priv', 'test', 'scripts', 'native']:
+            paths += [p for p in (root / directory).rglob('*') if p.is_file()
+                      and (p.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.py', '.exs', '.rs', '.toml', '.lock', '.so'))
+                           or directory == 'scripts') and 'target' not in p.parts and '__pycache__' not in p.parts]
+        inputs = {str(p.relative_to(root)): sha(p) for p in sorted(set(paths))}
+        floor = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+        return {'inputs': inputs, 'floor': floor}
+
+    frozen = capture()
+    (output / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
+    report = {'version': 1, 'status': 'running', 'seed': str(seed), 'tests': tests,
+              'boundaries': [b['id'] for b in matrix['boundaries']], 'stages': {},
+              'complete_goal': False, 'full_sdk_build': False}
+
+    def stage(name, command):
+        if capture() != frozen:
+            raise RuntimeError('frozen inputs changed before ' + name)
+        start = time.monotonic()
+        with (output / (name + '.log')).open('w') as log:
+            done = subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, timeout=1000)
+        report['stages'][name] = {'exit': done.returncode, 'seconds': round(time.monotonic()-start, 3)}
+        if done.returncode:
+            raise RuntimeError(name + ' failed; see retained log')
+        if capture() != frozen:
+            raise RuntimeError('frozen inputs changed during ' + name)
+
+    try:
+        stage('consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root), '--seed', str(seed), '--test-timeout', '900',
+                            '--test', *[str(root / p) for p in tests]])
+        log = (output / 'consumers.log').read_text()
+        summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
+        counts = re.findall(r'✓ .*?\s+(\d+) passed', log)
+        if summaries != [(str(len(tests)), '0', '0')] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
+            raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
+        report['assertions'] = sum(map(int, counts))
+        stage('sealed', [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),
+                         '--out', str(output / 'sealed'), '--activation-smoke', '--source-free', '--boundary-tests'])
+        sealed = json.loads((output / 'sealed/result.json').read_text())
+        if sealed['status'] != 'passed' or not sealed['source_free_sdk'] or not sealed['missing_unit_refused_before_initialization'] or not sealed['tampering_refused_before_initialization']:
+            raise RuntimeError('incomplete sealed positive/negative controls')
+        if sealed.get('sealed_source_consumers', {}).get('status') != 'passed':
+            raise RuntimeError('sealed Source-present consumer branch was not qualified')
+        report.update(status='passed', frozen_inputs_unchanged=True, sealed=sealed,
+                      coverage={b['id']: {'tests': b['tests'], 'status': 'passed'} for b in matrix['boundaries']})
+    except Exception as error:
+        report.update(status='failed', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'status': 'passed', 'files': len(tests), 'assertions': report['assertions'],
+                      'boundaries': report['boundaries'], 'receipt': str(output / 'result.json')}))
+
+
+if __name__ == '__main__':
+    main()
