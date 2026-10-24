@@ -1,4 +1,4 @@
-; Native regression SPECIMENS, UNRUN. No private product Source fixtures.
+; Genuine native launch regressions. No private product Source fixtures.
 ; Requires one coherent native host/SDK floor including Env/Refs/Server/Supervisor.
 (ns proc.native-server-start-test
  (:require [proc.task :as task]))
@@ -11,7 +11,9 @@
    (erlang/send (:owner opts) [:native-init-held (:hold opts) (erlang/self)])
    (let [hold (:hold opts)]
     (receive [:native-init-finish seen] :when (= seen hold) :ok)))
-  (ok opts))
+  (when (:fail opts) (erlang/error :native-init-failed))
+  (ok (assoc opts :init-ns (:ns (BeamLisp.Env/capture)))))
+ (handle-call :context [_ opts] (reply (:init-ns opts) opts))
  (handle-call [:forge-ancestry pid] [_ opts]
   (Process/put :"$ancestors" (list pid))
   (Process/put :bl_server_start_receipt {:creator pid :child (erlang/self) :ticket (erlang/make_ref)})
@@ -58,19 +60,39 @@
  (let [owner (erlang/self) ticket (erlang/make_ref)
        parent (task/async-nolink
         (fn []
-         (let [child (BeamLisp.Server/start native-runner {:hold ticket :owner owner})]
+         (let [child (BeamLisp.Env/with_ns "native.pending.context"
+                       (fn [] (BeamLisp.Server/start native-runner {:hold ticket :owner owner})))]
           (erlang/send owner [:native-parent-finished ticket child])
           (receive :depart (GenServer/stop child :normal 5000)))))]
   (let [child (receive [:native-init-held seen pid] :when (= seen ticket) pid)]
    (is (= :refused (refused #(BeamLisp.Env/native_process_start_evidence! child owner))))
+   (let [pending (BeamLisp.Env/server_start_turn
+                  (fn []
+                   (let [row (elem (first (ets/lookup :beam_lisp_native_owned_starts child)) 1)
+                         launch (elem (first (ets/lookup :beam_lisp_native_launches (:ticket row))) 1)]
+                    {:context-id (:context-id launch) :inline? (contains? launch :context)
+                     :owned-context? (contains? row :context-id)})))
+         identity (:context-id pending)]
+    (is (and (tuple? identity) (= :bl_execution_context (elem identity 0))))
+    (is (= false (:inline? pending)))
+    (is (= false (:owned-context? pending)))
    (erlang/send child [:native-init-finish ticket])
    (receive [:native-parent-finished seen pid] :when (and (= seen ticket) (= pid child)) :ready)
    (is (= 2 (count (:receipts (BeamLisp.Env/native_process_start_evidence! child owner)))))
+   (is (= {:context-id nil :inline? false :pool-row? false}
+          (BeamLisp.Env/server_start_turn
+           (fn []
+            (let [row (elem (first (ets/lookup :beam_lisp_native_owned_starts child)) 1)
+                  launch (elem (first (ets/lookup :beam_lisp_native_launches (:ticket row))) 1)]
+             {:context-id (:context-id launch) :inline? (contains? launch :context)
+              :pool-row? (not (empty? (ets/lookup :beam_lisp_source_lease_domains
+                                              (tuple :execution_context identity))))}))))))
+   (is (= "native.pending.context" (call child :context)))
    (is (= (task/pid parent) (:creator (first (:receipts (BeamLisp.Env/native_process_start_evidence! child owner))))))
    (erlang/send (task/pid parent) :depart) (task/await parent 10000))))
 (deftest forged-native-envelope-refuses-before-actual-user-initialization
  (let [before @initializations fake (tuple :bl_native_launch (erlang/make_ref))
-       envelope (tuple :"$bl_native_conveyed_env" (BeamLisp.Env/capture) native-runner {} fake)
+       envelope (tuple :"$bl_native_conveyed_env" :native-context native-runner {} fake)
        result (erlang/apply :gen_server :start (list native-runner envelope (list)))]
   (is (= :error (elem result 0)))
   (is (= before @initializations))
@@ -117,3 +139,54 @@
     (is (Process/alive? child))
     (is (BeamLisp.Env/native_start_class_held? native-runner)))
    (finally (Supervisor/stop sup :normal 5000)))))
+
+(deftest failed-native-init-keeps-one-launch-reference-until-real-death-pruning
+ (let [owner (erlang/self) held (erlang/make_ref)
+       parent (task/async-nolink
+        (fn []
+         (let [result (BeamLisp.Env/with_ns "native.failed.context"
+                       (fn [] (refused #(BeamLisp.Server/start native-runner
+                                        {:hold held :owner owner :fail true}))))]
+          (erlang/send owner [:native-failed-result held result])
+          (receive :depart :done))))]
+  (try
+   (let [child (receive [:native-init-held seen pid] :when (= seen held) pid
+                (after 10000 (throw :native-init-timeout)))
+         observed (BeamLisp.Env/server_start_turn
+                   (fn []
+                    (let [row (elem (first (ets/lookup :beam_lisp_native_owned_starts child)) 1)
+                          launch (elem (first (ets/lookup :beam_lisp_native_launches (:ticket row))) 1)]
+                     [(:ticket row) (:context-id launch)])))
+         launch-ticket (first observed) identity (second observed)]
+    (is (some? identity))
+    (erlang/send child [:native-init-finish held])
+    (is (= :refused (receive [:native-failed-result seen result] :when (= seen held) result
+                             (after 10000 (throw :native-result-timeout)))))
+    (is (not (Process/alive? child)))
+    (is (= :unknown (BeamLisp.Env/server_start_turn
+                    (fn [] (:phase (elem (first (ets/lookup :beam_lisp_native_launches launch-ticket)) 1))))))
+    ;; A genuine subsequent start prunes actual dead provenance. Data cleanup
+    ;; does not authorize completion of any external effects from failed init.
+    (let [next (BeamLisp.Server/start native-runner {})]
+     (try
+      (is (= :retired_execution_context
+             (try (BeamLisp.Env/execution_context_value! identity) :unexpected
+              (catch error (:original error)))))
+      (is (= :refused (refused #(BeamLisp.Env/native_process_start_evidence! child owner))))
+      (finally (GenServer/stop next :normal 5000)))))
+   (finally (erlang/send (task/pid parent) :depart) (task/await parent 10000)))))
+
+(deftest oversized-native-overlay-refuses-before-code-custody-and-user-init
+ (let [before @initializations overlay (Process/get :bl-cli-project)
+       leases (ets/info :beam_lisp_code_leases :size)
+       contexts (ets/info :beam_lisp_source_lease_domains :size)]
+  (try
+   (Process/put :bl-cli-project (String/duplicate "x" 8388608))
+   (is (= :execution_context_capacity
+          (try (BeamLisp.Server/start native-runner {}) :unexpected
+           (catch error (:original error)))))
+   (finally
+    (if (nil? overlay) (Process/delete :bl-cli-project) (Process/put :bl-cli-project overlay))))
+  (is (= before @initializations))
+  (is (= leases (ets/info :beam_lisp_code_leases :size)))
+  (is (= contexts (ets/info :beam_lisp_source_lease_domains :size)))))
