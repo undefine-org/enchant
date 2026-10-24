@@ -288,3 +288,37 @@ The optional `--bind` selects an explicit interface for an authorized review.
 This is a developer file viewer, with single-range GET/HEAD support; it is not
 a public hosting/authentication product. `scene_review_server.py` tests full,
 bounded, suffix, open-ended, HEAD, and invalid-range behavior.
+
+## Continuous metamorphosis: beyond the atlas plates
+
+The user superseded the slide/plate composition. `scene_demo/metamorphosis.bl`
+authors one evolving system: 48 persistent keyed nodes, corresponding contours,
+changing attachment geometry, and cameras following actual instances. Radial,
+branching, ribbon, and orbital formations transform continuously. There are no
+slide panels, replacement heading/body layouts, or opacity entrance/exit effects.
+The camera moves through scales 0.48–4.5; foreground paths remain native vectors.
+
+```sh
+# Inspect scripts/bl-mem and use the same capped/configured checkout commands.
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/metamorphosis.bl -- /tmp/bl-metamorphosis-review
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/metamorphosis.bl -- /tmp/bl-metamorphosis-film film
+python3 examples/scene-renderer/review_server.py \
+  research/scene-renderer-and-bend/scene-renderer/evidence/metamorphosis --port 4051
+```
+
+The film is `OUT/experience.mp4`: 48 seconds, 1152 frames at 24/1 fps, 1080p,
+silent. The native worker caches Cairo vector paths, admits explicit contour
+deformations, and executes BL-authored matrices and curves. Hatching and label
+halos are declared styles; paper is a frozen world-local repeating material.
+It rejects instance arrivals/departures and unrecognized visibility properties.
+It streams packed BGRA to one encoder. PNG/video use the same drawing path.
+
+Source/font/license bytes, shaping provenance, camera track, full motion plan,
+selected lossless frames, hashes, and media checks accompany each revision.
+The retained evidence includes `motion.json.gz`, a lossless compressed copy of
+the full evaluated plan. Reproduce from source to recreate its paper/native-path
+resources; the compressed plan alone is not a standalone executable project.
+The existing startup executable-capture qualification remains. Use one publisher
+per output directory and keep the whole process tree capped. New checks are
+`choreo_test.bl`, `metamorphosis_test.bl`, `scene_motion.py`, and the owned-browser
+`scene_metamorphosis_browser.mjs`.

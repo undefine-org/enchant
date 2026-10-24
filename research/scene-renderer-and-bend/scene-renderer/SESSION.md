@@ -150,3 +150,11 @@ unzoom/rezoom and meaningful transformations. Read TRANSFORMATION-EXPERIENCE.md.
 The committed atlas remains historical. Camera-only/static-world restrictions
 are superseded for the new piece; retain the no generic entrance/exit direction.
 Use persistent keyed structures that transform, with object-following camera work.
+
+The 48-second continuous metamorphosis is now implemented and retained under
+`evidence/metamorphosis/`, built by `metamorphosis.bl`. It uses `scene.choreo` and
+a cached-native-vector worker with explicit contour/formation/relationship morphs
+and semantic focus across 0.48–4.5 zoom. No panels or object entrance/exit opacity
+channels are used. Read the newest PROGRESS.md and TRANSFORMATION-EXPERIENCE.md.
+The studio remains a separate track; the atlas is historical rather than the
+current presentation target. Continue to commit completed slices autonomously.

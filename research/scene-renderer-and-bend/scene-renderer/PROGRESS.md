@@ -285,3 +285,57 @@ complete audiovisual viewing. Startup executable capture retains its documented
 qualification. The postcard studio is still separate; generic composition inputs,
 source hot replacement, richer effects/materials, and broader typography remain
 open work rather than claims implied by this presentation.
+
+## User correction: one transforming experience, no more slides
+
+The user approved preserving the committed atlas but rejected the slide/plate
+structure and requested a deeper motion/design/transformation language. The
+camera-only restriction was superseded; the no generic entrance/exit direction
+remains. TRANSFORMATION-EXPERIENCE.md records this correction and actual examples.
+Source/API implementation was committed as de624917 before full export.
+
+`scene.choreo` now supplies keyed formations, correspondence-based morphs,
+logarithmic scale, shortest-angle turns, continuously changing attachment
+endpoints, focus blending, and structured path morphs with authored topology.
+`scene_demo/metamorphosis.bl` uses 48 persistent nodes in radial, tree, ribbon,
+and orbital formations. The same seed changes between circle, leaf, and lens.
+The camera focuses on actual named instances, pulls back and dives across a
+0.48–4.5 zoom range, and returns to the whole connected structure. Inscriptions
+belong to that structure at different scales rather than six content panels.
+
+The new graphics worker caches native Cairo paths and accepts explicit per-frame
+vector deformations/curves/matrices authored by BL. It does not plan motion or
+construct formations. Hatching and cartographic label halos are declared styles;
+the paper is frozen world-local texture. It validates fixed ordered object/edge
+identities across the entire film and rejects implicit opacity/visibility fields.
+Native vector foregrounds preserve crisp edges during deep camera work. Raw pixels
+remain packed and one encoder is physically owned/drained by the worker.
+
+Full-size review caught excessive cross-connections and colliding annotations in
+the first attempt. Radial attachments were redirected along their branches and
+the two magnified semantic instances separated. The final encoded film and its
+selected full-size seed/formation/instance/inspection/whole views were inspected,
+along with a decoded motion contact sheet. This is not a claim of complete
+audiovisual viewing; actual browser playback and arbitrary seek checks also pass.
+
+The new silent film is 48 seconds, 1152 frames at 24/1 fps, 1920x1080. The full
+build took 213.734s; systemd reported a 937.5M process-tree peak. Twenty focused
+BL assertions (12 choreography, 8 experience) and six native tests pass. They
+cover keyed target reorder, parent/correspondence errors, path topology, native
+deformation/hatching/halos, fixed identities, arbitrary sampling, and encoding.
+Independent frames 168 and 720 match the full export PNGs exactly without needing
+frame zero. Movie, full-plan, and source leaf hashes were verified. All 1152 frames
+retain their complete ordered instance and edge identities.
+
+`evidence/metamorphosis/` retains the MP4, lossless opening/detail/whole views,
+compressed complete motion plan, provenance, report/checks, browser screenshot,
+contact sheet, and review page. The owned browser was stopped and profile removed;
+the new range-aware Tailscale review service is intentionally time-bounded for
+the user. Previous media remain historical; unrelated services were untouched.
+
+This is a finite authored transformation vocabulary, not arbitrary topology
+inference, self-intersection repair, simulation, or a general constraint solver.
+Parent endpoints interpolate while relationships change. The native plan remains
+a private versioned backend format, and the existing executable-capture
+qualification remains. The studio generic-composition/source-refresh work stays
+independent; this experience does not silently claim those milestones complete.

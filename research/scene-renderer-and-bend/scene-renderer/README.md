@@ -38,7 +38,14 @@ examples still describe a broader API; they are not all available signatures.
 
 ## Current implementation and retained artifacts
 
-The newest presentation is [The program is the sketchbook](evidence/atlas/index.html):
+The current direction is [A living picture](evidence/metamorphosis/index.html):
+a [48-second continuous transformation](evidence/metamorphosis/experience.mp4)
+of one keyed system, with contour/formation/relationship morphs and deep camera
+following. [TRANSFORMATION-EXPERIENCE.md](TRANSFORMATION-EXPERIENCE.md) records the
+user's correction away from slides and the actual new API. [Evidence](evidence/metamorphosis/checks.json)
+includes the full compressed evaluated plan, media, and deterministic sample checks.
+
+The earlier camera-only presentation is [The program is the sketchbook](evidence/atlas/index.html):
 a [56-second 1080p film](evidence/atlas/presentation.mp4) through six connected
 ideas, with camera-only motion and persistent content. Its [checks](evidence/atlas/checks.json)
 and [camera/script documentation](CAMERA-PRESENTATION.md) distinguish demonstrated
