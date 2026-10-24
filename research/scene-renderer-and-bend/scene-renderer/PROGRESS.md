@@ -137,3 +137,29 @@ origins, not arbitrary source-form traces. Broad sequence/parallel/event-track a
 simulation APIs are not implemented. A one-shot six-second export entrypoint is
 being checked separately; don't infer completion from the interactive preview.
 All owned studio/browser test services were stopped; unrelated VMs were preserved.
+
+The new six-second postcard export is now checked: 144 frames at 24/1 fps, 1080
+square, 2× internal sampling, silent H.264. Full generation took 250.359 seconds
+under the cap with a reported 882.7M peak. The quality master and MP4 are retained
+in `evidence/a1/`; source/font/shaping/quality provenance accompanies the export.
+The selected-frame 2× raster path was checked against the export's canonical PNG.
+
+Final HTTP checks passed after tightening admission ownership: only the render
+owner releases the slot after accepted physical work. A timed-out/disconnected
+HTTP wait cannot make a second native operation eligible. A deterministic client
+test separately verifies one in-flight request, coalesced latest intent, stale
+suppression, and failure retention. Seven Python graphics/text tests now include
+a regression for selecting frame 60 without creating or requiring frame zero.
+
+The final warm 540px studio latency sample uses ten text edits and ten cue-only
+edits. Text-edit p50 was 0.797s and nearest-rank p95 0.891s; cue-edit p50 0.613s and
+p95 0.660s. With ten samples the p95 estimator is the maximum; these are small
+local distributions, not a general performance guarantee. Full samples and host
+metadata are retained in `evidence/a1/latency.json`. No backend-speed comparison
+is claimed. All owned test services were stopped in cleanup.
+
+Remaining A1 work includes coherent hot replacement of BL source (the studio
+currently restarts to accept source changes), stronger source/executable capture
+at startup, direct export of the UI-edited config, and the broader clip algebra.
+The current milestone has a usable, committed playground and verified still/film
+path; these remaining items must not be hidden by calling the entire plan closed.

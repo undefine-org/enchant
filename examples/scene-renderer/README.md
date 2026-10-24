@@ -184,3 +184,27 @@ Run these BL commands under the same resource cap. Focused checks are
 `test/bl/scene/layout_test.bl`, `test/bl/scene/postcard_test.bl`,
 `test/scripts/scene_text.py`, and (against an owned studio)
 `test/scripts/scene_studio.py` / `scene_studio_browser.mjs`.
+
+A six-second quality export from the new authoring API is available with:
+
+```sh
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/postcard.bl -- /tmp/bl-postcard-export film
+```
+
+Use the same cgroup cap. This produces 144 frames at 24/1 fps, a 1080px PNG
+sequence rendered at 2× internally, `living-postcard.mp4`, and a manifest. It
+captures fonts, worker/source bytes, and normalized content before rendering.
+The still modes and film mode use the same measured component tree and sampling
+function. Source hot replacement and exporting a UI session's config directly
+from a button remain separate follow-up work.
+
+On the validation host, the toolchain was not initially on PATH. The exact
+host-specific environment used for checks was:
+
+```sh
+export PATH="/nix/store/wdzz6qm2jd36jjx94q7377zf23ggk036-elixir-1.20.4/bin:/nix/store/n849kp6a9lac3shjw3ycdl1b4sl1kw0l-erlang-29.0.1/bin:$PATH"
+export SCENE_RSVG=/nix/store/ii7wr6b6b8c5fq1ci26rw7amkb4apwm8-librsvg-2.62.3/bin/rsvg-convert
+```
+
+Other machines should prepare the declared dependencies normally. These paths
+record the measured host; they are not portable package-install instructions.

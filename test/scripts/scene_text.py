@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import os
+import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -40,6 +42,17 @@ class TextTests(unittest.TestCase):
     def test_missing_glyph_diagnosed(self):
         with self.assertRaisesRegex(ValueError,'Missing glyph'):
             worker.measure([{'text':'hello \U0010ffff'}],FONT,RSVG)
+    def test_selected_raster_does_not_require_frame_zero(self):
+        spec = importlib.util.spec_from_file_location('raster_worker', 'examples/scene-renderer/raster.py')
+        raster = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(raster)
+        with tempfile.TemporaryDirectory(prefix='scene-selected-check-') as tmp:
+            folder=Path(tmp)
+            (folder/'60.svg').write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>')
+            raster.raster(folder,1,FONT/'DMSans.ttf',RSVG,FONT,start=60,pixel_width=20)
+            self.assertFalse((folder/'0.png').exists())
+            self.assertEqual(list(json.loads((folder/'pixels.json').read_text())),['60'])
+            self.assertEqual(struct.unpack('>II',(folder/'60.png').read_bytes()[16:24]),(20,20))
     def test_invalid_geometry(self):
         for width in [0,-1,float('nan')]:
             with self.assertRaisesRegex(ValueError,'width'):
