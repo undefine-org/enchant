@@ -3,6 +3,18 @@
 # preserves their trace patterns; an unloaded module would make an empty trace
 # a false negative. Module-info reads are metadata, outside compiler work.
 Application.ensure_all_started(:crypto)
+program = System.get_env("BL_RUNTIME_MAIN") || "program"
+showcases = System.get_env("BL_RUNTIME_SHOWCASES") || "showcases"
+if expected_root = System.get_env("BL_RUNTIME_EXPECT_ROOT") do
+  root = Path.expand(expected_root)
+  unless Path.expand(to_string(:code.root_dir())) == root, do: raise("runtime used host ERTS root")
+  unless File.read_link!("/proc/self/exe") == Path.join(root, "erts-#{:erlang.system_info(:version)}/bin/beam.smp"),
+    do: raise("runtime did not execute bundled beam.smp")
+  for path <- :code.get_path() do
+    expanded = Path.expand(to_string(path))
+    unless expanded == root or String.starts_with?(expanded, root <> "/"), do: raise("external runtime code path: #{expanded}")
+  end
+end
 {:ok,[manifest]}=:file.consult(String.to_charlist(Path.join(BeamLisp.Bootstrap.seed_dir(),"manifest.term")))
 producer=manifest["compiler_key"]
 unless BeamLisp.AOTCache.current_compiler_key()!=producer, do: raise "source-free control did not lose compiler Source identity"
@@ -25,23 +37,23 @@ tracer=spawn(fn ->
 end)
 for pattern<-patterns, do: 1=:erlang.trace_pattern(pattern,true,[:local])
 :erlang.trace(self(),true,[:call,{:tracer,tracer}])
-value=BeamLisp.run_runtime_artifact("program",["runtime-argument"])
+value=BeamLisp.run_runtime_artifact(program,["runtime-argument"])
 [42,99,42]=BeamLisp.Vector.to_list(value)
 false=BeamLisp.Env.seeded?()
 false=BeamLisp.Env.retire_module!(BeamLisp.Ns.Body.Rt)
 false=BeamLisp.Env.retire_module!(BeamLisp.Ns.Body.Core)
-[42,99,42]=BeamLisp.run_runtime_artifact("program",[]) |> BeamLisp.Vector.to_list()
+[42,99,42]=BeamLisp.run_runtime_artifact(program,[]) |> BeamLisp.Vector.to_list()
 false=BeamLisp.Env.seeded?()
 first_owner=Process.whereis(BeamLisp.Env)
 Agent.stop(BeamLisp.Env)
-[42,99,42]=BeamLisp.run_runtime_artifact("program",[]) |> BeamLisp.Vector.to_list()
+[42,99,42]=BeamLisp.run_runtime_artifact(program,[]) |> BeamLisp.Vector.to_list()
 second_owner=Process.whereis(BeamLisp.Env)
 unless first_owner != second_owner and Process.alive?(second_owner), do: raise "runtime did not recover actual Env ownership"
 false=BeamLisp.Env.retire_module!(BeamLisp.Ns.Body.Rt)
 false=BeamLisp.Env.seeded?()
 for {name,expected} <- [{"language",[42,102,42,42]},{"query",[4,6]},
                         {"mailbox",[42,107,99]},{"cleanup",[42,100,40,200]}] do
- result=BeamLisp.run_runtime_artifact(Path.join("showcases",name),[])
+ result=BeamLisp.run_runtime_artifact(Path.join(showcases,name),[])
  actual=if is_struct(result,BeamLisp.Vector), do: BeamLisp.Vector.to_list(result), else: result
  unless actual==expected, do: raise "runtime showcase #{name}: #{inspect(actual)}"
  IO.puts("RUNTIME-SHOWCASE #{name} #{inspect(actual,charlists: :as_lists)}")
@@ -59,7 +71,7 @@ rescue
   unless Map.get(error,:original)==:runtime_floor_replacement_requires_restart, do: reraise(error,__STACKTRACE__)
 end
 ^before=BeamLisp.Ns.Body.Rt.module_info(:md5)
-[42,99,42]=BeamLisp.run_runtime_artifact("program",[]) |> BeamLisp.Vector.to_list()
+[42,99,42]=BeamLisp.run_runtime_artifact(program,[]) |> BeamLisp.Vector.to_list()
 barrier=:erlang.trace_delivered(:all)
 receive do {:trace_delivered,:all,^barrier}->:ok after 5000->raise "trace barrier timed out" end
 ticket=make_ref();send(tracer,{:finish,ticket})

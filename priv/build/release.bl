@@ -282,8 +282,9 @@
 (defn- make-boot-script!
   "`systools.make_script/2` → `$ROOT/lib` → `$RELEASE_LIB` → `script2boot/1`.
 
-   `systools` is told `:path [rel-dir lib-dir]` (so it finds the `.rel` and
-   every app's `.app`) and `:outdir rel-dir`. `script2boot` is given the
+   `systools` is told the copied apps' actual ebin directories, before the
+   producer code path. A parent lib directory does not select its children's
+   app resources: the producer's same-named app can otherwise win. `script2boot` is given the
    extension-less STEM — it appends `.boot` itself. The rewrite is global
    because the launcher passes `--boot-var RELEASE_LIB \"$ROOT/lib\"`: both
    spellings resolve to the same directory, and one rewrite covers the OTP apps
@@ -292,11 +293,13 @@
   (let [rel-dir (Path/join (Path/join out "releases") vsn)
         lib-dir (Path/join out "lib")
         script (Path/join rel-dir (str name ".script"))
+        paths (cons (String/to_charlist rel-dir)
+                (Enum/map (Path/wildcard (Path/join lib-dir "*/ebin"))
+                  (fn [path] (String/to_charlist path))))
         r (erlang/apply :systools :make_script
                         (list (String/to_charlist name)
                               (list (erlang/list_to_tuple
-                                      (list :path (list (String/to_charlist rel-dir)
-                                                        (String/to_charlist lib-dir))))
+                                      (list :path paths))
                                     (erlang/list_to_tuple (list :outdir (String/to_charlist rel-dir)))
                                     :silent)))]
     (if (= :error (erlang/element 1 r))
@@ -635,3 +638,141 @@
      (if (:ok? check)
        (assemble-tree v out)
        {:ok? false :out out :apps 0 :warnings 0 :errors (:errors check)}))))
+
+; Compiled programs use the same release assembler, with a runtime app resource
+; instead of the Source application's compiler-starting callback. Nothing here
+; grants SDK admission or turns the runtime image into a compiler SDK.
+(defn- runtime-call [namespace function args]
+  (BeamLisp.Loader/ensure_loaded namespace)
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! namespace function) args))
+
+(defn- runtime-name! [value]
+  (when-not (symbol? value)
+    (throw (ex-info "Runtime entry names must be quoted symbols" {:kind :runtime-release-name})))
+  (let [s (str value) chars (String/to_charlist s)]
+    (when-not (and (<= 1 (count chars) 64)
+                  (Enum/all? chars (fn [c] (or (<= 97 c 122) (<= 48 c 57) (= c 95) (= c 45)))))
+      (throw (ex-info "Invalid runtime entry name" {:kind :runtime-release-name :name s})))
+    s))
+
+(defn- write-runtime-app! [app floor manifest]
+  (let [ebin (Path/join app "ebin") seed (Path/join app "priv/bootstrap/seed")
+        original (get manifest "app")
+        original-bytes (BeamLisp.AOT/sdk_cache_read_bounded!
+                         (Path/join (BeamLisp.Bootstrap/seed_dir) "beam_lisp.app") 1048576)
+        actual (Base/encode16 (crypto/hash :sha256 original-bytes) (list (tuple :case :lower)))]
+    (when-not (and (= "beam_lisp.app" (get original "file")) (= actual (get original "sha256")))
+      (throw (ex-info "Runtime floor app changed" {:kind :runtime-release-floor-app})))
+    (File/mkdir_p! ebin) (File/mkdir_p! seed)
+    (doseq [pair (:prepared floor)]
+      (let [beam (elem pair 0) name (str (Atom/to_string (elem beam 0)) ".beam")]
+        (File/write! (Path/join ebin name) (elem beam 1))
+        (File/write! (Path/join seed name) (elem beam 1))))
+    (File/write! (Path/join seed "beam_lisp.app") original-bytes)
+    (File/write! (Path/join seed "manifest.term")
+      (erlang/iolist_to_binary (io_lib/format "~p.~n" (list manifest))))
+    (File/write! (Path/join ebin "beam_lisp.app")
+      (erlang/iolist_to_binary
+        (io_lib/format "~p.~n"
+          (list (tuple :application :beam_lisp
+            (list (tuple :description (String/to_charlist "Compiled beam-lisp runtime"))
+                  (tuple :vsn (String/to_charlist "0.1.0"))
+                  (tuple :modules (Enum/map (:prepared floor) (fn [pair] (elem (elem pair 0) 0))))
+                  (tuple :registered (list))
+                  (tuple :applications (list :kernel :stdlib :elixir :crypto))))))))
+    (File/mkdir_p! (Path/join app "priv/native"))
+    (File/write! (Path/join app "priv/native/lazy_memo.so")
+      (BeamLisp.AOT/sdk_cache_read_bounded!
+        (Path/join (BeamLisp.Tiers/priv_root) "native/lazy_memo.so") 33554432))))
+
+(defn- runtime-release-value [app]
+  (let [deps (distinct (concat (app-closure :elixir) (app-closure :crypto) (tool-apps)))]
+    {:name "beam_lisp" :vsn "0.1.0"
+     :erts {:vsn (text (erlang/system_info :version)) :dir (erts-root)}
+     :apps (into [{:app :beam_lisp :vsn "0.1.0" :dir app}] (map app-info deps))
+     :optional #{:z3}}))
+
+(defn- verify-runtime-tree! [tree expected]
+  ;; A fixed native probe, not a program entry or Source compiler invocation.
+  ;; Boot the COPIED native product: the producer's already-loaded identity
+  ;; cannot attest the file currently at its library pathname.
+  (let [probe (str "{:ok, _} = Application.ensure_all_started(:crypto); "
+                   "floor = BeamLisp.AOT.runtime_floor!(); "
+                   "IO.puts(Base.encode16(floor.identity, case: :lower))")
+        result (System/cmd (Path/join tree "bin/bl") (list "eval" probe)
+                 (list (tuple :cd tree) (tuple :stderr_to_stdout true)
+                       (tuple :env (list (tuple "BL_ROOT" nil) (tuple "BL_SEED_DIR" nil)
+                                         (tuple "BL_BOOTSTRAP_SEED" nil)))))
+        wanted (Base/encode16 expected (list (tuple :case :lower)))]
+    (when-not (and (= 0 (elem result 1)) (= wanted (String/trim (elem result 0))))
+      (throw (ex-info "Copied runtime does not match the selected program target"
+               {:kind :runtime-release-target-changed :output (String/slice (elem result 0) 0 4096)})))
+    :ok))
+
+(defn- write-runtime-launcher! [tree entry]
+  (let [path (Path/join tree "bin/run")]
+    (File/write! path
+      (str "#!/bin/sh\nset -eu\n"
+           "ROOT=$(CDPATH='' cd \"$(dirname \"$0\")/..\" && pwd -P)\n"
+           "export BL_RUNTIME_PROGRAM=\"$ROOT/programs/" entry "\"\n"
+           "exec \"$ROOT/bin/bl\" eval '"
+           "value = BeamLisp.run_runtime_artifact(System.fetch_env!(\"BL_RUNTIME_PROGRAM\"), System.argv()); IO.puts(BeamLisp.Ns.Rt.print_readably(value))"
+           "' \"$@\"\n"))
+    (File/chmod! path 493)))
+
+(defn assemble-runtime!
+  "Assemble verified contextual packages with bundled ERTS and no Source or
+   phase payload. Quoted symbols select named programs and the default entry.
+   Reuses the release assembler and workspace claim. Output must be absent.
+   Run build commands under a process-tree memory/time cap, as for self-build."
+  ([directory output] (assemble-runtime! {'main directory} 'main output))
+  ([programs entry output]
+   (when-not (and (map? programs) (<= 1 (count programs) 32) (contains? programs entry))
+     (throw (ex-info "Invalid runtime release programs" {:kind :runtime-release-programs})))
+   (let [entry-name (runtime-name! entry)
+         names (Enum/sort (Enum/map (Map/keys programs) (fn [key] (runtime-name! key))))
+         output (Path/expand output (BeamLisp/cwd))]
+     (when-not (= (tuple :error :enoent) (File/lstat output))
+       (throw (ex-info "Runtime release output exists" {:kind :runtime-release-output-exists :output output})))
+     (let [floor (BeamLisp.AOT/runtime_floor!) manifest (BeamLisp.Bootstrap/manifest)
+           acquired (runtime-call "claim" "acquire!" (list output "compiled runtime release"))]
+       (when-not (:ok? acquired)
+         (throw (ex-info "Runtime release workspace held" {:kind :build-workspace-held :held (:held acquired)})))
+       (try
+         (when-not (= (list ".claim") (File/ls! output))
+           (throw (ex-info "Runtime release output exists" {:kind :runtime-release-output-exists :output output})))
+         (let [stage (Path/join output (str ".runtime-stage-" (erlang/unique_integer (list :positive))))]
+           (File/mkdir! stage)
+           (try
+             (let [app (Path/join stage "beam_lisp-0.1.0") tree (Path/join stage "tree")]
+               (write-runtime-app! app floor manifest)
+               (let [built (assemble (runtime-release-value app) tree)]
+                 (when-not (:ok? built)
+                   (throw (ex-info (str "Runtime release assembly failed: " (pr-str (:errors built)))
+                            {:kind :runtime-release-assembly :errors (:errors built)}))))
+               (doseq [key (Map/keys programs)]
+                 (let [name (runtime-name! key) destination (Path/join tree (str "programs/" name))]
+                   (File/mkdir_p! (Path/dirname destination))
+                   (runtime-call "compile.world" "package-runtime!" (list (get programs key) destination))
+                   (let [unit (BeamLisp.AOT/capture_runtime_unit destination)
+                         members (BeamLisp.AOT/contextual_unit_members! unit)]
+                     (when-not (= (:identity floor) (get-in members [:metadata :runtime-image]))
+                       (throw (ex-info "Program selects a different runtime" {:kind :runtime-release-target-changed :program key}))))))
+               ;; Projection uses claim anchors outside individual packages.
+               ;; Build custody stays in the producer stage, not the product.
+               (File/rm_rf! (Path/join tree "programs/.bl"))
+               (verify-runtime-tree! tree (:identity floor))
+               (write-runtime-launcher! tree entry-name)
+               (doseq [name (File/ls! tree)] (File/rename! (Path/join tree name) (Path/join output name)))
+               (let [receipt {:version 1 :kind :compiled-runtime-release :out output
+                              :entry entry :programs names :runtime-image (:identity floor)
+                              :source-free true :bundled-erts true :sdk-image false :native-admission false}]
+                 (File/write! (Path/join output "runtime-image.term")
+                   (erlang/iolist_to_binary (io_lib/format "~p.~n" (list receipt))))
+                 (assoc receipt :ok? true)))
+             (finally (File/rm_rf! stage))))
+         (finally
+           (runtime-call "claim" "release!" (list output))
+           ;; Remove only an empty, newly-created output after refusal. A
+           ;; partial publication or another writer's files are preserved.
+           (File/rmdir output)))))))

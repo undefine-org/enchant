@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--seed', type=Path)
     parser.add_argument('--native-variant', type=Path,
                         help='a separately built, callable LazyMemo product with a different build identity')
+    parser.add_argument('--release', action='store_true',
+                        help='also assemble, relocate and execute a source-free bundled ERTS release')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     root, output = args.root.resolve(), args.out.absolute()
@@ -35,7 +37,8 @@ def main():
                              if p.is_file() and p.suffix in ('.so', '.dylib', '.dll'))
     drivers = [root / 'test/scripts/runtime-image-producer.bl', root / 'test/scripts/runtime-image-consumer.exs',
                root / 'test/scripts/runtime-image-adoption.exs',
-               root / 'test/scripts/runtime-native-identity.exs']
+               root / 'test/scripts/runtime-native-identity.exs',
+               root / 'test/scripts/runtime-release-native-control.bl']
     watched = sorted({Path(__file__).resolve(), *drivers, *native_products, root / 'env.bl',
                       root / 'scripts/demo-artifact-production',
                       *(root / 'native/lazy_memo/src').rglob('*.rs'),
@@ -95,10 +98,23 @@ def main():
                        BL_RUNTIME_IMAGE_WORLD=str(root / 'test/fixtures/contextual-validation/world.bl'),
                        XDG_CACHE_HOME=str(image / 'cache'),
                        ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+            if args.release:
+                env['BL_RUNTIME_RELEASE_OUT'] = str(output / 'release')
+            else:
+                env.pop('BL_RUNTIME_RELEASE_OUT', None)
             command = ['elixir']
             for dep in deps:
                 command += ['-pa', str(dep)]
             run('producer', [*command, '-pa', str(app / 'ebin'), str(image / 'boot.exs')], image, env)
+            if args.release and variant:
+                env.update(BL_ARTIFACT_DRIVER=str(drivers[4]),
+                           BL_RUNTIME_NATIVE_CONTROL=str(variant),
+                           BL_RUNTIME_RELEASE_CONTROL_UNIT=str(output / 'program'),
+                           BL_RUNTIME_RELEASE_CONTROL_OUT=str(output / 'refused-release'))
+                run('release-native-refusal', [*command, '-pa', str(app / 'ebin'), str(image / 'boot.exs')], image, env)
+                if (output / 'refused-release').exists():
+                    raise RuntimeError('refused release retained its uncommitted workspace')
+                report['release_changed_native_file_refused_before_publication'] = True
         image = output / 'image'
         app = image / 'lib/beam_lisp-0.1.0'
         shutil.copytree(seed, app / 'ebin')
@@ -160,6 +176,27 @@ def main():
                       adoption_request_bytes=int(re.search(r'request-bytes=(\d+)', (output / 'adoption.log').read_text()).group(1)),
                       showcases={'language': [42, 102, 42, 42], 'query': [4, 6],
                                  'mailbox': [42, 107, 99], 'cleanup': [42, 100, 40, 200]})
+        if args.release:
+            release = output / 'relocated-release'
+            (output / 'release').rename(release)
+            forbidden = [p for p in release.rglob('*')
+                         if p.name == '.bl' or p.suffix in ('.bl', '.phase', '.rs')]
+            if forbidden:
+                raise RuntimeError(f'release contains Source, phase or build state: {forbidden[:4]}')
+            receipt = release / 'runtime-image.term'
+            if not receipt.is_file():
+                raise RuntimeError('runtime release did not publish its completion receipt')
+            release_env = dict(env, BL_RUNTIME_MAIN='programs/validation',
+                               BL_RUNTIME_SHOWCASES='programs', BL_RUNTIME_EXPECT_ROOT=str(release))
+            release_env.pop('BL_RUNTIME_RELEASE_OUT', None)
+            run('release-consumer', [str(release / 'bin/bl'), 'eval',
+                 'Code.require_file(System.fetch_env!("BL_RUNTIME_HARNESS"))'], release,
+                dict(release_env, BL_RUNTIME_HARNESS=str(drivers[1])))
+            run('release-launcher', [str(release / 'bin/run'), 'first-argument'], output, release_env)
+            if '[42 99 42]' not in (output / 'release-launcher.log').read_text():
+                raise RuntimeError('bundled runtime launcher did not return its program value')
+            report.update(bundled_erts=True, source_free_release=True, relocated_release=True,
+                          bundled_beam_executable=True, external_release_code_paths=False)
     except Exception as error:
         report.update(status='error', error=str(error))
         raise
