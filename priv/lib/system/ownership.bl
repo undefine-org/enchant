@@ -583,18 +583,24 @@
  (let [active? (fn [id point]
                  (contains? #{:owned :borrowed :pending :prepared}
                             (get-in states [point :resources id :phase])))
-       resources (set (mapcat (fn [[point state]]
-                                (keep #(when (active? % point) %) (keys (:resources state)))) states))
+       ;; This finite graph pass must not build retained LazySeq recipes for
+       ;; every state/resource pair. Its admission budget is the engine's work
+       ;; bound, independent of unrelated VM-wide lazy-cache occupancy.
+       points (maps/keys states)
+       resources (reduce (fn [out [point state]]
+                           (reduce (fn [out id] (if (active? id point) (conj out id) out))
+                                   out (maps/keys (:resources state)))) #{} states)
        unresolved
-       (vec (keep (fn [id]
-               (let [released (gfp/af (keys states)
+       (reduce (fn [out id]
+               (let [released (gfp/af points
                                 (fn [point] (work! engine) (get edges point #{}))
                                 (fn [point] (work! engine) (not (active? id point))))
-                     pending (filter #(and (active? id %) (not (contains? released %))) (keys states))]
-                (when (seq pending) {:resource id :states (count pending) :sample (vec (take 16 pending))})))
-             resources))]
+                     pending (Enum/filter points #(and (active? id %) (not (contains? released %))))]
+                (if (seq pending)
+                 (conj out {:resource id :states (count pending) :sample (vec (Enum/take pending 16))}) out)))
+             [] resources)]
   {:scope :finite-cleanup-inevitability :status (if (seq unresolved) :unknown :proved)
-   :resources (count resources) :unresolved (count unresolved) :witnesses (vec (take 32 unresolved))
+   :resources (count resources) :unresolved (count unresolved) :witnesses (vec (Enum/take unresolved 32))
    :termination :not-proved :native-admission false}))
 
 (defn- failure-evidence [kind reason stack]
@@ -685,8 +691,10 @@
                  :scope :entry-local :reuse-across-snapshots false :native-admission false}
      :entries results :states (count states) :steps (- (get options :max-steps 100000) (:remaining @engine))
      :issues (vec issues) :runtime-obligations (vec obligations)
-     :diagnostics (vec (keep #(errors/node->warning :ownership {:ann (:origin %)}
-                                    (str "Possible ownership violation: " (name (:kind %)))) issues))})
+     :diagnostics (vec (Enum/filter
+                        (Enum/map issues #(errors/node->warning :ownership {:ann (:origin %)}
+                                            (str "Possible ownership violation: " (name (:kind %)))))
+                        some?))})
    (catch-raw [error-kind error error-stack]
     {:version 2 :scope :finite-anf-entry-lifecycle :status :unknown :native-admission false
      :kind (or (:kind (ex-data error)) :ownership-analysis-error)
