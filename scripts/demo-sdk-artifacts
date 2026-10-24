@@ -21,7 +21,14 @@ def main():
     parser.add_argument('--seed', type=Path)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--all-sdk', action='store_true', help='build the actual self-build library selection')
+    parser.add_argument('--activation-smoke', action='store_true', help='build the actual activation dependency graph before the full inventory gate')
+    parser.add_argument('--source-free', action='store_true', help='remove SDK Source after full production and use an empty-cache receiver')
     args = parser.parse_args()
+    if args.all_sdk and args.activation_smoke:
+        parser.error('choose --all-sdk or --activation-smoke')
+    inventory_mode = args.all_sdk or args.activation_smoke
+    if args.source_free and not inventory_mode:
+        parser.error('--source-free requires --all-sdk or --activation-smoke')
     root, output = args.root.resolve(), args.out.absolute()
     seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
     if os.path.lexists(output):
@@ -29,7 +36,7 @@ def main():
     output.mkdir(parents=True)
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     drivers = [root / 'test/scripts/sdk-artifact-build.bl', root / 'test/scripts/sdk-artifact-consumer.bl']
-    if args.all_sdk:
+    if inventory_mode:
         drivers[0] = root / 'test/scripts/sdk-artifact-all.bl'
     fixtures = root / 'test/fixtures/sdk-artifacts'
     trace = root / 'test/scripts/sdk-artifact-trace.exs'
@@ -40,6 +47,7 @@ def main():
     seed_inputs = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
     (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
     report = {'version': 1, 'scope': 'artifact-sdk-build-and-sealed-image', 'status': 'running',
+              'selection': 'activation-smoke' if args.activation_smoke else 'all-sdk' if args.all_sdk else 'scenario',
               'seconds': {}, 'full_sdk_qualified': False, 'source_free_sdk': False,
               'native_execution_admission': False}
     image = output / 'image'
@@ -61,6 +69,10 @@ def main():
     boot = boot.replace('BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))',
                         'if file = System.get_env("BL_SDK_ARTIFACT_TRACE"), do: Code.require_file(file)\n'
                         'BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))')
+    if args.source_free:
+        boot = boot.replace('BeamLisp.AOTCache.current_compiler_key()',
+                            '(if System.get_env("BL_SDK_ARTIFACT_SOURCE_FREE") == "yes", '
+                            'do: BeamLisp.AOTCache.compiler_key(), else: BeamLisp.AOTCache.current_compiler_key())')
     (image / 'boot.exs').write_text(boot)
     deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / 'deps').glob('*/ebin')),
                                                   *sorted((root / '_build').glob('*/lib/*/ebin'))]))
@@ -70,12 +82,14 @@ def main():
     command += ['-pa', str(app / 'ebin'), str(image / 'boot.exs')]
     env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off', BL_SDK_ARTIFACT_OUT=str(output),
                XDG_CACHE_HOME=str(image / 'cache'), ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+    if args.activation_smoke:
+        env['BL_SDK_ARTIFACT_SMOKE'] = 'yes'
 
     def run(stage, driver):
         started = time.monotonic()
         done = subprocess.run(command, cwd=image, env=dict(env, BL_ARTIFACT_DRIVER=str(driver)),
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              timeout=900 if args.all_sdk else 240)
+                              timeout=900 if inventory_mode else 240)
         report['seconds'][stage] = round(time.monotonic() - started, 3)
         (output / f'{stage}.log').write_text(done.stdout)
         print(done.stdout[-10000:], end='', flush=True)
@@ -87,12 +101,22 @@ def main():
             raise RuntimeError('selected floor changed during qualification')
 
     try:
-        if not args.all_sdk:
+        if not inventory_mode:
             env['BL_SDK_ARTIFACT_TRACE'] = str(trace)
         run('producer', drivers[0])
         report['producer'] = json.loads((output / 'producer.json').read_text())
         env.pop('BL_SDK_ARTIFACT_TRACE', None)
-        if args.all_sdk:
+        if args.source_free:
+            removed = []
+            for file in sorted((image / 'priv').rglob('*')):
+                if file.is_file() and file.name.endswith(('.bl', '.bl.md', '.ex', '.exs', '.rs', '.org')):
+                    removed.append(str(file.relative_to(image)))
+                    file.unlink()
+            (image / 'env.bl').unlink()
+            report['removed_source_files'] = len(removed)
+            (output / 'removed-source.json').write_text(json.dumps(removed, indent=2) + '\n')
+            env['BL_SDK_ARTIFACT_SOURCE_FREE'] = 'yes'
+        if inventory_mode:
             # The full producer uses the original 40-valued provider; the
             # seven-unit scenario changes it to 50 before sealing its image.
             env['BL_SDK_ARTIFACT_EXPECTED'] = '42'
@@ -107,7 +131,18 @@ def main():
             run('tamper', drivers[1])
         finally:
             victim.write_bytes(original)
-        report.update(status='passed', tampering_refused_before_initialization=True)
+        if args.source_free:
+            inventory = image / 'priv/sdk-code.term'
+            sealed = inventory.read_bytes()
+            try:
+                env.pop('BL_SDK_ARTIFACT_TAMPER', None)
+                env['BL_SDK_ARTIFACT_MISSING'] = 'yes'
+                run('missing-unit', drivers[1])
+            finally:
+                inventory.write_bytes(sealed)
+            report['missing_unit_refused_before_initialization'] = True
+        report.update(status='passed', tampering_refused_before_initialization=True,
+                      source_free_sdk=args.source_free)
     except Exception as error:
         report.update(status='error', error=str(error))
         raise

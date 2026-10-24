@@ -1841,6 +1841,7 @@
                      (list (tuple :bl_aot_replay_version 1)
                            (tuple :bl_source_hash source_hash)
                            (tuple :bl_unit_source_digest input_digest)
+                           (tuple :bl_unit_requires (tuple :requires (Map/get ns_meta :requires (list))))
                            (tuple :bl_aot_artifact_version 1)
                            (tuple :bl_unit_namespace ns))
                      (if floor? (list) (list (tuple :bl_compiler_key stamp_key))))
@@ -1888,6 +1889,7 @@
                 (tuple :bl_aot_phase_library (elem init_pair 3))
                 (tuple :bl_aot_replay_complete (erlang/== true (Map/get ns_meta :replay-complete)))
                 (tuple :bl_unit_source_digest input_digest)
+                (tuple :bl_unit_requires (tuple :requires (Map/get ns_meta :requires (list))))
                 (tuple :bl_aot_artifact_version 1)
                 (tuple :bl_aot_artifact_role :mutable-forwarder)
                 (tuple :bl_unit_namespace ns)
@@ -2144,6 +2146,15 @@
   (let [value (Keyword/get attrs key)]
     (if (and (erlang/is_list value) (erlang/== 1 (erlang/length value)))
       (erlang/hd value) value)))
+
+(defn- sdk_unit_requires [attrs]
+ (when-let [header (normalized_attribute attrs :bl_unit_requires)]
+  (when-not (and (erlang/is_tuple header) (erlang/== 2 (erlang/tuple_size header))
+                 (erlang/== :requires (elem header 0)) (erlang/is_list (elem header 1))
+                 (erlang/=< (erlang/length (elem header 1)) 1024)
+                 (Enum/all? (elem header 1) (fn [name] (erlang/is_binary name))))
+   (erlang/error :sdk_image_invalid_requirements))
+  (elem header 1)))
 
 ;; Validate only compiler-produced straight-line namespace forwarders. Unknown
 ;; VM instructions fail closed. Labels/line metadata carry no executable power.
@@ -2668,6 +2679,7 @@
         (normalized_attribute attrs :bl_aot_forwarder_namespace)
         (normalized_attribute attrs :bl_aot_forwarder_routes)))
     {:source (Path/relative_to source root) :source-digest input_digest
+     :requires (sdk_unit_requires attrs)
      :sha256 (crypto/hash :sha256 bytes) :md5 (elem (elem (beam_lib/md5 bytes) 1) 1)
      :imports (Enum/uniq (Enum/map (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                             (fn [entry] (elem entry 0))))
@@ -3054,11 +3066,13 @@
              :else nil)
        module (when (erlang/is_function arm arity) (elem (erlang/fun_info arm :module) 1))
        row (when module (sdk_compiler_row module))
-       source (physical_sdk_path (sdk_native_source_path ns))
-       root (physical_sdk_path (BeamLisp.Tiers/priv_root))]
+       root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+       source (or (physical_sdk_path (sdk_native_source_path ns))
+                  (when row (sdk_unit_source_path root (Map/get row :source))))]
   (when-not (and module row (erlang/== :external (elem (erlang/fun_info arm :type) 1))
                  (erlang/== name (Atom/to_string (elem (erlang/fun_info arm :name) 1)))
                  (erlang/== (Path/relative_to source root) (Map/get row :source))
+                 (sdk_source_current? root module row)
                  (erlang/== (Map/get row :md5) (erlang/apply module :module_info (list :md5))))
    (erlang/error (tuple :unattested_sdk_native_producer ns name)))
   arm))
@@ -3481,7 +3495,7 @@
                 (erlang/== identity (Path/basename identity))
                 (erlang/not (String/contains? identity "\\")))
     (erlang/error :invalid_sdk_inventory_module_name))
-  (Path/join (Path/dirname root) (str "ebin/" identity ".beam")))
+  (Path/join (Path/dirname root) (erlang/iolist_to_binary (list "ebin/" identity ".beam"))))
 
 (defn- image_sdk_entry! [root identity row]
   ;; Only a selected root/import is loaded. The full image manifest remains
@@ -3496,6 +3510,36 @@
     (when-not (Code/ensure_loaded? mod) (erlang/error :sdk_image_imports_changed))
     (erlang/element 2 decoded)))
 
+(defn sdk_unit_source_path
+ "A canonical recorded Source location, including an absent packaged input.
+  This is provenance data, not evidence that a file exists or owns any code."
+ [root name]
+ (when (and (erlang/is_binary root) (erlang/is_binary name)
+            (erlang/=< 1 (erlang/byte_size name)) (erlang/=< (erlang/byte_size name) 4096)
+            (erlang/== :relative (Path/type name)))
+  (let [candidate (Path/expand name root) stat (File/lstat candidate)
+        source (if (erlang/== (tuple :error :enoent) stat) candidate (physical_sdk_path candidate))]
+   (when (and source (erlang/== name (Path/relative_to source root))
+                    (String/starts_with? source (erlang/iolist_to_binary (list root "/")))) source))))
+
+(defn sdk_source_current?
+ "Check live SDK Source when present. An absent input is acceptable only for
+  this exact member of the actual sealed image, whose bytes are verified here.
+  A missing file alone and a caller's row never create image ownership."
+ [root module row]
+ (let [name (Map/get row :source)
+       source (sdk_unit_source_path root name)
+       relative (when source (Path/relative_to source root))]
+  (and source (erlang/== name relative) (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
+       (if (File/exists? source)
+        (erlang/== (crypto/hash :sha256 (BeamLisp.Loader/read_source source)) (Map/get row :source-digest))
+        (let [path (Path/join root "sdk-code.term")
+              raw (when (File/regular? path) (inventory_row path module))]
+         (and raw
+              (erlang/== (Map/take raw (list :source :source-digest :sha256 :compiler-key))
+                 (Map/take row (list :source :source-digest :sha256 :compiler-key)))
+              (erlang/not (erlang/== nil (image_sdk_entry! root (Atom/to_string module) raw)))))))))
+
 (defn decode_sdk_image_metadata!
   "Pure decoding for the native metadata cache. No loading, evaluation, caller
    callback or ownership publication. Live code/source checks remain at use."
@@ -3509,6 +3553,20 @@
         attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
         callable (normalized_attribute attrs :bl_sdk_callable_kinds)
         initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+    ;; The inventory's Source identity remains provenance after packaging. Its
+    ;; executable policy must still agree with the bytes, never merely a row.
+    (when (Map/get row :source)
+      (let [members (normalized_attribute attrs :bl_aot_unit_members)
+            references (when (and (erlang/is_tuple members) (= 2 (erlang/tuple_size members))
+                                   (= :members (elem members 0)))
+                         (Enum/map (elem members 1) (fn [member] (Atom/to_string member))))]
+        (when-not (and (= 1 (normalized_attribute attrs :bl_aot_artifact_version))
+                       (= (Map/get row :role) (normalized_attribute attrs :bl_aot_artifact_role))
+                       (= (Map/get row :source-digest) (normalized_attribute attrs :bl_unit_source_digest))
+                       (= (Map/get row :declaration-owner) (normalized_attribute attrs :bl_declaration_owner))
+                       (= (Map/get row :unit-references) references)
+                       (= (Map/get row :requires) (sdk_unit_requires attrs)))
+          (erlang/error :sdk_image_unit_metadata_changed))))
     (when (and initializer_kind
                (not (and (= :initializer (Map/get row :role)) (contains? #{:values :macros :namespace} initializer_kind))))
       (erlang/error :sdk_image_invalid_initializer_lambda_kind))
@@ -3601,10 +3659,10 @@
           (when-not (and (erlang/is_atom mod)
                         (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key))
                         (or (Map/get row :seed?)
-                          (and source (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
-                            (erlang/== (Map/get row :source-digest)
-                              (if (Map/has_key? seen source_name) (Map/get seen source_name)
-                                (crypto/hash :sha256 (BeamLisp.Loader/read_source source)))))))
+                          (if (and source (Map/has_key? seen source_name) (File/exists? source))
+                            (and (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
+                                 (erlang/== (Map/get row :source-digest) (Map/get seen source_name)))
+                            (sdk_source_current? root mod row))))
             (erlang/error :stale_sdk_runtime_inventory))
           (when-not (and (erlang/module_loaded mod)
                         (or (erlang/== (erlang/apply mod :module_info (list :md5)) (Map/get row :md5))
@@ -3704,10 +3762,8 @@
     (when-not (and row (erlang/== (tuple ns name) (Map/get row :declaration-owner))
                   (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key)))
       (erlang/error :unattested_framework_declaration))
-    (let [source (physical_sdk_path (Path/join root (Map/fetch! row :source)))]
-      (when-not (and source (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
-                    (erlang/== (crypto/hash :sha256 (BeamLisp.Loader/read_source source))
-                               (Map/get row :source-digest)))
+    (let [source (sdk_unit_source_path root (Map/fetch! row :source))]
+      (when-not (sdk_source_current? root mod row)
         (erlang/error :stale_framework_source_evidence)))
     (when image?
       (let [path (Path/join (Path/dirname root)
@@ -4112,9 +4168,11 @@
                     ;; boot/compiler receipts before publishing the shared lease.
                     (when (ets/member :beam_lisp_vars :bl_sdk_runtime_lease)
                       (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-                            source (physical_sdk_path (BeamLisp.Loader/source_path ns))]
-                        (when (and root source
-                                   (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))
+                            source (physical_sdk_path (BeamLisp.Loader/source_path ns))
+                            image (Path/join root "sdk-code.term")
+                            member (when (File/regular? image) (inventory_row image mod))]
+                        (when (and root (or member (and source
+                                   (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))))
                           (if (File/exists? (Path/join root "sdk-code.term"))
                             ;; Existing SDK lifetime: extend BEFORE initializer
                             ;; effects, for image and ordinary cached source alike.
@@ -4152,10 +4210,31 @@
   [ns]
   :when (string? ns)
   (let [mod (BeamLisp.Link/module_for ns)
-        source (when (library_tier? ns) (BeamLisp.Loader/source_path ns))]
+        selected (BeamLisp.Loader/source_path ns)
+        source (when (library_tier? ns) selected)
+        input (when (nil? selected) (sdk_inventory_input))
+        image-row (when (and input (elem input 1))
+                    (BeamLisp.Env/sdk_inventory_metadata! (elem input 1) (Atom/to_string mod)))
+        missing? (and input (elem input 1) (nil? image-row)
+                  (not (if (BeamLisp.Env/seeded?)
+                         (or (seed_dependency! mod)
+                             (seed_forwarder_dependency_from_manifest! mod (BeamLisp.Bootstrap/manifest)))
+                         (BeamLisp.Bootstrap/packaged_member? mod))))]
+    (if missing?
+      ;; A virtual namespace (e.g. the seeded cpp aliases) has no executable
+      ;; unit. Return directly to the registry-aware Source miss path; never
+      ;; race a second lookup into loading an unowned image module.
+      (if (= :non_existing (code/which mod)) :no_module
+        (erlang/error (tuple :sdk_image_unit_missing ns)))
     ;; Library source must obtain its checked callable values before its FIRST
     ;; initializer, even when no application has acquired the SDK lease yet.
     ;; Recovery bootstrap and source-absent images retain their native path.
+    (if image-row
+      (do
+        ;; Complete sealed-unit authentication precedes every initializer, even
+        ;; before the first managed SDK lifetime exists. No Source fallback.
+        (sdk_image_load_unit! ns (elem input 0) (elem input 1))
+        (init_loaded_module ns mod))
     (if (and (library_tier? ns) (erlang/not (BeamLisp.Env/loaded_ns? ns))
              (staged_sdk_source? ns source))
       (compile_sdk_source! ns (BeamLisp.Loader/read_source source) source)
@@ -4169,7 +4248,7 @@
 
         :else
           (init_loaded_module ns mod))
-      (repair_or_no_module ns)))))
+      (repair_or_no_module ns)))))))
 
 ; ── repairing a stale or missing library artifact ──────────────────────────
 ;
@@ -5100,21 +5179,26 @@
   (let [shim (BeamLisp.Emit/module_for ns)
         raw (BeamLisp.Env/sdk_inventory_metadata! bytes (Atom/to_string shim))]
     (when raw
-      (let [source (physical_sdk_path (sdk_native_source_path ns))
-            content (when source (BeamLisp.Loader/read_source source))
+      (let [selected (sdk_native_source_path ns)
+            source (or (physical_sdk_path selected) (sdk_unit_source_path root (Map/get raw :source)))
+            content (when (and source (File/exists? source)) (BeamLisp.Loader/read_source source))
             references (Map/get raw :unit-references)
             identities (when (erlang/is_list references)
                          (cons (Atom/to_string shim) references))]
-        (when-not (and source content
+        (when-not (and source
                        (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get raw :compiler-key))
-                       (String/starts_with? source (str root "/"))
+                       (erlang/== ns (Map/get raw :forwarder-namespace))
+                       (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
                        (erlang/== (Path/relative_to source root) (Map/get raw :source))
-                       (erlang/== (crypto/hash :sha256 content) (Map/get raw :source-digest))
+                       (or (erlang/== nil content) (erlang/== (crypto/hash :sha256 content) (Map/get raw :source-digest)))
                        identities (erlang/=< (erlang/length identities) 8192))
           (erlang/error (tuple :sdk_image_preload_source_changed ns)))
-        (let [header (BeamLisp.SourceGraph/header*-nodes
-                       (list (BeamLisp.Reader/read_first content source)))
-              _ (when-not (erlang/== ns (nth header 0))
+        (let [header (when content (BeamLisp.SourceGraph/header*-nodes
+                       (list (BeamLisp.Reader/read_first content source))))
+              requires (if header (nth header 1) (Map/get raw :requires))
+              _ (when-not (and (or (erlang/== nil header) (erlang/== ns (nth header 0)))
+                               (erlang/is_list requires) (erlang/=< (erlang/length requires) 1024)
+                               (Enum/all? requires (fn [name] (erlang/is_binary name))))
                   (erlang/error :sdk_image_preload_namespace_changed))
               members
               (Enum/map identities (fn [identity]
@@ -5135,7 +5219,30 @@
                                      (Enum/map references (fn [name]
                                        (if (erlang/is_binary name) (String/to_existing_atom name) name)))) metadata)]
                     {:module (elem decoded 0) :row metadata :file file :bytes object}))))]
-          {:namespace ns :requires (nth header 1) :members members})))))
+          {:namespace ns :requires requires :members members})))))
+
+(defn- sdk_image_load_unit! [namespace root inventory]
+ (let [unit (sdk_image_preload_unit namespace root inventory)
+       members (Map/get unit :members)]
+  (when-not unit (erlang/error :sdk_image_unit_missing))
+  (verify_complete_sdk_units! (Map/new (Enum/map members
+    (fn [member] (tuple (Map/get member :module) (Map/get member :row))))))
+  (BeamLisp.Env/with_namespace_lock namespace
+   (fn [] (BeamLisp.Env/with_publication namespace
+    (fn []
+     (let [fresh (Enum/reject members
+                   (fn [member]
+                    (let [module (Map/get member :module) row (Map/get member :row)]
+                     (when (erlang/module_loaded module)
+                      (when-not (or (erlang/== (Map/get row :md5) (erlang/apply module :module_info (list :md5)))
+                                    (and (erlang/== :mutable-forwarder (Map/get row :role))
+                                         (BeamLisp.Env/sdk_forwarder_current? module (Map/get row :forwarder-routes))))
+                       (erlang/error :sdk_runtime_loaded_code_changed))
+                      true))))]
+      (when (erlang/not (erlang/== fresh (list)))
+       (BeamLisp.Env/publish_binaries! (Enum/map fresh
+        (fn [member] (tuple (tuple (Map/get member :module) (Map/get member :bytes)) (Map/get member :file)))))))))))
+  :loaded))
 
 (defn- sdk_image_preload_plan [ns root bytes]
   (loop [pending (list ns) seen (MapSet/new) units (list) size 0]
@@ -5952,12 +6059,12 @@
           row (if (File/exists? image) (inventory_row image mod)
                   (source_sdk_receipt mod))
           metadata (when row (Map/get row :generated-class))
-          source (when row (physical_sdk_path (Path/join root (Map/get row :source))))]
+          source (when row (sdk_unit_source_path root (Map/get row :source)))]
       (and (erlang/is_atom mod) row (erlang/== :generated-class (Map/get row :role))
            (erlang/is_tuple metadata) (erlang/== 5 (erlang/tuple_size metadata))
            (erlang/== 1 (elem metadata 0)) source
            (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
-           (erlang/== (crypto/hash :sha256 (BeamLisp.Loader/read_source source)) (Map/get row :source-digest))
+           (sdk_source_current? root mod row)
            (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key))
            (erlang/== (tuple (elem metadata 1) (elem metadata 2)) (Map/get row :declaration-owner))
            (erlang/== mod (BeamLisp.Record/module_name (elem metadata 1) (elem metadata 2)))
