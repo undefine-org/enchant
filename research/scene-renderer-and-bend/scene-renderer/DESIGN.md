@@ -1,5 +1,15 @@
 # Scene renderer and live preview: implementation proposal
 
+## Authoring API continuation
+
+The R0–R4 sequence below remains the delivery framework. The newer
+[API research](API-RESEARCH.md), [semantic contract](API-CONTRACT.md),
+[examples](API-EXAMPLES.bl.md), and [A1 living postcard milestone](API-MVP.md)
+refine the authoring layer after the first implemented visual study. A1 is a
+proposed next acceptance gate across R1/R2/R3/R4, not a restart of R0 or a claim
+that its layout/text/inspection APIs already exist. See [PROGRESS.md](PROGRESS.md)
+for actual implementation and [API-SOURCES.md](API-SOURCES.md) for inspirations.
+
 ## Product goal and scope
 
 Give a human or agent a short path from structured scene code to a frame they

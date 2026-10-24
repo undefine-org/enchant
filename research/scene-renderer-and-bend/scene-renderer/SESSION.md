@@ -69,3 +69,32 @@ For the initial bootstrap turn, read the instructions and research, confirm the
 working directory and branch, and summarize the first concrete implementation
 step. Do not begin implementation or launch services yet: the user is moving
 into this fresh session to continue the work. End ready for their next message.
+
+## Implementation continuation
+
+The user superseded the initial bootstrap pause and authorized autonomous renderer
+implementation. See `PROGRESS.md`, `examples/scene-renderer/README.md` and the
+retained `evidence/` for the implemented R0–R3 vertical slice and initial R4 checks.
+Do not repeat the bootstrap pause. The next useful work is on-demand preview and
+stronger snapshot/publisher identity, with the remaining limitations in PROGRESS.md.
+
+The user subsequently rejected the visual quality of the first demo. The newer
+art-directed entrypoint is `examples/scene-renderer/editorial.bl`, using
+`scene.atelier`, `scene.material` and packaged fonts. Read `ART-DIRECTION.md`.
+Do not present the earlier plain demo as the current visual target. The user
+explicitly wants expressive Lisp abstractions and visual excellence, not merely
+pipeline acceptance. Keep using actual rendered visual checks.
+
+## API research and proposed first authoring milestone
+
+The user requested a durable written record of every API inspiration, sources,
+code examples, semantics, and a first milestone to review and play with. Read
+`README.md`, `API-RESEARCH.md`, `API-CONTRACT.md`, `API-EXAMPLES.bl.md`,
+`API-SOURCES.md`, and `API-MVP.md`. They preserve the conversational proposals and
+expand their rationale, risks, boundaries, and acceptance conditions. A1 is the
+proposed living postcard studio: measurable components, wrapped semantic text,
+stable keyed cards/anchors, cue-relative motion, selected-frame preview, and a
+small inspector. The user wants to refine the plan through playful experiments.
+These documents do not implement A1 or turn the illustrative syntax into a
+working public API. Preserve the distinction between existing prototype behavior
+and proposed design. The renderer remains separate from Bend/compiler research.

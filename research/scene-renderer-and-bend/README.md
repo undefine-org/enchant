@@ -24,6 +24,19 @@ This folder preserves the reasoning and separates their delivery criteria.
 7. [Worktree handoff](WORKTREE.md): where implementation proceeds and what that
    branch inherits.
 
+## Renderer API continuation
+
+The renderer now has an implemented editorial visual study and a separately
+proposed authoring API. Start with the [renderer research index](scene-renderer/README.md).
+It links the detailed [inspirations](scene-renderer/API-RESEARCH.md),
+[contract](scene-renderer/API-CONTRACT.md), [code examples](scene-renderer/API-EXAMPLES.bl.md),
+[primary sources](scene-renderer/API-SOURCES.md), and
+[first API milestone A1](scene-renderer/API-MVP.md). Existing implementation and
+measurements are in [PROGRESS.md](scene-renderer/PROGRESS.md). This continuation
+supersedes the initial bootstrap pause; it does not change the independent Bend
+comparison/compiler programme. The original research-only status below remains
+historical to that initial documentation task.
+
 ## The split is a dependency decision
 
 | | Scene renderer and preview | Outperforming Bend |

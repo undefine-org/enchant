@@ -91,3 +91,13 @@ This yields 15 samples over two minutes. Inspect additional frames around any
 transition under discussion. Sampling cannot establish motion smoothness, audio
 content, or the performance of the generating program. Keep attribution to the
 original post and do not use the resulting contact sheet as a renderer benchmark.
+
+## Scene authoring API research continuation
+
+The later API design discussion has its own [primary-source register](scene-renderer/API-SOURCES.md)
+and [retrieval manifest](scene-renderer/evidence/api-source-manifest.json). It covers
+Racket Pict, Typst, Motion Canvas, Houdini, Strudel/Tidal, OpenUSD, Salsa, Vega,
+and the relevant graphics/font references. [API-RESEARCH.md](scene-renderer/API-RESEARCH.md)
+explains what is borrowed and where the proposed BL design differs. Source
+mechanisms, original design proposals, and actual implementation evidence remain
+distinct. No source benchmark is adopted as a BL result.
