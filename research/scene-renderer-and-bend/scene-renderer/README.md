@@ -36,6 +36,13 @@ examples still describe a broader API; they are not all available signatures.
 
 ## Current implementation and retained artifacts
 
+The next visual-language study is the [twelve-second botanical film](evidence/growth/a-seed-of-possibility.mp4),
+with a [review page](evidence/growth/index.html), [lossless master](evidence/growth/master-264.png),
+and [checks](evidence/growth/checks.json). The studio now exports its accepted
+edited postcard revision; [export evidence](evidence/studio-export/checks.json)
+and [browser screenshot](evidence/studio-export/studio.png) record the first slice.
+See TRACKS.md for what remains independently open in both tracks.
+
 - [Authored editorial scene](../../../examples/scene-renderer/scene_demo/editorial.bl).
 - [Editorial build entrypoint](../../../examples/scene-renderer/editorial.bl).
 - [Atelier helpers](../../../priv/lib/scene/atelier.bl),

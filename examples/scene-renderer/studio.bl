@@ -1,8 +1,10 @@
 (ns scene-demo.studio
   (:require [scene-demo.postcard :as postcard] [scene.core :as scene] [scene.inspect :as inspect]
-            [scene.layout :as layout] [web] [interop] [proc.task :as task]))
+            [scene.layout :as layout] [scene-demo.studio-export :as export]
+            [web] [interop] [proc.task :as task]))
 (def out (Path/expand (or (first (clojure.io/current-command-line-args)) "/tmp/bl-postcard-studio")))
 (def source-paths ["examples/scene-renderer/studio.bl" "examples/scene-renderer/scene_demo/postcard.bl"
+                   "examples/scene-renderer/scene_demo/studio_export.bl"
                    "examples/scene-renderer/studio.html" "examples/scene-renderer/raster.py"
                    "priv/lib/scene/core.bl" "priv/lib/scene/material.bl" "priv/lib/scene/atelier.bl"
                    "priv/lib/scene/layout.bl" "priv/lib/scene/geometry.bl" "priv/lib/scene/text.bl"
@@ -70,6 +72,41 @@
        {:ok true :revision revision :frame k :time (scene/frame-time k 24 1)
         :image (str "data:image/png;base64," (Base/encode64 (File/read! png))) :objects (:objects frame)}])))
 (def gate (ets/new :postcard_gate (list :set :public)))
+(def jobs (ets/new :postcard_exports (list :set :public)))
+(defn job [revision]
+  (let [found (ets/lookup jobs revision)]
+    (when (seq found) (erlang/element 2 (first found)))))
+(def export-context {:out out :snapshot snapshot :font-dir font-dir :renderer renderer :code-id code-id
+                     :backend (erlang/element 1 backend) :jobs jobs
+                     :source-hashes (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) captured)
+                     :font-hashes font-hashes})
+;; A retained worker owns one physical export, independently of preview work.
+;; A disconnected HTTP client does not cancel it or release its admission slot.
+(def exporter
+  (task/async (fn []
+    (loop []
+      (receive
+        [:export prepared revision]
+          (do
+            (try (export/run! export-context prepared revision)
+              (catch error
+                (export/status! export-context revision {:state "failed" :diagnostic (str (ex-message error)
+                  (when (:diagnostic (ex-data error)) (str "\n" (:diagnostic (ex-data error)))))})))
+            (ets/delete gate :export)
+            (recur))
+        :stop nil)))))
+(defn admit-export [state request]
+  (let [revision (get request "revision") config (config-from-json (get request "config"))]
+    (when (not (and (:prepared state) (= revision (:revision state))
+                    (= revision (digest (interop/->json {:code code-id :config config})))))
+      (scene/fail "Preview this exact edit before exporting it" {}))
+    (cond
+      (= "ready" (:state (job revision))) {:ok true :job (dissoc (job revision) :path)}
+      (not (ets/insert_new gate (tuple :export true))) {:ok false :busy true :diagnostic "An export is already running"}
+      :else (do
+        (export/status! export-context revision {:state "queued" :frames 144 :completed 0})
+        (erlang/send (task/pid exporter) [:export (:prepared state) revision])
+        {:ok true :job (dissoc (job revision) :path)}))))
 (def owner
   (task/async (fn []
     (loop [state {}]
@@ -81,8 +118,14 @@
             (ets/delete gate :render)
             (erlang/send caller [ref (second result)])
             (recur (first result)))
+        [:export caller ref request]
+          (let [response (try (admit-export state request)
+                          (catch error {:ok false :diagnostic (ex-message error)}))]
+            (ets/delete gate :render)
+            (erlang/send caller [ref response])
+            (recur state))
         :stop nil)))))
-(defn route-frame [conn]
+(defn route-request [conn operation]
   (let [body (web/read-body-limited* conn 65536 10000) c (:conn body)]
     (cond
       (:error body) (web/json c 413 {:ok false :diagnostic "Postcard request exceeds its body budget"})
@@ -96,14 +139,27 @@
           (let [ref (erlang/make_ref)]
             ;; After send, only the owner releases admission. A timed-out HTTP
             ;; wait or disconnected client does not cancel physical graphics work.
-            (erlang/send (task/pid owner) [:request (erlang/self) ref (:request decoded)])
+            (erlang/send (task/pid owner) [operation (erlang/self) ref (:request decoded)])
             (receive [ref response] (web/json c response)
               (after 30000 (web/json c 503 {:ok false :diagnostic "Render is still running; retain the previous frame"})))))))))
+(defn requested-job [conn]
+  (let [params (erlang/apply (erlang/binary_to_atom "Elixir.URI") :decode_query (list (web/query conn)))
+        revision (get params "revision")]
+    (when (string? revision) (job revision))))
 (defn router [conn]
   (web/route conn
     [:get "/"] (web/html conn (File/read! (str snapshot "/examples__scene-renderer__studio.html")))
     [:get "/api/config"] (web/json conn postcard/defaults)
-    [:post "/api/frame"] (route-frame conn)
+    [:post "/api/frame"] (route-request conn :request)
+    [:post "/api/export"] (route-request conn :export)
+    [:get "/api/export"] (if-let [value (requested-job conn)]
+                           (web/json conn {:ok true :job (dissoc value :path)})
+                           (web/json conn 404 {:ok false :diagnostic "Unknown export"}))
+    [:get "/api/export/video"] (let [value (requested-job conn)]
+      (if (= "ready" (:state value))
+        (web/bytes (web/resp-header conn "content-disposition" "attachment; filename=living-postcard.mp4")
+                   "video/mp4" (File/read! (:path value)))
+        (web/text conn 404 "Export is not ready")))
     :else (web/text conn 404 "not found")))
 (web/serve {:port 4048 :ip (tuple 127 0 0 1) :log :off :plug router})
 (println "Living postcard studio: http://127.0.0.1:4048 — stop this process to close")

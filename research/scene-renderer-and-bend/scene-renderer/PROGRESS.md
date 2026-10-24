@@ -197,3 +197,37 @@ Dash reveals still require conservative path-length budgets. Camera geometry is
 authored directly. Alpha masks, isolated blending/effects, general path trimming,
 rich spans/glyph choreography, and shared-element shot transitions remain open.
 The existing startup executable-capture qualification remains. The film is silent.
+
+## Studio track: export the accepted edit
+
+The studio now exports the exact successfully previewed postcard revision. A
+retained export task owns one physical export independently of preview admission.
+Admission verifies the requested config/revision against the preview owner's
+accepted immutable prepared scene. Invalid/unpreviewed edits are rejected. The
+export's captured scene cannot be replaced by subsequent preview edits. Status
+is queued/rendering/encoding/ready/failed; a ready revision offers an MP4 download.
+The task releases admission after actual work completes, not after an HTTP wait.
+Closing a page leaves the admitted export running; stopping the studio drains
+its processes through the existing private-runtime wrapper and service cgroup.
+
+A real edited export was admitted, the title was then changed through preview,
+and a second export was rejected while the first remained active. Browser seeking,
+step, theme edits, inspector overlays, playback, and rapid scrubbing passed during
+export. The six-second MP4 completed in 245.408s, has 144 frames at 24/1 fps, and
+its configuration/provenance retains the original title, sentence, and cue. The
+download hash matches the encoder manifest. A separate real-browser check clicks
+the Export button for that same accepted revision and downloads the cached film.
+The deterministic client test covers refusal to silently export an unpreviewed
+edit. Evidence is in `evidence/studio-export/`.
+
+The browser test now explicitly selects a page CDP target: newer Chromium also
+exposes browser-UI targets, so the first entry is not reliably the test page.
+Owned browser services/profiles were stopped/removed. The studio, its tailnet
+proxy, and the botanical review page remain as explicitly time-bounded user
+review services, rather than forgotten test workers. Unrelated VMs were untouched.
+
+Remaining studio work: general composition entrypoints/parameter declarations,
+coherent BL source refresh and stronger executable capture, save/load, richer
+dependency/source inspection, and a playback/quality workflow. Export has phase
+status, not fine-grained per-frame progress. It currently serves postcard content;
+the new botanical film intentionally leads the studio's generic composition API.

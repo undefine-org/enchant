@@ -1,7 +1,9 @@
 // Owned studio at 4048, Chromium CDP at 9224. Uses Node's built-in WebSocket.
 import {writeFileSync} from 'node:fs';
 const tabs=await(await fetch('http://127.0.0.1:9224/json')).json();
-const socket=new WebSocket(tabs[0].webSocketDebuggerUrl);await new Promise(r=>socket.onopen=r);
+const page=tabs.find(tab=>tab.type==='page');
+if(!page)throw Error('No browser page target');
+const socket=new WebSocket(page.webSocketDebuggerUrl);await new Promise(r=>socket.onopen=r);
 let id=0;const pending=new Map();socket.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(m.error):p.resolve(m.result)}};
 const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});socket.send(JSON.stringify({id,method,params}))});
 const evaluate=async expression=>(await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true})).result.value;

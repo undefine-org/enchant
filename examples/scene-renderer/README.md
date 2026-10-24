@@ -195,8 +195,15 @@ Use the same cgroup cap. This produces 144 frames at 24/1 fps, a 1080px PNG
 sequence rendered at 2× internally, `living-postcard.mp4`, and a manifest. It
 captures fonts, worker/source bytes, and normalized content before rendering.
 The still modes and film mode use the same measured component tree and sampling
-function. Source hot replacement and exporting a UI session's config directly
-from a button remain separate follow-up work.
+function. The studio's Export button now captures the exact accepted preview
+revision, renders its 144 quality frames in a separately admitted worker, and
+offers the MP4 when encoding completes. Preview edits may continue during that
+export; they do not alter its prepared composition. One export runs at a time.
+An unpreviewed/invalid edit cannot silently export a previous composition.
+Status progresses through queued, rendering, encoding, and ready/failed; rendering
+does not yet report per-frame progress. Stop the studio unit to drain both workers.
+The whole service must stay under its resource cap. Source hot replacement remains
+open. Real export checks are in `test/scripts/scene_studio_export.py`.
 
 On the validation host, the toolchain was not initially on PATH. The exact
 host-specific environment used for checks was:
@@ -208,3 +215,32 @@ export SCENE_RSVG=/nix/store/ii7wr6b6b8c5fq1ci26rw7amkb4apwm8-librsvg-2.62.3/bin
 
 Other machines should prepare the declared dependencies normally. These paths
 record the measured host; they are not portable package-install instructions.
+
+## Botanical motion: the visual-language track
+
+`scene_demo/growth.bl` is a separate twelve-second composition, not a postcard
+studio preset. It uses canonical outlined typography, procedural leaves and
+petals, hatched surfaces, a halftone sun, paper grain, geometric iris clipping,
+camera scaling, and cue/clip clocks. It requires the same dependencies as A1.
+
+```sh
+# Inspect scripts/bl-mem and use the cgroup cap shown above for each BL command.
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/growth.bl -- /tmp/bl-growth-review
+# Five quality specimens: 0.75, 2.8, 5, 8.2, and 11 seconds.
+./bin/bl --cold -p examples/scene-renderer run examples/scene-renderer/growth.bl -- /tmp/bl-growth-film film
+# 288 frames / 24 fps / 12 seconds; OUT/a-seed-of-possibility.mp4.
+```
+
+The default review mode retains explicit sample times in its manifest; its five
+PNGs are specimens, not an evenly sampled five-frame film. Both modes render at
+2160px and reconstruct to 1080px. Text is shaped once into reusable vector paths.
+Font files and their OFL licenses are captured with the worker/source snapshots.
+Use one publisher per output directory. Source-change guards retain the existing
+load-before-capture qualification; this builder does not close executable capture.
+
+`scene.clip` owns temporal scheduling, not spatial layout or property blending.
+The illustration still authors its camera and geometry directly. Drawing uses
+conservative dash-length budgets, not a general curve-trimming implementation.
+The reveal uses geometric clips; arbitrary alpha masks and blend/effect isolation
+remain future work. The film is silent. These are deliberate evidence boundaries.
+See `research/scene-renderer-and-bend/scene-renderer/TRACKS.md` for the two tracks.

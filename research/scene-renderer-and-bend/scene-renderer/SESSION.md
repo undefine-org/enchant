@@ -117,3 +117,10 @@ films, then the studio adopts their inputs/inspection. The next approved study i
 a twelve-second illustrated transformation with clip clocks, path drawing,
 geometric reveals, camera movement, and procedural botanical composition. Continue
 autonomously and commit completed slices; do not spawn sub-agents.
+
+The first slices now exist: `scene.clip` finite schedules, the twelve-second
+`scene_demo/growth.bl` botanical film, and an independently admitted studio
+export of the accepted edited postcard revision. Read the latest PROGRESS.md and
+retained `evidence/growth/` / `evidence/studio-export/`. The film uses geometric
+clips and conservative dash reveals; do not claim general masks/path trimming.
+Studio generic-composition inputs and source hot replacement remain open.
