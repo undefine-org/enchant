@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Qualify contextual build/cache in serial fresh VMs, then execute runtime-only bytes.
+Run under a whole-process-tree memory/time cap. Output must be absent.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    if os.path.lexists(output):
+        parser.error('output must be absent')
+    output.mkdir(parents=True)
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    driver = root / 'test/scripts/world-build-driver.bl'
+    fixtures = root / 'test/fixtures/contextual-validation'
+    watched = {Path(__file__).resolve(), driver, root / 'env.bl', root / 'scripts/demo-artifact-production',
+               *fixtures.glob('*.bl'), *(root / 'priv').rglob('*.bl'),
+               *(root / 'priv').rglob('*.bl.md')}
+    inputs = {str(p.relative_to(root)): sha(p) for p in sorted(watched)}
+    seed_inputs = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+    (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
+    deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / 'deps').glob('*/ebin')),
+                                                  *sorted((root / '_build').glob('*/lib/*/ebin'))]))
+    boot = runpy.run_path(str(root / 'scripts/demo-artifact-production'))['BOOT']
+    report = {'version': 1, 'scope': 'fresh-contextual-build-cache-and-runtime-package',
+              'status': 'running', 'seconds': {}, 'native_execution_admission': False}
+    try:
+        for phase in ('producer', 'restorer', 'consumer'):
+            with tempfile.TemporaryDirectory(prefix=f'bl-world-build-{phase}-') as temporary:
+                image = Path(temporary)
+                subprocess.run(['cp', '-a', '--reflink=auto', str(root / 'priv'), str(image / 'priv')], check=True)
+                shutil.rmtree(image / 'priv/bootstrap/seed')
+                shutil.copytree(seed, image / 'priv/bootstrap/seed')
+                shutil.copy2(root / 'env.bl', image / 'env.bl')
+                app = image / '.bl/lib/beam_lisp-0.1.0'
+                app.mkdir(parents=True)
+                (app / 'priv').symlink_to(image / 'priv', target_is_directory=True)
+                shutil.copytree(seed, app / 'ebin')
+                shutil.copy2(driver, image / 'driver.bl')
+                (image / 'boot.exs').write_text(boot)
+                env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off',
+                           BL_ARTIFACT_DRIVER=str(image / 'driver.bl'),
+                           BL_WORLD_BUILD_PHASE=phase, BL_WORLD_BUILD_OUTPUT=str(output),
+                           BEAM_LISP_AOT_CACHE='on', BEAM_LISP_AOT_CACHE_DIR=str(output / 'cache'),
+                           XDG_CACHE_HOME=str(image / 'cache'),
+                           ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+                if phase != 'consumer':
+                    env['BL_WORLD_BUILD_MANIFEST'] = str(fixtures / 'world.bl')
+                else:
+                    env.pop('BL_WORLD_BUILD_MANIFEST', None)
+                command = ['elixir']
+                for dep in deps:
+                    command += ['-pa', str(dep)]
+                command += ['-pa', str(app / 'ebin'), str(image / 'boot.exs')]
+                started = time.monotonic()
+                done = subprocess.run(command, cwd=image, env=env, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+                report['seconds'][phase] = round(time.monotonic() - started, 3)
+                (output / f'{phase}.log').write_text(done.stdout)
+                print(done.stdout[-6000:], end='', flush=True)
+                if done.returncode:
+                    raise RuntimeError(f'{phase} failed with exit {done.returncode}')
+                report[phase] = json.loads((output / f'{phase}.json').read_text())
+            if inputs != {p: sha(root / p) for p in inputs}:
+                raise RuntimeError('Source/driver inputs changed during qualification')
+            if seed_inputs != {p.name: sha(p) for p in seed.iterdir() if p.is_file()}:
+                raise RuntimeError('candidate floor changed during qualification')
+        report['status'] = 'passed'
+    except Exception as error:
+        report.update(status='error', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(f'Passed. Artifacts and receipts: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

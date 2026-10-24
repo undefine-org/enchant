@@ -1,0 +1,178 @@
+(ns contextual-build-test
+ (:require [build :as build] [compile.world :as world] [bl.cli :as cli] [bl.env :as env]))
+
+(defn- restore [name value]
+ (if (nil? value) (System/delete_env name) (System/put_env name value)))
+(defn- fixture [action]
+ (let [root (Path/join (System/tmp_dir!) (str "contextual-build-" (erlang/unique_integer (list :positive))))
+       old-cache (System/get_env "BEAM_LISP_AOT_CACHE_DIR") old-on (System/get_env "BEAM_LISP_AOT_CACHE")]
+  (File/mkdir! root)
+  (System/put_env "BEAM_LISP_AOT_CACHE_DIR" (Path/join root "cache"))
+  (System/put_env "BEAM_LISP_AOT_CACHE" "on")
+  (try
+   (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 42))")
+   (File/write! (Path/join root "main.bl") "(ns main) (import-world 'forms 'current :only [answer]) (answer)")
+   (File/write! (Path/join root "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'forms :revision 'current :file \"forms.bl\"} {:namespace 'main :revision 'current :file \"main.bl\"}] :libraries []}")
+   (action root {:world (Path/join root "world.bl") :out (Path/join root "out")})
+   (finally (restore "BEAM_LISP_AOT_CACHE_DIR" old-cache) (restore "BEAM_LISP_AOT_CACHE" old-on)
+            (File/rm_rf! root)))))
+
+(defn- observe-macros [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn
+                (fn []
+                 (loop [calls 0]
+                  (receive
+                   [:trace _ :call [:Elixir.BeamLisp.AOT :eval_constructor_session! _]] (recur (inc calls))
+                   [:finish seen] :when (= seen ticket) (erlang/send parent [:macro-calls ticket calls])
+                   _ (recur calls)))))]
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) true (list :local))
+  (erlang/trace parent true (list :call (tuple :tracer tracer)))
+  (try
+   (let [value (action) barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= seen barrier) :ready (after 5000 (throw :macro-trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:macro-calls seen count] :when (= seen ticket) count (after 5000 (throw :macro-trace-timeout)))])
+   (finally
+    (erlang/trace parent false (list :call))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) false (list :local))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(defn- run-program [result]
+ (let [module :Elixir.BeamLisp.World.Program
+       bytes (File/read! (Path/join (:runtime-out result) "Elixir.BeamLisp.World.Program.beam"))]
+  (assert (= (tuple :module module) (code/load_binary module '() bytes)))
+  (try (erlang/apply module :run (list)) (finally (code/delete module) (code/purge module)))))
+
+(deftest default-build-driver-reuses-an-unchanged-world-without-macro-execution
+ (fixture
+  (fn [root opts]
+   (let [[first-run first-macros] (observe-macros #(build/run opts))
+         [warm warm-macros] (observe-macros #(build/run opts))]
+    (is (= [] (:errors first-run)))
+    (is (= 1 (:compiled first-run)))
+    (is (> first-macros 0))
+    (is (= [] (:errors warm)))
+    (is (= 0 (:built warm))) (is (= 0 (:compiled warm))) (is (= 0 warm-macros))
+    (is (= 42 (run-program warm)))
+    (is (= (list "Elixir.BeamLisp.World.Program.beam") (File/ls! (:runtime-out warm))))
+    (is (= 3 (count (File/ls! (:out warm)))))
+    (is (= 2 (count (:beams (world/read-unit (:out warm))))))
+    (is (= 1 (count (:modules (first (vals (:runtime-manifest warm)))))))
+    (is (= false (:native-admission warm)))
+    (is (not (File/exists? (Path/join (:out opts) ".claim"))))))))
+
+(deftest shared-cache-restoration-does-not-expand-macros-and-provider-edits-do
+ (fixture
+  (fn [root opts]
+   (is (= [] (:errors (build/run opts))))
+   (File/rm_rf! (:out opts))
+   (let [[restored calls] (observe-macros #(build/run opts))]
+    (is (= [] (:errors restored))) (is (= 1 (:cached restored))) (is (= 0 (:compiled restored)))
+    (is (= 0 calls)) (is (= 42 (run-program restored))))
+   (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 43))")
+   (let [[changed calls] (observe-macros #(build/run opts))]
+    (is (= [] (:errors changed))) (is (= 1 (:compiled changed))) (is (> calls 0))
+    (is (= 43 (run-program changed)))))))
+
+(deftest damaged-unit-bytes-restore-from-cache-and-foreign-members-remain-untouched
+ (fixture
+  (fn [root opts]
+   (let [first-run (build/run opts) output (:out first-run)]
+    (is (= [] (:errors first-run)))
+    (File/write! (Path/join output "Elixir.BeamLisp.World.Program.beam") "damaged")
+    (let [[repaired calls] (observe-macros #(build/run opts))]
+     (is (= [] (:errors repaired))) (is (= 1 (:cached repaired))) (is (= 0 calls))
+     (is (= 42 (run-program repaired))))
+    (let [foreign (Path/join output "keep-source.bl")]
+     (File/write! foreign "preserve")
+     (is (= 1 (count (:errors (build/run opts)))))
+     (is (= "preserve" (File/read! foreign))))))))
+
+(deftest world-builds-do-not-run-application-entries-or-ignore-mixed-options
+ (fixture
+  (fn [root opts]
+   (erlang/erase :world-build-effect)
+   (try
+    (File/write! (Path/join root "main.bl") "(ns main) (erlang/put :world-build-effect :ran)")
+    (is (= [] (:errors (build/run opts))))
+    (is (= :undefined (erlang/get :world-build-effect)))
+    (finally (erlang/erase :world-build-effect)))
+   (is (= 1 (count (:errors (build/run (assoc opts :sources [(Path/join root "main.bl")])))))))))
+
+(deftest env-world-declaration-uses-the-ordinary-build-command-and-runtime-app-directory
+ (fixture
+  (fn [root opts]
+   (File/write! (Path/join root "env.bl")
+    (str "{:build {:world \"world.bl\" :out " (pr-str (:out opts)) "} "
+         ":app {:name \"worlddemo\" :vsn \"0.1.0\" :applications []}}"))
+   (is (= 0 (BeamLisp/with_cwd root #(cli/run-argv ["build"]))))
+   (let [app (Path/join (:out opts) "ebin/worlddemo.app") read (file/consult (String/to_charlist app))]
+    (is (= :ok (elem read 0)))
+    (let [properties (elem (first (elem read 1)) 2) modules (Keyword/get properties :modules)]
+     (is (some #(= :Elixir.BeamLisp.World.Program %) modules))
+     (is (not (some #(= :Elixir.BeamLisp.World.Program.PhaseLibrary %) modules))))))))
+
+(deftest a-refused-world-build-does-not-write-an-app-resource
+ (fixture
+  (fn [root opts]
+   (File/write! (Path/join root "env.bl")
+     "{:build {:world \"absent.bl\" :out \"relative-out\"} :app {:name \"refusedworld\" :vsn \"0.1.0\"}}")
+   (is (= 1 (BeamLisp/with_cwd root #(cli/run-argv ["build"]))))
+   (is (not (File/exists? (Path/join root "relative-out/refusedworld.app"))))
+   (is (not (File/exists? (Path/join root "relative-out/ebin/refusedworld.app")))))))
+
+
+(deftest forced-world-build-reexpands-even-with-valid-local-and-shared-artifacts
+ (fixture
+  (fn [root opts]
+   (is (= [] (:errors (build/run opts))))
+   (let [[forced calls] (observe-macros #(build/run (assoc opts :force? true)))]
+    (is (= [] (:errors forced)))
+    (is (= 1 (:compiled forced)))
+    (is (> calls 0))
+    (is (= 42 (run-program forced)))))))
+
+(deftest project-schema-normalizes-world-paths-and-refuses-mixed-selections
+ (fixture
+  (fn [root opts]
+   (let [path (Path/join root "env.bl")]
+    (File/write! path "{:build {:world \"world.bl\" :out \"out\"}}")
+    (let [project (env/project root)]
+     (is (= [] (:errors project)))
+     (is (= (Path/join root "world.bl") (get-in project [:build :world]))))
+    (File/write! path "{:build {:world \"world.bl\" :paths [\"src\"]}}")
+    (is (seq (:errors (env/project root))))
+    (File/write! path "{:build {:world 42}}")
+    (is (seq (:errors (env/project root))))))))
+
+(deftest a-misaddressed-genuine-unit-is-rejected-and-the-shared-entry-is-repaired
+ (fixture
+  (fn [root opts]
+   (let [original (build/run opts)
+         record (first (vals (:manifest original)))
+         compiler (:key record) key (:hash record)
+         entry (Path/join (Path/join (BeamLisp.AOTCache/dir) compiler) key)]
+    (is (= [] (:errors original)))
+    (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 43))")
+    (let [other (build/run opts)]
+     (is (= [] (:errors other)))
+     ;; Both units are genuine compiled artifacts. This changes only the cache
+     ;; address; it fabricates no SDK evidence, ownership or admission receipt.
+     (File/rm_rf! entry)
+     (BeamLisp.AOTCache/store compiler key (:out other)
+       (to-list (:modules (first (vals (:manifest other)))))))
+    (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 42))")
+    (File/rm_rf! (:out opts))
+    (let [corrected (build/run opts)]
+     (is (= [] (:errors corrected)))
+     (is (= 1 (:compiled corrected)))
+     (is (= 42 (run-program corrected))))
+    (File/rm_rf! (:out opts))
+    (let [[reused calls] (observe-macros #(build/run opts))]
+     (is (= [] (:errors reused)))
+     (is (= 0 (:compiled reused)))
+     (is (= 1 (:cached reused)))
+     (is (= 0 calls))
+     (is (= 42 (run-program reused))))))))

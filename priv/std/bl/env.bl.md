@@ -135,7 +135,7 @@ worst kind of configuration bug.
   Unsupported policies are errors. See [loading](loading.bl).
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
-- `:build` — `{:paths :seed :out :native :jobs :ex :exclude}`: which roots hold
+- `:build` — `{:world :paths :seed :out :native :jobs :ex :exclude}`: which roots hold
   build sources, where the output goes, which crates are native, how wide to
   compile, and which sources must NEVER be compiled. `:exclude` holds paths
   RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
@@ -491,6 +491,7 @@ problems reports all three in one pass.
       (let [[paths perr]  (norm-strings (:paths v) ":build :paths" root)
             [native nerr] (norm-strings (:native v) ":build :native" root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
+            [world werr]  (norm-opt-string (:world v) ":build :world" root)
             [out oerr]    (norm-opt-string (:out v) ":build :out" root)
             ; Sources never compiled: entry programs that bind listeners on
             ; load. A FILE matches exactly; a DIRECTORY matches every source
@@ -510,16 +511,18 @@ problems reports all three in one pass.
                   [{:root r :exclude x}
                    (concat rerr xerr
                            (unknown-errs ex [:root :exclude] ":build :ex"))]))
-            errs (concat perr nerr serr oerr jerr xerr exerr
-                         (unknown-errs v [:paths :seed :out :native :jobs :ex :exclude] ":build"))]
+            mixed (if (and world (or (seq paths) (seq native) seed exv (seq xcl)))
+                       [":build :world cannot be combined with source/native/substrate selections"] [])
+            errs (concat perr nerr serr werr oerr jerr xerr exerr mixed
+                         (unknown-errs v [:world :paths :seed :out :native :jobs :ex :exclude] ":build"))]
         [(if (empty? errs)
-           {:paths paths
+           (cond-> {:paths paths
             :seed seed
             :out out
             :native native
             :jobs (or jobs 1)
             :exclude xcl
-            :ex exv}
+            :ex exv} world (assoc :world world))
            nil)
          errs])))
 

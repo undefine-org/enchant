@@ -804,21 +804,20 @@
           (provenance_attributes_match? attrs compiler_key closure_key))))
     (catch _e false)))
 
-(defn- provenance_attributes_match?
-  [attrs compiler_key closure_key]
-  ; BL's Erlang descriptor persists a binary; Elixir's registered attribute
-  ; persists a singleton list. Both encode the same exact key, not a wildcard.
-  (let [source (Keyword/get attrs :bl_source_hash)
-        compiler (Keyword/get attrs :bl_compiler_key)
-        ;; Source keys alone cannot identify the executing pinned emitter:
-        ;; an old host can stamp its old output with newly edited sources.
-        replay (Keyword/get attrs :bl_aot_replay_version)]
-    (and (or (erlang/== source closure_key) (erlang/== source (lst closure_key)))
-         (or (erlang/== compiler compiler_key) (erlang/== compiler (lst compiler_key))
-             ;; A FLOOR (boot/build tier) beam carries no key in its bytes; the
-             ;; cache entry's address and the floor claim name its generation.
-             (and (erlang/== nil compiler) (floor_unit? attrs)))
-         (or (erlang/== replay 1) (erlang/== replay (lst 1))))))
+(defn- provenance_keys_match? [attrs compiler_key closure_key]
+ ;; Simple attributes remain usable in this standalone preboot host: no
+ ;; language runtime, Env or contextual archive decoder enters cache checks.
+ (let [source (Keyword/get attrs :bl_source_hash) compiler (Keyword/get attrs :bl_compiler_key)]
+  (and (or (erlang/== source closure_key) (erlang/== source (lst closure_key)))
+       (or (erlang/== compiler compiler_key) (erlang/== compiler (lst compiler_key))
+           (and (erlang/== nil compiler) (floor_unit? attrs))))))
+
+(defn- provenance_attributes_match? [attrs compiler_key closure_key]
+ ;; Namespace replay retains its own protocol; contextual units do not claim
+ ;; namespace initialization or mutable-forwarder coverage.
+ (let [replay (Keyword/get attrs :bl_aot_replay_version)]
+  (and (provenance_keys_match? attrs compiler_key closure_key)
+       (or (erlang/== replay 1) (erlang/== replay (lst 1))))))
 
 (defn- floor_unit? [attrs]
   (let [raw (Keyword/get attrs :bl_unit_namespace)
@@ -828,23 +827,33 @@
            (or (erlang/== tier :boot) (erlang/== tier :build))))))
 
 (defn- cached_bytes_match? [mod bytes compiler_key closure_key]
-  (if (erlang/not (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")) true
+ (let [namespace? (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")
+       parsed (try (beam_lib/chunks bytes (lst :exports :attributes)) (catch _ nil))]
+  ;; Generic non-namespace cache entries retain the historical opaque-byte
+  ;; contract. A parseable contextual unit opts into its explicit provenance
+  ;; protocol. Namespace entries always retain their original strict checks.
+  (if (erlang/not (and (erlang/is_tuple parsed) (erlang/== :ok (erlang/element 1 parsed))))
+   (erlang/not namespace?)
    (try
-    (let [r (beam_lib/chunks bytes (lst :exports :attributes))
-          _ (when-not (and (erlang/== :ok (erlang/element 1 r))
-                           (erlang/== mod (erlang/element 1 (erlang/element 2 r))))
-              (erlang/error :cached_module_identity_changed))
-          chunks (erlang/element 2 (erlang/element 2 r))]
-      (if (and (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")
-               (Enum/member? (Keyword/get chunks :exports) (tup :__bl_ns_defs__ 0)))
-        (provenance_attributes_match? (Keyword/get chunks :attributes) compiler_key closure_key)
-        true))
-    (catch _ false))))
+    (let [actual (erlang/element 1 (erlang/element 2 parsed))
+          chunks (erlang/element 2 (erlang/element 2 parsed))
+          attrs (Keyword/get chunks :attributes)
+          contextual (Keyword/get attrs :bl_contextual_unit_version)]
+     (when (and (or namespace? (erlang/not (erlang/== nil contextual)))
+                (erlang/not (erlang/== mod actual)))
+      (erlang/error :cached_module_identity_changed))
+     (cond
+      (and namespace? (Enum/member? (Keyword/get chunks :exports) (tup :__bl_ns_defs__ 0)))
+       (provenance_attributes_match? attrs compiler_key closure_key)
+      (erlang/not (erlang/== nil contextual))
+       (and (or (erlang/== contextual 1) (erlang/== contextual (lst 1)))
+            (provenance_keys_match? attrs compiler_key closure_key))
+      :else true))
+    (catch _ false)))))
 
 (defn- cached_module_matches? [entry mod compiler_key closure_key]
-  (if (erlang/not (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")) true
-    (try (cached_bytes_match? mod (File/read! (Path/join entry (beam_file mod))) compiler_key closure_key)
-         (catch _ false))))
+ (try (cached_bytes_match? mod (File/read! (Path/join entry (beam_file mod))) compiler_key closure_key)
+  (catch _ false)))
 
 (defn- valid_keyed_entry
   [entry compiler_key closure_key]

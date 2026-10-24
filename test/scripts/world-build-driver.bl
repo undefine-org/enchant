@@ -1,0 +1,47 @@
+(ns world.build.driver (:require [build :as build]))
+(defn- observe [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn (fn []
+                 (loop [calls 0]
+                  (receive
+                   [:trace _ :call [:Elixir.BeamLisp.AOT :eval_constructor_session! _]] (recur (inc calls))
+                   [:finish seen] :when (= seen ticket) (erlang/send parent [:macro-calls ticket calls])
+                   _ (recur calls)))))]
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) true (list :local))
+  (erlang/trace parent true (list :call (tuple :tracer tracer)))
+  (try
+   (let [value (action) barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= seen barrier) :ready (after 5000 (throw :trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:macro-calls seen calls] :when (= seen ticket) calls (after 5000 (throw :trace-timeout)))])
+   (finally
+    (erlang/trace parent false (list :call))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) false (list :local))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(let [phase (System/fetch_env! "BL_WORLD_BUILD_PHASE") output (System/fetch_env! "BL_WORLD_BUILD_OUTPUT")
+      runtime (Path/join output "runtime")]
+ (if (= "consumer" phase)
+  (let [module :Elixir.BeamLisp.World.Program]
+   (assert (= :error (System/fetch_env "BL_WORLD_BUILD_MANIFEST")))
+   (assert (= (list "Elixir.BeamLisp.World.Program.beam") (File/ls! runtime)))
+   (assert (not (erlang/module_loaded :Elixir.BeamLisp.World.Program.PhaseLibrary)))
+   (assert (= (tuple :module module) (code/load_binary module '()
+                    (File/read! (Path/join runtime "Elixir.BeamLisp.World.Program.beam")))))
+   (let [value (erlang/apply module :run (list))]
+    (assert (= [42 99 42] value))
+    (assert (not (erlang/module_loaded :Elixir.BeamLisp.World.Program.PhaseLibrary)))
+    (File/write! (Path/join output "consumer.json")
+      (Jason/encode! {:status "passed" :value (to-list value) :phase-provider-present false :input-sources-selected false}))))
+  (let [[result calls] (observe #(build/run {:world (System/fetch_env! "BL_WORLD_BUILD_MANIFEST")
+                                             :out (Path/join output phase)}))]
+   (assert (= [] (:errors result)))
+   (assert (= 1 (:built result)))
+   (if (= "producer" phase)
+    (do (assert (= 1 (:compiled result))) (assert (> calls 0)))
+    (do (assert (= 0 (:compiled result))) (assert (= 1 (:cached result))) (assert (= 0 calls))
+        (File/cp_r! (:runtime-out result) runtime)))
+   (File/write! (Path/join output (str phase ".json"))
+    (Jason/encode! {:status "passed" :compiled (:compiled result) :cached (:cached result)
+                   :macro-evaluator-calls calls :native-admission (:native-admission result)}))))
+ (println "WORLD-BUILD" phase "passed"))
