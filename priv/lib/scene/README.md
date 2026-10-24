@@ -104,6 +104,31 @@ this route does not promise arbitrary-zoom vector equivalence. Selected lossless
 frames and streamed video use the same packed-surface sampler. Python does not
 plan the camera or author the world.
 
+## Persistent transformations
+
+`scene.choreo/formation` validates an ordered vector of keyed nodes with `:id`,
+`:at [x y]`, `:angle` degrees, positive `:scale`, and optional `:parent` identity.
+`morph` takes source/target formations and progress in [0,1]. Correspondence follows
+IDs rather than collection indices; paint order follows the source. Position is
+linear, scale logarithmic, and angle follows the shortest turn (a 180° tie takes
+the negative direction). Attachment endpoints travel between the source and target
+parent positions; this is an explicit relationship morph, not a constraint solver.
+No opacity/visibility channel is supplied. Unresolved parents and missing keyed
+correspondence fail. `progress` supplies finite quintic timing, and `follow`
+blends a camera's focus between points resolved from named objects.
+
+`path-morph` interpolates structured commands with matching operators/arity. The
+author supplies contour correspondence. It does not infer arbitrary shape topology,
+repair self-intersections, or promise tight bounds. Ordinary component functions
+can combine these operators with the existing geometry, timing, and camera values.
+
+The metamorphosis film uses 48 persistent nodes: radial, branching, ribbon, and
+orbital formations, with a changing seed contour and camera focus on actual
+instances. Its graphics worker caches native vector paths instead of flattening
+the complete world to a raster atlas, preserving deep-zoom edge quality. Paper is
+a cached, world-local repeating raster material. Hatching and label halos are
+explicit backend styles. PNG/video share the same packed native sampler.
+
 ## Verification and resource ownership
 
 Focused BL tests are in `test/bl/scene/layout_test.bl`. Real shaping tests are in

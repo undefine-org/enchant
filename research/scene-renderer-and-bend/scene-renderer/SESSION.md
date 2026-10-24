@@ -141,3 +141,12 @@ camera plan, reports, and review UI are in `evidence/atlas/`. Use the range-awar
 `review_server.py` for chapter seeking; plain Python http.server was insufficient.
 The new film preserves all content and animates only its camera. Continue that
 direction when extending this presentation unless the user changes it.
+
+## User correction: no more slides
+
+The user explicitly rejected the plate/slide composition and requested a more
+involved motion/design/transformation language: the whole experience, with deep
+unzoom/rezoom and meaningful transformations. Read TRANSFORMATION-EXPERIENCE.md.
+The committed atlas remains historical. Camera-only/static-world restrictions
+are superseded for the new piece; retain the no generic entrance/exit direction.
+Use persistent keyed structures that transform, with object-following camera work.
