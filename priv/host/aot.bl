@@ -5251,7 +5251,10 @@
   (or (nil? node) (= true node) (= false node) (erlang/is_integer node)
       (erlang/is_float node) (erlang/is_binary node) (stage-tag? node :keyword 2))))
 (defn- stage-head [node]
- (stage-symbol (first (stage-items node :list))))
+ (let [node (stage-unmeta node)
+       items (when (stage-tag? node :list 2) (elem node 1))
+       head (when (seq items) (stage-unmeta (first items)))]
+  (when (stage-tag? head :symbol 2) (elem head 1))))
 (defn- stage-requires [form]
  (let [items (stage-items form :list)]
   (when-not (= "ns" (stage-symbol (first items))) (stage-refuse :sdk-stage-namespace-required))
@@ -5337,7 +5340,7 @@
                  (sdk_dependency_ready? target))
     (stage-refuse :sdk-stage-dependency-not-ready)))
   (doseq [form (rest forms)]
-   (let [items (stage-items form :list) head (stage-symbol (first items))]
+   (let [head (stage-head form) items (when head (stage-items form :list))]
     (cond
      (contains? #{"defn" "defn-" "defmacro" "defprotocol" "defserver" "defrecord" "deftype"} head)
       (let [name (stage-symbol (second items))]
@@ -7917,6 +7920,40 @@
 (defn- constructor_source_declaration [namespace binding]
  (Map/get (constructor_source_declarations namespace) binding))
 
+(defn sdk_constructor_declaration_kind
+ "Declaration data in the current private constructor world. Ordinary source
+  declarations follow its selected files; unknown generated bindings require
+  actual bounded expansion of the selected provider.
+  no provider initialization, emitted receipt or runtime admission occurs."
+ [namespace binding]
+ (when-let [context (constructor_context)]
+  (or (get-in context [:declarations namespace binding])
+   (when (constructor_source_path! namespace)
+    (constructor_source_declaration namespace binding))
+   (when (and (constructor_source_path! namespace)
+              (nil? (constructor_source_declaration namespace binding))
+              ;; Literal Core seed routes have no Source declaration body.
+              ;; Keep their existing authenticated kernel metadata path.
+              (not (and (= "core" namespace)
+                        (Enum/any? (constructor_core_seed_rows!)
+                          (fn [row] (= binding (first row)))))))
+    (when (contains? (Map/get context :checking-declarations #{}) namespace)
+     (stage-refuse :cyclic-sdk-constructor-declarations))
+    (when-not (erlang/function_exported :Elixir.BeamLisp.Compiler :with_fresh_names 1)
+     (stage-refuse :sdk-constructor-fresh-scope-abi))
+    (constructor_context_put! :checking-declarations
+     (conj (Map/get (constructor_context!) :checking-declarations #{}) namespace))
+    (try
+     (let [unit (constructor_unit! namespace)]
+      (BeamLisp.Env/with_env (:compiler-env context)
+       (fn []
+        (BeamLisp.Compiler/with_fresh_names
+         (fn [] (stage-sdk-unit! (:source unit) (list (tuple :file (:file unit))))))))
+      (or (get-in (constructor_context!) [:declarations namespace binding]) :unavailable))
+     (finally
+      (constructor_context_put! :checking-declarations
+       (disj (Map/get (constructor_context!) :checking-declarations #{}) namespace))))))))
+
 (defn- constructor_binding_metadata! [namespace binding compiled]
  ;; This stores actual ANF DATA, never a runtime binding, Fn or frame capability.
  (let [context (constructor_context!) key [namespace binding]
@@ -8533,7 +8570,7 @@
  (if (empty? forms) (tuple values defined)
   (let [form (first forms)
         _ (constructor_record_definition! form namespace)
-        _ (when (constructor_context)
+        _ (when (and (constructor_context) (stage-head form))
             (let [owner (constructor_source_owner namespace (stage-head form))]
              (when (and owner (= "proc.server" (first owner)) (= "extend-clause!" (second owner)))
               (constructor_record_clause! form namespace))))
@@ -8570,7 +8607,7 @@
                             (let [name (stage-symbol name)]
                              (when-not (BeamLisp.Env/local_var? namespace name) (BeamLisp.Env/intern namespace name nil)))) values)
             "def" (append-staged-value values form namespace)
-            (if-let [extension (stage-clause-extension form namespace)]
+            (if-let [extension (when head (stage-clause-extension form namespace))]
              (do (constructor_record_clause! form namespace) (append-staged-value values extension namespace))
              (append-staged-action values form namespace file)))
           _ (when (contains? #{"defn" "defn-" "defmacro" "def"} head)

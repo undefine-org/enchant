@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Exercise the real artifact SDK build profile and sealed inventory consumer.
+
+Run under one whole-process-tree memory/time cap. No caller-created SDK rows,
+compiler-key memo overrides, source overlays or hotloaded host replacements.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--all-sdk', action='store_true', help='build the actual self-build library selection')
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    if os.path.lexists(output):
+        parser.error('output must be absent')
+    output.mkdir(parents=True)
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    drivers = [root / 'test/scripts/sdk-artifact-build.bl', root / 'test/scripts/sdk-artifact-consumer.bl']
+    if args.all_sdk:
+        drivers[0] = root / 'test/scripts/sdk-artifact-all.bl'
+    fixtures = root / 'test/fixtures/sdk-artifacts'
+    trace = root / 'test/scripts/sdk-artifact-trace.exs'
+    watched = sorted({Path(__file__).resolve(), *drivers, trace, root / 'scripts/demo-artifact-production', root / 'env.bl',
+                      *(root / 'priv').rglob('*.bl'), *(root / 'priv').rglob('*.bl.md'),
+                      *fixtures.glob('*.bl'), *(root / 'priv/native').glob('*.so')})
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    seed_inputs = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+    (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
+    report = {'version': 1, 'scope': 'artifact-sdk-build-and-sealed-image', 'status': 'running',
+              'seconds': {}, 'full_sdk_qualified': False, 'source_free_sdk': False,
+              'native_execution_admission': False}
+    image = output / 'image'
+    image.mkdir()
+    subprocess.run(['cp', '-a', '--reflink=auto', str(root / 'priv'), str(image / 'priv')], check=True)
+    shutil.rmtree(image / 'priv/bootstrap/seed')
+    shutil.copytree(seed, image / 'priv/bootstrap/seed')
+    shutil.copy2(root / 'env.bl', image / 'env.bl')
+    app = image / '.bl/lib/beam_lisp-0.1.0'
+    app.mkdir(parents=True)
+    (app / 'priv').symlink_to(image / 'priv', target_is_directory=True)
+    shutil.copytree(seed, image / 'ebin')
+    (app / 'ebin').symlink_to(image / 'ebin', target_is_directory=True)
+    target = image / 'priv/std/sdk/artifact'
+    target.mkdir(parents=True)
+    for file in fixtures.glob('*.bl'):
+        shutil.copy2(file, target / file.name)
+    boot = runpy.run_path(str(root / 'scripts/demo-artifact-production'))['BOOT']
+    boot = boot.replace('BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))',
+                        'if file = System.get_env("BL_SDK_ARTIFACT_TRACE"), do: Code.require_file(file)\n'
+                        'BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))')
+    (image / 'boot.exs').write_text(boot)
+    deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / 'deps').glob('*/ebin')),
+                                                  *sorted((root / '_build').glob('*/lib/*/ebin'))]))
+    command = ['elixir']
+    for dep in deps:
+        command += ['-pa', str(dep)]
+    command += ['-pa', str(app / 'ebin'), str(image / 'boot.exs')]
+    env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off', BL_SDK_ARTIFACT_OUT=str(output),
+               XDG_CACHE_HOME=str(image / 'cache'), ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+
+    def run(stage, driver):
+        started = time.monotonic()
+        done = subprocess.run(command, cwd=image, env=dict(env, BL_ARTIFACT_DRIVER=str(driver)),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              timeout=900 if args.all_sdk else 240)
+        report['seconds'][stage] = round(time.monotonic() - started, 3)
+        (output / f'{stage}.log').write_text(done.stdout)
+        print(done.stdout[-10000:], end='', flush=True)
+        if done.returncode:
+            raise RuntimeError(f'{stage} failed with exit {done.returncode}')
+        if inputs != {p: sha(root / p) for p in inputs}:
+            raise RuntimeError('source/driver/native inputs changed during qualification')
+        if seed_inputs != {p.name: sha(p) for p in seed.iterdir() if p.is_file()}:
+            raise RuntimeError('selected floor changed during qualification')
+
+    try:
+        if not args.all_sdk:
+            env['BL_SDK_ARTIFACT_TRACE'] = str(trace)
+        run('producer', drivers[0])
+        report['producer'] = json.loads((output / 'producer.json').read_text())
+        env.pop('BL_SDK_ARTIFACT_TRACE', None)
+        if args.all_sdk:
+            # The full producer uses the original 40-valued provider; the
+            # seven-unit scenario changes it to 50 before sealing its image.
+            env['BL_SDK_ARTIFACT_EXPECTED'] = '42'
+        env['XDG_CACHE_HOME'] = str(image / 'empty-consumer-cache')
+        run('consumer', drivers[1])
+        report['consumer'] = json.loads((output / 'consumer.json').read_text())
+        victim = app / 'ebin/Elixir.BeamLisp.Ns.Sdk.Artifact.Consumer.beam'
+        original = victim.read_bytes()
+        try:
+            victim.write_bytes(b'changed sealed artifact')
+            env['BL_SDK_ARTIFACT_TAMPER'] = 'yes'
+            run('tamper', drivers[1])
+        finally:
+            victim.write_bytes(original)
+        report.update(status='passed', tampering_refused_before_initialization=True)
+    except Exception as error:
+        report.update(status='error', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(f'Passed. Artifacts and receipts: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()
