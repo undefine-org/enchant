@@ -11,7 +11,7 @@ observed=[BeamLisp.Reader,BeamLisp.Compiler,BeamLisp.Ns.Reader,BeamLisp.Ns.Body.
 patterns=Enum.flat_map(observed,fn module ->
  Code.ensure_loaded!(module)
  for {name,arity}<-module.module_info(:functions), name != :module_info, do: {module,name,arity}
-end) ++ [{BeamLisp.AOT,:eval_constructor_session!,4}]
+end) ++ [{BeamLisp.AOT,:eval_constructor_session!,4},{BeamLisp.AOT,:runtime_floor!,0}]
 Code.ensure_loaded!(BeamLisp.AOT)
 parent=self()
 tracer=spawn(fn ->
@@ -66,5 +66,8 @@ ticket=make_ref();send(tracer,{:finish,ticket})
 calls=receive do {:calls,^ticket,calls}->calls after 5000->raise "trace report timed out" end
 :erlang.trace(self(),false,[:call])
 for pattern<-patterns, do: :erlang.trace_pattern(pattern,false,[:local])
-unless calls==%{}, do: raise "runtime executed compiler work: #{inspect(calls)}"
-IO.puts("STANDALONE-RUNTIME #{inspect(BeamLisp.Vector.to_list(value),charlists: :as_lists)} compiler-calls=0 exact-floor-retained=true compiler-seeded=false env-restarted=true replacement-refused=true")
+floor_captures = Map.get(calls, {BeamLisp.AOT, :runtime_floor!}, 0)
+compiler_calls = Map.delete(calls, {BeamLisp.AOT, :runtime_floor!})
+unless compiler_calls == %{}, do: raise "runtime executed compiler work: #{inspect(compiler_calls)}"
+unless floor_captures == 2, do: raise "warm entries recaptured the support floor: #{floor_captures}"
+IO.puts("STANDALONE-RUNTIME #{inspect(BeamLisp.Vector.to_list(value),charlists: :as_lists)} compiler-calls=0 exact-floor-retained=true compiler-seeded=false env-restarted=true replacement-refused=true floor-captures=#{floor_captures} warm-recaptures=0")
