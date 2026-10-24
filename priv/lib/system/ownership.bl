@@ -111,6 +111,72 @@
    [(first refs) state]
    [nil (unknown state :ownership-unresolved-resource node)])))
 
+(defn- closure-value [node state path]
+ ;; A finite recipe from actual ANF, not an executable host callback. Preserve
+ ;; only names observed in the body; parameters shadow captures on invocation.
+ (let [names (atom #{}) todo (atom (list node))]
+  (loop [left 4096]
+   (when (and (seq @todo) (> left 0))
+    (let [n (first @todo)]
+     (reset! todo (concat (ir/child-nodes n) (rest @todo)))
+     (when (= :var (:op n)) (swap! names conj (:name n)))
+     (recur (dec left)))))
+  (let [captured (select-keys (:env state) @names)]
+   (value (if (seq @todo) (unknown state :ownership-latent-budget node) state)
+          {:refs (reduce into #{} (map :refs (vals captured)))
+           :truth #{true} :shape :closure
+           :function {:id path :node node :env captured}}))))
+
+(defn- return-from-call [caller result]
+ (assoc result :env (:env caller)
+               :issues (into (:issues caller) (:issues result))
+               :obligations (into (:obligations caller) (:obligations result))
+               :opaque (or (:opaque caller) (:opaque result))))
+
+(defn- local-call [node callable args state engine depth]
+ (let [function (:function callable) clauses (get-in function [:node :clauses])
+       matches (filter #(= (count args) (count (:pats %))) clauses)
+       supported? (fn [clause]
+                    (and (nil? (:guard clause))
+                         (every? #(contains? #{:pvar :pwild} (:pop %)) (:pats clause))))]
+  (cond
+   (empty? matches) [(assoc state :exit :raised :value (opaque))]
+   ;; Selecting the first unconditional matching clause is exact. A guarded
+   ;; or destructuring predecessor cannot be silently skipped.
+   (not (supported? (first matches)))
+    [(value (unknown state :ownership-unsupported-call-clause node) (opaque))]
+   :else
+    (let [clause (first matches)
+          bound (reduce (fn [env [pattern argument]]
+                          (if (= :pvar (:pop pattern)) (assoc env (:name pattern) argument) env))
+                        (:env function) (map (fn [p v] [p v]) (:pats clause) args))
+          input (assoc state :env bound :value (scalar) :issues #{} :obligations #{} :opaque false)
+          ;; The entire semantic input is part of the context, including
+          ;; resource phases, aliases and captures. Inherited report facts do
+          ;; not affect execution: summarize local deltas and union them back
+          ;; into every caller. Points are graph addresses, not semantic input.
+          key [(:id function) (:node function) (dissoc input :point)]
+          known (get-in @engine [:summaries key])]
+     (cond
+      (= :active (:status known))
+       [(value (unknown state :ownership-recursive-call node) (opaque))]
+      (= :complete (:status known))
+       (do
+        (swap! engine update :summary-hits inc)
+        (swap! engine update-in [:edges (:point state)]
+         #(conj (or % #{}) (:initial known)))
+        (mapv #(return-from-call state %) (:terminals known)))
+      :else
+       (let [id (count (:summaries @engine))]
+        (when (>= id (:max-summaries @engine)) (fail! :ownership-summary-budget))
+        (let [path [:call-context id]
+              initial (edge! engine (:point state) input [path :entry])]
+         (swap! engine assoc-in [:summaries key] {:status :active :initial (:point initial)})
+         (let [terminals (visit (:body clause) initial path engine depth)]
+          (swap! engine assoc-in [:summaries key]
+                 {:status :complete :initial (:point initial) :terminals terminals})
+          (mapv #(return-from-call state %) terminals)))))))))
+
 (defn- apply-rule [node call rule values state path]
  (let [action (:action rule) id [:allocation path]
        state (reduce (fn [state requirement]
@@ -176,7 +242,10 @@
      (let [rule (get-in @engine [:protocol :rules (call-key call)])
            args (if (= :remote (:mode call)) values (vec (rest values)))]
       (if-not (and rule (some? (:arity call)))
-       [(value (unknown state :ownership-unknown-call node) (opaque))]
+       (if (and (not= :remote (:mode call)) (some? (:arity call))
+                (= :closure (:shape (first values))))
+        (local-call node (first values) args state engine depth)
+        [(value (unknown state :ownership-unknown-call node) (opaque))])
        (let [result (apply-rule node call rule args state path)
              raised (fn [state] (assoc state :exit :raised :value (opaque)))]
         (case (:throws rule)
@@ -249,18 +318,7 @@
                                                 (map-indexed (fn [index item] [index item]) handlers))]
                            (if (some total? handlers) handled (cons next handled))))) body)]
           (after-node (:after node) caught (conj path :after) engine depth))
-        (= :fn op)
-         ;; A closure is latent. Captured resource aliases travel with its
-         ;; value; they cannot disappear through a later aggregate or escape.
-         (let [refs (atom #{}) todo (atom (list node))]
-          (loop [left 4096]
-           (when (and (seq @todo) (> left 0))
-            (let [n (first @todo)]
-             (reset! todo (concat (ir/child-nodes n) (rest @todo)))
-             (when (= :var (:op n)) (swap! refs into (get-in state [:env (:name n) :refs] #{})))
-             (recur (dec left)))))
-          [(value (if (seq @todo) (unknown state :ownership-latent-budget node) state)
-                  {:refs @refs :truth #{true} :shape :closure})])
+        (= :fn op) [(closure-value node state path)]
         (ir/call-site node) (call-node node state path engine depth)
         (= :arith op)
          (mapcat (fn [{:keys [state values]}]
@@ -298,15 +356,17 @@
   (try
    (protocol! protocol)
    (when-not (and (erlang/is_map options)
-                  (every? #{:max-steps :max-states :max-paths} (keys options))
+                  (every? #{:max-steps :max-states :max-paths :max-summaries} (keys options))
                   (every? (fn [[key maximum]]
                             (let [n (get options key maximum)] (and (int? n) (<= 1 n maximum))))
-                          [[:max-steps 100000] [:max-states 4096] [:max-paths 256]]))
+                          [[:max-steps 100000] [:max-states 4096] [:max-paths 256] [:max-summaries 512]]))
     (fail! :ownership-budget-options))
    (BeamLisp.CompilerData/check_first_order! entries {:max-nodes 262144 :max-depth 128 :max-bytes 16777216})
    (when-not (and (or (vector? entries) (erlang/is_list entries)) (<= 1 (count entries) 128))
     (fail! :ownership-entries))
-   (let [engine (atom {:protocol protocol :states {} :index {} :edges {} :remaining (get options :max-steps 100000)
+   (let [engine (atom {:protocol protocol :states {} :index {} :edges {} :summaries {} :summary-hits 0
+                       :max-summaries (get options :max-summaries 512)
+                       :remaining (get options :max-steps 100000)
                        :max-states (get options :max-states 4096) :max-paths (get options :max-paths 256)})
          results
          (mapv (fn [[index entry]]
@@ -333,8 +393,11 @@
     {:version 1 :scope :finite-anf-entry-lifecycle :protocol (:id protocol) :native-admission false
      :status (cond opaque? :unknown (not all-safe?) :refused (seq obligations) :conditional :else :proved)
      :assumptions {:protocol-contracts true :future-native-custody :runtime :concrete-counterexample false}
-     :coverage {:immediate-control-flow true :latent-bodies :not-executed
+     :coverage {:immediate-control-flow true :latent-bodies :on-known-invocation
+                :local-calls :contextual-transitions :guarded-or-destructuring-calls :unknown
                 :recursive-and-unsupported-control :unknown :exception-contracts :explicit}
+     :summaries {:contexts (count (:summaries @engine)) :hits (:summary-hits @engine)
+                 :scope :entry-local :reuse-across-snapshots false :native-admission false}
      :entries results :states (count states) :steps (- (get options :max-steps 100000) (:remaining @engine))
      :issues (vec issues) :runtime-obligations (vec obligations)
      :diagnostics (vec (keep #(errors/node->warning :ownership {:ann (:origin %)}
