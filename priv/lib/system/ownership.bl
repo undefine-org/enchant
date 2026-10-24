@@ -8,6 +8,9 @@
  (throw (ex-info "Ownership analysis boundary refused" {:kind kind})))
 (defn- scalar [] {:refs #{} :truth #{true false} :shape :scalar})
 (defn- opaque [] {:refs #{} :truth #{true false} :shape :unknown})
+(defn- literal-value [v]
+ (cond-> {:refs #{} :shape :scalar :truth #{(and (some? v) (not= false v))}}
+  (or (nil? v) (keyword? v)) (assoc :literal v)))
 (defn- origin [node] (select-keys (:ann node) [:file :line :col :end-line :end-col]))
 (defn- call-key [call]
  (if (= :remote (:mode call)) [:remote (:mod call) (:fun call) (:arity call)]
@@ -19,25 +22,27 @@
   accepted native use still needs actual custody/context/code/deadline checks.
   These records do not establish adapter conformance or grant admission."
  []
- {:version 1 :id 'native-execution-lifecycle-v1
+ {:version 2 :id 'native-execution-lifecycle-v2
   :rules
   {[:remote :Elixir.BeamLisp.Execution :register! 1]
     {:action :acquire :throws :before :runtime [:native-registration-context]}
    [:remote :Elixir.BeamLisp.Execution :register! 2]
     {:action :acquire :throws :before :runtime [:native-registration-context]}
    [:remote :Elixir.BeamLisp.Execution :invoke! 2]
-    {:action :use :arg 0 :throws :before :result :unknown :runtime [:callback-custody :deadline :callback-effects]}
+    {:action :use :arg 0 :throws :unknown :result :unknown :runtime [:callback-custody :deadline :callback-effects]}
    [:remote :Elixir.BeamLisp.Execution :close! 1]
-    {:action :release :arg 0 :throws :never :idempotent true
+    {:action :native-close :arg 0 :throws :never :idempotent true
      :runtime [:native-context :close-and-drain]}
    [:remote :Elixir.BeamLisp.Execution :prepare-handoff! 2]
-    {:action :move :arg 0 :throws :before :runtime [:native-handoff-preparation]}
+    {:action :native-prepare :arg 0 :throws :before :runtime [:native-handoff-preparation]}
    [:remote :Elixir.BeamLisp.Execution :accept-handoff! 1]
-    {:action :accept :arg 0 :throws :before :runtime [:native-owner :handoff-epoch]}}})
+    {:action :native-accept :arg 0 :throws :before :runtime [:native-owner :handoff-epoch]}
+   [:remote :Elixir.BeamLisp.Execution :accept-handoff! 2]
+    {:action :native-accept :arg 0 :throws :before :runtime [:native-owner :handoff-epoch :native-admission-grant]}}})
 
 (defn- protocol! [protocol]
  (BeamLisp.CompilerData/check_first_order! protocol {:max-nodes 16384 :max-depth 32 :max-bytes 1048576})
- (when-not (and (= #{:version :id :rules} (set (keys protocol))) (= 1 (:version protocol))
+ (when-not (and (= #{:version :id :rules} (set (keys protocol))) (contains? #{1 2} (:version protocol))
                 (symbol? (:id protocol)) (erlang/is_map (:rules protocol))
                 (<= (count (:rules protocol)) 256)) (fail! :ownership-protocol))
  (doseq [[key rule] (:rules protocol)]
@@ -48,7 +53,10 @@
                  (int? (last key)) (<= 0 (last key) 64)
                  (erlang/is_map rule)
                  (every? #{:action :arg :throws :runtime :idempotent :result} (keys rule))
-                 (contains? #{:acquire :borrow :move :accept :release :escape :use :pure} (:action rule))
+                 (contains? #{:acquire :borrow :move :accept :release :escape :use :pure
+                              :native-prepare :native-accept :native-close} (:action rule))
+                 (or (= 2 (:version protocol))
+                     (not (contains? #{:native-prepare :native-accept :native-close} (:action rule))))
                  (contains? #{:before :after :never :unknown} (:throws rule))
                  (vector? (:runtime rule)) (<= (count (:runtime rule)) 32)
                  (every? keyword? (:runtime rule))
@@ -58,6 +66,61 @@
                      (and (int? (:arg rule)) (<= 0 (:arg rule)) (< (:arg rule) (last key)))))
    (fail! :ownership-rule)))
  protocol)
+
+(defn handoff-outcomes
+ "Finite cleanup-obligation relation for native handoff outcomes. IDs are
+  symbolic data, not native registrations. This neither executes a command
+  nor proves custody; real owner/epoch/admission/death fences remain runtime.
+  A cancelled observation can leave a prepublished target needing cleanup."
+ [resources command]
+ (BeamLisp.CompilerData/check_first_order! [resources command]
+  {:max-nodes 65536 :max-depth 96 :max-bytes 4194304})
+ (when-not (and (map? resources) (<= (count resources) 512) (map? command)
+                (or (and (= :close (:operation command)) (= #{:operation :target} (set (keys command))))
+                    (and (= :owner-down (:operation command)) (= #{:operation :targets} (set (keys command)))
+                         (vector? (:targets command)) (<= (count (:targets command)) 512)
+                         (every? #(contains? resources %) (:targets command)))
+                    (and (contains? #{:prepare :accept} (:operation command))
+                         (= #{:operation :source :target} (set (keys command)))))
+                (every? (fn [[id row]]
+                          (and (some? id) (map? row)
+                               (contains? #{:owned :prepared :moved :released} (:phase row))
+                               (or (nil? (:borrows row)) (empty? (:borrows row))))) resources))
+  (fail! :ownership-handoff-model-input))
+ (let [source (:source command) target (:target command)
+       source-phase (get-in resources [source :phase]) target-phase (get-in resources [target :phase])
+       result (fn [state outcome returned] {:resources state :outcome outcome :return returned})
+       cancelled (result resources :cancelled {:kind :status :status :cancelled})
+       accepted (fn [state] (result state :accepted {:kind :status :status :accepted :registration target}))
+       outcomes
+       (case (:operation command)
+        :owner-down
+         [(result (reduce #(assoc-in %1 [%2 :phase] :released) resources (:targets command))
+                  :owner-down {:kind :owner-down})]
+        :close
+         (do (when-not (contains? resources target) (fail! :ownership-handoff-model-target))
+             [(result (assoc-in resources [target :phase] :released) :closed {:kind :literal :value :ok})])
+        :prepare
+         (do (when-not (and (contains? resources source) (some? target) (not (contains? resources target)))
+               (fail! :ownership-handoff-model-preparation))
+             (if (= :owned source-phase)
+              [(result resources :cancelled {:kind :literal :value :cancelled})
+               (result (assoc resources target {:phase :prepared :borrows #{} :handoff-source source})
+                       :prepared {:kind :prepared :source source :target target})]
+              [(result resources :cancelled {:kind :literal :value :cancelled})]))
+        :accept
+         (do (when-not (and (contains? resources source) (contains? resources target)
+                            (= source (get-in resources [target :handoff-source])))
+               (fail! :ownership-handoff-model-acceptance))
+             (cond
+              (= :owned target-phase) [cancelled (accepted resources)]
+              (and (= :prepared target-phase) (= :owned source-phase))
+               [cancelled
+                (result resources :busy {:kind :status :status :busy :detail :code-retention-capacity})
+                (accepted (-> resources (assoc-in [source :phase] :moved)
+                              (assoc-in [target :phase] :owned)))]
+              :else [cancelled])))]
+  {:version 1 :scope :native-handoff-cleanup-obligations :native-admission false :outcomes outcomes}))
 
 ;; The graph records actual abstract transitions, including exceptional exits.
 ;; It uses the existing greatest-fixpoint engine to ask AG(no bad/opaque state).
@@ -82,6 +145,8 @@
 (defn- aggregate [values]
  {:refs (reduce into #{} (map :refs values)) :truth #{true} :shape :aggregate
   :opaque (some #(or (:opaque %) (= :unknown (:shape %))) values)})
+(defn- envelope [shape fields]
+ {:shape shape :fields fields :refs (reduce into #{} (map :refs (vals fields))) :truth #{true}})
 
 (declare visit)
 (defn- cap! [engine paths]
@@ -233,6 +298,47 @@
      :else (value (bad state :ownership-invalid-release) (scalar)))
    :else (value (unknown state :ownership-unknown-rule node) (opaque)))))
 
+(defn- native-rule-results [node call rule values state path]
+ (let [state (reduce (fn [s requirement]
+                       (update s :obligations conj
+                        {:kind requirement :site path :callee (call-key call) :origin (origin node)}))
+                     state (:runtime rule))
+       action (:action rule) input (get values (:arg rule))
+       [target state] (if (= :native-accept action) [nil state]
+                       (resource-argument state values rule node))
+       source-value (get-in input [:fields :source]) target-value (get-in input [:fields :accepted])
+       valid-preparation? (and (= :native-handoff (:shape input))
+                               (= :resource (:shape source-value)) (= 1 (count (:refs source-value)))
+                               (= :resource (:shape target-value)) (= 1 (count (:refs target-value))))
+       command (cond
+                 (and (= :native-prepare action) target)
+                  {:operation :prepare :source target :target [:allocation path]}
+                 (and (= :native-close action) target) {:operation :close :target target}
+                 (and (= :native-accept action) valid-preparation?)
+                  {:operation :accept :source (first (:refs source-value)) :target (first (:refs target-value))})]
+  (if-not command [(value (unknown state :ownership-unresolved-native-handoff node) (opaque))]
+   (mapv (fn [outcome]
+           (let [returned (:return outcome)
+                 v (case (:kind returned)
+                     :literal (literal-value (:value returned))
+                     :prepared (envelope :native-handoff {:source (token (:source returned))
+                                                         :accepted (token (:target returned))})
+                     :status (envelope :record
+                              (cond-> {:status (literal-value (:status returned))}
+                               (contains? returned :registration) (assoc :registration (token (:registration returned)))
+                               (contains? returned :detail) (assoc :kind (literal-value (:detail returned))))))]
+            (value (assoc state :resources (:resources outcome)) v)))
+         (:outcomes (handoff-outcomes (:resources state) command))))))
+
+(defn- keyword-projection [node state values]
+ (let [key (:literal (first values)) collection (second values) default (get values 2 (literal-value nil))]
+  (cond
+   (contains? #{:native-handoff :record} (:shape collection))
+    (value state (get (:fields collection) key default))
+   (and (contains? collection :literal) (contains? #{nil :cancelled} (:literal collection)))
+    (value state default)
+   :else (value (unknown state :ownership-unknown-projection node) (opaque)))))
+
 (defn- call-node [node state path engine depth]
  (let [call (ir/call-site node)
        nodes (if (= :remote (:mode call)) (:args call) (cons (:callee call) (:args call)))]
@@ -242,17 +348,22 @@
      (let [rule (get-in @engine [:protocol :rules (call-key call)])
            args (if (= :remote (:mode call)) values (vec (rest values)))]
       (if-not (and rule (some? (:arity call)))
-       (if (and (not= :remote (:mode call)) (some? (:arity call))
-                (= :closure (:shape (first values))))
-        (local-call node (first values) args state engine depth)
-        [(value (unknown state :ownership-unknown-call node) (opaque))])
-       (let [result (apply-rule node call rule args state path)
+       (cond
+        (and (not= :remote (:mode call)) (contains? #{1 2} (:arity call))
+             (keyword? (:literal (first values))))
+         [(keyword-projection node state values)]
+        (and (not= :remote (:mode call)) (some? (:arity call)) (= :closure (:shape (first values))))
+         (local-call node (first values) args state engine depth)
+        :else [(value (unknown state :ownership-unknown-call node) (opaque))])
+       (let [results (if (contains? #{:native-prepare :native-accept :native-close} (:action rule))
+                       (native-rule-results node call rule args state path)
+                       [(apply-rule node call rule args state path)])
              raised (fn [state] (assoc state :exit :raised :value (opaque)))]
         (case (:throws rule)
-         :never [result]
-         :before [result (raised state)]
-         :after [result (raised result)]
-         :unknown [result (raised (unknown state :ownership-exception-effect node))]))))))
+         :never results
+         :before (conj results (raised state))
+         :after (into results (map raised results))
+         :unknown (conj results (raised (unknown state :ownership-exception-effect node)))))))))
    (operands nodes state (conj path :arguments) engine depth))))
 
 (defn- after-node [node states path engine depth]
@@ -271,7 +382,7 @@
        depth (dec depth) op (:op node)
        result
        (cond
-        (= :lit op) [(value state {:refs #{} :shape :scalar :truth #{(and (some? (:val node)) (not= false (:val node)))}})]
+        (= :lit op) [(value state (literal-value (:val node)))]
         (= :enil op) [(value state (scalar))]
         (= :var op)
          (let [v (get-in state [:env (:name node)] (opaque))]
@@ -343,7 +454,7 @@
        state (if (and (= :normal (:exit state)) (= :unknown (:shape out)))
                (unknown state :ownership-unknown-return node) state)]
   (reduce (fn [state [id resource]]
-            (if (contains? #{:owned :borrowed :pending} (:phase resource))
+            (if (contains? #{:owned :borrowed :pending :prepared} (:phase resource))
              (issue state :ownership-unfinished-lifetime node {:resource id :phase (:phase resource)}) state))
           state (:resources state))))
 
