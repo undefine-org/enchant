@@ -31,7 +31,9 @@
 (defn- registration-meta [registration]
  (when registration
   (BeamLisp.Execution/metadata! registration)))
-(defn- proof-record [held key] (get (:callbacks (registration-meta (:handler held))) key))
+(defn- proof-record [held key]
+ (let [record (get (:callbacks (registration-meta (:handler held))) key)]
+  (when record (assoc record :registration (get held key)))))
 (defn- put-registration-meta! [registration value]
  (BeamLisp.Execution/put-metadata! registration value))
 
@@ -194,7 +196,7 @@
  ;; Ordinary SDK actors do not statically import analysis/prover dependencies.
  (BeamLisp.Loader/ensure_loaded "proc.message-domain")
  (erlang/apply (BeamLisp.Emit/module_for "proc.message-domain") operation (to-list args)))
-(defn- automatic-proof! [st spec]
+(defn- automatic-proof! [st spec held]
  (let [environment (spec-environment spec) graph (Process/get :bl_generation)]
   (when-not (and graph (BeamLisp.Env/executing_generation? graph)
                  (= (:digest graph) (:digest spec)) (= graph (:generation environment))
@@ -210,11 +212,11 @@
                    {:kind :unproved-prior-message-migration :scope :retained-old-owner}))))
   (doseq [key [:handler :accept? :upcast :migrate-state :check-state :downcast :check-reply]]
    (when-let [function (get spec key)] (BeamLisp.Env/assert_managed_callback! graph function)))
-  (let [record (fn [key] {:function (get spec key) :environment (:environment spec)})
+  (let [record (fn [key] (proof-record held key))
         proof (message-proof-api :compare-callbacks
                 [(proof-record (:current st) :accept?) (record :upcast) (record :accept?)])
-        state-proof (message-proof-api :capture [(:migrate-state spec) (:environment spec)])
-        check-proof (message-proof-api :capture [(:check-state spec) (:environment spec)])]
+        state-proof (message-proof-api :capture-registration! [(:migrate-state held)])
+        check-proof (message-proof-api :capture-registration! [(:check-state held)])]
    (when-not (and (= :proved (:status proof)) (= :proved (:status state-proof))
                   (= :proved (:status check-proof)) (empty? (:obligations state-proof))
                   (empty? (:obligations check-proof)))
@@ -255,6 +257,12 @@
     (try
      (validate-migrations! (:current st) spec)
      (reset! held (retain! spec))
+     ;; Prove the same registrations that conversion and future adapters own.
+     ;; No temporary proof registration or new fresh-graph admission is needed.
+     (when (:automatic spec)
+      (let [proof (automatic-proof! st spec @held) handler (:handler @held)]
+       (put-registration-meta! handler (assoc (registration-meta handler) :preparation-proof proof))
+       (put-registration-meta! (:upcast @held) {:message-proof (:domain proof)})))
      (let [result (fence/fence-fn (:upgrade-ms st)
                     #(dc/observing
                       (fn []
@@ -305,14 +313,13 @@
       (first-order/check! samples {:max-nodes 32768 :max-bytes 1048576 :max-depth 64})
       (when-not (and (vector? samples) (<= (count samples) 256))
        (throw (ex-info "Invalid explicit owner message samples" {:kind :invalid-message-samples})))
-      (let [proof (automatic-proof! st spec) samples (into samples (queued-samples! st))
+      (let [samples (into samples (queued-samples! st))
             _ (when (> (count samples) 256)
                 (throw (ex-info "Combined owner sample inventory exceeds budget" {:kind :message-inventory-budget})))
             _ (reset! conversion-entered true)
-            [reply after] (stage-upgrade st expected (assoc spec :automatic true :message-proof (:domain proof)) samples)]
+            [reply after] (stage-upgrade st expected (assoc spec :automatic true) samples)]
        (if (= :prepared (:status reply))
-        (let [registration (get-in after [:preparation :held :handler])]
-         (put-registration-meta! registration (assoc (registration-meta registration) :preparation-proof proof))
+        (do
          (BeamLisp.Env/owner_transition_prepared! grant (:ticket reply))
          [(assoc (dissoc reply :ticket) :scope :proved-future-owner-inputs)
           (update after :preparation #(assoc % :automatic-grant grant))])
