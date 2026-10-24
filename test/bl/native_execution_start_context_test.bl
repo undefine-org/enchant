@@ -1,0 +1,95 @@
+(ns native-execution-start-context-test
+ (:require [reload.generation :as g] [reload.state :as state] [proc.evolve :as ev]))
+
+(defn- await [predicate]
+ (loop [left 1000]
+  (cond (predicate) true (zero? left) false
+   :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- expired? [id]
+ (try (BeamLisp.Env/execution_context_value! id) false
+  (catch error (= :retired_execution_context (:original error)))))
+(def SOURCE
+ "(ns start.context)
+  (defserver owner (init [_] (ok nil)))
+  (defn class [] owner)
+  (defn accepts [x] (erlang/is_binary x))
+  (defn valid [x] (erlang/is_integer x))
+  (defn identity-value [x] x)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [version digest]
+   {:version version :digest digest :handler handler :accept? accepts :check-state valid
+    :migrate-state identity-value :upcast identity-value})")
+(defn- graph [revision]
+ (g/prepare! {:application-id "native-start-context" :native-modules #{"erlang"}
+              :resources {:revision revision} :sources {"start.context" SOURCE}}))
+(defn- spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "start.context/spec" [version (:digest graph)]))))
+
+(deftest pending-starts-share-context-ids-and-release-them-on-real-creator-death
+ (let [graph (graph 1) parent (erlang/self)
+       worker (spawn #(g/with! graph
+                 (fn []
+                  (let [class (g/invoke! graph "start.context/class" [])
+                        a (BeamLisp.Env/begin_server_start! class)
+                        b (BeamLisp.Env/begin_server_start! class)]
+                   (erlang/send parent [:pending-start-contexts a b])
+                   (receive :finish :ok)))))]
+  (try
+   (let [[a b] (receive [:pending-start-contexts a b] [a b] (after 15000 (throw :start-context-timeout)))
+         left (BeamLisp.Env/server_start_row (elem a 2))
+         right (BeamLisp.Env/server_start_row (elem b 2)) id (:context-id left)]
+    (is (some? id)) (is (= id (:context-id right)))
+    (is (some? (:graph left)))
+    (is (not (contains? left :context))) (is (not (contains? left :generation)))
+    (when id
+     (let [context (BeamLisp.Env/execution_context_value! id)
+           marker (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))]
+      (is (= graph (:generation context)))
+      (is (erts_debug/same (:generation context) (BeamLisp.Env/execution_graph_generation! marker)))))
+    (erlang/send worker :finish)
+    (is (await #(not (Process/alive? worker))))
+    (is (await #(nil? (BeamLisp.Env/server_start_row (elem a 2)))))
+    (is (await #(nil? (BeamLisp.Env/server_start_row (elem b 2)))))
+    (when id (is (expired? id))))
+   (finally
+    (erlang/send worker :finish) (when (Process/alive? worker) (Process/exit worker :kill))
+    (g/retire! graph)))))
+
+(deftest pending-transition-context-is-private-interned-and-released-on-abandonment
+ (let [old (graph 2) fresh (graph 3) owner (atom nil) grant (atom nil)]
+  (try
+   (g/with! old #(state/bind! {})) (g/inherit-runtime! fresh old)
+   (reset! owner (g/with! old #(ev/start! (spec old 1) 7 {:managed true})))
+   (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @owner)))
+   (let [row (BeamLisp.Env/server_start_turn #(BeamLisp.Env/owner_transition_cap_row! @grant))
+         id (:context-id row)]
+    (is (some? id)) (is (some? (:graph row)))
+    (is (not (contains? row :context))) (is (not (contains? row :generation)))
+    (when id (is (= fresh (:generation (BeamLisp.Env/execution_context_value! id)))))
+    (BeamLisp.Env/abandon_owner_transition! @grant) (reset! grant nil)
+    (when id (is (expired? id))))
+   (finally
+    (when @grant (BeamLisp.Env/abandon_owner_transition! @grant))
+    (when (and @owner (Process/alive? @owner)) (GenServer/stop @owner))
+    (g/retire! fresh) (g/retire! old)))))
+
+(deftest oversize-start-context-refuses-before-publishing-custody
+ (let [graph (graph 4)]
+  (try
+   (g/with! graph
+    (fn []
+     (let [class (g/invoke! graph "start.context/class" [])
+           before (Process/get :bl-cli-project)
+           leases (ets/info :beam_lisp_code_leases :size)
+           contexts (ets/info :beam_lisp_source_lease_domains :size)
+           starts (BeamLisp.Env/server_start_turn #(ets/info :beam_lisp_server_starts :size))]
+      (try
+       (Process/put :bl-cli-project (String/duplicate "x" 8388608))
+       (is (= :execution_context_capacity
+              (try (BeamLisp.Env/begin_server_start! class) :unexpected
+               (catch error (:original error)))))
+       (finally (if (nil? before) (Process/delete :bl-cli-project) (Process/put :bl-cli-project before))))
+      (is (= leases (ets/info :beam_lisp_code_leases :size)))
+      (is (= contexts (ets/info :beam_lisp_source_lease_domains :size)))
+      (is (= starts (BeamLisp.Env/server_start_turn #(ets/info :beam_lisp_server_starts :size)))))))
+   (finally (g/retire! graph)))))
