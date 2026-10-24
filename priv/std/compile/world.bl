@@ -168,6 +168,16 @@
  (Base/encode16 (digest (erlang/term_to_binary selection (list :deterministic)))
                  (list (tuple :case :lower))))
 
+(defn- selection-module [selection]
+ (Module/concat :Elixir.BeamLisp.World.Revision (str "R" (selection-key selection))))
+
+(defn runtime-module
+ "Select an immutable physical program name from the complete captured input
+  and compiler pipeline identity. The logical target is a fixed domain tag;
+  the resulting physical name is then part of the ordinary artifact selection."
+ [captured]
+ (selection-module (selection-identity captured :Elixir.BeamLisp.World.Program)))
+
 (defn- artifact-inputs [captured key]
  (Map/new (map-indexed
   (fn [index input]
@@ -266,23 +276,42 @@
 (defn- unit-file-names [verified]
  (cons "artifact-unit.term" (map #(str (Atom/to_string (elem % 0)) ".beam") (:beams verified))))
 
-(defn- publish-unit! [staged directory verified]
+(defn- publish-unit! [staged directory verified previous]
  ;; The workspace's existing kernel claim serializes writers. Refuse foreign
  ;; files; replace only this complete unit's known members, manifest last.
  (when (File/exists? directory)
   (when-not (and (= :directory (:type (File/lstat! directory)))
-                 (every? (set (unit-file-names verified)) (File/ls! directory)))
+                 (every? (set (concat (unit-file-names verified)
+                                      (when previous (unit-file-names previous)))) (File/ls! directory)))
    (refuse! :world-output-membership directory)))
  (doseq [beam (:beams verified)]
   (atomic-bytes! (Path/join directory (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
  (atomic-bytes! (Path/join directory "artifact-unit.term")
-                (File/read! (Path/join staged "artifact-unit.term"))))
+                (File/read! (Path/join staged "artifact-unit.term")))
+ ;; Only a captured, byte-verified previous unit proves cleanup ownership.
+ ;; Loaded code is independent of these disk files and keeps its own Env lease.
+ (when previous
+  (doseq [name (remove (set (unit-file-names verified)) (unit-file-names previous))]
+   (File/rm! (Path/join directory name)))))
 
 (defn- runtime-current? [verified directory]
  (every? (fn [beam]
            (let [path (Path/join directory (str (Atom/to_string (elem beam 0)) ".beam"))]
             (and (File/regular? path) (= (elem beam 1) (File/read! path)))))
          (:runtime-beams verified)))
+
+(defn- obsolete-runtime-beams [previous verified]
+ (let [current (set (map first (:runtime-beams verified)))]
+  (filter #(not (contains? current (first %))) (:runtime-beams previous))))
+
+(defn- check-obsolete-runtime! [previous verified directory]
+ (doseq [beam (obsolete-runtime-beams previous verified)]
+  (let [path (Path/join directory (str (Atom/to_string (first beam)) ".beam"))
+        stat (File/lstat path)]
+   (when-not (= stat (tuple :error :enoent))
+    (when-not (and (= :ok (elem stat 0)) (= :regular (:type (elem stat 1)))
+                   (= (second beam) (File/read! path)))
+     (refuse! :world-runtime-membership path))))))
 
 (defn- build-result [path directory runtime verified built compiled cached]
  (let [modules (mapv #(elem % 0) (:beams verified))
@@ -300,8 +329,10 @@
    :native-admission false}))
 
 (defn- build-unclaimed [path out force?]
- (let [captured (capture path) module :Elixir.BeamLisp.World.Program
-       selection (selection-identity captured module)
+ (let [captured (capture path)
+       logical-selection (selection-identity captured :Elixir.BeamLisp.World.Program)
+       module (selection-module logical-selection)
+       selection (assoc logical-selection :module (Atom/to_string module))
        compiler-key (:compiler-key selection)
        _ (when-not (= compiler-key (BeamLisp.AOTCache/compiler_key))
            (refuse! :world-compiler-changed nil))
@@ -309,9 +340,11 @@
        directory (Path/join out "artifact-unit") runtime (Path/join out "ebin")
        _ (when (and (File/exists? runtime) (not= :directory (:type (File/lstat! runtime))))
            (refuse! :world-runtime-membership runtime))
-       _ (when (File/exists? (Path/join runtime "Elixir.BeamLisp.World.Program.PhaseLibrary.beam"))
+       previous (try (read-unit directory) (catch _ nil))
+       _ (when (and previous
+                    (File/exists? (Path/join runtime (str (get-in previous [:metadata :phase-module]) ".beam"))))
            (refuse! :world-runtime-membership runtime))
-       local (when-not force? (try (expected-selection! (read-unit directory) selection) (catch _ nil)))
+       local (when-not force? (when previous (try (expected-selection! previous selection) (catch _ nil))))
        reusable (or local
                     (when-not force?
                      (when-let [cached (BeamLisp.AOTCache/prepare_fetch compiler-key cache-key)]
@@ -336,10 +369,15 @@
       (check-inputs! captured)
       (when-not (= selection (selection-identity captured module))
        (refuse! :world-pipeline-changed nil))
+      (check-obsolete-runtime! previous verified runtime)
       (BeamLisp.AOTCache/store compiler-key cache-key staged (to-list (map first (:beams verified))))
-      (publish-unit! staged directory verified)
+      (publish-unit! staged directory verified previous)
       (doseq [beam (:runtime-beams verified)]
        (atomic-bytes! (Path/join runtime (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
+      (when previous
+       (check-obsolete-runtime! previous verified runtime)
+       (doseq [beam (obsolete-runtime-beams previous verified)]
+        (File/rm (Path/join runtime (str (Atom/to_string (first beam)) ".beam")))))
       (build-result path directory runtime verified 1 (if reusable 0 1) (if reusable 1 0)))
      (finally (File/rm_rf! staged)))))))
 

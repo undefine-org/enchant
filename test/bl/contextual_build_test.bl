@@ -39,11 +39,9 @@
     (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) false (list :local))
     (when (Process/alive? tracer) (Process/exit tracer :kill))))))
 
-(defn- run-program [result]
- (let [module :Elixir.BeamLisp.World.Program
-       bytes (File/read! (Path/join (:runtime-out result) "Elixir.BeamLisp.World.Program.beam"))]
-  (assert (= (tuple :module module) (code/load_binary module '() bytes)))
-  (try (erlang/apply module :run (list)) (finally (code/delete module) (code/purge module)))))
+(defn- runtime-module [result]
+ (first (:modules (first (vals (:runtime-manifest result))))))
+(defn- run-program [result] (world/run-unit (:out result) []))
 
 (deftest default-build-driver-reuses-an-unchanged-world-without-macro-execution
  (fixture
@@ -56,7 +54,7 @@
     (is (= [] (:errors warm)))
     (is (= 0 (:built warm))) (is (= 0 (:compiled warm))) (is (= 0 warm-macros))
     (is (= 42 (run-program warm)))
-    (is (= (list "Elixir.BeamLisp.World.Program.beam") (File/ls! (:runtime-out warm))))
+    (is (= (list (str (Atom/to_string (runtime-module warm)) ".beam")) (File/ls! (:runtime-out warm))))
     (is (= 3 (count (File/ls! (:out warm)))))
     (is (= 2 (count (:beams (world/read-unit (:out warm))))))
     (is (= 1 (count (:modules (first (vals (:runtime-manifest warm)))))))
@@ -81,7 +79,7 @@
   (fn [root opts]
    (let [first-run (build/run opts) output (:out first-run)]
     (is (= [] (:errors first-run)))
-    (File/write! (Path/join output "Elixir.BeamLisp.World.Program.beam") "damaged")
+    (File/write! (Path/join output (str (Atom/to_string (runtime-module first-run)) ".beam")) "damaged")
     (let [[repaired calls] (observe-macros #(build/run opts))]
      (is (= [] (:errors repaired))) (is (= 1 (:cached repaired))) (is (= 0 calls))
      (is (= 42 (run-program repaired))))
@@ -111,8 +109,9 @@
    (let [app (Path/join (:out opts) "ebin/worlddemo.app") read (file/consult (String/to_charlist app))]
     (is (= :ok (elem read 0)))
     (let [properties (elem (first (elem read 1)) 2) modules (Keyword/get properties :modules)]
-     (is (some #(= :Elixir.BeamLisp.World.Program %) modules))
-     (is (not (some #(= :Elixir.BeamLisp.World.Program.PhaseLibrary %) modules))))))))
+     (is (= 1 (count modules)))
+     (is (String/starts_with? (Atom/to_string (first modules)) "Elixir.BeamLisp.World.Revision.R"))
+     (is (not (String/ends_with? (Atom/to_string (first modules)) ".PhaseLibrary"))))))))
 
 (deftest a-refused-world-build-does-not-write-an-app-resource
  (fixture
@@ -176,3 +175,68 @@
      (is (= 1 (:cached reused)))
      (is (= 0 calls))
      (is (= 42 (run-program reused))))))))
+
+(deftest changed-builds-coexist-with-escaped-closures-from-the-previous-physical-revision
+ (fixture
+  (fn [root opts]
+   (File/write! (Path/join root "main.bl") "(ns main) (fn [x] (erlang/+ x 40))")
+   (let [old (build/run opts) old-module (runtime-module old)
+         old-package (Path/join root "old-runtime")]
+    (is (= [] (:errors old)))
+    (world/package-runtime! (:out old) old-package)
+    (let [old-closure (world/run-unit old-package [])]
+     (try
+      (is (= 42 (old-closure 2)))
+      (File/write! (Path/join root "main.bl") "(ns main) (fn [x] (erlang/+ x 50))")
+      (let [new (build/run opts) new-module (runtime-module new)
+            new-package (Path/join root "new-runtime")]
+       (is (= [] (:errors new)))
+       (is (not= old-module new-module))
+       (is (= 3 (count (File/ls! (:out new)))))
+       (is (= (list (str (Atom/to_string new-module) ".beam")) (File/ls! (:runtime-out new))))
+       (world/package-runtime! (:out new) new-package)
+       (let [new-closure (world/run-unit new-package [])]
+        (try
+         (is (= 52 (new-closure 2)))
+         (is (= 42 (old-closure 2)))
+         (is (= 42 ((world/run-unit old-package []) 2)))
+         (is (erlang/module_loaded old-module))
+         (is (erlang/module_loaded new-module))
+         (is (= 0 (:built (build/run opts))))
+         (File/write! (Path/join root "main.bl") "(ns main) (fn [x] (erlang/+ x 40))")
+         (let [restored (build/run opts)]
+          (is (= [] (:errors restored)))
+          (is (= old-module (runtime-module restored)))
+          (is (= 42 ((world/run-unit (:out restored) []) 2)))
+          (is (= 52 (new-closure 2))))
+         (finally (BeamLisp.Env/retire_module! new-module)))))
+      (finally (BeamLisp.Env/retire_module! old-module))))))))
+
+(deftest revision-cleanup-refuses-changed-runtime-files-before-publishing-the-new-unit
+ (fixture
+  (fn [root opts]
+   (let [old (build/run opts)
+         manifest (File/read! (Path/join (:out old) "artifact-unit.term"))
+         path (Path/join (:runtime-out old) (str (Atom/to_string (runtime-module old)) ".beam"))]
+    (is (= [] (:errors old)))
+    (File/write! path "preserve changed runtime file")
+    (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 43))")
+    (is (= 1 (count (:errors (build/run opts)))))
+    (is (= "preserve changed runtime file" (File/read! path)))
+    (is (= manifest (File/read! (Path/join (:out old) "artifact-unit.term"))))
+    (is (= 3 (count (File/ls! (:out old)))))))))
+
+(deftest revision-cleanup-preserves-a-dangling-symlink-in-an-obsolete-runtime-slot
+ (fixture
+  (fn [root opts]
+   (let [old (build/run opts)
+         manifest (File/read! (Path/join (:out old) "artifact-unit.term"))
+         path (Path/join (:runtime-out old) (str (Atom/to_string (runtime-module old)) ".beam"))
+         missing (Path/join root "missing-foreign-target")]
+    (is (= [] (:errors old)))
+    (File/rm! path) (File/ln_s! missing path)
+    (File/write! (Path/join root "forms.bl") "(ns forms) (defsyntax answer [form ctx] (syntax-literal 43))")
+    (is (= 1 (count (:errors (build/run opts)))))
+    (is (= (tuple :ok missing) (File/read_link path)))
+    (is (= manifest (File/read! (Path/join (:out old) "artifact-unit.term"))))
+    (is (= 3 (count (File/ls! (:out old)))))))))
