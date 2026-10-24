@@ -1641,6 +1641,11 @@ fn loaded() -> bool {
     true
 }
 
+#[rustler::nif(name = "nif_runtime_identity")]
+fn runtime_identity() -> &'static str {
+    env!("BEAM_LISP_NATIVE_BUILD_ID")
+}
+
 // Rustler's init macro currently supplies no unload hook. This entry follows
 // its resource/inventory registration but joins our worker before dlclose.
 extern "C" fn load_native(
