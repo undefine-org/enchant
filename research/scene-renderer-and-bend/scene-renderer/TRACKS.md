@@ -91,3 +91,18 @@ Functions and data are the first extension mechanism. Small languages for plants
 annotations, printmaking, or diagrams can encode visual judgment above a common
 scene model. Macros may improve notation or source provenance when a concrete
 need appears; they are not required to make the first expressive components.
+
+## First implementation slices
+
+`scene.clip` now implements finite clips, sequence, parallel, delay, retime, scoped
+cues, and independently sampled leaf clocks. The botanical study lives in
+`examples/scene-renderer/scene_demo/growth.bl`, with a captured build entrypoint in
+`examples/scene-renderer/growth.bl`. It uses canonical shaped outlines and geometric
+clipping. Its camera is authored directly; its dash reveals use conservative
+length budgets. General curve trimming, masks, and effect isolation remain open.
+
+The studio export slice captures its accepted prepared postcard revision in a
+retained export worker, admits one export independently of preview, and exposes
+status/download endpoints. The broader generic-composition entrypoint and source
+refresh remain separate work. See PROGRESS.md for actual validation evidence;
+these slices do not close either track.

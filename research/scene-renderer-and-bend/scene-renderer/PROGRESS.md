@@ -163,3 +163,37 @@ currently restarts to accept source changes), stronger source/executable capture
 at startup, direct export of the UI-edited config, and the broader clip algebra.
 The current milestone has a usable, committed playground and verified still/film
 path; these remaining items must not be hidden by calling the entire plan closed.
+
+## Two tracks: first botanical film and finite clips
+
+The user approved TRACKS.md: studio workflow and visual/clip-language development
+advance independently, with the studio subsequently adopting proven capabilities.
+`scene.clip` now supplies finite clips, sequence, parallel, delay, retime, scoped
+cues, and half-open independently sampled leaf intervals. It schedules data rather
+than executing content callbacks or selecting layout. Eighteen focused assertions
+cover nested clocks, transformed cues, exact boundaries, gaps, zero-duration clips,
+arbitrary seek order, and invalid compositions.
+
+The first V-track composition is `scene_demo/growth.bl`, built by `growth.bl`:
+an original twelve-second botanical plate with canonical shaped outlines,
+procedural branching/leaves/petals, stable hatching/grain/halftones, an iris clip,
+drawn annotations, and a camera scale movement. The six-second local growth clock
+is retimed to 7.5 seconds and held for the final plate by the authored scene.
+Five standalone specimens were rendered before the full film. Full-size stills
+and six decoded motion samples were inspected; this does not claim a complete
+audiovisual viewing. A label was moved away from a leaf during the camera move.
+
+The completed film has 288 verified frames at 24/1 fps, twelve seconds, 1080 square,
+with 2x internal sampling. Generation/encoding took 477.998s; systemd reported a
+rounded 1.1G process-tree peak. A separately rasterized selected frame 264 exactly
+matches the export PNG, without requiring frame zero. Frame/MP4 hashes agree with
+the retained manifest. Evidence is in `evidence/growth/`, including a review page,
+film, lossless master, decoded contact sheet, provenance, and checks. Eighty-two
+focused BL assertions pass across core, editorial, layout, postcard, clip, and
+growth tests (18 + 11 + 14 + 12 + 18 + 9).
+
+This is the first visual-language slice, not a complete transformation grammar.
+Dash reveals still require conservative path-length budgets. Camera geometry is
+authored directly. Alpha masks, isolated blending/effects, general path trimming,
+rich spans/glyph choreography, and shared-element shot transitions remain open.
+The existing startup executable-capture qualification remains. The film is silent.

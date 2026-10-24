@@ -1,5 +1,26 @@
 # Proposed authoring and inspection examples
 
+For current executable signatures see `priv/lib/scene/README.md`. The finite
+temporal subset now implemented as `scene.clip` is illustrated below; the earlier
+`motion/clip` sketches remain proposed syntax rather than compatible aliases.
+
+```clojure
+;; Implemented API: data content, independent of picture layout.
+(ns clip-example (:require [scene.clip :as clip]))
+(def timing
+  (clip/schedule
+    (clip/sequence {:id "story"}
+      [(clip/clip {:id "opening" :duration 2} :opening)
+       (clip/retime {:id "slow-detail" :duration 4}
+         (clip/clip {:id "detail" :duration 2 :cues {"bloom" 1}} :detail))])))
+(clip/sample timing 4) ;; detail is active at local time 1
+(get (:cues timing) "story/slow-detail/detail/bloom") ;; 4 seconds
+```
+
+The author maps sampled content/local times to pictures. Sampling does not invoke
+functions, mutate a drawing, or choose arrangement. A hold is an authored interval
+of stable content; a gap is empty. The botanical study is an executable example.
+
 These are design examples, not runnable library examples. Namespaces, signatures,
 cue handling, structured transforms, measurement, inspector, and studio commands
 below are proposed unless specifically identified as existing. They preserve the
