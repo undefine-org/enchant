@@ -1,0 +1,60 @@
+(ns scene-demo.editorial-build
+  (:require [scene.core :as s] [scene-demo.editorial :as art] [interop]))
+(defn digest [bytes] (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes))))
+(defn command! [program args]
+  (let [result (System/cmd program (to-list args) (list (tuple :stderr_to_stdout true)))]
+    (when (not= 0 (erlang/element 2 result))
+      (s/fail "Editorial worker failed" {:output (erlang/element 1 result)}))
+    (erlang/element 1 result)))
+(def sources ["examples/scene-renderer/scene_demo/editorial.bl" "priv/lib/scene/core.bl"
+              "priv/lib/scene/atelier.bl" "priv/lib/scene/material.bl" "priv/lib/live/hiccup.bl"
+              "examples/scene-renderer/editorial.bl" "examples/scene-renderer/raster.py"
+              "examples/scene-renderer/preview.html"])
+(let [args (clojure.io/current-command-line-args)
+      out (Path/expand (or (first args) "/tmp/bl-scene-editorial"))
+      film? (= "film" (second args))
+      count (if film? 96 1)
+      captured (mapv (fn [p] [p (File/read! p)]) sources)
+      fonts (mapv (fn [p] [p (File/read! (str "examples/scene-renderer/assets/fonts/" p))])
+                  ["DMSans.ttf" "InstrumentSerif-Regular.ttf" "InstrumentSerif-Italic.ttf" "PatrickHand-Regular.ttf"])
+      rsvg (or (System/get_env "SCENE_RSVG") "rsvg-convert")
+      backend (String/trim (command! rsvg ["--version"]))
+      revision (digest (str (pr-str captured) (pr-str (mapv (fn [[p bytes]] [p (digest bytes)]) fonts)) backend film?))
+      final-dir (str out "/" revision)
+      dir (str out "/.pending-" revision "-" (System/pid))]
+  (when (not (File/dir? final-dir))
+    (File/mkdir_p! (str dir "/font"))
+    (File/mkdir_p! (str dir "/sources"))
+    (doseq [[p bytes] fonts] (File/write! (str dir "/font/" p) bytes))
+    (doseq [[p bytes] captured]
+      (File/write! (str dir "/sources/" (replace-str p "/" "__")) bytes))
+    (File/write! (str dir "/provenance.json")
+      (interop/->json {:sources (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) captured)
+                      :fonts (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) fonts)
+                      :backend backend :runtime (System/version) :supersampling 2
+                      :texture-policy "512px seeded paper tile, cached once, material-local coordinates"
+                      :alpha "sRGB SVG composition over opaque paper; PNG master"}))
+    (doseq [k (range count)]
+      (File/write! (str dir "/" k ".svg")
+                   (s/svg (art/scene (if film? (s/frame-time k 24 1) 2.5)))))
+    (File/write! (str dir "/scene.json") (interop/->json (art/scene 1)))
+    (command! "python3" [(str dir "/sources/examples__scene-renderer__raster.py") "raster" dir
+                         "--count" (str count) "--font-dir" (str dir "/font")
+                         "--font" (str dir "/font/InstrumentSerif-Regular.ttf")
+                         "--scale" "2" "--rsvg" rsvg])
+    (when (not= captured (mapv (fn [p] [p (File/read! p)]) sources))
+      (s/fail "Sources changed during editorial render; publication held" {}))
+    (File/rename! dir final-dir))
+  (File/write! (str out "/index.html")
+    (replace-str (File/read! "examples/scene-renderer/preview.html")
+                 "Scene Studies" "Field Notes"))
+  (File/write! (str out "/manifest.json.tmp")
+    (interop/->json {:version 1 :revision revision :width 1080 :height 1080
+                    :frames count :fps [24 1] :duration (/ count 24)
+                    :seed 41 :backend backend :scenes [0] :quality "2x Lanczos / cached paper v1"
+                    :still-time (if film? nil 2.5)}))
+  (File/rename! (str out "/manifest.json.tmp") (str out "/manifest.json"))
+  (when film?
+    (command! "python3" [(str final-dir "/sources/examples__scene-renderer__raster.py")
+                         "export" out "--out" (str out "/field-notes.mp4")]))
+  (println (str "Published " count " art-directed BL frames: " final-dir)))
