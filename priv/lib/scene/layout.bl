@@ -1,0 +1,133 @@
+(ns scene.layout
+  (:require [scene.core :as s] [scene.geometry :as g] [scene.atelier :as a]))
+(defn column [opts children] {:node :column :opts opts :children (vec children)})
+(defn row [opts children] {:node :row :opts opts :children (vec children)})
+(defn overlay [opts children] {:node :overlay :opts opts :children (vec children)})
+(defn padding [opts content] (column opts [content]))
+(defn id-part [id] (if (keyword? id) (name id) (str id)))
+(defn scope [parent opts] (if (some? (:id opts)) (conj parent (id-part (:id opts))) parent))
+(defn key-of [path] (join "/" path))
+(defn width-of [node available]
+  (when (not (and (s/finite? available) (> available 0)))
+    (s/fail "Invalid available layout width" {:width available}))
+  (let [w (get (:opts node) :width available)]
+    (when (not (and (s/finite? w) (> w 0))) (s/fail "Layout requires positive width" {:id (:id (:opts node)) :width w}))
+    w))
+(defn content-width [node available]
+  (let [w (width-of node available) p (get (:opts node) :padding 0)]
+    (when (not (and (s/finite? p) (>= p 0) (> w (* 2 p))))
+      (s/fail "Padding exceeds available content width" {:id (:id (:opts node)) :width w :padding p}))
+    (- w (* 2 p))))
+(defn typography [node theme]
+  (let [opts (:opts node) role (get opts :role :body)
+        defaults (get (:type theme) role)]
+    (when (nil? defaults) (s/fail "Unknown typography role" {:id (:id opts) :role role}))
+    (merge defaults (select-keys opts [:family :size :line-height :weight :italic]))))
+(defn child-width [node available]
+  (let [w (content-width node available) n (count (:children node)) gap (get (:opts node) :gap 0)]
+    (when (not (and (s/finite? gap) (>= gap 0))) (s/fail "Invalid layout gap" {:gap gap}))
+    (if (and (= :row (:node node)) (> n 0)) (/ (- w (* gap (- n 1))) n) w)))
+(defn requests
+  "Collect a batch after propagating width constraints. Local semantic ids are
+   scoped by components, not anonymous layout wrappers or sibling indices."
+  ([node width theme] (requests node width theme []))
+  ([node width theme parent]
+   (let [opts (:opts node) path (scope parent opts) w (content-width node width)]
+     (if (= :text (:node node))
+       [(merge (typography node theme)
+               {:id (key-of path) :text (:text node) :width (if (:wrap node) w nil)})]
+       (vec (mapcat (fn [child] (requests child (child-width node width) theme path)) (:children node)))))))
+(defn anchors [w h baseline]
+  (merge {:center [(/ w 2) (/ h 2)] :east [w (/ h 2)] :west [0 (/ h 2)]
+          :north [(/ w 2) 0] :south [(/ w 2) h]}
+         (if (some? baseline) {:baseline [0 baseline]} {})))
+(defn place [node x y]
+  (let [m (g/multiply (g/translate x y) (:matrix node))]
+    (assoc node :matrix m :render (assoc-in (:render node) [:attrs :transform] (g/svg-transform m)))))
+(defn evaluated [node theme runs available parent internal]
+  (let [opts (:opts node) kind (:node node) path (scope parent opts) id (key-of path) render-id (str id "/$" (join "." (mapv str internal)))
+        w (width-of node available) p (get opts :padding 0)
+        matrix (g/transform (get opts :transform []))
+        color (get opts :fill (:ink theme))]
+    (when (empty? path) (s/fail "Composition needs a semantic root id" {}))
+    (cond
+      (= kind :text)
+      (let [run (get runs id) typo (typography node theme)
+            logical (:logical run) ink (:ink run) h (nth logical 3)]
+        (when (nil? run) (s/fail "Missing canonical text metrics" {:id id}))
+        (when (> (+ (first logical) (nth logical 2)) (+ w 0.1))
+          (s/fail "Text exceeds its logical width" {:kind :text-overflow :id id :width w :measured logical}))
+        {:id id :addressable (some? (:id opts)) :semantic-id path :kind kind :enter (:enter opts) :matrix matrix :logical [0 0 w h] :ink ink :effect ink
+         :baseline (:baseline run) :lines (:lines run) :anchors (anchors w h (:baseline run))
+         :properties {:text (:text node) :role (get opts :role :body) :font (:family typo) :color color}
+         :provenance {:font {:from (if (:family opts) :local :style-role) :role (get opts :role :body)
+                             :style (:id theme) :value (:family typo)}
+                      :color {:from (if (:fill opts) :local :style) :style (:id theme) :value color}}
+         :children [] :render {:id id :kind :path
+                               :attrs {:d (g/path-data (:commands run)) :fill color :transform (g/svg-transform matrix)}}})
+      (contains? #{:rect :circle :path} kind)
+      (let [h (get opts :height w)
+            stroke (get opts :stroke-width 0)
+            box (get opts :bounds [0 0 w h])
+            attrs (merge {:fill color :stroke (get opts :stroke "none") :stroke-width stroke
+                          :transform (g/svg-transform matrix)}
+                         (cond (= kind :rect) {:x 0 :y 0 :width w :height h}
+                               (= kind :circle) {:cx (/ w 2) :cy (/ h 2) :r (min (/ w 2) (/ h 2))}
+                               :else {:d (g/path-data (:commands opts))}))
+            [bx by bw bh] box
+            ink [(- bx (/ stroke 2)) (- by (/ stroke 2)) (+ bw stroke) (+ bh stroke)]]
+        (when (not (and (s/finite? h) (> h 0) (s/finite? stroke) (>= stroke 0)
+                       (every? s/finite? box) (>= bw 0) (>= bh 0)))
+          (s/fail "Invalid picture geometry" {:id id}))
+        (when (and (= kind :path) (nil? (:bounds opts)))
+          (s/fail "Structured path needs conservative bounds" {:id id}))
+        {:id id :addressable (some? (:id opts)) :semantic-id path :kind kind :enter (:enter opts)
+         :matrix matrix :logical [0 0 w h] :ink ink :effect ink :anchors (anchors w h nil)
+         :children [] :properties {:color color}
+         :render {:id render-id :kind kind :attrs attrs}})
+      (contains? #{:column :row :overlay :group :card} kind)
+      (let [cw (child-width node available)
+            children (vec (map-indexed (fn [i child] (evaluated child theme runs cw path (conj internal i))) (:children node)))
+            gap (get opts :gap 0)
+            placed (loop [remaining children cursor p result []]
+              (if (empty? remaining) result
+                (let [child (first remaining)
+                      x (if (= :row kind) cursor p) y (if (= :column kind) cursor p)
+                      next (+ cursor gap (if (= :row kind) (nth (:logical child) 2) (nth (:logical child) 3)))]
+                  (recur (rest remaining) next (conj result (place child x y))))))
+            h (+ (* 2 p) (cond
+                (= :column kind) (+ (reduce + 0 (mapv (fn [c] (nth (:logical c) 3)) children)) (* gap (max 0 (- (count children) 1))))
+                :else (if (empty? children) 0 (apply max (mapv (fn [c] (nth (:logical c) 3)) children)))))
+            ink (g/union (mapv (fn [c] (g/bounds (:matrix c) (:ink c))) placed))
+            effect (g/union (mapv (fn [c] (g/bounds (:matrix c) (:effect c))) placed))
+            card? (= kind :card)
+            rendered (if card?
+              [(a/paper (str render-id "/shadow") 8 10 w h (:shadow theme))
+               (update (a/rough-box (str render-id "/stock") 0 0 w h (get theme :card-paper (:paper theme))) :children
+                 (fn [items] (mapv (fn [item] (assoc-in item [:attrs :stroke] (:ink theme))) items)))]
+              [])
+            rendered (if (and card? (:grain opts))
+                       (conj rendered (a/texture (str render-id "/grain") 1 1 (- w 2) (- h 2) (:grain opts))) rendered)]
+        (when (and (= :row kind) (> (+ (* 2 p) (reduce + 0 (mapv (fn [c] (nth (:logical c) 2)) children))
+                                                  (* gap (max 0 (- (count children) 1)))) (+ w 0.1)))
+          (s/fail "Row exceeds available width" {:kind :layout-overflow :id id :width w}))
+        (when (and (:max-height opts) (> h (:max-height opts)))
+          (s/fail "Content exceeds maximum height" {:kind :layout-overflow :id id :height h :limit (:max-height opts)}))
+        {:id id :addressable (some? (:id opts)) :semantic-id path :kind kind :enter (:enter opts) :matrix matrix :logical [0 0 w h]
+         :ink (if card? (g/union [ink [-2 -2 (+ w 4) (+ h 4)]]) ink)
+         :effect (if card? (g/union [effect [-2 -2 (+ w 11) (+ h 13)]]) effect)
+         :anchors (anchors w h nil) :decorations rendered :children placed :properties {:width w :padding p :gap gap}
+         :render {:id render-id :kind :group :attrs {:transform (g/svg-transform matrix)}
+                  :children (into rendered (mapv :render placed))}})
+      :else (s/fail "Unsupported authored layout node" {:kind kind :id id}))))
+(defn evaluate [node width theme runs] (evaluated node theme runs width [] []))
+(defn index
+  ([node] (index node g/identity))
+  ([node parent]
+   (let [world (g/multiply parent (:matrix node))
+         here (-> node (dissoc :children :render :matrix :decorations)
+                  (assoc :world-transform world
+                         :logical (g/bounds world (:logical node)) :ink (g/bounds world (:ink node))
+                         :effect (g/bounds world (:effect node))
+                         :anchors (into {} (mapv (fn [[k p]] [k (g/point world p)]) (:anchors node)))))]
+     (into (if (:addressable node) {(:id node) here} {}) (mapcat (fn [child] (seq (index child world))) (:children node))))))
