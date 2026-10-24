@@ -1,0 +1,149 @@
+(ns system.ownership-loops-test
+ (:require [system.ownership :as o] [anf :as a] [system.ir :as ir] [expand :as x]
+           [system.phase :as phase] [compile.world :as world] [lower :as lower]))
+
+(def protocol
+ {:version 1 :id 'logical-loop-lifetimes
+  :rules
+  {[:remote :Elixir.OwnershipLoops :acquire 0] {:action :acquire :throws :never :runtime []}
+   [:remote :Elixir.OwnershipLoops :release 1] {:action :release :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipLoops :use 1] {:action :use :arg 0 :result :scalar :throws :never :runtime []}
+   [:remote :Elixir.OwnershipLoops :coin 0] {:action :pure :result :scalar :throws :never :runtime []}}})
+(defn- node [source]
+ (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source)
+                           (BeamLisp.Compiler/new_env "ownership.loops.fixture")))
+(defn- report
+ ([source] (report source {}))
+ ([source options] (o/check [{:id 'fixture :body (node source)}] protocol options)))
+(defn- status [source] (:status (report source)))
+
+(deftest finite-tail-control-reaches-cleanup
+ (doseq [source ["(loop [] 42)"
+                 "(loop [done false] (if done 42 (recur true)))"
+                 "(let [r (OwnershipLoops/acquire)] (do (loop [done false] (if done 42 (recur true))) (OwnershipLoops/release r)))"
+                 "(let [r (OwnershipLoops/acquire)] (loop [done false] (if done (OwnershipLoops/release r) (recur true))))"
+                 "(let [r (OwnershipLoops/acquire)] (do (loop [outer false] (if outer 42 (do (loop [inner false] (if inner 42 (recur true))) (recur true)))) (OwnershipLoops/release r)))"]]
+  (let [r (report source)]
+   (is (= :proved (:status r)) (pr-str [source r]))
+   (is (= :proved (get-in r [:cleanup :status])))
+   (is (pos? (get-in r [:loops :states]))))))
+
+(deftest cycles-check-each-lifetime-without-claiming-termination
+ (let [r (report "(loop [] (let [r (OwnershipLoops/acquire)] (do (OwnershipLoops/release r) (recur))))")]
+  (is (= :proved (:status r)) (pr-str r))
+  (is (pos? (get-in r [:loops :back-edges])))
+  (is (= :not-proved (get-in r [:cleanup :termination])))
+  (is (= 1 (get-in r [:cleanup :resources]))))
+ (let [r (report "(loop [] (recur))")]
+  (is (= :proved (:status r)))
+  (is (= 0 (get-in r [:cleanup :resources])))))
+
+(deftest cleanup-after-a-possibly-infinite-loop-is-not-established
+ (doseq [source ["(let [r (OwnershipLoops/acquire)] (loop [] (recur)))"
+                 "(let [r (OwnershipLoops/acquire)] (try (loop [] (recur)) (finally (OwnershipLoops/release r))))"
+                 "(let [r (OwnershipLoops/acquire)] (do (loop [] (if (OwnershipLoops/coin) 42 (recur))) (OwnershipLoops/release r)))"]]
+  (let [r (report source)]
+   (is (= :unknown (:status r)) (pr-str r))
+   (is (= :unknown (get-in r [:cleanup :status])))
+   (is (pos? (get-in r [:cleanup :unresolved]))))))
+
+(deftest released-aliases-never-become-a-new-allocation
+ (is (= :refused (status "(loop [r (OwnershipLoops/acquire)] (do (OwnershipLoops/release r) (recur r)))")))
+ (is (= :refused (status "(let [make (fn [] (OwnershipLoops/acquire)) old (make)] (do (OwnershipLoops/release old) (let [fresh ((fn [] (do (loop [done false] (if done 42 (recur true))) (make))))] (do (OwnershipLoops/use old) (OwnershipLoops/release fresh)))))"))))
+
+(deftest suspended-argument-aliases-survive-later-argument-evaluation
+ (is (= :refused
+        (status "(let [make (fn [] (OwnershipLoops/acquire))] ((fn [old fresh] (do (OwnershipLoops/use old) (OwnershipLoops/release fresh))) (let [r (make)] (do (OwnershipLoops/release r) r)) (do (loop [done false] (if done 42 (recur true))) (make))))"))))
+
+(deftest named-and-anonymous-tail-functions-use-the-same-worklist
+ (doseq [source ["((fn [done] (if done 42 (recur true))) false)"
+                 "((fn advance [done] (if done 42 (advance true))) false)"
+                 "(let [r (OwnershipLoops/acquire)] ((fn advance [done] (if done (OwnershipLoops/release r) (advance true))) false))"
+                 "(let [r (OwnershipLoops/acquire)] ((fn [done] (if done (OwnershipLoops/release r) (recur true))) false))"
+                 "((fn again [] (let [r (OwnershipLoops/acquire)] (do (OwnershipLoops/release r) (recur)))))"]]
+  (let [r (report source)]
+   (is (= :proved (:status r)) (pr-str [source r]))
+   (is (= :proved (get-in r [:cleanup :status])))
+   (is (= :not-proved (get-in r [:cleanup :termination]))))))
+
+(deftest compiled-tail-functions-agree-on-finite-boolean-control
+ (doseq [source ["((fn advance [done] (if done 42 (advance true))) false)"
+                 "(loop [done false] (if done 42 (recur true)))"]]
+  (is (= 42 (BeamLisp/eval source)))
+  (is (= :proved (status source)))))
+
+(deftest analysis-identity-binds-contract-content-and-effective-budgets
+ (let [entries [{:id 'subject :body (node "42")}]
+       plain (o/check entries protocol)
+       explicit (o/check entries protocol {:max-loop-states 1024})
+       changed (o/check entries (assoc-in protocol [:rules [:remote :Elixir.OwnershipLoops :release 1] :idempotent] true))
+       limited (o/check entries protocol {:max-loop-states 1})]
+  (is (= 2 (:version plain)))
+  (is (= (:analysis-key plain) (:analysis-key explicit)))
+  (is (= (:protocol-key plain) (:protocol-key explicit) (:protocol-key limited)))
+  (is (not= (:protocol-key plain) (:protocol-key changed)))
+  (is (not= (:analysis-key plain) (:analysis-key changed)))
+  (is (not= (:analysis-key plain) (:analysis-key limited)))
+  (is (= false (:native-admission plain)))))
+
+(deftest contextual-world-tail-control-shares-the-prepared-snapshot
+ (let [program (x/program
+                [{:namespace 'helpers :revision 'old :file "helpers.bl"
+                  :source "(ns helpers) (defn advance [done] (if done 42 (recur true)))"}
+                 {:namespace 'main :revision 'current :file "main.bl"
+                  :source "(ns main) (import-world 'helpers 'old :only [advance]) (advance false)"}]
+                ['main 'current])
+       analysis (phase/analyze program)
+       description (world/describe {:program program :manifest {:entry ['main 'current]}
+                                    :phase (:report analysis) :facts (:facts analysis)
+                                    :ownership (:ownership analysis) :arity {:status :proved :scope :arity}})]
+  (is (= 42 (lower/eval-anf :Elixir.OwnershipLoopWorldExample (:node program))))
+  (is (= :proved (get-in analysis [:ownership :status])))
+  (is (= (get-in analysis [:facts :snapshot]) (get-in analysis [:ownership :snapshot])))
+  (is (= "proved" (:ownership-cleanup-check description)))
+  (is (= 2 (:ownership-loop-states description)))
+  (is (= false (:native-admission description)))))
+
+(deftest finally-and-nontail-recursion-cannot-be-treated-as-a-jump
+ (let [r (report "(loop [r (OwnershipLoops/acquire)] (try (recur r) (finally (OwnershipLoops/release r))))")]
+  (is (= :unknown (:status r)))
+  (is (contains? (set (map :kind (:issues r))) :ownership-unsupported-recursion)))
+ ;; Authored malformed control can be structurally valid ANF. Do not skip
+ ;; continuation work merely because its subtree resembles the recur knot.
+ (let [loop-node (node "(loop [flag true] (recur flag))")
+       recur-node (get-in loop-node [:fn :init :clauses])
+       original (:body (first (:clauses (ir/scaffold-inner (:fn loop-node)))))
+       broken (assoc-in loop-node [:fn :init :clauses]
+                (list (assoc (first (get-in loop-node [:fn :init :clauses])) :body
+                        (assoc (ir/scaffold-inner (:fn loop-node)) :clauses
+                          (list (assoc (first (:clauses (ir/scaffold-inner (:fn loop-node))))
+                                       :body (a/doo [(a/tup [original]) (a/lit 42)])))))))
+       r (o/check [{:id 'malformed-control :body broken}] protocol)]
+  (is (= :unknown (:status r)))
+  (is (contains? (set (map :kind (:issues r))) :ownership-unsupported-recursion))))
+
+(deftest loop-and-progress-work-budgets-refuse-partial-results
+ (is (= :ownership-loop-budget
+        (:kind (report "(loop [] (let [r (OwnershipLoops/acquire)] (recur)))" {:max-loop-states 4}))))
+ (is (= :ownership-loop-budget
+        (:kind (report "(loop [done false] (if done 42 (recur true)))" {:max-loop-states 1}))))
+ (is (= :ownership-budget-options (:kind (report "42" {:max-loop-states 1025}))))
+ (is (= :unknown (:status (report "(let [r (OwnershipLoops/acquire)] (OwnershipLoops/release r))" {:max-steps 5})))))
+
+(deftest lexical-shadowing-cannot-forge-the-compilers-self-binding
+ (let [original (node "(loop [flag true] (recur flag))")
+       outer (first (get-in original [:fn :init :clauses]))
+       inner (:body outer) clause (first (:clauses inner)) self (get-in original [:fn :name])
+       shadowed (assoc-in original [:fn :init :clauses]
+                  (list (assoc outer :body
+                          (assoc inner :clauses
+                            (list (assoc clause :body (a/lett self (a/lit 42) (:body clause))))))))
+       r (o/check [{:id 'shadowed-self :body shadowed}] protocol)]
+  (is (= :unknown (:status r)))
+  (is (contains? (set (map :kind (:issues r))) :ownership-unsupported-recursion))))
+
+(deftest repeated-pattern-variables-are-not-unconditional-bindings
+ (let [f (a/fnn [(a/clause [(a/pvar "same") (a/pvar "same")] nil (a/lit 42))])
+       r (o/check [{:id 'repeated-pattern :body (a/app f [(a/lit 1) (a/lit 2)])}] protocol)]
+  (is (= :unknown (:status r)))
+  (is (contains? (set (map :kind (:issues r))) :ownership-unsupported-call-clause))))

@@ -1,0 +1,114 @@
+#+title: Tail control, safety and inevitable cleanup
+
+* One control graph, two questions
+
+system.ownership now follows the compiler's actual loop/recur and function
+self-application forms through a bounded worklist. Equivalent abstract states
+create back-edges instead of another recursive interpreter call. Named self
+calls and recur use that same driver. system.ir owns the structural recognizers;
+the analysis additionally requires the actual lexical self marker, matching
+arity and a supported tail position. Printed names or annotations cannot create
+a control edge.
+
+AG safety checks that no supported operation violates its resource protocol.
+AF cleanup asks a different question: from every state with a live obligation,
+does every path eventually discharge it? The existing system.gfp owns both
+fixpoints. A loop may satisfy safety while holding a registration forever.
+Such a program cannot receive a cleanup proof merely because no exit was seen.
+
+#+begin_src beam-lisp :id cross-world-tail-control
+(ns ownership.tail.worlds (:require [expand :as expand] [system.phase :as phase] [lower :as lower]))
+(let [program (expand/program
+               [{:namespace 'helpers :revision 'old :file "helpers.bl"
+                 :source "(ns helpers) (defn advance [done] (if done 42 (recur true)))"}
+                {:namespace 'main :revision 'current :file "main.bl"
+                 :source "(ns main) (import-world 'helpers 'old :only [advance]) (advance false)"}]
+               ['main 'current])
+      analysis (phase/analyze program) ownership (:ownership analysis)
+      actual (lower/eval-anf :Elixir.OwnershipTailControlWalkthrough (:node program))]
+ (assert (= 42 actual))
+ (assert (= :proved (:status ownership)))
+ (assert (= :proved (get-in ownership [:cleanup :status])))
+ (assert (= 2 (get-in ownership [:loops :states])))
+ (assert (= (:snapshot ownership) (get-in analysis [:facts :snapshot])))
+ {:value actual :ownership (:status ownership) :cleanup (get-in ownership [:cleanup :status])
+  :abstract-states (get-in ownership [:loops :states])})
+#+end_src
+#+RESULTS: cross-world-tail-control
+: {:value 42, :cleanup :proved, :ownership :proved, :abstract-states 2}
+
+
+* Cleanup is not termination
+
+Creating and closing a resource on every iteration can satisfy the ownership
+profile even if the program never returns. Conversely, finally outside a loop
+does not establish cleanup if that loop can keep the resource forever. These
+examples are compiled and analyzed; the infinite programs are not executed.
+The adapter contracts below are logical assumptions, not native registrations.
+
+#+begin_src beam-lisp :id cleanup-before-reentry
+(ns ownership.tail.cleanup (:require [system.ownership :as ownership]))
+(let [protocol {:version 1 :id 'loop-demo
+                :rules {[:remote :Elixir.LoopDemo :acquire 0]
+                         {:action :acquire :throws :never :runtime []}
+                        [:remote :Elixir.LoopDemo :release 1]
+                         {:action :release :arg 0 :throws :never :runtime []}}}
+      analyze (fn [source]
+                (ownership/check [{:id 'demo :body
+                  (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source)
+                                            (BeamLisp.Compiler/new_env "ownership.tail.example"))}] protocol))
+      balanced (analyze "(loop [] (let [r (LoopDemo/acquire)] (do (LoopDemo/release r) (recur))))")
+      held (analyze "(let [r (LoopDemo/acquire)] (try (loop [] (recur)) (finally (LoopDemo/release r))))")]
+ (assert (= :proved (:status balanced)))
+ (assert (= :not-proved (get-in balanced [:cleanup :termination])))
+ (assert (= :unknown (:status held)))
+ (assert (pos? (get-in held [:cleanup :unresolved])))
+ {:per-iteration (:status balanced) :finally-after-loop (:status held)
+  :termination (get-in balanced [:cleanup :termination]) :native-admission false})
+#+end_src
+#+RESULTS: cleanup-before-reentry
+: {:native-admission false, :termination :not-proved, :per-iteration :proved, :finally-after-loop :unknown}
+
+
+* Keep the aliases that can still be used
+
+Completed resource rows may be collected only when current bindings, captured
+values, suspended caller bindings and previously evaluated call arguments no
+longer name them. Active obligations and parent/borrow/handoff links stay live.
+Allocation IDs are fresh while a prior row remains reachable. This prevents an
+old released alias from becoming a new resource when an allocation site repeats.
+
+Reused function summaries have separate return edges for each caller. Sharing a
+body's return vertex between callers invents cycles that are not executions;
+those cycles can falsely defeat progress. Completed summary transfers are reused
+without reconnecting their old return continuation.
+
+Recur across a protected handler/finally boundary remains unknown: running the
+finally before jumping would change the compiler's recursive-call semantics.
+Non-tail calls, unsupported clauses and recursive groups also remain explicit
+limits. Duplicate pattern variables are not unconditional bindings. Shadowing
+the compiler's self variable invalidates the special control interpretation.
+
+* Efficient finite progress
+
+system.gfp/af now snapshots each distinct state's successors and goal predicate
+once, then propagates reached goals through predecessor counts. Duplicate edges,
+dead ends, starvation cycles and successors outside the declared universe retain
+their previous meanings. Graph work is proportional to the snapshot's vertices
+and edges; this does not make arbitrary program analysis linear.
+
+The tests compare all two-state graphs and goal subsets with an independent
+finite-path oracle, and prove that a 256-state chain reads successors and goals
+once per state. Existing system.core phase-liveness consumers use the same AF.
+
+Ownership reports use schema version 2 and profile 'ownership-flow-v2. They bind
+the actual protocol body and effective budgets to content keys; changing a
+contract under the same symbol changes the analysis identity. Default budgets
+remain 100000 work units, 4096 graph states, 256 path alternatives, 512 summaries
+and 1024 tail-control states. Progress graph reads share the work budget.
+Exhaustion returns unknown, never a partial proof. Reports expose cleanup status,
+loop states and merged back-edges through the ordinary world-check description.
+
+This advances the finite-analysis plan. General recursive convergence, richer
+guard/pattern/control support, deadlines, shared type/effect/impact facts, native
+capacity-fault conformance and all final whole-system gates remain open.
