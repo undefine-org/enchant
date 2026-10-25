@@ -1,0 +1,62 @@
+(ns execution.history-runner-test)
+
+(defn- environments []
+ (set (Agent/get :Elixir.BeamLisp.Env (fn [state] (maps/keys (:envs state))))))
+
+(defn- compile-probe! [file module out]
+ (let [compiled (BeamLisp.AOT/compile_host_file file
+                  (list (tuple :module module) (tuple :output_dir out) (tuple :load? false)))
+       path (elem compiled 1)]
+  (when-not (= (tuple :module module) (code/load_binary module (String/to_charlist path) (File/read! path)))
+   (throw :history-runner-probe-load-failed))))
+
+(defn- original-case [source module-name namespace]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id)) previous (Process/get :test_ctx)
+       test "repeated-suites-release-their-base-environment-on-success-and-error"
+       rewritten (-> source
+                    (String/replace "(ns test-suite-lifetime-test)" (str "(ns " namespace ")"))
+                    (String/replace "BeamLisp.TestRT/run_suite" (str module-name "/run_suite")))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.TestRT/clear_registry)
+     (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string rewritten))
+     (let [found (Enum/filter (BeamLisp.TestRT/registered_tests namespace) #(= test (elem % 0)))]
+      (when-not (= 1 (count found)) (throw :history-runner-selector-changed))
+      (BeamLisp.TestRT/clear_registry)
+      (BeamLisp.TestRT/register_test namespace test (elem (first found) 1))
+      (select-keys (BeamLisp.TestRT/run_ns namespace) [:tests :pass :fail :error]))))
+   (finally
+    (if (nil? previous) (Process/delete :test_ctx) (Process/put :test_ctx previous))
+    (BeamLisp.Env/destroy scope)))))
+
+(deftest E24-original-warm-runner-case-detects-a-leaked-async-base-environment
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/test_rt.bl"))
+       test-source (File/read! (Path/join root "test/bl/test_suite_lifetime_test.bl"))
+       before "(finally (BeamLisp.Env/destroy base)))))]"
+       after "(finally nil))))]"
+       directory (Path/join (System/tmp_dir!) (str "history-runner-" (erlang/unique_integer (list :positive))))
+       initial (environments)
+       good :Elixir.ExecutionHistory.TestRunnerGood bad :Elixir.ExecutionHistory.TestRunnerLeak]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-runner-anchor-changed))
+   (File/mkdir_p! directory)
+   (let [original (Path/join directory "normal.bl") changed (Path/join directory "mutant.bl")]
+    (File/write! original source) (File/write! changed (String/replace source before after))
+    (compile-probe! original good (Path/join directory "normal"))
+    (compile-probe! changed bad (Path/join directory "mutant"))
+    (let [normal (original-case test-source "ExecutionHistory.TestRunnerGood" "history.runner.good")
+          broken (original-case test-source "ExecutionHistory.TestRunnerLeak" "history.runner.leak")]
+     (println :history-E24 {:normal normal :mutant broken
+                            :producer-sha256 (Base/encode16 (crypto/hash :sha256 source))})
+     (is (= {:tests 1 :pass 16 :fail 0 :error 0} normal))
+     (is (= {:tests 1 :pass 12 :fail 4 :error 0} broken))
+     (is (= 4 (count (filter #(not (contains? initial %)) (environments)))))))
+   (finally
+    ;; Nested tasks have joined. Dispose only the exact scopes this probe leaked.
+    (doseq [scope (filter #(not (contains? initial %)) (environments))]
+     (BeamLisp.Env/destroy scope))
+    (doseq [module [good bad]] (code/purge module) (code/delete module) (code/purge module))
+    (File/rm_rf! directory)))))

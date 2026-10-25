@@ -100,10 +100,30 @@
   ;; design: only the innermost bound is allowed to answer.
   (try
     (System/put_env "BL_Z3_READ_TIMEOUT" "300")
-    (let [said (atom nil)
-          pid (erlang/spawn (fn [] (reset! said (z3/check nil (hard 60000)))))]
-      (is (until (fn [] (not (Process/alive? pid))))
-          "the caller was killed by the port's read deadline")
-      (is (nil? @said) "and got no verdict, which is the difference"))
-    (finally (System/delete_env "BL_Z3_READ_TIMEOUT"))))
+    (let [said (atom nil) parent (erlang/self)
+          [pid monitor] (spawn-monitor
+                          (fn []
+                           ;; The port backstop belongs to the actual port
+                           ;; owner. A caller's env overlay does not configure
+                           ;; an already-running shared SDK solver process.
+                           (let [port (BeamLisp.Z3Port/open)]
+                            (try
+                             (erlang/send parent :z3-backstop-entered)
+                             (reset! said (BeamLisp.Z3Port/check port (hard 60000) false))
+                             (finally (BeamLisp.Z3Port/close port))))))]
+      (try
+       (is (receive :z3-backstop-entered true (after 5000 false))
+           "the owned child reached the actual query")
+       (let [reason (receive [:DOWN seen :process child reason]
+                      :when (and (= seen monitor) (= child pid)) reason
+                      (after 5000 :missing-backstop-exit))]
+        (is (String/contains? (Kernel/inspect reason (list (tuple :limit 12) (tuple :printable_limit 512)))
+                             "z3 timeout")
+            (str "only the actual port timeout counts: "
+              (Kernel/inspect reason (list (tuple :limit 12) (tuple :printable_limit 512))))))
+       (is (nil? @said) "and got no verdict, which is the difference")
+       (finally
+        (when (Process/alive? pid) (erlang/exit pid :kill))
+        (Process/demonitor monitor (list :flush)))))
+    (finally (z3/pool-stop!) (System/delete_env "BL_Z3_READ_TIMEOUT"))))
 

@@ -59,6 +59,38 @@ class ReceiptControls(unittest.TestCase):
 
 
 class CaptureControls(unittest.TestCase):
+    def test_solver_override_bytes_path_and_disappearance_invalidate_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundled = root / 'priv/z3/bin/z3'
+            bundled.parent.mkdir(parents=True)
+            bundled.write_bytes(b'bundled solver')
+            override = root / 'other-z3'
+            override.write_bytes(b'override solver')
+            with mock.patch.dict(history.os.environ, {'BEAM_LISP_Z3': str(override)}):
+                before = history.capture_tools(root)
+                self.assertEqual(before['z3']['selected']['sha256'], history.digest(override))
+                override.write_bytes(b'changed solver')
+                self.assertNotEqual(before, history.capture_tools(root))
+                override.write_bytes(b'override solver')
+                override.unlink()
+                self.assertEqual(history.capture_tools(root)['z3']['selected']['sha256'], history.digest(bundled))
+            with mock.patch.dict(history.os.environ, {}, clear=True):
+                selected = history.capture_tools(root)
+                self.assertEqual(selected['z3']['selected']['sha256'], history.digest(bundled))
+                self.assertNotEqual(before, selected)
+
+    def test_child_solver_receipt_must_match_the_captured_bytes_and_path(self):
+        expected = {'resolved': str(ROOT / 'solver'), 'sha256': 'exact'}
+        frozen = {'floor': {'manifest.term': 'floor'}, 'tools': {'z3': {'selected': expected}}}
+        image = {'priv-root': str(ROOT / 'priv'), 'manifest-sha256': 'floor', 'compiler-key': 'a' * 64,
+                 'tools': {'z3': {'path': str(ROOT / 'solver'), 'sha256': 'exact'}}}
+        history.validate_identity(image, ROOT, frozen)
+        for actual in [None, {'path': '/another/solver', 'sha256': 'exact'},
+                       {'path': str(ROOT / 'solver'), 'sha256': 'changed'}]:
+            with self.subTest(actual=actual), self.assertRaises(ValueError):
+                history.validate_identity(dict(image, tools={'z3': actual}), ROOT, frozen)
+
     def test_workflow_launcher_and_toolchain_edits_invalidate_the_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -102,7 +134,7 @@ class ManifestControls(unittest.TestCase):
         cases = self.read(self.data)
         report = history.audit(cases)
         self.assertEqual(len(cases), 86)
-        self.assertEqual(len(report['open']), 81)
+        self.assertEqual(len(report['open']), 79)
         self.assertFalse(report['executed'])
         self.assertFalse(report['complete_goal'])
 
