@@ -1,0 +1,59 @@
+(ns execution.history-boundary-test (:require [reload.sdk-readiness :as readiness]))
+
+(defn- scratch [prefix]
+ (Path/join (System/tmp_dir!) (str prefix (erlang/unique_integer (list :positive)))))
+
+(deftest E55-failed-loader-attribution-never-replays-initializer-effects
+ (let [root (scratch "history-load-error-")
+       namespace (str "historyloaderror" (erlang/unique_integer (list :positive)))
+       path (Path/join root (str namespace ".bl")) marker (Path/join root "effects")]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path
+    (str "(ns " namespace ")\n"
+         "(File/write! " (pr-str marker) " \"tick\\n\" (list :append))\n"
+         "(throw (ex-info \"history initializer stopped\" {:kind :history-initializer}))\n"))
+   (let [error (try (BeamLisp.Loader/with_search_dir root
+                     #(BeamLisp.Loader/ensure_loaded namespace))
+                   nil (catch error error))]
+    (is (some? error))
+    (is (String/contains? (ex-message error) "history initializer stopped"))
+    (is (= "tick\n" (File/read! marker)))
+    (is (= false (BeamLisp.Env/loaded_ns? namespace))))
+   (finally (File/rm_rf! root)))))
+
+(deftest E39-temporary-library-lifetime-never-enters-the-sdk-inventory
+ (let [root (scratch "history-library-")
+       namespace (str "historylibrary" (erlang/unique_integer (list :positive)))
+       path (Path/join root (str namespace ".bl"))
+       before (BeamLisp.Env/sdk_receipt_rows)]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path (str "(ns " namespace ") (defn answer [] 42)"))
+   (is (= false (boolean (BeamLisp.AOT/sdk_library_source? namespace path))))
+   (BeamLisp.Loader/with_search_dir root #(BeamLisp.Loader/ensure_loaded namespace))
+   (is (= 42 ((BeamLisp.Env/fetch_exact! namespace "answer"))))
+   (is (= before (BeamLisp.Env/sdk_receipt_rows)))
+   (File/rm_rf! root)
+   (is (= :sdk-runtime-retained (BeamLisp.Env/ensure_sdk_runtime!)))
+   (is (= before (BeamLisp.Env/sdk_receipt_rows)))
+   (finally (File/rm_rf! root)))))
+
+(deftest E44-binding-and-direct-sdk-references-reuse-the-same-closure-key
+ (let [namespace "clojure.string" binding "upper-case"
+       cache (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "closures")]
+  (is (= true (readiness/prepare! [[:binding namespace binding]])))
+  ;; First use can publish namespace definitions. That traversal deliberately
+  ;; cannot cache evidence read across a publication revision. Bind the stable
+  ;; input before comparing equivalent lookup representations.
+  (is (= true (readiness/prepare! [[:binding namespace binding]])))
+  (let [definition (first (BeamLisp.Env/ns_definition namespace binding))
+        provider (elem definition 4) arity (count (:params (elem definition 3)))
+        keys-before (set (keys @cache))
+        canonical (filterv #(= [[:binding namespace binding]] (nth % 3)) keys-before)]
+   (is (= 1 (count canonical)))
+   ;; A warm compiler remote and its redundant namespace guard must address
+   ;; the binding closure already prepared, without retaining a second copy.
+   (is (= true (readiness/prepare!
+                 [[:remote provider :upper-case arity] [:namespace namespace]])))
+   (is (= keys-before (set (keys @cache)))))))

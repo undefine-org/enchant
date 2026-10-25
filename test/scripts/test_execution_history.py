@@ -58,6 +58,35 @@ class ReceiptControls(unittest.TestCase):
                 history.validate_identity(dict(image, **edit), ROOT, frozen)
 
 
+class CaptureControls(unittest.TestCase):
+    def test_workflow_launcher_and_toolchain_edits_invalidate_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for directory in ['priv/bootstrap/seed', 'test/scripts', 'scripts',
+                              'native', 'bin', '.github/workflows']:
+                (root / directory).mkdir(parents=True)
+            manifest = root / history.MANIFEST
+            manifest.parent.mkdir(parents=True)
+            for path in ['env.bl', history.FINDINGS, history.MANIFEST, history.DRIVER,
+                         'scripts/check-execution-history', 'bin/bl', 'flake.nix',
+                         'flake.lock', '.github/workflows/ci.yml']:
+                (root / path).write_text('original')
+            before = history.capture(root, manifest)
+            for path in ['bin/bl', 'flake.nix', 'flake.lock', '.github/workflows/ci.yml']:
+                with self.subTest(path=path):
+                    file = root / path
+                    file.write_text('changed')
+                    self.assertNotEqual(before, history.capture(root, manifest))
+                    file.write_text('original')
+                    self.assertEqual(before, history.capture(root, manifest))
+            workflow = root / '.github/workflows/new.yml'
+            workflow.write_text('new required gate')
+            self.assertNotEqual(before, history.capture(root, manifest))
+            workflow.unlink()
+            (root / 'flake.lock').unlink()
+            self.assertNotEqual(before, history.capture(root, manifest))
+
+
 class ManifestControls(unittest.TestCase):
     def setUp(self):
         self.path = ROOT / history.MANIFEST
