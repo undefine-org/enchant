@@ -158,3 +158,10 @@ and semantic focus across 0.48–4.5 zoom. No panels or object entrance/exit opa
 channels are used. Read the newest PROGRESS.md and TRANSFORMATION-EXPERIENCE.md.
 The studio remains a separate track; the atlas is historical rather than the
 current presentation target. Continue to commit completed slices autonomously.
+
+## User correction: commercial energy and materials
+
+The user rejected the 48-second piece as slow and asked for a complete commercial
+showcase with much more dynamic motion, textures and shaders. Read SHOWCASE.md.
+The prior film remains historical. Build a substantially richer material/motion
+experience, with tight pacing, no slides, and autonomous incremental commits.
