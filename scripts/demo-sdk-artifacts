@@ -16,6 +16,7 @@ import time
 
 
 def main():
+    preparation_started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--seed', type=Path)
@@ -25,24 +26,33 @@ def main():
     parser.add_argument('--source-free', action='store_true', help='remove SDK Source after full production and use an empty-cache receiver')
     parser.add_argument('--boundary-tests', action='store_true', help='include real sealed loader consumers before removing Source')
     parser.add_argument('--contextual-tests', action='store_true', help='qualify contextual build/cache behavior in a Source-absent image')
+    parser.add_argument('--boundaries', nargs='+', help='focused sealed profiles; omit for complete coverage')
     args = parser.parse_args()
     if args.all_sdk and args.activation_smoke:
         parser.error('choose --all-sdk or --activation-smoke')
     inventory_mode = args.all_sdk or args.activation_smoke
-    if args.contextual_tests and not (args.activation_smoke and args.source_free):
-        parser.error('--contextual-tests requires --activation-smoke --source-free')
-    if args.boundary_tests and not args.activation_smoke:
-        parser.error('--boundary-tests requires --activation-smoke')
+    if args.contextual_tests and not (inventory_mode and args.source_free):
+        parser.error('--contextual-tests requires an inventory producer and --source-free')
+    if args.boundary_tests and not inventory_mode:
+        parser.error('--boundary-tests requires an inventory producer')
+    if args.boundaries is not None and not args.contextual_tests:
+        parser.error('--boundaries requires --contextual-tests')
     if args.source_free and not inventory_mode:
         parser.error('--source-free requires --all-sdk or --activation-smoke')
     root, output = args.root.resolve(), args.out.absolute()
     seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    profiles = runpy.run_path(str(root / 'scripts/sdk_sealed_profiles.py'))
+    timings = runpy.run_path(str(root / 'scripts/test_timings.py'))['slowest']
+    try:
+        selected_plan = profiles['plan'](args.boundaries)
+    except ValueError as error:
+        parser.error(str(error))
     if os.path.lexists(output):
         parser.error('output must be absent')
     capture_tools = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools']
     tools = capture_tools(root)
     solver = tools['z3']['selected']
-    if args.contextual_tests and (not solver or not solver['sha256']):
+    if args.contextual_tests and selected_plan['solver'] and (not solver or not solver['sha256']):
         parser.error('contextual Source-free qualification requires the pinned solver prerequisite')
     output.mkdir(parents=True)
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -52,13 +62,16 @@ def main():
     boundary_driver = root / 'test/scripts/sdk-boundary-sealed.bl'
     if args.boundary_tests:
         drivers.append(boundary_driver)
-    contextual_driver = root / 'test/scripts/sdk-contextual-consumer.bl'
+    contextual_driver = root / 'test/scripts/sdk-selected-consumer.bl'
     if args.contextual_tests:
         drivers.append(contextual_driver)
     fixtures = root / 'test/fixtures/sdk-artifacts'
     trace = root / 'test/scripts/sdk-artifact-trace.exs'
     watched = sorted({Path(__file__).resolve(), *drivers, trace, root / 'scripts/demo-artifact-production',
-                      root / 'scripts/check-execution-history', root / 'env.bl',
+                      root / 'scripts/check-execution-history', root / 'scripts/sdk_sealed_profiles.py',
+                      root / 'scripts/test_timings.py', root / 'env.bl',
+                      root / 'test/scripts/sdk-contextual-consumer.bl',
+                      *[root / row['path'] for group in selected_plan['groups'] for row in group['tests']],
                       *(root / 'priv').rglob('*.bl'), *(root / 'priv').rglob('*.bl.md'),
                       *(root / 'priv').rglob('*.bl.org'), *(root / 'priv').rglob('*.clj'), *(root / 'priv').rglob('*.cljc'),
                       *fixtures.glob('*.bl'), *(root / 'priv/native').glob('*.so')})
@@ -69,6 +82,9 @@ def main():
               'selection': 'activation-smoke' if args.activation_smoke else 'all-sdk' if args.all_sdk else 'scenario',
               'seconds': {}, 'full_sdk_qualified': False, 'source_free_sdk': False,
               'native_execution_admission': False, 'tool_inputs': tools}
+    if args.contextual_tests:
+        report['sealed_plan'] = selected_plan
+        (output / 'sealed-plan.json').write_text(json.dumps(selected_plan, indent=2) + '\n')
     image = output / 'image'
     image.mkdir()
     subprocess.run(['cp', '-a', '--reflink=auto', str(root / 'priv'), str(image / 'priv')], check=True)
@@ -95,17 +111,21 @@ def main():
     for dep in deps:
         command += ['-pa', str(dep)]
     command += ['-pa', str(app / 'ebin'), str(image / 'boot.exs')]
-    env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off', BL_SDK_ARTIFACT_OUT=str(output),
+    env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off', BL_SDK_ARTIFACT_OUT=str(output), BL_TEST_TIMES='1',
                XDG_CACHE_HOME=str(image / 'cache'), ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
     if args.activation_smoke:
         env['BL_SDK_ARTIFACT_SMOKE'] = 'yes'
     if args.contextual_tests:
         env['BL_SDK_CONTEXTUAL_TESTS'] = 'yes'
         env['BL_SDK_CONTEXTUAL_ROOT'] = str(root)
-        env['BL_SDK_EXPECT_Z3_SHA256'] = solver['sha256']
+        env['BL_TEST_SOURCE_ROOT'] = str(root)
+        env['BL_SDK_SEALED_PLAN'] = str(output / 'sealed-plan.json')
+        if solver:
+            env['BL_SDK_EXPECT_Z3_SHA256'] = solver['sha256']
     if args.boundary_tests:
         env['BL_SDK_BOUNDARY_TESTS'] = 'yes'
         env['BL_SDK_BOUNDARY_ROOT'] = str(root)
+    report['preparation_seconds'] = round(time.monotonic() - preparation_started, 3)
 
     def run(stage, driver):
         if tools != capture_tools(root):
@@ -116,6 +136,7 @@ def main():
                               timeout=900 if inventory_mode else 240)
         report['seconds'][stage] = round(time.monotonic() - started, 3)
         (output / f'{stage}.log').write_text(done.stdout)
+        report.setdefault('slowest_tests', {})[stage] = timings(done.stdout)
         print(done.stdout[-10000:], end='', flush=True)
         if done.returncode:
             raise RuntimeError(f'{stage} failed with exit {done.returncode}')
@@ -154,6 +175,7 @@ def main():
         if args.contextual_tests:
             run('contextual-consumer', contextual_driver)
             report['contextual_consumer'] = json.loads((output / 'contextual-consumer.json').read_text())
+            profiles['validate'](selected_plan, report['contextual_consumer'])
         run('consumer', drivers[1])
         report['consumer'] = json.loads((output / 'consumer.json').read_text())
         victim = app / 'ebin/Elixir.BeamLisp.Ns.Sdk.Artifact.Consumer.beam'

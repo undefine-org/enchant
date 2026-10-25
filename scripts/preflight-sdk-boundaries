@@ -44,8 +44,13 @@ def main():
         parser.error('output must be absent; keep earlier receipts')
     matrix_path = root / 'research/phase-compiler/sdk-boundary-consumers.json'
     matrix = json.loads(matrix_path.read_text())
+    profiles = runpy.run_path(str(root / 'scripts/sdk_sealed_profiles.py'))
+    timings = runpy.run_path(str(root / 'scripts/test_timings.py'))['slowest']
     try:
         selected = select_boundaries(matrix['boundaries'], args.boundaries)
+        if {b['id'] for b in matrix['boundaries']} != set(profiles['BOUNDARIES']):
+            raise ValueError('sealed profile map must cover the complete boundary inventory')
+        sealed_plan = profiles['plan'](args.boundaries)
     except ValueError as error:
         parser.error(str(error))
     # Refuse new/unmapped consumers before paying for any BEAM startup.
@@ -98,8 +103,10 @@ def main():
             raise RuntimeError('frozen inputs changed before ' + name)
         start = time.monotonic()
         with (output / (name + '.log')).open('w') as log:
-            done = subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, timeout=1000)
+            done = subprocess.run(command, cwd=root, env=dict(os.environ, BL_TEST_TIMES='1'),
+                                  stdout=log, stderr=subprocess.STDOUT, timeout=1000)
         report['stages'][name] = {'exit': done.returncode, 'seconds': round(time.monotonic()-start, 3)}
+        report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
         if done.returncode:
             raise RuntimeError(name + ' failed; see retained log')
         if capture() != frozen:
@@ -114,44 +121,22 @@ def main():
         if summaries != [(str(len(tests)), '0', '0')] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
             raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
         report['assertions'] = sum(map(int, counts))
-        stage('sealed', [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),
-                         '--out', str(output / 'sealed'), '--activation-smoke', '--source-free', '--boundary-tests', '--contextual-tests'])
+        command = [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),
+                   '--out', str(output / 'sealed'), '--activation-smoke', '--source-free', '--boundary-tests', '--contextual-tests']
+        if args.boundaries is not None:
+            command += ['--boundaries', *args.boundaries]
+        stage('sealed', command)
         sealed = json.loads((output / 'sealed/result.json').read_text())
+        profiles['validate_universal'](sealed)
         if sealed['status'] != 'passed' or not sealed['source_free_sdk'] or not sealed['missing_unit_refused_before_initialization'] or not sealed['tampering_refused_before_initialization']:
             raise RuntimeError('incomplete sealed positive/negative controls')
         if sealed.get('sealed_source_consumers', {}).get('status') != 'passed':
             raise RuntimeError('sealed Source-present consumer branch was not qualified')
         if sealed.get('contextual_consumer', {}).get('status') != 'passed':
             raise RuntimeError('Source-free contextual build/cache consumer was not qualified')
-        contextual = sealed['contextual_consumer']
-        if not contextual.get('ownership-snapshot-checked') or contextual.get('source-free-ownership-assertions') != 136:
-            raise RuntimeError('Source-free ownership report/test boundary was not qualified')
-        if contextual.get('source-free-ownership-call-assertions') != 123:
-            raise RuntimeError('Source-free ownership call summaries were not qualified')
-        if (contextual.get('source-free-native-outcome-assertions') != 207
-                or contextual.get('source-free-vector-default-assertions') != 65
-                or contextual.get('source-free-native-handoff-assertions') != 46
-                or contextual.get('native-protocol-version') != 2):
-            raise RuntimeError('Source-free native outcomes/vector fallback contract was not qualified')
-        if (contextual.get('source-free-ownership-loop-assertions') != 77
-                or contextual.get('source-free-af-worklist-assertions') != 75
-                or contextual.get('ownership-analysis-version') != 2
-                or not contextual.get('cleanup-progress-checked')):
-            raise RuntimeError('Source-free tail control and cleanup progress were not qualified')
-        if (contextual.get('source-free-native-capacity-assertions') != 99
-                or not contextual.get('native-capacity-model-checked')):
-            raise RuntimeError('Source-free native capacity/recovery conformance was not qualified')
-        if (contextual.get('source-free-server-return-assertions') != 10
-                or not contextual.get('server-return-order-checked')):
-            raise RuntimeError('Source-free server return operand order was not qualified')
-        if (contextual.get('source-free-clause-identity-assertions') != 5
-                or not contextual.get('clause-identity-determinism-checked')):
-            raise RuntimeError('Source-free clause identity determinism was not qualified')
-        if (contextual.get('source-free-solver-frame-assertions') != 71
-                or contextual.get('source-free-solver-lifetime-assertions') != 47
-                or contextual.get('source-free-solver-retirement-assertions') != 9
-                or not contextual.get('solver-tool-identity-checked')):
-            raise RuntimeError('Source-free solver conversation/tool identity was not qualified')
+        profiles['validate'](sealed_plan, sealed['contextual_consumer'])
+        if sealed.get('sealed_plan') != sealed_plan:
+            raise RuntimeError('sealed producer used a different boundary plan')
         report.update(status='passed', frozen_inputs_unchanged=True, sealed=sealed,
                       coverage={b['id']: {'tests': b['tests'], 'status': 'passed'} for b in selected})
     except Exception as error:
