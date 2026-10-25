@@ -7954,17 +7954,12 @@
       (constructor_context_put! :artifact-inputs inputs))))
    input))))
 
-(defn phase_library!
- "Read bounded phase recipes from manifest-authenticated floor bytes. This
-  returns data, never runtime authority, a native macro Fn or a loaded target."
- [namespace-symbol]
- (let [namespace (artifact_namespace namespace-symbol)
-       module-name (str "Elixir.BeamLisp.Ns."
+(defn- seed_phase_library! [namespace manifest]
+ (let [module-name (str "Elixir.BeamLisp.Ns."
                      (Enum/join (Enum/map (String/split namespace ".") (fn [segment] (Macro/camelize segment))) "."))
        name (str module-name ".beam")
-       manifest (BeamLisp.Bootstrap/manifest)
        expected (Map/get (Map/get manifest "modules" {}) name)]
-  (when-not (and expected (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key)))
+  (when-not expected
    (artifact_refuse :phase-library-not-in-seed))
   ;; Only authenticated manifest membership can introduce this bounded module
   ;; atom. Unknown public read requests do not intern arbitrary namespaces.
@@ -7980,13 +7975,40 @@
                   (= (MapSet/new (Map/keys (:macros library)))
                      (MapSet/new (Map/keys (:macro-declarations library)))))
     (artifact_refuse :unsupported-phase-library))
-   (assoc library :artifact-id (:sha256 proof) :compiler-key (:compiler-key proof)))))
+   (assoc library :artifact-id (:sha256 proof) :compiler-key (Map/get manifest "compiler_key")))))
+
+(defn phase_library!
+ "Read bounded phase recipes from the current manifest-authenticated floor.
+  Data only; kernel bootstrap imports use their separately captured identity."
+ [namespace-symbol]
+ (let [namespace (artifact_namespace namespace-symbol) manifest (BeamLisp.Bootstrap/manifest)]
+  (when-not (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key))
+   (artifact_refuse :phase-library-not-in-seed))
+  (seed_phase_library! namespace manifest)))
+
+(defn- constructor_kernel_manifest! []
+ ;; Target Source and the executing bootstrap kernel have separate identities.
+ ;; Capture is internal, before any supplied Source is interpreted. Every use
+ ;; rechecks the physical inventory; individual artifacts still require exact
+ ;; SHA and loaded-code proofs. This never grants SDK/runtime origin.
+ (let [manifest (:kernel-manifest (constructor_context!))]
+  (when-not (and manifest (= manifest (BeamLisp.Bootstrap/manifest)))
+   (stage-refuse :sdk-constructor-kernel-changed))
+  manifest))
+
+(defn- constructor_kernel_seed_proof [module]
+ (let [manifest (constructor_kernel_manifest!)
+       name (str (Atom/to_string module) ".beam")
+       expected (Map/get (Map/get manifest "modules" {}) name)]
+  (when expected
+   (when-let [proof (seed_artifact_proof module name expected)]
+    (assoc proof :compiler-key (Map/get manifest "compiler_key"))))))
 
 (defn- constructor_kernel_phase_state! []
  (let [context (constructor_context!)]
   (or (:kernel-phase-state context)
    (let [names (Enum/sort (Enum/uniq (cons "core" (:phase-imports context))))
-         libraries (Enum/map names (fn [name] (phase_library! (tuple :symbol name))))
+         libraries (Enum/map names (fn [name] (seed_phase_library! name (constructor_kernel_manifest!))))
          providers (Map/new (Enum/map libraries (fn [library] (tuple (:namespace library) library))))
          definitions (Map/new (Enum/map libraries (fn [library] (tuple (:namespace library) (:definitions library)))))
          values (Enum/reduce libraries {}
@@ -7994,7 +8016,7 @@
                    (Enum/reduce (Map/to_list (:initializers library)) out
                     (fn [pair out] (Map/put out [(:namespace library) (elem pair 0)] (elem pair 1))))))
          identity {:version 1 :kind :kernel-phase-world
-                   :compiler-key (BeamLisp.AOTCache/compiler_key)
+                   :compiler-key (Map/get (constructor_kernel_manifest!) "compiler_key")
                    :macro-imports (Enum/sort (:phase-imports context))
                    :providers (Enum/map libraries
                      (fn [library] {:namespace (:namespace library) :artifact-id (:artifact-id library)
@@ -8381,7 +8403,7 @@
  ;; No mutable Core macro/function value is executed to discover this ABI.
  (or (:core-rows (constructor_context!))
  (let [shim :Elixir.BeamLisp.Ns.Rt
-       proof (seed_dependency! shim)
+       proof (constructor_kernel_seed_proof shim)
        definitions (when proof (erlang/apply shim :__bl_ns_defs__ (list)))
        entries (Map/get definitions "seed-rows")
        entry (when (= 1 (count entries)) (first entries))
@@ -8389,7 +8411,7 @@
        provider (when entry (elem entry 4))]
   (when-not (and proof entry (= :fixed (elem entry 0)) (= 0 (elem entry 1))
                  (empty? (:params node)) (nil? (:guard node)) (= :lit (:op body))
-                 (seed_dependency! provider))
+                 (constructor_kernel_seed_proof provider))
    (stage-refuse :unattested-core-constructor-abi))
   (constructor_context_put! :core-provider provider)
   (constructor_context_put! :core-rows (:val body))
@@ -8436,11 +8458,11 @@
  (when-not (contains? (:kernel-modules (constructor_context!)) module)
   ;; Retain before the authoritative byte check; no captured native helper may
   ;; execute between successful attestation and a concurrent code replacement.
-  (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))
+  (when-not (constructor_kernel_seed_proof module) (stage-refuse :unattested-compiler-kernel))
   (let [handle (BeamLisp.Env/retain_code! (list module))]
    (constructor_context_put! :kernel-leases
      (cons handle (:kernel-leases (constructor_context!))))
-   (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))
+   (when-not (constructor_kernel_seed_proof module) (stage-refuse :unattested-compiler-kernel))
    (constructor_context_put! :kernel-modules
      (conj (:kernel-modules (constructor_context!)) module)))))
 
@@ -8449,10 +8471,10 @@
  ;; Interpret only its canonical, manifest-authenticated definition DATA. The
  ;; executable body providers below still require strict seed proofs and leases.
  (let [module :Elixir.BeamLisp.Ns.Core
-       manifest (BeamLisp.Bootstrap/manifest)
+       manifest (constructor_kernel_manifest!)
        name "Elixir.BeamLisp.Ns.Core.beam"
        expected (when manifest (Map/get (Map/get manifest "modules") name))
-       _ (when-not (and expected (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key)))
+       _ (when-not expected
            (stage-refuse :unattested-compiler-kernel))
        definitions (Map/get (seed_artifact_metadata! module name expected) :kernel-definitions)]
   (when-not (erlang/is_map definitions) (stage-refuse :invalid-compiler-kernel-definitions))
@@ -8493,9 +8515,13 @@
      (Map/put output name value))))))
 
 (defn- constructor_core_forwarder_proof! []
- (let [module :Elixir.BeamLisp.Ns.Core manifest (BeamLisp.Bootstrap/manifest)]
-  (or (seed_dependency_from_manifest! module manifest)
-      (seed_forwarder_dependency_from_manifest! module manifest))))
+ (let [module :Elixir.BeamLisp.Ns.Core manifest (constructor_kernel_manifest!)
+       name "Elixir.BeamLisp.Ns.Core.beam" expected (Map/get (Map/get manifest "modules" {}) name)]
+  (or (constructor_kernel_seed_proof module)
+      (when expected
+       (let [row (seed_artifact_metadata! module name expected)]
+        (when (and (= :mutable-forwarder (:role row))
+                    (BeamLisp.Env/sdk_forwarder_current? module (:forwarder-routes row))) row))))))
 
 (defn- constructor_retain_core_forwarder! []
  ;; Only original seed routes may be used by native helpers. Added bindings
@@ -8508,6 +8534,7 @@
   (when-not (constructor_core_forwarder_proof!) (stage-refuse :unattested-compiler-kernel))))
 
 (defn- constructor_install_kernel! []
+ (constructor_context_put! :kernel-manifest (BeamLisp.Bootstrap/manifest))
  ;; Only compiler-owned seed construction executes here, into this disposable
  ;; private Env. Rt.seed_core creates callable/link tables and closures; it
  ;; invokes no provider initializer, process operation or supplied callback.
@@ -8591,12 +8618,12 @@
   (when-not (= (:compiler-key unit) (BeamLisp.AOTCache/compiler_key))
    (stage-refuse :sdk-constructor-compiler-changed)))
  (when-let [provider (:core-provider (constructor_context!))]
-  (when-not (seed_dependency! :Elixir.BeamLisp.Ns.Rt) (stage-refuse :unattested-compiler-kernel))
-  (when-not (seed_dependency! provider) (stage-refuse :unattested-compiler-kernel)))
+  (when-not (constructor_kernel_seed_proof :Elixir.BeamLisp.Ns.Rt) (stage-refuse :unattested-compiler-kernel))
+  (when-not (constructor_kernel_seed_proof provider) (stage-refuse :unattested-compiler-kernel)))
  (when (:kernel-core-forwarder (constructor_context!))
   (when-not (constructor_core_forwarder_proof!) (stage-refuse :unattested-compiler-kernel)))
  (doseq [module (:kernel-modules (constructor_context!))]
-  (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))))
+  (when-not (constructor_kernel_seed_proof module) (stage-refuse :unattested-compiler-kernel))))
 
 (defn- constructor_compile_sdk_unit! [source opts]
  ;; Only authenticated source data enters this boundary; no caller callback can
