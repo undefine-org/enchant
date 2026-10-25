@@ -16,7 +16,7 @@ let
   library = manifest.lib.name or (builtins.replaceStrings [ "-" ] [ "_" ] manifest.package.name);
   # Compile identity excludes the BL consumer's ABI label. Changing consumer
   # metadata must not compile the same Rust source/toolchain a second time.
-  compiled = pkgs.rustPlatform.buildRustPackage {
+  compiled = (import ./bounded-build.nix { inherit pkgs; }) (pkgs.rustPlatform.buildRustPackage {
     pname = "bl-native-code-${request.crate}";
     version = manifest.package.version;
     src = source;
@@ -30,7 +30,11 @@ let
       install -m444 "target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/lib${library}.so" "$out/lib/${request.crate}.so"
       runHook postInstall
     '';
-  };
+    postInstall = ''
+      printf '{"backend":"nix-kvm","memoryMiB":3072,"memoryKiB":%s,"swapKiB":%s}\n' \
+        "$BL_WORKER_MEMORY_KIB" "$BL_WORKER_SWAP_KIB" > "$out/worker.json"
+    '';
+  });
   product = pkgs.runCommand "bl-native-${request.crate}" {} ''
     mkdir -p "$out/lib"
     cp ${compiled}/lib/${request.crate}.so "$out/lib/${request.crate}.so"
@@ -52,7 +56,8 @@ let
       library = "lib/${request.crate}.so";
     }}
     MANIFEST
-    ${pkgs.jq}/bin/jq --arg digest "$digest" '. + {sha256: $digest}' "$out/artifact.json" > "$out/manifest.tmp"
+    ${pkgs.jq}/bin/jq --arg digest "$digest" --slurpfile worker ${compiled}/worker.json \
+      '. + {sha256: $digest, worker: $worker[0]}' "$out/artifact.json" > "$out/manifest.tmp"
     mv "$out/manifest.tmp" "$out/artifact.json"
   '';
 in

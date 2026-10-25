@@ -28,12 +28,19 @@
       beam = import ./nix/beam.nix { inherit pkgs otp-src elixir-src; };
       rustPkgs = nixpkgs-rust.legacyPackages.${system};
       drop = import ./nix/bl-drop.nix { inherit pkgs rustPkgs; inherit (beam) erlang elixir; };
+      nativeProducts = import ./nix/native-products.nix { inherit pkgs; root = self; };
     in
     {
       nixosModules.artifacts = import ./nix/artifact-host.nix;
       packages.${system} = {
         artifact-platform = import ./nix/artifact-platform.nix { inherit pkgs; };
         command-executor = import ./nix/command-executor.nix { inherit pkgs; };
+        native-products = nativeProducts.bundle;
+        native-bl-json = nativeProducts.products.bl_json;
+        native-code-embed = nativeProducts.products.code_embed;
+        native-datom-datalog = nativeProducts.products.datom_datalog;
+        native-datom-fjall = nativeProducts.products.datom_fjall;
+        native-datom-vector = nativeProducts.products.datom_vector;
         inherit (beam) erlang elixir;
         bl-drop = drop.bl-drop;
         native-lazy-memo = import ./nix/native-artifact.nix {

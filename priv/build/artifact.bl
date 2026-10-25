@@ -62,6 +62,33 @@
 (defn- cache-root []
   (Path/join (or (System/get_env "XDG_CACHE_HOME") (Path/join (System/user_home!) ".cache"))
              "beam_lisp/artifacts"))
+
+(defn- source-files! [root]
+  ;; Nix normalizes write bits. Executability and contents remain semantic.
+  ;; Match native-source.nix's reserved names, and never traverse a symlink.
+  (loop [directories (list "") files {}]
+    (when (> (+ (count directories) (count files)) 16384)
+      (refuse "Native source inventory exceeds capacity" {:source root}))
+    (if (empty? directories) files
+      (let [directory (first directories)
+            state (reduce
+                    (fn [state name]
+                      (if (contains? #{".git" "target" ".bl"} name) state
+                        (let [relative (Path/join directory name)
+                              path (Path/join root relative)
+                              info (File/lstat! path)]
+                          (case (:type info)
+                            :directory [(conj (first state) relative)
+                                        (assoc (second state) relative [:directory])]
+                            :regular [(first state)
+                                      (assoc (second state) relative
+                                        [(digest (File/read! path))
+                                         (not= 0 (erlang/band (:mode info) 73))])]
+                            (refuse "Native source must contain only directories and regular files"
+                                    {:path path})))))
+                    [(rest directories) files] (sort (File/ls! (Path/join root directory))))]
+        (recur (first state) (second state))))))
+
 (defn- fresh-directory! [parent label]
   (File/mkdir_p! parent)
   (let [directory (Path/join parent (str label "-" (System/system_time :microsecond) "-"
@@ -145,6 +172,33 @@
           (File/rm_rf! directory)
           (throw error))
         (finally (File/rm stdout) (File/rm snapshot-output) (File/rm (Path/join directory "source-root.txt")))))))
+
+(defn resolve-native!
+  "Consume a declared immutable producer input when its complete source and
+   contract match; otherwise prepare through Nix. BL_PREPARED_NATIVES names a
+   retained native-set input supplied by the launcher or packaging producer.
+   This input supplies bytes, never execution authority or test qualification."
+  [options]
+  (let [expected (request (:source options) (:crate options) (:abi options)
+                          (or (:target options) "x86_64-linux"))
+        prepared (System/get_env "BL_PREPARED_NATIVES")
+        product (when prepared
+                  (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" prepared)
+                    (refuse "Prepared native inputs must be an immutable store object" {}))
+                  (let [bundle (Jason/decode! (File/read! (Path/join prepared "artifacts.json")))]
+                    (when-not (and (= schema (get bundle "version"))
+                                   (= "native-set" (get bundle "kind"))
+                                   (= (get expected "target") (get bundle "target"))
+                                   (map? (get bundle "products")))
+                      (refuse "Prepared native input inventory is invalid" {}))
+                    (get-in bundle ["products" (get expected "crate")])))
+        imported (when (and product (= (get expected "abi") (get product "abi")))
+                   (let [snapshot (get product "source")
+                         verified (verify! (get product "output") (assoc expected "source" snapshot))]
+                     (when (= (source-files! (get expected "source")) (source-files! snapshot))
+                       (assoc verified :request (assoc expected "source" snapshot)
+                              :prepared-set prepared))))]
+    (or imported (prepare-native! options))))
 
 (defn retained
   "List successful per-request receipts without executing Nix or collecting outputs."

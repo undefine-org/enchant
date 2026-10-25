@@ -1,6 +1,6 @@
 # A stock launcher supplies the pre-BEAM custody protocol without a BL VM.
 { pkgs }:
-pkgs.rustPlatform.buildRustPackage {
+(import ./bounded-build.nix { inherit pkgs; }) (pkgs.rustPlatform.buildRustPackage {
   pname = "beam-lisp-command-executor";
   version = "1";
   src = pkgs.lib.fileset.toSource { root = ../tooling/drop; fileset = ../tooling/drop; };
@@ -15,4 +15,4 @@ pkgs.rustPlatform.buildRustPackage {
     digest=$(sha256sum "$out/bin/bl-command-executor" | cut -d' ' -f1)
     printf '{"version":1,"protocol":"BEAM_LISP_CUSTODY_COMMAND_V1","sha256":"%s"}\n' "$digest" > "$out/executor.json"
   '';
-}
+})

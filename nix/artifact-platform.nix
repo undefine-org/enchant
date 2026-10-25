@@ -6,5 +6,6 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   cp ${commandExecutor}/executor.json "$out/executor.json"
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
   cp ${./native-source.nix} "$out/nix/native-source.nix"
+  cp ${./bounded-build.nix} "$out/nix/bounded-build.nix"
   cp ${../flake.lock} "$out/flake.lock"
 ''
