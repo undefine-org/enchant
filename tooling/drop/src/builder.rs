@@ -373,20 +373,25 @@ fn build_natives(tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), Str
     Ok(())
 }
 
-/// Where cargo writes for the crate at `dir`: `cargo metadata`'s answer, which
-/// honours `CARGO_TARGET_DIR` and any `build.target-dir` config.
+/// Require Cargo's successful, read-only answer. A guessed target can publish
+/// an unrelated old library after failed metadata discovery.
 fn cargo_target_dir(dir: &Path, custody: &BuildLock) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     command
-        .args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"])
-        .arg(dir.join("Cargo.toml"))
-        .stderr(Stdio::null());
+        .args(["metadata", "--locked", "--format-version", "1", "--no-deps", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"));
     custody.prepare_command(&mut command)?;
-    Ok(command.output()
-        .ok()
-        .and_then(|o| json_string(&String::from_utf8_lossy(&o.stdout), "target_directory"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join("target")))
+    let output = command.output().map_err(|e| format!("native Cargo metadata could not start for {}: {e}", dir.display()))?;
+    if !output.status.success() {
+        return Err(format!("native Cargo metadata failed for {} ({}): {}",
+            dir.display(), output.status, String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("native Cargo metadata was not valid JSON for {}: {e}", dir.display()))?;
+    let target = metadata.get("target_directory").and_then(serde_json::Value::as_str)
+        .map(PathBuf::from).filter(|p| p.is_absolute())
+        .ok_or_else(|| format!("native Cargo metadata omitted an absolute target_directory for {}", dir.display()))?;
+    Ok(target)
 }
 
 fn tree_bl(tree: &Path, args: &[&str]) -> Command {
@@ -1188,6 +1193,94 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(root.join("external-exited").exists());
+    }
+
+    #[test]
+    fn cargo_target_discovery_requires_successful_real_metadata() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop cargo discovery {}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        assert!(cargo_target_dir(&root.join("missing crate"), &custody).is_err(),
+                "failed real Cargo metadata must never authorize a guessed target directory");
+        let crate_dir = root.join("valid crate");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"target_discovery_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"target_discovery_probe\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let lock_before = std::fs::read(crate_dir.join("Cargo.lock")).unwrap();
+        let discovered = cargo_target_dir(&crate_dir, &custody).unwrap();
+        assert!(discovered.is_absolute(), "actual Cargo target is an absolute address");
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target = PathBuf::from(target);
+            if target.is_absolute() { assert_eq!(target, discovered); }
+        } else {
+            assert_eq!(crate_dir.join("target"), discovered);
+        }
+        assert_eq!(lock_before, std::fs::read(crate_dir.join("Cargo.lock")).unwrap());
+        assert!(!crate_dir.join("target").exists(), "discovery must not compile an artifact");
+    }
+
+    #[test]
+    fn cargo_metadata_ignores_nested_lookalike_output_directories() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop cargo metadata shadow {}", std::process::id()));
+        std::fs::create_dir_all(root.join("crate/src")).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let crate_dir = root.join("crate");
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"metadata_shadow_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[package.metadata]\ntarget_directory=\"/unrelated-old-products\"\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"metadata_shadow_probe\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let discovered = cargo_target_dir(&crate_dir, &custody).unwrap();
+        assert_ne!(PathBuf::from("/unrelated-old-products"), discovered,
+                   "package metadata must not nominate Cargo's output directory");
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target = PathBuf::from(target);
+            if target.is_absolute() { assert_eq!(target, discovered); }
+        }
+    }
+
+    #[test]
+    fn failed_metadata_prevents_real_native_publication_even_with_a_guessed_library() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop native metadata failure {}", std::process::id()));
+        let _cleanup = CustodyDirectory(root.clone());
+        let project = root.join("project");
+        let crate_dir = project.join("native/tiny_discovery");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"tiny_discovery\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[lib]\ncrate-type=[\"cdylib\"]\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"tiny_discovery\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "#[no_mangle]\npub extern \"C\" fn answer() -> u8 { 42 }\n").unwrap();
+        // Cargo already read its manifest. Make subsequent real metadata fail
+        // after compilation, with an unrelated library waiting at the old guess.
+        std::fs::write(crate_dir.join("build.rs"),
+            "fn main() { std::fs::remove_file(std::path::PathBuf::from(std::env::var_os(\"CARGO_MANIFEST_DIR\").unwrap()).join(\"Cargo.toml\")).unwrap(); }\n").unwrap();
+        let guessed = crate_dir.join("target/release");
+        std::fs::create_dir_all(&guessed).unwrap();
+        std::fs::write(guessed.join("libtiny_discovery.so"), "unrelated guessed product").unwrap();
+        let destination = project.join("priv/native/tiny_discovery.so");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, "old installed library").unwrap();
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let log = root.join("build.log");
+        let error = build_natives(&project, &log, &custody)
+            .expect_err("failed metadata must prevent real native publication");
+        assert!(error.contains("native Cargo metadata"), "unexpected failure before metadata: {error}");
+        assert!(std::fs::read_to_string(log).unwrap().contains("Finished"), "actual Cargo compilation must succeed first");
+        assert!(!crate_dir.join("Cargo.toml").exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old installed library");
+        assert_eq!(std::fs::read(guessed.join("libtiny_discovery.so")).unwrap(), b"unrelated guessed product");
     }
 
     struct CustodyChild(std::process::Child);
