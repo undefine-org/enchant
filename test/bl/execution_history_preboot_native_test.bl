@@ -1,0 +1,53 @@
+(ns execution.history-preboot-native-test)
+
+(defn- bare-child [app script]
+ (System/cmd "elixir" (list "--erl" "+S 2:2 +SDcpu 1:1 +SDio 1"
+                            "-pa" (Path/join app "ebin") "-e" script)
+  (list (tuple :cd (Path/dirname app)) (tuple :stderr_to_stdout true)
+        (tuple :env (list (tuple "BL_ROOT" app) (tuple "BEAM_LISP_PATH" nil))))))
+
+(defn- prepare-app! [directory source]
+ (let [app (Path/join directory "beam_lisp-0.1.0") ebin (Path/join app "ebin")
+       native (Path/join app "priv/native") file (Path/join directory "lazy-memo.bl")
+       priv (BeamLisp.Tiers/priv_root)]
+  (File/mkdir_p! ebin) (File/mkdir_p! native) (File/write! file source)
+  ;; Emit the exact NIF module atom without loading/replacing it in this VM.
+  (BeamLisp.AOT/compile_host_file file
+   (list (tuple :module :Elixir.BeamLisp.LazyMemo) (tuple :output_dir ebin)
+         (tuple :file "priv/host/lazy_memo.bl") (tuple :load? false)))
+  (File/cp! (erlang/list_to_binary (code/which :Elixir.BeamLisp.Tiers))
+            (Path/join ebin "Elixir.BeamLisp.Tiers.beam"))
+  (File/cp! (Path/join (Path/dirname priv) "ebin/beam_lisp.app") (Path/join ebin "beam_lisp.app"))
+  (let [libraries (Path/wildcard (Path/join priv "native/lazy_memo.*"))]
+   (when (empty? libraries) (throw :historical-preboot-native-prerequisite-missing))
+   (doseq [path libraries] (File/cp! path (Path/join native (Path/basename path)))))
+  app))
+
+(deftest E58-language-list-helper-in-the-load-lock-breaks-a-real-bare-vm
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/lazy_memo.bl"))
+       before "(defn- tup [& xs] (erlang/list_to_tuple xs))"
+       after "(defn- tup [& xs] (erlang/list_to_tuple (BeamLisp.Ns.Body.Core/list xs)))"
+       directory (Path/join (System/tmp_dir!) (str "history-native-preboot-" (erlang/unique_integer (list :positive))))
+       live-md5 (BeamLisp.LazyMemo/module_info :md5)
+       script (str "for m <- [BeamLisp.Ns.Body.Core, BeamLisp.Ns.Core, BeamLisp.Ns.Rt, BeamLisp.Env], do: false = :code.is_loaded(m)\n"
+                   ":ok = BeamLisp.LazyMemo.ensure_loaded!()\ntrue = BeamLisp.LazyMemo.nif_loaded?()\n"
+                   "{:ok, lease} = BeamLisp.LazyMemo.nif_file_lock(Path.join(System.fetch_env!(\"BL_ROOT\"), \"lock\"), true, false)\n"
+                   ":ok = BeamLisp.LazyMemo.nif_file_unlock(lease)\n"
+                   "for m <- [BeamLisp.Ns.Body.Core, BeamLisp.Ns.Core, BeamLisp.Ns.Rt, BeamLisp.Env], do: false = :code.is_loaded(m)\n"
+                   "IO.puts(\"HISTORICAL_NATIVE_PREBOOT_READY\")")]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :historical-preboot-mutation-drift))
+   (let [good (prepare-app! (Path/join directory "good") source)
+         bad (prepare-app! (Path/join directory "bad") (String/replace source before after))
+         positive (bare-child good script) negative (bare-child bad script)]
+    (println :history-E58 {:positive-exit (elem positive 1) :mutant negative
+                           :producer-sha256 (Base/encode16 (crypto/hash :sha256 source))})
+    (is (= 0 (elem positive 1)) (elem positive 0))
+    (is (String/contains? (elem positive 0) "HISTORICAL_NATIVE_PREBOOT_READY"))
+    (is (not= 0 (elem negative 1)))
+    (is (String/contains? (elem negative 0) "BeamLisp.Ns.Body.Core.list"))
+    (is (String/contains? (elem negative 0) "undefined"))
+    (is (not (String/contains? (elem negative 0) "HISTORICAL_NATIVE_PREBOOT_READY")))
+    (is (= live-md5 (BeamLisp.LazyMemo/module_info :md5)) "the compiling VM's native module was never replaced"))
+   (finally (File/rm_rf! directory)))))

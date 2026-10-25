@@ -195,6 +195,22 @@ System.halt(0)
 '''
 
 
+def phase_command(command, env, *, use_systemd, image, unit):
+    """Preserve startup inputs across the user-manager process boundary."""
+    if not use_systemd:
+        return list(command)
+    cap = ['systemd-run', '--user', '--collect', '--wait', '--pipe', '--quiet',
+           f'--unit={unit}', f'--working-directory={image}',
+           '--property=MemoryMax=6G', '--property=MemorySwapMax=0', '--property=RuntimeMaxSec=300']
+    if 'PROBE_BOOTSTRAP' in env:
+        cap += [f"--setenv=PROBE_BOOTSTRAP={env['PROBE_BOOTSTRAP']}"]
+    # The user manager predates setup-beam/asdf/Nix's shell PATH.
+    # Elixir also resolves its erl child through that same PATH.
+    for key in ('PATH', 'BL_ROOT', 'PROBE_WORK', 'PROBE_PHASE', 'BEAM_LISP_AOT_CACHE_DIR', 'BL_DAEMON', 'ELIXIR_ERL_OPTIONS'):
+        cap += [f'--setenv={key}={env[key]}']
+    return cap + list(command)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', type=Path, required=True)
@@ -246,21 +262,15 @@ def main():
             env = {**os.environ, 'BL_ROOT': str(image), 'PROBE_WORK': str(work), 'PROBE_PHASE': phase,
                    'BEAM_LISP_AOT_CACHE_DIR': str(work / 'cache'), 'BL_DAEMON': 'off',
                    'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
-            cap = ['systemd-run', '--user', '--collect', '--wait', '--pipe', '--quiet',
-                   f'--unit=bl-sdk-probe-{os.getpid()}-{phase}', f'--working-directory={image}',
-                   '--property=MemoryMax=6G', '--property=MemorySwapMax=0', '--property=RuntimeMaxSec=300']
             if args.bootstrap_image:
                 env['PROBE_BOOTSTRAP'] = str(args.bootstrap_image.resolve())
-                cap += [f"--setenv=PROBE_BOOTSTRAP={env['PROBE_BOOTSTRAP']}"]
-            # The user manager predates setup-beam/asdf/Nix's shell PATH.
-            # Elixir also resolves its erl child through that same PATH.
-            for key in ('PATH', 'BL_ROOT', 'PROBE_WORK', 'PROBE_PHASE', 'BEAM_LISP_AOT_CACHE_DIR', 'BL_DAEMON', 'ELIXIR_ERL_OPTIONS'):
-                cap += [f'--setenv={key}={env[key]}']
+            unit = f'bl-sdk-probe-{os.getpid()}-{phase}'
+            launch = phase_command(command, env, use_systemd=use_systemd, image=image, unit=unit)
             try:
-                subprocess.run((cap if use_systemd else []) + command, env=env, check=True, timeout=300)
+                subprocess.run(launch, env=env, check=True, timeout=300)
             finally:
                 if use_systemd:
-                    subprocess.run(['systemctl', '--user', 'stop', f'bl-sdk-probe-{os.getpid()}-{phase}'],
+                    subprocess.run(['systemctl', '--user', 'stop', unit],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             expected = 'x' if phase in ('first', 'unchanged') else 'xx'
             assert (work / 'effect-count').read_text() == expected, 'packaging repeated or lost arbitrary effects'
