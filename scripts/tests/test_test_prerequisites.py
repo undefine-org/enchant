@@ -107,6 +107,41 @@ class Prerequisites(unittest.TestCase):
             freeze.assert_not_called()
             launch.assert_not_called()
 
+    def test_preflight_rejects_missing_or_drifted_bootstrap_consumers_before_vm_start(self):
+        module = load("bootstrap_consumer_preflight", ROOT / "scripts/preflight-sdk-boundaries")
+        original_loads, run = module.json.loads, module.subprocess.run
+
+        def only_discovery(command, **kwargs):
+            self.assertEqual("rg", command[0], "no candidate subprocess may start")
+            return run(command, **kwargs)
+
+        for edit in ["missing", "empty", "source", "consumer"]:
+            def decode(text, *args, **kwargs):
+                value = original_loads(text, *args, **kwargs)
+                if isinstance(value, dict) and "external_writers" in value:
+                    if edit == "missing":
+                        value.pop("external_writers")
+                    elif edit == "empty":
+                        value["external_writers"] = []
+                    elif edit == "source":
+                        value["external_writers"][0]["source_sha256"] = "0" * 64
+                    else:
+                        value["external_writers"][0]["references"].pop()
+                return value
+
+            with self.subTest(edit=edit), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "not-created"
+                argv = ["preflight", "--root", str(ROOT), "--out", str(output),
+                        "--boundaries", "vector-lookup-default"]
+                with patch.object(sys, "argv", argv), patch.object(module.json, "loads", side_effect=decode), \
+                        patch.object(module.subprocess, "run", side_effect=only_discovery), \
+                        contextlib.redirect_stderr(io.StringIO()) as errors:
+                    with self.assertRaises(SystemExit) as exit:
+                        module.main()
+                    self.assertEqual(2, exit.exception.code)
+                    self.assertRegex(errors.getvalue(), "bootstrap writer inventory|external writer source drift|external consumer map drift")
+                    self.assertFalse(output.exists())
+
     def test_E63_preflight_refuses_after_mapping_before_freezing_or_starting_a_vm(self):
         module = load("prerequisite_preflight", ROOT / "scripts/preflight-sdk-boundaries")
         run = module.subprocess.run

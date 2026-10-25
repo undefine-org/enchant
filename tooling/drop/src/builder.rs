@@ -52,46 +52,60 @@ fn bl_err(msg: String) -> String {
 // ── the machine-wide build lock ─────────────────────────────────────────────
 
 pub struct BuildLock {
-    path: PathBuf,
+    // Keep the open kernel object for the whole build. The readable PID is
+    // diagnostic data; it never authorizes acquisition or stale-lock removal.
+    _file: std::fs::File,
+    diagnostic: PathBuf,
+    owner: String,
 }
 
 impl BuildLock {
-    /// Take the lock, waiting for a live holder; a holder whose process is gone
-    /// is stale and replaced.
-    pub fn take(store: &Store) -> BuildLock {
-        let path = store.meta().join("locks").join("build");
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let mut told = false;
-        loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = write!(f, "{}", std::process::id());
-                    return BuildLock { path };
-                }
-                Err(_) => {
-                    let holder = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u32>().ok());
-                    match holder {
-                        Some(pid) if Path::new(&format!("/proc/{pid}")).exists() || !Path::new("/proc").exists() => {
-                            if !told {
-                                say(&format!("another build is running (pid {pid}); waiting for it"));
-                                told = true;
-                            }
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                        }
-                        _ => {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
+    /// One permanent inode serializes cooperating bootstrap builders, before
+    /// any BEAM/NIF exists. Do not unlink it during release or crash recovery.
+    /// This parent lease does not yet establish custody for surviving children.
+    pub fn take(store: &Store) -> Result<BuildLock, String> {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::io::Write;
+        let locks = store.meta().join("locks");
+        std::fs::create_dir_all(&locks)
+            .map_err(|e| format!("cannot prepare build custody {}: {e}", locks.display()))?;
+        let anchor = locks.join("build.kernel");
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&anchor).map_err(|e| format!("cannot open build custody {}: {e}", anchor.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                say("another bootstrap build holds kernel custody; waiting for it");
+                file.lock().map_err(|e| format!("cannot acquire build custody {}: {e}", anchor.display()))?;
             }
+            Err(TryLockError::Error(e)) => return Err(format!("cannot acquire build custody {}: {e}", anchor.display())),
         }
+        let diagnostic = locks.join("build");
+        let owner = std::process::id().to_string();
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos();
+        let temporary = locks.join(format!("build.writing-{owner}-{nonce}"));
+        let publish = (|| -> std::io::Result<()> {
+            let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            output.write_all(owner.as_bytes())?;
+            drop(output);
+            // Replace an old diagnostic symlink; never write through it.
+            std::fs::rename(&temporary, &diagnostic)
+        })();
+        if let Err(error) = publish {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("cannot publish build owner {}: {error}", diagnostic.display()));
+        }
+        Ok(BuildLock { _file: file, diagnostic, owner })
     }
 }
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.diagnostic).ok().as_deref() == Some(self.owner.as_str()) {
+            let _ = std::fs::remove_file(&self.diagnostic);
+        }
+        // The descriptor drops after diagnostic cleanup. Its inode stays.
     }
 }
 
@@ -275,7 +289,7 @@ pub struct Built {
 /// bleeding-edge and under its source key. `extra` are more pointers to move to
 /// it (`channels/latest`).
 pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -> Result<Built, String> {
-    let _lock = BuildLock::take(store);
+    let _lock = BuildLock::take(store)?;
     let before = stamp(tree);
 
     // The lock was waited for: another build may have produced exactly this.
@@ -741,8 +755,137 @@ mod builder_tests {
         }
     }
 
+    fn custody_source_identity() {
+        // A shared Cargo target selected a different tree's cached test binary
+        // in the original replay. Bind the code compiled into this test image.
+        if let Ok(expected) = std::env::var("BL_CUSTODY_TEST_SOURCE_SHA256") {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            for (path, source) in [
+            ("Cargo.toml", include_str!("../Cargo.toml")),
+            ("Cargo.lock", include_str!("../Cargo.lock")),
+            ("src/builder.rs", include_str!("builder.rs")),
+            ("src/checkout.rs", include_str!("checkout.rs")),
+            ("src/common.rs", include_str!("common.rs")),
+            ("src/daemon.rs", include_str!("daemon.rs")),
+            ("src/hooks.rs", include_str!("hooks.rs")),
+            ("src/launcher.rs", include_str!("launcher.rs")),
+            ("src/pack.rs", include_str!("pack.rs")),
+            ("src/store.rs", include_str!("store.rs")),
+            ("src/transport.rs", include_str!("transport.rs")),
+            ] {
+                digest.update(path.as_bytes()); digest.update([0]);
+                digest.update(source.as_bytes()); digest.update([0]);
+            }
+            let actual = hex(&digest.finalize());
+            assert_eq!(actual, expected, "requested custody Source differs from compiled test image");
+            eprintln!("BUILD-CUSTODY-SOURCE {actual}");
+        }
+    }
+
+    // Only launched by the exact subprocess test below; no build tool or BEAM.
+    #[test]
+    #[ignore = "explicit custody subprocess worker"]
+    fn custody_subprocess_worker() {
+        custody_source_identity();
+        let root = PathBuf::from(std::env::var_os("BL_CUSTODY_TEST_ROOT").expect("private test root"));
+        let store = Store { root: root.clone() };
+        std::fs::write(root.join("ready"), "ready").unwrap();
+        let _guard = BuildLock::take(&store).unwrap();
+        assert_eq!(std::fs::read_to_string(store.meta().join("locks/build")).unwrap(),
+                   std::process::id().to_string());
+        std::fs::write(root.join("entered"), "entered").unwrap();
+        while !root.join("finish").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    struct CustodyChild(std::process::Child);
+    impl Drop for CustodyChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct CustodyDirectory(PathBuf);
+    impl Drop for CustodyDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn await_custody_file(path: &Path, child: &mut CustodyChild) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "custody worker exited before {}", path.display());
+            assert!(std::time::Instant::now() < deadline, "custody worker timed out: {}", path.display());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn build_custody_survives_missing_or_forged_diagnostics_and_owner_crash() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop-custody-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _directory = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let held = BuildLock::take(&store).unwrap();
+        let diagnostic = store.meta().join("locks/build");
+        let mut child = CustodyChild(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "builder_tests::custody_subprocess_worker", "--ignored", "--nocapture"])
+            .env("BL_CUSTODY_TEST_ROOT", &root).spawn().unwrap());
+        await_custody_file(&root.join("ready"), &mut child);
+        for diagnostic_bytes in [None, Some(""), Some("999999999"), Some("handmade marker")] {
+            match diagnostic_bytes {
+                None => { let _ = std::fs::remove_file(&diagnostic); }
+                Some(bytes) => std::fs::write(&diagnostic, bytes).unwrap(),
+            }
+            // The original PID loop sleeps two seconds between probes.
+            // Observe beyond that interval; a100ms window can falsely pass.
+            std::thread::sleep(std::time::Duration::from_millis(2200));
+            assert!(!root.join("entered").exists(), "diagnostic text admitted a competing actual process");
+        }
+        drop(held);
+        await_custody_file(&root.join("entered"), &mut child);
+        // SIGKILL bypasses Rust Drop. Actual kernel custody must still release.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered = BuildLock::take(&store).unwrap();
+        assert_eq!(std::fs::read_to_string(&diagnostic).unwrap(), std::process::id().to_string());
+        drop(recovered);
+    }
+
+    #[test]
+    fn build_custody_reports_io_errors_and_releases_after_publication_failure() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop-custody-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _directory = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let locks = store.meta().join("locks");
+        let anchor = locks.join("build.kernel");
+        std::fs::create_dir_all(&anchor).unwrap();
+        assert!(BuildLock::take(&store).err().unwrap().contains("cannot open build custody"));
+        std::fs::remove_dir(&anchor).unwrap();
+        // Publishing over a directory fails after actual kernel acquisition.
+        std::fs::create_dir(locks.join("build")).unwrap();
+        assert!(BuildLock::take(&store).err().unwrap().contains("cannot publish build owner"));
+        let observer = std::fs::OpenOptions::new().read(true).write(true).open(&anchor).unwrap();
+        observer.try_lock().expect("publication failure released its actual kernel descriptor");
+        assert!(std::fs::read_dir(&locks).unwrap().all(|entry|
+            !entry.unwrap().file_name().to_string_lossy().starts_with("build.writing-")));
+        drop(observer);
+        std::fs::remove_dir(locks.join("build")).unwrap();
+        let acquired = BuildLock::take(&store).unwrap();
+        assert!(matches!(std::fs::File::open(&anchor).unwrap().try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(acquired);
+        assert!(anchor.is_file(), "the permanent anchor survives release");
+        std::fs::File::open(&anchor).unwrap().try_lock().unwrap();
+    }
+
     #[test]
     fn the_build_lock_is_exclusive_and_stale_locks_are_taken() {
+        custody_source_identity();
         let d = std::env::temp_dir().join(format!("drop-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let store = Store { root: d.clone() };
@@ -750,7 +893,7 @@ mod builder_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "999999999").unwrap(); // a pid that cannot be alive
         {
-            let _l = BuildLock::take(&store);
+            let _l = BuildLock::take(&store).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
         }
         assert!(!path.exists(), "the lock is released on drop");

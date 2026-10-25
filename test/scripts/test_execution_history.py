@@ -95,16 +95,18 @@ class CaptureControls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for directory in ['priv/bootstrap/seed', 'test/scripts', 'scripts',
-                              'native', 'bin', '.github/workflows']:
+                              'native', 'bin', '.github/workflows', 'tooling/drop/src']:
                 (root / directory).mkdir(parents=True)
             manifest = root / history.MANIFEST
             manifest.parent.mkdir(parents=True)
             for path in ['env.bl', history.FINDINGS, history.MANIFEST, history.DRIVER,
                          'scripts/check-execution-history', 'bin/bl', 'flake.nix',
-                         'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl']:
+                         'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl',
+                         'tooling/drop/src/builder.rs', 'tooling/drop/Cargo.toml', 'tooling/drop/Cargo.lock']:
                 (root / path).write_text('original')
             before = history.capture(root, manifest)
-            for path in ['bin/bl', 'flake.nix', 'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl']:
+            for path in ['bin/bl', 'flake.nix', 'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl',
+                         'tooling/drop/src/builder.rs', 'tooling/drop/Cargo.toml', 'tooling/drop/Cargo.lock']:
                 with self.subTest(path=path):
                     file = root / path
                     file.write_text('changed')
