@@ -1,17 +1,24 @@
 (ns proc.instance-test (:require [proc.instance :as instance] [reload.generation :as generation] [env]))
 
-(defn probe [application marker]
- (generation/prepare! {:application-id application :stable-namespaces #{"proc.instance"}
+(defn probe-proposal [application marker]
+ {:application-id application :stable-namespaces #{"proc.instance"}
   :native-modules #{"erlang"}
   :sources {"instance.probe"
    (str "(ns instance.probe (:require [proc.instance :as instance]))\n"
     "(defserver service (init [value] (instance/register! :instance-test/service (erlang/self)) (ok value))"
-    " (handle-call :value [_ st] (reply st st)))\n"
+    " (handle-call :value [_ st] (reply st st))"
+    " (handle-call :unanswered [_ st] (noreply st)))\n"
     "(defn start-owner [value] (start service value))\n"
     "(defn find-owner [] (instance/whereis :instance-test/service))\n"
     "(defn owner-class [] service)\n"
     "(defn value [] (instance/call :instance-test/service :value))\n"
-    "(defn marker [] " marker ")")}}))
+    "(defn generic-value [] (call (instance/name :instance-test/service) :value))\n"
+    "(defn value-with-timeout [timeout] (instance/call :instance-test/service :value timeout))\n"
+    "(defn unanswered [timeout] (instance/call :instance-test/service :unanswered timeout))\n"
+    "(defn marker [] " marker ")")}})
+
+(defn probe [application marker]
+ (generation/prepare! (probe-proposal application marker)))
 
 (deftest process-names-are-isolated-by-instance-and-stable-across-code-generations
  (let [a (probe "instance-a" 1) a2 (probe "instance-a" 2) b (probe "instance-b" 3)
@@ -26,6 +33,15 @@
    (is (= pa (generation/invoke! a2 "instance.probe/find-owner" [])))
    (is (= :a (generation/invoke! a2 "instance.probe/value" [])))
    (is (= :b (generation/invoke! b "instance.probe/value" [])))
+   (is (= :a (generation/invoke! a2 "instance.probe/generic-value" [])))
+   (is (= :a (generation/invoke! a2 "instance.probe/value-with-timeout" [1000])))
+   (is (= :b (generation/invoke! b "instance.probe/value-with-timeout" [:infinity])))
+   (is (= :timeout
+        (try (generation/invoke! a2 "instance.probe/unanswered" [0]) :unexpected-reply
+         (catch-raw [kind reason stack]
+          (when (= :exit kind) (elem reason 0))))))
+   (is (= :a (generation/invoke! a2 "instance.probe/value" []))
+       "a caller timeout leaves the owner available")
    (is (nil? (Process/whereis :instance-test/service)))
    (is (nil? (instance/whereis :instance-test/service)))
    (is (= :instance-name-conflict
@@ -51,6 +67,35 @@
    (is (= :invalid-instance-name
         (try (instance/call "request-supplied-name" :value) nil (catch e (:kind (ex-data e))))))
    (finally (generation/retire! g)))))
+
+(deftest explicit-timeout-calls-reject-foreign-process-references
+ (is (= :invalid-instance-name
+      (try (instance/call (tuple :global (tuple :beam_lisp_instance "other-app" :service))
+                         :value 1000)
+           nil (catch e (:kind (ex-data e)))))))
+
+(deftest E13-original-raw-call-is-refused-before-owner-start
+ (let [proposal (probe-proposal "instance-historical-call" 1)
+       source (get-in proposal [:sources "instance.probe"])
+       before (str "(instance/" "call :instance-test/service :value)")
+       ;; Core's generic call now uses the SDK Server too. Restore its former
+       ;; lowered raw target at the application call site, not inside trusted SDK code.
+       after "(GenServer/call (instance/name :instance-test/service) :value)"
+       changed (String/replace source before after)
+       graph (generation/prepare! proposal)]
+  (try
+   (is (= 2 (count (String/split source before))) "one actual application call site")
+   (when-not (= 2 (count (String/split source before))) (throw :instance-call-mutation-drift))
+   (is (nil? (generation/invoke! graph "instance.probe/find-owner" [])))
+   (let [refusal (try (generation/prepare! (assoc-in proposal [:sources "instance.probe"] changed))
+                     nil (catch e (:kind (ex-data e))))
+         owner (generation/invoke! graph "instance.probe/find-owner" [])]
+    (is (= :undeclared-dependency refusal))
+    (is (nil? owner) "the rejected call never starts an owner")
+    (println :history-E13 {:source-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                          :mutant-sha256 (Base/encode16 (crypto/hash :sha256 changed))
+                          :refusal refusal :owner-started (some? owner)}))
+   (finally (generation/retire! graph)))))
 
 (deftest an-instance-call-boundary-does-not-admit-raw-otp-calls
  (is (= :undeclared-dependency
