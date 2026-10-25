@@ -36,6 +36,15 @@ measurable-card and selected-frame studio slices are now implemented. See
 [A1 evidence](evidence/a1/checks.json), and [PROGRESS.md](PROGRESS.md). The design
 examples still describe a broader API; they are not all available signatures.
 
+## Completed product narrative film
+
+[Hello, world.](evidence/hello-film/index.html) is the completed
+[60-second 1080p/60 film](evidence/hello-film/hello-world.mp4), with friendlier
+Nunito typography, one continuing project and an original stereo score.
+[Film notes](HELLO-FILM.md) and [checks](evidence/hello-film/checks.json) record
+actual rendering, precise scene revisits, full playback and limits. The studio
+shell is explicitly labeled as a concept; the scene artwork actually executes.
+
 ## Current product film storyboard
 
 The latest creative direction is [Hello, world.](evidence/storyboard/index.html),

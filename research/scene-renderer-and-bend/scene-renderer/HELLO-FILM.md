@@ -73,3 +73,45 @@ for all 3,600 frames. The current private executor admits at most 256 MiB of JSO
 400 items/frame, 80 glyph assets, bounded native paths and 512 sound events.
 Numbers, transforms, clips, paints, shader weights, IDs and rational frame clocks
 are checked before graphics allocation. No per-pixel BEAM values are constructed.
+
+## Completed export and checks
+
+[Watch Hello, world.](evidence/hello-film/index.html), or open the
+[MP4](evidence/hello-film/hello-world.mp4). The user review endpoint is
+`http://100.124.205.18:4054/` while its intentional four-hour service is alive.
+
+The final capture revision is
+`78f8135e99273346c5595e8e1bdacd458fab324d9627bd38138ea16266d9cce7`,
+source commit `2c4883f0`. The film contains exactly 3,600 frames, 1920×1080 at
+60/1 fps, 60 seconds. Stereo AAC is 48 kHz / 60 seconds. The movie is 20,841,909
+bytes. Capture took 69.098 seconds / 1.5 GiB peak; render/encode/probe took
+120.988 seconds cgroup wall time / 1.6 GiB peak. Both used zero swap. These are
+measurements of this one offline workload, not interactive-preview benchmarks.
+
+Nine BL assertions, nine canonical text tests and nine worker admission tests
+pass. A fresh native context sampled frames 1980, 0, 2520, 3420 in that order;
+all matched their full-export PNGs byte-for-byte. At film seconds 30 and 33,
+the project is at the same eight-second marker. The complete 1360×765 artwork
+crop is byte-identical in those two native frames, including glyphs, attachments,
+seed texture and shader highlights. The pointer/timeline are separate film UI.
+This is a native-frame equality check, not a claim of equal compressed H.264 bytes.
+
+Chromium played the entire 60 seconds with sound enabled and reported zero
+dropped frames out of 3,600. Nine forward/backward seek requests, Nunito loading,
+replay state and a 390-pixel layout passed. HTTP video byte ranges returned 206
+with the expected 16 bytes. The owned browser/profile, encoders and native test
+workers were stopped. The intentional review server is time-bounded.
+
+AAC decode level checks measured mean -21.0 dBFS and peak -2.9 dBFS. The retained
+movie, lossless samples, decoded contact, screenshot, source/font provenance,
+render report, independent sample report and full compressed evaluated plan are
+under `evidence/hello-film/`. The raw JSON plan is 231,476,147 bytes; its lossless
+archive is 18,263,848 bytes. Source, movie and decompressed plan hashes were
+verified. Full-size samples and the decoded contact were inspected; automated
+playback does not establish a human full audiovisual review or professional mix.
+
+Visual review corrected clipping around the extended title, scale/spacing in the
+family, inherited tree density, degenerate connector stubs, the marker clock,
+selected-text baseline scaling and the concept label's position. All components
+remain keyed; actual geometry and material changes carry the story. The end
+keeps the same title, shared coral stock, attached seed and chosen spectral finish.

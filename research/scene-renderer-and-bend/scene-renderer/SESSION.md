@@ -209,3 +209,17 @@ where generic source editing/picking/material controls exceed the current studio
 artwork, geometry, text, sampled motion and materials must actually execute.
 Do not present reconstructed UI as captured shipping behavior. Commit completed
 slices and deliver an actual playable film, not another storyboard or static deck.
+
+The actual Hello world narrative film is now complete. Read HELLO-FILM.md and
+`evidence/hello-film/`: 60 seconds / 1080p60 / original stereo, Nunito throughout.
+Authorship is `scene_demo/hello.bl`, captured build `hello.bl`, `hello_worker.py`
+and `hello/` shaders. The concept interface is labeled in the movie and review
+page; it is not a capture of a new generic editor. Nine BL assertions, nine font
+checks, nine admission tests, all frame admission, byte-identical reordered native
+samples and exact marked-moment artwork pixels pass. Full unmuted Chromium
+playback had zero drops / 3,600; seeks, replay, fonts and mobile layout passed.
+Capture/render peaks were 1.5/1.6 GiB with zero swap. Retained source commit is
+2c4883f0 and capture revision 78f8135e99273346c5595e8e1bdacd458fab324d9627bd38138ea16266d9cce7.
+Owned tests/browsers/encoders are cleaned up. `bl-scene-hello-review` intentionally
+serves the film for four hours at `http://100.124.205.18:4054/`. Preserve unrelated
+worktree files. The user's approval did not authorize unrelated compiler work.

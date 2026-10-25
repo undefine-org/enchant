@@ -1,3 +1,30 @@
+# Latest: completed Hello world product narrative film
+
+The approved 60-second story now exists as an actual 1080p/60 movie with original
+stereo audio and friendlier Nunito type. One measured title, cutout, seed, family,
+attached structure and changing material carry the narrative. BL owns sampled
+layout, IDs, transforms, clocks and sound events. Cached Cairo outlines and native
+GLES shader materials produce packed frames. The cinematic studio interface is
+explicitly labeled as a concept; no shipped generic editor/picking/material UI or
+general-project export is implied. [HELLO-FILM.md](HELLO-FILM.md) records the boundary.
+
+Capture: 69.098 seconds / 1.5 GiB peak. Render/encode/probe: 120.988 seconds /
+1.6 GiB peak, zero swap. Exact export: 3,600 frames / 60/1 fps / 60 seconds,
+1920×1080, stereo AAC at 48 kHz. Nine BL assertions, nine canonical-text tests and
+nine admission tests pass. Four independently reordered native frames match the
+full export byte-for-byte. The entire artwork crop at film seconds 30 and 33 is
+identical at the same eight-second project marker. Source/movie/compressed-plan
+hashes and HTTP byte ranges pass. Chromium played the full minute unmuted with
+zero dropped frames / 3,600; nine seeks, replay, Nunito and mobile layout passed.
+
+[Film](evidence/hello-film/index.html), [checks](evidence/hello-film/checks.json),
+full evaluated plan archive and visual evidence are retained. Browser/profile,
+GPU workers, encoders and focused test VM are cleaned up. The intentional four-hour
+review service is `bl-scene-hello-review`, `http://100.124.205.18:4054/`.
+Unrelated worktree files were preserved. Studio and Bend/compiler work stay separate.
+
+---
+
 # Latest creative direction: product narrative storyboard
 
 The user requested a complete product story after rejecting spectacle alone.
