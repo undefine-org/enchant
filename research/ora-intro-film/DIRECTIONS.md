@@ -12,6 +12,8 @@ What changes is the visual world, and with it who the film speaks to first.
 
 ## B — "Zellige"
 
+> Superseded by the full film in [zellige/](zellige/BRIEF.md), rebuilt from scratch with a short spoken-free script.
+
 **Idea:** Moroccan geometric tilework as the metaphor for a shared method. One
 compass-and-straightedge construction (the playbook) generates a pattern that
 every tile obeys. It is Casablanca-rooted without being a postcard. The point

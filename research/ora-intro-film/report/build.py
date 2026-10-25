@@ -41,3 +41,15 @@ data={'landings':landings,'arrivals':arrivals,'glow':glow,'distance':distance,'o
  'beat':60/128,'fps':60,'frames':900}
 (ROOT/'data.json').write_text(json.dumps(data))
 print(json.dumps({'landings':landings,'arrivals':arrivals,'peak_glow':max(glow),'loud_max':max(loud)},indent=1))
+
+# Zellige: one thumbnail per scripted line, from the delivered film.
+ZF=FILM/'zellige'/'film'/'evidence'/'zellige.mp4'
+script=[(1.2,4.6,'Everyone uses AI.'),(6.0,10.8,'Each in their own way.'),(13.0,17.6,'One shared way of working.'),(19.6,24.8,'Everything fits.'),
+ (27.0,30.8,'Better, for everyone.'),(33.2,37.6,'Across the whole company.'),(41.0,45.0,'ORA Ventures')]
+zel=[]
+for k,(a,b2,line) in enumerate(script):
+ t=min(44.5,(a+b2)/2+(.8 if k==6 else 0))
+ subprocess.run(['ffmpeg','-v','error','-y','-ss',str(t),'-i',str(ZF),'-frames:v','1','-vf','scale=640:-2','-q:v','3',str(MEDIA/f'zellige-{k}.jpg')],check=True)
+ zel.append({'in':a,'out':b2,'line':line,'src':f'media/zellige-{k}.jpg'})
+data['zellige']=zel
+(ROOT/'data.json').write_text(json.dumps(data))

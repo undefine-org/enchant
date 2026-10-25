@@ -6,6 +6,7 @@ carried by picture and sound. The only copy is the closing "ORA Ventures".
 
 | Read | What it is |
 |---|---|
+| [zellige/](zellige/BRIEF.md) | **Zellige, the full film** (45 s, rendered): rebuilt from scratch with a seven-line script in the simplest words. [Film and evidence](zellige/film/README.md) |
 | [RESEARCH.md](RESEARCH.md) | What the ORA site says, its brand system, what the studio can carry, visual principles |
 | [BRIEF.md](BRIEF.md) | **The Common Block**: 45 s, 8-shot brief with action, camera, meaning, sound, transitions, gates, deliverables |
 | [storyboard/index.html](storyboard/index.html) | Timed visual storyboard (serve the folder over HTTP; `?contact=1` for a contact sheet) |

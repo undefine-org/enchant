@@ -15,3 +15,9 @@ Project Authors. Its rounded terminals provide a friendlier artwork/UI voice.
 hashes. The accompanying `Nunito-OFL.txt` must travel with the font. Canonical
 shaping explicitly requires and hashes Nunito when requested; older specimens
 continue to require only their original packaged set.
+
+The ORA Ventures films add **Schibsted Grotesk** (variable weight), by the
+Schibsted-Grotesk Project Authors, retrieved 2026-10-25. It is the display face of
+the ORA Ventures website. `SchibstedGrotesk-source.json` records the source URLs
+and exact byte hashes; `SchibstedGrotesk-OFL.txt` must travel with the font.
+Canonical shaping requires and hashes it only when a request names it.
