@@ -1,0 +1,61 @@
+;; Trusted worker entry: request JSON is data; the SDK's existing producer owns
+;; compilation, descriptor emission and workspace admission.
+(ns artifact.application-worker
+  (:require [build :as build] [build-plan :as plan] [bl.env :as env] [app-resource :as app]))
+
+(let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
+      root (System/fetch_env! "BL_APPLICATION_SOURCE")
+      out (System/fetch_env! "BL_APPLICATION_OUTPUT")
+      project (env/project root)
+      _ (when (seq (:errors project))
+          (throw (ex-info "Application declaration is invalid" {:errors (:errors project)})))
+      _ (doseq [path (:paths project)] (BeamLisp.Env/add_search_path path))
+      relative (fn [path] (when path (Path/join root path)))
+      ex (get request "ex")
+      options {:root root :out (Path/join out "ebin")
+               :sources (Enum/map (get request "sources") relative)
+               :world (relative (get request "world"))
+               :exclude (Enum/map (get request "exclude") relative)
+               :jobs (get request "jobs")
+               :native (get request "native")
+               :ex (when ex {:root (relative (get ex "root")) :exclude (get ex "exclude")})
+               :log println}
+      result (build/run options)
+      errors (Enum/map (:errors result) identity)]
+  (when (seq errors) (throw (ex-info "Application production failed" {:errors errors})))
+  (let [planning (when-not (get request "world")
+                   (plan/plan-paths (build/select-sources (:sources options) (:exclude options))))
+        units
+        (when-not (get request "world")
+          (let [sources (Enum/map (Enum/map (:order planning) #(:path %))
+                          (fn [file]
+                            (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source file))]
+                              (when-not namespace
+                                (throw (ex-info "Application artifact source requires a namespace" {:file file})))
+                              {:namespace (symbol namespace) :file file})))
+                workspace (BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources sources} {})]
+            (try
+              (Enum/map sources
+                (fn [source]
+                  (let [namespace (:namespace source)
+                        name (str namespace)
+                        relative (str "units/" name)
+                        directory (Path/join out relative)
+                        prepared (BeamLisp.AOT/prepare_unit workspace namespace)
+                        _ (BeamLisp.AOT/emit_unit prepared directory)
+                        verified (BeamLisp.AOT/verify_unit directory)]
+                    {:namespace name :directory relative :modules (count (get-in verified [:manifest :modules]))})))
+              (finally (BeamLisp.AOT/close_workspace! workspace)))))
+        resource (app/write-project! project (or (:runtime-out result) (Path/join out "ebin")))]
+    (File/write! (Path/join out "result.json")
+      (Jason/encode! {:built (:built result) :cached (:cached result)
+                     :ex-built (:ex-built result) :errors errors
+                     :units units
+                     :impact (when planning
+                               (Enum/map (:order planning)
+                                 (fn [node]
+                                   {:namespace (:ns node) :path (Path/relative_to (:path node) root)
+                                    :content (:hash node) :interface (:iface node)
+                                    :key (get (:key planning) (:path node))
+                                    :requires (Enum/map (:reqs node) identity)})))
+                     :app-resource (:ok? resource)}))))
