@@ -199,3 +199,13 @@ seek, direct shot navigation, full treatment, contact mode and print; all 12 pos
 and mobile layout were checked. No BEAM was launched. The browser/profile are
 cleaned up. `bl-scene-storyboard-review` intentionally serves the evidence folder
 for four hours at `http://100.124.205.18:4053/storyboard/`.
+
+## Product film implementation approved
+
+The user accepted the storyboard for now and explicitly requested committing and
+making the actual video, with a friendlier font. Use Nunito for the new film.
+The 60-second narrative is the active task. Keep conceptual studio chrome labeled
+where generic source editing/picking/material controls exceed the current studio;
+artwork, geometry, text, sampled motion and materials must actually execute.
+Do not present reconstructed UI as captured shipping behavior. Commit completed
+slices and deliver an actual playable film, not another storyboard or static deck.

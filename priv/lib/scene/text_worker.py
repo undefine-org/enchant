@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 
 SCALE = 1024
-FAMILIES = {'Instrument Serif', 'DM Sans', 'Patrick Hand'}
+FAMILIES = {'Instrument Serif', 'DM Sans', 'Patrick Hand', 'Nunito'}
 
 class Rectangle(C.Structure):
     _fields_ = [(k, C.c_int) for k in ['x', 'y', 'width', 'height']]
@@ -175,6 +175,8 @@ class Shaper:
 def measure(requests, font_dir, rsvg):
     font_dir = Path(font_dir).resolve()
     required = ['DMSans.ttf', 'InstrumentSerif-Regular.ttf', 'InstrumentSerif-Italic.ttf', 'PatrickHand-Regular.ttf']
+    if any(request.get('family') == 'Nunito' for request in requests):
+        required.append('Nunito.ttf')
     hashes = {name: hashlib.sha256((font_dir / name).read_bytes()).hexdigest() for name in required}
     with tempfile.TemporaryDirectory(prefix='scene-shaping-') as scratch:
         config = Path(scratch) / 'fonts.conf'
