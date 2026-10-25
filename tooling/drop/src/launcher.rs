@@ -13,6 +13,7 @@ include!("transport.rs");
 include!("builder.rs");
 include!("hooks.rs");
 include!("checkout.rs");
+mod command_domain;
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
@@ -612,6 +613,9 @@ pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_IN
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(status) = command_domain::dispatch(&argv) {
+        std::process::exit(status);
+    }
     if argv.first().map(String::as_str) == Some("--checkout") {
         checkout_main(&argv[1..]);
     }

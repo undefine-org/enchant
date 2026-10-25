@@ -26,6 +26,17 @@ def load(name, path):
 
 
 class Prerequisites(unittest.TestCase):
+    def test_external_command_consumers_require_controllers_before_vm_start(self):
+        for name in ['test/bl/native_test.bl', 'test/bl/native_runtime_custody_test.bl',
+                     'test/bl/build_custody_operations_test.bl']:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                for tool in ['cargo', 'rustc']:
+                    executable = Path(directory) / tool
+                    executable.write_text('#!/bin/sh\nexit 0\n')
+                    executable.chmod(0o755)
+                with self.assertRaisesRegex(RuntimeError, 'before VM startup.*systemd-run.*systemctl'):
+                    REQUIRE(ROOT, [name], platform='linux', path=directory)
+
     def test_E63_actual_gate_refuses_missing_tool_and_source_mutant_accepts_it(self):
         with self.assertRaisesRegex(RuntimeError, "before VM startup.*inotifywait"):
             REQUIRE(ROOT, [WATCHER], platform="linux", path="")

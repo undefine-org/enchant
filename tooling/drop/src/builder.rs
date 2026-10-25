@@ -897,6 +897,7 @@ mod builder_tests {
             ("Cargo.lock", include_str!("../Cargo.lock")),
             ("src/builder.rs", include_str!("builder.rs")),
             ("src/checkout.rs", include_str!("checkout.rs")),
+            ("src/command_domain.rs", include_str!("command_domain.rs")),
             ("src/common.rs", include_str!("common.rs")),
             ("src/daemon.rs", include_str!("daemon.rs")),
             ("src/hooks.rs", include_str!("hooks.rs")),

@@ -51,6 +51,21 @@ module = Module.concat([ExecutionHistory, CustodyWorker])
     {state, invoke("build", "build-native-crate", [project, crate, nil])}
   end
 
+  def handle(%{"op" => "managed_command", "root" => root, "program" => program, "argv" => argv} = request, state) do
+    options = %{:cd => request["cwd"] || root, :"read-locks" => request["read_locks"] || [],
+                :"timeout-ms" => request["timeout_ms"] || 20000, :"memory-bytes" => 268435456,
+                :"output-bytes" => request["output_bytes"] || 65536,
+                :env => Enum.map(request["env"] || %{}, fn {key, value} -> {key, value} end)}
+    result = invoke("claim", "command!", [root, program, argv, options])
+    {state, %{output: elem(result, 0), exit: elem(result, 1)}}
+  end
+
+  def handle(%{"op" => "probe_lock", "path" => path}, state) do
+    result = BeamLisp.LazyMemo.nif_file_lock(path, false, true)
+    if elem(result, 0) == :ok, do: BeamLisp.LazyMemo.nif_file_unlock(elem(result, 1))
+    {state, %{status: elem(result, 0)}}
+  end
+
   def handle(%{"op" => "claim", "out" => out}, state) do
     result = invoke("claim", "acquire!", [out, "independent writer"])
     context = if result[:"ok?"], do: invoke("claim", "follower-context", [out]), else: nil
