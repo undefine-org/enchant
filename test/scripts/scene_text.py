@@ -21,7 +21,8 @@ class TextTests(unittest.TestCase):
             {'id': 'short', 'text': 'A little world', 'family': 'Instrument Serif', 'size': 44, 'width': 360},
             {'id': 'long', 'text': 'A little world with a much longer story to tell', 'family': 'Instrument Serif', 'size': 44, 'width': 240},
             {'id': 'italic', 'text': 'flying together', 'family': 'Instrument Serif', 'size': 44, 'italic': True, 'width': 360},
-            {'id': 'spaces', 'text': 'word\nnext line', 'family': 'DM Sans', 'size': 20, 'width': 240}], FONT, RSVG)
+            {'id': 'spaces', 'text': 'word\nnext line', 'family': 'DM Sans', 'size': 20, 'width': 240},
+            {'id':'friendly','text':'Hello, world.','family':'Nunito','size':44,'weight':650}], FONT, RSVG)
     def test_wrap_changes_measured_height(self):
         a,b = self.result['runs'][:2]
         self.assertGreater(b['lines'], a['lines'])
@@ -53,6 +54,17 @@ class TextTests(unittest.TestCase):
             self.assertFalse((folder/'0.png').exists())
             self.assertEqual(list(json.loads((folder/'pixels.json').read_text())),['60'])
             self.assertEqual(struct.unpack('>II',(folder/'60.png').read_bytes()[16:24]),(20,20))
+    def test_nunito_is_captured_and_shaped(self):
+        import hashlib
+        self.assertEqual(self.result['fonts']['Nunito.ttf'],hashlib.sha256((FONT/'Nunito.ttf').read_bytes()).hexdigest())
+        self.assertTrue(self.result['runs'][4]['commands'])
+    def test_nunito_cannot_fall_back_when_packaged_file_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target=Path(folder)
+            for name in ['DMSans.ttf','InstrumentSerif-Regular.ttf','InstrumentSerif-Italic.ttf','PatrickHand-Regular.ttf']:
+                (target/name).symlink_to((FONT/name).resolve())
+            with self.assertRaises(FileNotFoundError):
+                worker.measure([{'text':'Hello','family':'Nunito'}],target,RSVG)
     def test_invalid_geometry(self):
         for width in [0,-1,float('nan')]:
             with self.assertRaisesRegex(ValueError,'width'):

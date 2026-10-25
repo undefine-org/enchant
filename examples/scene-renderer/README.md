@@ -361,3 +361,26 @@ worker fails explicitly if that capability is unavailable.
 `scene_demo/showcase.bl`; `showcase.bl` captures source/font/plan identities.
 The shader backend is an experimental private film executor, not a completed
 public shader graph, simulation system, physical renderer, or studio integration.
+
+## Hello world product narrative film
+
+The approved storyboard is implemented as a 60-second / 1080p / 60 fps authored
+product concept film, with a friendlier **Nunito** type direction and original
+stereo synthesis. Its concept interface is explicitly labeled; it is not a screen
+recording of a shipped general editor. Actual BL-authored measured layout, keyed
+instances/attachments, sampled camera/motion and GPU materials produce the art.
+See [the film treatment and boundaries](../../research/scene-renderer-and-bend/scene-renderer/HELLO-FILM.md).
+
+With the same toolchain and graphics-library environment as the showcase above:
+
+```sh
+examples/scene-renderer/hello.sh /tmp/bl-hello-film review
+examples/scene-renderer/hello.sh /tmp/bl-hello-film film
+```
+
+The wrapper inspects memory and caps serial capture/render jobs. The build retains
+all explicit source/font hashes and 3,600 ordered evaluated display lists. The
+worker validates clocks, identity, native geometry, clips and shader inputs before
+rendering. Cairo draws cached glyph/path geometry; GLES shades seed-local paper,
+weave and spectral metal. Both stills and the film use the same drawing function.
+The native graphics workers and encoders are owned and drained on completion.
