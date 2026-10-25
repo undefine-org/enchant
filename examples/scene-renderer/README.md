@@ -322,3 +322,42 @@ The existing startup executable-capture qualification remains. Use one publisher
 per output directory and keep the whole process tree capped. New checks are
 `choreo_test.bl`, `metamorphosis_test.bl`, `scene_motion.py`, and the owned-browser
 `scene_metamorphosis_browser.mjs`.
+
+## MAKE WORLDS — material-led commercial study
+
+A 30-second / 1920×1080 / 60 fps film, with original synthesized stereo audio.
+BL authors the finite numeric score, camera matrices, surface/material controls,
+shaped typography and sound events. Captured GLSL deforms and lights a persistent
+five-band mesh. A native EGL/GLES worker provides depth, 4x MSAA, RGBA16F lighting,
+UV-locked brushed/iridescent/woven materials, orbital points and a bloom/tone pass.
+Typography is a warped camera-facing compositing layer behind the sculpture;
+two small signature lines sit in front. It is not physical 3D glyph geometry.
+No panels, fades or stock entrance/exit presets are used.
+
+Set the checkout Elixir/Erlang toolchain PATH as above, and explicit graphics
+libraries. On the current host:
+
+```sh
+export SCENE_RSVG=/nix/store/ii7wr6b6b8c5fq1ci26rw7amkb4apwm8-librsvg-2.62.3/bin/rsvg-convert
+export SCENE_EGL=/nix/store/dpi7sgi4dmnddwjwdi57d8x06sx49vkn-libglvnd-1.7.0/lib/libEGL.so.1
+export SCENE_GLES=/nix/store/dpi7sgi4dmnddwjwdi57d8x06sx49vkn-libglvnd-1.7.0/lib/libGLESv2.so.2
+export __EGL_VENDOR_LIBRARY_FILENAMES=/nix/store/bfkyl4qgipm1vpfls2cqr3kv0afgpbya-mesa-26.1.1/share/glvnd/egl_vendor.d/50_mesa.json
+examples/scene-renderer/showcase.sh /tmp/bl-showcase review
+examples/scene-renderer/showcase.sh /tmp/bl-showcase film
+```
+
+The wrapper inspects `scripts/bl-mem`, captures through one capped cold checkout
+VM, and renders the captured worker/shaders under a separate 3 GiB / 256 MiB swap
+/ 15-minute ceiling. Selected review frames use the canonical drawing path.
+`OUT/manifest.json` identifies a **captured plan**, not a completed movie.
+`REVISION/report.json` exists after successful rendering; film mode checks exact
+video/audio clocks before publishing `REVISION/showcase.mp4`. Failed renders do
+not replace an earlier movie. External driver/library identities remain backend
+dependencies; identical GPU bytes across different hardware are not promised.
+A GLES3 implementation with four-sample RGBA16F renderbuffers is required; the
+worker fails explicitly if that capability is unavailable.
+
+`scene.score` supplies continuous numeric tracks. Authoring is in
+`scene_demo/showcase.bl`; `showcase.bl` captures source/font/plan identities.
+The shader backend is an experimental private film executor, not a completed
+public shader graph, simulation system, physical renderer, or studio integration.

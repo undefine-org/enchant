@@ -48,3 +48,39 @@ Primary backend references:
 The first hardware probe created a surfaceless GLES 3.2 context and reported
 Mesa Intel UHD Graphics 630 (CML GT2), Mesa 26.1.1. This is an observed local
 backend capability, not a performance comparison with any other renderer.
+
+## Implemented visual vocabulary
+
+`scene.score` supplies finite numeric-vector tracks with time-aware cubic
+Hermite tangents. Interior keys do not force the camera to stop. Camera matrices
+are calculated in BL. Geometry weights are normalized; physical material channels
+are bounded after score interpolation. The shader consumes those captured values
+without reading a wall clock or replaying a simulation. Five persistent bands
+share one continuously deforming loop/knot/wave/helix surface grammar. The private
+GLSL vertex stage defines this actual parametric geometry; it is not BL-compiled
+GPU code. UV materials follow the deformation. 320 deterministic orbital points
+provide scale detail. Native depth and four-sample antialiasing preserve overlap.
+
+The typography is shaped once with packaged Pango fonts and rasterized from the
+same outlines, then warped on camera-facing quads. Giant words pass through the
+composition behind the sculpture; the two small signature lines stay in front.
+This layered occlusion is compositing, not 3D extruded text or physical shadows.
+The final brand has a separate clear area. No chapter panels or fading objects.
+
+The scene buffer is RGBA16F with depth24, resolved from 4x MSAA. The post pass
+adds a tightly sampled glow and an ACES-like curve, then writes opaque RGBA8.
+The material model uses analytic studio reflection cards, view-dependent colour,
+UV-locked brushing/weave and edge accents. It is original stylized shading, not
+a full microfacet/anisotropic BRDF, path tracing, or a universal material system.
+No film grain/noise source is advanced through playback history.
+
+The first visual iteration exposed mirrored/unreadable world-facing type and
+a pastel foil palette. Camera-facing type and darker metal corrected those.
+A wide sparse bloom kernel created ghost outlines; a tighter 32-tap disk and
+lower fringe strength removed the obvious replicas in inspected frames.
+
+Checks completed before full export: 12 BL assertions (including all 1,800 frame
+controls), 9 Python admission tests, shader compilation and eleven full-size
+selected frames on the Intel GPU. The canonical movie and playback verification
+are recorded separately after export; a selected-frame review is not full motion
+or audio quality assurance.

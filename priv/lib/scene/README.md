@@ -136,3 +136,15 @@ Focused BL tests are in `test/bl/scene/layout_test.bl`. Real shaping tests are i
 and cap the test process tree as root AGENTS.md requires. Run checks serially.
 Shaping is a bounded synchronous batch process, not a persistent test service.
 The postcard example is a selected-frame build; full-film export is independent.
+
+### Continuous motion scores
+
+`scene.score/track` accepts at least two ordered `{:at seconds :value vector}`
+keys with equal finite vector lengths and strictly increasing times.
+`scene.score/sample track t` holds outside endpoints and uses cubic Hermite
+interpolation with time-aware centered tangents inside. Interior velocity is
+continuous, so every key need not be a stop. Endpoint tangents are zero.
+Channels may overshoot: apply a deliberate bound/normalization for physical
+controls. This is deterministic sampling, not a spring simulation or scheduler.
+The material-led showcase demonstrates a private GLES executor; it does not add
+arbitrary shader nodes to the public scene/studio API.
