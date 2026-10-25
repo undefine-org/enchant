@@ -69,31 +69,25 @@
              (= (BeamLisp.AOTCache/current_compiler_key)
                 (get (erlang/hd (elem parsed 1)) "compiler_key")))))))
 
-(defn- reuse-boot-floor!
- "A runtime host edit preserves compiler_key. Reuse that floor's COMPLETE boot
-  units after checking their membership and manifest digests. From-scratch
-  qualification always takes the compiler path instead."
- [root ebin]
- (when (and (not (from-scratch?)) (floor-current? root))
-  (let [seed (str root "/priv/bootstrap/seed")
-        manifest (erlang/hd (elem (file/consult (String/to_charlist (str seed "/manifest.term"))) 1))
-        nss (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "namespaces")
-                                 (list (str root "/priv/boot")))
-        inventory (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "boot-inventory") (list nss seed))
-        objects (:objects inventory)]
-   (when (and (empty? (:errors inventory)) (seq objects)
-              (every? (fn [object]
-                        (= (get (get manifest "modules") (:name object))
-                           (Base/encode16 (crypto/hash :sha256 (:bytes object)) (list (tuple :case :lower))))) objects))
-    (File/mkdir_p! ebin)
-    (doseq [object objects] (File/write! (str ebin "/" (:name object)) (:bytes object)))
-    {:built 0 :compiled 0 :cached (count nss) :errors [] :reused-floor true :modules (count objects)}))))
+(defn- load-fresh-hosts! [compiled]
+ ;; The recovery caller has already proved that no SDK/application custody is
+ ;; live. Read the entire replacement cohort before changing executable code.
+ ;; Atomic loading makes dependency order irrelevant and refuses the whole
+ ;; cohort on bad bytes, old code or on_load. LazyMemo owns the OLD native
+ ;; lifetime in this VM, so its new facade belongs exclusively to the next VM.
+ (let [loads (Enum/map (Enum/reject compiled #(= :Elixir.BeamLisp.LazyMemo (elem % 0)))
+               (fn [entry] (tuple (elem entry 0) (String/to_charlist (elem entry 1))
+                                  (File/read! (elem entry 1)))))
+       result (code/atomic_load loads)]
+  (when-not (= :ok result)
+   (throw (ex-info "Fresh host cohort refused before publication"
+                  {:kind :bootstrap-host-cohort-refused :result result})))
+  :ok))
 
 (defn regenerate-source-floor! [root output]
  (preflight! root output)
  ;; Project refusal precedes host compilation, build work or output writes.
  (let [hosts (str output "/fresh-hosts")
-      ebin (str output "/ebin")
       floor (str output "/seed")
       ;; Resolve the project readers while the recovery runtime still owns its
       ;; coherent source image. Retargeting first makes their lazy SDK load
@@ -173,15 +167,13 @@
            ["supervisor.bl" :Elixir.BeamLisp.Supervisor]
            ["bootstrap.bl" :Elixir.BeamLisp.Bootstrap]
            ["application.bl" :Elixir.BeamLisp.Application]])))))]
+  (load-fresh-hosts! compiled)
   (doseq [result compiled]
    (let [module (elem result 0) path (elem result 1)
          native-only? (= module :Elixir.BeamLisp.LazyMemo)]
     (if native-only?
      (println {:next-vm-host module :artifact result :loaded? false})
-     (let [loaded (code/load_binary module (String/to_charlist path) (File/read! path))]
-      (when-not (= loaded (tuple :module module))
-       (throw (ex-info "Fresh host load failed" {:module module :result loaded})))
-      (println {:fresh-host module :artifact result}))))))
+     (println {:fresh-host module :artifact result :cohort :atomic})))))
  ;; Native-owned fresh recovery seam BEFORE compiler boot / guarded Ref use.
  ;; Hotloaded Env does not rerun start_link. No Root/Source caller may create
  ;; these tables or adopt rows from an earlier custody/runtime lifetime.
@@ -263,26 +255,22 @@
                  {:kind :bootstrap-project-writer-stale})))
  ;; Resolve driver functions only after both current native hosts are loaded;
  ;; no ns :require or cached driver call can race ahead of that boundary.
- (doseq [name ["build" "seed" "app-resource"]]
+ (doseq [name ["seed" "app-resource"]]
   (BeamLisp.Loader/ensure_loaded name))
  (BeamLisp/eval (File/read! (str root "/priv/build/seed.bl")))
  (BeamLisp.Env/bind captured)
- (let [sources (conj (vec (Path/wildcard (str root "/priv/boot/*.bl")))
-                     (str root "/priv/std/multi.bl"))
-       expected-key (BeamLisp.AOTCache/compiler_key)
-       built (phase! :boot-tier (fn []
-               (or (reuse-boot-floor! root ebin)
-                   (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "build" "run")
-                     (list {:sources sources :out ebin :jobs (erlang/system_info :schedulers_online)
-                            :force? (from-scratch?) :scope :scoped :log println})))))]
-  (println {:build built})
-  (when (seq (:errors built))
-   (throw (ex-info "Current-host keyed bootstrap build failed" {:errors (:errors built)})))
-  (let [seeded (phase! :seed (fn [] (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "run")
-                 (list {:root root :ebin ebin :out floor :app app :reuse-hosts [hosts] :reuse-floor (not (from-scratch?))}))))]
+ ;; Bootstrap generation is artifact production, never publication of the
+ ;; boot units over the compiler executing this script. Reuse the established
+ ;; producer's workspace, source judge, complete inventory and manifest-last
+ ;; commit instead of a second build-and-publish/reuse path.
+ (let [expected-key (BeamLisp.AOTCache/compiler_key)
+       seeded (phase! :seed (fn []
+                (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "seed" "produce-artifacts")
+                  (list {:root root :out floor}))))]
    (println {:seed seeded})
-   (when-not (:ok? seeded)
-    (throw (ex-info "Current-host bootstrap seed failed" {:errors (:errors seeded)})))
+   (when-not (and (= :artifact-generation (:kind seeded)) (pos? (:modules seeded))
+                 (= false (:native-admission seeded)))
+    (throw (ex-info "Current-host bootstrap artifact production failed" {:result seeded})))
    (BeamLisp.AOTCache/reset_keys)
    (when-not (= expected-key (BeamLisp.AOTCache/compiler_key))
     (throw (ex-info "Compiler source moved during seed generation" {:expected expected-key :actual (BeamLisp.AOTCache/compiler_key)})))
@@ -317,7 +305,7 @@
    ;; Generation remains review-only by default; explicit 1 requests install.
    (when (= "1" (System/get_env "BL_BOOTSTRAP_INSTALL"))
     (System/put_env "BL_BOOTSTRAP_SEED" floor)
-    (BeamLisp/eval (File/read! (str root "/scripts/install-seed.bl"))))))))
+    (BeamLisp/eval (File/read! (str root "/scripts/install-seed.bl")))))))
 
 
 ;; An older coherent recovery drop must start outside a changing compiler tree;
