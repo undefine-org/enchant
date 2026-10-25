@@ -20,7 +20,7 @@
 ; anf→core→beam synthesis (all of which bl already drives).
 
 (ns vm.native
-  (:require [anf] [lower]))
+  (:require [anf] [lower] [claim :as c]))
 
 (defn- rep-bin
   "erlang:string:replace with :all returns IODATA (a list); flatten to a binary."
@@ -364,40 +364,15 @@
 
 ;; ── the build: cargo in, cdylib out (folds native_task + cargo) ─────────────
 ;;
-;; Boot-safe: only System/cmd + File, no language dependency — so bin/bl can
-;; call it before the prelude is fully interned (the lazy_memo crate must exist
-;; before LazySeq loads). When artefacts are current it costs a stat per crate;
-;; when cargo is absent it says so and returns, so a checkout with no toolchain
-;; still boots (natives read as ABSENT).
+;; Runtime refresh runs after application startup, with mandatory native
+;; custody available. Explicit and startup builds share build's producer.
+;; First native boot is the Rust builder's responsibility; this namespace
+;; cannot repair an absent mandatory runtime by bootstrapping through itself.
 
 (def NATIVE-DIR "native")          ; crate SOURCES, cwd-relative (project root)
 (def INSTALL-DIR "priv/native")    ; where the built .so is installed, cwd-relative
 
 (defn- nif-ext [] ".so")  ; every unix (macOS included) uses .so for erl_ddll
-
-(defn- cargo-target-dir
-  "cargo's target dir for `crate-dir` — ASKED, never assumed (CARGO_TARGET_DIR,
-   a .cargo/config, or a workspace all redirect it)."
-  [crate-dir]
-  (let [r (System/cmd "cargo"
-            (to-list ["metadata" "--format-version" "1" "--no-deps"])
-            (to-list [(tuple :cd crate-dir) (tuple :stderr_to_stdout true)]))]
-    (if (= 0 (elem r 1))
-      (let [m (erlang/apply :re :run
-                (list (elem r 0) "\"target_directory\"\\s*:\\s*\"([^\"]+)\""
-                      (to-list [(tuple :capture (to-list [1]) :binary)])))]
-        (if (and (erlang/is_tuple m) (= :match (elem m 0)))
-          (first (elem m 1))
-          (str crate-dir "/target")))
-      (str crate-dir "/target"))))
-
-(defn- built-cdylib
-  "The cdylib cargo produced for `crate` in `release-dir`, or nil."
-  [release-dir crate]
-  (some (fn [p] (if (File/exists? p) p nil))
-        (list (str release-dir "/lib" crate ".so")
-              (str release-dir "/lib" crate ".dylib")
-              (str release-dir "/" crate ".dll"))))
 
 (defn- crate-fresh?
   "Is the installed .so newer than every source of the crate? (skip cargo)."
@@ -427,31 +402,24 @@
             0 files)))
 
 (defn build!
-  "Build one crate with cargo, install its cdylib into priv/native/<crate>.so.
-   Returns {:ok path} | {:skipped :fresh} | {:error reason}. Raises on a real
-   compile failure (broken Rust source is different from an absent toolchain)."
+  "Explicitly build one crate through the admitted content-addressed producer.
+   A fresh installed artifact keeps the stat-only fast path. A stale artifact
+   returns {:ok path}; actual producer failures raise with the crate's name."
   [crate]
+  (when (or (not (string? crate)) (= "" crate) (contains? #{"." ".."} crate)
+            (not= crate (Path/basename crate)) (= :absolute (Path/type crate)))
+    (throw (ex-info "Native crate must be one directory name" {:kind :native-crate-scope :crate crate})))
   (let [crate-dir (str NATIVE-DIR "/" crate)]
     (if (crate-fresh? crate crate-dir)
       {:skipped :fresh}
-      (let [r (System/cmd "cargo" (to-list ["build" "--release"])
-                (to-list [(tuple :cd crate-dir) (tuple :stderr_to_stdout true)]))]
-        (if (not= 0 (elem r 1))
-          (throw (ex-info (str "cargo build failed for " crate " (exit " (elem r 1) "):\n" (elem r 0)) {:crate crate}))
-          (let [release (str (cargo-target-dir crate-dir) "/release")
-                built (built-cdylib release crate)]
-            (if (nil? built)
-              (throw (ex-info (str "cargo reported success but produced no " crate " cdylib"
-                                   " — invocation: cargo build --release (in " crate-dir ")"
-                                   ", expected one of: " release "/lib" crate ".so, "
-                                   release "/lib" crate ".dylib, " release "/" crate ".dll")
-                              {:crate crate}))
-              (let [dest (str INSTALL-DIR "/" crate (nif-ext))
-                    tmp (str dest ".tmp-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
-                (File/mkdir_p! INSTALL-DIR)
-                (File/cp! built tmp)
-                (erlang/apply :file :rename (list tmp dest))
-                {:ok dest}))))))))
+      (do
+        (BeamLisp.Loader/ensure_loaded "build")
+        (let [result (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "build-native-crate")
+                       (list (Path/expand ".") crate nil))]
+          (when (seq (:errors result))
+            (throw (ex-info (str "cargo build failed for " crate ":\n" (join "\n" (:errors result)))
+                           {:crate crate :errors (:errors result)})))
+          {:ok (str INSTALL-DIR "/" crate (nif-ext))})))))
 
 (defn- source-native-roots
   ;; A command normally runs in the consumer project, not the language tree.
@@ -489,24 +457,23 @@
   (mapv #(Path/join (Path/join root "priv/native") (artifact-name (Path/basename %)))
         (native-refresh-crates root)))
 
-(defn- native-refresh-state [root inputs]
-  (let [artifacts (native-refresh-artifacts root)]
-    (when (every? File/regular? artifacts)
-      (native-refresh-digest
-        [inputs (mapv #(tuple % (crypto/hash :sha256 (File/read! %))) artifacts)]))))
+(defn- native-refresh-state [artifacts inputs]
+  (when (every? File/regular? artifacts)
+    (native-refresh-digest
+      [inputs (mapv #(tuple % (crypto/hash :sha256 (File/read! %))) artifacts)])))
 
-(defn- refresh-native-root [root producer cargo build]
+(defn- refresh-native-root-owned [root producer cargo build receipt artifacts]
+  (when-not (= artifacts (native-refresh-artifacts root))
+    (throw (ex-info "Native artifact selection changed before admission" {:kind :native-refresh-scope})))
   (let [inputs (native-refresh-inputs root producer cargo)
-        state (native-refresh-state root inputs)
-        receipt (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-refresh")
-                           (native-refresh-digest (Path/expand root)))]
+        state (native-refresh-state artifacts inputs)]
     (if (and (BeamLisp.AOTCache/enabled?) state (= (tuple :ok state) (File/read receipt)))
       {:built 0 :cached (count (native-refresh-artifacts root))
        :artifacts (native-refresh-artifacts root) :errors []}
       (let [result (build root)]
         (when (and (BeamLisp.AOTCache/enabled?) (empty? (:errors result))
                    (= inputs (native-refresh-inputs root producer cargo)))
-          (when-let [after (native-refresh-state root inputs)]
+          (when-let [after (native-refresh-state artifacts inputs)]
             (File/mkdir_p! (Path/dirname receipt))
             (let [tmp (str receipt ".tmp-" (erlang/apply :os :getpid (list)) "-"
                            (erlang/unique_integer (list :positive)))]
@@ -515,6 +482,17 @@
                 (File/rename! tmp receipt)
                 (finally (File/rm tmp))))))
         result))))
+
+(defn- refresh-native-root [root producer cargo build]
+  (let [receipt (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-refresh")
+                           (native-refresh-digest (Path/expand root)))
+        artifacts (native-refresh-artifacts root)]
+    ;; The receipt and the observed files form one operation. A foreign native
+    ;; publisher must exclude even a cache hit before bytes are inspected.
+    (c/with-writer! (str receipt ".custody") "native refresh receipt"
+      (fn []
+        (c/with-artifacts! artifacts "native refresh publication"
+          #(refresh-native-root-owned root producer cargo build receipt artifacts))))))
 
 (defn build-all!
   "Refresh source-backed native roots using the producer's content-addressed

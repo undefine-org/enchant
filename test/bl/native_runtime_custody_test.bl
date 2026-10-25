@@ -1,0 +1,64 @@
+(ns native-runtime-custody.test (:require [build :as build] [vm.native :as native] [claim :as c]))
+
+(defn- fixture [action]
+ (let [root (Path/join (System/tmp_dir!) (str "native-runtime-custody-" (erlang/unique_integer (list :positive))))
+       crate (Path/join root "native/tiny")]
+  (try
+   (File/mkdir_p! (Path/join crate "src"))
+   (File/write! (Path/join crate "Cargo.toml")
+    "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n")
+   (File/write! (Path/join crate "src/lib.rs")
+    "#[no_mangle]\npub extern \"C\" fn tiny_answer() -> i32 { 42 }\n")
+   (action root crate)
+   (finally (File/rm_rf! root)))))
+
+(deftest explicit-runtime-build-reuses-the-admitted-single-crate-producer
+ (fixture
+  (fn [root crate]
+   (let [first (build/build-native-crate root "tiny" nil)
+         cached (Path/join (Path/join (build/native-root) (build/native-key crate)) "tiny")
+         source (Path/join cached "release/libtiny.so")
+         dest (Path/join root "priv/native/tiny.so") parent (erlang/self)]
+    (is (empty? (:errors first)))
+    (is (= 1 (+ (:built first) (:cached first))))
+    (File/rm! dest)
+    ;; An unrelated broken crate must never enter a requested single-crate build.
+    (File/mkdir_p! (Path/join root "native/unrelated"))
+    (File/write! (Path/join root "native/unrelated/Cargo.toml") "broken declaration")
+    (let [[worker watch] (spawn-monitor
+                          (fn []
+                           (erlang/send parent [:producer-held (:ok? (c/acquire! cached "cache producer"))])
+                           (receive :finish :ok)))]
+     (try
+      (receive [:producer-held owned] (assert owned) (after 5000 (throw :producer-not-ready)))
+      (File/cd! root
+       (fn []
+        (is (thrown-with-msg? "held by" (native/build! "tiny")))
+        (is (not (File/exists? dest)))))
+      (erlang/exit worker :kill)
+      (receive [:DOWN ref :process pid _] :when (and (= ref watch) (= pid worker)) :ok
+       (after 5000 (throw :producer-not-down)))
+      (let [inode (:inode (File/stat! source))]
+       (File/cd! root (fn [] (is (= {:ok "priv/native/tiny.so"} (native/build! "tiny")))))
+       (is (= inode (:inode (File/stat! source))))
+       (is (= (File/read! source) (File/read! dest)))
+       (is (nil? (c/held-by cached)))
+       (is (nil? (c/held-by (c/artifact-scope dest)))))
+      (finally (erlang/exit worker :kill))))))))
+
+(deftest single-crate-entry-refuses-escaping-or-missing-declarations-before-writing
+ (fixture
+  (fn [root _]
+   (doseq [name ["../escape" "/absolute" "" "." ".."]]
+    (is (= :native-crate-scope
+           (try (build/build-native-crate root name nil) :accepted
+            (catch error (:kind (ex-data error)))))))
+   (is (= :native-crate-missing
+          (try (build/build-native-crate root "missing" nil) :accepted
+           (catch error (:kind (ex-data error))))))
+   (is (not (File/exists? (Path/join root "native/missing"))))
+   (File/cd! root
+    (fn []
+     (is (= :native-crate-scope
+            (try (native/build! "../escape") :accepted
+             (catch error (:kind (ex-data error)))))))))))

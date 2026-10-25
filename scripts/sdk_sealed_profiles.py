@@ -17,6 +17,7 @@ GROUPS = {
     "solver-retirement": ([('test/bl/system/z3_retirement_test.bl', 9)], ['z3pool']),
     "filesystem": ([('test/bl/file_lock_test.bl', 15), ('test/bl/build_claim_reentrant_test.bl', 77)], []),
     "filesystem-operations": ([('test/bl/build_custody_operations_test.bl', 71)], ['selfbuild']),
+    "filesystem-refresh": ([('test/bl/vm/native_refresh_test.bl', 43), ('test/bl/native_runtime_custody_test.bl', 17)], ['vm.native', 'build']),
 }
 BOUNDARIES = {
     'unit-metadata': ['clauses'], 'source-and-class-proof': ['handoffs', 'capacity'],
@@ -28,7 +29,7 @@ BOUNDARIES = {
     'vector-lookup-default': ['vectors'], 'finite-cleanup-progress': ['loops', 'af'],
     'constructor-evaluation-order': ['returns'], 'execution-clause-identity': ['clauses'],
     'solver-command-frames': ['solver-frames', 'solver-lifetime', 'solver-retirement'],
-    'filesystem-custody': ['filesystem', 'filesystem-operations'],
+    'filesystem-custody': ['filesystem', 'filesystem-operations', 'filesystem-refresh'],
 }
 PIPELINE = {'unit-metadata', 'source-and-class-proof', 'sealed-loader', 'constructor-and-scope',
             'artifact-profile-and-cache', 'contextual-pipeline-identity', 'contextual-analysis-reports',
