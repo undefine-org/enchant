@@ -1,4 +1,5 @@
-(ns proc-callback-capacity-test (:require [proc.callback :as callback]))
+(ns proc-callback-capacity-test
+ (:require [proc.callback :as callback] [system.ownership :as ownership]))
 
 (defn- fill-ledger! [owner]
  ;; Other native tests can leave dead-owner rows until the next admission.
@@ -13,6 +14,87 @@
   rows))
 (defn- clear-ledger! [rows]
  (doseq [row rows] (ets/delete_object :beam_lisp_code_leases row)))
+
+(defn- follow-native-outcome [resources command observed]
+ (let [relation (ownership/handoff-outcomes resources command)
+       matches (Enum/filter (:outcomes relation) #(= observed (:return %)))]
+  (is (= false (:native-admission relation)))
+  (is (= 1 (count matches)) (pr-str [command observed relation]))
+  (when-not (= 1 (count matches)) (throw :capacity-trace-outside-native-model))
+  (:resources (first matches))))
+
+(defn- observed-accept [prepared]
+ (let [result (BeamLisp.Execution/accept-handoff! prepared)]
+  (case (:status result)
+   :busy
+    (do (is (= {:status :busy :kind :code-retention-capacity} result))
+        {:kind :status :status :busy :detail (:kind result)})
+   :accepted
+    (do (is (= {:status :accepted :registration (:accepted prepared)} result))
+        {:kind :status :status :accepted :registration 'target})
+   :cancelled
+    (do (is (= {:status :cancelled} result)) {:kind :status :status :cancelled})
+   (throw {:unrecognized-native-capacity-outcome result}))))
+
+(deftest actual-capacity-and-recovery-traces-conform-to-the-shared-ownership-relation
+ (doseq [cancel-after-busy [false true]]
+  (let [owner (spawn (fn [] (receive :never nil))) calls (atom 0)
+        source (BeamLisp.Execution/register! (fn [] (swap! calls inc) 42))
+        prepared (BeamLisp.Execution/prepare-handoff! source owner)
+        target (:accepted prepared) rows (atom [])
+        accept {:operation :accept :source 'source :target 'target}
+        close-source {:operation :close :target 'source}
+        close-target {:operation :close :target 'target}]
+   (try
+    (is (= source (:source prepared)))
+    (is (= :pending (:status (BeamLisp.Execution/observe target))))
+    (let [initial (follow-native-outcome {'source {:phase :owned :borrows #{}}}
+                    {:operation :prepare :source 'source :target 'target}
+                    {:kind :prepared :source 'source :target 'target})]
+     ;; Fill only this disposable VM's ledger. Live-owner rows survive native
+     ;; dead-owner pruning; all injected rows are removed before leaving.
+     (reset! rows (fill-ledger! owner))
+     (is (= 65536 (ets/info :beam_lisp_code_leases :size)))
+     (let [busy (observed-accept prepared)
+           pending (follow-native-outcome initial accept busy)]
+      (is (= :busy (:status busy)))
+      (is (= initial pending))
+      (is (= :active (:status (BeamLisp.Execution/observe source))))
+      (is (= :pending (:status (BeamLisp.Execution/observe target))))
+      (is (= 0 @calls))
+      (let [ready (if cancel-after-busy
+                    (follow-native-outcome pending close-source
+                      {:kind :literal :value (BeamLisp.Execution/close! source)}) pending)]
+       (clear-ledger! @rows) (reset! rows [])
+       (let [returned (observed-accept prepared)
+             accepted (follow-native-outcome ready accept returned)
+             repeated (observed-accept prepared)
+             acknowledged (follow-native-outcome accepted accept repeated)]
+        (is (= (if cancel-after-busy :cancelled :accepted) (:status returned)))
+        (is (= returned repeated))
+        (is (= accepted acknowledged))
+        (is (= (if cancel-after-busy :released :moved) (get-in acknowledged ['source :phase])))
+        (is (= (if cancel-after-busy :prepared :owned) (get-in acknowledged ['target :phase])))
+        (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+        (is (= (if cancel-after-busy :cancelled :active) (:status (BeamLisp.Execution/observe target))))
+        (is (= 0 @calls))
+        (is (= (if cancel-after-busy {:status :cancelled} {:status :completed :value 42})
+               (BeamLisp.Execution/invoke! target [])))
+        (is (= (if cancel-after-busy 0 1) @calls))
+        (let [closed-source (follow-native-outcome acknowledged close-source
+                              {:kind :literal :value (BeamLisp.Execution/close! source)})
+              closed (follow-native-outcome closed-source close-target
+                       {:kind :literal :value (BeamLisp.Execution/close! target)})]
+         (is (every? #(= :released (:phase %)) (vals closed)))
+         (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+         (is (= :cancelled (:status (BeamLisp.Execution/observe target))))
+         (println :capacity-trace {:cancel-after-busy cancel-after-busy :busy (:status busy)
+                                  :recovered (:status returned) :callback-entries @calls
+                                  :cleanup :released}))))))
+    (finally
+     (clear-ledger! @rows)
+     (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target)
+     (Process/exit owner :kill))))))
 
 (deftest native-handoff-pressure-leaves-the-source-and-prepublished-target-recoverable
  (let [owner (spawn (fn [] (receive :never nil)))
