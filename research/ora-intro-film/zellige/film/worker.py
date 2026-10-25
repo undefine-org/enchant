@@ -8,7 +8,7 @@ from pathlib import Path
 
 FRAMES,SECONDS,W,H=2700,45,1920,1080
 UNIFORMS={'eye':3,'right':3,'up':3,'forward':3,'clock':4,'build':4,'fit':4,'refine':4,'light':4,'finale':4,'grade':4,'finish':4}
-VOICES=['pluck','drone','chime','swell','clack','bass','hat','chord']
+VOICES=['guembri','qraqeb','clap','tbel','tap']
 def digest(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def module(path,name):
  s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
@@ -27,32 +27,61 @@ def validate(p):
   if [t.get('id') for t in f['types']]!=ids:raise ValueError('Words must keep stable ordered identities')
   for t in f['types']:
    if set(t)!={'id','rect','opacity','ink'} or not vector(t['rect'],4) or min(t['rect'][2:])<=0 or not vector(t['ink'],3) or not vector([t['opacity']],1) or not 0<=t['opacity']<=1:raise ValueError('Invalid word placement')
- if not isinstance(p['audio'],list) or len(p['audio'])>1024:raise ValueError('Invalid audio budget')
+ if not isinstance(p['audio'],list) or len(p['audio'])>2048:raise ValueError('Invalid audio budget')
  for e in p['audio']:
   if set(e)!={'at','voice','duration','frequency','gain'} or e['voice'] not in VOICES or not vector([e['at'],e['duration'],e['frequency'],e['gain']],4,20000) or not 0<=e['at']<SECONDS or not 0<e['duration']<=4 or not 20<=e['frequency']<=10000 or not 0<e['gain']<=1:raise ValueError('Invalid sound event')
  return p
 
 def soundtrack(events,path):
+ # Gnawa-inspired, acoustic-leaning synthesis: plucked-string guembri (Karplus-Strong) with a
+ # thumb thump and a rattling buzz, iron qraqeb pairs, hand claps, tbel drum, ceramic taps.
  rate=48000;n=rate*SECONDS;mix=array.array('f',[0])*(n*2)
+ pans={'guembri':.42,'tbel':.5,'tap':.55}
  for k,e in enumerate(events):
-  start=round(e['at']*rate);length=min(round(e['duration']*rate),n-start);f=e['frequency'];seed=9001+k*733;pan=.5+.3*math.sin(e['at']*1.7+k)
-  voice=e['voice']
+  start=round(e['at']*rate);length=min(round(e['duration']*rate),n-start);f=e['frequency'];g=e['gain'];voice=e['voice'];seed=9001+k*733
+  pan=pans.get(voice,.5+.32*math.sin(e['at']*5.1+k*.7))
+  def rnd():
+   nonlocal seed;seed=(1664525*seed+1013904223)&0xffffffff;return seed/2147483648-1
+  out=array.array('f',[0])*max(length,0)
+  if voice=='guembri':
+   # A dark, low excitation (smoothed ten times) keeps the energy in the low harmonics.
+   N=max(2,int(rate/f));buf=[rnd() for _ in range(N)]
+   for _ in range(10):buf=[(buf[i]+buf[i-1])*.5 for i in range(N)]
+   peak=max(abs(x) for x in buf) or 1;buf=[x/peak for x in buf]
+   for j in range(length):
+    i=j%N;cur=buf[i];buf[i]=.4972*(cur+buf[(i+1)%N]);t=j/rate
+    env=math.exp(-t*2.6)*min(1,(length-j)/(rate*.08))
+    out[j]=(cur*.9+.06*rnd()*abs(cur)*math.exp(-t*6))*env+.55*math.sin(2*math.pi*f*t)*math.exp(-t*9)+.5*math.sin(2*math.pi*52*t)*math.exp(-t*30)+.08*rnd()*math.exp(-t*300)
+  elif voice=='qraqeb':
+   parts=((1,1),(1.583,.7),(2.204,.5),(3.12,.35))
+   for j in range(length):
+    t=j/rate;v=0
+    for off,amp in ((0,1),(.027,.75)):
+     u=t-off
+     if u>=0:v+=amp*(sum(a*math.sin(2*math.pi*f*m*u) for m,a in parts)*.4*math.exp(-u*55)+rnd()*.5*math.exp(-u*130))
+    out[j]=v
+  elif voice=='clap':
+   prev=0
+   for j in range(length):
+    t=j/rate;env=sum(math.exp(-max(0,t-o)*420)*(t>=o) for o in (0,.008,.017))+.35*math.exp(-t*26)
+    x=rnd();out[j]=(x-prev)*env*.8;prev=x
+  elif voice=='tbel':
+   for j in range(length):
+    t=j/rate;out[j]=math.sin(2*math.pi*(f*t+40*(1-math.exp(-t*25))/25))*math.exp(-t*8)+.3*rnd()*math.exp(-t*70)
+  else:
+   for j in range(length):
+    t=j/rate;out[j]=(.6*math.sin(2*math.pi*f*t)+.3*math.sin(2*math.pi*f*1.67*t))*math.exp(-t*70)+.2*rnd()*math.exp(-t*220)
   for j in range(length):
-   t=j/rate;seed=(1664525*seed+1013904223)&0xffffffff;noise=seed/2147483648-1
-   if voice=='pluck':v=sum(math.sin(2*math.pi*f*m*t)/m**1.3 for m in (1,2,3,4))*math.exp(-t*(5+f/180))*min(1,t*400)
-   elif voice=='drone':v=(math.sin(2*math.pi*f*t)+.5*math.sin(2*math.pi*f*1.5*t+.3*math.sin(t*.7)))*min(1,t*.8)*min(1,(e['duration']-t)*.8)*.6
-   elif voice=='chime':v=sum(math.sin(2*math.pi*f*m*t)*a for m,a in ((1,1),(2.76,.4),(5.4,.2)))*math.exp(-t*2.2)*min(1,t*300)
-   elif voice=='swell':env=(t/e['duration'])**2;v=(sum(math.sin(2*math.pi*f*m*t) for m in (1,1.5,2))/3*.7+noise*.2)*env
-   elif voice=='clack':v=(noise*.6+math.sin(2*math.pi*f*t)*.7+math.sin(2*math.pi*f*2.3*t)*.3)*math.exp(-t*55)
-   elif voice=='bass':v=(math.sin(2*math.pi*f*t)+.25*math.sin(4*math.pi*f*t))*min(1,t*150)*math.exp(-t*3.5)
-   elif voice=='hat':v=noise*math.exp(-t*85)
-   else:v=sum(math.sin(2*math.pi*f*r*t+.2*math.sin(t*2.3)) for r in (1,1.189,1.498,2))/4*min(1,t*5)*math.exp(-t*.8)
-   at=(start+j)*2;value=v*e['gain'];mix[at]+=value*(1.15-pan*.5);mix[at+1]+=value*(.65+pan*.5)
- for delay,g in ((round(rate*.131)*2,.18),(round(rate*.257)*2,.1)):
-  for k in range(len(mix)-1,delay-1,-1):mix[k]+=g*mix[k-delay]
+   at=(start+j)*2;v=out[j]*g;mix[at]+=v*(1.2-pan*.8);mix[at+1]+=v*(.4+pan*.8)
+ # A small room: a few early reflections and one short tail, nothing synthetic-sounding.
+ for delay,gain,cross in ((.019,.16,1),(.031,.12,0),(.047,.09,1),(.083,.06,0),(.161,.05,1)):
+  d=round(rate*delay)*2
+  for k in range(len(mix)-1,d-1,-1):
+   src=k-d+(1 if cross and k%2==0 else -1 if cross else 0)
+   if 0<=src<len(mix):mix[k]+=gain*mix[src]
  pcm=array.array('h');peak=0
  for k,v in enumerate(mix):
-  v=math.tanh(v*2.1)*.9*min(1,(n-k//2)/(rate*1.2));peak=max(peak,abs(v));pcm.append(round(v*32767))
+  v=math.tanh(v*1.6)*.92*min(1,(n-k//2)/(rate*1.0));peak=max(peak,abs(v));pcm.append(round(v*32767))
  with wave.open(str(path),'wb') as w:w.setnchannels(2);w.setsampwidth(2);w.setframerate(rate);w.writeframes(pcm.tobytes())
  return {'rate':rate,'samples':n,'channels':2,'peak':peak,'events':len(events),'sha256':digest(path)}
 

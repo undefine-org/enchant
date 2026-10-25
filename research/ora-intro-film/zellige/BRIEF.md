@@ -1,77 +1,72 @@
 # Zellige — the ORA Ventures film
 
-Built from scratch on 2026-10-25. This supersedes the Zellige sketch in `../DIRECTIONS.md`.
+Rebuilt on 2026-10-25. It's aimed at one person: **the founder or managing director of a
+fast-moving SMB** who already works with AI agents (an assistant, a few custom
+agents, some automations) and has started to feel the limit. The agents know *them*;
+the company doesn't benefit. The film says: what you do with agents can become
+the way your whole company works, and it stays yours.
 
-## The idea in one sentence
+[Mood board of real zellige](moodboard/index.html) · [Film and evidence](film/README.md)
 
-Every team already uses AI, each in its own way. ORA gives the company one shared
-way of working, and everything fits.
+## The metaphor, checked against the real craft
 
-Zellige is a natural carrier for that idea. It is Moroccan tilework made from
-hundreds of hand-cut glazed pieces. On their own the pieces are just tiles.
-Laid to **one master construction** they become a pattern that can extend
-forever. That is the move ORA makes for AI in a company.
+The [mood board](moodboard/index.html) gathers 23 openly licensed photographs. The film borrows
+directly from what they show:
 
-## The words (the whole script)
-
-The previous direction scored low on "reads as AI infrastructure", because
-tiles alone don't say *AI*. So this version adds one short line per beat, in
-the simplest words available, and lets the picture do the rest.
-
-| Time | On screen | The picture underneath |
+| What the craft does | What it means for the founder | Photos |
 |---|---|---|
-| 1.2–4.6 s | **Everyone uses AI.** | One glazed tile, close up. Pull back: hundreds of tiles. |
-| 6.0–10.8 s | **Each in their own way.** | Every tile a different glaze, angle and tempo. Some are chipped, some missing. Nothing fits. |
-| 13.0–17.6 s | **One shared way of working.** | The field dims. A coral compass line draws one circle, one star, then the lines that generate the whole pattern. |
-| 19.6–24.8 s | **Everything fits.** | On the beat, ring by ring from the centre, every tile snaps into place and takes the pattern's colours. Missing tiles appear. Coral light runs through the joints to every piece. |
-| 27.0–30.8 s | **Better, for everyone.** | One tile gains a finer inner star. The refinement spreads to every star in the field. |
-| 33.2–37.6 s | **Across the whole company.** | A low grazing shot: the pattern runs to the horizon and the glaze glints in one shared rhythm. |
-| 41.0–45 s | **ORA Ventures** · We build your AI infrastructure. | Top-down. The centre star becomes a coral ring: the O of ORA. |
+| One glazed piece fits in a palm | Your agent: good, but one piece | #5, #22 |
+| The master draws the pattern once on the floor; pieces are laid face down onto it | Your way of working becomes the drawing everyone builds on | #4, #16, #23 |
+| A rosette grows from one centre outward | It starts with you and reaches every team | #0, #9, #14 |
+| Star-and-cross: white stars with coloured hearts, cobalt/green/black crosses, cement joints | The pattern itself; coral stays ORA's colour | #7, #19, #20 |
+| Walls laid centuries ago still stand | Built to last; owned by the house, not rented | #6, #15, #17 |
 
-There are 22 words before the logo. Each line is a short sentence with no
-jargon. The only borrowed phrase is the closing line, which is the site's own
-headline.
+## The values
 
-## Why each choice
+1. **It starts with you.** Your method, your standards, your taste are the pattern.
+2. **Shared, not scattered.** Everyone works from the same drawing.
+3. **Lessons are passed on.** What one person learns, everyone keeps (the craft
+   word is *transmission*).
+4. **Yours to keep.** Your data, your methods, your system. No lock-in.
+5. **Built to last.** Infrastructure, not a trend.
 
-- **One object carries the story.** The centre star is coral from the first
-  frame, a little calmer than its neighbours. It is the first piece of the
-  pattern and the last thing on screen: the O.
-- **Fragmentation is shown in four ways at once:** a different glaze, a
-  different angle, a different shimmer tempo, and gaps. Watched muted it reads
-  as *disorder*, never as *broken AI* clip-art.
-- **The method is drawn, not stated.** The construction lines are the real
-  geometry. The star-and-cross pattern on screen is exactly the shape those
-  extended lines make. "One shared way of working" is literally true of the
-  picture.
-- **Fit happens on the beat.** Rings land on 128 BPM. The ear hears order arrive
-  before the eye has finished reading it.
-- **Coral means ORA.** The shared joints glow coral as the pattern reaches each
-  piece, the pattern's cross pieces are coral, and the closing O is coral.
-- **Zellige's real signature is the glint.** Every hand-cut tile sits at a
-  slightly different angle, so the wall sparkles as you move. Fragmented tiles
-  glint on their own clocks. Fitted tiles glint as one wave.
-- **What was cut, deliberately:** trust and products. The site explains them
-  well. A 45 s intro that tries to say everything says nothing.
+## The script
 
-## Look
+| Time | On screen | Picture |
+|---|---|---|
+| 1.2–4.8 s | **You already work with agents.** | One coral star, yours, close up, glazed and shining |
+| 6.0–10.8 s | **But they only know you.** | Pull back: the team's pieces scattered, every glaze and angle different, some chipped or missing |
+| 13.0–17.6 s | **Your way of working becomes the pattern.** | Coral lines grow out of *your* star: circle, star, then the lines that generate the whole pattern |
+| 19.6–24.8 s | **Now the whole company shares it.** | Ring by ring, on the beat, every piece lands in place; cement joints close, coral light runs through them |
+| 27.0–31.2 s | **Every lesson is kept and passed on.** | One star's heart turns coral and the change travels to every star |
+| 33.2–37.8 s | **Built to last. Yours to keep.** | A low shot: the finished floor runs to the horizon |
+| 41.0–45 s | **ORA Ventures** · From personal agents to a company brain. | Top-down: your star becomes the O |
 
-- **Palette:** ORA navy, cream and coral for the pattern, set on a night-navy
-  ground. The fragmented glazes are the only other colours: teal, ochre, plum,
-  green, rose and slate. They leave as the pattern arrives.
-- **Type:** Schibsted Grotesk, the ORA site's display face. Lines sit lower-left
-  in cream, with a soft darkening behind them.
-- **Material:** domed glaze, thin terracotta at the edges, craquelure,
-  per-tile tilt, and sharp specular glints. All of it is procedural.
+Every line uses everyday words. "Agents" is kept because this audience uses the
+word. "Company brain" is the phrase they already reach for.
 
-## Sound
+## Sound: Gnawa-inspired and down to earth
 
-The score is original and set on the BL event clock at 128 BPM.
+There are no pads, chimes or synth swells. Every voice imitates a hand-played instrument:
+
+| Instrument | What it is | How it's synthesised |
+|---|---|---|
+| **Guembri** | the Gnawa bass lute: low, plucked, a little buzz from its rattling plate, a thumb thump on the skin | a plucked-string model, ten-times-smoothed excitation, decaying buzz and thump |
+| **Qraqeb** | iron castanets, always in pairs | a short inharmonic metal partial set, two hits 27 ms apart |
+| **Hand claps** | a group joining in | three micro-bursts and a short tail |
+| **Tbel** | a frame drum | a falling low tone plus skin noise |
+| **Ceramic taps** | a tile landing | a quiet tap for each ring of tiles that fits |
+
+The music follows the story:
 
 | Time | What you hear |
 |---|---|
-| 0–12 s | Three plucked voices on unrelated tempos, over a low drone |
-| 12.4 s | Silence. Then a bright chime for each construction step, and a rising swell under the grid |
-| 18 s onward | A ceramic clack on every ring that lands, a bass line and an off-beat hat. The plucks lock to the beat in one scale |
-| ~27 s | An upward chime arpeggio for the refinement |
-| 39.5 s | Everything drops out. One low note, then one chord as the ring closes |
+| 0–12 s | Three qraqeb players on their own tempos, guembri notes slightly out of tune with each other |
+| 12.2 s | Silence. One low guembri note as your star starts the drawing; a pair of qraqeb hits at each step; the iron starts counting in |
+| 18 s | The groove: a guembri riff on A minor pentatonic, three qraqeb strokes to every beat, the tbel drum |
+| 27 s | Hand claps join for "every lesson is kept and passed on": others take part |
+| 39.4 s | The groove stops. One long low guembri note, then a single qraqeb pair and drum as the O closes |
+
+It's all on the same 128 BPM clock as the picture, with three strokes to the beat for the Gnawa lilt.
+This is inspired synthesis, not a recording of Gnawa musicians. A release version
+should commission real players, a maâlem and qraqeb, on the same structure.

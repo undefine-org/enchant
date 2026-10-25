@@ -18,11 +18,19 @@ const float A=.35355339;
 const float GAP=.016;
 const vec3 NIGHT=vec3(.0063,.0116,.0296);
 const vec3 CREAM=vec3(.92,.79,.60);
+// Glazes measured from the mood-board photographs (linear): white, honey, green, cobalt, black, terracotta.
+const vec3 WHITE=vec3(.83,.80,.72);
+const vec3 HONEY=vec3(.56,.37,.09);
+const vec3 GREEN=vec3(.11,.26,.12);
+const vec3 COBALT=vec3(.045,.10,.34);
+const vec3 BLACK=vec3(.008,.008,.009);
+const vec3 TERRA=vec3(.42,.14,.06);
+const vec3 CEMENT=vec3(.50,.47,.41);
 const vec3 CORAL=vec3(.693,.087,.050);
 const vec3 CORAL2=vec3(.871,.195,.133);
 const vec3 NAVYG=vec3(.018,.045,.16);
 const vec3 CLAY=vec3(.50,.22,.11);
-const vec3 GLAZES[6]=vec3[6](vec3(.02,.17,.19),vec3(.38,.24,.04),vec3(.12,.045,.18),vec3(.035,.17,.065),vec3(.40,.13,.17),vec3(.11,.13,.16));
+const vec3 GLAZES[6]=vec3[6](vec3(.83,.80,.72),vec3(.56,.37,.09),vec3(.11,.26,.12),vec3(.045,.10,.34),vec3(.02,.02,.022),vec3(.42,.14,.06));
 const vec3 SAND=vec3(.80,.60,.37);
 
 vec4 hash4(vec2 h){
@@ -58,9 +66,10 @@ float crack(vec2 p){ // craquelure: distance to cell borders of a jittered grid
 }
 vec3 patternColour(Tile T){
  if(T.centre)return CORAL2;
- if(T.kind>.5)return NAVYG;
- return ((int(mod(T.home.x+T.home.y,2.))==0)?CREAM:SAND)*(.94+.12*T.h.w);
+ if(T.kind>.5){int k=int(mod(floor(T.home.x)+2.*floor(T.home.y)+300.,3.));return (k==0?COBALT:k==1?GREEN:BLACK)*(.92+.16*T.h.w);}
+ return WHITE*(.95+.08*T.h.w);
 }
+vec3 heartColour(Tile T){int k=int(mod(T.home.x-T.home.y+300.,3.));return k==0?HONEY:k==1?GREEN:COBALT;}
 void main(){
  vec2 ndc=gl_FragCoord.xy/resolution*2.-1.;float aspect=resolution.x/resolution.y;
  vec3 dir=normalize(forward+ndc.x*aspect*tanHalf*right+ndc.y*tanHalf*up);
@@ -87,10 +96,11 @@ void main(){
   }
   // ---- ground and joints ----
   float r=length(p),fl=clamp((fit.x-r)/fit.y,0.,1.);
-  vec3 ground=NIGHT*1.5*(.5+.5*smoothstep(0.,.14,minD));
-  float front=exp(-pow((r-fit.x)/1.6,2.));
   float joint=1.-smoothstep(0.,.05,minD);
-  ground+=CORAL2*fit.w*joint*fl*(.28+2.6*front);
+  vec3 ground=NIGHT*1.5*(.5+.5*smoothstep(0.,.14,minD));
+  ground=mix(ground,CEMENT*(.55+.45*smoothstep(0.,.03,minD)),joint*fl*(1.-fit.z));
+  float front=exp(-pow((r-fit.x)/1.6,2.));
+  ground+=CORAL2*fit.w*joint*fl*(.10+2.6*front);
   col=ground;
   vec3 V=-dir,L=normalize(vec3(cos(light.x)*cos(light.y),sin(light.y),sin(light.x)*cos(light.y)));
   float lod=smoothstep(.05,.22,fw);
@@ -102,10 +112,12 @@ void main(){
    // the shared refinement: a finer inner star inside every star
    if(T.kind<.5&&!T.centre){
     float ref=clamp((refine.z-length(T.home-refine.xy))/1.2,0.,1.)*refine.w*colourFit;
-    float inner=1.-smoothstep(-.006,.006,starD(q*2.7)/2.7+.0);
-    float ring=1.-smoothstep(.006,.016,abs(starD(q*1.55)/1.55));
-    vec3 inlay=CORAL2;
-    c=mix(c,inlay,ref*max(inner,ring*.9));
+    float inner=1.-smoothstep(-.006,.006,starD(q*2.7)/2.7);
+    float cut=1.-smoothstep(.004,.010,abs(starD(q*2.7)/2.7));
+    float ring=1.-smoothstep(.006,.014,abs(starD(q*1.55)/1.55));
+    c=mix(c,mix(heartColour(T),CORAL2,ref),inner*colourFit);
+    c=mix(c,CEMENT*.8,cut*colourFit*.8);
+    c=mix(c,CORAL2,ref*ring*.85);
    }
    // fragmented chips expose terracotta
    float chip=(1.-step(.35,T.x))*step(.8,h.w)*(1.-smoothstep(.09,.11,length(q-vec2(.47,0.))));
@@ -127,7 +139,7 @@ void main(){
    vec2 la=normalize(L.xz);float face=dot(normalize(R.xz+1e-4),la);
    float strip=pow(max(0.,1.-abs(R.y-.5)*2.6),18.)*smoothstep(.2,.9,face)*(1.-lod*.7)*(1.-finale.y);
    float glaze=(1.-chip)*(1.-lod*.5);
-   vec3 tc=c*.62*(.18+.82*diffuse)+vec3(1.,.95,.86)*(glint+sheen*.35+strip*.42)*glaze+sky*(.04+.32*fres)*glaze;
+   vec3 tc=c*.62*(.18+.82*diffuse)+vec3(1.,.95,.86)*(glint+(sheen*.25+strip*.26)*(1.-.55*dot(c,vec3(.33))))*glaze+sky*(.03+.26*fres)*glaze;
    tc*=1.-fit.z*.78;
    tc=mix(tc,mix(c*.55,ground,.2),lod*.6);
    if(!T.centre)tc=mix(tc,NIGHT*1.25+tc*.035,finale.y);

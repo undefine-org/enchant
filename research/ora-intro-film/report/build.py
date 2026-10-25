@@ -44,8 +44,8 @@ print(json.dumps({'landings':landings,'arrivals':arrivals,'peak_glow':max(glow),
 
 # Zellige: one thumbnail per scripted line, from the delivered film.
 ZF=FILM/'zellige'/'film'/'evidence'/'zellige.mp4'
-script=[(1.2,4.6,'Everyone uses AI.'),(6.0,10.8,'Each in their own way.'),(13.0,17.6,'One shared way of working.'),(19.6,24.8,'Everything fits.'),
- (27.0,30.8,'Better, for everyone.'),(33.2,37.6,'Across the whole company.'),(41.0,45.0,'ORA Ventures')]
+script=[(1.2,4.8,'You already work with agents.'),(6.0,10.8,'But they only know you.'),(13.0,17.6,'Your way of working becomes the pattern.'),(19.6,24.8,'Now the whole company shares it.'),
+ (27.0,31.2,'Every lesson is kept and passed on.'),(33.2,37.8,'Built to last. Yours to keep.'),(41.0,45.0,'ORA Ventures · From personal agents to a company brain.')]
 zel=[]
 for k,(a,b2,line) in enumerate(script):
  t=min(44.5,(a+b2)/2+(.8 if k==6 else 0))
