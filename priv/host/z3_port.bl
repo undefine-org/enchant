@@ -206,8 +206,12 @@
    marker is returned as `:output`; an `(error …)` line comes back as
    `%{ok: false}` rather than desynchronizing the reader."
   [port smt]
-  (Port/command port (str smt "\n(echo \"~~bl-ok~~\")\n"))
-  (let [r (read_until_marker port "" "")]
+  ;; The command owns its delimiter. A literal echo in supplied SMT cannot
+  ;; acknowledge this later frame. Consume the full frame before reporting any
+  ;; error, whether the transport coalesces or splits the error/marker lines.
+  (let [marker (str "~~bl-ok-" (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower))) "~~")
+        _ (Port/command port (str smt "\n(echo \"" marker "\")\n"))
+        r (read_command_frame port marker "")]
     (if (erlang/== :marker (erlang/element 1 r))
       {:ok true :output (erlang/element 2 r)}
       {:ok false :error (erlang/element 2 r) :output (erlang/element 3 r)})))
@@ -281,25 +285,25 @@
 
 (defn- read_until_marker
   [port acc out]
-  (let [lines (String/split acc "\n")]
-    (cond
-      (Enum/member? lines "~~bl-ok~~")
-      (tuple :marker out)
+  ;; Retain the pinned helper ABI; all command parsing has one implementation.
+  (read_command_frame port "~~bl-ok~~" acc))
 
-      (Enum/any? lines (fn [l] (String/starts_with? l "(error")))
-      (tuple :error (Enum/find lines (fn [l] (String/starts_with? l "(error"))) out)
-
-      :else
-      (receive
-        [p [:data data]] :when (== p port)
-        (let [acc2 (str acc data)
-              keep (Enum/join
-                     (Enum/reject (String/split acc2 "\n")
-                                  (fn [l] (or (erlang/== l "") (erlang/== l "~~bl-ok~~"))))
-                     "\n")]
-          (read_until_marker port acc2 keep))
-        (after (read_timeout)
-          (tuple :error "timeout waiting for z3 to acknowledge" out))))))
+(defn- read_command_frame [port marker acc]
+ (let [pieces (String/split acc "\n")
+       ;; A transport chunk may end inside the marker; only complete lines can
+       ;; finish a frame. Error lines remain data until its marker is consumed.
+       lines (Enum/drop pieces -1)
+       end (Enum/find_index lines (fn [line] (= marker line)))
+       complete (if (nil? end) lines (Enum/take lines end))
+       output (Enum/join (Enum/reject complete (fn [line] (= "" line))) "\n")
+       error (Enum/find complete (fn [line] (String/starts_with? (String/trim_leading line) "(error")))]
+  (if (nil? end)
+   (receive
+    [p [:data data]] :when (== p port)
+     (read_command_frame port marker (str acc data))
+    (after (read_timeout)
+     (tuple :error "timeout waiting for z3 to acknowledge" output)))
+   (if error (tuple :error error output) (tuple :marker output)))))
 
 (defn- read_answer
   "Read until a status LINE appears, returning `{status, rest}`.
