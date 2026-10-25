@@ -1,0 +1,62 @@
+;; Causal compiler controls evaluate selected real Source forms in private
+;; namespaces. The installed compiler, its helpers and its floor stay intact.
+(ns execution.history-compiler-test)
+
+(defn- install-walker [source namespace]
+ (let [wanted #{"finite-concat" "executable-clause-children" "executable-pair-children" "executable-children"}
+       forms (Enum/filter (BeamLisp.Reader/read_string source "priv/boot/anf.bl")
+                #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                      (contains? wanted (BeamLisp.AOT/stage-symbol
+                                          (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 4 (count forms)) (throw :historical-walker-forms-changed))
+  (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+  (Enum/each forms #(BeamLisp.Compiler/eval_form % (BeamLisp.Compiler/new_env namespace)))))
+
+(defn- original-vector-case [source walker namespace]
+ (let [previous-context (Process/get :test_ctx)
+       name "grammar-children-are-eager-and-literal-data-remains-inert"
+       rewritten (String/replace source "anf/executable-children" (str walker "/executable-children"))
+       forms (Enum/filter (BeamLisp.Reader/read_string rewritten "test/bl/execution_ir_children_test.bl")
+                #(let [head (BeamLisp.AOT/stage-head %)]
+                   (or (and (= "def" head)
+                            (contains? #{"a" "b" "c" "d"}
+                             (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list)))))
+                       (and (= "deftest" head)
+                            (= name (BeamLisp.AOT/stage-symbol
+                                      (second (BeamLisp.AOT/stage-items % :list))))))))]
+  (when-not (= 5 (count forms)) (throw :historical-vector-regression-changed))
+  (try
+   (BeamLisp.Compiler/eval_string (str "(ns " namespace " (:require [system.ir :as ir]))"))
+   (BeamLisp.TestRT/clear_registry)
+   (BeamLisp.TestRT/declarations
+    #(Enum/each forms (fn [form] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))))
+   (select-keys (BeamLisp.TestRT/run_ns namespace) [:tests :pass :fail :error])
+   (finally
+    (if (nil? previous-context) (Process/delete :test_ctx) (Process/put :test_ctx previous-context))))))
+
+(deftest E14-original-vector-regression-detects-native-map-confusion
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "boot/anf.bl"))
+       original (File/read! "test/bl/execution_ir_children_test.bl")
+       before "(fn [pair] (list (first pair) (second pair)))"
+       after "(fn [pair] (maps/to_list pair))"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :historical-walker-anchor-changed))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [changed (String/replace source before after)]
+      (install-walker source "history.walker.good")
+      (install-walker changed "history.walker.mutant")
+      (let [normal (original-vector-case original "history.walker.good" "history.walker.good-case")
+            mutant (original-vector-case original "history.walker.mutant" "history.walker.mutant-case")]
+       (println :history-E14 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                             :mutant-sha256 (Base/encode16 (crypto/hash :sha256 changed))
+                             :normal normal :mutant mutant})
+       (is (= 1 (:tests normal) (:tests mutant)))
+       (is (= 4 (:pass normal)))
+       (is (= 0 (:fail normal) (:error normal)))
+       (is (= 2 (:pass mutant)))
+       (is (= 2 (:fail mutant)))
+       (is (= 0 (:error mutant)))))))
+   (finally (BeamLisp.Env/destroy scope)))))
