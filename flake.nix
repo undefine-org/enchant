@@ -30,9 +30,20 @@
       drop = import ./nix/bl-drop.nix { inherit pkgs rustPkgs; inherit (beam) erlang elixir; };
     in
     {
+      nixosModules.artifacts = import ./nix/artifact-host.nix;
       packages.${system} = {
+        artifact-platform = import ./nix/artifact-platform.nix { inherit pkgs; };
         inherit (beam) erlang elixir;
         bl-drop = drop.bl-drop;
+        native-lazy-memo = import ./nix/native-artifact.nix {
+          requestJson = builtins.toJSON {
+            version = 1;
+            crate = "lazy_memo";
+            source = toString (self + "/native/lazy_memo");
+            abi = "beam-lisp-native-lazy_memo-v1";
+            target = system;
+          };
+        };
         default = drop.bl-drop;
       };
 

@@ -10,6 +10,7 @@ include!("common.rs");
 include!("daemon.rs");
 include!("store.rs");
 include!("transport.rs");
+mod nix_artifact;
 include!("builder.rs");
 include!("hooks.rs");
 include!("checkout.rs");

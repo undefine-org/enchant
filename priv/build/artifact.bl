@@ -1,0 +1,195 @@
+; Immutable native products supplied by the pinned Nix platform.
+; Native artifacts grant no execution authority: the runtime still checks its ABI.
+(ns artifact (:require [artifact.process :as process]))
+
+(def schema 1)
+(defn- refuse [message data] (throw (ex-info message (assoc data :kind :artifact-refused))))
+(defn- digest [bytes]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+(defn- name? [value]
+  (and (string? value) (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]*$" value)))
+(defn selected?
+  "Whether this invocation explicitly selects the Nix native provider."
+  []
+  (= "nix" (System/get_env "BL_NATIVE_PROVIDER")))
+
+(defn request
+  "Validate the finite native product contract. The platform owns the recipe;
+   project input is data. Standalone cdylib crates require a committed lock."
+  [source crate abi target]
+  (when-not (name? crate) (refuse "Native crate name is invalid" {:crate crate}))
+  (when-not (and (string? abi) (> (count abi) 0) (<= (count abi) 128))
+    (refuse "A native ABI identity is required" {}))
+  (when-not (= "x86_64-linux" target)
+    (refuse "Nix native products currently support x86_64-linux" {:target target}))
+  (when-not (and (string? source) (= :absolute (Path/type source)))
+    (refuse "Native source must be an absolute directory" {}))
+  (doseq [file ["Cargo.toml" "Cargo.lock"]]
+    (when-not (File/regular? (Path/join source file))
+      (refuse (str "Native source requires " file) {:source source})))
+  {"version" schema "source" (Path/expand source) "crate" crate "abi" abi "target" target})
+
+(defn verify!
+  "Verify one actual immutable product against the expected request and bytes.
+   The returned library is a direct store address, ready for a runtime consumer."
+  [output expected]
+  (when-not (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output))
+    (refuse "Artifact output must be a top-level Nix store path" {:output output}))
+  (when-not (and (map? expected) (= schema (get expected "version"))
+                 (name? (get expected "crate")) (= "x86_64-linux" (get expected "target"))
+                 (string? (get expected "abi")) (> (count (get expected "abi")) 0)
+                 (string? (get expected "source"))
+                 (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" (get expected "source")))
+    (refuse "Artifact verification requires a complete immutable request" {}))
+  (let [manifest (Jason/decode! (File/read! (Path/join output "artifact.json")))
+        library (Path/join output (str "lib/" (get expected "crate") ".so"))]
+    (when-not (and (= schema (get expected "version")) (= schema (get manifest "version")) (= "native-library" (get manifest "kind"))
+                  (= (str "lib/" (get expected "crate") ".so") (get manifest "library"))
+                  (every? #(= (get manifest %) (get expected %)) ["crate" "abi" "target" "source"])
+                  (= :regular (:type (File/lstat! library))))
+      (refuse "Native product identity or inventory disagrees" {:output output}))
+    (when-not (= (digest (File/read! library)) (get manifest "sha256"))
+      (refuse "Native product digest disagrees" {:output output}))
+    (when-not (and (string? (get manifest "source"))
+                  (String/starts_with? (get manifest "source") "/nix/store/")
+                  (= "rustc" (get-in manifest ["toolchain" "name"]))
+                  (string? (get-in manifest ["toolchain" "version"]))
+                  (string? (get-in manifest ["toolchain" "identity"]))
+                  (Regex/match? #"^[0-9a-f]{64}$" (get-in manifest ["toolchain" "identity"])))
+      (refuse "Native product omitted its source or toolchain closure" {:output output}))
+    {:output output :library library :manifest manifest}))
+
+(defn- cache-root []
+  (Path/join (or (System/get_env "XDG_CACHE_HOME") (Path/join (System/user_home!) ".cache"))
+             "beam_lisp/artifacts"))
+(defn- fresh-directory! [parent label]
+  (File/mkdir_p! parent)
+  (let [directory (Path/join parent (str label "-" (System/system_time :microsecond) "-"
+                                      (erlang/unique_integer (list :positive))))]
+    (File/mkdir! directory)
+    (File/chmod! directory 448)
+    directory))
+
+(defn- managed! [platform executable argv timeout memory stdout]
+  (let [manager (process/tool "systemd-run")
+        unit (str "bl-artifact-" (System/system_time :microsecond) ".service")
+        args (concat ["--user" "--quiet" "--wait" "--collect" "--pipe" "--expand-environment=no"
+                      (str "--unit=" unit) (str "--working-directory=" platform)
+                      (str "--property=MemoryMax=" memory) "--property=MemorySwapMax=0"
+                      (str "--property=RuntimeMaxSec=" (inc (quot timeout 1000)))
+                      "--property=KillMode=control-group" "--" executable] argv)
+        environment (reduce (fn [env key] (if-let [value (System/get_env key)] (assoc env key value) env))
+                            {} ["XDG_RUNTIME_DIR" "DBUS_SESSION_BUS_ADDRESS"])
+        result (process/run manager args {:timeout-ms (+ timeout 5000) :limit 65536 :stdout-file stdout :env environment})]
+    (when-not (process/ok? result)
+      (refuse "Native artifact preparation failed" {:status (:status result) :detail (:out result)}))
+    (when (> (:size (File/stat! stdout)) 65536)
+      (refuse "Artifact machine result exceeds capacity" {}))
+    (File/read! stdout)))
+
+(defn prepare-native!
+  "Prepare and retain a native product through Nix and a bounded systemd client.
+   Options: :platform (trusted checkout), :source, :crate, :abi, :target,
+   :timeout-ms, :memory-bytes, :retention-dir. Each successful request owns a
+   separate root, so one requester never releases another's retention."
+  [options]
+  (let [expected (request (:source options) (:crate options) (:abi options)
+                          (or (:target options) "x86_64-linux"))
+        platform (Path/expand (:platform options))
+        recipe (Path/join platform "nix/native-artifact.nix")
+        nix (process/tool "nix")
+        manager (process/tool "systemd-run")
+        instantiate (process/tool "nix-instantiate")
+        timeout (or (:timeout-ms options) 300000)
+        memory (or (:memory-bytes options) 1073741824)
+        parent (or (:retention-dir options) (cache-root))]
+    (when-not (and (File/regular? recipe) (File/regular? (Path/join platform "flake.lock")))
+      (refuse "Trusted artifact platform recipe and flake.lock are required" {:platform platform}))
+    (when-not (and nix instantiate manager) (refuse "Nix and the systemd user manager are required" {}))
+    (when-not (and (int? timeout) (>= timeout 1000) (<= timeout 3600000)
+                  (int? memory) (>= memory 67108864) (<= memory 8589934592))
+      (refuse "Artifact client resource bounds are invalid" {}))
+    (let [directory (fresh-directory! parent "native")
+          stdout (Path/join directory "result.json")
+          root (Path/join directory "retained")
+          snapshot-output (Path/join directory "snapshot.json")]
+      (try
+        (let [snapshot (Jason/decode!
+                         (managed! platform instantiate
+                           ["--eval" "--strict" "--json" "--read-write-mode" (Path/join platform "nix/native-source.nix")
+                            "--argstr" "source" (get expected "source") "--argstr" "crate" (get expected "crate")]
+                           timeout memory snapshot-output))
+              _ (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" snapshot)
+                  (refuse "Source snapshot is not a store object" {}))
+              _ (managed! platform (process/tool "nix-store")
+                          ["--add-root" (Path/join directory "source-retained") "--indirect" "--realise" snapshot]
+                          timeout memory (Path/join directory "source-root.txt"))
+              expected (assoc expected "source" snapshot)
+              response (managed! platform nix
+                         ["build" "--impure" "--file" recipe "--argstr" "requestJson" (Jason/encode! expected)
+                          "--json" "--out-link" root "--max-jobs" "1" "--cores" "1"
+                          "--option" "timeout" (str (quot timeout 1000))]
+                         timeout memory stdout)
+              rows (Jason/decode! response)]
+          (when-not (= 1 (count rows)) (refuse "Expected one native artifact output" {}))
+          (let [output (get-in (first rows) ["outputs" "out"])
+                product (verify! output expected)]
+            (when-not (= (tuple :ok output) (File/read_link root))
+              (refuse "Artifact retention does not name its product" {}))
+            (let [receipt (assoc product :request expected :retention-root root
+                                :derivation (get (first rows) "drvPath"))]
+              (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+              receipt)))
+        (catch error
+          ;; Only this request's fresh directory is owned here.
+          (File/rm_rf! directory)
+          (throw error))
+        (finally (File/rm stdout) (File/rm snapshot-output) (File/rm (Path/join directory "source-root.txt")))))))
+
+(defn retained
+  "List successful per-request receipts without executing Nix or collecting outputs."
+  ([] (retained (cache-root)))
+  ([root]
+   (map (fn [path] (Jason/decode! (File/read! path)))
+        (sort (Path/wildcard (Path/join root "native-*/receipt.json"))))))
+
+
+(defn compare
+  "Explain product changes using two recorded receipts. This compares identities;
+   it does not infer ABI compatibility or permission to activate a product."
+  [left right]
+  (let [read (fn [receipt key] (or (get receipt key) (get receipt (keyword key))))
+        lm (read left "manifest") rm (read right "manifest")
+        fields ["crate" "abi" "target" "source" "toolchain" "sha256"]]
+    {:same-output (= (read left "output") (read right "output"))
+     :changes (vec (keep (fn [field]
+                          (when-not (= (get lm field) (get rm field))
+                            {:field field :before (get lm field) :after (get rm field)})) fields))}))
+
+(defn capsule!
+  "Create a retained reproduction descriptor for a verified artifact. This
+   records identities, not application secrets, mutable data or test authority."
+  [receipt parent]
+  (let [value (fn [key] (or (get receipt key) (get receipt (keyword key))))
+        expected (value "request")
+        product (verify! (value "output") expected)
+        directory (fresh-directory! (Path/expand parent) "capsule")
+        stdout (Path/join directory "retain.txt")
+        root (Path/join directory "retained")]
+    (try
+      (let [store (process/tool "nix-store")]
+        (when-not store (refuse "nix-store is required to retain a capsule" {}))
+        (managed! (BeamLisp/cwd) store ["--add-root" root "--indirect" "--realise" (:output product)]
+                  30000 268435456 stdout)
+        (when-not (= (tuple :ok (:output product)) (File/read_link root))
+          (refuse "Capsule root disagrees with its verified product" {}))
+        (let [descriptor {"version" schema "kind" "artifact-capsule"
+                          "request" expected "output" (:output product)
+                          "manifest" (:manifest product)
+                          "compiler" (BeamLisp.AOTCache/current_compiler_key)
+                          "loadedNative" (BeamLisp.LazyMemo/runtime_identity!)
+                          "qualification" "not-recorded"}]
+          (File/write! (Path/join directory "capsule.json") (Jason/encode! descriptor))
+          {:directory directory :descriptor descriptor}))
+      (catch error (File/rm_rf! directory) (throw error))
+      (finally (File/rm stdout)))))

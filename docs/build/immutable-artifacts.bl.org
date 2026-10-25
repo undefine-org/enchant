@@ -1,0 +1,164 @@
+#+title: Native libraries as prepared artifacts
+
+* Build a library once and use its exact bytes
+A native product contains a shared library and a manifest naming its source
+snapshot, target, compiler identity, ABI requirement and SHA256. Nix builds the
+product from the platform's pinned flake.lock. Beam Lisp checks the manifest
+and library before selecting it. A selection is a symlink to immutable store
+bytes; a failed preparation leaves the selected library in place.
+
+The managed backend supports standalone, locked Rust cdylib crates on
+x86_64-linux. Registry dependencies are vendored by Nix. Crate snapshots include
+build.rs, Cargo configuration and supporting files; target/, .git/ and .bl/
+are reserved generated directories. Source symlinks are refused. Workspace/path
+dependencies outside the crate need a separate declared source-closure recipe.
+
+* Prepare from the checkout
+Use a trusted platform checkout containing flake.lock and nix/native-artifact.nix.
+The Nix client and systemd user manager must be available. The platform is trusted
+build code; project requests contain data.
+
+#+begin_src sh
+export BL_ARTIFACT_PLATFORM="$PWD"
+./bin/bl artifacts prepare "$PWD/native/lazy_memo" lazy_memo beam-lisp-native-lazy_memo-v1
+./bin/bl artifacts list
+#+end_src
+
+Each preparation prints a JSON receipt and registers its own Nix retention root.
+Receipts live under $XDG_CACHE_HOME/beam_lisp/artifacts, or
+~/.cache/beam_lisp/artifacts. Their native-*/receipt.json files can be inspected
+with ordinary tools. Roots remain until deliberately removed by their owner;
+automatic pruning requires a complete live-consumer retention policy.
+
+The first request may fetch dependencies and compile Rust. An unchanged request
+reuses the product. Updating an application's .bl files leaves a standalone
+native crate's snapshot unchanged. Updating Rust, a build script, Cargo config,
+a lockfile or the pinned toolchain participates in its build identity.
+
+* Select the provider for a project
+The build API and runtime native refresh read BL_NATIVE_PROVIDER. Use local for
+the admitted Cargo producer and nix for immutable products. Unsupported values
+refuse. Provider selection never silently changes after a preparation failure.
+
+#+begin_src clojure
+;; env.bl: the project's ordinary declaration surface.
+{:name "search-service"
+ :paths ["src"]
+ :env {"BL_NATIVE_PROVIDER" "nix"}
+ :build {:native ["native/*"]}}
+#+end_src
+
+Set BL_ARTIFACT_PLATFORM in the managed environment to the trusted platform
+checkout. The project needs its Cargo files and ordinary env.bl declaration.
+The platform supplies the Nix recipe. Use the project's normal build command;
+build/build-native-crate, build/build-native and vm.native refresh share the
+selected provider. The Rust bootstrap also reads the same provider selection
+before starting BEAM.
+
+A successful native build selects priv/native/<crate>.so under destination
+custody. Nix-backed selections refer directly to a store library. Already loaded
+native code stays bound to its loaded library; native changes require a fresh
+VM. The runtime's actual NIF module, function and arity checks govern loading.
+An ABI label in a receipt expresses a consumer requirement, not a proof of ABI
+compatibility or an execution grant.
+
+* Compare candidates
+Use receipt paths printed by preparation or found with artifacts list.
+
+#+begin_src sh
+./bin/bl artifacts compare /path/to/first/receipt.json /path/to/second/receipt.json
+#+end_src
+
+The report names changed source, target, ABI requirement, toolchain and library
+identity. It reports identity differences; runtime compatibility and migration
+have their own checks. Compilation and metadata assembly are separate Nix
+products, so a changed consumer ABI label reuses identical compiled Rust bytes.
+
+* Keep a reproducible bug descriptor
+#+begin_src sh
+./bin/bl artifacts capsule /path/to/receipt.json "$PWD/capsules"
+#+end_src
+
+A new capsule directory retains the verified product and records the immutable
+source request, manifest, compiler key and the loaded native runtime identity.
+Its qualification field is not-recorded: attaching test evidence is a separate
+operation. Mutable databases, application secrets and shell environments are
+outside this descriptor. Copying it to another machine also requires making its
+store objects available there, for example through an authorized Nix store copy
+or configured substituter.
+
+* Call a prepared NIF
+The executable showcase lives in examples/artifacts. It prepares artifact_demo,
+selects the store library, loads its real Rustler host and checks answer() = 42.
+
+#+begin_src sh
+export BL_ARTIFACT_PLATFORM="$PWD"
+./bin/bl --cold run examples/artifacts/showcase.bl
+#+end_src
+
+Read native/artifact_demo/src/lib.rs and src/artifact/showcase.bl inside that
+example together: the Rustler module name matches the Beam Lisp host name.
+Use a fresh VM after changing the native source. Multiple preparations and
+comparison can run independently of activation.
+
+* Use the library API
+#+begin_src clojure
+(ns my.preparation (:require [artifact :as artifact]))
+
+(def product
+  (artifact/prepare-native!
+    {:platform "/trusted/beam-lisp"
+     :source "/project/native/search"
+     :crate "search"
+     :abi "search-api-v1"
+     :target "x86_64-linux"
+     :timeout-ms 300000
+     :memory-bytes 1073741824}))
+
+(:library product)       ; immutable library path
+(:request product)       ; immutable source snapshot and requested contract
+(:retention-root product)
+(artifact/verify! (:output product) (:request product))
+#+end_src
+
+The process adapter preserves Nix's JSON stdout separately from progress logs.
+External client jobs have deadlines, memory/swap limits and cgroup cleanup.
+Nix daemon workers have their own resource boundary: client limits do not cap
+those workers. Configure and qualify worker limits before large builds.
+
+Nix artifacts retain their source and compiled product. Toolchain metadata uses
+a fingerprint rather than a compiler-output reference, keeping native runtime
+closures smaller. Reproduction may still require fetching the pinned compiler
+and dependency inputs. A shipped FHS drop can carry the selected library without
+requiring a Nix installation on its destination host.
+
+* Pin the provider in a managed environment
+The flake exports artifact-platform: a small store object containing the trusted
+recipes and lockfile. It is independent of the compiler and application payload.
+
+#+begin_src sh
+nix build .#artifact-platform
+export BL_ARTIFACT_PLATFORM="$(readlink -f result)"
+#+end_src
+
+Managed NixOS build hosts can import the artifacts module from this flake:
+
+#+begin_src nix
+{
+  imports = [ beam-lisp.nixosModules.artifacts ];
+  services.beam-lisp-artifacts = {
+    enable = true;
+    maxJobs = 1;
+    daemonMemoryMax = "8G";
+    daemonMemorySwapMax = "1G";
+  };
+}
+#+end_src
+
+The module sets a strict sandbox, disables sandbox fallback, enables Nix build
+cgroups, bounds the daemon's aggregate memory/swap and publishes the immutable
+platform path to sessions. Its policy applies to the host's shared Nix daemon,
+so choose limits for the whole build host. Apply it through the normal host
+configuration deployment and validate actual worker containment afterward.
+Unprivileged clients cannot enforce restricted daemon settings themselves.
+Each remote builder needs its own accepted worker policy.

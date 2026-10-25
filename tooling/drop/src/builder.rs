@@ -345,12 +345,36 @@ fn publish_native_artifact(source: &Path, destination: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// Select a verified immutable product under the existing destination admission.
+/// Old mapped libraries retain their immutable inodes; each request keeps a root.
+fn publish_native_reference(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(unix)] {
+        let custody = NativePublication::take(destination)?;
+        let destination = &custody.destination;
+        if std::fs::read_link(destination).is_ok_and(|path| path == source) { return Ok(()); }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+        let temporary = destination.with_extension(format!("nix-{}-{nonce}", std::process::id()));
+        std::os::unix::fs::symlink(source, &temporary).map_err(|e| e.to_string())?;
+        let result = std::fs::rename(&temporary, destination).map_err(|e| e.to_string());
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result
+    }
+    #[cfg(not(unix))] {
+        let _ = (source, destination);
+        Err("immutable native selection is unsupported on this target".into())
+    }
+}
+
 /// Build every `native/<crate>` of `tree` with cargo and install its cdylib as
 /// `priv/native/<crate>.so` (`.dylib` on macOS is loaded under the same `.so`
 /// name, as `vm.native` installs it). The boot itself loads `lazy_memo`, so
 /// this runs before the tree's own `bin/bl` does anything. Cargo's shared
 /// target directory makes a crate that did not change a no-op.
 fn build_natives(tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), String> {
+    let provider = std::env::var("BL_NATIVE_PROVIDER").unwrap_or_else(|_| "local".into());
+    if provider != "local" && provider != "nix" {
+        return Err("BL_NATIVE_PROVIDER must be local or nix".into());
+    }
     let native = tree.join("native");
     let dest = tree.join("priv/native");
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
@@ -359,6 +383,11 @@ fn build_natives(tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), Str
     crates.sort();
     for dir in crates {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        if provider == "nix" {
+            let library = nix_artifact::prepare(tree, &dir, &name, custody)?;
+            publish_native_reference(&library, &dest.join(format!("{name}.so")))?;
+            continue;
+        }
         let mut cmd = Command::new("cargo");
         cmd.args(["build", "--release", "--message-format=short", "--manifest-path"]).arg(dir.join("Cargo.toml"));
         run_logged(cmd, log, &format!("cargo build native/{name}"), custody)?;
@@ -886,7 +915,7 @@ mod builder_tests {
         }
     }
 
-    fn custody_source_identity() {
+    pub(crate) fn custody_source_identity() {
         // A shared Cargo target selected a different tree's cached test binary
         // in the original replay. Bind the code compiled into this test image.
         if let Ok(expected) = std::env::var("BL_CUSTODY_TEST_SOURCE_SHA256") {
@@ -896,6 +925,7 @@ mod builder_tests {
             ("Cargo.toml", include_str!("../Cargo.toml")),
             ("Cargo.lock", include_str!("../Cargo.lock")),
             ("src/builder.rs", include_str!("builder.rs")),
+            ("src/nix_artifact.rs", include_str!("nix_artifact.rs")),
             ("src/checkout.rs", include_str!("checkout.rs")),
             ("src/command_domain.rs", include_str!("command_domain.rs")),
             ("src/common.rs", include_str!("common.rs")),
