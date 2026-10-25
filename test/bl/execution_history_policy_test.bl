@@ -12,6 +12,49 @@
  (loop [n 0]
   (receive :history-wrapped-target-effect (recur (inc n)) (after 0 n))))
 
+(deftest guarded-constructor-fallback-retains-the-actual-source-native-policy
+ (let [target :Elixir.ExecutionHistory.ConstructorFallbackEffect
+       fixture :Elixir.ExecutionHistory.ConstructorFallbackFixture
+       graph (atom nil)]
+  (try
+   ;; Introduce the forbidden target only inside the declared native fixture;
+   ;; this exercises the SDK fallback in a real Source frame, not an earlier
+   ;; argument check or a caller-supplied generation/admission marker.
+   (Code/compile_string
+    "defmodule ExecutionHistory.ConstructorFallbackEffect do
+       def step(value), do: (send(self(), :\"history-wrapped-target-effect\"); value)
+     end
+     defmodule ExecutionHistory.ConstructorFallbackFixture do
+       def identity(value), do: value
+       def dispatch(shape) do
+         callable = case shape do
+           :allowed -> &__MODULE__.identity/1
+           :plain -> &ExecutionHistory.ConstructorFallbackEffect.step/1
+           :remote -> {:\"$remote\", ExecutionHistory.ConstructorFallbackEffect, :step}
+           :multi -> {:\"$blfn\", %{1 => &ExecutionHistory.ConstructorFallbackEffect.step/1}, nil}
+         end
+         helper = BeamLisp.Env.fetch_exact!(\"proc.reconcile-runtime\", \"start-call!\")
+         BeamLisp.Ns.Rt.invoke(helper, [callable, [:payload], %{version: 1, declaration: \"fake/worker\"}, :start])
+       end
+     end")
+   (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
+   (reset! graph (g/prepare!
+    {:sources {"constructor.fallback.policy"
+      "(ns constructor.fallback.policy) (defn run [shape] (ExecutionHistory.ConstructorFallbackFixture/dispatch shape))"}
+     :native-modules #{"ExecutionHistory.ConstructorFallbackFixture"}}))
+   (is (= :payload (g/invoke! @graph "constructor.fallback.policy/run" [:allowed]))
+       "the actual SDK fallback admits the declared native identity")
+   (doseq [shape [:plain :remote :multi]]
+    (drain-effects)
+    (is (= :source_native_target_refused
+         (try (g/invoke! @graph "constructor.fallback.policy/run" [shape]) :wrongly-ran
+          (catch error (BeamLisp.ExInfo/ex_original error)))))
+    (is (= 0 (drain-effects))))
+   (finally
+    (when @graph (g/retire! @graph))
+    (drain-effects)
+    (doseq [module [fixture target]] (code/purge module) (code/delete module))))))
+
 (deftest E57-wrapped-runtime-targets-keep-the-ordinary-native-policy
  (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
        source (File/read! (Path/join root "priv/boot/rt.bl"))

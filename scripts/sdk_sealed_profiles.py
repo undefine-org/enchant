@@ -12,6 +12,7 @@ GROUPS = {
     "capacity": ([('test/bl/proc_callback_capacity_test.bl', 99)], ['proc.callback', 'system.ownership']),
     "returns": ([('test/bl/server_return_model_test.bl', 10)], []),
     "clauses": ([('test/bl/execution_clause_identity_test.bl', 5)], []),
+    "constructor-calls": ([('test/bl/reload/reconcile_callsite_test.bl', 5)], ['reload.reconcile-callsite', 'proc.reconcile-runtime']),
     "solver-frames": ([('test/bl/execution_solver_protocol_test.bl', 71)], []),
     "solver-lifetime": ([('test/bl/execution_solver_lifetime_test.bl', 47)], []),
     "solver-retirement": ([('test/bl/system/z3_retirement_test.bl', 9)], ['z3pool']),
@@ -23,7 +24,7 @@ GROUPS = {
 BOUNDARIES = {
     'unit-metadata': ['clauses'], 'source-and-class-proof': ['handoffs', 'capacity'],
     'preboot-identity': ['clauses', 'filesystem'], 'sealed-loader': [],
-    'constructor-and-scope': ['imports', 'native-outcomes'], 'artifact-profile-and-cache': ['imports'],
+    'constructor-and-scope': ['imports', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['imports'],
     'native-custody': ['native-outcomes', 'handoffs', 'capacity'],
     'record-representation': ['returns'], 'contextual-pipeline-identity': ['imports', 'clauses'],
     'contextual-analysis-reports': ['ownership', 'ownership-calls', 'native-outcomes', 'loops', 'af'],

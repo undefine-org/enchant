@@ -7,7 +7,8 @@
            [proc.queue-runtime :as runtime] [proc.queue :as q]
            [proc.queue-family :as family] [proc.queue-family-root :as root]
            [proc.framework :as framework] [proc.transition :as transition]
-           [datom :as d] [datom.projection :as pj] [datom.store-fjall :as fjall] [test.support.source-fixtures :as fixtures]))
+           [datom :as d] [datom.projection :as pj] [datom.store-fjall :as fjall] [test.support.source-fixtures :as fixtures]
+           [system.ir :as ir] [reload.native-call :as native-call]))
 (fixtures/effects!)
 (def P (pj/projection :bridge/projection
          {:member '[[?src :fixture/scope ?scope]] :revision '[[?src :fixture/rev ?rev]]}))
@@ -99,6 +100,26 @@
    (finally (doseq [graph [pure effectful composed]] (g/retire! graph))
             (when (File/exists? marker) (File/rm! marker))))))
 
+(deftest proved-canonical-constructors-rewrite-the-actual-source-call-boundary
+ (let [graph (prepare "canonical-callsite-boundary" :new {})
+       owner (get (:mapping graph) "bridge.fixture")]
+  (try
+   (is (= 1 (:version (canonical graph))))
+   (doseq [binding ["start!" "linked!"]]
+    (let [entries (env/with-env (:scope graph) #(BeamLisp.Env/ns_definition owner binding))
+          rewritten (atom 0) unconverted (atom [])]
+     (doseq [entry entries]
+      (ir/rewrite
+       (fn [node]
+        (when (and (= :global (:op node)) (= "proc.reconcile-runtime" (:ns node))
+                   (contains? #{"start-declared!" "start-call!"} (:name node))) (swap! rewritten inc))
+        (when-let [original (native-call/original-source-call node)]
+         (when (= :Elixir.BeamLisp.Server (:mod original))
+          (swap! unconverted conj (select-keys original [:mod :fun :args]))))
+        node) (:body (elem entry 3))))
+     (is (= 1 @rewritten) (str binding " unreplaced calls: " (pr-str @unconverted)))))
+   (finally (g/retire! graph)))))
+
 (deftest canonical-first-order-start-handover-keeps-real-work-and-retires-old-graph
  (let [app (str "canonical-live-" (erlang/unique_integer (list :positive)))
        path (str (System/get_env "HOME") "/tmp/product-online-20261014/" app)
@@ -180,8 +201,20 @@
     (is (= ["a" :old] (:proj/target (pj/record P (d/db mirror) "a" [:bridge "a" "source"]))))
     (is (= ["b" :new] (:proj/target (pj/record P (d/db mirror) "b" [:bridge "b" "source"]))))
     (is (= 1 (:done (q/stats qa))))
-    (is (= :invalid-reconcile-payload
-          (kind #(g/with! b (fn [] (q/enqueue! qb {:wrong :message}))))))
+    (let [before (count (d/q '[:find ?e :where [?e :job/id _]] (d/db (q/conn qb))))
+          outcome (try
+                    ;; Satisfy the generic uniqueness/partition preflight so
+                    ;; this reaches the reconciliation envelope boundary.
+                    {:returned (g/with! b (fn [] (q/enqueue! qb
+                      {:proj/key [:bridge "b" "invalid"] :proj/rev 1
+                       :proj/scope 1 :proj/kind :invalid})))}
+                    (catch-raw [class reason stack]
+                     {:class class :data (ex-data reason)
+                      :original (BeamLisp.ExInfo/ex_original reason)}))]
+     (println :canonical-invalid-enqueue outcome)
+     (is (= :invalid-reconcile-payload (get-in outcome [:data :kind])))
+     (is (= before (count (d/q '[:find ?e :where [?e :job/id _]] (d/db (q/conn qb)))))
+         "a rejected envelope cannot create a durable job"))
     (is (= 1 (:done (q/stats qb)))))
    (finally
     (when (:pid @work) (erlang/send (:pid @work) [:release token]))

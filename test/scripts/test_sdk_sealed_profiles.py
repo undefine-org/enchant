@@ -20,7 +20,7 @@ class SealedProfiles(unittest.TestCase):
         matrix = json.loads((ROOT / 'research/phase-compiler/sdk-boundary-consumers.json').read_text())
         self.assertEqual({b['id'] for b in matrix['boundaries']}, set(selection['boundaries']))
         self.assertEqual(list(PROFILE['GROUPS']), [g['id'] for g in selection['groups']])
-        self.assertEqual(1010 + 92 + 71 + 60 + 30, selection['assertions'])
+        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5, selection['assertions'])
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])

@@ -1,6 +1,6 @@
 ; Compiler-owned constructor rewriting for canonical reconcile declarations.
 ; Returned data names only the declaration; native runtime rechecks authority.
-(ns reload.reconcile-callsite (:require [system.ir :as ir]))
+(ns reload.reconcile-callsite (:require [system.ir :as ir] [anf :as anf]))
 (defn- refuse [reason]
  (throw (ex-info "Reconcile callsite remains unproved" {:kind :unproved-reconcile-callsite :reason reason})))
 (defn- lit [value] {:op :lit :val value :ann {}})
@@ -9,12 +9,12 @@
  (reduce (fn [tail value] {:op :cons :head value :tail tail :ann {}})
    {:op :enil :ann {}} (reverse values)))
 (defn- runtime-call [binding values]
- {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke
-  :args (list {:op :global :ns "proc.reconcile-runtime" :name binding :lookup :exact :ann {}}
-              (argument-list values)) :ann {}})
+ (anf/invoke {:op :global :ns "proc.reconcile-runtime" :name binding :lookup :exact :ann {}}
+             (argument-list values)))
 (defn specialize
- "Rewrite exact compiler-known constructors of actual canonical declarations.
-  Unknown/composed/higher-order bindings retain their original executable IR.
+ "Rewrite constructor candidates of actual canonical declarations. Resolved
+  native calls specialize directly; scoped globals retain guarded dispatch.
+  Other/composed/higher-order calls keep their original executable IR.
   This pass neither starts owners nor invokes a factory/reifier/Source callback.
   Context grants NO runtime authority: receiver must recheck the descriptor
   against its actual selected graph before invoking existing native Server APIs."
@@ -51,8 +51,16 @@
            (if (= :remote (:mode call))
             (get (:targets context) [(:mod call) (:fun call) (:arity call)])
             (let [callee (:callee call)]
-             (when (and (= :global (:op callee)) (= :exact (:lookup callee)))
-              (get (:globals context) [(:ns callee) (:name callee) (:arity call)])))))
+             (when (= :global (:op callee))
+              (or (when (= :exact (:lookup callee))
+                    (get (:globals context) [(:ns callee) (:name callee) (:arity call)]))
+                  ;; A spelling is only a speculative constructor candidate.
+                  ;; The receiver compares the evaluated callable with the real
+                  ;; SDK constructor; shadowed bindings keep ordinary dispatch.
+                  (when-let [function (when (= :invoke (:mode call))
+                                       (get {"start" :start "start-link" :start_link} (:name callee)))]
+                   (when-let [route (get (:targets context) [:Elixir.BeamLisp.Server function (:arity call)])]
+                    (assoc route :guard-callee true))))))))
           (rewrite-call [n]
            (when-let [call (ir/call-site n)]
             (when (some? (:arity call))
@@ -78,9 +86,13 @@
                 ;; Rt.invoke. Native remote/apply arguments preserve their order
                 ;; as one tuple subject. The SDK call consumes bound values only.
                 (let [packed? (= :invoke (:mode call))
-                      subject (if packed? (second (:args n)) {:op :tuple :elems (to-list args) :ann {}})
+                      guarded? (:guard-callee route)
+                      packed (when packed? (:arguments (anf/callable-invocation n)))
+                      callee-name (when guarded? (fresh))
+                      subject (cond packed? packed
+                                    :else {:op :tuple :elems (to-list args) :ann {}})
                       bound (mapv (fn [_] (fresh)) args)
-                      pattern (if packed?
+                      arguments-pattern (if packed?
                                 (reduce (fn [tail name] {:pop :pcons :head {:pop :pvar :name name} :tail tail})
                                   {:pop :pnil} (reverse bound))
                                 {:pop :ptuple :elems (to-list (map #(hash-map :pop :pvar :name %) bound))})
@@ -90,14 +102,21 @@
                       init-value (argument (:argument-position route) nil)
                       options (argument (:options-position route) {})
                       payload (lit (select-keys descriptor [:version :declaration]))
-                      body (if (= :child-spec (:operation route))
+                      body (cond guarded?
+                             (runtime-call "start-call!"
+                              [(local callee-name) (argument-list (mapv local bound)) payload (lit (:operation route))])
+                             (= :child-spec (:operation route))
                              (runtime-call "child-spec-declared!"
                                [(argument (:id-position route) nil) class-value init-value options payload])
+                             :else
                              (runtime-call "start-declared!"
                                [class-value init-value options payload (lit (:operation route))]))]
                  (swap! changes conj {:declaration (:declaration descriptor) :operation (:operation route)})
-                 {:op :case :subj subject :ann (or (:ann n) {})
-                  :clauses (list {:pats (list pattern) :guard nil :body body})})))))))
+                 (let [matched {:op :case :subj subject :ann (or (:ann n) {})
+                                :clauses (list {:pats (list arguments-pattern) :guard nil :body body})}]
+                  ;; Core aggregate operands are not a sequencing boundary.
+                  ;; Keep the language invoke's explicit callee-before-args let.
+                  (if guarded? (anf/lett callee-name (:callee call) matched) matched)))))))))
           (visit [n]
            (spend! 0)
            (cond
