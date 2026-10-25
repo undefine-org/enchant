@@ -57,6 +57,9 @@ class VM:
                 raise RuntimeError('worker selected another physical runtime root')
             if self.ready['os_pid'] != str(self.process.pid):
                 raise RuntimeError('worker wrapper PID differs from actual BEAM PID')
+            scope = 'source-component' if 'BL_CUSTODY_COMPONENT_IDENTITY' in env else 'packaged-floor'
+            if self.ready.get('identity_scope') != scope:
+                raise RuntimeError('worker used a different identity scope')
         except BaseException:
             self.close()
             raise

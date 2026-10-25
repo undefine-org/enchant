@@ -65,31 +65,70 @@
                              (map lock-entry deps)))]
     {:ok? (empty? missing) :checked (count deps) :missing missing}))
 
+(defn- entry-custody [dir]
+  ;; Metadata lives outside the published immutable package. Installer and
+  ;; sweeper derive exactly the same per-entry admission resource.
+  (Path/join (Path/join (Path/join (Path/dirname dir) ".bl") "store-custody") (Path/basename dir)))
+
+(defn- checked-entry! [dir]
+  (let [info (File/lstat dir)]
+    (when (and (= :ok (elem info 0)) (= :symlink (:type (elem info 1))))
+      (throw (ex-info "Store entry cannot redirect publication" {:kind :store-entry-scope :path dir}))))
+  dir)
+
+(defn- complete-entry? [dir sha]
+  (let [read (File/read (sha-file dir))]
+    (and (File/dir? dir) (= :ok (elem read 0)) (= sha (String/trim (elem read 1))))))
+
 (defn install-dir!
-  "Install a DIRECTORY of files as the library `(name, vsn, sha)`:\n\n   copy to a temp dir beside the destination, record the digest, then RENAME.\n\n   The rename is the whole point: a library becomes visible under its content\n   address only when it is complete, so a build that dies mid-install leaves a\n   temp dir to sweep, never a half-library that looks locked."
+  "Publish one complete content-addressed package under per-entry kernel custody.
+   A valid existing entry is immutable. A unique sibling temporary is invisible
+   until copy and digest recording finish; concurrent sweep uses the same claim."
   [name vsn sha from]
-  (let [dir (dir-for name vsn sha)
-        tmp (str dir ".tmp-" (c/owner-pid))]
-    (File/rm_rf! tmp)
-    (File/mkdir_p! (Path/dirname dir))
-    (File/mkdir_p! tmp)
-    (File/cp_r! from tmp)
-    (File/write! (sha-file tmp) sha)
-    (File/rm_rf! dir)
-    (File/rename tmp dir)
-    dir))
+  (let [root (root) basename (str name "-" vsn "-" (subs sha 0 8))]
+    (when (or (not= basename (Path/basename basename)) (= :absolute (Path/type basename)))
+      (throw (ex-info "Store entry must be one directory name" {:kind :store-entry-scope})))
+    (let [dir (checked-entry! (Path/join root basename))]
+      (if (complete-entry? dir sha) dir
+        (c/with-writer! (entry-custody dir) "store install"
+          (fn []
+            (checked-entry! dir)
+            (if (complete-entry? dir sha) dir
+              (let [tmp (str dir ".tmp-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
+                (try
+                  (File/mkdir_p! tmp)
+                  (File/cp_r! from tmp)
+                  (File/write! (sha-file tmp) sha)
+                  (File/rm_rf! dir)
+                  (File/rename! tmp dir)
+                  dir
+                  (finally (File/rm_rf! tmp)))))))))))
+
+(defn- temporary-entry [path]
+  (let [parts (String/split (Path/basename path) ".tmp-")]
+    (when (and (> (count parts) 1) (not= "" (first parts))
+               (Regex/match? (Regex/compile! "^[0-9]+(-[0-9]+)?$") (last parts)))
+      (Path/join (Path/dirname path) (Enum/join (Enum/drop (to-list parts) -1) ".tmp-")))))
 
 (defn sweep-temp!
-  "Remove leftover `.tmp-*` directories in the store. A killed install leaves one;
-   nothing else ever does, so this needs no bookkeeping to be safe."
+  "Sweep inactive temporary installs. An active entry's actual kernel custody
+   excludes cleanup; a diagnostic PID or stale-looking name never authorizes it."
   []
-  (let [r (root)]
-    (if (File/dir? r)
-      (let [tmps (filter (fn [p] (some? (index-of (Path/basename p) ".tmp-")))
-                         (Path/wildcard (Path/join r "*")))]
-        (doseq [t tmps] (File/rm_rf! t))
-        (count tmps))
-      0)))
+  (let [directory (root)]
+    (if-not (File/dir? directory) 0
+      (reduce
+        (fn [removed path]
+          (if-let [entry (temporary-entry path)]
+            (let [custody (entry-custody entry) ours (c/owned? custody)
+                  acquired (if ours {:ok? false} (c/acquire! custody "store sweep"))]
+              ;; Even this process must not sweep its own in-progress install.
+              (if-not (:ok? acquired) removed
+                (try
+                  (if (File/exists? path)
+                    (do (File/rm_rf! path) (inc removed)) removed)
+                  (finally (c/release! custody)))))
+            removed))
+        0 (Path/wildcard (Path/join directory "*"))))))
 
 (defn entries
   "What the store actually holds, sorted: `[{:name :vsn :sha8 :dir} …]` read from
@@ -103,7 +142,7 @@
                             (let [base (Path/basename p)
                                   parts (String/split base "-")
                                   n (count parts)]
-                              (when (and (File/dir? p) (>= n 3))
+                              (when (and (File/dir? p) (not (temporary-entry p)) (>= n 3))
                                 {:name (join "-" (take (- n 2) parts))
                                  :vsn (nth parts (- n 2))
                                  :sha8 (nth parts (dec n))

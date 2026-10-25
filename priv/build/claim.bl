@@ -127,19 +127,93 @@
       (action)
       (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1))))))
 
+(defn with-writer!
+  "Run one operation under actual workspace admission; preserve a caller's
+   existing claim. This grants filesystem custody, not Source invocation."
+  [root what action]
+  (let [ours (owned? root) acquired (if ours {:ok? true} (acquire! root what))]
+    (when-not (:ok? acquired)
+      (throw (ex-info "Build workspace is in use" {:kind :build-workspace-held :held (:held acquired)})))
+    (try (action) (finally (when-not ours (release! root))))))
+
+(defn- scope-path! [path]
+  ;; Build workspaces are mutable. Do not reuse the SDK path cache's assumption
+  ;; that an already resolved ancestor remains immutable. Resolve existing
+  ;; components freshly, including a symlink above a not-yet-existing target.
+  (loop [current (Path/expand path) suffix [] links 0 steps 0]
+    (when (or (> links 32) (> steps 512))
+      (throw (ex-info "Cannot resolve workspace scope" {:kind :build-workspace-scope :path path})))
+    (let [link (File/read_link current) info (File/lstat current)]
+      (cond
+        (= :ok (elem link 0))
+        (recur (Path/expand (elem link 1) (Path/dirname current)) suffix (inc links) (inc steps))
+        (= :ok (elem info 0))
+        (let [physical (BeamLisp.AOT/physical_sdk_path_walk current)]
+          (when-not physical
+            (throw (ex-info "Cannot resolve workspace scope" {:kind :build-workspace-scope :path path})))
+          (reduce Path/join physical (reverse suffix)))
+        (= :enoent (elem info 1))
+        (recur (Path/dirname current) (conj suffix (Path/basename current)) links (inc steps))
+        :else (throw (ex-info "Cannot inspect workspace scope" {:kind :build-workspace-scope :path path}))))))
+
+(defn- anchor-path? [path]
+  (loop [parts (Path/split path)]
+    (cond
+      (< (count parts) 2) false
+      (and (contains? #{".bl" ".bl-locks"} (first parts)) (= "locks" (second parts))) true
+      :else (recur (rest parts)))))
+
+(defn- clear-entry-plan [path keep depth]
+  (when (> depth 256)
+    (throw (ex-info "Workspace clear traversal limit" {:kind :build-workspace-scope :path path})))
+  (let [info (File/lstat! path) name (Path/basename path)]
+    (cond
+      (or (= path keep) (anchor-path? path)
+          (and (= :symlink (:type info)) (contains? #{".bl" ".bl-locks"} name)))
+      {:actions [] :kept true}
+      (= name ".claim")
+      (throw (ex-info "Nested workspace requires its own explicit drain"
+               {:kind :build-workspace-nested-claim :path path}))
+      (= :directory (:type info))
+      (let [children (mapv #(clear-entry-plan (Path/join path %) keep (inc depth)) (sort (File/ls! path)))
+            kept (some #(:kept %) children)
+            actions (vec (mapcat #(:actions %) children))]
+        {:actions (if kept actions (conj actions [:directory path])) :kept kept})
+      :else {:actions [[:file path]] :kept false})))
+
+(defn- clear-owned! [dir root]
+  (when-not (owned? root)
+    (throw (ex-info "Workspace claim required" {:kind :workspace-unclaimed})))
+  (let [physical (scope-path! root) target (scope-path! dir)
+        prefix (Path/split physical)]
+    (when (or (anchor-path? target) (not= prefix (take (count prefix) (Path/split target))))
+      (throw (ex-info "Clear target is outside writable workspace scope"
+               {:kind :build-workspace-scope :root root :path dir})))
+    (let [barrier (followers-lock! root false)]
+      (when-not (= :ok (elem barrier 0))
+        (throw (ex-info "Workspace compiler followers are still active" {:kind :build-workspace-held :custody :child})))
+      (try
+        ;; Validate the whole deletion plan before any removal. Symlinks inside
+        ;; the tree are unlinked, never traversed; permanent anchors survive.
+        (let [keep (Path/join physical ".claim")
+              plan (when (File/dir? target)
+                     (vec (mapcat #(:actions (clear-entry-plan (Path/join target %) keep 0))
+                                  (sort (File/ls! target)))))]
+          (File/mkdir_p! target)
+          (doseq [[kind path] plan]
+            (if (= :directory kind) (File/rmdir! path) (File/rm! path)))
+          :ok)
+        (finally (BeamLisp.LazyMemo/nif_file_unlock (elem barrier 1)))))))
+
 (defn clear!
-  "Empty `dir` and keep it, and keep the claim on it. A build that rewrites a
-   directory it holds a claim on must not use `rm_rf!`: the claim file lives IN the
-   directory, so wiping it hands the directory to the next builder mid-build (the
-   self-build did exactly that, and a second build then wiped its staging root while
-   the first was compiling from it). Everything but the claim goes."
-  [dir]
-  (File/mkdir_p! dir)
-  (let [keep (path-for dir)]
-    (doseq [entry (to-list (File/ls! dir))]
-      (let [p (Path/join dir entry)]
-        (when (not= p keep) (File/rm_rf! p)))))
-  :ok)
+  "Clear an admitted workspace, preserving its claim and permanent anchors.
+   The two-argument form clears a descendant under an already owned root.
+   Active compiler followers, escaping paths and nested workspace claims refuse."
+  ([dir]
+   (when (anchor-path? (scope-path! dir))
+     (throw (ex-info "Cannot clear permanent lock anchors" {:kind :build-workspace-scope :path dir})))
+   (with-writer! dir "workspace clear" #(clear-owned! dir dir)))
+  ([dir root] (clear-owned! dir root)))
 
 (defn release!
   "Release this BEAM process's claim, removing its diagnostic before unlock."

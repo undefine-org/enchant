@@ -148,8 +148,30 @@ module = Module.concat([ExecutionHistory, CustodyWorker])
 end
 
 key = BeamLisp.AOTCache.current_compiler_key()
-{^key, _} = BeamLisp.Bootstrap.packaged_keys!()
-IO.puts("BL-CUSTODY " <> Jason.encode!(%{ready: true, os_pid: System.pid(), compiler_key: key,
+# Source-component development has no packaged-floor proof. Bind its exact
+# loaded replacement host, NIF identity and Source instead. This test-only mode
+# does not alter SDK admission or manufacture a compiler/floor authority row.
+component = System.get_env("BL_CUSTODY_COMPONENT_IDENTITY")
+identity_scope = if component do
+  expected = Jason.decode!(component)
+  actual = %{
+    "scope" => "source-component",
+    "root" => Path.expand(BeamLisp.Tiers.priv_root()),
+    "compiler_key" => key,
+    "native_identity" => BeamLisp.LazyMemo.runtime_identity!(),
+    "memo_loaded_md5" => Base.encode16(BeamLisp.LazyMemo.module_info(:md5), case: :lower),
+    "memo_beam_sha256" => Base.encode16(:crypto.hash(:sha256, File.read!(List.to_string(:code.which(BeamLisp.LazyMemo)))), case: :lower),
+    "source_sha256" => Map.new(["build/claim.bl", "build/build.bl"], fn relative ->
+      {relative, Base.encode16(:crypto.hash(:sha256, File.read!(Path.join(BeamLisp.Tiers.priv_root(), relative))), case: :lower)}
+    end)
+  }
+  if actual != expected, do: raise("Source-component identity changed: #{inspect(actual)}")
+  "source-component"
+else
+  {^key, _} = BeamLisp.Bootstrap.packaged_keys!()
+  "packaged-floor"
+end
+IO.puts("BL-CUSTODY " <> Jason.encode!(%{ready: true, identity_scope: identity_scope, os_pid: System.pid(), compiler_key: key,
   root: BeamLisp.Tiers.priv_root(), native_identity: BeamLisp.LazyMemo.runtime_identity!(),
   manifest_sha256: Base.encode16(:crypto.hash(:sha256, File.read!(Path.join(BeamLisp.Tiers.priv_root(), "bootstrap/seed/manifest.term"))), case: :lower)}))
 module.loop(%{})

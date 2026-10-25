@@ -1,0 +1,237 @@
+(ns build-custody-operations.test (:require [claim :as c] [store :as store] [build :as build] [selfbuild :as selfbuild]))
+
+(defn- scratch [action]
+ (let [root (Path/join (System/tmp_dir!) (str "custody-operations-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! root)
+  (try (action root) (finally (c/release! root) (File/rm_rf! root)))))
+(defn- kind [action] (try (action) :accepted (catch error (:kind (ex-data error)))))
+(defn- down! [pid watch]
+ (erlang/exit pid :kill)
+ (receive [:DOWN ref :process seen _] :when (and (= ref watch) (= seen pid)) :ok
+  (after 5000 (throw :custody-worker-not-down))))
+
+(deftest clear-refuses-foreign-custody-before-touching-payload-or-diagnostic
+ (scratch
+  (fn [root]
+   (let [parent (erlang/self) marker (Path/join root "payload")
+         [worker watch] (spawn-monitor (fn [] (c/acquire! root "other")
+                                        (erlang/send parent :claimed) (receive :finish :ok)))]
+    (try
+     (receive :claimed :ok (after 5000 (throw :claim-not-ready)))
+     (File/write! marker "untouched")
+     (let [record (File/read! (c/path-for root))]
+      (is (= :build-workspace-held (kind #(c/clear! root))))
+      (is (= "untouched" (File/read! marker)))
+      (is (= record (File/read! (c/path-for root))))
+      (BeamLisp.Compiler/eval_string
+       (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+                     "test/fixtures/execution_history/unprotected_clear.bl")))
+      ((BeamLisp.Env/fetch_exact! "execution.history.unprotected-clear" "clear!") root)
+      (is (not (File/exists? marker)) "actual original clear removed a foreign writer's payload")
+      (is (= record (File/read! (c/path-for root)))))
+     (finally (down! worker watch)))))))
+
+(deftest descendant-clear-is-bounded-by-the-actual-root-and-preserves-other-output
+ (scratch
+  (fn [root]
+   (c/acquire! root "parent")
+   (let [child (Path/join root "priv") units (Path/join root "units") outside (str root "-outside")
+         alias (Path/join root "escape") record (File/read! (c/path-for root))]
+    (try
+     (File/mkdir_p! child) (File/mkdir_p! units) (File/mkdir_p! outside)
+     (File/write! (Path/join child "old") "old")
+     (File/write! (Path/join units "keep") "compiled")
+     (File/write! (Path/join outside "keep") "outside")
+     (File/ln_s! outside alias)
+     (is (= :build-workspace-scope (kind #(c/clear! outside root))))
+     (is (= :build-workspace-scope (kind #(c/clear! alias root))))
+     (is (= :build-workspace-scope (kind #(c/clear! (Path/join alias "missing") root))))
+     (is (not (File/exists? (Path/join outside "missing"))))
+     (is (= :ok (c/clear! child root)))
+     (is (= [] (File/ls! child)))
+     (is (= "compiled" (File/read! (Path/join units "keep"))))
+     (is (= "outside" (File/read! (Path/join outside "keep"))))
+     (is (= record (File/read! (c/path-for root))))
+     (is (c/owned? root))
+     (finally (File/rm_rf! outside)))))))
+
+(deftest clear-drains-even-a-current-cohort-follower-before-removing-anything
+ (scratch
+  (fn [root]
+   (c/acquire! root "parent")
+   (let [context (c/follower-context root) parent (erlang/self) marker (Path/join root "payload")
+         [worker watch] (spawn-monitor
+                        (fn [] (c/with-follower context
+                                 (fn [] (erlang/send parent :reading) (receive :finish :ok)))))]
+    (try
+     (receive :reading :ok (after 5000 (throw :reader-not-ready)))
+     (File/write! marker "retained")
+     (is (= :build-workspace-held (kind #(c/clear! root))))
+     (is (= "retained" (File/read! marker)))
+     (down! worker watch)
+     (is (= :ok (c/clear! root)))
+     (is (not (File/exists? marker)))
+     (is (c/owned? root))
+     (finally (erlang/exit worker :kill)))))))
+
+(deftest clear-preserves-permanent-anchor-inodes-and-unlinks-payload-symlinks
+ (scratch
+  (fn [root]
+   (c/acquire! root "parent")
+   (let [locks (Path/join root "cache/.bl/locks") anchor (Path/join locks "entry")
+         outside (str root "-outside") link (Path/join root "payload-link")]
+    (try
+     (File/mkdir_p! locks) (File/write! anchor "anchor") (File/write! outside "outside")
+     (File/ln_s! outside link)
+     (let [inode (:inode (File/stat! anchor))]
+      (is (= :build-workspace-scope (kind #(c/clear! locks root))))
+      (is (= :ok (c/clear! root)))
+      (is (= inode (:inode (File/stat! anchor))))
+      (is (= "outside" (File/read! outside)))
+      (is (= (tuple :error :enoent) (File/lstat link)))
+      (is (c/owned? root)))
+     (finally (File/rm outside)))))))
+
+(deftest nested-workspace-diagnostics-refuse-before-partial-deletion
+ (scratch
+  (fn [root]
+   (c/acquire! root "parent")
+   (File/write! (Path/join root "a-payload") "keep")
+   (File/mkdir_p! (Path/join root "z-nested"))
+   (File/write! (Path/join root "z-nested/.claim") "unknown nested workspace")
+   (is (= :build-workspace-nested-claim (kind #(c/clear! root))))
+   (is (= "keep" (File/read! (Path/join root "a-payload")))))))
+
+(defn- with-store [root action]
+ (let [previous (System/get_env "XDG_CACHE_HOME")]
+  (try
+   (System/put_env "XDG_CACHE_HOME" root)
+   (action)
+   (finally (if previous (System/put_env "XDG_CACHE_HOME" previous) (System/delete_env "XDG_CACHE_HOME"))))))
+(defn- custody [dir] ((BeamLisp.Env/fetch_exact! "store" "entry-custody") dir))
+
+(deftest active-store-install-excludes-other-installers-and-sweep
+ (scratch
+  (fn [root]
+   (with-store root
+    (fn []
+     (let [sha (String/duplicate "a" 64) dir (store/dir-for "demo" "1" sha)
+           tmp (str dir ".tmp-123-456") parent (erlang/self)
+           [worker watch] (spawn-monitor
+                          (fn [] (c/acquire! (custody dir) "active install")
+                            (erlang/send parent :install-held) (receive :finish :ok)))]
+      (try
+       (receive :install-held :ok (after 5000 (throw :installer-not-ready)))
+       (File/mkdir_p! tmp) (File/write! (Path/join tmp "payload") "active")
+       (is (= :build-workspace-held (kind #(store/install-dir! "demo" "1" sha (str root "/missing-source")))))
+       (is (= 0 (store/sweep-temp!)))
+       (is (= "active" (File/read! (Path/join tmp "payload"))))
+       (is (= [] (store/entries)))
+       (down! worker watch)
+       (is (= 1 (store/sweep-temp!)))
+       (is (not (File/exists? tmp)))
+       (finally (erlang/exit worker :kill)))))))))
+
+(deftest published-store-entries-are-immutable-and-sweeping-does-not-touch-them
+ (scratch
+  (fn [root]
+   (with-store root
+    (fn []
+     (let [source (Path/join root "input") sha (String/duplicate "b" 64)]
+      (File/mkdir_p! source) (File/write! (Path/join source "payload") "original")
+      (let [dir (store/install-dir! "demo" "1" sha source) inode (:inode (File/stat! dir))]
+       (File/write! (Path/join source "payload") "changed input")
+       (is (= dir (store/install-dir! "demo" "1" sha source)))
+       (is (= inode (:inode (File/stat! dir))))
+       (is (= "original" (File/read! (Path/join dir "payload"))))
+       (File/mkdir_p! (str dir ".tmp-999"))
+       (is (= 1 (store/sweep-temp!)))
+       (is (= "original" (File/read! (Path/join dir "payload"))))
+       (is (store/present? "demo" "1" sha)))))))))
+
+
+(deftest cached-native-reads-require-producer-custody-before-publication
+ (scratch
+  (fn [root]
+   (with-store root
+    (fn []
+     (let [crate (Path/join root "native/tiny") parent (erlang/self)]
+      (File/mkdir_p! (Path/join crate "src"))
+      (File/write! (Path/join crate "Cargo.toml") "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\n")
+      (File/write! (Path/join crate "src/lib.rs") "// cached publication fixture\n")
+      (let [dir (Path/join (Path/join (build/native-root) (build/native-key crate)) "tiny")
+            artifact (Path/join dir "release/libtiny.so") dest (Path/join root "priv/native/tiny.so")]
+       (File/mkdir_p! (Path/dirname artifact)) (File/write! artifact "completed-cache-bytes")
+       (let [[worker watch] (spawn-monitor
+                             (fn [] (c/acquire! dir "cache producer")
+                              (erlang/send parent :native-held) (receive :finish :ok)))]
+        (try
+         (receive :native-held :ok (after 5000 (throw :native-producer-not-ready)))
+         (let [record (File/read! (c/path-for dir)) result (build/build-native root nil)]
+          (is (= 1 (count (:errors result))))
+          (is (= 0 (:cached result)))
+          (is (not (File/exists? dest)))
+          (is (= "completed-cache-bytes" (File/read! artifact)))
+          (is (= record (File/read! (c/path-for dir)))))
+         (down! worker watch)
+         (c/acquire! dir "caller-owned")
+         (let [result (build/build-native root nil)]
+          (is (empty? (:errors result)))
+          (is (= 1 (:cached result)))
+          (is (= "completed-cache-bytes" (File/read! dest)))
+          (is (c/owned? dir) "cache reuse preserves the caller's actual claim"))
+         (finally (erlang/exit worker :kill) (c/release! dir)))))))))))
+
+(deftest native-publication-refuses-a-foreign-destination-and-cleans-up-failure
+ (scratch
+  (fn [root]
+   (let [dest (Path/join root "priv/native/tiny.so") parent (erlang/self)
+         publish (BeamLisp.Env/fetch_exact! "build" "install-artifact!")
+         custody ((BeamLisp.Env/fetch_exact! "build" "artifact-custody") dest)
+         [worker watch] (spawn-monitor
+                        (fn [] (c/acquire! custody "other publication")
+                         (erlang/send parent :destination-held) (receive :finish :ok)))]
+    (try
+     (receive :destination-held :ok (after 5000 (throw :destination-not-ready)))
+     (is (= :build-workspace-held (kind #(publish (str root "/missing-source") dest))))
+     (is (not (File/exists? dest)))
+     (down! worker watch)
+     (let [source (Path/join root "source")]
+      (File/write! source "new artifact")
+      (File/mkdir_p! dest) (File/write! (Path/join dest "keep") "existing directory")
+      (is (not= :accepted (try (publish source dest) :accepted (catch _ :refused))))
+      (is (= "existing directory" (File/read! (Path/join dest "keep"))))
+      (is (= [] (Path/wildcard (str dest ".tmp-*"))))
+      (is (not (c/owned? custody)))
+      (is (nil? (c/held-by custody)))
+      (File/rm_rf! dest)
+      (is (= dest (publish source dest)))
+      (let [inode (:inode (File/stat! dest))]
+       (is (= dest (publish source dest)))
+       (is (= inode (:inode (File/stat! dest)))))
+      (File/write! source "different artifact")
+      (let [inode (:inode (File/stat! dest))]
+       (is (= dest (publish source dest)))
+       (is (not= inode (:inode (File/stat! dest)))))
+      (is (= "different artifact" (File/read! dest))))
+     (finally (erlang/exit worker :kill)))))))
+
+(deftest sdk-staging-requires-its-actual-parent-claim-before-clearing-inputs
+ (scratch
+  (fn [root]
+   (let [stage (BeamLisp.Env/fetch_exact! "selfbuild" "stage-library-root!")
+         payload (Path/join root "priv/payload")]
+    (File/mkdir_p! (Path/dirname payload)) (File/write! payload "retained")
+    (is (= :workspace-unclaimed (kind #(stage root))))
+    (is (= "retained" (File/read! payload)))
+    (File/mkdir_p! (Path/join root "units"))
+    (File/write! (Path/join root "units/keep") "compiled")
+    (c/acquire! root "SDK producer")
+    (let [record (File/read! (c/path-for root)) result (stage root)]
+     (is (= (Path/join root "priv") (:priv result)))
+     (is (= (Path/join root "ebin") (:ebin result)))
+     (is (not (File/exists? payload)))
+     (is (File/regular? (Path/join root "ebin/beam_lisp.app")))
+     (is (= "compiled" (File/read! (Path/join root "units/keep"))))
+     (is (= record (File/read! (c/path-for root))))
+     (is (c/owned? root)))))))
