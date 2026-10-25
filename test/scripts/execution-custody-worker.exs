@@ -40,6 +40,17 @@ module = Module.concat([ExecutionHistory, CustodyWorker])
     {state, %{scope: invoke("claim", "artifact-scope", [destination])}}
   end
 
+  def handle(%{"op" => "native_scope", "project" => project, "crate" => crate}, state) do
+    directory = Path.join([project, "native", crate])
+    key = invoke("build", "native-key", [directory])
+    root = invoke("build", "native-root", [])
+    {state, %{scope: Path.join([root, key, crate])}}
+  end
+
+  def handle(%{"op" => "native_build", "project" => project, "crate" => crate}, state) do
+    {state, invoke("build", "build-native-crate", [project, crate, nil])}
+  end
+
   def handle(%{"op" => "claim", "out" => out}, state) do
     result = invoke("claim", "acquire!", [out, "independent writer"])
     context = if result[:"ok?"], do: invoke("claim", "follower-context", [out]), else: nil
