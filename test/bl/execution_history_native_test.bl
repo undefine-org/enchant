@@ -1,0 +1,68 @@
+;; Causal controls use actual host Source and existing regressions, under
+;; private module names. They never overwrite a compiler-floor module.
+(ns execution.history-native-test)
+
+(defn- compile-probe! [source module out]
+ (let [result (BeamLisp.AOT/compile_host_file source
+                (list (tuple :module module) (tuple :output_dir out) (tuple :load? false)))
+       path (erlang/element 2 result)
+       loaded (code/load_binary module (String/to_charlist path) (File/read! path))]
+  (when-not (= :module (erlang/element 1 loaded))
+   (throw (ex-info "Historical host probe did not load" {:module module})))
+  module))
+
+(defn- original-throttle-case [source module-name ns-name]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       previous-context (Process/get :test_ctx)
+       name "interleaved-cache-roots-keep-independent-sweep-budgets"
+       rewritten (-> source
+                     (String/replace "(ns aot-cache.gc.test)" (str "(ns " ns-name ")"))
+                     (String/replace "BeamLisp.AOTCache/" (str module-name "/")))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.TestRT/clear_registry)
+     (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string rewritten))
+     (let [found (Enum/filter (BeamLisp.TestRT/registered_tests ns-name)
+                   #(= name (erlang/element 1 %)))]
+      (when-not (= 1 (count found))
+       (throw (ex-info "Original throttle regression selector changed" {})))
+      (BeamLisp.TestRT/clear_registry)
+      (BeamLisp.TestRT/register_test ns-name name (erlang/element 2 (first found)))
+      (select-keys (BeamLisp.TestRT/run_ns ns-name) [:tests :pass :fail :error]))))
+   (finally
+    (if (nil? previous-context) (Process/delete :test_ctx)
+      (Process/put :test_ctx previous-context))
+    (BeamLisp.Env/destroy scope)))))
+
+(deftest E02-original-root-switch-regression-detects-singleton-throttle-publication
+ (let [root (str (System/tmp_dir!) "/history-throttle-" (erlang/unique_integer (list :positive)))
+       host (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/aot_cache.bl"))
+       before "(Map/put slots root now)" after "(Map/put (Map/new) root now)"
+       original (File/read! "test/bl/aot_cache_gc_test.bl")
+       good :Elixir.ExecutionHistory.ThrottleGood mutant :Elixir.ExecutionHistory.ThrottleMutant]
+  (try
+   ;; Refuse drift instead of silently running a no-op mutation.
+   (is (= 2 (count (String/split host before))))
+   (when-not (= 2 (count (String/split host before)))
+    (throw (ex-info "Historical throttle mutation anchor changed" {})))
+   (File/mkdir_p! root)
+   (let [good-source (Path/join root "good.bl") mutant-source (Path/join root "mutant.bl")
+         changed (String/replace host before after)]
+    (File/write! good-source host) (File/write! mutant-source changed)
+    (compile-probe! good-source good (Path/join root "good"))
+    (compile-probe! mutant-source mutant (Path/join root "mutant"))
+    (let [normal (original-throttle-case original "ExecutionHistory.ThrottleGood" "history.throttle.good")
+          broken (original-throttle-case original "ExecutionHistory.ThrottleMutant" "history.throttle.mutant")]
+     (println :history-E02 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 host))
+                           :mutant-sha256 (Base/encode16 (crypto/hash :sha256 changed))
+                           :normal normal :mutant broken})
+     (is (= 1 (:tests normal) (:tests broken)))
+     (is (= 2 (:pass normal)))
+     (is (= 0 (:fail normal) (:error normal)))
+     (is (= 1 (:pass broken)))
+     (is (= 1 (:fail broken)))
+     (is (= 0 (:error broken)))))
+   (finally
+    (doseq [module [good mutant]] (code/purge module) (code/delete module))
+    (File/rm_rf! root)))))

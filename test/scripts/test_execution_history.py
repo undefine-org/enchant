@@ -69,11 +69,11 @@ class ManifestControls(unittest.TestCase):
             path.write_text(json.dumps(data))
             return history.read_manifest(ROOT, path)
 
-    def test_all_original_cases_are_present_but_not_claimed_closed(self):
+    def test_original_inventory_and_bound_controls_do_not_claim_execution(self):
         cases = self.read(self.data)
         report = history.audit(cases)
         self.assertEqual(len(cases), 86)
-        self.assertEqual(len(report['open']), 86)
+        self.assertEqual(len(report['open']), 85)
         self.assertFalse(report['executed'])
         self.assertFalse(report['complete_goal'])
 
@@ -90,6 +90,33 @@ class ManifestControls(unittest.TestCase):
         self.data['cases'][0]['issue'] = 'unrelated easier requirement'
         with self.assertRaises(ValueError):
             self.read(self.data)
+
+    def test_stale_producer_or_unbound_causal_selector_is_rejected(self):
+        for edit in [{'producer_sha256': 'changed'}, {'selector': {
+                'path': 'absent.bl', 'namespace': 'absent', 'test': 'absent'}}]:
+            data = copy.deepcopy(self.data)
+            case = next(c for c in data['cases'] if c['id'] == 'E02')
+            case['baseline'].update(edit)
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                self.read(data)
+
+    def test_noop_or_missing_anchor_causal_mutation_is_rejected(self):
+        for edit in [{'after': '(Map/put slots root now)'}, {'before': 'missing anchor'}]:
+            data = copy.deepcopy(self.data)
+            case = next(c for c in data['cases'] if c['id'] == 'E02')
+            case['baseline'].update(edit)
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                self.read(data)
+
+    def test_causal_binding_requires_both_roles_and_no_remaining_variant(self):
+        cases = self.read(self.data)
+        case = copy.deepcopy(next(c for c in cases if c['id'] == 'E02'))
+        self.assertTrue(history.controls_bound(case))
+        case['remaining'] = ['a variant still needs proof']
+        self.assertFalse(history.controls_bound(case))
+        case['remaining'] = []
+        case.pop('baseline')
+        self.assertFalse(history.controls_bound(case))
 
     def test_missing_or_escaped_test_path_is_rejected(self):
         for path in ['test/bl/does-not-exist.bl', '../AGENTS.md']:
