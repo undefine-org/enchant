@@ -165,3 +165,15 @@ The user rejected the 48-second piece as slow and asked for a complete commercia
 showcase with much more dynamic motion, textures and shaders. Read SHOWCASE.md.
 The prior film remains historical. Build a substantially richer material/motion
 experience, with tight pacing, no slides, and autonomous incremental commits.
+
+The completed new film is MAKE WORLDS under `evidence/showcase/`, with source in
+`scene_demo/showcase.bl`, `showcase.bl`, `showcase_worker.py`, captured GLSL in
+`examples/scene-renderer/showcase/`, and numeric tracks in `scene.score`.
+Read SHOWCASE.md for build, visual decisions, actual evidence and limits.
+The film is 30 seconds, 1080p/60 with original 48 kHz stereo synthesis; full
+render/encode/probe took ~80 seconds / 860 MiB peak on the Intel GPU. All 1,800
+frames, 12 BL assertions, 9 admission tests, reordered native samples, full-duration
+browser playback and seeking passed. An intentional four-hour review server is
+`bl-scene-showcase-review` on `http://100.124.205.18:4052/`; owned browser tests are
+stopped. The GPU executor is private to this film; public shader/studio integration
+remains open. Continue autonomous commits and preserve the independent tracks.

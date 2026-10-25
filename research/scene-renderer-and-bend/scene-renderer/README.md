@@ -38,7 +38,13 @@ examples still describe a broader API; they are not all available signatures.
 
 ## Current implementation and retained artifacts
 
-The current direction is [A living picture](evidence/metamorphosis/index.html):
+The current showcase is [MAKE WORLDS](evidence/showcase/index.html): a
+[30-second 1080p/60 commercial study](evidence/showcase/showcase.mp4) with
+continuous surface transformations, GPU materials, kinetic typography and an
+original stereo score. [SHOWCASE.md](SHOWCASE.md) records actual mechanisms,
+measurements and limits; [checks](evidence/showcase/checks.json) retain the evidence.
+
+The earlier direction is [A living picture](evidence/metamorphosis/index.html):
 a [48-second continuous transformation](evidence/metamorphosis/experience.mp4)
 of one keyed system, with contour/formation/relationship morphs and deep camera
 following. [TRANSFORMATION-EXPERIENCE.md](TRANSFORMATION-EXPERIENCE.md) records the

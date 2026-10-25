@@ -1,3 +1,34 @@
+# Latest: MAKE WORLDS material and motion showcase
+
+The user rejected the slow diagram study. The completed replacement is a
+30-second 1080p/60 film with five continuously deforming ribbon bands, real
+GPU vertex/fragment shading, brushed/interference/woven material controls,
+analytic studio reflection lighting, depth, 4x MSAA, HDR scene/post passes,
+kinetic camera-facing type and 320 orbital points. BL owns the finite score,
+camera matrices, sampled controls, shaped text requests, sound events and capture.
+The actual procedural surface equations and shading are captured GLSL, executed
+by a private EGL/GLES worker. This is not BL GPU compilation or a public shader
+API. It remains separate from Bend/compiler research and studio development.
+
+`scene.score` introduces continuous time-aware vector tracks. The complete film
+has 1,800 frames at 60/1 fps and original stereo AAC, 48 kHz / 30 seconds.
+Native render + encode + verification took 80.453 seconds cgroup wall time,
+860 MiB peak, zero swap. 12 focused BL assertions, 9 admission tests, all frame
+admission, four reordered byte-identical native samples, source/plan/media hashes,
+full-duration unmuted Chromium playback, forward/backward seek, mobile layout,
+replay state and HTTP ranges passed. Chromium reported 1 dropped frame / 1,800.
+Owned browser/profile and GPU/encoder checks are cleaned up. The intentional
+four-hour review service is `bl-scene-showcase-review`, Tailscale port 4052.
+
+[SHOWCASE.md](SHOWCASE.md) records art direction, build and limits.
+[Retained film](evidence/showcase/showcase.mp4), [review](evidence/showcase/index.html),
+[checks](evidence/showcase/checks.json) and compressed complete plan are committed.
+Full-size samples and contacts were inspected; automated playback is not a claim
+of a human full audiovisual review. No shadow maps, temporal blur, simulation,
+physical BRDF, extruded glyphs, public shader graph or studio adoption are claimed.
+
+---
+
 # Renderer implementation evidence — 2026-10-24
 
 The bootstrap pause is superseded by the user's implementation authorization.
