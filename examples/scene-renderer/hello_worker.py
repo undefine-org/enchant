@@ -169,4 +169,4 @@ def run(a):
   if painter:painter.close()
   if gpu:gpu.close()
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('folder',type=Path);p.add_argument('--gpu-worker',required=True,type=Path);p.add_argument('--helper',required=True,type=Path);p.add_argument('--shaders',required=True,type=Path);p.add_argument('--rsvg',required=True);p.add_argument('--egl',required=True);p.add_argument('--gles',required=True);p.add_argument('--film',action='store_true');p.add_argument('--selected',default='0,120,360,660,990,1260,1560,1860,2100,2430,2610,2850,3150,3420,3599');run(p.parse_args())
+ p=argparse.ArgumentParser();p.add_argument('folder',type=Path);p.add_argument('--gpu-worker',required=True,type=Path);p.add_argument('--helper',required=True,type=Path);p.add_argument('--shaders',required=True,type=Path);p.add_argument('--rsvg',required=True);p.add_argument('--egl',required=True);p.add_argument('--gles',required=True);p.add_argument('--film',action='store_true');p.add_argument('--selected',default='0,120,360,660,990,1260,1560,1800,1860,1980,2100,2430,2520,2610,2850,3150,3420,3599');run(p.parse_args())
