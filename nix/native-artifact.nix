@@ -14,15 +14,22 @@ let
     else import ./native-source.nix { inherit (request) source crate; };
   manifest = builtins.fromTOML (builtins.readFile (source + "/Cargo.toml"));
   library = manifest.lib.name or (builtins.replaceStrings [ "-" ] [ "_" ] manifest.package.name);
+  desktop = request.crate == "wry_webview";
+  memoryMiB = if desktop then 6144 else 3072;
   # Compile identity excludes the BL consumer's ABI label. Changing consumer
   # metadata must not compile the same Rust source/toolchain a second time.
-  compiled = (import ./bounded-build.nix { inherit pkgs; }) (pkgs.rustPlatform.buildRustPackage {
+  compiled = (import ./bounded-build.nix {
+    inherit pkgs memoryMiB;
+    diskMiB = if desktop then 16384 else 12288;
+  }) (pkgs.rustPlatform.buildRustPackage {
     pname = "bl-native-code-${request.crate}";
     version = manifest.package.version;
     src = source;
     cargoLock.lockFile = source + "/Cargo.lock";
     doCheck = false;
     strictDeps = true;
+    nativeBuildInputs = pkgs.lib.optionals desktop [ pkgs.pkg-config ];
+    buildInputs = pkgs.lib.optionals desktop [ pkgs.gtk3 pkgs.webkitgtk_4_1 pkgs.gtk-layer-shell ];
     cargoBuildFlags = [ "--lib" ];
     installPhase = ''
       runHook preInstall
@@ -31,7 +38,7 @@ let
       runHook postInstall
     '';
     postInstall = ''
-      printf '{"backend":"nix-kvm","memoryMiB":3072,"memoryKiB":%s,"swapKiB":%s}\n' \
+      printf '{"backend":"nix-kvm","memoryMiB":${toString memoryMiB},"memoryKiB":%s,"swapKiB":%s}\n' \
         "$BL_WORKER_MEMORY_KIB" "$BL_WORKER_SWAP_KIB" > "$out/worker.json"
     '';
   });

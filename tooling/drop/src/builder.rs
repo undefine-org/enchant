@@ -365,15 +365,11 @@ fn publish_native_reference(source: &Path, destination: &Path) -> Result<(), Str
     }
 }
 
-/// Build every `native/<crate>` of `tree` with cargo and install its cdylib as
-/// `priv/native/<crate>.so` (`.dylib` on macOS is loaded under the same `.so`
-/// name, as `vm.native` installs it). The boot itself loads `lazy_memo`, so
-/// this runs before the tree's own `bin/bl` does anything. Cargo's shared
-/// target directory makes a crate that did not change a no-op.
-fn build_natives(tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), String> {
-    let provider = std::env::var("BL_NATIVE_PROVIDER").unwrap_or_else(|_| "local".into());
-    if provider != "local" && provider != "nix" {
-        return Err("BL_NATIVE_PROVIDER must be local or nix".into());
+/// Prepare every declared native crate through the pinned immutable recipe.
+/// Cargo is confined to Nix workers; unsupported environments fail explicitly.
+fn build_natives(tree: &Path, _log: &Path, custody: &BuildLock) -> Result<(), String> {
+    if std::env::var("BL_NATIVE_PROVIDER").is_ok_and(|provider| provider != "nix") {
+        return Err("native production requires Nix; local providers are unsupported".into());
     }
     let native = tree.join("native");
     let dest = tree.join("priv/native");
@@ -383,21 +379,8 @@ fn build_natives(tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), Str
     crates.sort();
     for dir in crates {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        if provider == "nix" {
-            let library = nix_artifact::prepare(tree, &dir, &name, custody)?;
-            publish_native_reference(&library, &dest.join(format!("{name}.so")))?;
-            continue;
-        }
-        let mut cmd = Command::new("cargo");
-        cmd.args(["build", "--release", "--message-format=short", "--manifest-path"]).arg(dir.join("Cargo.toml"));
-        run_logged(cmd, log, &format!("cargo build native/{name}"), custody)?;
-        let out = cargo_target_dir(&dir, custody)?.join("release");
-        let lib = [format!("lib{name}.so"), format!("lib{name}.dylib")]
-            .into_iter()
-            .map(|f| out.join(f))
-            .find(|p| p.is_file())
-            .ok_or_else(|| format!("native/{name}: cargo produced no cdylib in {}", out.display()))?;
-        publish_native_artifact(&lib, &dest.join(format!("{name}.so")))?;
+        let library = nix_artifact::prepare(tree, &dir, &name, custody)?;
+        publish_native_reference(&library, &dest.join(format!("{name}.so")))?;
     }
     Ok(())
 }

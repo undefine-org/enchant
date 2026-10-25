@@ -35,12 +35,26 @@
       packages.${system} = {
         artifact-platform = import ./nix/artifact-platform.nix { inherit pkgs; };
         command-executor = import ./nix/command-executor.nix { inherit pkgs; };
+        checkout-platform = import ./nix/checkout-platform.nix {
+          inherit pkgs;
+          inherit (beam) erlang elixir;
+          root = self;
+        };
         native-products = nativeProducts.bundle;
         native-bl-json = nativeProducts.products.bl_json;
         native-code-embed = nativeProducts.products.code_embed;
         native-datom-datalog = nativeProducts.products.datom_datalog;
         native-datom-fjall = nativeProducts.products.datom_fjall;
         native-datom-vector = nativeProducts.products.datom_vector;
+        native-wry-webview = import ./nix/native-artifact.nix {
+          requestJson = builtins.toJSON {
+            version = 1;
+            crate = "wry_webview";
+            source = toString (self + "/native/wry_webview");
+            abi = "beam-lisp-native-wry_webview-v1";
+            target = system;
+          };
+        };
         inherit (beam) erlang elixir;
         bl-drop = drop.bl-drop;
         native-lazy-memo = import ./nix/native-artifact.nix {

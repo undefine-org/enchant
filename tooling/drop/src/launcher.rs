@@ -617,6 +617,10 @@ fn main() {
     if let Some(status) = command_domain::dispatch(&argv) {
         std::process::exit(status);
     }
+    if argv.first().map(String::as_str) == Some("--checkout-prerequisites") {
+        checkout_prerequisites(&argv[1..]).unwrap_or_else(|error| fail(&error));
+        return;
+    }
     if argv.first().map(String::as_str) == Some("--checkout") {
         checkout_main(&argv[1..]);
     }

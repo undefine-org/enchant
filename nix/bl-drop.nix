@@ -101,6 +101,11 @@ let
   nativeProducts = import ./native-products.nix { inherit pkgs; };
   natives = nativeProducts.bundle;
   buildPlatform = import ./artifact-platform.nix { inherit pkgs; commandExecutor = drop-tools; };
+  buildCheckout = import ./checkout-platform.nix {
+    inherit pkgs erlang elixir;
+    executor = drop-tools;
+    includeDesktop = false;
+  };
 
   # ── pinned binary assets ─────────────────────────────────────────────────────
   z3 = pkgs.fetchurl {
@@ -155,6 +160,7 @@ let
       export BL_DAEMON=off LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu"
       export BL_NATIVE_PROVIDER=nix BL_PREPARED_NATIVES=${natives}
       export BL_ARTIFACT_PLATFORM=${buildPlatform} BL_BIN=${drop-tools}/bin/drop-launcher
+      export BL_CHECKOUT_PLATFORM=${buildCheckout}
       export RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH=$TMPDIR/rp-cache
       export EXPLORER_USE_LEGACY_ARTIFACTS=false
       mkdir -p $HOME $XDG_CACHE_HOME/beam_lisp $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH

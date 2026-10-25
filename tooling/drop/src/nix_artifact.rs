@@ -2,10 +2,10 @@
 use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
-fn store_object(path: &str) -> bool {
+pub(super) fn store_object(path: &str) -> bool {
     let Some(name) = path.strip_prefix("/nix/store/") else { return false };
     name.len() > 33 && name.as_bytes()[32] == b'-' && !name.contains('/')
-        && name[..32].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && name.as_bytes()[..32].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Build resolution includes the selected trusted recipe/lock, even when the
@@ -151,6 +151,7 @@ mod tests {
     fn mutable_and_traversing_products_are_refused() {
         crate::builder_tests::custody_source_identity();
         assert!(!store_object("/tmp/old-library"));
+        assert!(!store_object(&format!("/nix/store/{}é-tail", "a".repeat(31))));
         assert!(!store_object("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo/../other"));
         assert!(verify(Path::new("/tmp/old-library"), &json!({})).is_err());
     }

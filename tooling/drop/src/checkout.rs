@@ -4,6 +4,57 @@ fn checkout_root() -> Option<PathBuf> {
     std::env::var_os("BL_CHECKOUT_ROOT").map(PathBuf::from)
 }
 
+// This supplies filesystem prerequisites only. It grants no Source invocation
+// authority and uses the same publication custody as the bootstrap builder.
+fn checkout_prerequisites(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 { return Err("usage: --checkout-prerequisites ROOT PLATFORM".into()); }
+    let root = std::fs::canonicalize(&args[0]).map_err(|e| e.to_string())?;
+    if !root.join("priv/bootstrap/seed/manifest.term").is_file() {
+        return Err("checkout bootstrap manifest is required".into());
+    }
+    let platform = std::fs::canonicalize(&args[1]).map_err(|e| e.to_string())?;
+    if !platform.to_str().is_some_and(nix_artifact::store_object) {
+        return Err("checkout platform must be an immutable store object".into());
+    }
+    let descriptor: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(platform.join("platform.json")).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if descriptor["version"] != 1 || descriptor["kind"] != "checkout-platform"
+        || descriptor["target"] != "x86_64-linux" {
+        return Err("unsupported checkout platform".into());
+    }
+    let bundle = std::fs::canonicalize(platform.join("native-products")).map_err(|e| e.to_string())?;
+    if !bundle.to_str().is_some_and(nix_artifact::store_object) {
+        return Err("native set must be an immutable store object".into());
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle.join("artifacts.json")).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if manifest["version"] != 1 || manifest["kind"] != "native-set"
+        || manifest["target"] != "x86_64-linux" { return Err("unsupported native set".into()); }
+    let products = manifest["products"].as_object().ok_or("native set omits products")?;
+    if products.is_empty() || products.len() > 128 || !products.contains_key("lazy_memo") {
+        return Err("native set omits mandatory products or exceeds capacity".into());
+    }
+    let mut selections = Vec::new();
+    for (name, row) in products {
+        let output = row["output"].as_str().ok_or("native set omits product output")?;
+        let request = serde_json::json!({"version": 1, "crate": name,
+            "abi": format!("beam-lisp-native-{name}-v1"), "target": "x86_64-linux",
+            "source": row["source"]});
+        let library = nix_artifact::verify(Path::new(output), &request)?;
+        selections.push((library, root.join("priv/native").join(format!("{name}.so"))));
+    }
+    // Validate the whole set before publishing anything. All selection occurs
+    // before BEAM boot can freeze native-host physical-library identities.
+    for (library, destination) in selections {
+        if std::fs::read_link(&destination).is_ok_and(|selected| selected == library) { continue; }
+        std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
+        publish_native_reference(&library, &destination)?;
+    }
+    Ok(())
+}
+
 fn checkout_main(args: &[String]) -> ! {
     let root = args
         .first()

@@ -713,22 +713,6 @@
   (first (filter (fn [p] (File/exists? p))
                  (map (fn [n] (Path/join dir n)) (cdylib-names crate)))))
 
-(defn- run-cargo
-  "Run `cargo ARGS` with `crate-dir` as its working directory, answering
-   `[output exit]`. A cargo that cannot be STARTED (not on PATH, not executable)
-   answers `[why 127]` — the shell's own `command not found` — so an absent
-   toolchain is an ordinary failed step the caller reports, not an exception it
-   must catch.
-
-   `System/cmd` and not `:os.cmd` because the EXIT STATUS is the thing that was
-   being thrown away (FUP-100). It also takes the working directory as an option
-   instead of a shell `cd`, so a path with a space is a path and not a word."
-  [args crate-dir producer]
-  (try
-    (let [r (c/command! producer "cargo" args {:cd crate-dir})]
-      [(elem r 0) (elem r 1)])
-    (catch e [(str "cargo could not be run: " (ex-message e)) 127])))
-
 (defn cargo-verdict
   "What a finished `cargo build` MEANS: `{:ok path}` or `{:error message}`. Pure
    in the run's `exit` and `output`, the `release-dir` cargo was told to write
@@ -786,43 +770,6 @@
             dest
             (finally (File/rm tmp))))))))
 
-(defn- native-one-local
-  "One crate under producer custody, including cache reads. Destination
-   publication has its own custody because different keys share its filename."
-  [acc crate-dir root log]
-  (let [crate (Path/basename crate-dir)
-        key (native-key crate-dir)
-        dir (Path/join (Path/join (native-root) key) crate)
-        dest (Path/join (Path/join root "priv/native") (nif-artifact-name crate))
-        ours (c/owned? dir)
-        acquired (if ours {:ok? true} (c/acquire! dir crate))]
-    (if-not (:ok? acquired)
-      (do
-        (when log (log (str "beam-lisp native: " crate " SKIPPED — held; nothing was installed")))
-        (assoc acc :errors (conj (:errors acc) (str "native: " crate " held by " (pr-str (:held acquired))))))
-      (try
-        (let [release (Path/join dir "release")
-              found (cdylib-in release crate)]
-          (if found
-            (do
-              (install-artifact! found dest)
-              (when log (log (str "beam-lisp native: " crate " from cache")))
-              (assoc acc :cached (inc (:cached acc)) :artifacts (conj (:artifacts acc) dest)))
-            (let [args ["build" "--release" "--target-dir" dir]
-                  invocation (str "cargo " (join " " args) "  (in " crate-dir ")")
-                  _ (when log (log (str "beam-lisp native: " crate " — building")))
-                  [output exit] (run-cargo args crate-dir dir)
-                  verdict (cargo-verdict crate release exit output invocation)]
-              (if (:error verdict)
-                (assoc acc :errors (conj (:errors acc) (:error verdict)))
-                (do
-                  (install-artifact! (:ok verdict) dest)
-                  (when log (log (str "beam-lisp native: " crate " built")))
-                  (assoc acc :built (inc (:built acc)) :artifacts (conj (:artifacts acc) dest)))))))
-        (catch error
-          (assoc acc :errors (conj (:errors acc) (str "native: " crate " publication failed: " (ex-message error)))))
-        (finally (when-not ours (c/release! dir)))))))
-
 (defn- native-one-nix [acc crate-dir root log]
   (let [crate (Path/basename crate-dir)
         destination (Path/join (Path/join root "priv/native") (nif-artifact-name crate))]
@@ -832,26 +779,29 @@
                       (list {:platform (or (System/get_env "BL_ARTIFACT_PLATFORM") (System/get_env "BL_ROOT"))
                              :source (Path/expand crate-dir) :crate crate
                              :abi (str "beam-lisp-native-" crate "-v1")}))
-            library (:library product)]
-        (c/with-writer! (artifact-custody destination) "immutable native selection"
+            library (:library product)
+            cached (c/with-writer! (artifact-custody destination) "immutable native selection"
           (fn []
             (File/mkdir_p! (Path/dirname destination))
-            (let [temporary (str destination ".nix-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
+            (if (= (tuple :ok library) (File/read_link destination))
+              true
+              (let [temporary (str destination ".nix-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
               (try
                 (File/ln_s! library temporary)
                 (File/rename! temporary destination)
-                (finally (File/rm temporary))))))
+                false
+                (finally (File/rm temporary)))))))]
         (when log (log (str "beam-lisp native: " crate " -> " library)))
-        (assoc acc :built (inc (:built acc)) :artifacts (conj (:artifacts acc) destination)))
+        (assoc acc (if cached :cached :built) (inc (get acc (if cached :cached :built)))
+                   :artifacts (conj (:artifacts acc) destination)))
       (catch error
         (assoc acc :errors (conj (:errors acc) (str "native: " crate " Nix preparation failed: " (ex-message error)
                                                         (when-let [detail (:detail (ex-data error))] (str "\n" detail)))))))))
 
 (defn- native-one [acc crate-dir root log]
-  (case (or (System/get_env "BL_NATIVE_PROVIDER") "local")
-    "local" (native-one-local acc crate-dir root log)
-    "nix" (native-one-nix acc crate-dir root log)
-    (assoc acc :errors (conj (:errors acc) "BL_NATIVE_PROVIDER must be local or nix"))))
+  (if (= "nix" (or (System/get_env "BL_NATIVE_PROVIDER") "nix"))
+    (native-one-nix acc crate-dir root log)
+    (assoc acc :errors (conj (:errors acc) "Native production requires Nix; local providers are unsupported"))))
 
 (defn build-native-crate
   "The single-crate entry to the same admitted content-addressed producer used
