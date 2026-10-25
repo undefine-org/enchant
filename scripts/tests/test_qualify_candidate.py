@@ -19,6 +19,7 @@ class Receipts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
+            (root / "scripts/test-prerequisites.json").write_text('{"version":1,"tests":{}}')
             (root / "scripts/test-isolation.json").write_text('{"fault.bl": "isolated"}')
             candidate = root / "candidate"
             candidate.write_text("#!/usr/bin/env python3\n" + f"fail_first = {fail_first!r}\n" + '''

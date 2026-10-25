@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import tempfile
@@ -109,6 +110,11 @@ def main():
     prior = completed(args.results, identity) if args.resume else {}
     files = list(dict.fromkeys(args.files))
     pending = [name for name in files if name not in prior]
+    if pending:
+        try:
+            runpy.run_path(str(Path(__file__).resolve().parent / "test_prerequisites.py"))["require"](ROOT, pending)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.error(str(error))
     args.results.parent.mkdir(parents=True, exist_ok=True)
     status = batch_status(args.results, identity) if args.resume else -1
     if pending:

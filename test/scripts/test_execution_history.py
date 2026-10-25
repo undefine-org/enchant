@@ -101,10 +101,10 @@ class CaptureControls(unittest.TestCase):
             manifest.parent.mkdir(parents=True)
             for path in ['env.bl', history.FINDINGS, history.MANIFEST, history.DRIVER,
                          'scripts/check-execution-history', 'bin/bl', 'flake.nix',
-                         'flake.lock', '.github/workflows/ci.yml']:
+                         'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl']:
                 (root / path).write_text('original')
             before = history.capture(root, manifest)
-            for path in ['bin/bl', 'flake.nix', 'flake.lock', '.github/workflows/ci.yml']:
+            for path in ['bin/bl', 'flake.nix', 'flake.lock', '.github/workflows/ci.yml', 'test/fixture.erl']:
                 with self.subTest(path=path):
                     file = root / path
                     file.write_text('changed')
@@ -134,7 +134,7 @@ class ManifestControls(unittest.TestCase):
         cases = self.read(self.data)
         report = history.audit(cases)
         self.assertEqual(len(cases), 86)
-        self.assertEqual(len(report['open']), 73)
+        self.assertEqual(len(report['open']), 72)
         self.assertFalse(report['executed'])
         self.assertFalse(report['complete_goal'])
 

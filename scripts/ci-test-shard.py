@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import signal
 import sys
@@ -48,6 +49,10 @@ def main():
     if args.list:
         print("\n".join(selected))
         return 0
+    try:
+        runpy.run_path(str(root / "scripts/test_prerequisites.py"))["require"](root, selected)
+    except (OSError, ValueError, RuntimeError) as error:
+        parser.error(str(error))
     # One VM per shard. Independent runners provide isolation; each runner
     # executes its files serially under a cap, including any child processes.
     command = ["systemd-run", "--user", "--collect", "--wait", "--pipe", "--quiet",
