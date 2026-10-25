@@ -220,6 +220,83 @@ fn seed_assets(from: &Path, tree: &Path, log: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// The preboot publisher joins claim/artifact-scope's kernel protocol without
+// loading a BEAM/NIF. These descriptors grant filesystem exclusion only.
+struct NativePublication {
+    destination: PathBuf,
+    _writer: std::fs::File,
+    _followers: std::fs::File,
+}
+
+impl NativePublication {
+    fn take(destination: &Path) -> Result<Self, String> {
+        use std::fs::{OpenOptions, TryLockError};
+        let name = destination.file_name().ok_or("native destination needs a filename")?;
+        // Resolve directory aliases, but replace a destination symlink itself.
+        let parent = std::fs::canonicalize(destination.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+        let scope = parent.join(".bl/artifact-custody").join(name);
+        std::fs::create_dir_all(&scope).map_err(|e| e.to_string())?;
+        let scope = std::fs::canonicalize(scope).map_err(|e| e.to_string())?;
+        let base = scope.file_name().ok_or("native custody needs a filename")?;
+        let anchors = scope.parent().ok_or("native custody needs a parent")?
+            .join(if base == ".bl" { ".bl-locks" } else { ".bl" }).join("locks");
+        std::fs::create_dir_all(&anchors).map_err(|e| e.to_string())?;
+        let anchor = anchors.join(scope.file_name().ok_or("native custody needs a filename")?);
+        let lock = |path: &Path| -> Result<std::fs::File, String> {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+                .open(path).map_err(|e| format!("cannot open native publication custody: {e}"))?;
+            match file.try_lock() {
+                Ok(()) => Ok(file),
+                Err(TryLockError::WouldBlock) => Err("native publication custody held".into()),
+                Err(TryLockError::Error(e)) => Err(format!("cannot acquire native publication custody: {e}")),
+            }
+        };
+        let writer = lock(&anchor)?;
+        let mut follower_name = anchor.as_os_str().to_os_string();
+        follower_name.push(".followers");
+        let followers = lock(Path::new(&follower_name))?;
+        // No old Source follower may enter after this publisher releases. Keep
+        // the follower barrier through invalidation and destination publication.
+        match std::fs::remove_file(scope.join(".claim")) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("cannot invalidate native publication cohort: {e}")),
+        }
+        Ok(Self { destination: parent.join(name), _writer: writer, _followers: followers })
+    }
+}
+
+fn publish_native_artifact(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let custody = NativePublication::take(destination)?;
+    let destination = &custody.destination;
+    let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+    if std::fs::symlink_metadata(destination).is_ok_and(|m| m.is_file())
+        && std::fs::read(destination).is_ok_and(|installed| installed == bytes) {
+        return Ok(());
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_nanos();
+    let temporary = destination.with_file_name(format!("{}.tmp-{}-{nonce}",
+        destination.file_name().ok_or("native destination needs a filename")?.to_string_lossy(), std::process::id()));
+    // Never follow or truncate a preexisting temporary. Only remove a file we
+    // actually created; create_new failure leaves somebody else's bytes intact.
+    let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+    let publish = (|| -> std::io::Result<()> {
+        output.write_all(&bytes)?;
+        output.set_permissions(std::fs::metadata(source)?.permissions())?;
+        drop(output);
+        std::fs::rename(&temporary, destination)
+    })();
+    if let Err(error) = publish {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 /// Build every `native/<crate>` of `tree` with cargo and install its cdylib as
 /// `priv/native/<crate>.so` (`.dylib` on macOS is loaded under the same `.so`
 /// name, as `vm.native` installs it). The boot itself loads `lazy_memo`, so
@@ -243,9 +320,7 @@ fn build_natives(tree: &Path, log: &Path) -> Result<(), String> {
             .map(|f| out.join(f))
             .find(|p| p.is_file())
             .ok_or_else(|| format!("native/{name}: cargo produced no cdylib in {}", out.display()))?;
-        let tmp = dest.join(format!("{name}.so.tmp-{}", std::process::id()));
-        std::fs::copy(&lib, &tmp).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, dest.join(format!("{name}.so"))).map_err(|e| e.to_string())?;
+        publish_native_artifact(&lib, &dest.join(format!("{name}.so")))?;
     }
     Ok(())
 }
@@ -797,6 +872,63 @@ mod builder_tests {
         std::fs::write(root.join("entered"), "entered").unwrap();
         while !root.join("finish").exists() {
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit native-publication subprocess worker"]
+    fn native_publication_subprocess_worker() {
+        custody_source_identity();
+        let source = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_SOURCE").expect("test source"));
+        let destination = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_DESTINATION").expect("test destination"));
+        let result = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_RESULT").expect("test result"));
+        if let Some(finish) = std::env::var_os("BL_PUBLICATION_TEST_HOLD_UNTIL") {
+            let _guard = NativePublication::take(&destination).unwrap();
+            std::fs::write(&result, "held").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !Path::new(&finish).exists() {
+                assert!(std::time::Instant::now() < deadline, "publication holder timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return;
+        }
+        let verdict = publish_native_artifact(&source, &destination);
+        std::fs::write(&result, match verdict { Ok(()) => "ok".to_string(), Err(error) => format!("error:{error}") }).unwrap();
+    }
+
+    #[test]
+    fn native_publication_preserves_old_bytes_and_releases_failed_operations() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("native-publication-failure-{}", std::process::id()));
+        let _cleanup = CustodyDirectory(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("built.so");
+        let destination = root.join("installed.so");
+        std::fs::write(&destination, "old").unwrap();
+        assert!(publish_native_artifact(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        std::fs::write(&source, "new").unwrap();
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        assert!(publish_native_artifact(&source, &destination).is_err());
+        assert!(destination.is_dir());
+        assert!(!std::fs::read_dir(&root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("installed.so.tmp-")));
+        std::fs::remove_dir(&destination).unwrap();
+        let diagnostic = root.join(".bl/artifact-custody/installed.so/.claim");
+        std::fs::create_dir(&diagnostic).unwrap();
+        assert!(publish_native_artifact(&source, &destination).unwrap_err().contains("invalidate"));
+        std::fs::remove_dir(&diagnostic).unwrap();
+        publish_native_artifact(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        #[cfg(unix)] {
+            let other = root.join("untouched.so");
+            std::fs::write(&other, "untouched").unwrap();
+            std::fs::remove_file(&destination).unwrap();
+            std::os::unix::fs::symlink(&other, &destination).unwrap();
+            publish_native_artifact(&source, &destination).unwrap();
+            assert!(!std::fs::symlink_metadata(&destination).unwrap().is_symlink());
+            assert_eq!(std::fs::read(&other).unwrap(), b"untouched");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"new");
         }
     }
 

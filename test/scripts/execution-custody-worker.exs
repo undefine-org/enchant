@@ -36,6 +36,10 @@ module = Module.concat([ExecutionHistory, CustodyWorker])
     {state, %{built: result.built, errors: Enum.to_list(result.errors)}}
   end
 
+  def handle(%{"op" => "artifact_scope", "destination" => destination}, state) do
+    {state, %{scope: invoke("claim", "artifact-scope", [destination])}}
+  end
+
   def handle(%{"op" => "claim", "out" => out}, state) do
     result = invoke("claim", "acquire!", [out, "independent writer"])
     context = if result[:"ok?"], do: invoke("claim", "follower-context", [out]), else: nil
