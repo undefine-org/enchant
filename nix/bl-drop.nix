@@ -64,6 +64,7 @@ let
     url = "https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip";
     sha256 = "7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e";
   };
+  z3Runtime = import ./z3-runtime.nix { inherit pkgs; archive = z3; };
   # explorer's polars NIF (rustler_precompiled), the non-legacy-CPU build; its
   # sha256 is the one explorer's own checksum file pins. glibc floor 2.35.
   explorerNif = pkgs.fetchurl {
@@ -81,13 +82,23 @@ let
 
   # The checkout, as the build needs it. wry_webview (gtk/webkit, desktop only)
   # is left out: a server drop does not carry it, and `wry/*` reads as ABSENT.
+  cleanDirectory = directory: omitted:
+    lib.fileset.difference directory
+      (lib.fileset.unions (map (name: lib.fileset.maybeMissing (directory + "/${name}")) omitted));
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../bin ../priv ../env.bl ../bl.lock ../scripts
+      ../bin
+      (cleanDirectory ../priv [ "native" "z3" ".bl" "codegen.sources" "precompiled.term" "sdk-code.term" ])
+      ../env.bl ../bl.lock
+      ../scripts/prepare-release.bl
+      ../scripts/qualify-artifact-generation
+      ../scripts/demo-artifact-production
+      ../scripts/check-source-floor
+      ../scripts/check-execution-history
       ../test/scripts/artifact-generation.bl
-      ../native/bl_json ../native/code_embed ../native/datom_datalog
-      ../native/datom_fjall ../native/datom_vector ../native/lazy_memo
+      (lib.fileset.unions (map (crate:
+        cleanDirectory (../native + "/${crate}") [ "target" ".git" ".bl" ]) nativeCrates))
       ../tooling/drop/src ../tooling/drop/Cargo.toml ../tooling/drop/Cargo.lock
     ];
   };
@@ -174,10 +185,9 @@ let
       ./bin/bl --cold seed --check
 
       # pinned z3, laid out as `bl install z3` leaves it
-      unzip -q ${z3} -d $TMPDIR/z3
       mkdir -p priv/z3/bin
-      cp $TMPDIR/z3/*/bin/z3 $TMPDIR/z3/*/bin/libz3.so priv/z3/bin/
-      cp $TMPDIR/z3/*/LICENSE.txt priv/z3/
+      cp ${z3Runtime}/bin/z3 ${z3Runtime}/bin/libz3.so priv/z3/bin/
+      cp ${z3Runtime}/LICENSE.txt priv/z3/
       echo 7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e > priv/z3/.fetched
 
       # the launcher the target executes: FHS loader, no store RUNPATH
@@ -200,6 +210,14 @@ let
       done
       cp $TMPDIR/selfbuilt.drop "$sdk/bl"
       chmod 555 "$sdk/bl"
+      mkdir -p "$sdk/bin"
+      cat > "$sdk/bin/bl" <<EOF
+      #!${pkgs.runtimeShell}
+      export PATH=${buildCheckout}/bin:\$PATH
+      export BL_ARTIFACT_PLATFORM=${buildCheckout}/artifact-platform
+      exec "$sdk/bl" "\$@"
+      EOF
+      chmod 555 "$sdk/bin/bl"
       printf '%s\n' '${builtins.toJSON {
         version = 1;
         kind = "sdk";
