@@ -30,7 +30,7 @@ class SealedProfiles(unittest.TestCase):
         self.assertEqual(['filesystem', 'filesystem-operations', 'filesystem-refresh', 'filesystem-regressions'], [g['id'] for g in selection['groups']])
         self.assertFalse(selection['pipeline'])
         self.assertFalse(selection['solver'])
-        self.assertEqual(['selfbuild', 'vm.native', 'build', 'deps-compile'], selection['roots'])
+        self.assertEqual(['selfbuild', 'vm.native', 'build', 'artifact', 'bl.artifacts', 'deps-compile'], selection['roots'])
         self.assertEqual(PROFILE['UNIVERSAL'], selection['universal'])
         self.assertEqual('focused', selection['mode'])
 

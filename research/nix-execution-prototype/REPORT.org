@@ -1,0 +1,182 @@
+#+title: Foundry-backed Nix execution experiment — results and decision
+#+date: 2026-10-25
+#+state: Experiment passed; infrastructure redirection recommended; production migration unimplemented
+
+* Decision
+Make Foundry's existing process/data interface the starting point for a Nix
+artifact backend. Delegate immutable artifact production to Nix and Linux
+external-job lifecycle to systemd. Keep compiler semantics, execution admission,
+callback/actor lifetimes, descriptors and in-VM generation retirement in BL.
+
+This is enough evidence to redirect the infrastructure portion of the ongoing
+execution work. It is not evidence to remove its implementations immediately,
+close its historical cases, or claim that all remaining work is solved.
+Read PLAN.org for the incremental replacement gates and CAPABILITIES.org for
+the proposed product experience. HANDOFF.org is the message for the other session.
+
+* Isolation and identities
+The prototype ran in /home/othman/projects/nix-execution-prototype, outside both
+implementation checkouts. Only this new research directory is added here.
+No tracked implementation, existing checklist, floor, native runtime, Foundry
+source, daemon configuration or production service was edited. No broad suite,
+SDK rebuild, deployment, global GC or cross-session message was performed.
+The other session was already changing the execution checklist and receipt.
+Its observed head advanced to 6bfb6796 before the prototype. Reconcile newer
+commits before implementing this plan; do not revert their repairs.
+
+inputs.json records heads, final fixture/evidence SHA256, the actual installed
+runtime SHA256 and Foundry executor/source hashes. The runtime was a frozen
+installed store binary in the separate experiment directory, not the changing
+checkout launcher. It proves this backend boundary, not compatibility with the
+other session's final compiler candidate. Foundry's native Nix codec library
+was absent; it was not compiled or exercised. The actual BL bridge reused
+Foundry's deployment-exec source and JSON to a fixed Nix recipe. The codec is
+useful for authoring/config edits but need not be a compiler boot prerequisite.
+
+* Actual prototype
+A dependency-free real Cargo crate exports answer() from a cdylib. The Nix
+recipe pins existing store tool paths and generates its source from a typed
+integer input. Cargo runs offline and locked with a private target directory.
+The result is a library and schema-versioned JSON manifest. Python ctypes
+loads the real library and checks its answer and SHA256. BL invokes the fixed
+request recipe through the real Foundry executor, decodes Nix JSON, reads the
+manifest and checks the returned answer. No fake Cargo or compiler is used.
+
+The prototype is intentionally host-specific: x86_64 Linux, absolute existing
+store tool paths, and an experiment-only scratch path in bridge.bl. A production
+backend must use derivation dependencies from the pinned flake, source filesets,
+complete request/result contracts, target inventories and explicit retention.
+The answer parameter is not a complete real-world source/ABI dependency closure.
+
+* Results
+results.json contains ten passing controls:
+| Control | Observed result |
+| Identity and reuse | Same request returns same store path; answer 43 changes path, bytes and actual loaded behavior |
+| Concurrent requests | Two independent clients return one output; retained Nix log contains exactly one builder-start marker |
+| Requester death | Kill the actual Nix client after builder-start; a new request obtains a valid product |
+| Descendant after builder exit | Child is confirmed ready, closes descriptors 3–9, and attempts a delayed output write; no late write appears |
+| Causal negative | Same unsupervised delayed writer writes successfully after its parent shell exits |
+| Failed build | A deliberately failed candidate is refused; previously valid output remains usable |
+| Explicit retention | Register a real indirect GC root, query it, remove it, confirm that reference is gone |
+| systemd descendant cleanup | Actual child calls setsid; kill service main; pidfd confirms descendant termination |
+| Filesystem isolation | An existing host-side canary is absent from the real Nix builder view |
+| Request refusal | Wrong argument type and unexpected JSON field refuse before artifact acceptance |
+
+bridge-result.json separately records a successful actual BL -> Foundry executor
+-> Nix -> manifest -> BL round trip, twice in one VM. A unique request token
+forces the first tiny library build, then the second reuses its exact output.
+First request: 241ms. Warm request: 22ms. Cold bridge service: 1.217s,
+119.8M reported peak, zero swap. Ten-control service: 17.666s, 25.3M reported
+client-tree peak, zero swap. These are single observations, not benchmarks or
+predictions for full compiler builds. Concurrent requests took about five seconds;
+no inference of a latency win is made for that case. The isolation case reused
+a prior result in the final pass; its first actual build also passed.
+
+The systemd client caps do NOT include workers in the separate Nix daemon.
+Nix was sandbox=true, sandbox-fallback=false, use-cgroups=false. Python build
+requests selected one local job/core and a 35s builder timeout; the BL build
+used a 30s client deadline. No claim of whole-build memory enforcement is made.
+Establish daemon worker containment before using large workloads.
+
+* What the experiment does not establish
+- Client death is not cancellation. The test accepts legitimate daemon-owned
+  continuation or safe restart, and does not distinguish them. A production
+  shared-request cancellation/reference policy remains to be tested.
+- The Nix delayed-write observation proves output stability over its window,
+  not a universal descendant-death proof. systemd death is separately observed.
+- Retention registration is tested; actual garbage collection, last-root races,
+  and realm-crash cleanup are not. No global collector was run.
+- No full compiler artifact generation, B/C reproduction, mandatory NIF loading,
+  SDK, native ABI matrix, remote worker or non-Linux product was qualified.
+- Result manifests are prototype checks, not authenticated runtime admission.
+  Tampered product/manifest refusals, target binding and loaded ABI identity
+  must be enforced and tested in the real consumer.
+- No Foundry codec round-trip, native codec build or generated Nix host deployment
+  is claimed. Existing codec evidence remains separate.
+
+* Findings that affect implementation
+1. Existing Foundry argv execution can carry a data request without shell
+   interpolation. Use a fixed recipe with a closed JSON request schema.
+2. Foundry normally merges stderr into stdout. Nix progress breaks naive JSON
+   decoding on a fresh build. Its existing private stdout-file option separates
+   machine results; the final bridge exercises a fresh build using this option.
+3. Existing store packages must retain Nix string context. In this raw prototype,
+   coercing path literals copied packages as source directories, losing the
+   expected runtime closure. builtins.storePath fixed the fixture. Production
+   should interpolate actual pinned derivations, not reconstructed path strings.
+4. Minimal sandbox shell packages are not full tool environments. Explicit
+   coreutils was needed. This is useful evidence for declaring all build inputs.
+5. Foundry's process-group executor is useful plumbing, but process groups alone
+   cannot contain setsid descendants. Reuse its data API while adding a real
+   cgroup-backed job adapter; do not treat its group cleanup as the final boundary.
+6. systemd expands dollar syntax in command arguments unless disabled. The
+   fixture sets --expand-environment=no. Passing arbitrary shell scripts as
+   service arguments is not the proposed production request interface.
+7. nix eval --file can return a lambda without exercising assertions. The
+   negative request gate uses nix build to force actual request application.
+
+Early fixture failures remain in attempt1/2/3.json; they are not product
+regressions. The final ten-control run passed after repairing the fixture.
+A smoke check also diagnosed store-path coercion before the final run.
+
+* Reproduction
+Fixtures are recorded verbatim in fixtures/. Python scripts resolve their local
+fixture directory. bridge.bl intentionally refers to the original scratch path;
+copy fixtures there before replaying the bridge, or update its explicit paths
+and record a new fixture identity. The store tool paths must exist on the host.
+
+Run experiment.py and supplement.py sequentially under a named, bounded
+systemd user service. Run bridge.bl once under the recorded frozen runtime,
+with -p /home/othman/code/undefine/foundry/src/foundry/support. Read scripts/bl-mem
+first. Do not invoke the changing checkout compiler just to replay this boundary.
+Final JSON receipts and inputs.json are the reviewable evidence. Tests clean up
+owned client processes, the private GC root and the supervisor test service.
+Small ordinary unrooted Nix outputs remain for normal store GC.
+
+* Research supporting the decision
+Local code and evidence inspected:
+- Foundry docs/nix-as-edn.bl.org: lossless native Nix grammar, projection refusals,
+  editing/generation; explicitly not a Nix evaluator.
+- Foundry src/foundry/host/deployment-render-host.bl: validated BL declarations,
+  Nix generation, parse/read-back checks.
+- Foundry src/foundry/support/deployment-exec.bl: bounded argv execution,
+  environment handling, private machine-output capture, group cleanup.
+- Foundry infra/foundry-host.nix and tests/integration/nixos-module-test.bl:
+  Nix-configured BL services/helpers and build-free evaluated module tests.
+- Foundry docs/beam-lisp-release-architecture.md: artifact identity, preparation,
+  readiness, code/data rollback separation and known runtime cache failures.
+- Foundry FUP-016: completed split Nix drop, reused native derivations, 390
+  assertions; .bl-only perturbation measurement remains a distinct obligation.
+- This checkout flake.nix and nix/bl-drop.nix: existing toolchain and dependency
+  pins, separate native/tools outputs, offline assembly and the Cargo shim.
+- Initial PLAN-enforced-execution-protocol.org and PLAN-phase-aware-language-and-execution.org;
+  current CHECKLIST-language-execution-completion.org, especially batches 2b–6.
+
+Primary external references researched in this conversation:
+- https://github.com/NixOS/nix/blob/master/doc/manual/source/store/building.md
+  Build environments, declared inputs, output paths and concurrent-build locks.
+- https://nix.dev/manual/nix/2.28/package-management/garbage-collection
+  Explicit roots and retained generations; not language ownership.
+- https://nix.dev/manual/nix/2.28/command-ref/conf-file.html
+  Sandbox and use-cgroups settings; inspect deployed version/configuration.
+- https://www.freedesktop.org/software/systemd/man/257/systemd.service.html
+  Main-process versus cgroup lifetime. Main-exit cleanup and drain-all are distinct policies.
+- https://www.freedesktop.org/software/systemd/man/252/systemd.kill.html
+  Group cleanup policy.
+- https://github.com/containers/bubblewrap/blob/main/README.md
+  Candidate local sandbox when a Nix derivation is the wrong granularity.
+- https://bazel.build/versions/7.5.0/docs/sandboxing
+  Strong action-sandbox alternative; would add another build integration.
+- https://docs.buildstream.build/2.8/main_install.html
+  BuildBox CAS/sandbox composition; alternative orchestration stack.
+- https://github.com/moby/buildkit
+  Cached build graphs and OCI workers; plausible OCI packaging backend.
+- https://github.com/bazelbuild/remote-apis
+  Optional future distributed action/cache contract, not needed for this slice.
+- https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md
+- https://gvisor.dev/docs/architecture_guide/intro/
+  Stronger hostile-workload isolation; no compiler-semantic guarantees.
+
+Nix plus systemd is preferred because it extends the existing deployed ecosystem.
+Bubblewrap remains a candidate for private local jobs. Another build orchestrator
+or stronger VM boundary requires a concrete unmet requirement first.
