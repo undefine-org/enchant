@@ -1,0 +1,83 @@
+(ns execution.solver-owner-test
+ (:require [proc.super :as super]))
+
+(defn- wait-for [predicate]
+ (loop [n 0]
+  (cond (predicate) true (>= n 200) false
+   :else (do (Process/sleep 5) (recur (inc n))))))
+
+(defn- owner-forms [source]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "priv/std/z3pool.bl")
+               #(and (contains? #{"defn-" "defserver"} (BeamLisp.AOT/stage-head %))
+                     (contains? #{"solver-command" "z3-solver"}
+                       (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 2 (count forms)) (throw :solver-owner-source-forms-changed))
+  forms))
+
+(defn- run-owner [source namespace directory]
+ ;; Compile the actual command wrapper and actor declarations in a private Env.
+ ;; Only the one-child supervision harness is test code; no SDK module is replaced.
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Compiler/eval_string (str "(ns " namespace " (:require [proc.super :as super]))"))
+     (doseq [form (owner-forms source)]
+      (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))
+     (BeamLisp.Compiler/eval_string
+      (str "(ns " namespace ")"
+           "(super/defsupervisor owner-tree (strategy :one-for-one) (child :solver z3-solver 0))"
+           "(defn start-tree [] (start-link owner-tree))"))
+     (let [start (BeamLisp.Env/fetch_exact! namespace "start-tree") tree (start)
+           supervisor (if (map? tree) (:pid tree) tree)
+           victim (super/child-of supervisor :solver) monitor (Process/monitor victim)]
+      (try
+       (let [result (try (gen_server/call victim [:command "(record-effect)"] 2000)
+                      (catch-raw [kind reason stack] {:kind kind :reason reason}))
+             replaced (wait-for #(let [current (super/child-of supervisor :solver)]
+                                  (and (erlang/is_pid current) (not= victim current))))
+             now (super/child-of supervisor :solver)
+             next (if replaced (gen_server/call now [:command "(reset)"] 2000)
+                    {:ok (gen_server/call now [:alive?] 2000)})]
+        {:replaced replaced :old-alive (Process/alive? victim) :next next
+         :original result :effects (File/read! (Path/join directory "effects"))})
+       (finally
+        (Process/demonitor monitor (list :flush))
+        (Supervisor/stop supervisor))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest an-incomplete-command-restarts-its-real-owner-without-replaying-the-effect
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "std/z3pool.bl"))
+       before "(when-not (BeamLisp.Z3Port/alive? port)"
+       after "(when (and false (BeamLisp.Z3Port/alive? port))"
+       root (Path/join (System/tmp_dir!) (str "solver-owner-" (erlang/unique_integer (list :positive))))
+       old-solver (System/get_env "BEAM_LISP_Z3") old-budget (System/get_env "BL_Z3_READ_TIMEOUT")]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :solver-owner-mutation-anchor-changed))
+   (System/put_env "BL_Z3_READ_TIMEOUT" "75")
+   (doseq [variant [:good :missing-retirement]]
+    (let [directory (Path/join root (name variant)) exe (Path/join directory "solver")]
+     (File/mkdir_p! directory) (File/write! (Path/join directory "effects") "")
+     (File/write! exe
+      (str "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nblocked=0\n"
+           "while IFS= read -r line; do\ncase \"$line\" in\n"
+           " *record-effect*) printf 'effect\\n' >> effects; blocked=1 ;;\n"
+           " *bl-ok*) if [ \"$blocked\" = 0 ]; then printf '%s\\n' \"$line\" | cut -d '\"' -f 2; else blocked=0; fi ;;\n"
+           "esac\ndone\n"))
+     (File/chmod! exe 493) (System/put_env "BEAM_LISP_Z3" exe)
+     (let [result (run-owner (if (= :good variant) source (String/replace source before after))
+                    (str "execution.solver.owner." (if (= :good variant) "good" "mutant")) directory)]
+      (println :solver-owner variant result)
+      (is (= (= :good variant) (:replaced result)))
+      (if (= :good variant)
+       (is (and (= :exit (:kind (:original result)))
+                (String/contains? (Kernel/inspect (:reason (:original result))) "Solver conversation retired")))
+       (is (= false (:ok (:original result)))))
+      (is (= (= :missing-retirement variant) (:old-alive result)))
+      (is (= "effect\n" (:effects result)) "the accepted command effect occurs exactly once")
+      (is (= (= :good variant) (:ok (:next result)))))))
+   (finally
+    (if (nil? old-solver) (System/delete_env "BEAM_LISP_Z3") (System/put_env "BEAM_LISP_Z3" old-solver))
+    (if (nil? old-budget) (System/delete_env "BL_Z3_READ_TIMEOUT") (System/put_env "BL_Z3_READ_TIMEOUT" old-budget))
+    (File/rm_rf! root)))))
