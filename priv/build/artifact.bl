@@ -4,6 +4,14 @@
 
 (def schema 1)
 (defn- refuse [message data] (throw (ex-info message (assoc data :kind :artifact-refused))))
+(defn- immutable-directory! [path]
+  (let [expanded (Path/expand path)
+        link (File/read_link expanded)
+        resolved (if (= :ok (erlang/element 1 link)) (erlang/element 2 link) expanded)]
+    (when-not (and (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" resolved)
+                  (File/dir? resolved))
+      (refuse "A retained immutable store directory is required" {:path path}))
+    resolved))
 (defn- digest [bytes]
   (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
 (defn- name? [value]
@@ -109,10 +117,62 @@
                             {} ["XDG_RUNTIME_DIR" "DBUS_SESSION_BUS_ADDRESS"])
         result (process/run manager args {:timeout-ms (+ timeout 5000) :limit 65536 :stdout-file stdout :env environment})]
     (when-not (process/ok? result)
-      (refuse "Native artifact preparation failed" {:status (:status result) :detail (:out result)}))
-    (when (> (:size (File/stat! stdout)) 65536)
+      (refuse "Artifact preparation failed" {:status (:status result) :detail (:out result)}))
+    (when (> (:size (File/stat! stdout)) 16777216)
       (refuse "Artifact machine result exceeds capacity" {}))
     (File/read! stdout)))
+
+(defn prepare-application!
+  "Realize an application through the trusted recipe and an exact SDK. Source
+   roots are explicit project-relative input declarations, including supporting
+   files. Every request retains its SDK, source and result independently.
+   This prepares a product; it does not publish files or execute its units."
+  [options]
+  (let [platform (immutable-directory! (or (:platform options) (System/fetch_env! "BL_ARTIFACT_PLATFORM")))
+        sdk (immutable-directory! (:sdk options))
+        source (Path/expand (:source options))
+        roots (:roots options)
+        timeout (or (:timeout-ms options) 3600000)
+        memory 2147483648
+        nix (process/tool "nix")
+        store (process/tool "nix-store")
+        _ (when-not (and nix store (File/dir? source) (sequential? roots) (seq roots)
+                         (int? timeout) (>= timeout 1000) (<= timeout 3600000))
+            (refuse "Application preparation requires Nix, declared source roots and bounded time" {}))
+        directory (fresh-directory! (or (:retention-dir options) (cache-root)) "application")
+        run (fn [label executable argv]
+              (managed! platform executable argv timeout memory (Path/join directory (str label ".json"))))
+        _ (run "sdk-retention" store
+               ["--add-root" (Path/join directory "sdk-retained") "--indirect" "--realise" sdk])
+        snapshot-rows (Jason/decode!
+                        (run "source" nix
+                          ["build" "--impure" "--file" (Path/join platform "nix/project-snapshot.nix")
+                           "--argstr" "source" source "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
+                           "--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"]))
+        _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one project snapshot" {}))
+        snapshot (immutable-directory! (get-in (first snapshot-rows) ["outputs" "out"]))
+        request {"version" 1 "source" snapshot "sources" (Enum/map (or (:sources options) []) identity)
+                 "world" (:world options) "exclude" (Enum/map (or (:exclude options) []) identity)
+                 "ex" (when-let [ex (:ex options)] {"root" (:root ex) "exclude" (Enum/map (or (:exclude ex) []) identity)})
+                 "native" (boolean (:native options)) "jobs" (or (:jobs options) 1)}
+        request-path (Path/join directory "request.json")
+        _ (File/write! request-path (Jason/encode! request))
+        rows (Jason/decode!
+               (run "product" nix
+                 ["build" "--impure" "--file" (Path/join platform "nix/application-artifact.nix")
+                  "--argstr" "requestPath" request-path "--argstr" "sdk" sdk
+                  "--json" "--out-link" (Path/join directory "retained") "--max-jobs" "0"]))
+        _ (when-not (= 1 (count rows)) (refuse "Expected one application output" {}))
+        output (immutable-directory! (get-in (first rows) ["outputs" "out"]))
+        result (Jason/decode!
+                 (run "verification" (Path/join platform "bin/python3")
+                   [(Path/join platform "nix/application-inventory.py") "verify" output sdk snapshot]))
+        receipt {:output output :sdk sdk :source snapshot :request request :result result
+                 :derivation (get (first rows) "drvPath") :retention-root (Path/join directory "retained")}]
+    (when-not (= (tuple :ok output) (File/read_link (:retention-root receipt)))
+      (refuse "Application retention does not name its product" {}))
+    (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+    receipt))
 
 (defn prepare-native!
   "Prepare and retain a native product through Nix and a bounded systemd client.

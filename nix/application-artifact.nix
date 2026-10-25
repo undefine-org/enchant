@@ -87,4 +87,6 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
     sdk = toString image;
     target = "x86_64-linux";
   }}' > "$out/artifact.json"
+  ${pkgs.python3}/bin/python3 ${./application-inventory.py} write "$out"
+  ${pkgs.python3}/bin/python3 ${./application-inventory.py} verify "$out" ${image} ${source} >/dev/null
 '')
