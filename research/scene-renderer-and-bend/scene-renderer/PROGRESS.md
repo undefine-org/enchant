@@ -1,3 +1,26 @@
+# Latest creative direction: product narrative storyboard
+
+The user requested a complete product story after rejecting spectacle alone.
+[PRODUCT-STORYBOARD.md](PRODUCT-STORYBOARD.md) defines the 60-second “Hello, world.”
+film in 12 timed shots, with a distinct 30-second edit. One project connects all
+interactions and transformations; the finished image must visibly contain the
+creator’s earlier decisions. Primary advertising copy is brand/category/CTA;
+layout, instance relationships, time manipulation, inspection and export carry
+the product explanation visually. Per-shot production gates distinguish existing
+primitives from the unimplemented integrated workflow.
+
+[Visual review board](evidence/storyboard/index.html): twelve original native SVG
+poses, timed storyboard player (stills, not final animation), scrub/shot navigation,
+full treatment, contact mode and print. Desktop, all twelve navigation targets,
+play/pause, final boundary and 390-pixel layout were checked in Chromium. All SVGs
+parse; the shot range is contiguous and totals 60 seconds. Desktop/mobile/contact
+screenshots and checks are retained. Browser/profile cleaned up; no BEAM launched.
+The intentional four-hour review service is `bl-scene-storyboard-review`,
+`http://100.124.205.18:4053/storyboard/`. The storyboard is a draft; no user approval
+or completed product-film implementation is inferred.
+
+---
+
 # Latest: MAKE WORLDS material and motion showcase
 
 The user rejected the slow diagram study. The completed replacement is a

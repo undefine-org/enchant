@@ -177,3 +177,25 @@ browser playback and seeking passed. An intentional four-hour review server is
 `bl-scene-showcase-review` on `http://100.124.205.18:4052/`; owned browser tests are
 stopped. The GPU executor is private to this film; public shader/studio integration
 remains open. Continue autonomous commits and preserve the independent tracks.
+
+## Product narrative storyboard
+
+The user rejected spectacle without a product narrative and requested a complete
+storyboard optimized for visual communication and crisp copy. The drafted
+`PRODUCT-STORYBOARD.md` and `evidence/storyboard/index.html` follow one project,
+“Hello, world.”, through finished artwork → product reveal → title/layout edit →
+shared rule → family → motion → exact seek → inspection → material transformation
+→ cumulative result → accepted export → invitation. The master is 60 seconds,
+12 shots, no voiceover; a separate 30-second adaptation is specified. Each shot
+records framing, action, viewer meaning, copy, sound, transition and production gate.
+
+This is proposed staging, not a new film or a capture of a shipped general studio.
+Source refresh/picking/unified material controls/general project export remain
+explicit production gates. The old shader reel is a material study, not the
+approved product narrative. No user approval of this draft is assumed. The next
+production step, if continuing the film, is a silent gray-box animatic of the
+causal interactions before more shader work. The review board has timed stills,
+seek, direct shot navigation, full treatment, contact mode and print; all 12 poses
+and mobile layout were checked. No BEAM was launched. The browser/profile are
+cleaned up. `bl-scene-storyboard-review` intentionally serves the evidence folder
+for four hours at `http://100.124.205.18:4053/storyboard/`.

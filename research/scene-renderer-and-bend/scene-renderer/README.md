@@ -36,6 +36,15 @@ measurable-card and selected-frame studio slices are now implemented. See
 [A1 evidence](evidence/a1/checks.json), and [PROGRESS.md](PROGRESS.md). The design
 examples still describe a broader API; they are not all available signatures.
 
+## Current product film storyboard
+
+The latest creative direction is [Hello, world.](evidence/storyboard/index.html),
+a 60-second, 12-shot product narrative. [The full treatment](PRODUCT-STORYBOARD.md)
+specifies visual causality, camera blocking, copy, sound, continuous transitions,
+readability, implementation gates and a separate 30-second adaptation. The
+[contact sheet](evidence/storyboard/contact.png) shows all twelve staging poses.
+These are proposed boards, not footage of an already integrated generic studio.
+
 ## Current implementation and retained artifacts
 
 The current showcase is [MAKE WORLDS](evidence/showcase/index.html): a
