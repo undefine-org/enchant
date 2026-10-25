@@ -66,3 +66,57 @@
    (finally
     (doseq [module [good mutant]] (code/purge module) (code/delete module))
     (File/rm_rf! root)))))
+
+(defn- registry-reader [source ns-name]
+ ;; Select real forms with the language reader. No alternate Source parser and
+ ;; no copied implementation of the registry decision protocol.
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "priv/lib/datom/conn.bl")
+                #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                      (contains? #{"agent-get-and-update" "agent-get"}
+                                 (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 2 (count forms))
+   (throw (ex-info "Connection registry reader forms changed" {})))
+  (BeamLisp.Compiler/eval_string (str "(ns " ns-name ")"))
+  (Enum/each forms #(BeamLisp.Compiler/eval_form % (BeamLisp.Compiler/new_env ns-name)))
+  (BeamLisp.Env/fetch_exact! ns-name "agent-get")))
+
+(deftest E66-registry-read-causal-mutation-raises-in-the-shared-agent
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "lib/datom/conn.bl"))
+       before "(agent-get-and-update agent (fn [state] (tuple (action state) state)) timeout)"
+       after "(Agent/get agent (BeamLisp.Env/convey action) timeout)"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       good (elem (Agent/start (fn [] {:connection :original})) 1)
+       bad (elem (Agent/start (fn [] {:connection :original})) 1)
+       monitor (Process/monitor bad)
+       shared-before (Process/whereis :datom-conn-registry)]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before)))
+    (throw (ex-info "Historical registry mutation anchor changed" {})))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal (registry-reader source "history.registry.good")
+           changed (String/replace source before after)
+           mutant (registry-reader changed "history.registry.mutant")
+           reject (fn [_] (throw (ex-info "Invalid historical handle" {:kind :history-invalid-handle})))
+           normal-result (try (normal good reject 5000) :unexpected-success
+                           (catch-raw [kind reason stack] {:class kind :kind (:kind (ex-data reason))}))
+           mutant-result (try (mutant bad reject 5000) :unexpected-success
+                           (catch-raw [kind reason stack] {:class kind}))
+           down (receive [:DOWN seen :process pid reason]
+                  :when (and (= monitor seen) (= bad pid)) (not= :normal reason)
+                  (after 5000 false))]
+      (println :history-E66 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                            :mutant-sha256 (Base/encode16 (crypto/hash :sha256 changed))
+                            :normal normal-result :mutant mutant-result :mutant-down down})
+      (is (= {:class :error :kind :history-invalid-handle} normal-result))
+      (is (Process/alive? good))
+      (is (= {:connection :original} (normal good (fn [state] state) 5000)))
+      (is (= {:class :exit} mutant-result))
+      (is (= true down))
+      (is (= false (Process/alive? bad)))
+      (is (= shared-before (Process/whereis :datom-conn-registry))))))
+   (finally
+    (Process/demonitor monitor (list :flush))
+    (doseq [pid [good bad]] (when (Process/alive? pid) (Agent/stop pid)))
+    (BeamLisp.Env/destroy scope)))))
