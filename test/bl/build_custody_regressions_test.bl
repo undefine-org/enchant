@@ -1,0 +1,132 @@
+(ns build-custody-regressions.test
+ (:require [claim :as c] [store :as store] [deps-compile :as dc] [selfbuild]))
+
+(defn- fixture [action]
+ (let [root (Path/join (System/tmp_dir!) (str "custody-regression-" (erlang/unique_integer (list :positive))))
+       prior (System/get_env "XDG_CACHE_HOME")]
+  (File/mkdir_p! root)
+  (try
+   (System/put_env "XDG_CACHE_HOME" root)
+   (action root)
+   (finally
+    (if prior (System/put_env "XDG_CACHE_HOME" prior) (System/delete_env "XDG_CACHE_HOME"))
+    (File/rm_rf! root)))))
+(defn- custody [path] ((BeamLisp.Env/fetch_exact! "store" "entry-custody") path))
+(defn- handle [path] (Process/get ((BeamLisp.Env/fetch_exact! "claim" "handle-key") path)))
+(defn- down! [worker watch]
+ (erlang/exit worker :kill)
+ (receive [:DOWN ref :process pid _] :when (and (= ref watch) (= pid worker)) :ok
+  (after 5000 (throw :custody-worker-not-down))))
+(defn- with-other-owner [scope action]
+ (let [parent (erlang/self)
+       [worker watch] (spawn-monitor
+                      (fn []
+                       (erlang/send parent [:held (:ok? (c/acquire! scope "other owner"))])
+                       (receive :finish :ok)))]
+  (try
+   (receive [:held owned] (assert owned) (after 5000 (throw :custody-worker-not-ready)))
+   (action)
+   (finally (down! worker watch)))))
+(defn- retained! [scope resource record]
+ (is (c/owned? scope))
+ (is (= resource (handle scope)))
+ (is (= (tuple :ok record) (File/read (c/path-for scope))))
+ (let [parent (erlang/self)
+       [worker watch] (spawn-monitor
+                      (fn []
+                       (let [r (c/acquire! scope "contender")]
+                        (when (:ok? r) (c/release! scope))
+                        (erlang/send parent [:competing (:ok? r)]))))]
+  (is (= false (receive [:competing accepted] accepted (after 5000 :timeout))))
+  (receive [:DOWN ref :process pid _] :when (and (= ref watch) (= pid worker)) :ok
+   (after 5000 (throw :contender-not-down)))))
+
+(deftest published-temp-looking-versions-survive-listing-and-sweep-under-their-actual-owner
+ (fixture
+  (fn [root]
+   (let [source (Path/join root "input") sha (String/duplicate "45678901" 8) version "1.0.0+foo.tmp-123"]
+    (File/mkdir_p! source) (File/write! (Path/join source "payload") "published")
+    (let [dir (store/install-dir! "demo" version sha source) inode (:inode (File/stat! dir))]
+     (is (some #(= dir (:dir %)) (store/entries)))
+     (with-other-owner (custody dir)
+      (fn []
+       (is (= 0 (store/sweep-temp!)))
+       (is (= inode (:inode (File/stat! dir))))
+       (is (= "published" (File/read! (Path/join dir "payload"))))))
+     (is (= 0 (store/sweep-temp!)))
+     (is (store/present? "demo" version sha)))))))
+
+(deftest sweeping-takes-the-candidates-own-custody-as-well-as-the-legacy-installers
+ (fixture
+  (fn [_]
+   (let [dir (store/dir-for "demo" "1" (String/duplicate "a" 64)) tmp (str dir ".tmp-123-456")]
+    (File/mkdir_p! tmp) (File/write! (Path/join tmp "payload") "uncommitted")
+    (with-other-owner (custody tmp)
+     (fn []
+      (is (= 0 (store/sweep-temp!)))
+      (is (= "uncommitted" (File/read! (Path/join tmp "payload"))))))
+    (is (= 1 (store/sweep-temp!)))
+    (is (not (File/exists? tmp)))))))
+
+(deftest nested-dependency-success-and-failure-preserve-the-callers-actual-claim
+ (fixture
+  (fn [_]
+   (doseq [[name source expected] [["custody_dep_ok" "-module(custody_dep_ok).\n-export([answer/0]).\nanswer() -> 42.\n" :compiled]
+                                 ["custody_dep_bad" "-module(custody_dep_bad).\nthis is invalid erlang.\n" :failed]]]
+    (let [e {:name name :vsn "1.0.0" :sha (String/duplicate "c" 64)}
+          dir (store/dir-for name (:vsn e) (:sha e)) ad (dc/app-dir e)]
+     (File/mkdir_p! (Path/join dir "src"))
+     (File/write! (Path/join dir (str "src/" name ".erl")) source)
+     (File/write! (Path/join dir (str "src/" name ".app.src"))
+      (str "{application, " name ", [{vsn, \"1.0.0\"}, {applications, [kernel, stdlib]}]}.\n"))
+     (c/acquire! ad "outer dependency operation")
+     (try
+      (let [resource (handle ad) record (File/read! (c/path-for ad))]
+       (is (= expected (:state (dc/ensure! e nil 0))))
+       (retained! ad resource record))
+      (finally (c/release! ad))))))))
+
+(deftest failed-library-staging-preserves-the-callers-sdk-root-claim-before-child-birth
+ (fixture
+  (fn [root]
+   (let [workspace ((BeamLisp.Env/fetch_exact! "selfbuild" "library-root"))
+         compile (BeamLisp.Env/fetch_exact! "selfbuild" "do-library-compile")]
+    (c/acquire! workspace "outer SDK operation")
+    (try
+     (File/mkdir_p! (Path/join workspace "priv/nested"))
+     (File/write! (Path/join workspace "priv/nested/.claim") "undrained nested workspace")
+     (let [resource (handle workspace) record (File/read! (c/path-for workspace))]
+      (is (= :build-workspace-nested-claim
+             (try (compile {:ok? true :errors [] :stages {}} (Path/join root "scratch") (Path/join root "payload") 1)
+              :accepted (catch error (:kind (ex-data error))))))
+      (retained! workspace resource record))
+     (finally (c/release! workspace)))))))
+
+(deftest failed-selfbuild-before-assembly-preserves-the-callers-staging-claim
+ (fixture
+  (fn [root]
+   ;; Evaluate the exact current consumer in an isolated test namespace, with
+   ;; only its fixed staging path redirected to a private directory.
+   (let [workspace (Path/join root "stage") scratch (Path/join root "not-a-directory")
+         launcher (Path/join root "launcher")
+         image-source (Path/join (BeamLisp.Tiers/priv_root) "build/selfbuild.bl")
+         source-path (if (File/regular? image-source) image-source
+                       (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) "priv/build/selfbuild.bl"))
+         source (File/read! source-path)
+         anchor "(Path/join (System/tmp_dir) \"bl-selfbuild-src\")"]
+    (assert (= 2 (count (String/split source anchor))))
+    (BeamLisp.Compiler/eval_string
+     (-> source (String/replace "(ns selfbuild" "(ns execution.history.private-stage-selfbuild")
+                (String/replace anchor (pr-str workspace))))
+    (File/write! scratch "force ENOTDIR before any assembly or child")
+    (File/write! launcher "plain launcher")
+    (c/acquire! workspace "outer self-build")
+    (try
+     (let [resource (handle workspace) record (File/read! (c/path-for workspace))
+           run (BeamLisp.Env/fetch_exact! "execution.history.private-stage-selfbuild" "run")]
+      (is (= :refused
+             (File/cd! root (fn []
+              (try (run {:bin launcher :out (Path/join root "out") :scratch scratch}) :accepted
+               (catch _ :refused))))))
+      (retained! workspace resource record))
+     (finally (c/release! workspace)))))))

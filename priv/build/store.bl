@@ -110,23 +110,44 @@
                (Regex/match? (Regex/compile! "^[0-9]+(-[0-9]+)?$") (last parts)))
       (Path/join (Path/dirname path) (Enum/join (Enum/drop (to-list parts) -1) ".tmp-")))))
 
+(defn- published-entry? [path]
+  ;; A published version can itself contain .tmp-<digits>. Its content address,
+  ;; not that substring, identifies a complete immutable entry. Ambiguous legacy
+  ;; temporaries with an identical address/marker are conservatively retained.
+  (let [read (File/read (sha-file path))]
+    (and (= :ok (elem read 0)) (File/dir? path)
+         (let [sha (String/trim (elem read 1))]
+           (and (Regex/match? (Regex/compile! "^[0-9a-fA-F]{64}$") sha)
+                (String/ends_with? (Path/basename path) (str "-" (subs sha 0 8))))))))
+
+(defn- sweep-candidate! [path entry]
+  (let [candidate (entry-custody path) installer (entry-custody entry)]
+    ;; One spelling can be either a legacy temporary or a published address.
+    ;; Own both possible writers before checking its marker or removing bytes.
+    ;; Never sweep this process's own in-progress operation.
+    (if (or (c/owned? candidate) (c/owned? installer)) false
+      (try
+        (c/with-writer! candidate "store sweep candidate"
+          (fn []
+            (c/with-writer! installer "store sweep installer"
+              (fn []
+                (if (or (published-entry? path) (= (tuple :error :enoent) (File/lstat path)))
+                  false
+                  (do (File/rm_rf! path) true))))))
+        (catch error
+          (if (= :build-workspace-held (:kind (ex-data error))) false (throw error)))))))
+
 (defn sweep-temp!
-  "Sweep inactive temporary installs. An active entry's actual kernel custody
-   excludes cleanup; a diagnostic PID or stale-looking name never authorizes it."
+  "Sweep inactive legacy temporary installs under both candidate and installer
+   custody. Complete content-addressed publication is never inferred as scratch
+   from its name; marker validation happens after acquiring the actual scopes."
   []
   (let [directory (root)]
     (if-not (File/dir? directory) 0
       (reduce
         (fn [removed path]
           (if-let [entry (temporary-entry path)]
-            (let [custody (entry-custody entry) ours (c/owned? custody)
-                  acquired (if ours {:ok? false} (c/acquire! custody "store sweep"))]
-              ;; Even this process must not sweep its own in-progress install.
-              (if-not (:ok? acquired) removed
-                (try
-                  (if (File/exists? path)
-                    (do (File/rm_rf! path) (inc removed)) removed)
-                  (finally (c/release! custody)))))
+            (if (sweep-candidate! path entry) (inc removed) removed)
             removed))
         0 (Path/wildcard (Path/join directory "*"))))))
 
@@ -142,7 +163,7 @@
                             (let [base (Path/basename p)
                                   parts (String/split base "-")
                                   n (count parts)]
-                              (when (and (File/dir? p) (not (temporary-entry p)) (>= n 3))
+                              (when (and (File/dir? p) (or (not (temporary-entry p)) (published-entry? p)) (>= n 3))
                                 {:name (join "-" (take (- n 2) parts))
                                  :vsn (nth parts (- n 2))
                                  :sha8 (nth parts (dec n))

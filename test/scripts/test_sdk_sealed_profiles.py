@@ -20,17 +20,17 @@ class SealedProfiles(unittest.TestCase):
         matrix = json.loads((ROOT / 'research/phase-compiler/sdk-boundary-consumers.json').read_text())
         self.assertEqual({b['id'] for b in matrix['boundaries']}, set(selection['boundaries']))
         self.assertEqual(list(PROFILE['GROUPS']), [g['id'] for g in selection['groups']])
-        self.assertEqual(1010 + 92 + 71 + 60, selection['assertions'])
+        self.assertEqual(1010 + 92 + 71 + 60 + 30, selection['assertions'])
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])
 
     def test_focused_custody_avoids_unrelated_analyses_and_retains_universal_integrity(self):
         selection = PROFILE['plan'](['filesystem-custody'])
-        self.assertEqual(['filesystem', 'filesystem-operations', 'filesystem-refresh'], [g['id'] for g in selection['groups']])
+        self.assertEqual(['filesystem', 'filesystem-operations', 'filesystem-refresh', 'filesystem-regressions'], [g['id'] for g in selection['groups']])
         self.assertFalse(selection['pipeline'])
         self.assertFalse(selection['solver'])
-        self.assertEqual(['selfbuild', 'vm.native', 'build'], selection['roots'])
+        self.assertEqual(['selfbuild', 'vm.native', 'build', 'deps-compile'], selection['roots'])
         self.assertEqual(PROFILE['UNIVERSAL'], selection['universal'])
         self.assertEqual('focused', selection['mode'])
 
