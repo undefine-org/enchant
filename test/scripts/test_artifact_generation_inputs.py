@@ -23,13 +23,14 @@ class ArtifactGenerationInputsTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        for folder in ("scripts", "test/scripts", "priv/boot", "priv/bootstrap/seed"):
+        for folder in ("scripts", "test/scripts", "priv/boot", "priv/bootstrap/seed", "priv/native"):
             (self.root / folder).mkdir(parents=True)
         shutil.copy2(SCRIPT, self.root / "scripts/qualify-artifact-generation")
         (self.root / "scripts/demo-artifact-production").write_text("BOOT = ''\n")
         (self.root / "scripts/check-source-floor").write_text("")
         (self.root / "test/scripts/artifact-generation.bl").write_text("nil\n")
         (self.root / "priv/boot/example.bl").write_text("(ns example)\n")
+        (self.root / "priv/native/inert.so").write_bytes(b"inert native input, never loaded")
         (self.root / "env.bl").write_text("{}\n")
         self.seed = self.root / "priv/bootstrap/seed"
         (self.seed / "manifest.term").write_text("inert manifest placeholder\n")
@@ -86,6 +87,14 @@ class ArtifactGenerationInputsTest(unittest.TestCase):
             if destination.name == "ebin":
                 image = destination.parents[3]
                 (image / "priv/boot/example.bl").write_text("(ns changed)\n")
+
+        self.assert_copy_refused(damage)
+
+    def test_copied_native_product_is_checked_before_code_starts(self):
+        def damage(destination):
+            if destination.name == "ebin":
+                image = destination.parents[3]
+                (image / "priv/native/inert.so").write_bytes(b"changed native copy")
 
         self.assert_copy_refused(damage)
 
