@@ -10,6 +10,7 @@
 (deftest product-refuses-mutable-and-traversing-output-addresses
   (is (refused? #(a/verify! "/tmp/old-library" {"crate" "demo"})))
   (is (refused? #(a/verify! "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo/../other" {"crate" "demo"}))))
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
 (deftest actual-native-product-identity-and-byte-verification
   (when-let [output (System/get_env "BL_ARTIFACT_TEST_OUTPUT")]
     (let [request {"version" 1 "source" (get (Jason/decode! (File/read! (str output "/artifact.json"))) "source") "crate" "lazy_memo" "abi" "beam-lisp-native-lazy_memo-v1" "target" "x86_64-linux"}
@@ -17,6 +18,7 @@
       (is (= (str output "/lib/lazy_memo.so") (:library verified)))
       (is (refused? #(a/verify! output (assoc request "abi" "wrong-abi"))))
       (is (refused? #(a/verify! output (assoc request "target" "wrong-target")))))))
+)
 
 (deftest exact-source-and-abi-binding-refuse-a-different-product
   (let [left {"output" "/nix/store/left" "manifest" {"source" "a" "abi" "v1" "sha256" "same"}}
@@ -25,6 +27,7 @@
     (is (= false (:same-output report)))
     (is (= [{:field "abi" :before "v1" :after "v2"}] (:changes report)))))
 
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
 (deftest actual-nix-provider-retains-snapshot-and-build-consumer-selects-store-bytes
   (let [platform (System/fetch_env! "BL_ARTIFACT_PLATFORM")
         output (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR")
@@ -37,6 +40,7 @@
     (File/write! (Path/join output "product.json") (Jason/encode! product))
     (let [capsule (a/capsule! product (Path/join output "capsules"))]
       (is (= "not-recorded" (get (:descriptor capsule) "qualification")))
+      (is (= (:derivation product) (get (:descriptor capsule) "derivation")))
       (is (= (tuple :ok (:output product)) (File/read_link (Path/join (:directory capsule) "retained")))))
     (File/mkdir_p! (Path/dirname source))
     (File/cp_r! (get (:manifest product) "source") source)
@@ -84,8 +88,9 @@
                 "the changed snapshot reaches the actual Rust compiler")
             (is (= (tuple :ok (:library product)) (File/read_link destination)))))
         (finally (if before (System/put_env "BL_NATIVE_PROVIDER" before) (System/delete_env "BL_NATIVE_PROVIDER")))))))
+)
 
-
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
 (deftest consumer-metadata-changes-reuse-the-compiled-native-product
   (let [platform (System/fetch_env! "BL_ARTIFACT_PLATFORM")
         root (System/fetch_env! "BL_ARTIFACT_SOURCE_ROOT")
@@ -100,3 +105,43 @@
     (is (= (get-in prior ["manifest" "compiled"]) (get (:manifest changed) "compiled")))
     (is (= (get-in prior ["manifest" "sha256"]) (get (:manifest changed) "sha256")))
     (File/write! (Path/join output "metadata-product.json") (Jason/encode! changed))))
+)
+
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
+(deftest checkout-executor-staging-authenticates-bytes-before-an-actual-command
+  (let [source (System/fetch_env! "BL_ARTIFACT_SOURCE_ROOT")
+        output (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR")
+        workspace (Path/join output "command-workspace")
+        prior (System/get_env "BL_ARTIFACT_PLATFORM")
+        printf (System/find_executable "printf")]
+    (assert (some? printf))
+    (File/mkdir_p! workspace)
+    (claim/acquire! workspace "artifact executor consumer")
+    (try
+      ;; A checkout supplies its helper through Nix; Cargo is absent from this
+      ;; test VM's PATH. The default resolver does not depend on project cwd.
+      (System/put_env "BL_ARTIFACT_PLATFORM" source)
+      (let [executor (claim/command-executor)
+            result (claim/command! workspace printf ["staged-command-ok"]
+                                  {:timeout-ms 5000 :memory-bytes 268435456 :output-bytes 1024})]
+        (is (String/starts_with? executor "/nix/store/"))
+        (is (= 0 (elem result 1)))
+        (is (String/contains? (elem result 0) "staged-command-ok"))
+        (is (claim/owned? workspace))
+        (File/write! (Path/join output "executor.json")
+          (Jason/encode! {"path" executor
+                          "sha256" (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! executor))))})))
+      ;; Matching protocol text alone cannot replace authenticated bytes.
+      (let [fake (Path/join output "fake-platform")]
+        (File/mkdir_p! (Path/join fake "bin"))
+        (File/write! (Path/join fake "bin/bl-command-executor") "BEAM_LISP_CUSTODY_COMMAND_V1")
+        (File/write! (Path/join fake "executor.json")
+                     (Jason/encode! {"version" 1 "protocol" "BEAM_LISP_CUSTODY_COMMAND_V1" "sha256" "wrong"}))
+        (System/put_env "BL_ARTIFACT_PLATFORM" fake)
+        (is (= :command-executor-identity
+               (try (claim/command! workspace printf ["must-not-start"] {}) :accepted
+                    (catch error (:kind (ex-data error)))))))
+      (finally
+        (claim/release! workspace)
+        (if prior (System/put_env "BL_ARTIFACT_PLATFORM" prior) (System/delete_env "BL_ARTIFACT_PLATFORM"))))))
+)

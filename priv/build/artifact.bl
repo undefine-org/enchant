@@ -173,6 +173,9 @@
   (let [value (fn [key] (or (get receipt key) (get receipt (keyword key))))
         expected (value "request")
         product (verify! (value "output") expected)
+        derivation (value "derivation")
+        _ (when-not (and (string? derivation) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+[.]drv$" derivation))
+            (refuse "A capsule requires its recorded derivation identity" {}))
         directory (fresh-directory! (Path/expand parent) "capsule")
         stdout (Path/join directory "retain.txt")
         root (Path/join directory "retained")]
@@ -184,12 +187,46 @@
         (when-not (= (tuple :ok (:output product)) (File/read_link root))
           (refuse "Capsule root disagrees with its verified product" {}))
         (let [descriptor {"version" schema "kind" "artifact-capsule"
-                          "request" expected "output" (:output product)
+                          "request" expected "output" (:output product) "derivation" derivation
                           "manifest" (:manifest product)
                           "compiler" (BeamLisp.AOTCache/current_compiler_key)
                           "loadedNative" (BeamLisp.LazyMemo/runtime_identity!)
                           "qualification" "not-recorded"}]
           (File/write! (Path/join directory "capsule.json") (Jason/encode! descriptor))
           {:directory directory :descriptor descriptor}))
+      (catch error (File/rm_rf! directory) (throw error))
+      (finally (File/rm stdout)))))
+
+(defn prepare-platform!
+  "Stage a trusted checkout's immutable recipes and authenticated command helper.
+   This Nix build owns private outputs and needs no Source filesystem loan."
+  [platform]
+  (let [platform (Path/expand platform)
+        recipe (Path/join platform "nix/prepare-platform.nix")
+        nix (process/tool "nix")
+        _ (when-not (and nix (File/regular? recipe))
+            (refuse "Artifact platform cannot stage its command executor" {:platform platform}))
+        directory (fresh-directory! (cache-root) "platform")
+        stdout (Path/join directory "result.json")
+        root (Path/join directory "retained")]
+    (try
+      (let [rows (Jason/decode!
+                   (managed! platform nix ["build" "--impure" "--file" recipe "--json" "--out-link" root
+                                          "--max-jobs" "1" "--cores" "1" "--option" "timeout" "300"]
+                             300000 1073741824 stdout))
+            _ (when-not (= 1 (count rows)) (refuse "Expected one staged platform" {}))
+            output (get-in (first rows) ["outputs" "out"])
+            _ (when-not (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output))
+                (refuse "Staged platform must be an immutable store object" {}))
+            executor (Path/join output "bin/bl-command-executor")
+            manifest (Jason/decode! (File/read! (Path/join output "executor.json")))]
+        (when-not (and (= 1 (get manifest "version"))
+                       (= "BEAM_LISP_CUSTODY_COMMAND_V1" (get manifest "protocol"))
+                       (= (digest (File/read! executor)) (get manifest "sha256"))
+                       (= (tuple :ok output) (File/read_link root)))
+          (refuse "Staged executor identity or retention disagrees" {}))
+        (let [receipt {:platform output :executor executor :manifest manifest :retention-root root}]
+          (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+          receipt))
       (catch error (File/rm_rf! directory) (throw error))
       (finally (File/rm stdout)))))

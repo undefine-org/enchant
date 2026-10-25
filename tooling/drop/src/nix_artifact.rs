@@ -11,10 +11,18 @@ fn store_object(path: &str) -> bool {
 /// Build resolution includes the selected trusted recipe/lock, even when the
 /// platform lives outside the application's source tree.
 pub(super) fn stamp_inputs(platform: &Path) -> Vec<String> {
-    ["nix/native-artifact.nix", "nix/native-source.nix", "flake.lock"].iter().map(|relative| {
-        let digest = std::fs::read(platform.join(relative)).map(|bytes| crate::sha256_hex(&bytes))
+    let mut inputs: Vec<PathBuf> = ["nix/native-artifact.nix", "nix/native-source.nix", "flake.lock",
+        "nix/artifact-platform.nix", "nix/command-executor.nix", "nix/prepare-platform.nix", "executor.json",
+        "tooling/drop/Cargo.toml", "tooling/drop/Cargo.lock"].iter().map(PathBuf::from).collect();
+    if let Ok(entries) = std::fs::read_dir(platform.join("tooling/drop/src")) {
+        inputs.extend(entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| path.strip_prefix(platform).unwrap().to_path_buf()));
+    }
+    inputs.sort();
+    inputs.into_iter().map(|relative| {
+        let digest = std::fs::read(platform.join(&relative)).map(|bytes| crate::sha256_hex(&bytes))
             .unwrap_or_else(|_| "missing".into());
-        format!("artifact-platform {relative} {digest}")
+        format!("artifact-platform {} {digest}", relative.display())
     }).collect()
 }
 
@@ -133,6 +141,9 @@ mod tests {
         assert_ne!(initial, recipe);
         std::fs::write(root.join("flake.lock"), "lock-v2").unwrap();
         assert_ne!(recipe, stamp_inputs(&root));
+        let locked = stamp_inputs(&root);
+        std::fs::write(root.join("executor.json"), "executor-v2").unwrap();
+        assert_ne!(locked, stamp_inputs(&root));
         std::fs::remove_dir_all(root).unwrap();
     }
 
