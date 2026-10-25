@@ -35,6 +35,8 @@ fn main() {
     let root = std::path::PathBuf::from(std::env::var_os("BL_CUSTODY_EXTERNAL_ROOT").unwrap());
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let parent = status.lines().find_map(|line| line.strip_prefix("PPid:")).unwrap().trim();
+    let witness = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("after-owner-death.txt");
+    std::fs::write(root.join("witness-path"), witness.to_str().unwrap()).unwrap();
     std::fs::write(root.join("cargo-pid"), parent).unwrap();
     std::fs::write(root.join("external-pid"), std::process::id().to_string()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -42,6 +44,7 @@ fn main() {
         assert!(std::time::Instant::now() < deadline, "Source command test timed out");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    std::fs::write(witness, "actual write after both ancestors died").unwrap();
     std::fs::write(root.join("external-exited"), "exited").unwrap();
 }
 ''')
@@ -67,11 +70,16 @@ fn main() {
                 owner.process.wait(timeout=5)
                 signal.pidfd_send_signal(cargo_fd, signal.SIGKILL)
                 self.assertEqual([], select.select([child_fd], [], [], 0)[0], 'real build script must still be alive')
+                witness = Path((root / 'witness-path').read_text())
+                self.assertTrue(witness.resolve().is_relative_to(Path(scope).resolve()),
+                                'actual Cargo OUT_DIR must lie inside the claimed producer scope')
+                self.assertFalse(witness.exists())
                 acquired = observer.ask('claim', out=scope)
-                self.assertFalse(acquired['acquired'], 'a real Source producer must exclude replacement while its orphan writes')
-                self.assertEqual('child', acquired['custody'])
                 (root / 'finish').write_text('finish')
                 self.assertTrue(select.select([child_fd], [], [], 5)[0], 'actual build script must exit')
+                self.assertEqual('actual write after both ancestors died', witness.read_text())
+                self.assertFalse(acquired['acquired'], 'a real Source producer must exclude replacement while its orphan writes')
+                self.assertEqual('child', acquired['custody'])
                 deadline = time.monotonic() + 5
                 while True:
                     acquired = observer.ask('claim', out=scope)
