@@ -57,6 +57,10 @@
         };
         inherit (beam) erlang elixir;
         bl-drop = drop.bl-drop;
+        compiler = drop.compiler;
+        sdk = drop.sdk;
+        dependencies = drop.dependencies;
+        drop-tools = drop.drop-tools;
         native-lazy-memo = import ./nix/native-artifact.nix {
           requestJson = builtins.toJSON {
             version = 1;

@@ -1,15 +1,16 @@
 # Resource ownership stays with the Nix realization even when a client exits.
 # KVM-backed RAM and a finite scratch disk bound the whole guest process tree;
 # they do not depend on an unprivileged client changing daemon settings.
-{ pkgs, memoryMiB ? 3072, diskMiB ? 12288, commandManager ? false }:
+{ pkgs, memoryMiB ? 3072, diskMiB ? 12288, commandManager ? false, cpuCount ? 1 }:
 drv:
 assert builtins.isInt memoryMiB && memoryMiB >= 256 && memoryMiB <= 8192;
 assert builtins.isInt diskMiB && diskMiB >= 1024 && diskMiB <= 65536;
 assert builtins.isBool commandManager;
+assert builtins.isInt cpuCount && cpuCount >= 1 && cpuCount <= 8;
 pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
   memSize = memoryMiB;
   enableParallelBuilding = false;
-  QEMU_OPTS = "";
+  QEMU_OPTS = pkgs.lib.optionalString (cpuCount != 1) "-smp cpus=${toString cpuCount}";
   preVM = ''
     ${pkgs.lib.optionalString commandManager "trap 'test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT"}
     diskImage="$PWD/worker.ext4"

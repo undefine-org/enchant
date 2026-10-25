@@ -45,57 +45,9 @@ let
     '') hexDeps}
   '';
 
-  # ── crates: one merged vendor dir per Cargo.lock set ─────────────────────────
-  mkVendor = name: locks:
-    let vs = map (l: pkgs.rustPlatform.importCargoLock { lockFile = l; }) locks; in
-    pkgs.runCommand name { } ''
-      mkdir -p $out
-      for v in ${toString vs}; do
-        for c in $v/*; do
-          n=$(basename $c)
-          [ "$n" = Cargo.lock ] && continue
-          [ -e $out/$n ] || ln -s $(readlink -f $c) $out/$n
-        done
-      done
-    '';
-  cargoEnv = vendorDir: ''
-    export HOME=$TMPDIR/home CARGO_HOME=$TMPDIR/cargo CARGO_NET_OFFLINE=true
-    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${pkgs.stdenv.cc}/bin/cc
-    mkdir -p $HOME $CARGO_HOME
-    cat > $CARGO_HOME/config.toml <<EOF
-    [source.crates-io]
-    replace-with = "vendored"
-    [source.vendored]
-    directory = "${vendorDir}"
-    [net]
-    offline = true
-    EOF
-  '';
-
-  # Each derivation sees ONLY what it reads, so a change elsewhere cannot rebuild it.
+  # Shared with the automatic checkout prerequisites and command executor.
+  drop-tools = import ./drop-tools.nix { inherit pkgs; };
   nativeCrates = nativeProducts.names;
-  toolSrc = lib.fileset.toSource { root = ../.; fileset = ../tooling/drop; };
-
-  # 1. launcher + pack tool — keyed on tooling/drop only.
-  drop-tools = (import ./bounded-build.nix { inherit pkgs; }) (pkgs.stdenv.mkDerivation {
-    pname = "bl-drop-tools";
-    version = "0.1.0";
-    src = toolSrc;
-    nativeBuildInputs = [ rustPkgs.rustc rustPkgs.cargo pkgs.gcc ];
-    dontConfigure = true;
-    dontFixup = true;
-    buildPhase = ''
-      ${cargoEnv (mkVendor "bl-vendor-tools" [ ../tooling/drop/Cargo.lock ])}
-      cargo build --release --offline --manifest-path tooling/drop/Cargo.toml --target-dir $TMPDIR/t
-    '';
-    installPhase = ''
-      install -Dm755 $TMPDIR/t/release/drop-launcher $out/bin/drop-launcher
-      install -Dm755 $TMPDIR/t/release/drop $out/bin/drop
-      ln -s drop-launcher $out/bin/bl-command-executor
-      digest=$(sha256sum $out/bin/drop-launcher | cut -d' ' -f1)
-      printf '{"version":1,"protocol":"BEAM_LISP_CUSTODY_COMMAND_V1","sha256":"%s"}\n' "$digest" > $out/executor.json
-    '';
-  });
 
   # 2. Independent verified native products, also consumed by interactive builds.
   nativeProducts = import ./native-products.nix { inherit pkgs; };
@@ -132,30 +84,15 @@ let
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../bin ../priv ../env.bl ../bl.lock ../scripts/prepare-release.bl
+      ../bin ../priv ../env.bl ../bl.lock ../scripts
+      ../test/scripts/artifact-generation.bl
       ../native/bl_json ../native/code_embed ../native/datom_datalog
       ../native/datom_fjall ../native/datom_vector ../native/lazy_memo
       ../tooling/drop/src ../tooling/drop/Cargo.toml ../tooling/drop/Cargo.lock
     ];
   };
 
-  # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
-  # launcher come from the two derivations above.
-  bl-drop = (import ./bounded-build.nix {
-    inherit pkgs;
-    memoryMiB = 6144;
-    diskMiB = 32768;
-    commandManager = true;
-  }) (pkgs.stdenv.mkDerivation {
-    pname = "bl-drop";
-    version = "0.1.0";
-    inherit src;
-    nativeBuildInputs = [ erlang elixir pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
-    dontConfigure = true;
-    dontFixup = true; # the drop is one opaque file
-
-    buildPhase = ''
-      runHook preBuild
+  setupTree = ''
       export HOME=$TMPDIR/home XDG_CACHE_HOME=$TMPDIR/home/.cache
       export BL_DAEMON=off LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu"
       export BL_NATIVE_PROVIDER=nix BL_PREPARED_NATIVES=${natives}
@@ -181,13 +118,56 @@ let
         install -m755 ${natives}/$crate.so priv/native/$crate.so
       done
 
-      # Bootstrap commands use the source launcher directly. The native
-      # transport client is already built in drop-tools; compiling another
-      # client here would attempt a crates.io fetch inside the offline sandbox.
-      # Keep the provisioning verb first: the bare bootstrap can run before
-      # application dependencies exist. bin/bl recognizes --cold anywhere.
+  '';
+  worker = import ./bounded-build.nix {
+    inherit pkgs;
+    memoryMiB = 6144;
+    diskMiB = 32768;
+    cpuCount = 4;
+    commandManager = true;
+  };
+  producerTools = [ erlang elixir pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
+
+  dependencies = worker (pkgs.stdenv.mkDerivation {
+    pname = "beam-lisp-dependencies";
+    version = "1";
+    inherit src;
+    nativeBuildInputs = producerTools;
+    dontConfigure = true;
+    dontFixup = true;
+    buildPhase = setupTree + ''
       ./bin/bl deps verify --cold
       ./bin/bl deps compile --cold
+    '';
+    installPhase = ''
+      mkdir -p "$out"
+      cp -a --no-preserve=ownership "$XDG_CACHE_HOME/beam_lisp/ebin" "$out/ebin"
+    '';
+  });
+  compiler = import ./compiler-product.nix {
+    inherit pkgs erlang elixir src dependencies;
+    checkoutPlatform = buildCheckout;
+    nativeProducts = nativeProducts;
+  };
+
+  # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
+  # launcher come from the two derivations above.
+  bl-drop = worker (pkgs.stdenv.mkDerivation {
+    pname = "bl-drop";
+    version = "0.1.0";
+    outputs = [ "out" "sdk" ];
+    inherit src;
+    nativeBuildInputs = producerTools;
+    dontConfigure = true;
+    dontFixup = true; # the drop is one opaque file
+
+    buildPhase = setupTree + ''
+      runHook preBuild
+      rm -rf "$XDG_CACHE_HOME/beam_lisp/ebin"
+      cp -a --no-preserve=ownership ${dependencies}/ebin "$XDG_CACHE_HOME/beam_lisp/ebin"
+      rm -rf priv/bootstrap/seed build .bl/lib/beam_lisp-0.1.0
+      mkdir -p priv/bootstrap/seed
+      cp -a --no-preserve=ownership ${compiler}/seed/. priv/bootstrap/seed/
       ./bin/bl --cold run scripts/prepare-release.bl
       # Package the source-validated compiler floor. Compiler regeneration is
       # a bare-VM operation, independent of the runtime's retained SDK lease.
@@ -206,11 +186,28 @@ let
       chmod u+w $TMPDIR/launcher
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
-      ./bin/bl --cold self-build --reuse-floor --bin $TMPDIR/launcher --out $TMPDIR/selfbuilt.drop --jobs $NIX_BUILD_CORES
+      ./bin/bl --cold self-build --reuse-floor --bin ${drop-tools}/bin/drop-launcher --out $TMPDIR/selfbuilt.drop --jobs $NIX_BUILD_CORES
 
       # unpack, retarget every ELF at the FHS loader, repack with the same launcher
       $TMPDIR/drop unpack $TMPDIR/selfbuilt.drop --dir $TMPDIR/payload
       chmod -R u+w $TMPDIR/payload
+      # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
+      # checks the existing sealed metadata and actual bytes at load time.
+      mkdir -p "$sdk"
+      cp -a --no-preserve=ownership $TMPDIR/payload/lib "$sdk/lib"
+      for application in "$sdk"/lib/beam_lisp-*; do
+        ln -s "lib/$(basename "$application")" "$sdk/image"
+      done
+      cp $TMPDIR/selfbuilt.drop "$sdk/bl"
+      chmod 555 "$sdk/bl"
+      printf '%s\n' '${builtins.toJSON {
+        version = 1;
+        kind = "sdk";
+        compiler = toString compiler;
+        dependencies = toString dependencies;
+        platform = toString buildCheckout;
+        target = "x86_64-linux";
+      }}' > "$sdk/artifact.json"
       # A portable drop carries bytes rather than references to its build store.
       for native in $TMPDIR/payload/lib/beam_lisp-*/priv/native/*.so; do
         if [ -L "$native" ]; then
@@ -239,4 +236,4 @@ let
     '';
   });
 in
-{ inherit bl-drop drop-tools natives; }
+{ inherit bl-drop drop-tools natives dependencies compiler; sdk = bl-drop.sdk; }
