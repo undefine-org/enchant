@@ -1,0 +1,65 @@
+(ns proc.message-proof-custody-test
+ (:require [reload.generation :as g] [proc.message-domain :as domain]))
+
+(defn- private-probes [scope path function before after]
+ (let [source (File/read! (BeamLisp.Loader/source_path path))
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                    (= function (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))
+        suffix (str (erlang/unique_integer (list :positive)))]
+   (assert (= 2 (count (String/split text before))))
+   (BeamLisp.Env/with_env scope
+    #(mapv (fn [mutant?]
+             (let [namespace (str "history.callback." suffix "." (if mutant? "historical" "current"))]
+              (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+              (BeamLisp.Compiler/eval_string (if mutant? (String/replace text before after) text))
+              (BeamLisp.Env/fetch_exact! namespace function))) [false true])))))
+
+(defn- original-error [action]
+ (try {:status :returned :value (action)}
+  (catch error {:status :thrown :original (BeamLisp.ExInfo/ex_original error)})))
+
+(deftest captured-proof-context-requires-actual-executing-custody
+ (let [graph (g/prepare! {:application-id "message-proof-custody-control"
+                         :sources {"proof.custody" "(ns proof.custody) (defn accepts [x] true)"}})
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       previous (BeamLisp.Env/capture)
+       live (BeamLisp.Env/fetch_exact! "proc.message-domain" "with-environment")]
+  (try
+   (let [record (g/with! graph #(let [namespace (get (:mapping graph) "proof.custody")]
+                 {:callback (BeamLisp.Env/fetch_exact! namespace "accepts")
+                  :environment (BeamLisp.Env/capture)}))
+         [copied historical] (private-probes scope "proc.message-domain" "with-environment"
+                              "(with! graph enter)" "(enter)")
+         inspect #(do (BeamLisp.Env/assert_execution_context!)
+                    {:status :admitted :module (elem (erlang/fun_info (:callback record) :module) 1)})
+         call (fn [probe action] (BeamLisp.Ns.Rt/invoke probe (list (:environment record) action)))]
+    (doseq [probe [live copied]]
+     (is (= :admitted (:status (call probe inspect)))))
+    (let [refused (original-error #(call historical inspect))]
+     (println :history-E60-no-custody refused)
+     (is (= :thrown (:status refused)))
+     (is (= :unadmitted_execution_origin (:original refused))))
+    (is (= previous (BeamLisp.Env/capture)))
+    ;; Same ingress assertion as capture-current-once, without triggering
+    ;; unrelated downstream lazy metadata loading. This is custody evidence,
+    ;; not a complete proof-capture regression pass.
+    (is (= 0 (:registrations (g/evidence graph))))
+    ;; Unexpected exit must propagate and unwind context and physical lease.
+    (doseq [probe [live copied]]
+     (is (= {:status :thrown :original :message-proof-unexpected-fault}
+            (original-error #(call probe (fn []
+              (is (= 1 (:registrations (g/evidence graph))))
+              (is (= graph (BeamLisp.Env/execution_origin)))
+              (erlang/error :message-proof-unexpected-fault))))))
+     (is (= previous (BeamLisp.Env/capture)))
+     (is (= :admitted (:status (call probe inspect)))))
+    (is (= 0 (:registrations (g/evidence graph))))
+    (is (= live (BeamLisp.Env/fetch_exact! "proc.message-domain" "with-environment")))
+    (is (= :retired (:status (g/retire! graph)))))
+   (finally (g/retire! graph) (BeamLisp.Env/destroy scope)))))
+
