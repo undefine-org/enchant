@@ -6,6 +6,7 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   ln -s ${pkgs.python3}/bin/python3 "$out/bin/python3"
   cp ${commandExecutor}/executor.json "$out/executor.json"
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
+  cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
   cp ${./native-source.nix} "$out/nix/native-source.nix"
   cp ${./bounded-build.nix} "$out/nix/bounded-build.nix"
   cp ${./application-artifact.nix} "$out/nix/application-artifact.nix"

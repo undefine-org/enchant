@@ -11,7 +11,7 @@ pub(super) fn store_object(path: &str) -> bool {
 /// Build resolution includes the selected trusted recipe/lock, even when the
 /// platform lives outside the application's source tree.
 pub(super) fn stamp_inputs(platform: &Path) -> Vec<String> {
-    let mut inputs: Vec<PathBuf> = ["nix/native-artifact.nix", "nix/native-source.nix", "nix/bounded-build.nix", "flake.lock",
+    let mut inputs: Vec<PathBuf> = ["nix/native-artifact.nix", "nix/native-source.nix", "nix/native-snapshot.nix", "nix/bounded-build.nix", "flake.lock",
         "nix/artifact-platform.nix", "nix/command-executor.nix", "nix/prepare-platform.nix", "executor.json",
         "tooling/drop/Cargo.toml", "tooling/drop/Cargo.lock"].iter().map(PathBuf::from).collect();
     if let Ok(entries) = std::fs::read_dir(platform.join("tooling/drop/src")) {
@@ -74,16 +74,20 @@ pub(super) fn prepare(tree: &Path, source: &Path, name: &str,
     std::fs::create_dir_all(&retained).map_err(|e| e.to_string())?;
     let result = (|| {
         let source = std::fs::canonicalize(source).map_err(|e| e.to_string())?;
-        let snapshot_text = capture(&platform, "nix-instantiate", &[
-            "--eval".into(), "--strict".into(), "--json".into(), "--read-write-mode".into(),
-            platform.join("nix/native-source.nix").to_string_lossy().into_owned(),
+        let snapshot_root = retained.join("source-retained");
+        let snapshot_text = capture(&platform, "nix", &[
+            "build".into(), "--impure".into(), "--file".into(),
+            platform.join("nix/native-snapshot.nix").to_string_lossy().into_owned(),
             "--argstr".into(), "source".into(), source.to_string_lossy().into_owned(),
-            "--argstr".into(), "crate".into(), name.into()], custody)?;
-        let snapshot: String = serde_json::from_slice(&snapshot_text).map_err(|e| e.to_string())?;
-        if !store_object(&snapshot) { return Err("invalid native source snapshot".into()); }
-        capture(&platform, "nix-store", &["--add-root".into(),
-            retained.join("source-retained").to_string_lossy().into_owned(),
-            "--indirect".into(), "--realise".into(), snapshot.clone()], custody)?;
+            "--argstr".into(), "crate".into(), name.into(), "--json".into(),
+            "--out-link".into(), snapshot_root.to_string_lossy().into_owned(),
+            "--max-jobs".into(), "0".into()], custody)?;
+        let snapshots: Value = serde_json::from_slice(&snapshot_text).map_err(|e| e.to_string())?;
+        let rows = snapshots.as_array().filter(|rows| rows.len() == 1).ok_or("expected one native source snapshot")?;
+        let snapshot = rows[0]["outputs"]["out"].as_str().ok_or("missing native source snapshot")?;
+        if !store_object(snapshot) || std::fs::read_link(&snapshot_root).map_err(|e| e.to_string())? != Path::new(snapshot) {
+            return Err("native source snapshot lacks its requester root".into());
+        }
         let request = json!({"version":1,"source":snapshot,"crate":name,
                              "abi":format!("beam-lisp-native-{name}-v1"),"target":"x86_64-linux"});
         let root = retained.join("retained");
@@ -92,7 +96,7 @@ pub(super) fn prepare(tree: &Path, source: &Path, name: &str,
             platform.join("nix/native-artifact.nix").to_string_lossy().into_owned(),
             "--argstr".into(), "requestJson".into(), request.to_string(), "--json".into(),
             "--out-link".into(), root.to_string_lossy().into_owned(),
-            "--max-jobs".into(), "1".into(), "--cores".into(), "1".into(),
+            "--max-jobs".into(), "0".into(), "--cores".into(), "1".into(),
             "--option".into(), "timeout".into(), "300".into()], custody)?;
         let rows: Value = serde_json::from_slice(&output).map_err(|e| e.to_string())?;
         let rows = rows.as_array().filter(|rows| rows.len() == 1).ok_or("expected one native output")?;
