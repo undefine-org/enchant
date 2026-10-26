@@ -20,7 +20,8 @@
 ; anf→core→beam synthesis (all of which bl already drives).
 
 (ns vm.native
-  (:require [anf] [lower] [claim :as c]))
+  (:require [anf] [lower] [claim :as c]
+            [bl.native-declarations :as native-declarations]))
 
 (defn- rep-bin
   "erlang:string:replace with :all returns IODATA (a list); flatten to a binary."
@@ -374,33 +375,6 @@
 
 (defn- nif-ext [] ".so")  ; every unix (macOS included) uses .so for erl_ddll
 
-(defn- crate-fresh?
-  "Is the installed .so newer than every source of the crate? (skip cargo)."
-  [crate crate-dir]
-  (let [dest (str INSTALL-DIR "/" crate (nif-ext))]
-    (if (not (File/exists? dest))
-      false
-      (let [mt (erlang/apply :filelib :last_modified (list (erlang/binary_to_list dest)))
-            built (if (and mt (erlang/is_tuple mt))
-                    (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt))
-                    0)
-            newest (crate-newest-source crate-dir)]
-        (< newest built)))))
-
-(defn- crate-newest-source [crate-dir]
-  ;; newest mtime among the crate's real sources
-  (let [globs (list "src/**/*.rs" "Cargo.toml" "Cargo.lock" "build.rs" ".cargo/config.toml")
-        files (mapcat (fn [g] (to-list (erlang/apply :filelib :wildcard
-                                          (list (erlang/binary_to_list (str crate-dir "/" g))))))
-                      globs)]
-    (reduce (fn [acc f]
-              (let [fp (erlang/list_to_binary f)
-                    mt (try (erlang/apply :filelib :last_modified (list f)) (catch _ 0))]
-                (if (and mt (erlang/is_tuple mt) (> (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt)) acc))
-                  (erlang/apply :calendar :datetime_to_gregorian_seconds (list mt))
-                  acc)))
-            0 files)))
-
 (defn- nix-provider? []
   (when-not (= "nix" (or (System/get_env "BL_NATIVE_PROVIDER") "nix"))
     (throw (ex-info "Native production requires Nix; local providers are unsupported"
@@ -408,32 +382,59 @@
   true)
 
 (defn build!
-  "Explicitly build one crate through the admitted content-addressed producer.
-   A fresh installed artifact keeps the stat-only fast path. A stale artifact
-   returns {:ok path}; actual producer failures raise with the crate's name."
+  "Prepare one declared native alias through the admitted Nix producer."
   [crate]
   (when (or (not (string? crate)) (= "" crate) (contains? #{"." ".."} crate)
             (not= crate (Path/basename crate)) (= :absolute (Path/type crate)))
     (throw (ex-info "Native crate must be one directory name" {:kind :native-crate-scope :crate crate})))
-  (let [crate-dir (str NATIVE-DIR "/" crate)]
-    (if (and (not (nix-provider?)) (crate-fresh? crate crate-dir))
-      {:skipped :fresh}
-      (do
-        (BeamLisp.Loader/ensure_loaded "build")
-        (let [result (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "build-native-crate")
-                       (list (Path/expand ".") crate nil))]
-          (when (seq (:errors result))
-            (throw (ex-info (str "Native preparation failed for " crate ":\n" (join "\n" (:errors result)))
-                           {:crate crate :errors (:errors result)})))
-          {:ok (str INSTALL-DIR "/" crate (nif-ext))})))))
+  (nix-provider?)
+  (BeamLisp.Loader/ensure_loaded "build")
+  (let [result (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "build-native-crate")
+                 (list (Path/expand ".") crate nil))]
+    (when (seq (:errors result))
+      (throw (ex-info (str "Native preparation failed for " crate ":\n" (join "\n" (:errors result)))
+                     {:crate crate :errors (:errors result)})))
+    {:ok (str INSTALL-DIR "/" crate (nif-ext))}))
+
+(defn- native-root-directory! [path]
+  ;; lstat EVERY ancestor before enumeration: expanding a path alone does not
+  ;; prevent traversing a symlink hidden in an ancestor directory.
+  (let [expanded (Path/expand path)]
+    (when (= "/" expanded)
+      (throw (ex-info "Native refresh cannot scan the filesystem root" {:kind :native-refresh-scope})))
+    (reduce (fn [parent part]
+              (let [current (Path/join parent part)]
+                (when-not (= :directory (:type (File/lstat! current)))
+                  (throw (ex-info "Native refresh requires real source directories"
+                                  {:kind :native-refresh-scope :path current})))
+                current)) "/" (rest (Path/split expanded)))
+    expanded))
+
+(defn- native-refresh-crates [root]
+  ;; Consumer and engine projects normalize independently. Never borrow the
+  ;; consumer's declarations for the platform root or vice versa.
+  (let [root (Path/expand root)
+        entries (when (File/regular? (Path/join root "env.bl"))
+                  (BeamLisp.Loader/ensure_loaded "bl.env")
+                  (let [project (BeamLisp.Ns.Rt/invoke
+                                  (BeamLisp.Env/fetch_exact! "bl.env" "project") (list root))]
+                    (when (seq (:errors project))
+                      (throw (ex-info "Invalid native refresh project" {:kind :native-refresh-declarations
+                                                                       :root root :errors (:errors project)})))
+                    (get-in project [:build :native])))]
+    (let [requests (native-declarations/discover! root entries)]
+      ;; SDK image selections can be symlinks with no Rust sources. Validate
+      ;; only actual selected source roots before source traversal/production.
+      (doseq [source (distinct (map :source requests))] (native-root-directory! source))
+      requests)))
 
 (defn- source-native-roots
-  ;; A command normally runs in the consumer project, not the language tree.
-  ;; Include both; otherwise engine Rust fixes never reach that consumer.
-  ([] (source-native-roots (BeamLisp/cwd) (System/get_env "BL_ROOT")))
+  ;; A source-backed consumer and engine each retain their own publication root.
+  ([] (source-native-roots (BeamLisp/cwd)
+        (erlang/apply :Elixir.System :get_env (list "BL_ROOT"))))
   ([project platform]
-   (distinct (filter (fn [root] (File/dir? (str root "/" NATIVE-DIR)))
-                     (map (fn [root] (Path/expand root)) (remove nil? [project platform]))))))
+   (vec (filter (fn [root] (seq (native-refresh-crates root)))
+                (distinct (map Path/expand (remove nil? [project platform])))))))
 
 ;; A successful producer run leaves a content receipt, not a timestamp shortcut.
 ;; The receipt covers a conservative superset of native-key's inputs, the live
@@ -443,24 +444,52 @@
   (String/downcase (Base/encode16 (crypto/hash :sha256
     (erlang/term_to_binary value (list :deterministic))))))
 
-(defn- native-refresh-crates [root]
-  (sort (filter #(File/regular? (Path/join % "Cargo.toml"))
-                (Path/wildcard (Path/join root "native/*")))))
+(defn- native-source-inventory! [source]
+  ;; Capture the whole declared closure, including support files and sibling
+  ;; packages. Generated directories match the immutable snapshot exclusions.
+  ;; Bounds make accidental huge source declarations a refusal, not a VM sink.
+  (let [source (native-root-directory! source)]
+    (loop [pending [[source 0]] rows [] entries 0 bytes 0]
+      (if (empty? pending)
+        (sort rows)
+        (let [[path depth] (first pending)
+              remaining (rest pending)
+              info (File/lstat! path)
+              entries (inc entries)]
+          (when (or (> entries 65536) (> depth 64))
+            (throw (ex-info "Native source inventory exceeds its entry/depth bound"
+                            {:kind :native-refresh-capacity :source source})))
+          (cond
+            (= :directory (:type info))
+              (let [children (remove #(contains? #{".git" ".bl" "target"} %)
+                                      (sort (File/ls! path)))]
+                (when (> (+ entries (count remaining) (count children)) 65536)
+                  (throw (ex-info "Native source directory exceeds inventory capacity"
+                                  {:kind :native-refresh-capacity :path path})))
+                (recur (concat (map (fn [name] [(Path/join path name) (inc depth)]) children) remaining)
+                       (conj rows [(Path/relative_to path source) :directory]) entries bytes))
+            (= :regular (:type info))
+              (let [size (:size info) total (+ bytes size)]
+                (when (or (> size 134217728) (> total 1073741824))
+                  (throw (ex-info "Native support files exceed inventory byte capacity"
+                                  {:kind :native-refresh-capacity :path path})))
+                (recur remaining
+                       (conj rows [(Path/relative_to path source) :regular
+                                   (erlang/band (:mode info) 511)
+                                   (crypto/hash :sha256 (File/read! path))]) entries total))
+            :else
+              (throw (ex-info "Native source inventory refuses symlinks and special files"
+                              {:kind :native-refresh-scope :path path}))))))))
 
 (defn- native-refresh-inputs [root producer cargo]
-  (let [files (sort (mapcat
-                (fn [crate]
-                  (concat (Path/wildcard (Path/join crate "src/**/*.rs"))
-                          (filter File/regular?
-                            (map #(Path/join crate %)
-                              ["Cargo.toml" "Cargo.lock" ".cargo/config.toml" "build.rs"]))))
-                (native-refresh-crates root)))]
+  (let [requests (native-refresh-crates root)
+        sources (sort (distinct (map :source requests)))]
     (native-refresh-digest
-      [1 (Path/expand root) producer cargo
-       (mapv #(tuple (Path/relative_to % root) (crypto/hash :sha256 (File/read! %))) files)])))
+      [2 (Path/expand root) producer cargo requests
+       (mapv #(tuple % (native-source-inventory! %)) sources)])))
 
 (defn- native-refresh-artifacts [root]
-  (mapv #(Path/join (Path/join root "priv/native") (artifact-name (Path/basename %)))
+  (mapv #(Path/join (Path/join root "priv/native") (artifact-name (:crate %)))
         (native-refresh-crates root)))
 
 (defn- native-refresh-state [artifacts inputs]

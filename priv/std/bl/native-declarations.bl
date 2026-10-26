@@ -1,0 +1,76 @@
+(ns bl.native-declarations)
+
+(defn- matches? [pattern value limit]
+  (and (string? value) (<= (erlang/byte_size value) limit)
+       (Regex/match? (Regex/compile! pattern) value)))
+
+(defn- member? [value]
+  (and (string? value) (<= (erlang/byte_size value) 4096)
+       (or (= "." value)
+           (and (not= "" value)
+                (every? (fn [part]
+                          (and (matches? "^[A-Za-z0-9_.][A-Za-z0-9_.-]*\\z" part 255)
+                               (not (contains? #{"." ".." ".git" ".bl" "target"} part))))
+                        (String/split value "/"))))))
+
+(defn- declaration-errors [value]
+  (let [required #{:source :member :package :crate :abi}]
+    (vec (concat
+      (map (fn [key] (str "native declaration unknown key " key))
+           (remove (fn [key] (contains? required key)) (keys value)))
+      (when-not (and (string? (:source value)) (not= "" (:source value))
+                     (<= (erlang/byte_size (:source value)) 4096)
+                     (not (String/contains? (:source value) (erlang/list_to_binary (list 0)))))
+        ["native declaration :source must be a nonempty path"])
+      (when-not (member? (:member value))
+        ["native declaration :member must be . or a bounded normalized relative package directory"])
+      (when-not (matches? "^[A-Za-z0-9_][A-Za-z0-9_-]*\\z" (:package value) 128)
+        ["native declaration :package must be a bounded Cargo package name"])
+      (when-not (matches? "^[A-Za-z_][A-Za-z0-9_]*\\z" (:crate value) 128)
+        ["native declaration :crate must be a bounded Rust identifier"])
+      (when-not (and (string? (:abi value)) (not= "" (:abi value))
+                     (<= (erlang/byte_size (:abi value)) 128)
+                     (not (String/contains? (:abi value) (erlang/list_to_binary (list 0)))))
+        ["native declaration :abi must be a nonempty bounded ABI label"])))))
+
+(defn normalize
+  "Total env normalizer. Legacy path/glob strings and explicit workspace maps
+   resolve their source paths against the project root. Does not read sources."
+  [entries root]
+  (cond
+    (nil? entries) [[] []]
+    (not (vector? entries)) [[] [":build :native must be a vector of paths or workspace declarations"]]
+    :else
+    (reduce (fn [[out errors] entry]
+              (cond
+                (string? entry) [(conj out (Path/expand entry root)) errors]
+                (map? entry) (let [problems (declaration-errors entry)]
+                               (if (seq problems)
+                                 [out (vec (concat errors problems))]
+                                 [(conj out (assoc entry :source (Path/expand (:source entry) root))) errors]))
+                :else [out (conj errors ":build :native entries must be paths or workspace declarations")]))
+            [[] []] entries)))
+
+(defn discover!
+  "Expand declarations into producer option maps. source is an absolute closure
+   root; crate is the publication alias, independent of package and member.
+   Missing/empty declarations preserve the native/* convention. No code runs."
+  [root entries]
+  (let [[normalized errors] (normalize entries root)]
+    (when (seq errors)
+      (throw (ex-info "Invalid native declarations" {:kind :native-declarations :errors errors})))
+    (let [requests
+          (vec (mapcat
+            (fn [entry]
+              (if (map? entry)
+                [(assoc entry :version 2 :target "x86_64-linux")]
+                (map (fn [source]
+                       (let [crate (Path/basename source)]
+                         {:version 1 :source source :crate crate
+                          :abi (str "beam-lisp-native-" crate "-v1") :target "x86_64-linux"}))
+                     (filter (fn [source] (File/regular? (Path/join source "Cargo.toml")))
+                             (sort (Path/wildcard entry))))))
+            (if (seq normalized) normalized [(Path/join (Path/expand root) "native/*")])))]
+      (when (not= (count requests) (count (distinct (map :crate requests))))
+        (throw (ex-info "Native declarations publish duplicate crate aliases" {:kind :native-alias-collision})))
+      requests)))

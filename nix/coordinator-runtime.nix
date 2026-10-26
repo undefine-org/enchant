@@ -44,6 +44,7 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   cat > "$out/boot.exs" <<EOF_BOOT
   for path <- Path.wildcard("$out/lib/*/ebin"), do: Code.prepend_path(path)
   Code.prepend_path("$out/image/ebin")
+  Code.delete_path(".")
   BeamLisp.Launcher.start_app!(System.argv(), %{})
   EOF_BOOT
   cat > "$out/bin/bl" <<EOF_BL
@@ -61,6 +62,7 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   export BL_PREPARATION_PLATFORM="$(readlink -f ${platform}/artifact-platform)"
   export LANG=C.UTF-8 LC_ALL=C.UTF-8
   export ELIXIR_ERL_OPTIONS='+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1'
+  cd "$out/foundry"
   exec ${platform}/bin/elixir "$out/boot.exs" "\$@"
   EOF_BL
   cat > "$out/bin/worker" <<EOF_WORKER
@@ -76,7 +78,7 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   case "\$job" in *[!A-Za-z0-9_]*) exit 64 ;; esac
   exec ${platform}/bin/systemd-run --user --quiet --collect --wait --pipe \\
     --working-directory="$out/foundry" --unit="foundry-artifact-\$job.service" \\
-    --property=MemoryMax=2G --property=MemorySwapMax=0 \\
+    --property=MemoryMax=4G --property=MemorySwapMax=0 \\
     --property=RuntimeMaxSec=3600 --property=KillMode=control-group \\
     -- ${pkgs.coreutils}/bin/env -i "HOME=\$HOME" "PATH=${platform}/bin:/usr/bin:/bin" \\
       "XDG_RUNTIME_DIR=\''${XDG_RUNTIME_DIR:-}" \\

@@ -25,7 +25,8 @@ as data. A broken `env.bl` degrades what the tree can do — its tasks, its port
 
 ```beam-lisp silent
 (ns bl.env
-  (:require [bl.util :as u] [bl.loading-policy :as loading]))
+  (:require [bl.util :as u] [bl.loading-policy :as loading]
+            [bl.native-declarations :as native-declarations]))
 ```
 
 ## Discovery
@@ -137,7 +138,10 @@ worst kind of configuration bug.
   application, so a build need not interrogate the running VM about itself.
 - `:build` — `{:world :paths :inputs :seed :out :native :jobs :ex :exclude}`: which roots hold
   build sources, where the output goes, which crates are native, how wide to
-  compile, and which sources must NEVER be compiled. `:exclude` holds paths
+  compile, and which sources must NEVER be compiled. `:native` accepts path/glob
+  strings and workspace maps with `:source`, `:member`, `:package`, `:crate` and
+  `:abi`. The source names the complete Cargo workspace root; crate names its
+  BL library alias. `:exclude` holds paths
   RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
   here): each names a FILE (matched exactly) or a DIRECTORY (every source
   beneath it — the separator is what makes `src/foo` miss `src/foobar`).
@@ -490,7 +494,7 @@ problems reports all three in one pass.
     :else
       (let [[paths perr]  (norm-strings (:paths v) ":build :paths" root)
             [inputs ierr] (norm-strings (:inputs v) ":build :inputs" root)
-            [native nerr] (norm-strings (:native v) ":build :native" root)
+            [native nerr] (native-declarations/normalize (:native v) root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
             [world werr]  (norm-opt-string (:world v) ":build :world" root)
             [out oerr]    (norm-opt-string (:out v) ":build :out" root)

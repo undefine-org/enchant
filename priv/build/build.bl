@@ -115,7 +115,8 @@
             [substrate :as sub]
             [drop :as d]
             [store :as st]
-            [claim :as c]))
+            [claim :as c]
+            [bl.native-declarations :as native-declarations]))
 
 ; ── manifest ─────────────────────────────────────────────────────────────────
 
@@ -772,16 +773,14 @@
             dest
             (finally (File/rm tmp))))))))
 
-(defn- native-one-nix [acc crate-dir root log]
-  (let [crate (Path/basename crate-dir)
+(defn- native-one-nix [acc request root log]
+  (let [crate (:crate request)
         destination (Path/join (Path/join root "priv/native") (nif-artifact-name crate))]
     (try
       (BeamLisp.Loader/ensure_loaded "artifact")
       (let [product (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "artifact" "resolve-native!")
-                      (list {:platform (:platform (BeamLisp.Ns.Rt/invoke
-                                                   (BeamLisp.Env/fetch_exact! "artifact" "framework-context") (list)))
-                             :source (Path/expand crate-dir) :crate crate
-                             :abi (str "beam-lisp-native-" crate "-v1")}))
+                      (list (assoc request :platform (:platform (BeamLisp.Ns.Rt/invoke
+                                                   (BeamLisp.Env/fetch_exact! "artifact" "framework-context") (list))))))
             library (:library product)
             cached (c/with-writer! (artifact-custody destination) "immutable native selection"
           (fn []
@@ -801,35 +800,46 @@
         (assoc acc :errors (conj (:errors acc) (str "native: " crate " Nix preparation failed: " (ex-message error)
                                                         (when-let [detail (:detail (ex-data error))] (str "\n" detail)))))))))
 
-(defn- native-one [acc crate-dir root log]
+(defn- native-one [acc request root log]
   (if (= "nix" (or (erlang/apply :Elixir.System :get_env (list "BL_NATIVE_PROVIDER")) "nix"))
-    (native-one-nix acc crate-dir root log)
+    (native-one-nix acc request root log)
     (assoc acc :errors (conj (:errors acc) "Native production requires Nix; local providers are unsupported"))))
 
+(defn- project-native-declarations [root]
+  (if (File/regular? (Path/join (Path/expand root) "env.bl"))
+    (do
+      (BeamLisp.Loader/ensure_loaded "bl.env")
+      (let [project (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "bl.env" "project") (list root))]
+        (when (seq (:errors project))
+          (throw (ex-info "Invalid project native configuration" {:errors (:errors project)})))
+        (get-in project [:build :native])))
+    nil))
+
 (defn build-native-crate
-  "The single-crate entry to the same admitted content-addressed producer used
-   by build-native. Runtime callers do not implement their own Cargo/install path."
+  "Prepare one declared publication alias through the normal Nix producer."
   [root crate log]
   (when (or (not (string? crate)) (= "" crate) (contains? #{"." ".."} crate)
             (not= crate (Path/basename crate)) (= :absolute (Path/type crate)))
     (throw (ex-info "Native crate must be one directory name" {:kind :native-crate-scope :crate crate})))
-  (let [directory (Path/join (Path/join (Path/expand root) "native") crate)]
-    (when-not (File/regular? (Path/join directory "Cargo.toml"))
+  (let [root (Path/expand root)
+        request (first (filter (fn [request] (= crate (:crate request)))
+                         (native-declarations/discover! root (project-native-declarations root))))]
+    (when-not request
       (throw (ex-info "Native crate declaration is absent" {:kind :native-crate-missing :crate crate})))
-    (native-one {:built 0 :cached 0 :artifacts [] :errors []} directory (Path/expand root) log)))
+    (native-one {:built 0 :cached 0 :artifacts [] :errors []} request root log)))
 
 (defn build-native
-  "Build (or find) every crate's artefact and install it at
-   `priv/native/<crate>.so` — the name the NIF loader asks for.
-   Returns `{:built n :cached n :artifacts [path …] :errors [msg …]}`."
-  [root log]
-  (let [crates (vec (filter (fn [dir] (File/exists? (Path/join dir "Cargo.toml")))
-                            (sort (Path/wildcard (Path/join root "native/*")))))]
-    (loop [cs crates
-           acc {:built 0 :cached 0 :artifacts [] :errors []}]
-      (if (empty? cs)
-        acc
-        (recur (rest cs) (native-one acc (first cs) root log))))))
+  "Prepare declared native products and atomically select priv/native/<crate>.so.
+   Explicit declarations can be passed by sealed application workers."
+  ([root log] (build-native root log (project-native-declarations root)))
+  ([root log declarations]
+   (let [root (Path/expand root)
+         requests (native-declarations/discover! root declarations)]
+     (loop [remaining requests
+            acc {:built 0 :cached 0 :artifacts [] :errors []}]
+       (if (empty? remaining)
+         acc
+         (recur (rest remaining) (native-one acc (first remaining) root log)))))))
 
 ; ── source selection: what a run is allowed to compile ──────────────────────
 ;
@@ -1080,7 +1090,9 @@
         (throw (ex-info "SDK source inventory changed during artifact production" {:kind :sdk-artifact-input-changed})))
       (blog/write! lpath (blog/facts-of st))
       (write-manifest mpath projection)
-      (let [nat (if (:native opts) (build-native (or (:root opts) ".") log)
+      (let [nat (if (:native opts) (if (contains? opts :native-declarations)
+                                         (build-native (or (:root opts) ".") log (:native-declarations opts))
+                                         (build-native (or (:root opts) ".") log))
                                   {:built 0 :cached 0 :artifacts [] :errors []})]
         {:built (:built final) :compiled (:compiled final) :cached (:cached final)
          :lock-wait-us (:lock-wait-us final)
