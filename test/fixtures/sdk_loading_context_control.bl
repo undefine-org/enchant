@@ -1,0 +1,124 @@
+;; Executed only by source-fixtures/cold!, before launcher SDK retention.
+;; This is a native component control, not a replacement production SDK.
+(assert (BeamLisp.AOT/sdk_preinit_floor_ready?))
+(ns fixture.sdk-loading-context-control
+ (:require [reload.generation :as g] [reload.preinit-counter :as counter]))
+
+(def TARGET "reload.preinit-state-fixture")
+(def PROBE :Elixir.SdkLoadingContextRedirectControl)
+
+(defn- helper! [root scratch mutated?]
+ ;; Extract the actual current entry body. Every other Loader operation stays
+ ;; on its original native module, including Source/AOT verification and the
+ ;; real Loader.Server context handoff. No live module or binding is replaced.
+ (let [source (File/read! (Path/join root "priv/host/loader.bl"))
+       start "(defn- ensure_loaded_in"
+       parts (String/split source start)
+       _ (assert (= 2 (count parts)))
+       body (first (String/split (second parts) "\n(defn- restore-pdict"))
+       predicate "(and (or (Process/get :bl_generation) (Process/get :bl_application_identity))\n           (let [path (source_path ns)]\n             (and path (BeamLisp.AOT/sdk_library_source? ns path))))"
+       _ (assert (= 2 (count (String/split body predicate))))
+       changed (if mutated? (String/replace body predicate "false") body)
+       forwards
+        "(defn assert_initialization_allowed! [x] (BeamLisp.Loader/assert_initialization_allowed! x))\n(defn source_path [x] (BeamLisp.Loader/source_path x))\n(defn extra_dirs [] (BeamLisp.Loader/extra_dirs))\n(defn realm_facts [] (BeamLisp.Loader/realm_facts))\n(defn optional_timing [] (BeamLisp.Loader/optional_timing))\n(defn with_declaration_snapshot [f] (BeamLisp.Loader/with_declaration_snapshot f))\n(defn ensure_loaded_locked [x] (BeamLisp.Loader/ensure_loaded_locked x))\n(defn restore-pdict [k v] (BeamLisp.Loader/restore-pdict k v))\n"
+       path (Path/join scratch "loader-control.bl")]
+  (File/write! path (str "(ns fixture.sdk-loading-context-redirect-native)\n" forwards start changed))
+  (println :sdk-loading-control-source
+   {:original-sha256 (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower)))
+    :original-loader-source-attribute (Keyword/get (BeamLisp.Loader/module_info :attributes) :bl_source_hash)
+    :component-sha256 (Base/encode16 (crypto/hash :sha256 (File/read! path)) (list (tuple :case :lower)))
+    :mutation (if mutated? :disable-application-to-sdk-redirect-only :none)})
+  (BeamLisp.AOT/compile_host_file path
+   (list (tuple :module PROBE) (tuple :output_dir scratch) (tuple :load? true)))))
+
+(defn- observed-load [action]
+ ;; Trace exact namespace arguments, not source presence or an assumed route.
+ ;; AOT calls are attempts; source entry/compilation are recorded separately.
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       patterns [(tuple :Elixir.BeamLisp.Loader :ensure_loaded_source 1)
+                 (tuple :Elixir.BeamLisp.Loader :ensure_build_aot 2)
+                 (tuple :Elixir.BeamLisp.AOT :ensure_loaded 1)
+                 (tuple :Elixir.BeamLisp.AOT :compile_sdk_source! 3)]
+       tracer (erlang/spawn (fn []
+                (loop [calls []]
+                 (receive
+                  [:trace _ :call [module function arguments]]
+                   (recur (if (= TARGET (first arguments))
+                            (conj calls [module function]) calls))
+                  [:finish seen] :when (= ticket seen)
+                   (erlang/send parent [:loading-route ticket calls])
+                  _ (recur calls)))))]
+  (doseq [pattern patterns] (erlang/trace_pattern pattern true (list :local)))
+  (erlang/trace :all true (list :call (tuple :tracer tracer)))
+  (try
+   (let [outcome (try (action) {:status :returned}
+                  (catch error {:status :refused :error (BeamLisp.ExInfo/ex_original error)}))
+         barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= barrier seen) :ready
+     (after 5000 (throw :sdk-loading-context-trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [outcome (receive [:loading-route seen calls] :when (= ticket seen) calls
+              (after 5000 (throw :sdk-loading-context-trace-timeout)))])
+   (finally
+    (erlang/trace :all false (list :call))
+    (doseq [pattern patterns] (erlang/trace_pattern pattern false (list :local)))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(defn- caller []
+ {:scope (BeamLisp.Env/env_id) :generation (g/current)
+  :origin (BeamLisp.Env/execution_origin) :lease (Process/get :bl_executing_code_lease)})
+
+(let [mode (System/fetch_env! "BL_TEST_SDK_LOADING_CONTEXT_CONTROL")
+      root (System/fetch_env! "BL_TEST_SOURCE_ROOT")
+      scratch (Path/join (System/tmp_dir!) (str "sdk-loading-context-control-" (erlang/unique_integer (list :positive))))
+      graph (g/prepare! {:application-id "sdk-loading-context-control"
+                        :sources {"sdk.loading.application" "(ns sdk.loading.application) (defn value [] 42)"}})
+      loader-md5 (BeamLisp.Loader/module_info :md5)]
+ (File/mkdir_p! scratch)
+ (try
+  (assert (contains? #{"original" "copied-original" "without-redirect"} mode))
+  (when (not= "original" mode) (helper! root scratch (= "without-redirect" mode)))
+  ;; Preparing an unrelated real Source graph must not consume the target's
+  ;; first init. Abort rather than clearing flags if SDK evolution changes this.
+  (assert (= false (BeamLisp.Env/loaded_ns? TARGET)))
+  (assert (= 0 (counter/value :state)))
+  (let [result
+        (g/with! graph
+         (fn []
+          (let [before (caller)
+                [outcome routes] (observed-load
+                                  #(if (= mode "original")
+                                     (BeamLisp.Loader/ensure_loaded TARGET)
+                                     (erlang/apply PROBE :ensure_loaded_in (list TARGET nil))))]
+           {:outcome outcome :routes routes :caller-restored (= before (caller))})))
+        retirement (g/retire! graph)
+        retired? (contains? #{:retired :already-retired} (:status retirement))
+        loaded (BeamLisp.Env/loaded_ns? TARGET)
+        count (counter/value :state)
+        usable (when loaded
+                 (try (= 17 ((BeamLisp.Env/fetch_exact! TARGET "invoke") 7))
+                  (catch _ false)))
+        invariant (and (= :returned (get-in result [:outcome :status]))
+                       (:caller-restored result) retired? loaded (= 1 count) usable)]
+   (assert (= loader-md5 (BeamLisp.Loader/module_info :md5)))
+   (println :sdk-loading-context-observation
+    (assoc result :mode mode :retirement retirement :loaded loaded :initialization-count count
+                  :usable usable :invariant invariant :original-loader-unchanged true))
+   (if (not= mode "without-redirect")
+    (do (assert invariant)
+        (println (if (= mode "original") "SDK_LOADING_CONTEXT_ORIGINAL_READY"
+                     "SDK_LOADING_CONTEXT_COPIED_ORIGINAL_READY")))
+    ;; A surviving mutation is a failure of this causal control. Never convert
+    ;; it into a historical closure merely because the fixture ran successfully.
+    (do
+     (assert (= :incomplete_generation_execution_lease (get-in result [:outcome :error])))
+     (assert (:caller-restored result))
+     (assert retired?)
+     (assert (= false loaded))
+     (assert (= 0 count))
+     (assert (= false invariant))
+     (println "SDK_LOADING_CONTEXT_REDIRECT_CONTROL_CAUGHT"))))
+  (finally
+   (g/retire! graph)
+   (when (not= "original" mode) (code/purge PROBE) (code/delete PROBE))
+   (File/rm_rf! scratch))))
