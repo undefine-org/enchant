@@ -22,7 +22,8 @@ Columns
   WHAT   the command's arguments, then ` @ <cwd>` when the cwd is not the args' own
 
 A VM is "beam-lisp" when the actual BEAM process enters BeamLisp.Launcher.main
-or BeamLisp.Ns.Bl.Cli.main, or carries the SDK application's/seed's code path.
+or BeamLisp.Ns.Bl.Cli.main, enters an immutable SDK/coordinator boot.exs,
+or carries the SDK application's/seed's code path.
 This includes direct Elixir compiler and test drivers. Rows flagged `!` are
 old (>= 1h) and own >= 512 MB: the ones to restart.
 """
@@ -35,6 +36,11 @@ import time
 
 ENTRY = re.compile(r"BeamLisp\.(Launcher\.(?:main|start_app!)|Ns\.Bl\.Cli\.main)")
 APP_EBIN = re.compile(r"/beam_lisp(?:-[^/]+)?/ebin/?$")
+# These wrappers add their code paths inside boot.exs, after BEAM startup.
+# Match complete immutable entrypoint tokens, never a substring in shell text.
+IMMUTABLE_BOOT = re.compile(
+    r"/nix/store/[0-9a-z]{32}-(?:beam-lisp-sdk-selection|"
+    r"beam-lisp-foundry-coordinator-runtime|bl-drop-[0-9][A-Za-z0-9.+_-]*-sdk)/boot\.exs\Z")
 KINDS = {
     "serve": "serve", "run": "run", "test": "test", "self-build": "self-build",
     "build": "build", "watch": "watch", "mcp": "mcp", "eval": "eval",
@@ -83,7 +89,7 @@ def uptime_s():
 
 
 def kind_and_args(argv):
-    """The words after the `--` that closes the BEAM's `-e/--eval` entry form."""
+    """Arguments following the launcher expression or immutable boot script."""
     for i, a in enumerate(argv):
         if ENTRY.search(a):
             tail = argv[i + 1:]
@@ -98,6 +104,16 @@ def kind_and_args(argv):
                 if w in KINDS:
                     return KINDS[w], " ".join(tail)
             return "other", " ".join(tail)
+    boot = immutable_boot_index(argv)
+    if boot is not None:
+        tail = argv[boot + 1:]
+        if tail and tail[0] == "--":
+            tail = tail[1:]
+        # Flags before the verb belong to the language CLI. Everything after
+        # the verb (especially after its --) is opaque command/program data.
+        words = [word for word in tail if word != "--cold"]
+        kind = KINDS.get(words[0], "other") if words else "other"
+        return kind, " ".join(tail) or "immutable " + argv[boot].rsplit("/", 2)[1]
     if runtime_code_path(argv):
         driver = next((os.path.basename(word) for word in reversed(argv)
                        if word.endswith(".exs")), None)
@@ -111,11 +127,26 @@ def runtime_code_path(argv):
                for index, word in enumerate(argv) if index)
 
 
-def beam_lisp_vm(argv):
+def immutable_boot_index(argv):
+    # Real Elixir script entrypoints follow -extra. Do not classify an unrelated
+    # Elixir -e/--eval VM merely because its program argv names a boot script.
+    if "-extra" in argv:
+        index = argv.index("-extra") + 1
+        if index < len(argv) and argv[index] == "--":
+            index += 1
+        return index if index < len(argv) and IMMUTABLE_BOOT.fullmatch(argv[index]) else None
+    # Keep the helper useful for direct BEAM argv observations without Elixir's
+    # -extra envelope; the actual executable check still belongs to the caller.
+    return 1 if len(argv) > 1 and IMMUTABLE_BOOT.fullmatch(argv[1]) else None
+
+
+def beam_lisp_vm(argv, executable=None):
     # Parent shells and systemd-run can carry the same entry text/code paths.
     # Only the actual BEAM owns the memory this table is accounting for.
     return bool(argv and os.path.basename(argv[0]) in ("beam.smp", "beam")
-                and (any(ENTRY.search(word) for word in argv) or runtime_code_path(argv)))
+                and (executable is None or os.path.basename(executable) in ("beam.smp", "beam"))
+                and (any(ENTRY.search(word) for word in argv) or runtime_code_path(argv)
+                     or immutable_boot_index(argv) is not None))
 
 
 def collect():
@@ -126,7 +157,11 @@ def collect():
             continue
         pid = int(name)
         argv = cmdline(pid)
-        if not beam_lisp_vm(argv):
+        try:
+            executable = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        if not beam_lisp_vm(argv, executable):
             continue
         kind, what = kind_and_args(argv)
         st = kv_kb(f"/proc/{pid}/status", ("VmRSS", "VmSwap", "VmHWM"))
