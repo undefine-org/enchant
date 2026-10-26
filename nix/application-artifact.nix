@@ -45,7 +45,10 @@ let
 in
 assert (requestJson == null) != (requestPath == null);
 assert (request.version == 1 && builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ])
-  || (request.version == 2 && builtins.attrNames request == [ "base" "ex" "exclude" "jobs" "native" "scope" "source" "sources" "version" "world" ]);
+  || (request.version == 2 && builtins.attrNames request == [ "base" "ex" "exclude" "jobs" "native" "scope" "source" "sources" "version" "world" ])
+  || (request.version == 3 && builtins.attrNames request == [ "attempt" "base" "ex" "exclude" "force" "jobs" "native" "scope" "source" "sources" "version" "world" ]);
+assert request.version != 3 || (request.force == true && builtins.isString request.attempt
+  && builtins.match "[0-9a-f]{64}" request.attempt != null);
 assert builtins.elem (request.scope or "full") [ "full" "scoped" ];
 assert (request.base or null) == null || (scoped && storeObject request.base);
 assert !scoped || request.world == null;
