@@ -135,7 +135,7 @@ worst kind of configuration bug.
   Unsupported policies are errors. See [loading](loading.bl).
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
-- `:build` — `{:world :paths :seed :out :native :jobs :ex :exclude}`: which roots hold
+- `:build` — `{:world :paths :inputs :seed :out :native :jobs :ex :exclude}`: which roots hold
   build sources, where the output goes, which crates are native, how wide to
   compile, and which sources must NEVER be compiled. `:exclude` holds paths
   RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
@@ -489,6 +489,7 @@ problems reports all three in one pass.
     (not (map? v)) [nil [":build must be a map"]]
     :else
       (let [[paths perr]  (norm-strings (:paths v) ":build :paths" root)
+            [inputs ierr] (norm-strings (:inputs v) ":build :inputs" root)
             [native nerr] (norm-strings (:native v) ":build :native" root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
             [world werr]  (norm-opt-string (:world v) ":build :world" root)
@@ -513,10 +514,11 @@ problems reports all three in one pass.
                            (unknown-errs ex [:root :exclude] ":build :ex"))]))
             mixed (if (and world (or (seq paths) (seq native) seed exv (seq xcl)))
                        [":build :world cannot be combined with source/native/substrate selections"] [])
-            errs (concat perr nerr serr werr oerr jerr xerr exerr mixed
-                         (unknown-errs v [:world :paths :seed :out :native :jobs :ex :exclude] ":build"))]
+            errs (concat perr ierr nerr serr werr oerr jerr xerr exerr mixed
+                         (unknown-errs v [:world :paths :inputs :seed :out :native :jobs :ex :exclude] ":build"))]
         [(if (empty? errs)
            (cond-> {:paths paths
+            :inputs inputs
             :seed seed
             :out out
             :native native

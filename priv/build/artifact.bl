@@ -3,6 +3,14 @@
 (ns artifact (:require [artifact-process :as process]))
 
 (def schema 1)
+(defn framework-context
+  "Pinned startup configuration, separate from a project's logical :env.
+   This closed accessor exposes no arbitrary process environment variables."
+  []
+  (into {} (Enum/map [[:platform "BL_ARTIFACT_PLATFORM"] [:sdk "BL_SDK_PRODUCT"]
+                      [:checkout "BL_CHECKOUT_ROOT"]]
+             (fn [[kind key]]
+               [kind (erlang/apply :Elixir.System :get_env (list key))]))))
 (defn- refuse [message data] (throw (ex-info message (assoc data :kind :artifact-refused))))
 (defn- immutable-directory! [path]
   (let [expanded (Path/expand path)
@@ -122,13 +130,28 @@
       (refuse "Artifact machine result exceeds capacity" {}))
     (File/read! stdout)))
 
+(defn verify-application!
+  "Recheck immutable identity and every emitted byte before publication."
+  [output sdk source]
+  (let [platform (immutable-directory! (:platform (framework-context)))
+        output (immutable-directory! output)
+        sdk (immutable-directory! sdk)
+        source (immutable-directory! source)
+        directory (fresh-directory! (cache-root) "application-verification")]
+    (try
+      (Jason/decode!
+        (managed! platform (Path/join platform "bin/python3")
+          [(Path/join platform "nix/application-inventory.py") "verify" output sdk source]
+          30000 268435456 (Path/join directory "result.json")))
+      (finally (File/rm_rf! directory)))))
+
 (defn prepare-application!
   "Realize an application through the trusted recipe and an exact SDK. Source
    roots are explicit project-relative input declarations, including supporting
    files. Every request retains its SDK, source and result independently.
    This prepares a product; it does not publish files or execute its units."
   [options]
-  (let [platform (immutable-directory! (or (:platform options) (System/fetch_env! "BL_ARTIFACT_PLATFORM")))
+  (let [platform (immutable-directory! (or (:platform options) (:platform (framework-context))))
         sdk (immutable-directory! (:sdk options))
         source (Path/expand (:source options))
         roots (:roots options)
@@ -148,6 +171,7 @@
                         (run "source" nix
                           ["build" "--impure" "--file" (Path/join platform "nix/project-snapshot.nix")
                            "--argstr" "source" source "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
+                           "--argstr" "excludedJson" (Jason/encode! (Enum/map (or (:excluded-roots options) []) identity))
                            "--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"]))
         _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one project snapshot" {}))
         snapshot (immutable-directory! (get-in (first snapshot-rows) ["outputs" "out"]))
@@ -159,9 +183,10 @@
         _ (File/write! request-path (Jason/encode! request))
         rows (Jason/decode!
                (run "product" nix
-                 ["build" "--impure" "--file" (Path/join platform "nix/application-artifact.nix")
+                 (concat ["build" "--impure" "--file" (Path/join platform "nix/application-artifact.nix")
                   "--argstr" "requestPath" request-path "--argstr" "sdk" sdk
-                  "--json" "--out-link" (Path/join directory "retained") "--max-jobs" "0"]))
+                  "--json" "--out-link" (Path/join directory "retained") "--max-jobs" "0"]
+                   (when (:force? options) ["--rebuild"]))))
         _ (when-not (= 1 (count rows)) (refuse "Expected one application output" {}))
         output (immutable-directory! (get-in (first rows) ["outputs" "out"]))
         result (Jason/decode!

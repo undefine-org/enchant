@@ -1,7 +1,8 @@
 ;; Trusted worker entry: request JSON is data; the SDK's existing producer owns
 ;; compilation, descriptor emission and workspace admission.
 (ns artifact.application-worker
-  (:require [build :as build] [build-plan :as plan] [bl.env :as env] [app-resource :as app]))
+  (:require [build :as build] [build-plan :as plan] [build-log :as blog]
+            [bl.env :as env] [vm.osenv :as osenv] [app-resource :as app]))
 
 (let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
       root (System/fetch_env! "BL_APPLICATION_SOURCE")
@@ -9,13 +10,15 @@
       project (env/project root)
       _ (when (seq (:errors project))
           (throw (ex-info "Application declaration is invalid" {:errors (:errors project)})))
+      _ (Process/put osenv/PDICT-KEY (merge (osenv/overlay) (osenv/validate (or (:env project) {}))))
       _ (doseq [path (:paths project)] (BeamLisp.Env/add_search_path path))
       relative (fn [path] (when path (Path/join root path)))
       ex (get request "ex")
       options {:root root :out (Path/join out "ebin")
                :sources (Enum/map (get request "sources") relative)
                :world (relative (get request "world"))
-               :exclude (Enum/map (get request "exclude") relative)
+               :exclude (vec (distinct (concat (Enum/map (get request "exclude") relative)
+                                                (get-in project [:build :exclude]))))
                :jobs (get request "jobs")
                :native (get request "native")
                :ex (when ex {:root (relative (get ex "root")) :exclude (get ex "exclude")})
@@ -23,6 +26,14 @@
       result (build/run options)
       errors (Enum/map (:errors result) identity)]
   (when (seq errors) (throw (ex-info "Application production failed" {:errors errors})))
+  ;; Per-request wall-clock history belongs to the coordinator/Nix log. Keep
+  ;; actual source/module facts in the immutable product without timestamps.
+  (let [log (Path/join out "ebin/build.log")]
+    (when (File/regular? log)
+      (blog/write! log (blog/facts-of (dissoc (blog/replay (blog/read-facts log)) :runs :ended)))))
+  (File/write! (Path/join out "producer-projection.term")
+    (erlang/term_to_binary (select-keys result
+      [:manifest :runtime-manifest :profile :out :runtime-out :native-admission])))
   (let [planning (when-not (get request "world")
                    (plan/plan-paths (build/select-sources (:sources options) (:exclude options))))
         units
@@ -58,4 +69,7 @@
                                     :content (:hash node) :interface (:iface node)
                                     :key (get (:key planning) (:path node))
                                     :requires (Enum/map (:reqs node) identity)})))
+                     :runtime-out (when (:runtime-out result) (Path/relative_to (:runtime-out result) out))
+                     :app-file (when (:ok? resource) (Path/basename (:path resource)))
+                     :app-why (:why resource)
                      :app-resource (:ok? resource)}))))
