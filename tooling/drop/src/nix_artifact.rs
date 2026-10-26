@@ -130,7 +130,7 @@ pub(super) fn prepare(tree: &Path, source: &Path, name: &str,
 
 /// Prepare a closed standalone/workspace request using the same rooted source
 /// and product recipe as Source. No caller expression or tool argv is accepted.
-pub(super) fn prepare_request(tree: &Path, requested: &Value,
+pub(super) fn prepare_request(_tree: &Path, requested: &Value,
                               custody: &crate::BuildLock) -> Result<PathBuf, String> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("Nix native products currently support x86_64-linux".into());
@@ -139,15 +139,22 @@ pub(super) fn prepare_request(tree: &Path, requested: &Value,
     let name = requested["crate"].as_str().ok_or("missing native crate")?;
     let source = Path::new(requested["source"].as_str().ok_or("missing native source")?);
     let platform = std::env::var_os("BL_ARTIFACT_PLATFORM").map(PathBuf::from)
-        .unwrap_or_else(|| tree.to_path_buf());
+        .ok_or("startup BL_ARTIFACT_PLATFORM is required for native preparation")?;
     let platform = std::fs::canonicalize(platform).map_err(|e| e.to_string())?;
+    if !platform.to_str().is_some_and(store_object) {
+        return Err("native preparation recipes must use an immutable startup platform".into());
+    }
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?.as_nanos();
     let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
         .unwrap_or_else(|| crate::expand_home("~/.cache"));
-    let retained = cache.join("beam_lisp/artifacts").join(format!("native-rust-{}-{nonce}", std::process::id()));
-    std::fs::create_dir_all(&retained).map_err(|e| e.to_string())?;
-    let result = (|| {
+    let parent = cache.join("beam_lisp/artifacts");
+    std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+    let retained = std::fs::canonicalize(parent).map_err(|e| e.to_string())?
+        .join(format!("native-rust-{}-{nonce}", std::process::id()));
+    let coordinator = preparation_coordinator()?;
+    create_private_request(&retained)?;
+    let result: Result<PathBuf, String> = (|| {
         let source = std::fs::canonicalize(source).map_err(|e| e.to_string())?;
         if !source.is_dir() || source == Path::new("/") {
             return Err("native source must be a self-contained directory".into());
@@ -176,37 +183,122 @@ pub(super) fn prepare_request(tree: &Path, requested: &Value,
         }
         let mut request = requested.clone();
         request["source"] = json!(snapshot);
+        let operation = json!({"version":1,"kind":"native","request":request});
+        let operation_bytes = serde_json::to_vec(&operation).map_err(|e| e.to_string())?;
+        write_private_new(&retained.join("operation.json"), &operation_bytes)?;
+        let handle = coordinator_call(&coordinator, &retained, "submit", &[], custody)?;
+        let operation_digest = crate::sha256_hex(&operation_bytes);
+        if handle["version"] != 1 || handle["kind"] != "preparation-handle"
+            || handle["coordinator"].as_str() != coordinator.to_str()
+            || handle["directory"].as_str() != retained.to_str()
+            || handle["operation-sha256"].as_str() != Some(operation_digest.as_str())
+            || !handle["id"].as_str().is_some_and(|id| id.len() == 20 && id.starts_with("job_")
+                && id[4..].bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err("coordinator returned a different native preparation handle".into());
+        }
+        // The dispatcher persists handle.json before replying. Keep it and all
+        // requester roots on timeout, disconnect, cancellation, or verification
+        // failure so a later session can inspect/rejoin the durable operation.
+        let stored_handle: Value = serde_json::from_slice(&std::fs::read(retained.join("handle.json"))
+            .map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        if stored_handle != handle { return Err("durable native preparation handle disagrees".into()); }
+        let product = coordinator_call(&coordinator, &retained, "await", &["300000".into()], custody)?;
         let root = retained.join("retained");
-        let output = capture(&platform, "nix", &[
-            "build".into(), "--impure".into(), "--file".into(),
-            platform.join("nix/native-artifact.nix").to_string_lossy().into_owned(),
-            "--argstr".into(), "requestJson".into(), request.to_string(), "--json".into(),
-            "--out-link".into(), root.to_string_lossy().into_owned(),
-            "--max-jobs".into(), "0".into(), "--cores".into(), "1".into(),
-            "--option".into(), "timeout".into(), "300".into()], custody)?;
-        let rows: Value = serde_json::from_slice(&output).map_err(|e| e.to_string())?;
-        let rows = rows.as_array().filter(|rows| rows.len() == 1).ok_or("expected one native output")?;
-        let out = rows[0]["outputs"]["out"].as_str().ok_or("missing native output")?;
+        if product["version"] != 1 || product["kind"] != "preparation-result"
+            || product["operation"] != "native" || product["source"] != request["source"]
+            || product["operation-sha256"].as_str() != Some(operation_digest.as_str())
+            || product["retention-root"].as_str() != root.to_str() {
+            return Err("native preparation result disagrees with accepted operation".into());
+        }
+        let out = product["output"].as_str().ok_or("missing native output")?;
         let library = verify(Path::new(out), &request)?;
-        if std::fs::read_link(&root).map_err(|e| e.to_string())? != Path::new(out) {
-            return Err("native retention does not name its product".into());
+        if std::fs::read_link(&root).map_err(|e| e.to_string())? != Path::new(out)
+            || std::fs::read_link(&snapshot_root).map_err(|e| e.to_string())? != Path::new(snapshot) {
+            return Err("native retention does not name its product and captured source".into());
         }
         let receipt = json!({"request":request,"output":out,"library":library,
                               "manifest":serde_json::from_slice::<Value>(&std::fs::read(Path::new(out).join("artifact.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?,
-                              "retention-root":root,"derivation":rows[0]["drvPath"]});
-        std::fs::write(retained.join("receipt.json"), receipt.to_string()).map_err(|e| e.to_string())?;
+                              "retention-root":root,"derivation":product["derivation"]});
+        write_private_new(&retained.join("receipt.json"), receipt.to_string().as_bytes())?;
         Ok(library)
     })();
-    if result.is_err() { let _ = std::fs::remove_dir_all(retained); }
-    result
+    result.map_err(|error| format!("{error}; durable native request retained at {}", retained.display()))
+}
+
+#[cfg(unix)]
+fn create_private_request(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let parent = path.parent().ok_or("missing native request parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    // Never adopt or chmod an existing request directory.
+    std::fs::DirBuilder::new().mode(0o700).create(path).map_err(|e| e.to_string())?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_dir() || metadata.mode() & 0o077 != 0
+        || metadata.uid() != std::fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid() {
+        return Err("native request directory is not private to this operator".into());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn create_private_request(_: &Path) -> Result<(), String> { Err("native preparation requires Unix".into()) }
+
+#[cfg(unix)]
+fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(path).map_err(|e| e.to_string())?;
+    file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())
+}
+#[cfg(not(unix))]
+fn write_private_new(_: &Path, _: &[u8]) -> Result<(), String> { Err("native preparation requires Unix".into()) }
+
+fn preparation_coordinator() -> Result<PathBuf, String> {
+    let selected = std::env::var_os("BL_PREPARATION_COORDINATOR")
+        .ok_or("startup BL_PREPARATION_COORDINATOR is required for native preparation")?;
+    let coordinator = std::fs::canonicalize(selected).map_err(|e| e.to_string())?;
+    if !coordinator.to_str().is_some_and(store_object) || !coordinator.is_dir() {
+        return Err("native preparation coordinator must be an immutable store directory".into());
+    }
+    let metadata: Value = serde_json::from_slice(&std::fs::read(coordinator.join("artifact.json"))
+        .map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if metadata["version"] != 1 || metadata["kind"] != "artifact-coordinator-runtime"
+        || !coordinator.join("bin/bl").is_file()
+        || !coordinator.join("foundry/bin/preparation-operation.bl").is_file() {
+        return Err("pinned coordinator does not provide fixed preparation operations".into());
+    }
+    Ok(coordinator)
+}
+
+fn coordinator_call(coordinator: &Path, directory: &Path, mode: &str, arguments: &[String],
+                    custody: &crate::BuildLock) -> Result<Value, String> {
+    let runtime = coordinator.join("bin/bl");
+    let dispatcher = coordinator.join("foundry/bin/preparation-operation.bl");
+    let mut argv = vec!["--cold".into(), "run".into(),
+        dispatcher.to_str().ok_or("coordinator dispatcher is not UTF-8")?.into(), "--".into(),
+        mode.into(), directory.to_str().ok_or("native request directory is not UTF-8")?.into()];
+    argv.extend_from_slice(arguments);
+    let bytes = capture_with_limit(coordinator, runtime.to_str().ok_or("coordinator executable is not UTF-8")?,
+        &argv, custody, 365)?;
+    let envelope: Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid coordinator machine result: {e}"))?;
+    if envelope["ok"] != true {
+        return Err(format!("native preparation {mode} refused: {}", envelope["error"]));
+    }
+    envelope.get("value").cloned().ok_or_else(|| "coordinator machine result omitted its value".into())
 }
 
 fn capture(platform: &Path, tool: &str, argv: &[String], custody: &crate::BuildLock) -> Result<Vec<u8>, String> {
+    capture_with_limit(platform, tool, argv, custody, 305)
+}
+
+fn capture_with_limit(platform: &Path, tool: &str, argv: &[String], custody: &crate::BuildLock,
+                      runtime_seconds: u32) -> Result<Vec<u8>, String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
     let mut command = std::process::Command::new("systemd-run");
     command.args(["--user", "--quiet", "--wait", "--collect", "--pipe", "--expand-environment=no",
-                  "--property=MemoryMax=1G", "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=305",
+                  "--property=MemoryMax=1G", "--property=MemorySwapMax=0",
                   "--property=KillMode=control-group"])
+        .arg(format!("--property=RuntimeMaxSec={runtime_seconds}"))
         .arg(format!("--unit=bl-artifact-{}-{nonce}.service", std::process::id()))
         .arg(format!("--working-directory={}", platform.display()))
         .arg("--").arg(tool).args(argv).stderr(std::process::Stdio::inherit());
