@@ -8,7 +8,7 @@ let
     "src/foundry/support/deployment-tar.bl" ];
 in
 assert manifest.version == 1;
-assert manifest.revision == "1e945f2aedcef4c26ccada8d8208bd76aecec4a7";
+assert manifest.revision == "d5a733f0672521fdd447587c3ce7eadcd23a0c1b";
 assert builtins.attrNames manifest.files == expected;
 assert builtins.all (file: builtins.hashFile "sha256" (root + "/${file}") == manifest.files.${file}) expected;
 root
