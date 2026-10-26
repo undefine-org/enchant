@@ -276,5 +276,20 @@ let
       runHook postInstall
     '';
   });
+  portable = import ./portable-drop.nix {
+    inherit pkgs;
+    product = bl-drop;
+    sdk = bl-drop.sdk;
+    tools = drop-tools;
+  };
+  selection = import ./sdk-selection.nix {
+    inherit pkgs;
+    image = bl-drop.sdk;
+    release = portable;
+    platform = buildCheckout;
+  };
 in
-{ inherit bl-drop drop-tools natives dependencies compiler; sdk = bl-drop.sdk; }
+{ inherit drop-tools natives dependencies compiler;
+  bl-drop = portable;
+  sdk = selection;
+}
