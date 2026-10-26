@@ -31,8 +31,10 @@ module = Module.concat([ExecutionHistory, CustodyWorker])
   def handle(%{"op" => "cli_mode", "mutant" => mutant}, state),
     do: {Map.put(state, :cli_mutant, mutant), %{mutant: mutant}}
 
-  def handle(%{"op" => "build", "namespace" => ns, "source" => source, "out" => out}, state) do
-    result = invoke(ns, "run", [%{sources: [source], out: out, jobs: 1, force?: true}])
+  # Qualification of the internal compiler producer, not a local production
+  # fallback. Public CLI/API builds retain their authoritative Nix route.
+  def handle(%{"op" => "produce", "namespace" => ns, "source" => source, "out" => out}, state) do
+    result = invoke(ns, "produce!", [%{sources: [source], out: out, jobs: 1, force?: true}])
     {state, %{built: result.built, errors: Enum.to_list(result.errors)}}
   end
 

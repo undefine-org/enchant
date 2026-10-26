@@ -168,11 +168,17 @@ class ProcessCustodyControls(unittest.TestCase):
                                   '    (do (Process/sleep 10) (recur (inc n))))))\n'
                                   " (list 'defn 'answer [] 42))\n(hold-compilation)\n")
                 rival.write_text('(ns historical.api.rival) (defn answer [] 99)\n')
-                pending = owner.send('cli', root=str(root), source=str(source), out=str(workspace))
+                # Nix compiles public application products in an isolated
+                # builder, where a caller's mutable barrier path is absent.
+                # Exercise the existing internal producer directly: this is
+                # a disposable qualification component, never a published
+                # local production fallback. Real public CLI refusal remains
+                # below, before any build request can start.
+                pending = owner.send('produce', namespace='build', source=str(source), out=str(workspace))
                 wait_for_file(marker, owner.process)
                 log = workspace / 'build.log'
                 before = log.read_bytes() if log.exists() else None
-                good = collector.ask('build', namespace='build', source=str(rival), out=str(workspace))
+                good = collector.ask('produce', namespace='build', source=str(rival), out=str(workspace))
                 self.assertEqual(good['built'], 0)
                 self.assertTrue(any('held by' in error for error in good['errors']), good)
                 self.assertEqual(log.read_bytes() if log.exists() else None, before)
@@ -183,13 +189,13 @@ class ProcessCustodyControls(unittest.TestCase):
                 self.assertEqual(cli_mutant, {'exit': 1, 'events': 2}, 'ignored CLI claim must expose premature build events')
                 collector.ask('cli_mode', mutant=False)
                 self.assertEqual(log.read_bytes() if log.exists() else None, before)
-                bad = collector.ask('build', namespace='execution.history.unclaimed-build', source=str(rival), out=str(workspace))
+                bad = collector.ask('produce', namespace='execution.history.unclaimed-build', source=str(rival), out=str(workspace))
                 self.assertEqual(bad['errors'], [], bad)
                 self.assertEqual(bad['built'], 1)
                 self.assertNotEqual(log.read_bytes() if log.exists() else None, before,
                                     'bypassed SDK admission must expose the shared fact-log write')
                 release.write_text('go')
-                self.assertEqual(owner.result(pending)['exit'], 0)
+                self.assertEqual(owner.result(pending), {'built': 1, 'errors': []})
                 custody = owner.ask('claim', out=str(workspace))
                 self.assertTrue(custody['acquired'])
                 collector.ask('follow', context=custody['context'])
