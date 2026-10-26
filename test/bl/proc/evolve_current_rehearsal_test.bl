@@ -122,3 +122,60 @@
     (is (= :owner-transition-authority-required
            (:kind (GenServer/call pid [:proc.evolve/rehearse 1 value 1000])))))
    (is (= "retained same owner" (ev/request! pid 2 "retained same owner"))))))
+
+(defn- observation-probes [scope]
+ (let [source (File/read! (BeamLisp.Loader/source_path "proc.evolve"))
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                    (= "automatic-observation" (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))
+       before ":version (get-in st [:preparation :held :version])"
+       after ":version (get-in st [:current :version])"
+       suffix (str (erlang/unique_integer (list :positive)))]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))]
+   (assert (= 2 (count (String/split text before))))
+   (BeamLisp.Env/with_env scope
+    #(mapv (fn [historical?]
+             (let [namespace (str "history.evolve.observation." suffix "." (if historical? "installed" "held"))]
+              (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+              (BeamLisp.Compiler/eval_string (if historical? (String/replace text before after) text))
+              (BeamLisp.Env/fetch_exact! namespace "automatic-observation"))) [false true])))))
+
+(deftest prepared-observation-reports-held-candidate-not-installed-version
+ (with-owner "rehearsal-prepared-observation-causal"
+  (fn [_ fresh pid value]
+   (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+         live (BeamLisp.Env/fetch_exact! "proc.evolve" "automatic-observation")]
+    (try
+     (let [prepared (g/with! fresh #(ev/prepare-upgrade! pid 1 value))
+           _ (is (= :prepared (:status prepared)))
+           [current historical] (observation-probes scope)
+           before (erlang/apply :sys :get_state (list pid))
+           grant (get-in before [:preparation :automatic-grant])
+           observed (atom nil)]
+      (is (= 1 (:version (ev/status pid))))
+      (is (= 2 (:version (ev/transition-status pid grant))))
+      (with-counters (mapv #(get value %) [:handler :accept? :check-state :migrate-state :upcast])
+       (fn [counters]
+        ;; Run observations in the actual target owner: native grant status
+        ;; authenticates this PID. No supplied map/ticket creates a grant.
+        (erlang/apply :sys :replace_state
+         (list pid
+          (fn [st]
+           (let [call (fn [probe state] (BeamLisp.Ns.Rt/invoke probe (list state grant)))]
+            (reset! observed {:current (call current st) :historical (call historical st)
+                             :stale (call current (update st :revision inc))}))
+           st)))
+        (is (= {:status :prepared :version 2 :revision (:revision before 0)} (:current @observed)))
+        (is (= (assoc (:current @observed) :version 1) (:historical @observed)))
+        (is (= {:status :stale :version 2 :revision (inc (:revision before 0))} (:stale @observed)))
+        (is (= before (erlang/apply :sys :get_state (list pid))))
+        (doseq [mfa counters] (is (= 0 (calls mfa))))))
+      (is (= :applied (:status (g/with! fresh #(ev/commit-upgrade! pid (:ticket prepared))))))
+      (is (= :applied (:status (ev/transition-status pid grant))))
+      (is (= 2 (:version (ev/transition-status pid grant))))
+      (is (= "candidate remains usable" (ev/request! pid 2 "candidate remains usable")))
+      (is (= live (BeamLisp.Env/fetch_exact! "proc.evolve" "automatic-observation"))))
+     (finally (BeamLisp.Env/destroy scope)))))))
