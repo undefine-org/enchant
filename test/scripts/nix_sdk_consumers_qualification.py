@@ -176,6 +176,16 @@ def main():
         run('portable-receiver', [portable, '--cold', 'eval', '(do (assert (= 42 (+ 20 22))) (println "PORTABLE-CONSUMER passed"))'],
             portable_dir, marker='PORTABLE-CONSUMER passed')
 
+        fhs = output / 'portable-fhs'
+        run('portable-no-nix-store', [platform / 'artifact-platform/bin/nix', 'build', '--impure',
+                                    '--file', repo / 'test/nix/portable-runtime-control.nix',
+                                    '--argstr', 'release', release, '--max-jobs', '0',
+                                    '--option', 'experimental-features', 'nix-command flakes',
+                                    '--out-link', fhs], output)
+        fhs_result = json.loads((fhs / 'result.json').read_text())
+        assert fhs_result == {'passed': True, 'nixStoreVisible': False, 'answer': 42, 'nativeJson': True}
+        report['products']['portable_fhs'] = str(fhs.resolve(strict=True))
+
         workspace = output / 'workspace-project'
         shutil.copytree(repo / 'examples/artifacts/workspace', workspace,
                         ignore=shutil.ignore_patterns('target', '.bl', '.git', 'priv'))
