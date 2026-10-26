@@ -4,6 +4,13 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   mkdir -p "$out/nix" "$out/bin"
   ln -s ${commandExecutor}/bin/bl-command-executor "$out/bin/bl-command-executor"
   ln -s ${pkgs.python3}/bin/python3 "$out/bin/python3"
+  for executable in ${pkgs.nix}/bin/*; do
+    ln -s "$executable" "$out/bin/$(basename "$executable")"
+  done
+  ln -s ${pkgs.systemd}/bin/systemd-run "$out/bin/systemd-run"
+  ln -s ${pkgs.systemd}/bin/systemctl "$out/bin/systemctl"
+  ln -s ${pkgs.util-linux}/bin/setsid "$out/bin/setsid"
+  ln -s ${pkgs.procps}/bin/kill "$out/bin/kill"
   cp ${commandExecutor}/executor.json "$out/executor.json"
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
   cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
