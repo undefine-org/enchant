@@ -85,7 +85,8 @@
    project input is data. Standalone cdylib crates require a committed lock."
   [source crate abi target]
   (when-not (name? crate) (refuse "Native crate name is invalid" {:crate crate}))
-  (when-not (and (string? abi) (> (count abi) 0) (<= (count abi) 128))
+  (when-not (and (string? abi) (> (count abi) 0) (<= (count abi) 128)
+                (not (String/contains? abi (erlang/list_to_binary (list 0)))))
     (refuse "A native ABI identity is required" {}))
   (when-not (= "x86_64-linux" target)
     (refuse "Nix native products currently support x86_64-linux" {:target target}))
@@ -96,21 +97,52 @@
       (refuse (str "Native source requires " file) {:source source})))
   {"version" schema "source" (Path/expand source) "crate" crate "abi" abi "target" target})
 
+(defn native-request!
+  "Validate standalone or explicitly selected workspace package input."
+  [options]
+  (let [base (request (:source options) (:crate options) (:abi options)
+                      (or (:target options) "x86_64-linux"))]
+    (if (or (contains? options :member) (contains? options :package))
+      (let [member (:member options) package (:package options)]
+        (when-not (and (string? member) (<= 1 (count member) 4096)
+                       (or (= member ".")
+                         (every? (fn [part]
+                                   (and (<= 1 (count part) 255)
+                                        (not (contains? #{"." ".." ".git" ".bl" "target"} part))
+                                        (not (String/starts_with? part "-"))
+                                        (Regex/match? #"^[A-Za-z0-9_.-]+$" part)))
+                                 (String/split member "/"))))
+          (refuse "Native workspace member must be a bounded relative path" {}))
+        (when-not (and (string? package) (<= 1 (count package) 128)
+                       (Regex/match? #"^[A-Za-z0-9_][A-Za-z0-9_-]*$" package))
+          (refuse "Native workspace package name is invalid" {}))
+        (assoc base "version" 2 "member" member "package" package)) base)))
+
 (defn verify!
   "Verify one actual immutable product against the expected request and bytes.
    The returned library is a direct store address, ready for a runtime consumer."
   [output expected]
   (when-not (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output))
     (refuse "Artifact output must be a top-level Nix store path" {:output output}))
-  (when-not (and (map? expected) (= schema (get expected "version"))
+  (when-not (and (map? expected) (contains? #{1 2} (get expected "version"))
+                 (= (set (keys expected))
+                    (if (= 2 (get expected "version"))
+                      #{"version" "source" "member" "package" "crate" "abi" "target"}
+                      #{"version" "source" "crate" "abi" "target"}))
                  (name? (get expected "crate")) (= "x86_64-linux" (get expected "target"))
                  (string? (get expected "abi")) (> (count (get expected "abi")) 0)
                  (string? (get expected "source"))
                  (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" (get expected "source")))
     (refuse "Artifact verification requires a complete immutable request" {}))
+  (let [options {:source (get expected "source") :crate (get expected "crate")
+                 :abi (get expected "abi") :target (get expected "target")}
+        options (if (= 2 (get expected "version"))
+                  (assoc options :member (get expected "member") :package (get expected "package")) options)]
+    (when-not (= expected (native-request! options))
+      (refuse "Native request is not canonical" {})))
   (let [manifest (Jason/decode! (File/read! (Path/join output "artifact.json")))
         library (Path/join output (str "lib/" (get expected "crate") ".so"))]
-    (when-not (and (= schema (get expected "version")) (= schema (get manifest "version")) (= "native-library" (get manifest "kind"))
+    (when-not (and (= (get expected "version") (get manifest "version")) (= "native-library" (get manifest "kind"))
                   (= (str "lib/" (get expected "crate") ".so") (get manifest "library"))
                   (every? #(= (get manifest %) (get expected %)) ["crate" "abi" "target" "source"])
                   (= :regular (:type (File/lstat! library))))
@@ -124,6 +156,16 @@
                   (string? (get-in manifest ["toolchain" "identity"]))
                   (Regex/match? #"^[0-9a-f]{64}$" (get-in manifest ["toolchain" "identity"])))
       (refuse "Native product omitted its source or toolchain closure" {:output output}))
+    (when (= 2 (get expected "version"))
+      (let [cargo (get manifest "cargoLibrary") compiled (get manifest "compiled")]
+        (when-not (and (= (get expected "member") (get manifest "member"))
+                       (= (get expected "package") (get manifest "package"))
+                       (name? cargo) (string? compiled)
+                       (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" compiled)
+                       (= :regular (:type (File/lstat! (Path/join compiled (str "lib/" cargo ".so")))))
+                       (= (get manifest "sha256")
+                          (digest (File/read! (Path/join compiled (str "lib/" cargo ".so"))))))
+          (refuse "Native workspace provenance or compiled bytes disagree" {}))))
     {:output output :library library :manifest manifest}))
 
 (defn- cache-root []
@@ -268,8 +310,7 @@
    :timeout-ms, :memory-bytes, :retention-dir. Each successful request owns a
    separate root, so one requester never releases another's retention."
   [options]
-  (let [expected (request (:source options) (:crate options) (:abi options)
-                          (or (:target options) "x86_64-linux"))
+  (let [expected (native-request! options)
         platform (Path/expand (:platform options))
         recipe (Path/join platform "nix/native-artifact.nix")
         nix (process/tool "nix")
@@ -290,9 +331,12 @@
       (try
         (let [snapshot-rows (Jason/decode!
                               (managed! platform nix
-                                ["build" "--impure" "--file" (Path/join platform "nix/native-snapshot.nix")
-                                 "--argstr" "source" (get expected "source") "--argstr" "crate" (get expected "crate")
-                                 "--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"]
+                                (concat ["build" "--impure" "--file" (Path/join platform "nix/native-snapshot.nix")
+                                 "--argstr" "source" (get expected "source") "--argstr" "crate" (get expected "crate")]
+                                  (when (= 2 (get expected "version"))
+                                    ["--arg" "version" "2" "--argstr" "member" (get expected "member")
+                                     "--argstr" "package" (get expected "package")])
+                                  ["--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"])
                                 timeout memory snapshot-output))
               _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one native source snapshot" {}))
               snapshot (get-in (first snapshot-rows) ["outputs" "out"])
@@ -327,8 +371,7 @@
    retained native-set input supplied by the launcher or packaging producer.
    This input supplies bytes, never execution authority or test qualification."
   [options]
-  (let [expected (request (:source options) (:crate options) (:abi options)
-                          (or (:target options) "x86_64-linux"))
+  (let [expected (native-request! options)
         prepared (:natives (framework-context))
         product (when prepared
                   (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" prepared)
