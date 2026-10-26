@@ -44,16 +44,20 @@
         project (env/project root)
         _ (when (seq (:errors project))
             (throw (ex-info "Invalid application declaration" {:errors (:errors project)})))
+        jobs (or (:jobs options) 1)
+        _ (when-not (and (int? jobs) (> jobs 0))
+            (throw (ex-info "Application parallel width must be a positive integer" {})))
+        ex (when (and (:ex options) (File/dir? (get-in options [:ex :root]))) (:ex options))
         out (Path/expand (:out options) root)
         sources (Enum/map (or (:sources options) []) #(relative! root %))
         world (:world options)
         world-inputs (when world
                        (BeamLisp.Loader/ensure_loaded "compile.world")
                        (:inputs ((BeamLisp.Env/fetch! "compile.world" "capture") world)))
-        paths (concat (:paths project) (get-in project [:build :paths])
+        paths (concat (filter #(File/exists? %) (concat (:paths project) (get-in project [:build :paths])))
                       (get-in project [:build :inputs]) (:inputs options) (:sources options)
                       (Enum/map (or world-inputs []) :path)
-                      (when (:ex options) (list (get-in options [:ex :root])))
+                      (when ex (list (:root ex)))
                       (when (and (:native options) (File/dir? (Path/join root "native")))
                         (list (Path/join root "native")))
                       (filter #(File/regular? %) [(Path/join root "env.bl") (Path/join root "bl.lock")]))
@@ -68,8 +72,8 @@
        :excluded-roots (conj excluded "priv/native")
        :sources sources :world (when world (relative! root world))
        :exclude (Enum/map (or (:exclude options) []) #(relative! root %))
-       :ex (when-let [ex (:ex options)] {:root (relative! root (:root ex)) :exclude (:exclude ex)})
-       :native (:native options) :jobs (or (:jobs options) 1) :force? (:force? options)})))
+       :ex (when ex {:root (relative! root (:root ex)) :exclude (:exclude ex)})
+       :native (:native options) :jobs (min 4 jobs) :force? (:force? options)})))
 
 (defn select!
   "Select a prepared product without replacing the directory that owns its
@@ -78,6 +82,8 @@
   [receipt out]
   (when-not (claim/owned? out)
     (throw (ex-info "Application publication requires output custody" {:kind :application-output-unclaimed})))
+  (when (= :ok (elem (File/read_link (Path/join out ".nix-sdk")) 0))
+    (throw (ex-info "SDK and application products require separate output workspaces" {})))
   (let [product (:output receipt)
         result (artifact/verify-application! product (:sdk receipt) (:source receipt))
         previous (File/read_link (Path/join out ".nix-product"))
@@ -106,6 +112,37 @@
                           (File/read_link (Path/join out relative))))
               (File/rm! (Path/join out relative)))))))
     {:cached? cached :units units :product product :receipt receipt :result result}))
+
+(defn select-sdk!
+  "Project the already prepared SDK for an engine-checkout build. The stable
+   output directory keeps its claim; all selected code remains immutable."
+  [sdk options]
+  (let [out (Path/expand (:out options))
+        _ (when (and (:root options) (= out (Path/expand (:root options))))
+            (throw (ex-info "An SDK output cannot replace its checkout root" {})))
+        metadata (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
+        _ (when-not (and (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" sdk)
+                         (= 1 (get metadata "version")) (= "sdk" (get metadata "kind"))
+                         (= "x86_64-linux" (get metadata "target"))
+                         (File/regular? (Path/join sdk "image/ebin/beam_lisp.app")))
+            (throw (ex-info "Engine build requires its prepared SDK" {})))]
+    (claim/with-writer! out "Nix SDK selection"
+      (fn []
+        (when (= :ok (elem (File/read_link (Path/join out ".nix-product")) 0))
+          (throw (ex-info "SDK and application products require separate output workspaces" {})))
+        (doseq [name ["image" "lib" ".nix-sdk"]]
+          (let [existing (File/lstat (Path/join out name))]
+            (when (and (= :ok (elem existing 0)) (not= :symlink (:type (elem existing 1))))
+              (throw (ex-info "SDK output projection would replace an unrelated entry" {:name name})))))
+        (let [cached (= (tuple :ok sdk) (File/read_link (Path/join out ".nix-sdk")))]
+          (atomic-link! (Path/join sdk "image") (Path/join out "image"))
+          (atomic-link! (Path/join sdk "lib") (Path/join out "lib"))
+          (atomic-link! sdk (Path/join out ".nix-sdk"))
+          (when-let [log (:log options)] (log (str "beam-lisp SDK: " sdk)))
+          {:built (if cached 0 1) :compiled 0 :cached (if cached 1 0)
+           :errors [] :ex-built 0 :manifest {} :lock-wait-us 0
+           :product sdk :sdk? true :app-resource true :app-file "beam_lisp.app"
+           :native {:built 0 :cached 0 :artifacts [] :errors []}})))))
 
 (defn build!
   "Normal application build: Nix production followed by claimed publication.

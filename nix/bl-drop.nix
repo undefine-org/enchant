@@ -92,6 +92,7 @@ let
       (cleanDirectory ../priv [ "native" "z3" ".bl" "codegen.sources" "precompiled.term" "sdk-code.term" ])
       ../env.bl ../bl.lock
       ../scripts/prepare-release.bl
+      ../scripts/produce-sdk.bl
       ../scripts/qualify-artifact-generation
       ../scripts/demo-artifact-production
       ../scripts/check-source-floor
@@ -199,7 +200,9 @@ let
       chmod u+w $TMPDIR/launcher
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
-      ./bin/bl --cold self-build --reuse-floor --bin ${drop-tools}/bin/drop-launcher --out $TMPDIR/selfbuilt.drop --jobs $NIX_BUILD_CORES
+      export BL_PRODUCTION_LAUNCHER=${drop-tools}/bin/drop-launcher
+      export BL_PRODUCTION_DROP_OUTPUT=$TMPDIR/selfbuilt.drop
+      ./bin/bl --cold run scripts/produce-sdk.bl
 
       # unpack, retarget every ELF at the FHS loader, repack with the same launcher
       $TMPDIR/drop unpack $TMPDIR/selfbuilt.drop --dir $TMPDIR/payload
@@ -216,19 +219,25 @@ let
       mkdir -p "$sdk/bin"
       cat > "$sdk/bin/bl" <<EOF
       #!${pkgs.runtimeShell}
+      unset BL_INTERNAL_PRODUCER
       export PATH=${buildCheckout}/bin:\$PATH
       export BL_ARTIFACT_PLATFORM=${buildCheckout}/artifact-platform
+      export BL_SDK_PRODUCT="$sdk"
       exec "$sdk/bl" "\$@"
       EOF
       chmod 555 "$sdk/bin/bl"
       printf '%s\n' '${builtins.toJSON {
         version = 1;
         kind = "sdk";
+        producerAPI = 2;
         compiler = toString compiler;
         dependencies = toString dependencies;
         platform = toString buildCheckout;
         target = "x86_64-linux";
       }}' > "$sdk/artifact.json"
+      ${pkgs.jq}/bin/jq --arg release "$out" --arg source "$src" \
+        '. + {release: $release, source: $source}' "$sdk/artifact.json" > "$sdk/artifact.tmp"
+      mv "$sdk/artifact.tmp" "$sdk/artifact.json"
       # A portable drop carries bytes rather than references to its build store.
       for native in $TMPDIR/payload/lib/beam_lisp-*/priv/native/*.so; do
         if [ -L "$native" ]; then
@@ -253,6 +262,17 @@ let
       runHook preInstall
       mkdir -p $out
       cp $TMPDIR/bl.drop $out/bl.drop
+      digest=$(sha256sum "$out/bl.drop" | cut -d' ' -f1)
+      printf '%s\n' '${builtins.toJSON {
+        version = 1;
+        kind = "release";
+        target = "x86_64-linux";
+        compiler = toString compiler;
+        file = "bl.drop";
+      }}' > "$out/artifact.json"
+      ${pkgs.jq}/bin/jq --arg sha "$digest" '. + {sha256: $sha}' \
+        "$out/artifact.json" > "$out/artifact.tmp"
+      mv "$out/artifact.tmp" "$out/artifact.json"
       runHook postInstall
     '';
   });

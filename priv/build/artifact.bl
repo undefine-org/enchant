@@ -1,6 +1,6 @@
 ; Immutable native products supplied by the pinned Nix platform.
 ; Native artifacts grant no execution authority: the runtime still checks its ABI.
-(ns artifact (:require [artifact-process :as process]))
+(ns artifact (:require [artifact-process :as process] [claim :as claim] [drop :as drop]))
 
 (def schema 1)
 (defn framework-context
@@ -8,7 +8,7 @@
    This closed accessor exposes no arbitrary process environment variables."
   []
   (into {} (Enum/map [[:platform "BL_ARTIFACT_PLATFORM"] [:sdk "BL_SDK_PRODUCT"]
-                      [:checkout "BL_CHECKOUT_ROOT"]]
+                      [:checkout "BL_CHECKOUT_ROOT"] [:producer "BL_INTERNAL_PRODUCER"]]
              (fn [[kind key]]
                [kind (erlang/apply :Elixir.System :get_env (list key))]))))
 (defn- refuse [message data] (throw (ex-info message (assoc data :kind :artifact-refused))))
@@ -22,6 +22,55 @@
     resolved))
 (defn- digest [bytes]
   (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+
+(defn verify-release!
+  "Authenticate the portable output retained by the selected SDK."
+  [sdk]
+  (let [sdk (immutable-directory! sdk)
+        selected (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
+        _ (when-not (and (= 1 (get selected "version")) (= "sdk" (get selected "kind"))
+                         (= "x86_64-linux" (get selected "target")))
+            (refuse "Unsupported SDK release selection" {}))
+        _ (when-not (string? (get selected "release"))
+            (refuse "Selected SDK does not retain a managed Nix release" {:sdk sdk}))
+        output (immutable-directory! (get selected "release"))
+        descriptor (Jason/decode! (File/read! (Path/join output "artifact.json")))
+        file (Path/join output "bl.drop")]
+    (when-not (and (= 1 (get descriptor "version")) (= "release" (get descriptor "kind"))
+                  (= "x86_64-linux" (get descriptor "target")) (= "bl.drop" (get descriptor "file"))
+                  (= (get selected "compiler") (get descriptor "compiler"))
+                  (= :regular (:type (File/lstat! file)))
+                  (= (get descriptor "sha256") (drop/sha256-hex-of file 0 (drop/file-size file))))
+      (refuse "Release identity or bytes disagree with the selected SDK" {:output output}))
+    {:output output :file file :manifest descriptor}))
+
+(defn publish-release!
+  "Copy an already produced immutable release under destination custody."
+  [sdk destination]
+  (let [release (verify-release! sdk)
+        destination (Path/expand destination)
+        temporary (str destination ".nix-" (System/system_time :microsecond)
+                       "-" (erlang/unique_integer (list :positive)))]
+    (claim/with-writer! (claim/artifact-scope destination) "Nix release publication"
+      (fn []
+        (File/mkdir_p! (Path/dirname destination))
+        (let [target (File/open! temporary (list :write :binary :exclusive))]
+          (try
+            (try
+              (let [source (File/open! (:file release) (list :read :binary))]
+                (try
+                  (when-not (= (tuple :ok (drop/file-size (:file release)))
+                               (erlang/apply :file :copy (list source target)))
+                    (refuse "Release copy did not complete" {}))
+                  (finally (File/close source))))
+              (finally (File/close target)))
+            (when-not (= (get-in release [:manifest "sha256"])
+                         (drop/sha256-hex-of temporary 0 (drop/file-size temporary)))
+              (refuse "Release copy digest disagrees" {}))
+            (File/chmod! temporary 493)
+            (File/rename! temporary destination)
+            (assoc release :destination destination)
+            (finally (File/rm temporary))))))))
 (defn- name? [value]
   (and (string? value) (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]*$" value)))
 (defn selected?

@@ -625,6 +625,7 @@ fn main() {
         checkout_main(&argv[1..]);
     }
     // A drop must never inherit a checkout's launch mode or source receipt.
+    std::env::remove_var("BL_INTERNAL_PRODUCER");
     std::env::remove_var("BL_CHECKOUT_ROOT");
     std::env::remove_var("BL_CHECKOUT_GENERATION");
     let me = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));

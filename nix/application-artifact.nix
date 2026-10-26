@@ -45,6 +45,7 @@ assert (requestJson == null) != (requestPath == null);
 assert builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ];
 assert request.version == 1 && storeObject request.source && storeObject sdk;
 assert descriptor.version == 1 && descriptor.kind == "sdk" && descriptor.target == "x86_64-linux";
+assert (descriptor.producerAPI or 1) == 2;
 assert builtins.isList request.sources && builtins.all relative request.sources;
 assert request.world == null || relative request.world;
 assert builtins.isList request.exclude && builtins.all relative request.exclude;
