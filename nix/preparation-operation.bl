@@ -13,8 +13,12 @@
   ;; Only actual sequential values become JSON arrays; maps recurse at any depth.
   (cond
     (map? value) (reduce (fn [out key]
-                          (assoc out (if (keyword? key) (name key) key)
-                            (json-native (get value key)))) {} (keys value))
+                          (let [normalized (if (keyword? key) (name key) key)]
+                            (when-not (string? normalized)
+                              (throw (ex-info "JSON object keys must be strings or keywords" {})))
+                            (when (contains? out normalized)
+                              (throw (ex-info "JSON object keys collide after normalization" {})))
+                            (assoc out normalized (json-native (get value key))))) {} (keys value))
     (sequential? value) (to-list (map json-native value))
     (keyword? value) (name value)
     :else value))
@@ -75,14 +79,14 @@
 (defn- state-path [directory] (Path/join directory "foundry-state"))
 
 (defn- atomic-json! [path value]
-  (let [temporary (str path ".tmp-" (erlang/unique_integer (list :positive)))]
+  (let [temporary (str path ".tmp-" (Base/encode16 (crypto/strong_rand_bytes 16)))]
     (try
       (File/write! temporary (encode-json! value) (list :exclusive))
       (File/chmod! temporary 384)
       (File/rename! temporary path)
       (finally (File/rm temporary)))))
 
-(defn- native! [request]
+(defn- native-contract! [request relative-source?]
   (let [version (get request "version")]
     (exact! request (if (= version 2)
                       ["version" "source" "member" "package" "crate" "abi" "target"]
@@ -91,11 +95,16 @@
                   (string? (get request "abi")) (< 0 (count (get request "abi")) 129)
                   (= "x86_64-linux" (get request "target")))
       (refuse! "Invalid native preparation contract"))
-    (store! (get request "source"))
+    (if relative-source?
+      (when-not (application-relative? (get request "source"))
+        (refuse! "Native application input must be relative to its captured project"))
+      (store! (get request "source")))
     (when (= version 2)
       (when-not (and (member? (get request "member")) (string? (get request "package"))
                     (Regex/match? #"^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$" (get request "package")))
         (refuse! "Invalid native workspace selection"))) request))
+
+(defn- native! [request] (native-contract! request false))
 
 (defn- application! [request]
   (let [version (get request "version")
@@ -104,6 +113,7 @@
                       1 common
                       2 (concat common ["base" "scope"])
                       3 (concat common ["base" "scope" "force" "attempt"])
+                      4 (concat common ["base" "scope" "force" "attempt" "nativeProducts"])
                       (refuse! "Unsupported application request version")))
     (store! (get request "source"))
     (when-not (and (sequential? (get request "sources")) (<= (count (get request "sources")) 256)
@@ -124,6 +134,20 @@
       (when-not (and (= true (get request "force")) (string? (get request "attempt"))
                     (Regex/match? #"^[0-9a-f]{64}$" (get request "attempt")))
         (refuse! "Invalid forced application attempt")))
+    (when (= version 4)
+      (let [force (get request "force") attempt (get request "attempt")
+            products (get request "nativeProducts")]
+        (when-not (and (contains? #{true false} force)
+                      (if force
+                        (and (string? attempt) (Regex/match? #"^[0-9a-f]{64}$" attempt))
+                        (nil? attempt))
+                      (sequential? products) (<= (count products) 128)
+                      (or (get request "native") (empty? products)))
+          (refuse! "Invalid application native products or attempt"))
+        (doseq [product products] (native-contract! product true))
+        (let [aliases (map #(get % "crate") products)]
+          (when-not (= (count aliases) (count (set aliases)))
+            (refuse! "Application native crate aliases must be unique")))))
     (when-let [ex (get request "ex")]
       (exact! ex ["root" "exclude"])
       (when-not (and (application-relative? (get ex "root")) (sequential? (get ex "exclude"))
@@ -190,12 +214,11 @@
                         "--" "worker" directory (:digest loaded) (sha (encode-json! (identity directory)))]
                 "cwd" (:foundry ctx) "env" (:environment ctx) "timeoutSeconds" 3500
                 "outputLimit" 65536 "cancellable" true}]}))
-(defn- record! [loaded ctx id]
+(defn- validate-record! [loaded ctx id row]
   (when-not (and (string? id) (Regex/match? #"^job_[0-9a-f]{16}$" id))
     (refuse! "Invalid preparation job identity"))
   (let [request (runner/validate-request (fixed-request loaded ctx))
-        expected (Jason/decode! (encode-json! request))
-        row (owned-json! (Path/join (state-path (:directory loaded)) (str "ledger/jobs/" id ".json")) operation-limit)]
+        expected (Jason/decode! (encode-json! request))]
     (when-not (and (= id (get row "id")) (= (get expected "idempotencyKey") (get row "idempotency_key"))
                   (= (runner/request-digest request) (get row "request_digest"))
                   (= (get expected "target") (get row "target")) (= "artifact-prepare" (get row "kind"))
@@ -205,6 +228,12 @@
                   (int? (get row "spawn_count")) (<= 0 (get row "spawn_count") 3)
                   (sequential? (get row "steps")) (= 1 (count (get row "steps"))))
       (refuse! "Stored job differs from the fixed accepted preparation operation")) row))
+(defn- record! [loaded ctx id]
+  ;; Validate path identity before constructing any ledger pathname.
+  (when-not (and (string? id) (Regex/match? #"^job_[0-9a-f]{16}$" id))
+    (refuse! "Invalid preparation job identity"))
+  (validate-record! loaded ctx id
+    (owned-json! (Path/join (state-path (:directory loaded)) (str "ledger/jobs/" id ".json")) operation-limit)))
 (defn- tokens [pid]
   (try (String/split (bounded! (str "/proc/" pid "/cmdline") 65536) (erlang/list_to_binary (list 0)))
        (catch error nil)))
@@ -262,61 +291,74 @@
   (let [result (process/run (Path/join (:platform ctx) "bin/systemctl")
                  ["--user" "show" (str "foundry-artifact-" id ".service")
                   "--property=LoadState" "--property=ActiveState" "--property=MainPID"
-                  "--property=InvocationID"] {:timeout-ms 10000 :limit 8192})
+                  "--property=InvocationID"] {:timeout-ms 10000 :limit 8192 :env (:environment ctx)})
         fields (into {} (keep (fn [line]
                                (let [pair (String/split line "=" (list (tuple :parts 2)))]
                                  (when (= 2 (count pair)) pair))) (String/split (:out result) "\n")))]
     (when-not (and (contains? fields "LoadState") (contains? fields "MainPID"))
       (refuse! "Managed worker cannot be observed; needs recovery")) fields))
 (defn- cancel! [directory]
-  (let [state (state! directory) loaded (:loaded state) ctx (:context state) row (:row state)
-        id (get row "id") observed (observation loaded ctx row)]
-    (if (contains? terminal (get row "status")) observed
-      (do
-        (runner/update-job! (state-path directory) id
-          (fn [current] (assoc current "cancel_requested" true "updated_at" (runner/iso-now))))
-        (if (= "queued" (get row "status")) (status! directory)
-          (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))]
-            (if-not (and (get observed "workerAlive") (= pid (get row "worker_pid"))
-                         (not (empty? (get unit "InvocationID" ""))) (in-unit? pid id)
-                         (worker-known? loaded ctx row pid (get row "worker_ticks")))
-              (assoc (status! directory) "needsRecovery" true)
-              (let [stopped (process/run (Path/join (:platform ctx) "bin/systemctl")
-                              ["--user" "stop" (str "foundry-artifact-" id ".service")]
-                              {:timeout-ms 30000 :limit 8192})]
-                (when-not (process/ok? stopped) (refuse! "Managed worker stop was not confirmed; needs recovery"))
-                ;; No PGID signal and no claim that an in-flight effect rolled back.
-                (runner/settle! (state-path directory) id "interrupted"
-                  "Cancellation stopped the managed worker; in-flight outcome unknown" nil)
-                (status! directory)))))))))
-(defn- recover! [directory]
-  (let [state (state! directory) loaded (:loaded state) ctx (:context state) row (:row state)
-        id (get row "id") observed (observation loaded ctx row)]
+  (let [state (state! directory) loaded (:loaded state) ctx (:context state)
+        id (get (:row state) "id")
+        row (runner/update-job! (state-path directory) id
+              (fn [current]
+                (let [row (validate-record! loaded ctx id current)]
+                  ;; A queued worker must acquire this same mutex before admission.
+                  ;; Its flag is therefore observed before any step can start.
+                  ;; Running workers are stopped only through their verified unit,
+                  ;; never via the generic runner's process-group cancellation.
+                  (if (= "queued" (get row "status"))
+                    (assoc row "cancel_requested" true "updated_at" (runner/iso-now)) row))))
+        observed (observation loaded ctx row)]
     (cond
-      (or (contains? terminal (get row "status")) (get observed "workerAlive")) observed
+      (contains? terminal (get row "status")) observed
+      (= "queued" (get row "status")) (status! directory)
       :else
-      (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))
-            recorded (get row "worker_pid")
-            recorded-live (and (int? recorded) (> recorded 1) (File/dir? (str "/proc/" recorded)))]
-        (if (or (> pid 0) recorded-live) (assoc observed "needsRecovery" true)
-          (if (and (= "queued" (get row "status")) (not (get row "cancel_requested"))
-                   (< (get row "spawn_count" 0) 3))
-            (let [pid (runner/spawn-worker! (state-path directory) id (get row "worker_nonce"))]
-              (runner/update-job! (state-path directory) id
-                (fn [current]
-                  (if (= "queued" (get current "status"))
-                    (assoc current "worker_pid" pid "worker_ticks" (runner/proc-start-ticks pid)
-                      "spawn_count" (inc (get current "spawn_count" 0)) "updated_at" (runner/iso-now)) current)))
-              (status! directory))
-            (do (runner/settle! (state-path directory) id "interrupted"
-                  "Worker is absent; preparation outcome requires verification" nil)
-                (status! directory))))))))
+      (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))]
+        (if-not (and (get observed "workerAlive") (= pid (get row "worker_pid"))
+                     (not (empty? (get unit "InvocationID" ""))) (in-unit? pid id)
+                     (worker-known? loaded ctx row pid (get row "worker_ticks")))
+          (assoc (status! directory) "needsRecovery" true)
+          (let [stopped (process/run (Path/join (:platform ctx) "bin/systemctl")
+                          ["--user" "stop" (str "foundry-artifact-" id ".service")]
+                          {:timeout-ms 30000 :limit 8192 :env (:environment ctx)})]
+            (when-not (process/ok? stopped) (refuse! "Managed worker stop was not confirmed; needs recovery"))
+            ;; No PGID signal and no claim that an in-flight effect rolled back.
+            (runner/settle! (state-path directory) id "interrupted"
+              "Cancellation stopped the managed worker; in-flight outcome unknown" nil)
+            (status! directory)))))))
+
+(defn- recover! [directory]
+  (let [state (state! directory) loaded (:loaded state) ctx (:context state)
+        id (get (:row state) "id")]
+    ;; The existing Foundry mutex serializes competing recovery claims. Spawn
+    ;; while holding it: the new worker cannot claim queued until its identity
+    ;; has been recorded, and another recover sees that recorded live process.
+    (runner/update-job! (state-path directory) id
+      (fn [current]
+        (let [row (validate-record! loaded ctx id current)
+              observed (observation loaded ctx row)]
+          (if (or (contains? terminal (get row "status")) (get observed "workerAlive")) row
+            (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))
+                  recorded (get row "worker_pid")
+                  recorded-live (and (int? recorded) (> recorded 1) (File/dir? (str "/proc/" recorded)))]
+              (if (or (> pid 0) recorded-live) row
+                (if (and (= "queued" (get row "status")) (not (get row "cancel_requested"))
+                         (< (get row "spawn_count" 0) 3))
+                  (let [spawned (runner/spawn-worker! (state-path directory) id (get row "worker_nonce"))]
+                    (assoc row "worker_pid" spawned "worker_ticks" (runner/proc-start-ticks spawned)
+                      "spawn_count" (inc (get row "spawn_count" 0)) "updated_at" (runner/iso-now)))
+                  ;; No unverified process is signalled or adopted. Preserve
+                  ;; roots and the ledger for explicit outcome investigation.
+                  row)))))))
+    (status! directory)))
 
 (defn- run! [ctx directory label executable argv]
-  (let [path (Path/join directory (str label "-" (erlang/unique_integer (list :positive)) ".json"))
+  (let [path (Path/join directory (str label "-" (Base/encode16 (crypto/strong_rand_bytes 16)) ".json"))
         result (process/run executable argv {:timeout-ms 3300000 :limit 65536 :stdout-file path
-                                            :env {"PATH" (str (:platform ctx) "/bin:/usr/bin:/bin")
-                                                  "NIX_CONFIG" "experimental-features = nix-command flakes"}})]
+                                            :env (merge (:environment ctx)
+                                                   {"PATH" (str (:platform ctx) "/bin:/usr/bin:/bin")
+                                                    "NIX_CONFIG" "experimental-features = nix-command flakes"})})]
     (when-not (process/ok? result)
       (refuse! (str "Preparation " label " failed: " (:error result) " " (:out result))))
     (json! path machine-limit)))
@@ -324,7 +366,7 @@
   (let [root (Path/join directory name)
         result (process/run (Path/join (:platform ctx) "bin/nix-store")
                  ["--add-root" root "--indirect" "--realise" input]
-                 {:timeout-ms 60000 :limit 65536})]
+                 {:timeout-ms 60000 :limit 65536 :env (:environment ctx)})]
     (when-not (and (process/ok? result) (= (tuple :ok input) (File/read_link root)))
       (refuse! "Preparation input retention failed"))))
 (defn- file-digest! [path]

@@ -11,8 +11,12 @@
   ;; Only actual sequential values become JSON arrays; maps recurse at any depth.
   (cond
     (map? value) (reduce (fn [out key]
-                          (assoc out (if (keyword? key) (name key) key)
-                            (json-native (get value key)))) {} (keys value))
+                          (let [normalized (if (keyword? key) (name key) key)]
+                            (when-not (string? normalized)
+                              (throw (ex-info "JSON object keys must be strings or keywords" {})))
+                            (when (contains? out normalized)
+                              (throw (ex-info "JSON object keys collide after normalization" {})))
+                            (assoc out normalized (json-native (get value key))))) {} (keys value))
     (sequential? value) (to-list (map json-native value))
     (keyword? value) (name value)
     :else value))
@@ -57,7 +61,10 @@
   (let [directory (Path/expand path)]
     (when (and create? (not (File/exists? directory)))
       ;; The caller owns the parent. Do not chmod an adopted existing directory.
-      (File/mkdir! directory) (File/chmod! directory 448))
+      (let [created (File/mkdir directory)]
+        (when (= :ok created) (File/chmod! directory 448))
+        (when-not (or (= :ok created) (= (tuple :error :eexist) created))
+          (refuse! "Cannot create private artifact request directory" {:directory directory}))))
     (let [info (File/lstat! directory)]
       (when-not (and (= :directory (:type info)) (= (:uid (File/stat! "/proc/self")) (:uid info)) (= 0 (erlang/band (:mode info) 63))
                     (not= 0 (erlang/band (:mode info) 128)))
@@ -69,7 +76,7 @@
                (fn [key] [key (erlang/apply :Elixir.System :get_env (list key))])))))
 (defn- call! [runtime directory mode arguments timeout]
   (let [runtime (runtime! runtime) directory (directory! directory false)
-        output (Path/join directory (str "client-" mode "-" (erlang/unique_integer (list :positive)) ".json"))
+        output (Path/join directory (str "client-" mode "-" (Base/encode16 (crypto/strong_rand_bytes 16)) ".json"))
         argv (concat ["--cold" "run" (Path/join runtime "foundry/bin/preparation-operation.bl")
                       "--" mode directory] arguments)
         result (process/run (Path/join runtime "bin/bl") argv
@@ -113,10 +120,18 @@
         body (encode-json! operation)
         _ (when (> (erlang/byte_size body) operation-limit) (refuse! "Artifact preparation operation exceeds capacity" {}))
         path (Path/join directory "operation.json")]
-    (if (File/exists? path)
-      (when-not (= body (owned-file! path operation-limit))
-        (refuse! "An artifact request directory cannot be reused for different input" {:directory directory}))
-      (do (File/write! path body (list :exclusive)) (File/chmod! path 384)))
+    ;; Publish complete, private bytes with an exclusive hard link. Competing
+    ;; identical submissions never observe a partially written operation file.
+    (let [temporary (str path ".tmp-" (Base/encode16 (crypto/strong_rand_bytes 16)))]
+      (try
+        (File/write! temporary body (list :exclusive))
+        (File/chmod! temporary 384)
+        (let [written (File/ln temporary path)]
+          (when-not (or (= :ok written) (= (tuple :error :eexist) written))
+            (refuse! "Cannot record private artifact operation" {:directory directory}))
+          (when-not (= body (owned-file! path operation-limit))
+            (refuse! "An artifact request directory cannot be reused for different input" {:directory directory})))
+        (finally (File/rm temporary))))
     (let [handle (call! coordinator directory "submit" [] 60000)]
       (when-not (and (= coordinator (get handle "coordinator")) (= directory (get handle "directory"))
                     (= (identity directory) (get handle "directory-identity"))
