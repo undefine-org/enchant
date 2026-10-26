@@ -1,5 +1,6 @@
 (ns data.cache-generation-test
- (:require [data.bounded-cache :as cache] [data.cache-pool :as pool] [reload.generation :as g] [env]))
+ (:require [data.bounded-cache :as cache] [data.cache-pool :as pool] [proc.table :as table]
+           [reload.generation :as g] [env]))
 (defn factory [value] (fn [] value))
 (defn graph [value]
  (g/prepare! {:application-id "cache-generation"
@@ -18,6 +19,55 @@
    (is (nil? (g/owner-evidence (Process/whereis name))))
    (is (= :retired (:status (g/retire! old))))
    (finally (cleanup name [old])))))
+
+(defn- ambient-context [pid]
+ ;; Sample between OTP turns, rather than during a legitimate temporary
+ ;; callback context. Only read registered context fields, not arbitrary data.
+ (let [dictionary (first (elem (erlang/apply :sys :get_status (list pid)) 3))]
+  {:generation (Keyword/get dictionary :bl_generation)
+   :env (Keyword/get dictionary :bl_env)}))
+
+(deftest shared-sdk-table-and-cache-owners-retain-data-without-the-starting-graph
+ (let [table-name :e35_shared_table cache-name :e35_shared_cache
+       old (graph :first) fresh (graph :second)
+       prior-heir (Process/whereis table/HEIR)
+       prior-pool (Process/whereis pool/NAME)
+       owned (atom [])]
+  (try
+   (g/with! old
+    (fn []
+     (table/hold table-name)
+     (is (cache/ready! cache-name))
+     (is (pool/ready!))
+     (ets/insert table-name (tuple :answer 42))))
+   (let [keeper (table/owner table-name) heir (Process/whereis table/HEIR)
+         cache-owner (Process/whereis cache-name) collector (Process/whereis pool/NAME)
+         owners [keeper heir cache-owner collector]]
+    (reset! owned (vec (concat [keeper cache-owner]
+                        (when-not prior-heir [heir]) (when-not prior-pool [collector]))))
+    (doseq [pid owners]
+     (is (erlang/is_pid pid))
+     (is (= {:generation nil :env :global} (ambient-context pid)))
+     (is (nil? (g/owner-evidence pid))))
+    (is (= :retired (:status (g/retire! old))))
+    (is (every? Process/alive? owners))
+    (is (= (list (tuple :answer 42)) (ets/lookup table-name :answer)))
+    (g/with! fresh
+     (fn []
+      (is (= table-name (table/hold table-name)))
+      (is (cache/ready! cache-name))
+      (is (pool/ready!))))
+    (is (= owners [(table/owner table-name) (Process/whereis table/HEIR)
+                   (Process/whereis cache-name) (Process/whereis pool/NAME)]))
+    (is (= :retired (:status (g/retire! fresh))))
+    (is (every? Process/alive? owners)))
+   (finally
+    ;; Stop only the uniquely named test owners and shared services that this
+    ;; test actually created. Delete the test table before stopping its keeper
+    ;; so the heir cannot retain it after cleanup.
+    (when (not= :undefined (ets/whereis table-name)) (ets/delete table-name))
+    (doseq [pid @owned] (when (and pid (Process/alive? pid)) (GenServer/stop pid)))
+    (doseq [generation [old fresh]] (g/retire! generation))))))
 
 (deftest callback-fingerprint-does-not-replace-generation-and-configuration-authority
  (let [name :bounded_cache_generation_values old (graph 1) next (graph 2)
