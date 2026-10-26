@@ -5,15 +5,20 @@ reproducing a packaged release. `command -v bl` identifies the executable on
 `PATH`; `bl which` describes a running tool's image. A drop contains an immutable
 SDK snapshot. Editing a checkout changes that checkout's commands.
 
-`build/` is the checkout application image. `BEAM_LISP_EBIN` selects an explicitly
-prepared image. Keep experiments in private images and caches; an installed
-drop's files and another checkout's outputs belong to their owners.
+The normal checkout entry selects a retained Nix SDK before starting BEAM.
+Its code paths come from that immutable image. `build/` holds a build projection;
+it does not choose the running compiler. `BEAM_LISP_EBIN` belongs to the internal
+producer/checker workflow. Keep experiments in private images and caches.
+Current cutover qualification is recorded in
+[production status](../../research/authoritative-nix-production/STATUS.org).
 
 ## One compiler VM, fresh project code
 
-`./bin/bl` builds its native transport client with Cargo on first use. The
-client reaches an existing VM before starting Elixir or staging host beams.
-Each request supplies its directory, arguments and environment.
+`./bin/bl` prepares its pinned native transport and prerequisites through Nix.
+The client reaches an existing VM before Elixir startup or SDK preparation.
+Cold preparation uses the configured Nix build station with local builds
+disabled. Cargo runs inside native recipes. Each request supplies its directory,
+arguments and environment.
 
 Current installed drops also run their first default command in the persistent
 VM. The first client waits for readiness and retains its command's initialized
@@ -22,8 +27,8 @@ transport declaration still overrides the default.
 
 The client hashes actual runtime and project bytes under separate identities:
 
-- Runtime identity covers SDK sources, native sources, launcher settings,
-  the compiler floor and an explicitly selected image. A change starts a fresh VM.
+- Runtime identity covers complete SDK producer inputs, native sources, launcher
+  settings, the compiler floor and the selected platform. A change starts a fresh VM.
 - Project identity covers project sources and declared or explicit source paths.
   A document analysis realm keeps its environment and bounded content caches.
   A realm with published project definitions retires on a project change, so
@@ -39,7 +44,7 @@ systemd user runtime, automatic VMs have a 4 GiB memory limit and 512 MiB swap
 limit. Keep test daemons in private runtime directories and stop them in cleanup;
 `test/scripts/checkout_transport.py` exercises that lifecycle.
 
-`./bin/bl --cold ...` starts a fresh VM and also works without Cargo. Image builds
+`./bin/bl --cold ...` starts a fresh VM using the selected SDK. Image builds
 and dependency provisioning run cold. The `:warm` setting in `env.bl` or the user
 configuration overrides the checkout's default transport policy.
 
@@ -59,8 +64,9 @@ SDK custody. If the current image cannot load changed compiler sources, use a
 coherent older source image through `BL_REGEN_ROOT`. The regeneration workflow
 and recovery contract are in [bootstrap regeneration](../bootstrap-regeneration.org).
 
-A release reuses the qualified floor and compiles the complete SDK during
-`self-build`. Its precompiled index records every member and digest of each
+A Nix release recipe reuses the qualified floor and runs the existing SDK
+producer. Public `self-build` publishes the selected SDK's verified portable
+release. Its precompiled index records every member and digest of each
 compiled unit. A fresh runtime verifies and restores the whole unit before
 initializing it. SDK compilation is build work; runtime admission verifies
 source bytes, code identities and ownership evidence.
