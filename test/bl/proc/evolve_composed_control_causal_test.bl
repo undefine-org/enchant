@@ -1,0 +1,133 @@
+(ns proc.evolve-composed-control-causal-test
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+
+(def SOURCE
+ "(ns composed.control (:require [proc.server :as ps] [proc.evolve :as ev]))
+  (defn accepts [message] (erlang/is_binary message))
+  (defn valid [value] (erlang/is_integer value))
+  (defn unchanged [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [version digest]
+   {:version version :digest digest :accept? accepts :check-state valid :handler handler
+    :migrate-state unchanged :upcast unchanged})
+  (ps/defserver owner
+   (evolve {:spec (:spec start-opts) :state 0 :managed true})
+   (init [_] (ok {:custom 7}))
+   (handle-call :custom [_ st] (reply (:custom st) st)))")
+(defn- graph [revision]
+ (g/prepare! {:application-id "composed-control-causal" :fixed-runtime true
+              :resources {:revision revision} :native-modules #{"erlang"}
+              :stable-namespaces #{"proc.server" "proc.evolve"}
+              :sources {"composed.control" (if (= revision 1) SOURCE
+                            (first (String/split SOURCE "  (ps/defserver owner")))}}))
+(defn- spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "composed.control/spec" [version (:digest graph)]))))
+(defn- owner [graph]
+ (g/with! graph #(start (BeamLisp.Env/fetch_exact! (get (:mapping graph) "composed.control") "owner")
+                        {:spec (spec graph 1)})))
+
+(defn- probes [scope]
+ (let [source (File/read! (BeamLisp.Loader/source_path "proc.evolve"))
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                    (= "public-spec-call" (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))
+       before "(control-spec grant spec)" after "spec"
+       parameters "[pid prefix spec suffix timeout]"
+       injected "[control-spec public-owner-call pid prefix spec suffix timeout]"
+       suffix (str (erlang/unique_integer (list :positive)))]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))]
+   (assert (= 2 (count (String/split text before))))
+   (assert (= 2 (count (String/split text parameters))))
+   ;; Inject the SAME live SDK helpers as lexical arguments. Their private Env
+   ;; bindings belong to another scope; no context rebinding grants authority.
+   (BeamLisp.Env/with_env scope
+    #(mapv (fn [historical?]
+             (let [namespace (str "history.composed.control." suffix "." (if historical? "raw" "opaque"))
+                   body (String/replace text parameters injected)]
+              (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+              (BeamLisp.Compiler/eval_string (if historical? (String/replace body before after) body))
+              (BeamLisp.Env/fetch_exact! namespace "public-spec-call"))) [false true])))))
+
+(defn- outcome [action]
+ (try {:status :returned :value (action)}
+  (catch error {:status :thrown :reason (BeamLisp.ExInfo/ex_original error)
+                :kind (:kind (ex-data error))})))
+
+(deftest composed-source-owner-requires-an-opaque-control-payload-before-candidate-admission
+ (let [before-flag (Process/flag :trap_exit true)
+       old (graph 1) fresh (graph 2) scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       p (atom nil) owned (atom []) grant (atom nil) observed (atom nil) tracked (atom [])]
+  (try
+   (g/with! old #(state/bind! {})) (g/inherit-runtime! fresh old)
+   (reset! p (owner old)) (swap! owned conj @p)
+   (let [candidate (spec fresh 2) [current historical] (probes scope)
+         control (BeamLisp.Env/fetch_exact! "proc.evolve" "control-spec")
+         live-call (BeamLisp.Env/fetch_exact! "proc.evolve" "public-owner-call")
+         observer (fn [pid message timeout]
+                    (let [reply (outcome #(live-call pid message timeout))]
+                     (reset! observed {:payload-map? (map? (nth message 3))
+                                      :payload-tuple? (tuple? (nth message 3)) :reply reply})
+                     (if (= :returned (:status reply)) (:value reply)
+                      (throw (ex-info "Observed control failure" {:kind (:kind reply)})))))
+         call-probe (fn [probe]
+                      (g/with! fresh #(BeamLisp.Ns.Rt/invoke probe
+                       (list control observer @p [:proc.evolve/automatic-prepare @grant 1] candidate [[]] 5000))))
+         watch (Process/monitor @p)]
+    (is (= 7 (GenServer/call @p :custom)))
+    (is (= 1 (:version (ev/status @p))))
+    (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @p)))
+    (doseq [callback (mapv #(get candidate %) [:handler :accept? :check-state :migrate-state :upcast])]
+     (is (= :external (elem (erlang/fun_info callback :type) 1)))
+     (let [mfa (tuple (elem (erlang/fun_info callback :module) 1)
+                      (elem (erlang/fun_info callback :name) 1)
+                      (elem (erlang/fun_info callback :arity) 1))]
+      (is (= 1 (erlang/trace_pattern mfa true (list :call_count))))
+      (swap! tracked conj mfa)))
+    (let [raw (outcome #(call-probe historical))
+          down (receive [:DOWN seen :process pid why] :when (= seen watch) {:pid pid :reason why}
+                 (after 100 nil))]
+     (println :history-E76-raw-control {:client (select-keys raw [:status :kind])
+                                     :payload-map? (:payload-map? @observed)
+                                     :reply-status (get-in @observed [:reply :status])
+                                     :reply-kind (get-in @observed [:reply :kind])
+                                     :owner-down? (some? down)
+                                     :owner-reason (let [why (:reason down)] (if (tuple? why) (elem why 0) why))})
+     (is (= true (:payload-map? @observed)))
+     (is (some? down))
+     (is (= :source_native_target_refused
+            (let [why (:reason down)] (if (tuple? why) (elem why 0) why))))
+     (doseq [mfa (distinct @tracked)]
+      (is (= 0 (elem (erlang/trace_info mfa :call_count) 1)))
+      (erlang/trace_pattern mfa false (list :call_count)))
+     (reset! tracked [])
+     (is (= :thrown (:status raw)))
+     (is (= :invalid_execution_registration (:reason raw)))
+     (when @grant (try (BeamLisp.Env/abandon_owner_transition! @grant) (catch _ nil)))
+     (reset! grant nil)
+     (when-not (Process/alive? @p) (reset! p (owner old)) (swap! owned conj @p)))
+    (Process/demonitor watch (list :flush))
+    (is (= 7 (GenServer/call @p :custom)))
+    (is (= 1 (:version (ev/status @p))))
+    (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @p)))
+    (let [prepared (call-probe current)]
+     (is (= false (:payload-map? @observed)))
+     (is (= true (:payload-tuple? @observed)))
+     (is (= :prepared (:status prepared))))
+    (is (= :applied (:status (g/with! fresh #(ev/commit-transition! @p @grant)))))
+    (reset! grant nil)
+    (is (= 2 (:version (ev/status @p))))
+    (is (= "composed candidate" (ev/request! @p 2 "composed candidate")))
+    (is (= 7 (GenServer/call @p :custom))))
+   (finally
+    (doseq [mfa @tracked] (erlang/trace_pattern mfa false (list :call_count)))
+    (when @grant
+     (try (g/with! fresh #(ev/cancel-transition! @p @grant)) (catch _ nil))
+     (try (BeamLisp.Env/abandon_owner_transition! @grant) (catch _ nil)))
+    (doseq [pid @owned]
+     (when (Process/alive? pid) (try (GenServer/stop pid) (catch _ nil)))
+     (receive [:EXIT stopped _] :when (= stopped pid) :done (after 0 nil)))
+    (g/retire! fresh) (g/retire! old) (BeamLisp.Env/destroy scope)
+    (Process/flag :trap_exit before-flag)))))
