@@ -16,21 +16,29 @@ let
   descriptor = builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile (image + "/artifact.json")));
   platform = builtins.storePath descriptor.platform;
   nativeDirectory = source + "/native";
-  crates = if request.native && builtins.pathExists nativeDirectory
+  legacyCrates = if request.native && builtins.pathExists nativeDirectory
     then builtins.filter (name: builtins.pathExists (nativeDirectory + "/${name}/Cargo.toml"))
       (builtins.attrNames (builtins.readDir nativeDirectory)) else [];
-  products = builtins.listToAttrs (map (crate: {
-    name = crate;
+  declarations = if request.version == 4 then request.nativeProducts else map (crate: {
+    version = 1;
+    inherit crate;
+    source = "native/${crate}";
+    abi = "beam-lisp-native-${crate}-v1";
+    target = "x86_64-linux";
+  }) legacyCrates;
+  validNative = item: builtins.isAttrs item
+    && builtins.elem item.version [ 1 2 ]
+    && builtins.attrNames item == (if item.version == 1 then [ "abi" "crate" "source" "target" "version" ]
+       else [ "abi" "crate" "member" "package" "source" "target" "version" ])
+    && relative item.source && item.target == "x86_64-linux"
+    && builtins.isString item.crate && builtins.match "[A-Za-z_][A-Za-z0-9_]{0,127}" item.crate != null;
+  crates = map (item: item.crate) declarations;
+  products = builtins.listToAttrs (map (item: {
+    name = item.crate;
     value = import ./native-artifact.nix {
-      requestJson = builtins.toJSON {
-        version = 1;
-        inherit crate;
-        source = toString (nativeDirectory + "/${crate}");
-        abi = "beam-lisp-native-${crate}-v1";
-        target = "x86_64-linux";
-      };
+      requestJson = builtins.toJSON (item // { source = toString (source + "/${item.source}"); });
     };
-  }) crates);
+  }) declarations);
   nativeSet = if crates == [] then null else import ./native-bundle.nix { inherit pkgs products; };
   requestFile = pkgs.writeText "beam-lisp-application-request.json" (builtins.toJSON request);
   boot = pkgs.writeText "beam-lisp-application-producer.exs" ''
@@ -46,9 +54,17 @@ in
 assert (requestJson == null) != (requestPath == null);
 assert (request.version == 1 && builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ])
   || (request.version == 2 && builtins.attrNames request == [ "base" "ex" "exclude" "jobs" "native" "scope" "source" "sources" "version" "world" ])
-  || (request.version == 3 && builtins.attrNames request == [ "attempt" "base" "ex" "exclude" "force" "jobs" "native" "scope" "source" "sources" "version" "world" ]);
+  || (request.version == 3 && builtins.attrNames request == [ "attempt" "base" "ex" "exclude" "force" "jobs" "native" "scope" "source" "sources" "version" "world" ])
+  || (request.version == 4 && builtins.attrNames request == [ "attempt" "base" "ex" "exclude" "force" "jobs" "native" "nativeProducts" "scope" "source" "sources" "version" "world" ]);
 assert request.version != 3 || (request.force == true && builtins.isString request.attempt
   && builtins.match "[0-9a-f]{64}" request.attempt != null);
+assert request.version != 4 || (builtins.isBool request.force
+  && (if request.force then builtins.isString request.attempt && builtins.match "[0-9a-f]{64}" request.attempt != null
+      else request.attempt == null)
+  && builtins.isList declarations && builtins.length declarations <= 128
+  && builtins.all validNative declarations
+  && builtins.length crates == builtins.length (pkgs.lib.unique crates)
+  && (request.native || declarations == []));
 assert builtins.elem (request.scope or "full") [ "full" "scoped" ];
 assert (request.base or null) == null || (scoped && storeObject request.base);
 assert !scoped || request.world == null;

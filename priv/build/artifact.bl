@@ -1,6 +1,7 @@
 ; Immutable native products supplied by the pinned Nix platform.
 ; Native artifacts grant no execution authority: the runtime still checks its ABI.
-(ns artifact (:require [artifact-process :as process] [claim :as claim] [drop :as drop]))
+(ns artifact (:require [artifact-process :as process] [artifact-jobs :as jobs]
+                       [claim :as claim] [drop :as drop]))
 
 (def schema 1)
 (defn framework-context
@@ -9,6 +10,7 @@
   []
   (into {} (Enum/map [[:platform "BL_ARTIFACT_PLATFORM"] [:sdk "BL_SDK_PRODUCT"]
                       [:checkout "BL_CHECKOUT_ROOT"] [:producer "BL_INTERNAL_PRODUCER"]
+                      [:coordinator "BL_PREPARATION_COORDINATOR"]
                       [:natives "BL_PREPARED_NATIVES"] [:home "HOME"] [:cache "XDG_CACHE_HOME"]
                       [:runtime "XDG_RUNTIME_DIR"] [:bus "DBUS_SESSION_BUS_ADDRESS"]]
              (fn [[kind key]]
@@ -24,6 +26,12 @@
     resolved))
 (defn- digest [bytes]
   (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+(defn- platform! [options]
+  (let [pinned (immutable-directory! (:platform (framework-context)))
+        selected (if (contains? options :platform) (immutable-directory! (:platform options)) pinned)]
+    (when-not (= selected pinned)
+      (refuse "Artifact recipes must use the pinned startup platform" {}))
+    pinned))
 
 (defn verify-release!
   "Authenticate the portable output retained by the selected SDK."
@@ -226,6 +234,14 @@
       (refuse "Artifact machine result exceeds capacity" {}))
     (File/read! stdout)))
 
+(defn- prepare-job! [directory operation timeout]
+  (let [coordinator (:coordinator (framework-context))
+        _ (when-not coordinator
+            (refuse "Managed preparation coordinator is missing from startup configuration" {}))
+        handle (jobs/submit! coordinator (Path/join directory "job") operation)
+        result (jobs/await! handle timeout)]
+    (assoc result "handle" handle)))
+
 (defn verify-application!
   "Recheck immutable identity and every emitted byte before publication."
   [output sdk source]
@@ -247,7 +263,7 @@
    files. Every request retains its SDK, source and result independently.
    This prepares a product; it does not publish files or execute its units."
   [options]
-  (let [platform (immutable-directory! (or (:platform options) (:platform (framework-context))))
+  (let [platform (platform! options)
         sdk (immutable-directory! (:sdk options))
         source (Path/expand (:source options))
         roots (:roots options)
@@ -285,20 +301,23 @@
         request (if (:force? options)
                   (assoc request "version" 3 "scope" (if (= :scoped (:scope options)) "scoped" "full")
                                  "base" (:base options) "force" true "attempt" (digest directory)) request)
-        request-path (Path/join directory "request.json")
-        _ (File/write! request-path (Jason/encode! request))
-        rows (Jason/decode!
-               (run "product" nix
-                 ["build" "--impure" "--file" (Path/join platform "nix/application-artifact.nix")
-                  "--argstr" "requestPath" request-path "--argstr" "sdk" sdk
-                  "--json" "--out-link" (Path/join directory "retained") "--max-jobs" "0"]))
-        _ (when-not (= 1 (count rows)) (refuse "Expected one application output" {}))
-        output (immutable-directory! (get-in (first rows) ["outputs" "out"]))
+        request (if (contains? options :native-products)
+                  (assoc request "version" 4 "scope" (if (= :scoped (:scope options)) "scoped" "full")
+                    "base" (:base options) "force" (boolean (:force? options))
+                    "attempt" (when (:force? options) (digest directory))
+                    "nativeProducts" (Enum/map (:native-products options) identity)) request)
+        _ (when (:base options)
+            (run "base-retention" store
+              ["--add-root" (Path/join directory "base-retained") "--indirect" "--realise"
+               (immutable-directory! (:base options))]))
+        prepared (prepare-job! directory {"version" 1 "kind" "application" "sdk" sdk "request" request} timeout)
+        output (immutable-directory! (get prepared "output"))
         result (Jason/decode!
                  (run "verification" (Path/join platform "bin/python3")
                    [(Path/join platform "nix/application-inventory.py") "verify" output sdk snapshot]))
         receipt {:output output :sdk sdk :source snapshot :request request :result result
-                 :derivation (get (first rows) "drvPath") :retention-root (Path/join directory "retained")}]
+                 :job (get prepared "handle") :derivation (get prepared "derivation")
+                 :retention-root (get prepared "retention-root")}]
     (when-not (= (tuple :ok output) (File/read_link (:retention-root receipt)))
       (refuse "Application retention does not name its product" {}))
     (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
@@ -311,7 +330,7 @@
    separate root, so one requester never releases another's retention."
   [options]
   (let [expected (native-request! options)
-        platform (Path/expand (:platform options))
+        platform (platform! options)
         recipe (Path/join platform "nix/native-artifact.nix")
         nix (process/tool "nix")
         manager (process/tool "systemd-run")
@@ -344,24 +363,19 @@
                                (= (tuple :ok snapshot) (File/read_link (Path/join directory "source-retained"))))
                   (refuse "Native source snapshot lacks its requester root" {}))
               expected (assoc expected "source" snapshot)
-              response (managed! platform nix
-                         ["build" "--impure" "--file" recipe "--argstr" "requestJson" (Jason/encode! expected)
-                          "--json" "--out-link" root "--max-jobs" "0" "--cores" "1"
-                          "--option" "timeout" (str (quot timeout 1000))]
-                         timeout memory stdout)
-              rows (Jason/decode! response)]
-          (when-not (= 1 (count rows)) (refuse "Expected one native artifact output" {}))
-          (let [output (get-in (first rows) ["outputs" "out"])
+              prepared (prepare-job! directory {"version" 1 "kind" "native" "request" expected} timeout)
+              root (get prepared "retention-root")]
+          (let [output (get prepared "output")
                 product (verify! output expected)]
             (when-not (= (tuple :ok output) (File/read_link root))
               (refuse "Artifact retention does not name its product" {}))
             (let [receipt (assoc product :request expected :retention-root root
-                                :derivation (get (first rows) "drvPath"))]
+                                :job (get prepared "handle") :derivation (get prepared "derivation"))]
               (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
               receipt)))
         (catch error
-          ;; Only this request's fresh directory is owned here.
-          (File/rm_rf! directory)
+          ;; A submitted durable job may outlive this caller. Preserve its
+          ;; inputs, handle and roots even when await or verification fails.
           (throw error))
         (finally (File/rm stdout) (File/rm snapshot-output) (File/rm (Path/join directory "source-root.txt")))))))
 

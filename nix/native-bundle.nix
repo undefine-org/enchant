@@ -13,7 +13,7 @@ pkgs.runCommand "beam-lisp-server-natives" {} ''
     test ! -L "$product/lib/${name}.so"
     digest=$(sha256sum "$product/lib/${name}.so" | cut -d' ' -f1)
     ${pkgs.jq}/bin/jq -e --arg crate ${name} --arg target ${target} --arg digest "$digest" \
-      '.version == 1 and .kind == "native-library" and .crate == $crate and .target == $target and .library == ("lib/" + $crate + ".so") and .sha256 == $digest' \
+      '(.version == 1 or .version == 2) and .kind == "native-library" and .crate == $crate and .target == $target and .library == ("lib/" + $crate + ".so") and .sha256 == $digest' \
       "$product/artifact.json" > /dev/null
     ln -s "$product/lib/${name}.so" "$out/${name}.so"
     ${pkgs.jq}/bin/jq --arg output "$product" '. + {output: $output}' \
