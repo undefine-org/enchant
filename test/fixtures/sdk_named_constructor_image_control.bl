@@ -1,0 +1,176 @@
+;; Proposed-fix component only. Parent supplies an owned, byte-identical copied
+;; SDK with Source removed and launches bare AOT.boot before launcher retention.
+;; No networking, live module replacement or SDK authority fabrication occurs.
+(assert (= (elem (BeamLisp.Bootstrap/packaged_keys!) 0)
+           (BeamLisp.AOTCache/current_compiler_key)))
+(ns fixture.sdk-named-constructor-image-control)
+
+(def ORIGINAL :Elixir.SdkNamedConstructorImageOriginal)
+(def CANDIDATE :Elixir.SdkNamedConstructorImageCandidate)
+(def TARGET "reload.source-guard")
+(def BINDING "http-request!")
+
+(defn- sha [bytes]
+ (Base/encode16 (crypto/hash :sha256 bytes) (list (tuple :case :lower))))
+(defn- refusal [action]
+ (try (action) {:status :accepted}
+  (catch error
+   (let [original (BeamLisp.ExInfo/ex_original error)
+         kind (or (:kind (ex-data error))
+                  (cond (keyword? original) original
+                        (tuple? original) (elem original 0)
+                        (map? original) (or (:kind original) (:__struct__ original))
+                        :else :other-error))]
+    {:status :refused :kind kind}))))
+
+(defn- native-form [source name]
+ ;; The real Reader owns form boundaries. Never locate the next definition by
+ ;; a textual delimiter that can also occur in comments, strings or nested data.
+ (loop [stream (BeamLisp.Ns.Reader/stream source "priv/host/aot.bl") found []]
+  (let [read (BeamLisp.Ns.Reader/read-next-string stream)]
+   (if (= :ok (first read))
+    (let [form (second read) text (nth read 2)]
+     (recur (nth read 3)
+      (if (String/starts_with? text (str "(defn- " name " ["))
+       (conj found {:text text :span (select-keys (BeamLisp.FormMeta/meta form) [:offset :end-offset])}) found)))
+    (do (assert (= 1 (count found))) (first found))))))
+
+(defn- compile-helpers! [source scratch]
+ (let [selected (native-form source "sdk_named_constructor!") original (:text selected)
+       callable-selected (native-form source "sdk_callable_module!") callable-original (:text callable-selected)
+       anchor "source (physical_sdk_path (BeamLisp.Loader/source_path ns))]"
+       replacement "source (or (physical_sdk_path (BeamLisp.Loader/source_path ns))\n                  (when row (sdk_unit_source_path root (Map/get row :source))))]"
+       check "(when-not (and row source (= :stable-body (Map/get row :role))"
+       strengthened "(when-not (and row source (sdk_source_current? root module row) (= :stable-body (Map/get row :role))"
+       _ (assert (= 2 (count (String/split original anchor))))
+       _ (assert (= 2 (count (String/split original check))))
+       changed (-> original (String/replace anchor replacement) (String/replace check strengthened))
+       callable-anchor
+       "(let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))\n            relative (Map/get row :source)\n            source (when relative (physical_sdk_path (Path/join root relative)))]\n        (when-not (and source (String/starts_with? source (str root \"/\"))\n                       (= (Map/get row :source-digest)\n                          (crypto/hash :sha256 (BeamLisp.Loader/read_source source))))\n          (erlang/error :stale_sdk_runtime_inventory)))"
+       callable-replacement
+       "(when-not (sdk_source_current? (physical_sdk_path (BeamLisp.Tiers/priv_root)) mod row)\n        (erlang/error :stale_sdk_runtime_inventory))"
+       _ (assert (= 2 (count (String/split callable-original callable-anchor))))
+       callable-changed (String/replace callable-original callable-anchor callable-replacement)
+       forwards
+       "(defn sdk_unit_compiled? [ns] (BeamLisp.AOT/sdk_unit_compiled? ns))\n(defn sdk_compiler_row [module] (BeamLisp.AOT/sdk_compiler_row module))\n(defn physical_sdk_path [path] (BeamLisp.AOT/physical_sdk_path path))\n(defn stage-refuse [kind] (BeamLisp.AOT/stage-refuse kind))\n(defn sdk_unit_source_path [root path] (BeamLisp.AOT/sdk_unit_source_path root path))\n(defn sdk_source_current? [root module row] (BeamLisp.AOT/sdk_source_current? root module row))\n(defn sdk_callable_manifest! [] (BeamLisp.AOT/sdk_callable_manifest!))\n(defn seed_dependency_from_manifest! [module manifest] (BeamLisp.AOT/seed_dependency_from_manifest! module manifest))\n(defn seed_forwarder_dependency_from_manifest! [module manifest] (BeamLisp.AOT/seed_forwarder_dependency_from_manifest! module manifest))\n(defn sdk_source_dependency! [module] (BeamLisp.AOT/sdk_source_dependency! module))\n"]
+  (println :sdk-named-constructor-source
+   {:host-sha256 (sha source) :reader-span (:span selected)
+    :original-form-sha256 (sha original) :candidate-form-sha256 (sha changed)
+    :callable-reader-span (:span callable-selected)
+    :original-callable-form-sha256 (sha callable-original)
+    :candidate-callable-form-sha256 (sha callable-changed)
+    :component :source-derived-two-leaf-private-helpers :accepted-sdk-qualification false})
+  (doseq [[module text] [[ORIGINAL (str original "\n" callable-original)]
+                        [CANDIDATE (str changed "\n" callable-changed)]]]
+   (let [path (Path/join scratch (str (Atom/to_string module) ".bl"))]
+    (File/write! path (str "(ns fixture.sdk-named-constructor-private)\n" forwards text))
+    (BeamLisp.AOT/compile_host_file path
+     (list (tuple :module module) (tuple :output_dir scratch) (tuple :load? true)))))))
+
+(defn- named [module namespace binding arity]
+ (erlang/apply module :sdk_named_constructor! (list namespace binding arity)))
+
+(defn- owned-file! [root path]
+ ;; An explicit root assertion is necessary before denial controls write bytes.
+ ;; Refuse symlinks/hard links that could change the accepted immutable original.
+ (assert (not (String/starts_with? root "/nix/store/")))
+ (assert (String/starts_with? (Path/expand path) (str (Path/dirname root) "/")))
+ (let [stat (File/lstat! path)]
+  (assert (= :regular (:type stat))) (assert (= 1 (:links stat)))))
+
+(defn- with-changed-file [root path replacement action]
+ (owned-file! root path)
+ (let [original (File/read! path)]
+  (try
+   (File/write! path (replacement original))
+   (action)
+   (finally
+    (File/write! path original)
+    (assert (= original (File/read! path)))))))
+
+(let [root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+      owned-root (System/fetch_env! "BL_TEST_SDK_CONTROL_MUTABLE_ROOT")
+      source-root (System/fetch_env! "BL_TEST_SOURCE_ROOT")
+      source (File/read! (Path/join source-root "priv/host/aot.bl"))
+      aot-md5 (BeamLisp.AOT/module_info :md5)
+      aot-source (BeamLisp.AOT/normalized_attribute (BeamLisp.AOT/module_info :attributes) :bl_source_hash)
+      scratch (Path/join (System/tmp_dir!) (str "sdk-named-constructor-image-" (erlang/unique_integer (list :positive))))]
+ (println :sdk-named-constructor-preconditions
+  {:root root :source-sha256 (sha source) :loaded-aot-source-sha256 aot-source})
+ (assert (= root (Path/expand owned-root)))
+ (assert (= (sha source) aot-source))
+ (assert (= [] (vec (Path/wildcard (Path/join root "**/*.bl")))))
+ (assert (= [] (vec (Path/wildcard (Path/join root "**/*.bl.md")))))
+ (assert (File/regular? (Path/join root "sdk-code.term")))
+ (File/mkdir_p! scratch)
+ (try
+  (compile-helpers! source scratch)
+  (BeamLisp.Env/with_env :global #(BeamLisp.Loader/ensure_loaded TARGET))
+  (assert (BeamLisp.AOT/sdk_unit_compiled? TARGET))
+  (let [live (refusal #(named :Elixir.BeamLisp.AOT TARGET BINDING 1))
+        copy (refusal #(named ORIGINAL TARGET BINDING 1))
+        candidate (named CANDIDATE TARGET BINDING 1)
+        body (elem (erlang/fun_info candidate :module) 1)
+        evidence (refusal #(BeamLisp.AOT/sdk_callable_evidence! candidate))
+        unchanged-module (refusal #(erlang/apply ORIGINAL :sdk_callable_module! (list body)))
+        module-row (erlang/apply CANDIDATE :sdk_callable_module! (list body))
+        actual-row (BeamLisp.AOT/sdk_compiler_row body)
+        body-path (BeamLisp.AOT/sdk_image_artifact_path root (Atom/to_string body))
+        inventory-path (Path/join root "sdk-code.term")
+        negatives
+         {:missing-namespace (refusal #(named CANDIDATE "sdk.no-such-constructor-provider" BINDING 1))
+          :missing-binding (refusal #(named CANDIDATE TARGET "no-such-constructor" 1))
+          :wrong-arity (refusal #(named CANDIDATE TARGET BINDING 0))}]
+   (println :sdk-named-constructor-component
+    {:live live :unchanged-private copy :candidate-type (elem (erlang/fun_info candidate :type) 1)
+     :candidate-module body :candidate-function (elem (erlang/fun_info candidate :name) 1)
+     :candidate-arity (elem (erlang/fun_info candidate :arity) 1)
+     :actual-sdk-callable-evidence evidence :unchanged-module-helper unchanged-module
+     :candidate-module-row (select-keys module-row [:role :source :md5 :seed?])
+     :negative-inputs negatives :full-runtime-evidence-success false})
+   (assert (= {:status :refused :kind :unattested-sdk-stage-constructor} live copy))
+   (assert (erlang/is_function candidate 1))
+   (assert (= :external (elem (erlang/fun_info candidate :type) 1)))
+   (assert (= :http-request! (elem (erlang/fun_info candidate :name) 1)))
+   (assert (= (BeamLisp.AOT/ns_body_module TARGET) body))
+   ;; The accepted SDK still refuses this callable: this private two-leaf
+   ;; component proposes fixes without forging success for the live evidence API.
+   (assert (= {:status :refused :kind :stale_sdk_runtime_inventory} evidence unchanged-module))
+   (assert (= :stable-body (:role module-row)))
+   (assert (= (:md5 module-row) (erlang/apply body :module_info (list :md5))))
+   (assert (= (:source module-row) (:source actual-row)))
+   (assert (= module-row actual-row))
+   (assert (BeamLisp.AOT/sdk_source_current? root body module-row))
+   (assert (every? #(= :refused (:status %)) (vals negatives)))
+   (let [changed-body
+         (with-changed-file root body-path #(str % "\nconstructor-component-denial")
+          (fn []
+           {:constructor (refusal (fn [] (named CANDIDATE TARGET BINDING 1)))
+            :module-currentness (refusal (fn [] (erlang/apply CANDIDATE :sdk_callable_module! (list body))))}))]
+    (println :sdk-named-constructor-changed-stored-body changed-body)
+    (assert (every? #(= :refused (:status %)) (vals changed-body))))
+   ;; Byte removal from a real copied inventory is denial only. No replacement
+   ;; row, callback, header or SDK receipt is introduced.
+   (let [missing-body
+         (with-changed-file root inventory-path
+          (fn [bytes]
+           (let [inventory (erlang/binary_to_term bytes (list :safe))
+                 identity (Atom/to_string body)]
+            (assert (contains? (:modules inventory) identity))
+            (erlang/term_to_binary (update inventory :modules dissoc identity))))
+          (fn []
+           {:constructor (refusal (fn [] (named CANDIDATE TARGET BINDING 1)))
+            :module-currentness (refusal (fn [] (erlang/apply CANDIDATE :sdk_callable_module! (list body))))}))]
+    (println :sdk-named-constructor-missing-body-inventory missing-body)
+    (assert (every? #(= :refused (:status %)) (vals missing-body))))
+   (assert (= aot-md5 (BeamLisp.AOT/module_info :md5)))
+   ;; Both exact disk inputs have been restored. The candidate's genuine
+   ;; external function and private module-currentness check work again; the
+   ;; accepted SDK's full evidence API deliberately still refuses it.
+   (assert (= candidate (named CANDIDATE TARGET BINDING 1)))
+   (assert (= module-row (erlang/apply CANDIDATE :sdk_callable_module! (list body))))
+   (assert (= evidence (refusal #(BeamLisp.AOT/sdk_callable_evidence! candidate))))
+   (println "SDK_NAMED_CONSTRUCTOR_IMAGE_COMPONENT_READY"))
+  (finally
+   (doseq [module [ORIGINAL CANDIDATE]] (code/purge module) (code/delete module))
+   (File/rm_rf! scratch))))

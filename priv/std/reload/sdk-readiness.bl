@@ -10,8 +10,10 @@
   (every? (fn [[namespace expected]]
             (let [source (BeamLisp.Loader/source_path namespace)]
              (and (= source (:path expected))
-                  (BeamLisp.AOT/sdk_library_source? namespace source)
-                  (= (:sha expected) (crypto/hash :sha256 (BeamLisp.Loader/read_source source)))))) inputs)
+                  (if (:image? expected)
+                    (nil? source)
+                    (and (BeamLisp.AOT/sdk_library_source? namespace source)
+                         (= (:sha expected) (crypto/hash :sha256 (BeamLisp.Loader/read_source source)))))))) inputs)
   (catch _ false)))
 
 (defn reference [node]
@@ -77,17 +79,21 @@
           (sdk-namespace [namespace]
             (if (contains? (read :namespaces) namespace) (get (read :namespaces) namespace)
              (let [source (when (string? namespace) (BeamLisp.Loader/source_path namespace))
-                   fixed? (and source (BeamLisp.AOT/sdk_library_source? namespace source))
+                   fixed? (and (string? namespace) (BeamLisp.AOT/sdk_library_unit? namespace))
                    info (when fixed?
                           ;; Initialize the unit before reading its current
                           ;; descriptor, but never all its function bodies.
-                          (when (and (not (contains? (read :initialized) namespace))
-                                     (BeamLisp.AOT/sdk_library_source? namespace source))
+                          (when (not (contains? (read :initialized) namespace))
                            (BeamLisp.Env/load_sdk_library! namespace)
                            (write! :initialized (conj (read :initialized) namespace)))
-                          (let [content (BeamLisp.Loader/read_source source)
+                          (let [content (when source (BeamLisp.Loader/read_source source))
                                 definitions (BeamLisp.Env/ns_defs namespace)
                                 shim (BeamLisp.Emit/module_for namespace)
+                                row (when-not source (BeamLisp.AOT/sdk_compiler_row shim inventory))
+                                requires (if content (second (BeamLisp.SourceGraph/header content)) (:requires row))
+                                _ (when-not (erlang/is_list requires)
+                                    (throw (ex-info "SDK readiness requires complete unit metadata"
+                                             {:kind :sdk-readiness-unit-metadata-required :namespace namespace})))
                                 routes (Enum/reduce definitions {}
                                  (fn [pair out]
                                   (Enum/reduce (elem pair 1) out
@@ -100,22 +106,25 @@
                                         (assoc out [module (elem entry 2) (count (:params clause))] (elem pair 0))
                                         out))))))))]
                            {:definitions (Map/new definitions) :routes routes
-                            :source-input {:path source :sha (crypto/hash :sha256 content)}
-                            :requires (second (BeamLisp.SourceGraph/header content))}))]
+                            :source-input (if content {:path source :sha (crypto/hash :sha256 content)}
+                                             {:path nil :image? true})
+                            :requires requires}))]
               (write! :namespaces (maps/put namespace info (read :namespaces))) info)))
           (module-namespace [module]
             (if (contains? (read :modules) module) (get (read :modules) module)
              (let [row (when (erlang/is_atom module)
                          (BeamLisp.AOT/sdk_compiler_row module inventory))
                    source (:source row)
-                   namespace (when source
-                               (BeamLisp.Loader/declared_ns
-                                (BeamLisp.Loader/read_source
-                                 (Path/join (elem inventory 0) source))))]
+                   path (when source (BeamLisp.AOT/sdk_unit_source_path (elem inventory 0) source))
+                   namespace (if (and path (File/regular? path))
+                               (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
+                               ;; Derived from the authenticated artifact bytes,
+                               ;; even when the module has not been loaded yet.
+                               ;; Never infer a namespace from a filename.
+                               (:unit-namespace row))]
               (write! :modules (maps/put module namespace (read :modules))) namespace)))]
    (let [fixed-name? (fn [namespace]
-                       (let [source (when (string? namespace) (BeamLisp.Loader/source_path namespace))]
-                        (and source (BeamLisp.AOT/sdk_library_source? namespace source))))
+                       (and (string? namespace) (BeamLisp.AOT/sdk_library_unit? namespace)))
          canonical (Enum/reduce (to-list roots) []
           (fn [target output]
            (let [kind (first target)
@@ -135,9 +144,10 @@
          cached (get @closures key)]
     (if (and cached
              (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) (:namespaces cached))
-             (or image-key
-                 (and (= (:generations cached) (BeamLisp.Env/sdk_namespace_generations (to-list (:namespaces cached))))
-                      (source-inputs-current? (:sources cached)))))
+             (= (:generations cached) (BeamLisp.Env/sdk_namespace_generations (to-list (:namespaces cached))))
+             ;; A stable image index does not freeze provider selection or
+             ;; mutable namespace definitions, including transitive providers.
+             (source-inputs-current? (:sources cached)))
      true
      (do
       (write! :pending roots)
@@ -173,12 +183,11 @@
       ;; SDK source/byte validation still runs before every preparation, and
       ;; each miss initializes through the ordinary verified SDK loader.
       (let [namespaces (vec (sort (read :initialized)))
-            sources (when-not image-key
-                      (Map/new (Enum/map namespaces
+            sources (Map/new (Enum/map namespaces
                         (fn [namespace]
-                         (tuple namespace (:source-input (get (read :namespaces) namespace)))))))
+                         (tuple namespace (:source-input (get (read :namespaces) namespace))))))
             value {:namespaces namespaces :sources sources
-                   :generations (when-not image-key (BeamLisp.Env/sdk_namespace_generations (to-list namespaces)))}]
+                   :generations (BeamLisp.Env/sdk_namespace_generations (to-list namespaces))}]
        ;; Namespace publication during traversal cannot certify the data read
        ;; earlier in that traversal. A later stable preparation can memoize it.
        (when (and preparation-revision

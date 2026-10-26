@@ -38,6 +38,9 @@ PIPELINE = {'unit-metadata', 'source-and-class-proof', 'sealed-loader', 'constru
             'execution-clause-identity'}
 UNIVERSAL = ['fresh-source-free-load', 'new-project-packaged-macro', 'class-image-proof',
              'source-present-loader', 'tamper-before-initialization', 'missing-unit-before-initialization']
+SDK_INITIALIZATION = {'unit-metadata', 'source-and-class-proof', 'preboot-identity',
+                      'sealed-loader', 'constructor-and-scope', 'native-custody',
+                      'contextual-pipeline-identity'}
 
 
 def plan(boundaries=None):
@@ -51,8 +54,12 @@ def plan(boundaries=None):
     pipeline = bool(set(chosen) & PIPELINE)
     if pipeline:
         roots = list(dict.fromkeys(['compile.world', 'build', *roots]))
+    sdk_initialization = bool(set(chosen) & SDK_INITIALIZATION)
+    if sdk_initialization:
+        roots = list(dict.fromkeys([*roots, 'proc.reg']))
     return {'version': 1, 'mode': 'complete' if boundaries is None else 'focused',
             'boundaries': chosen, 'universal': UNIVERSAL, 'pipeline': pipeline, 'roots': roots,
+            'sdk-initialization': sdk_initialization,
             'solver': pipeline or any(name.startswith('solver-') for name in selected),
             'groups': groups, 'assertions': sum(row['assertions'] for g in groups for row in g['tests'])}
 
@@ -60,7 +67,8 @@ def plan(boundaries=None):
 def validate(plan, receipt):
     if (receipt.get('status') != 'passed' or receipt.get('source-free') is not True
             or receipt.get('boundaries') != plan['boundaries']
-            or receipt.get('mode') != plan['mode'] or receipt.get('pipeline') != plan['pipeline']):
+            or receipt.get('mode') != plan['mode'] or receipt.get('pipeline') != plan['pipeline']
+            or receipt.get('sdk-initialization', False) != plan['sdk-initialization']):
         raise ValueError('wrong sealed selection or missing source-free receipt')
     expected = [(g['id'], row['path'], row['assertions']) for g in plan['groups'] for row in g['tests']]
     actual = receipt.get('files')
@@ -74,6 +82,16 @@ def validate(plan, receipt):
             raise ValueError('failed, empty or incorrect sealed test coverage: ' + path)
     if receipt.get('assertions') != plan['assertions']:
         raise ValueError('incorrect sealed assertion total')
+
+
+def validate_initialization(plan, receipt):
+    if plan['sdk-initialization']:
+        if (not isinstance(receipt, dict) or receipt.get('status') != 'passed'
+                or receipt.get('fresh-receiver') is not True or receipt.get('source-free') is not True
+                or type(receipt.get('sdk-source-compiles')) is not int or receipt['sdk-source-compiles'] != 0):
+            raise ValueError('missing fresh Source-free SDK application initialization control')
+    elif receipt is not None:
+        raise ValueError('unexpected SDK application initialization scope')
 
 
 def validate_universal(receipt):

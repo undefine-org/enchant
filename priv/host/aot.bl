@@ -3552,7 +3552,15 @@
         routes (when forwarder? (image_sdk_routes! bytes row))
         attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
         callable (normalized_attribute attrs :bl_sdk_callable_kinds)
+        unit-namespace (normalized_attribute attrs :bl_unit_namespace)
         initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+    (when (and (not (nil? unit-namespace))
+               (not (and (erlang/is_binary unit-namespace) (erlang/=< 1 (erlang/byte_size unit-namespace))
+                         (erlang/=< (erlang/byte_size unit-namespace) 512))))
+      (erlang/error :sdk_image_unit_metadata_changed))
+    (when (and (Map/has_key? row :unit-namespace)
+               (not= (Map/get row :unit-namespace) unit-namespace))
+      (erlang/error :sdk_image_unit_metadata_changed))
     ;; The inventory's Source identity remains provenance after packaging. Its
     ;; executable policy must still agree with the bytes, never merely a row.
     (when (Map/get row :source)
@@ -3592,6 +3600,7 @@
           (erlang/error :sdk_image_declaration_metadata_changed)))
       (verify_sdk_forwarder! (tuple mod bytes) (Map/get row :forwarder-namespace) routes))
     (tuple mod (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
+                    :unit-namespace unit-namespace
                     :initializer-lambda-kind initializer_kind
                     :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes)
                     :lambda-routes (when (or (= :stable-body (Map/get row :role))
@@ -3711,13 +3720,8 @@
                             (BeamLisp.Env/sdk_forwarder_current? mod (Map/get row :forwarder-routes)))))
       (erlang/error :unattested_sdk_callback))
     (when-not (Map/get row :seed?)
-      (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-            relative (Map/get row :source)
-            source (when relative (physical_sdk_path (Path/join root relative)))]
-        (when-not (and source (String/starts_with? source (str root "/"))
-                       (= (Map/get row :source-digest)
-                          (crypto/hash :sha256 (BeamLisp.Loader/read_source source))))
-          (erlang/error :stale_sdk_runtime_inventory))))
+      (when-not (sdk_source_current? (physical_sdk_path (BeamLisp.Tiers/priv_root)) mod row)
+        (erlang/error :stale_sdk_runtime_inventory)))
     row))
 
 (defn sdk_callable_evidence!
@@ -5072,6 +5076,19 @@
                        (erlang/iolist_to_binary (list root "/" tier "/")))))
          (erlang/== ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source source))))))
 
+(defn sdk_library_unit?
+ "Whether the selected library is fixed SDK code. Selected Source takes
+  precedence; without Source, verify the actual image unit's bytes/metadata.
+  This data observation loads no code, runs no initializer and grants no lease."
+ [ns]
+ (and (erlang/is_binary ns) (erlang/=< 1 (erlang/byte_size ns))
+      (erlang/=< (erlang/byte_size ns) 512) (library_tier? ns)
+      (let [source (BeamLisp.Loader/source_path ns)]
+        (if source (sdk_library_source? ns source)
+          (let [input (sdk_inventory_input) root (elem input 0) bytes (elem input 1)]
+            (and bytes (not (nil? (sdk_image_preload_unit ns root bytes)))
+                 (= input (sdk_inventory_input))))))))
+
 (defn- sdk_preinit_seed_member! [manifest mod source]
   (let [name (erlang/iolist_to_binary (list (Atom/to_string mod) ".beam"))
         expected (Map/get (Map/get manifest "modules") name)
@@ -5648,8 +5665,9 @@
        module (when entry (elem entry 4)) function (when entry (elem entry 2))
        row (when module (sdk_compiler_row module))
        root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-       source (physical_sdk_path (BeamLisp.Loader/source_path ns))]
-  (when-not (and row source (= :stable-body (Map/get row :role))
+       source (or (physical_sdk_path (BeamLisp.Loader/source_path ns))
+                  (when row (sdk_unit_source_path root (Map/get row :source))))]
+  (when-not (and row source (sdk_source_current? root module row) (= :stable-body (Map/get row :role))
                  (= (Path/relative_to source root) (Map/get row :source))
                  (= name (Atom/to_string function))
                  (= (Map/get row :md5) (erlang/apply module :module_info (list :md5)))

@@ -57,3 +57,37 @@
    (is (= true (readiness/prepare!
                  [[:remote provider :upper-case arity] [:namespace namespace]])))
    (is (= keys-before (set (keys @cache)))))))
+
+(defn- sdk-load-count [action]
+ (let [pattern (tuple :Elixir.BeamLisp.Env :load_sdk_library! 1)]
+  (erlang/trace_pattern pattern true (list :local :call_count))
+  (try
+   (action)
+   (elem (erlang/trace_info pattern :call_count) 1)
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(deftest an-image-index-does-not-freeze-transitive-sdk-publication-generations
+ (let [roots [[:binding "datom" "db"]]
+       cache (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "closures")]
+  (is (some? (elem (BeamLisp.AOT/sdk_inventory_input) 1)) "this control needs a real SDK image")
+  (readiness/prepare! roots)
+  (readiness/prepare! roots)
+  (let [entries (filterv #(= roots (nth (first %) 3)) (vec @cache))]
+   (is (= 1 (count entries)))
+   (when-not (= 1 (count entries)) (throw :sdk-readiness-cache-control-missing))
+   (let [[key entry] (first entries)
+         transitive (first (remove #(= "datom" %) (:namespaces entry)))
+         warm (sdk-load-count #(readiness/prepare! roots))]
+    (is (string? transitive))
+    (when-not (string? transitive) (throw :sdk-readiness-transitive-control-missing))
+    ;; This real native publication fence changes the generation without
+    ;; replacing any SDK value, descriptor, module or initializer flag.
+    (BeamLisp.Env/with_env :global
+     #(BeamLisp.Env/with_publication transitive (fn [] :same-bindings)))
+    (let [after (sdk-load-count #(readiness/prepare! roots))
+          again (sdk-load-count #(readiness/prepare! roots))]
+     (println :sdk-readiness-publication-control
+      {:transitive transitive :warm-loads warm :after-publication-loads after :again-loads again})
+     (is (> after warm) "the transitive publication invalidates the actual readiness closure")
+     (is (= warm again) "the stable replacement closure is reusable")
+     (is (not= (:generations entry) (:generations (get @cache key)))))))))

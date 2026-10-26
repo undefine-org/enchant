@@ -24,12 +24,15 @@ class SealedProfiles(unittest.TestCase):
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])
+        self.assertTrue(selection['sdk-initialization'])
+        self.assertIn('proc.reg', selection['roots'])
 
     def test_focused_custody_avoids_unrelated_analyses_and_retains_universal_integrity(self):
         selection = PROFILE['plan'](['filesystem-custody'])
         self.assertEqual(['filesystem', 'filesystem-operations', 'filesystem-refresh', 'filesystem-regressions'], [g['id'] for g in selection['groups']])
         self.assertFalse(selection['pipeline'])
         self.assertFalse(selection['solver'])
+        self.assertFalse(selection['sdk-initialization'])
         self.assertEqual(['selfbuild', 'vm.native', 'build', 'artifact', 'bl.artifacts', 'deps-compile'], selection['roots'])
         self.assertEqual(PROFILE['UNIVERSAL'], selection['universal'])
         self.assertEqual('focused', selection['mode'])
@@ -38,6 +41,20 @@ class SealedProfiles(unittest.TestCase):
         for requested in [[], ['missing'], ['sealed-loader', 'sealed-loader']]:
             with self.subTest(requested=requested), self.assertRaises(ValueError):
                 PROFILE['plan'](requested)
+
+    def test_first_sdk_initialization_is_required_only_for_affected_boundaries(self):
+        affected = PROFILE['plan'](['unit-metadata'])
+        unrelated = PROFILE['plan'](['filesystem-custody'])
+        good = {'status': 'passed', 'fresh-receiver': True, 'source-free': True, 'sdk-source-compiles': 0}
+        PROFILE['validate_initialization'](affected, good)
+        PROFILE['validate_initialization'](unrelated, None)
+        with self.assertRaises(ValueError):
+            PROFILE['validate_initialization'](unrelated, good)
+        for edit in [None, {}, dict(good, status='failed'), dict(good, **{'fresh-receiver': False}),
+                     dict(good, **{'source-free': False}), dict(good, **{'sdk-source-compiles': 1}),
+                     dict(good, **{'sdk-source-compiles': False})]:
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                PROFILE['validate_initialization'](affected, edit)
 
     def test_receipt_must_have_exact_requested_nonempty_files_and_actual_counts(self):
         selection = PROFILE['plan'](['vector-lookup-default'])
