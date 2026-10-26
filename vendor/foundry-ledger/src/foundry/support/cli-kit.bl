@@ -1,0 +1,110 @@
+; src/foundry/support/cli-kit.bl — tiny shared helpers for the ported Foundry CLIs.
+;
+; A CLI prints exactly ONE JSON line and exits 0 (ok) or 1 (refusal/internal
+; error). Contract:
+;   (parse-args argv spec) → {:ok {:verb ["group" "sub"] :args {key value}}}
+;                          | {:error msg}
+;     spec = {"--flag" {:key "k" :type :string|:int|:bool|:path|:multi}}
+;     Leading positional words (max 2) are the verb path; a bare `--` is
+;     ignored; unknown flag, missing value, duplicate non-multi flag, a
+;     relative :path, or a non-integer :int are refused. :bool takes no value.
+;     :multi collects into a vector.
+;   (emit! m)        → prints m as one JSON line (keys stringified recursively,
+;                      keywords → names)
+;   (finish! result) → {:ok payload} → {ok:true,...payload}, exit 0
+;                      {:error msg :code c} → {ok:false,code,error}, exit 1
+;   (main! argv spec handler) → parse, call (handler verb args) → result map,
+;                      finish!; an exception becomes an internal-error JSON, exit 1
+;   (read-stdin-all) / (read-stdin-line) → string | nil, via the VM's standard IO.
+
+(ns cli-kit)
+
+(defn- name-of [k] (if (keyword? k) (name k) (str k)))
+
+(defn- jsonable [v]
+  (cond
+    (map? v) (reduce (fn [o k] (assoc o (name-of k) (jsonable (get v k)))) {} (keys v))
+    (keyword? v) (name v)
+    (or (vector? v) (list? v) (seq? v) (set? v)) (to-list (map jsonable v))
+    :else v))
+
+(defn emit! [m]
+  ;; ASCII on the wire: a Latin-1 terminal (host gateway uses LC_ALL=C)
+  ;; otherwise prints Unicode as \x{…}, which is not a JSON escape.
+  (println (Jason/encode! (jsonable m) (list (tuple :escape :unicode)))))
+
+(defn finish! [result]
+  (if (contains? result :ok)
+    (let [p (:ok result)]
+      (emit! (merge {:ok true} (if (map? p) p {:value p})))
+      (System/halt 0))
+    (do
+      (emit! {:ok false
+              :code (or (:code result) "error")
+              :error (or (:error result) (:message result) "failed")})
+      (System/halt 1))))
+
+(defn parse-args [argv spec]
+  (loop [xs (seq argv) verb [] args {} seen-flag false]
+    (if (nil? xs)
+      {:ok {:verb verb :args args}}
+      (let [a (first xs)]
+        (cond
+          (= a "--") (recur (next xs) verb args seen-flag)
+          (String/starts_with? a "--")
+          (let [def (get spec a)]
+            (if (nil? def)
+              {:error (str "unknown flag " a)}
+              (let [k (:key def) t (:type def)]
+                (if (= t :bool)
+                  (if (contains? args k)
+                    {:error (str "duplicate flag " a)}
+                    (recur (next xs) verb (assoc args k true) true))
+                  (if (nil? (next xs))
+                    {:error (str a " needs a value")}
+                    (let [raw (first (next xs))
+                          rest-xs (next (next xs))]
+                      (cond
+                        (and (not= t :multi) (contains? args k)) {:error (str "duplicate flag " a)}
+                        (and (= t :path) (not (String/starts_with? raw "/")))
+                        {:error (str a " must be an absolute path")}
+                        (and (= t :int) (not= :match (erlang/apply :re :run (list raw "^-?[0-9]+$" (list (erlang/list_to_tuple (list :capture :none)))))))
+                        {:error (str a " must be an integer")}
+                        :else
+                        (let [v (if (= t :int) (erlang/binary_to_integer raw) raw)]
+                          (recur rest-xs verb
+                                 (if (= t :multi)
+                                   (assoc args k (conj (get args k []) v))
+                                   (assoc args k v))
+                                 true)))))))))
+          (and (not seen-flag) (< (count verb) 2)) (recur (next xs) (conj verb a) args seen-flag)
+          :else {:error (str "unexpected argument " a)})))))
+
+(defn main! [argv spec handler]
+  (try
+    (let [p (parse-args argv spec)]
+      (if (contains? p :error)
+        (finish! {:error (:error p) :code "usage"})
+        (finish! (handler (:verb (:ok p)) (:args (:ok p))))))
+    (catch e
+      (let [m (try (ex-message e) (catch e2 nil))]
+        (finish! {:error (if (and (string? m) (not= "" m)) m (str e)) :code "internal-error"})))))
+
+(defn- stdin-line! []
+  ;; prim_tty already owns fd 0. Reopening it as a port steals its driver and
+  ;; conflicts with the VM's terminal ownership even for a caller-supplied pipe.
+  (let [line (erlang/apply :io :get_line (list :standard_io ""))]
+    (cond
+      (= :eof line) nil
+      (and (tuple? line) (= :error (erlang/element 1 line)))
+      (throw (ex-info "could not read standard input" {"kind" "cli-kit"}))
+      :else (erlang/apply :unicode :characters_to_binary (list line)))))
+
+(defn read-stdin-all []
+  (loop [acc ""]
+    (let [line (stdin-line!)]
+      (if (nil? line) acc (recur (str acc line))))))
+
+(defn read-stdin-line []
+  (let [line (stdin-line!)]
+    (when (string? line) (first (String/split line "\n")))))
