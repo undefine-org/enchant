@@ -1,0 +1,409 @@
+;; Live integration uses the ordinary isolated test runner, never capsule code.
+(ns artifact.replay-runner
+  (:require [artifact.replay :as replay] [artifact :as artifact]
+            [artifact-process :as process] [bl.test :as tests]))
+
+(defn- refuse! [message]
+  (throw (ex-info message {:kind :artifact-replay-runner})))
+
+(defn- record! [value allowed required]
+  (when-not (map? value) (refuse! "Expected a replay runner record"))
+  (when (> (erlang/map_size value) (count allowed)) (refuse! "Replay runner record exceeds its schema"))
+  (let [row (reduce (fn [out key]
+                      (let [key-name (if (keyword? key) (Atom/to_string key) key)]
+                        (when-not (and (string? key-name) (contains? allowed key-name)
+                                       (not (contains? out key-name)))
+                          (refuse! "Unknown or duplicate replay runner field"))
+                        (assoc out key-name (get value key)))) {} (keys value))]
+    (doseq [key (sort required)]
+      (when-not (contains? row key) (refuse! "Missing replay runner field")))
+    row))
+
+(defn- digest [bytes]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+
+(defn- hash! [path limit]
+  (let [info (File/lstat! path)]
+    (when-not (and (= :regular (:type info)) (<= (:size info) limit))
+      (refuse! "Replay runner requires a bounded regular file"))
+    (let [file (File/open! path (list :read :binary))]
+      (try
+        (loop [hash (crypto/hash_init :sha256) size 0]
+          (let [chunk (IO/binread file 65536)]
+            (if (= :eof chunk)
+              (do
+                (when-not (= size (:size info)) (refuse! "Replay runner file size changed"))
+                {"sha256" (String/downcase (Base/encode16 (crypto/hash_final hash))) "bytes" size})
+              (do
+                (when-not (string? chunk) (refuse! "Replay runner file read failed"))
+                (let [size (+ size (erlang/byte_size chunk))]
+                  (when (> size limit) (refuse! "Replay runner file exceeds capacity"))
+                  (recur (crypto/hash_update hash chunk) size))))))
+        (finally (File/close file))))))
+
+(defn- path! [path]
+  (when-not (and (string? path) (<= 1 (erlang/byte_size path) 4096)
+                 (= :absolute (Path/type path))
+                 (not (String/contains? path (erlang/list_to_binary (list 0))))
+                 (not (String/contains? path "\\")))
+    (refuse! "Replay runner requires a bounded absolute path"))
+  path)
+
+(defn- canonical! [path]
+  ;; Resolve trusted startup selections/tool links, with bounded link expansion.
+  ;; replay/capture! subsequently rejects links in its canonical file addresses.
+  (path! path)
+  (loop [current "/" parts (seq (Enum/drop (String/split (Path/expand path) "/") 1)) links 0]
+    (if (nil? parts) current
+      (let [candidate (Path/join current (first parts)) info (File/lstat! candidate)]
+        (if (= :symlink (:type info))
+          (do
+            (when (>= links 32) (refuse! "Replay runner link resolution exceeds capacity"))
+            (let [target (path! (Path/expand (File/read_link! candidate) current))
+                  remainder (Enum/join (rest parts) "/")
+                  full (path! (if (= remainder "") target (Path/join target remainder)))]
+              (recur "/" (seq (Enum/drop (String/split full "/") 1)) (inc links))))
+          (do
+            (when (and (next parts) (not= :directory (:type info)))
+              (refuse! "Replay runner path component is not a directory"))
+            (recur candidate (next parts) links)))))))
+
+(defn- store! [path]
+  (path! path)
+  (when-not (and (Regex/match? #"^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+$" path)
+                 (= :directory (:type (File/lstat! path))))
+    (refuse! "Replay runner requires an immutable store root"))
+  path)
+
+(defn- sdk! []
+  (let [sdk (store! (canonical! (:sdk (artifact/framework-context))))
+        descriptor-path (Path/join sdk "artifact.json")
+        _ (hash! descriptor-path 16777216)
+        descriptor (Jason/decode! (File/read! descriptor-path))
+        _ (when-not (map? descriptor) (refuse! "Startup SDK descriptor must be a record"))
+        _ (when-not (and (= 1 (get descriptor "version")) (= "sdk" (get descriptor "kind"))
+                         (= "x86_64-linux" (get descriptor "target")))
+            (refuse! "Startup SDK descriptor is unsupported"))
+        selected-priv (canonical! (Path/join sdk "image/priv"))
+        actual-priv (canonical! (BeamLisp.Tiers/priv_root))
+        actual-seed (canonical! (BeamLisp.Bootstrap/seed_dir))]
+    ;; Environment metadata alone cannot establish which floor this VM loaded.
+    (when-not (and (= selected-priv actual-priv)
+                   (= (Path/join actual-priv "bootstrap/seed") actual-seed))
+      (refuse! "Running floor is not physically bound to the selected immutable SDK"))
+    sdk))
+
+(defn- tool-names! [input]
+  (when-not (or (vector? input) (erlang/is_list input)) (refuse! "Expected replay tool names"))
+  (let [names (Enum/take input 65)]
+    (when (> (count names) 64) (refuse! "Too many replay tool names"))
+    (doseq [name names]
+      (when-not (and (string? name) (<= 1 (erlang/byte_size name) 64)
+                     (Regex/match? #"^[A-Za-z0-9][A-Za-z0-9._+-]*$" name))
+        (refuse! "Invalid replay tool name")))
+    (when-not (= (count names) (count (distinct names))) (refuse! "Duplicate replay tool name"))
+    (sort names)))
+
+(defn observe!
+  "Observe the actual immutable SDK floor, boot/live compiler and build keys,
+   loaded-native identity, and fixed startup tool resolution. Executes no tool."
+  ([] (observe! []))
+  ([tool-names]
+    (let [sdk (sdk!) packaged (BeamLisp.Bootstrap/packaged_keys!)
+          compiler (BeamLisp.AOTCache/compiler_key) build (BeamLisp.AOTCache/build_key)
+          _ (when-not (and (= compiler (BeamLisp.AOTCache/current_compiler_key))
+                           (= build (BeamLisp.AOTCache/current_build_key))
+                           (= compiler (elem packaged 0)) (= build (elem packaged 1)))
+              (refuse! "Running compiler/build floor drifted from its packaged identity"))
+          tools (second
+                  (reduce (fn [[remaining rows] name]
+                            (let [path (canonical! (process/tool name))
+                                  _ (when-not (String/starts_with? path "/nix/store/")
+                                      (refuse! "Observed replay tool is outside the immutable store"))
+                                  _ (store! (str "/nix/store/" (nth (String/split path "/") 3)))
+                                  info (File/lstat! path)
+                                  _ (when (= 0 (erlang/band (:mode info) 73))
+                                      (refuse! "Observed replay tool is not executable"))
+                                  facts (hash! path (min remaining 268435456))]
+                              [(- remaining (get facts "bytes"))
+                               (conj rows {"name" name "path" path "sha256" (get facts "sha256")})]))
+                          [1073741824 []] (tool-names! tool-names)))]
+      {"sdk" sdk "runtime" {"compiler" compiler "build" build
+                                 "loadedNative" (BeamLisp.LazyMemo/runtime_identity!)}
+       "tools" (to-list tools)})))
+
+(defn- private-parent! [path]
+  (path! path)
+  (when-not (= path (canonical! path)) (refuse! "Replay custody parent must be canonical"))
+  (let [info (File/lstat! path)]
+    (when-not (and (= :directory (:type info)) (= (:uid info) (:uid (File/stat! "/proc/self")))
+                   (= 0 (erlang/band (:mode info) 63)))
+      (refuse! "Replay custody parent must be private to the current operator")))
+  path)
+
+(defn- retain! [capsule parent]
+  (let [parent (private-parent! parent)
+        directory (Path/join parent (str "replay-" (System/system_time :microsecond) "-"
+                                         (erlang/unique_integer (list :positive))))
+        roots (sort (distinct (concat (vals (get capsule "identities"))
+                         (Enum/map (get capsule "tools")
+                           (fn [tool] (str "/nix/store/" (nth (String/split (get tool "path") "/") 3)))))))
+        executable (process/tool "nix-store")]
+    (when-not executable (refuse! "Nix store retention tool is unavailable"))
+    (File/mkdir! directory)
+    (File/chmod! directory 448)
+    (try
+      (doseq [[index path] (map-indexed (fn [index path] [index path]) roots)]
+        (store! path)
+        (let [root (Path/join directory (str "retained-" index))
+              result (process/run executable ["--add-root" root "--indirect" "--realise" path]
+                         {:timeout-ms 30000 :limit 65536 :env {}})]
+          (when-not (and (process/ok? result) (not (:truncated result))
+                         (= (tuple :ok path) (File/read_link root)))
+            (refuse! "Replay closure retention failed"))))
+      {"directory" directory "closures" (to-list roots)}
+      (catch error (File/rm_rf! directory) (throw error)))))
+
+(defn capture!
+  "Capture using actual observations and retain all immutable identity/tool
+   closures. options never supply SDK/runtime observations, argv, env or grants."
+  [options custody-parent]
+  (let [allowed #{"product" "source" "test-source" "cwd" "tests" "inputs" "reproduction" "tool-names"}
+        options (record! options allowed #{"product" "source" "tests"})
+        names (if (contains? options "tool-names") (get options "tool-names") [])
+        observed (observe! names)
+        opts (merge (dissoc options "tool-names") observed)
+        capsule (replay/capture! opts)
+        custody (retain! capsule custody-parent)
+        _ (replay/plan! capsule (observe! names))]
+    {"capsule" capsule "custody" custody}))
+
+(defn- aggregate! [value]
+  (let [keys #{"tests" "pass" "fail" "error" "files" "ok" "exit"}
+        row (record! value keys keys)]
+    (doseq [key ["tests" "pass" "fail" "error" "files" "exit"]]
+      (when-not (and (int? (get row key)) (<= 0 (get row key)) (<= (get row key) 10000000))
+        (refuse! "Existing test runner returned invalid aggregate counts")))
+    (when-not (and (contains? #{true false} (get row "ok"))
+                   (contains? #{0 1} (get row "exit"))
+                   (= (get row "ok") (= 0 (get row "exit"))))
+      (refuse! "Existing test runner returned inconsistent status"))
+    row))
+
+(defn- under? [path root]
+  (or (= path root) (String/starts_with? path (str root "/"))))
+
+(defn- source-directory! [path sdk-root]
+  ;; Sealed SDKs remove Source directories. Resolve the nearest existing parent
+  ;; physically, then allow an absent suffix only inside that verified SDK.
+  (let [expanded (Path/expand (path! path))]
+    (loop [candidate expanded suffix []]
+      (let [found (File/lstat candidate)]
+        (cond
+          (= (tuple :error :enoent) found)
+            (let [parent (Path/dirname candidate)]
+              (when (= candidate parent) (refuse! "Replay Source root has no physical ancestor"))
+              (recur parent (cons (Path/basename candidate) suffix)))
+          (and (erlang/is_tuple found) (= :ok (elem found 0)))
+            (let [base (canonical! candidate)
+                  _ (when-not (= :directory (:type (File/lstat! base)))
+                      (refuse! "Replay Source root is not a directory"))
+                  full (if (empty? suffix) base (Path/join base (Enum/join suffix "/")))]
+              (when (and (seq suffix) (not (under? full sdk-root)))
+                (refuse! "Replay missing Source root is outside the verified SDK"))
+              full)
+          :else (refuse! "Replay Source root is inaccessible"))))))
+
+(defn- floor-namespace? [namespace inventory manifest]
+  (let [module (BeamLisp.Emit/base_module_for namespace)
+        name (str (Atom/to_string module) ".beam")
+        modules (get manifest "modules")
+        forwarder (get (elem inventory 2) module)]
+    ;; Use the floor's own manifest mapping, never a fixed namespace whitelist.
+    ;; The pinned bootstrap helper is an existing exported host ABI.
+    (and (contains? modules name)
+         (= namespace (BeamLisp.Bootstrap/seed_module_to_ns name))
+         (or (BeamLisp.Bootstrap/packaged_member? module)
+             (and forwarder (= namespace (:namespace forwarder))
+                  (BeamLisp.Env/sdk_forwarder_current? module (:routes forwarder)))))))
+
+(defn- seeded-cpp-namespace? [namespace inventory manifest]
+  ;; cpp has values seeded by rt/seed-core, but no Source definitions or SDK
+  ;; unit of its own. Read the seed ABI's literal from authenticated Rt code;
+  ;; never execute an Env callback or trust a whitelist of twenty known names.
+  (and (= namespace "cpp")
+       (= 0 (BeamLisp.Env/ns_definition_count namespace))
+       (floor-namespace? "rt" inventory manifest)
+       (let [module :Elixir.BeamLisp.Ns.Rt
+             immutable? (BeamLisp.Bootstrap/packaged_member? module)
+             definitions (when immutable? (erlang/apply module :__bl_ns_defs__ (list)))
+             entries (get definitions "seed-cpp-rows")
+             entry (when (= 1 (count entries)) (first entries))
+             node (when (and entry (= 5 (erlang/tuple_size entry))) (elem entry 3))
+             body (when node (:body node))
+             provider (when node (elem entry 4))
+             rows (when (= :lit (:op body)) (:val body))]
+         (and immutable? entry (= :fixed (elem entry 0)) (= 0 (elem entry 1))
+              (empty? (:params node)) (nil? (:guard node))
+              (BeamLisp.Bootstrap/packaged_member? provider)
+              (erlang/is_list rows) (<= 1 (count rows) 128)
+              (every? (fn [row]
+                        (and (erlang/is_list row) (= 4 (count row))
+                             (string? (first row)) (<= 1 (erlang/byte_size (first row)) 256)
+                             (erlang/is_atom (second row))
+                             (map? (nth row 2)) (<= 1 (erlang/map_size (nth row 2)) 32)
+                             ;; This seeded ABI currently specifies fixed-only
+                             ;; external functions, including multi-arity values.
+                             (nil? (nth row 3))
+                             (every? (fn [pair]
+                                       (and (int? (elem pair 0)) (<= 0 (elem pair 0) 255)
+                                            (erlang/is_atom (elem pair 1))))
+                                     (maps/to_list (nth row 2))))) rows)
+              (let [names (Enum/map rows first)]
+                (and (= (count names) (count (distinct names)))
+                     (= (sort names) (sort (BeamLisp.Env/own_names namespace)))
+                     ;; seed-row's :value mode writes no links, refers or aliases.
+                     ;; Extra routes would change resolution even with equal vars.
+                     (every? (fn [tag]
+                               (empty? (BeamLisp.Env/match_own
+                                         (tuple (tuple tag namespace :_) :_))))
+                             [:link :refer :alias])
+                     (every? (fn [row]
+                               (let [name (first row) target (second row)
+                                     target (if (= target :rt) module target)
+                                     fixed (nth row 2)
+                                     values (maps/map (fn [arity function]
+                                                        (erlang/make_fun target function arity)) fixed)
+                                     expected (if (= 1 (erlang/map_size values))
+                                                (elem (first (maps/to_list values)) 1)
+                                                (tuple :"$blfn" values nil))]
+                                 (= (tuple :ok expected)
+                                    (BeamLisp.Env/lookup_own (tuple namespace name))))) rows)
+                     ;; The original inventory predates the literal reader; a
+                     ;; concurrent body replacement cannot validate this proof.
+                     (BeamLisp.Bootstrap/packaged_member? provider)))))))
+
+(defn- source-roots! [capsule]
+  (let [identities (get capsule "identities")
+        roots [(canonical! (get identities "source")) (canonical! (get identities "test-source"))
+               (canonical! (BeamLisp.Tiers/priv_root))]
+        permitted! (fn [path]
+                     (let [path (source-directory! path (nth roots 2))]
+                       (when-not (some #(under? path %) roots)
+                         (refuse! "Replay refuses a caller Source root outside captured immutable inputs or SDK"))))
+        process-roots (mapcat
+                        (fn [key]
+                          (let [paths (Process/get key)]
+                            (if (nil? paths) []
+                              (do
+                                (when-not (erlang/is_list paths) (refuse! "Replay loader roots are not a proper path list"))
+                                paths))))
+                        [:bl_ambient_dirs :bl_search_dirs :bl_fixed_dirs :bl_load_paths])
+        deferred (BeamLisp.Env/match (tuple (tuple :deferred :_) :"$1"))
+        deferred-roots (mapcat (fn [row]
+                                  (let [paths (first row)]
+                                    (when-not (erlang/is_list paths)
+                                      (refuse! "Replay deferred loader roots are invalid"))
+                                    paths)) deferred)
+        env-path (System/get_env "BEAM_LISP_PATH")
+        env-roots (if (or (nil? env-path) (= "" env-path)) [] (String/split env-path ":"))
+        all (concat (BeamLisp.Env/load_paths) (BeamLisp.Env/search_paths) process-roots deferred-roots env-roots)]
+    (when (> (count all) 1024) (refuse! "Replay caller has too many Source roots"))
+    (doseq [path all] (permitted! path))
+    roots))
+
+(defn assert-clean!
+  "Read-only refusal gate for the narrow live replay receiver. A matching
+   result is evidence only; it grants no execution or namespace authority."
+  [input]
+  (let [capsule (replay/validate input)]
+    (when-not (and (= :global (BeamLisp.Env/env_id)) (= (list :global) (BeamLisp.Env/chain)))
+      (refuse! "Replay requires a clean global SDK context, not a caller project realm"))
+    (doseq [key [:realm_key :realm_decl :realm_uses_paths]]
+      (let [row (BeamLisp.Env/lookup key)]
+        (when (and (erlang/is_tuple row) (= 2 (erlang/tuple_size row))
+                   (= :ok (elem row 0)) (not (nil? (elem row 1))))
+          (refuse! "Replay refuses inherited project realm declarations"))))
+    (when (Process/get :bl_load_realm) (refuse! "Replay refuses an active project loader realm"))
+    (let [code-path (System/get_env "BEAM_LISP_CODE_PATH")]
+      (when-not (or (nil? code-path) (= "" code-path))
+        (refuse! "Replay refuses caller BEAM_LISP_CODE_PATH additions")))
+    ;; Native dependency code may live in the SDK's immutable Nix closure,
+    ;; but no mutable caller ebin directory may participate in resolution.
+    (doseq [raw (code/get_path)]
+      (let [path (canonical! (if (string? raw) raw (unicode/characters_to_binary raw)))]
+        (when-not (String/starts_with? path "/nix/store/")
+          (refuse! "Replay refuses mutable caller BEAM code paths"))))
+    (source-roots! capsule)
+    ;; This existing verifier authenticates SDK bytecode and forwarder routes.
+    ;; It does not attest unrelated application vars, which are refused below.
+    (let [inventory (BeamLisp.AOT/sdk_runtime_inventory! true)
+          manifest (BeamLisp.Bootstrap/manifest)
+          before (BeamLisp.Env/definition_context)
+          slots (BeamLisp.Env/match (tuple (tuple :"$1" :_) :_))
+          namespaces (sort (distinct (concat ["cpp"] (BeamLisp.Env/namespaces)
+                                (filter string? (Enum/map slots first)))))]
+      (when (or (nil? before) (> (count namespaces) 8192))
+        (refuse! "Replay cannot establish bounded stable caller definitions"))
+      (doseq [namespace namespaces]
+        (when-not (if (= namespace "cpp")
+                    (seeded-cpp-namespace? namespace inventory manifest)
+                    (or (and (= 0 (BeamLisp.Env/ns_definition_count namespace))
+                             (empty? (BeamLisp.Env/own_names namespace)))
+                        (floor-namespace? namespace inventory manifest)
+                        (BeamLisp.AOT/sdk_unit_compiled? namespace)))
+          ;; Current source_path is not provenance for an already loaded value.
+          ;; Even apparently immutable project definitions need a fresh receiver.
+          (refuse! (str "Replay refuses preloaded non-SDK namespace definitions: " namespace))))
+      (when-not (= before (BeamLisp.Env/definition_context))
+        (refuse! "Replay caller definitions changed during clean-context inspection")))
+    {"status" "clean-sdk-context" "authority" "none"
+     "project-definitions" "refused" "source-roots" "captured-immutable-or-sdk"}))
+
+(defn run!
+  "Retain/recheck and invoke only bl.test's existing admitted isolated selected
+   file path. No alternate executor or activation is constructed from metadata."
+  [input custody-parent]
+  (let [capsule (replay/validate input)
+        paths (rest (get capsule "argv"))
+        _ (doseq [path paths]
+            (when-not (String/ends_with? path ".bl")
+              (refuse! "Live replay currently supports explicit .bl files only")))
+        names (Enum/map (get capsule "tools") #(get % "name"))
+        before (observe! names)
+        _ (assert-clean! capsule)
+        _ (replay/plan! capsule before)
+        custody (retain! capsule custody-parent)
+        plan (replay/plan! capsule (observe! names))
+        _ (assert-clean! capsule)
+        result (BeamLisp/with_cwd (get plan "cwd")
+                 (fn [] (BeamLisp/with_argv (to-list (get plan "argv"))
+                          (fn [] (BeamLisp.Loader/with_search_dir (get plan "test-source")
+                                   (fn [] (tests/run-selected-data! (to-list paths))))))))
+        aggregate (aggregate! result)
+        _ (when-not (= (count paths) (get aggregate "files"))
+            (refuse! "Existing test runner did not report the complete selected file set"))
+        after (observe! names)
+        _ (assert-clean! capsule)
+        _ (when-not (= before after) (refuse! "Runtime/tool identities changed during replay"))
+        _ (replay/plan! capsule after)
+        status (if (and (get aggregate "ok") (> (get aggregate "tests") 0)) "passed"
+                 (if (get aggregate "ok") "incomplete" "failed"))
+        binding (get capsule "binding")
+        ;; Canonical fixed-position receipt DATA, without test stdout/errors.
+        receipt (list 1 "selected-test-outcome" binding status
+                      (Enum/map ["tests" "pass" "fail" "error" "files" "ok" "exit"] #(get aggregate %))
+                      "bl.test/run-selected-data!")
+        receipt-digest (digest (Jason/encode! receipt))
+        outcome (merge (select-keys aggregate ["tests" "pass" "fail" "error" "exit"])
+                       {"binding" binding "status" status "receiptDigest" receipt-digest})
+        recorded (replay/attach-outcome (assoc capsule "outcome" nil "qualification" nil) outcome)
+        qualification-status (if (= status "passed") "passed" (if (= status "failed") "failed" "incomplete"))
+        qualification-receipt (list 1 "selected-test-qualification" binding qualification-status "selected-tests-only" receipt-digest)
+        qualification-digest (digest (Jason/encode! qualification-receipt))
+        recorded (replay/attach-qualification recorded
+                   {"binding" binding "status" qualification-status "scope" "selected-tests-only"
+                    "receiptDigest" qualification-digest})]
+    {"capsule" recorded "custody" custody "outcome-receipt" receipt
+     "qualification-receipt" qualification-receipt "aggregate" aggregate
+     "status" status}))

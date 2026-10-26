@@ -1,0 +1,73 @@
+;; File-facing replay verbs. Machine results are published files, not scraped IO.
+(ns artifact.replay-cli
+  (:require [artifact.json :as json] [artifact.replay :as replay]
+            [artifact.replay-runner :as runner] [artifact :as artifact] [claim :as claim]))
+
+(defn- refuse! [message] (throw (ex-info message {:kind :artifact-replay-cli})))
+
+(defn- private-cache! []
+  (let [context (artifact/framework-context)
+        base (or (:cache context) (when (:home context) (Path/join (:home context) ".cache")))
+        _ (when-not (and (string? base) (= :absolute (Path/type base))
+                         (<= 1 (erlang/byte_size base) 4000)
+                         (not (String/contains? base (erlang/list_to_binary (list 0))))
+                         (not (String/contains? base "\\")))
+            (refuse! "Pinned framework cache/home must supply an absolute replay cache"))
+        path (Path/join (Path/expand base) "beam_lisp/artifact-replay")]
+    ;; Check each component before continuing; never adopt a symlinked cache.
+    (loop [current "/" parts (seq (Enum/drop (String/split path "/") 1))]
+      (when parts
+        (let [candidate (Path/join current (first parts)) found (File/lstat candidate)]
+          (if (= (tuple :error :enoent) found)
+            (do (File/mkdir! candidate) (File/chmod! candidate 448))
+            (when-not (and (= :ok (elem found 0)) (= :directory (:type (elem found 1))))
+              (refuse! "Replay cache component is missing, inaccessible or linked")))
+          (recur candidate (next parts)))))
+    (let [info (File/lstat! path)]
+      (when-not (and (= :directory (:type info)) (= (:uid info) (:uid (File/stat! "/proc/self")))
+                     (= 0 (erlang/band (:mode info) 63)))
+        (refuse! "Replay cache must be private to the current operator")))
+    path))
+
+(defn- captured! [filename]
+  (let [wrapper (json/read! filename)]
+    (when-not (and (map? wrapper) (= #{"capsule" "custody"} (set (keys wrapper))))
+      (refuse! "Replay capsule file must contain the exact capture wrapper"))
+    ;; Custody is persisted observation only. Never follow its supplied paths,
+    ;; remove roots from it, or use it as a command/execution handle.
+    (when-not (map? (get wrapper "custody")) (refuse! "Replay capsule custody record is missing"))
+    (replay/validate (get wrapper "capsule"))))
+
+(defn capture!
+  "Read strict options, capture with actual observations and publish a new
+   private capture wrapper containing both capsule and retained root custody."
+  [options-json capsule-json]
+  (let [destination (json/assert-new! capsule-json) options (json/read! options-json)]
+    (claim/with-writer! (claim/artifact-scope destination) "Replay capture publication"
+      (fn []
+        (json/assert-new! destination)
+        (let [captured (runner/capture! options (private-cache!))]
+          (json/write-new! destination captured)
+          {"status" "captured" "capsule" destination
+           "binding" (get (get captured "capsule") "binding")})))))
+
+(defn plan!
+  "Recheck a captured capsule against actual running SDK/runtime/tool facts.
+   Returns admission DATA only; never executes selected tests."
+  [capsule-json]
+  (let [capsule (captured! capsule-json)
+        names (Enum/map (get capsule "tools") #(get % "name"))]
+    (replay/plan! capsule (runner/observe! names))))
+
+(defn run!
+  "Run through the legitimate selected-test path, then publish structured
+   results to a new private RESULT_JSON. Test stdout is never parsed as JSON."
+  [capsule-json result-json]
+  (let [destination (json/assert-new! result-json) capsule (captured! capsule-json)]
+    (claim/with-writer! (claim/artifact-scope destination) "Replay result publication"
+      (fn []
+        (json/assert-new! destination)
+        (let [result (runner/run! capsule (private-cache!))]
+          (json/write-new! destination result)
+          {"status" (get result "status") "result" destination
+           "binding" (get capsule "binding")})))))
