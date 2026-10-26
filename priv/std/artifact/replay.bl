@@ -27,6 +27,16 @@
       (when-not (contains? record key) (refuse! (str "Missing replay field: " key))))
     record))
 
+(defn- optional [record key fallback]
+  ;; Only absence selects a default: explicit false/null must reach validation.
+  (if (contains? record key) (get record key) fallback))
+
+(defn- projected-field [record key]
+  (let [atom (keyword key)]
+    (when (and (contains? record key) (contains? record atom))
+      (refuse! "Duplicate reproduction field"))
+    (if (contains? record key) (get record key) (get record atom))))
+
 (defn- text! [value limit]
   (when-not (and (string? value) (> (erlang/byte_size value) 0)
                  (<= (erlang/byte_size value) limit)
@@ -244,8 +254,10 @@
         (loop [hash (crypto/hash_init :sha256) bytes 0]
           (let [chunk (IO/binread file chunk-bytes)]
             (if (= :eof chunk)
-              {"sha256" (String/downcase (Base/encode16 (crypto/hash_final hash))) "bytes" bytes
-               "executable" (not= 0 (erlang/band (:mode info) 73))}
+              (do
+                (when-not (= bytes (:size info)) (refuse! "Replay input size changed during hashing"))
+                {"sha256" (String/downcase (Base/encode16 (crypto/hash_final hash))) "bytes" bytes
+               "executable" (not= 0 (erlang/band (:mode info) 73))})
               (do
                 (when-not (string? chunk) (refuse! "Replay input could not be read"))
                 (let [size (+ bytes (erlang/byte_size chunk))]
@@ -267,22 +279,24 @@
 (defn- project-reproduction! [input]
   (when-not (nil? input)
     (when-not (map? input) (refuse! "Invalid reproduction descriptor"))
-    (let [descriptor (if (contains? input :descriptor) (:descriptor input)
-                       (if (contains? input "descriptor") (get input "descriptor") input))
-          _ (when-not (map? descriptor) (refuse! "Invalid reproduction descriptor"))
-          request (or (get descriptor "request") (:request descriptor))
-          manifest (or (get descriptor "manifest") (:manifest descriptor))
-          _ (when-not (and (map? request) (map? manifest)) (refuse! "Invalid reproduction identity records"))]
-      ;; Select only fixed identity fields. Raw requests/manifests, environments,
-      ;; captured resources and arbitrary qualification data are not serialized.
-      {"version" (or (get descriptor "version") (:version descriptor))
-       "kind" (or (get descriptor "kind") (:kind descriptor))
-       "output" (or (get descriptor "output") (:output descriptor))
-       "source" (or (get request "source") (:source request) (get manifest "source") (:source manifest))
-       "derivation" (or (get descriptor "derivation") (:derivation descriptor))
-       "compiler" (or (get descriptor "compiler") (:compiler descriptor))
-       "loadedNative" (or (get descriptor "loadedNative") (:loadedNative descriptor))
-       "qualification" (or (get descriptor "qualification") (:qualification descriptor))})))
+    (let [wrapped? (or (contains? input :descriptor) (contains? input "descriptor"))
+          wrapper (when wrapped? (record! input #{"directory" "descriptor"} #{"descriptor"}))
+          keys #{"version" "kind" "request" "manifest" "output" "derivation"
+                 "compiler" "loadedNative" "qualification"}
+          descriptor (record! (if wrapped? (get wrapper "descriptor") input) keys keys)
+          request (get descriptor "request") manifest (get descriptor "manifest")
+          _ (when-not (and (map? request) (map? manifest)) (refuse! "Invalid reproduction identity records"))
+          request-source (projected-field request "source")
+          manifest-source (projected-field manifest "source")
+          _ (when (and (not (nil? request-source)) (not (nil? manifest-source))
+                       (not= request-source manifest-source))
+              (refuse! "Reproduction source identities disagree"))]
+      ;; Raw request/manifest fields are never copied into the capsule.
+      {"version" (get descriptor "version") "kind" (get descriptor "kind")
+       "output" (get descriptor "output")
+       "source" (if (nil? request-source) manifest-source request-source)
+       "derivation" (get descriptor "derivation") "compiler" (get descriptor "compiler")
+       "loadedNative" (get descriptor "loadedNative") "qualification" (get descriptor "qualification")})))
 
 (defn capture!
   "Hash selected immutable inputs and construct replay DATA. No test, Nix,
@@ -291,12 +305,12 @@
   (let [allowed #{"sdk" "product" "source" "test-source" "cwd" "tests" "inputs" "runtime" "tools" "reproduction"}
         opts (record! options allowed #{"sdk" "product" "source" "tests" "runtime"})
         identities (identities! {"sdk" (get opts "sdk") "product" (get opts "product") "source" (get opts "source")
-                                 "test-source" (or (get opts "test-source") (get opts "source"))})
+                                 "test-source" (optional opts "test-source" (get opts "source"))})
         _ (doseq [path (vals identities)] (root! path))
-        cwd (relative! (or (get opts "cwd") ".") true)
+        cwd (relative! (optional opts "cwd" ".") true)
         _ (member! (get identities "test-source") cwd true)
         tests (Enum/map (items! (get opts "tests") max-files) test-path!)
-        inputs (Enum/map (items! (or (get opts "inputs") []) max-files) #(relative! % false))
+        inputs (Enum/map (items! (optional opts "inputs" []) max-files) #(relative! % false))
         selected (concat (Enum/map tests (fn [path] {"path" path "role" "test"}))
                          (Enum/map inputs (fn [path] {"path" path "role" "input"})))
         _ (when (empty? tests) (refuse! "Replay requires an explicit nonempty test selection"))
@@ -312,7 +326,7 @@
                                          (fn [owner]
                                            (let [facts (file-facts! (member! (get identities owner) "artifact.json" false) max-file-bytes max-file-bytes)]
                                              {"identity" owner "sha256" (get facts "sha256") "bytes" (get facts "bytes")}))))
-        runtime (runtime! (get opts "runtime")) tools (tools! (or (get opts "tools") []))
+        runtime (runtime! (get opts "runtime")) tools (tools! (optional opts "tools" []))
         _ (check-tool-files! tools)
         reproduction (reproduction! (project-reproduction! (get opts "reproduction")) identities runtime)
         binding (binding-of identities cwd files identity-files runtime tools reproduction)]
@@ -323,11 +337,13 @@
 
 (defn attach-outcome [capsule receipt]
   "Attach a bounded caller-reported outcome bound to the exact selected inputs."
+  (when (nil? receipt) (refuse! "An outcome attachment must contain its receipt"))
   (let [capsule (validate capsule)]
     (validate (assoc capsule "outcome" (outcome! receipt (get capsule "binding"))))))
 
 (defn attach-qualification [capsule receipt]
   "Attach a selected-test qualification observation; this never grants admission."
+  (when (nil? receipt) (refuse! "A qualification attachment must contain its receipt"))
   (let [capsule (validate capsule)]
     (validate (assoc capsule "qualification" (qualification! receipt (get capsule "binding"))))))
 

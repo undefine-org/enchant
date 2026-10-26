@@ -1,0 +1,150 @@
+;; Strict JSON ingress for artifact data; object duplicates survive decoding.
+(ns artifact.json (:require [claim :as claim]))
+(def ^:private byte-limit 8388608)
+(def ^:private depth-limit 64)
+(def ^:private node-limit 65536)
+(defn- refuse! [message] (throw (ex-info message {:kind :artifact-json})))
+
+(defn- absolute! [path]
+  (when-not (and (string? path) (<= 1 (erlang/byte_size path) 4096)
+                 (= :absolute (Path/type path))
+                 (not (String/contains? path (erlang/list_to_binary (list 0))))
+                 (not (String/contains? path "\\")))
+    (refuse! "Artifact JSON requires a bounded absolute filename"))
+  (Path/expand path))
+
+(defn- directories! [path]
+  (loop [current "/" parts (seq (Enum/drop (String/split path "/") 1))]
+    (when parts
+      (let [candidate (Path/join current (first parts)) info (File/lstat! candidate)]
+        (when-not (= :directory (:type info)) (refuse! "Artifact JSON parent is missing or linked"))
+        (recur candidate (next parts))))))
+
+(defn- stamp [info]
+  (select-keys info [:type :size :inode :major_device :minor_device :uid :mode :mtime :ctime]))
+
+(defn- read-bytes! [path]
+  (directories! (Path/dirname path))
+  (let [before (File/lstat! path)]
+    (when-not (and (= :regular (:type before)) (<= (:size before) byte-limit))
+      (refuse! "Artifact JSON must be a bounded regular file, without symlinks"))
+    (let [file (File/open! path (list :read :binary))]
+      (try
+        (let [body (loop [parts [] size 0]
+                     (let [chunk (IO/binread file 65536)]
+                       (if (= :eof chunk)
+                         (do
+                           (when-not (= size (:size before)) (refuse! "Artifact JSON size changed while reading"))
+                           (IO/iodata_to_binary (to-list (reverse parts))))
+                         (do
+                           (when-not (string? chunk) (refuse! "Artifact JSON could not be read"))
+                           (let [size (+ size (erlang/byte_size chunk))]
+                             (when (> size byte-limit) (refuse! "Artifact JSON exceeds its byte budget"))
+                             (recur (conj parts chunk) size))))))]
+          (when-not (= (stamp before) (stamp (File/lstat! path)))
+            (refuse! "Artifact JSON changed while reading"))
+          body)
+        (finally (File/close file))))))
+
+(defn- nesting! [body]
+  ;; Bound structure before decoding, retaining strings/escapes as lexical state.
+  (loop [index 0 depth 0 in-string? false escaped? false nodes 0 token? false]
+    (when (< index (erlang/byte_size body))
+      (let [byte (binary/at body index)
+            open? (and (not in-string?) (or (= byte 123) (= byte 91)))
+            close? (and (not in-string?) (or (= byte 125) (= byte 93)))
+            quote? (and (not in-string?) (= byte 34))
+            delimiter? (contains? #{9 10 13 32 44 58 91 93 123 125} byte)
+            atom-start? (and (not in-string?) (not token?) (not quote?) (not delimiter?))
+            nodes (if (or open? quote? atom-start?) (inc nodes) nodes)
+            _ (when (> nodes node-limit) (refuse! "Artifact JSON exceeds its node budget"))
+            depth (cond open? (inc depth) close? (dec depth) :else depth)
+            _ (when (> depth depth-limit) (refuse! "Artifact JSON exceeds its depth budget"))]
+        (cond
+          escaped? (recur (inc index) depth true false nodes false)
+          (and in-string? (= byte 92)) (recur (inc index) depth true true nodes false)
+          (= byte 34) (recur (inc index) depth (not in-string?) false nodes false)
+          in-string? (recur (inc index) depth true false nodes false)
+          :else (recur (inc index) depth false false nodes (not delimiter?)))))))
+
+(defn- decode-node [value depth remaining]
+  (when (or (> depth depth-limit) (<= remaining 0)) (refuse! "Artifact JSON exceeds its structure budget"))
+  (cond
+    (and (erlang/is_map value) (= :"Elixir.Jason.OrderedObject" (Map/get value :__struct__)))
+      (reduce
+        (fn [[out budget] pair]
+          (let [key (elem pair 0)]
+            (when (or (not (string? key)) (contains? out key))
+              (refuse! "Artifact JSON contains a duplicate object field"))
+            ;; Object keys count toward the node budget too.
+            (let [[child budget] (decode-node (elem pair 1) (inc depth) (dec budget))]
+              [(assoc out key child) budget])))
+        [{} (dec remaining)] (Map/fetch! value :values))
+    (erlang/is_list value)
+      (let [[items budget] (reduce (fn [[out budget] item]
+                                    (let [[child budget] (decode-node item (inc depth) budget)]
+                                      [(conj out child) budget])) [[] (dec remaining)] value)]
+        [(to-list items) budget])
+    (or (nil? value) (string? value) (number? value) (contains? #{true false} value))
+      [value (dec remaining)]
+    :else (refuse! "Artifact JSON decoder returned unsupported data")))
+
+(defn read!
+  "Read at most 8 MiB/64 levels/65536 nodes, rejecting every duplicate raw
+   object key before normalization. Never accepts symlink path components."
+  [filename]
+  (let [body (read-bytes! (absolute! filename))
+        _ (nesting! body)
+        ordered (Jason/decode! body (list (tuple :objects :ordered_objects)))]
+    (first (decode-node ordered 0 node-limit))))
+
+(defn- encode-node [value depth remaining]
+  (when (or (> depth depth-limit) (<= remaining 0)) (refuse! "Artifact JSON output exceeds its structure budget"))
+  (cond
+    (map? value)
+      (reduce (fn [[out budget] key]
+                (when-not (string? key) (refuse! "Artifact JSON output fields must be strings"))
+                (let [[child budget] (encode-node (get value key) (inc depth) (dec budget))]
+                  [(assoc out key child) budget])) [{} (dec remaining)] (keys value))
+    (or (vector? value) (erlang/is_list value))
+      (let [[items budget] (reduce (fn [[out budget] item]
+                                    (let [[child budget] (encode-node item (inc depth) budget)]
+                                      [(conj out child) budget])) [[] (dec remaining)] value)]
+        [(to-list items) budget])
+    (or (nil? value) (string? value) (number? value) (contains? #{true false} value)) [value (dec remaining)]
+    :else (refuse! "Artifact JSON output contains unsupported data")))
+
+(defn assert-new!
+  "Validate a future publication address without creating or replacing it."
+  [filename]
+  (let [destination (absolute! filename)]
+    (directories! (Path/dirname destination))
+    (when-not (= (tuple :error :enoent) (File/lstat destination))
+      (refuse! "Artifact JSON destination already exists or is inaccessible"))
+    destination))
+
+(defn write-new!
+  "Publish complete private JSON under the existing artifact writer claim.
+   Exclusive hardlink publication refuses every existing destination."
+  [filename value]
+  (let [destination (assert-new! filename) parent (Path/dirname destination)
+        _ (directories! parent)
+        data (first (encode-node value 0 node-limit)) body (Jason/encode! data)]
+    (when (> (erlang/byte_size body) byte-limit) (refuse! "Artifact JSON output exceeds its byte budget"))
+    (claim/with-writer! (claim/artifact-scope destination) "Artifact JSON publication"
+      (fn []
+        (assert-new! destination)
+        (let [temporary (Path/join parent (str ".artifact-json-" (Base/encode16 (crypto/strong_rand_bytes 16))))
+              file (File/open! temporary (list :write :binary :exclusive))]
+          (try
+            (File/chmod! temporary 384)
+            (when-not (= :ok (IO/binwrite file body))
+              (refuse! "Artifact JSON temporary write failed"))
+            (when-not (= :ok (erlang/apply :file :sync (list file)))
+              (refuse! "Artifact JSON temporary file could not be synchronized"))
+            (when-not (= :ok (File/close file))
+              (refuse! "Artifact JSON temporary close failed"))
+            (when-not (= :ok (File/ln temporary destination))
+              (refuse! "Artifact JSON destination already exists or cannot be published"))
+            destination
+            (finally (File/close file) (File/rm temporary))))))))
