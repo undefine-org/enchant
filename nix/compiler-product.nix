@@ -15,6 +15,7 @@
   dontConfigure = true;
   dontFixup = true;
   buildPhase = ''
+    cp bin/bl-producer bin/bl
     export HOME=$TMPDIR/home XDG_CACHE_HOME=$TMPDIR/home/.cache BL_DAEMON=off
     mkdir -p "$HOME" "$XDG_CACHE_HOME/beam_lisp"
     cp -a --no-preserve=ownership ${dependencies}/ebin "$XDG_CACHE_HOME/beam_lisp/ebin"

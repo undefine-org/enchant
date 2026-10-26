@@ -335,6 +335,8 @@ fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>) -> std::io::Result<
         "BEAM_LISP_EBIN",
         "BEAM_LISP_PATH",
         "BL_BOOTSTRAP_SEED",
+        "BL_CHECKOUT_PLATFORM",
+        "BL_CHECKOUT_SDK_INPUTS",
     ] {
         hash.update(key.as_bytes());
         hash.update([0]);

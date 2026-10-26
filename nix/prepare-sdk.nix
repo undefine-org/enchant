@@ -7,6 +7,7 @@ let
   products = import (/. + root + "/nix/bl-drop.nix") {
     inherit pkgs;
     rustPkgs = pkgs;
+    includeDesktop = builtins.pathExists (/. + root + "/native/wry_webview/Cargo.toml");
     inherit (locked.packages.x86_64-linux) erlang elixir;
   };
 in assert builtins.elem product [ "sdk" "compiler" "dependencies" "bl-drop" ];

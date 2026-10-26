@@ -11,7 +11,7 @@
 # with no RUNPATH, so the drop does not depend on /nix/store paths existing on
 # the target. On NixOS that loader is nix-ld's, which resolves libc from the HOST:
 # the host's glibc must therefore be >= the drop's symbol floor, which is the point.
-{ pkgs, rustPkgs, erlang, elixir }:
+{ pkgs, rustPkgs, erlang, elixir, includeDesktop ? false }:
 let
   inherit (pkgs) lib;
 
@@ -50,13 +50,13 @@ let
   nativeCrates = nativeProducts.names;
 
   # 2. Independent verified native products, also consumed by interactive builds.
-  nativeProducts = import ./native-products.nix { inherit pkgs; };
+  nativeProducts = import ./native-products.nix { inherit pkgs includeDesktop; };
   natives = nativeProducts.bundle;
   buildPlatform = import ./artifact-platform.nix { inherit pkgs; commandExecutor = drop-tools; };
   buildCheckout = import ./checkout-platform.nix {
     inherit pkgs erlang elixir;
     executor = drop-tools;
-    includeDesktop = false;
+    inherit includeDesktop;
   };
 
   # ── pinned binary assets ─────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ let
   };
 
   # The checkout, as the build needs it. wry_webview (gtk/webkit, desktop only)
-  # is left out: a server drop does not carry it, and `wry/*` reads as ABSENT.
+  # is left out of server products; the managed checkout SDK includes it.
   cleanDirectory = directory: omitted:
     lib.fileset.difference directory
       (lib.fileset.unions (map (name: lib.fileset.maybeMissing (directory + "/${name}")) omitted));
@@ -121,6 +121,9 @@ let
       # the writable working copy bin/bl builds inside (it links .bl/ + build/ into the tree)
       cp -r $src $TMPDIR/tree && chmod -R u+w $TMPDIR/tree
       cd $TMPDIR/tree
+      # The closed Nix recipe bootstraps its producers directly. Ordinary
+      # checkout entry instead selects the completed immutable SDK.
+      cp bin/bl-producer bin/bl
       patchShebangs bin
 
       # the one native the boot itself needs (see release.yml "Bootstrap the native crates")
