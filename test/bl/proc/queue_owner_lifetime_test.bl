@@ -29,6 +29,90 @@
 (defn- wait-job [c id target]
  (await #(= target (:job/state (d/entity (d/db c) id)))))
 
+(defn- activation-probes [scope source]
+ ;; Compile only the actual activation form in two private namespaces. Its
+ ;; dependencies stay the real SDK functions; no actor class or admission is
+ ;; replaced. Reader spans retain the exact producer text for the mutation.
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "proc/queue-runtime.bl")
+              #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                    (= "activate" (BeamLisp.AOT/stage-symbol
+                                     (second (BeamLisp.AOT/stage-items % :list))))))
+       before "(when (:reconcile installed) (reconcile-handler/accept! installed))"
+       after "(reconcile-handler/accept! installed)"]
+  (when-not (and (= 1 (count forms)) (= 2 (count (String/split source before))))
+   (throw :queue-activation-mutation-drift))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))]
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (mapv
+      (fn [[namespace mutant?]]
+       (BeamLisp.Compiler/eval_string
+        (str "(ns " namespace " (:require [proc.queue :as q] [datom :as d] [datom.conn :as dc]"
+             " [proc.reconcile-handler :as reconcile-handler]))"))
+       (doseq [helper ["handler-refusal" "activation-blocker" "sync" "finish-install" "retain" "release" "refuse"]]
+        (BeamLisp.Compiler/eval_string
+         (str "(def " helper " (BeamLisp.Env/fetch_exact! \"proc.queue-runtime\" \"" helper "\"))")))
+       (BeamLisp.Compiler/eval_string (if mutant? (String/replace text before after) text))
+       (BeamLisp.Env/fetch_exact! namespace "activate"))
+      [["queue.activation.guarded" false] ["queue.activation.unguarded" true]]))))))
+
+(deftest E73-ordinary-activation-rejects-the-unconditional-sealed-acceptor-mutation
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "std/proc/queue-runtime.bl"))
+       original (BeamLisp.Env/fetch_exact! "proc.queue-runtime" "activate")
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       app "queue-activation-causal" old (graph app 1) fresh (graph app 2)
+       c (d/connect []) p (atom nil) outcome (atom nil)]
+  (try
+   (let [[good bad] (activation-probes scope source)]
+    (generation/with! old #(state/bind! {:lifetime/instance (atom :causal)}))
+    (generation/inherit-runtime! fresh old)
+    (let [a (handler old) b (handler fresh) srv (:server a)]
+     (queue/attach-store! srv c)
+     (reset! p (runtime/start! a))
+     ;; The copied transition executes inside the real SDK owner, with its
+     ;; actual state and handler leases. Failure restores that same state.
+     (let [transition (fn [probe]
+                       (erlang/apply :sys :replace_state
+                        (list @p
+                         (fn [st]
+                          (try
+                           (let [[result after] (BeamLisp.Env/with_env scope
+                                                #(BeamLisp.Ns.Rt/invoke probe (list st (:digest old) b)))]
+                            (reset! outcome result) after)
+                           (catch error
+                            (println :history-E73-transition-error
+                             {:kind (:kind (ex-data error)) :message (ex-message error)
+                              :original (BeamLisp.ExInfo/ex_original error)})
+                            (reset! outcome {:caught (:kind (ex-data error))}) st))))))
+           before (runtime/owner-evidence srv)]
+      (is (= @p (:pid before)) "the retained evidence belongs to the actual native queue owner")
+      (transition bad)
+      (is (= {:caught :unsealed-reconcile-handler} @outcome))
+      (is (= (:digest old) (:generation (runtime/status srv))))
+      (is (= (:digest old) (:generation (queue/declaration srv))))
+      (is (nil? (get-in (erlang/apply :sys :get_state (list @p)) [:queue :handlers (:digest fresh)])))
+      (is (= before (runtime/owner-evidence srv)))
+      (transition good)
+      (is (= :applied (:status @outcome)))
+      (is (= (:digest fresh) (:generation (runtime/status srv))))
+      (is (= (:digest fresh) (:generation (queue/declaration srv))))
+      (let [job (generation/with! fresh #(queue/enqueue! :imports {:test/id "causal"}))]
+       (is (wait-job c (:db/id job) :done))
+       (is (= {:value "causal" :generation (:digest fresh) :instance :causal}
+              (:job/result (d/entity (d/db c) (:db/id job))))))
+      (is (= before (runtime/owner-evidence srv)))
+      (is (= nil (ambient-generation @p)))
+      (is (= :valid (:status (inventory/snapshot app))))
+      (is (= original (BeamLisp.Env/fetch_exact! "proc.queue-runtime" "activate")))
+      (println :history-E73 {:source-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                            :mutant-refusal :unsealed-reconcile-handler
+                            :normal-status (:status @outcome) :same-owner true}))))
+   (finally
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (d/close! c) (generation/retire! old) (generation/retire! fresh)
+    (BeamLisp.Env/destroy scope)))))
+
 (deftest stable-sdk-queue-retains-old-pending-handler-then-retires-old-graph-at-the-same-pid
  (let [app "queue-stable-owner" old (graph app 1) fresh (graph app 2)
        c (d/connect []) p (atom nil)]
