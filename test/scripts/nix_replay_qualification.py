@@ -42,7 +42,11 @@ report = {'sdk': str(sdk), 'testSource': str(frozen), 'stages': {}}
 
 
 def run(label, argv, expected=0, cwd=frozen, extra_env=None):
-    environment = dict(os.environ, **(extra_env or {}))
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('BL_', 'BEAM_LISP_'))
+                   and key not in ('ERL_LIBS', 'ERL_FLAGS', 'ERL_AFLAGS', 'ERL_ZFLAGS', 'ELIXIR_ERL_OPTIONS')}
+    environment.update(ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+    environment.update(extra_env or {})
     completed = subprocess.run([str(sdk / 'bin/bl'), '--cold', 'artifacts', *map(str, argv)],
                                cwd=cwd, env=environment, text=True, capture_output=True, timeout=180)
     (output / (label + '.stdout')).write_text(completed.stdout)
