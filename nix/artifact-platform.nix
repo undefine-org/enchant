@@ -16,6 +16,7 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
   cp ${./native-workspace.nix} "$out/nix/native-workspace.nix"
   cp ${./sdk-source.nix} "$out/nix/sdk-source.nix"
+  cp ${./engine-inputs.json} "$out/nix/engine-inputs.json"
   cp ${./sdk-artifact.nix} "$out/nix/sdk-artifact.nix"
   cp ${./native-source.nix} "$out/nix/native-source.nix"
   cp ${./bounded-build.nix} "$out/nix/bounded-build.nix"

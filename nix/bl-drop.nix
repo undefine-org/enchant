@@ -217,13 +217,23 @@ let
       cp $TMPDIR/selfbuilt.drop "$sdk/bl"
       chmod 555 "$sdk/bl"
       mkdir -p "$sdk/bin"
+      cat > "$sdk/boot.exs" <<EOF
+      for path <- Path.wildcard("$sdk/lib/*/ebin"), do: Code.prepend_path(path)
+      Code.prepend_path("$sdk/image/ebin")
+      :code.del_path(~c".")
+      BeamLisp.Launcher.start_app!(System.argv(), %{})
+      EOF
       cat > "$sdk/bin/bl" <<EOF
       #!${pkgs.runtimeShell}
       unset BL_INTERNAL_PRODUCER
       export PATH=${buildCheckout}/bin:\$PATH
       export BL_ARTIFACT_PLATFORM=${buildCheckout}/artifact-platform
+      export BL_PREPARATION_COORDINATOR=${coordinator}
       export BL_SDK_PRODUCT="$sdk"
-      exec "$sdk/bl" "\$@"
+      export BL_ROOT="$sdk/image" BL_EBIN="$sdk/image/ebin" BL_BUILD_ID=src BEAM_LISP_DEV=0
+      export BL_BIN=${buildCheckout}/bin/drop-launcher
+      export BL_PREPARED_NATIVES="$(readlink -f ${buildCheckout}/native-products)"
+      exec ${buildCheckout}/bin/elixir "$sdk/boot.exs" "\$@"
       EOF
       chmod 555 "$sdk/bin/bl"
       printf '%s\n' '${builtins.toJSON {
@@ -233,6 +243,7 @@ let
         compiler = toString compiler;
         dependencies = toString dependencies;
         platform = toString buildCheckout;
+        coordinator = toString coordinator;
         target = "x86_64-linux";
       }}' > "$sdk/artifact.json"
       ${pkgs.jq}/bin/jq --arg release "$out" --arg source "$src" \
@@ -282,14 +293,20 @@ let
     sdk = bl-drop.sdk;
     tools = drop-tools;
   };
+  coordinator = import ./coordinator-runtime.nix {
+    inherit pkgs compiler dependencies;
+    source = src;
+    platform = buildCheckout;
+  };
   selection = import ./sdk-selection.nix {
-    inherit pkgs;
+    inherit pkgs coordinator;
     image = bl-drop.sdk;
     release = portable;
     platform = buildCheckout;
   };
 in
-{ inherit drop-tools natives dependencies compiler;
+{ inherit drop-tools natives dependencies compiler coordinator;
   bl-drop = portable;
   sdk = selection;
+  sdk-image = bl-drop.sdk;
 }

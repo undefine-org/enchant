@@ -44,7 +44,7 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   cat > "$out/boot.exs" <<EOF_BOOT
   for path <- Path.wildcard("$out/lib/*/ebin"), do: Code.prepend_path(path)
   Code.prepend_path("$out/image/ebin")
-  Code.delete_path(".")
+  :code.del_path(~c".")
   BeamLisp.Launcher.start_app!(System.argv(), %{})
   EOF_BOOT
   cat > "$out/bin/bl" <<EOF_BL

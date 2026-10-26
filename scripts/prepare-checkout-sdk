@@ -3,53 +3,223 @@
 set -euo pipefail
 umask 077
 root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
-inventory() {
-  local directory=$1
-  shift
-  local prune=(-false)
-  for omitted in "$@"; do prune+=(-o -path "$directory/$omitted"); done
-  find "$directory" \( "${prune[@]}" \) -prune -o -printf '%y %m %p %l\n'
-  find "$directory" \( "${prune[@]}" \) -prune -o -type f -exec sha256sum {} +
+fingerprint_of_tree() {
+  python3 "$root/scripts/sdk-inputs" --root "$root"
 }
-fingerprint=$(
-  {
-    inventory "$root/bin"
-    inventory "$root/nix"
-    inventory "$root/priv" native z3 .bl codegen.sources precompiled.term sdk-code.term
-    inventory "$root/tooling/drop" target .git .bl
-    inventory "$root/vendor/foundry-ledger"
-    for crate in "$root"/native/*; do inventory "$crate" target .git .bl; done
-    sha256sum "$root/env.bl" "$root/bl.lock" "$root/flake.lock" "$root/flake.nix" \
-      "$root/scripts/prepare-checkout-sdk" \
-      "$root/scripts/prepare-release.bl" "$root/scripts/qualify-artifact-generation" \
-      "$root/scripts/produce-sdk.bl" \
-      "$root/scripts/demo-artifact-production" "$root/scripts/check-source-floor" \
-      "$root/scripts/check-execution-history" "$root/test/scripts/artifact-generation.bl"
-  } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
-)
-if [ "${1:-}" = --fingerprint ] && [ "$#" = 1 ]; then
-  printf '%s\n' "$fingerprint"
-  exit 0
-fi
-if [ "$#" != 0 ]; then
-  echo 'usage: prepare-checkout-sdk [--fingerprint]' >&2
-  exit 64
-fi
+selection=false
+case "${1:-}" in
+  --fingerprint)
+    [ "$#" = 1 ] || exit 64
+    fingerprint_of_tree
+    exit 0 ;;
+  --selection)
+    [ "$#" = 1 ] || exit 64
+    selection=true ;;
+  '') [ "$#" = 0 ] || exit 64 ;;
+  *) echo 'usage: prepare-checkout-sdk [--fingerprint|--selection]' >&2; exit 64 ;;
+esac
+emit_selection() {
+  if "$selection"; then printf '%s %s\n' "$1" "$fingerprint"
+  else printf '%s\n' "$1"; fi
+}
+for prerequisite in nix-build systemd-run python3 flock; do
+  command -v "$prerequisite" >/dev/null || { echo "bl: required preparation tool missing: $prerequisite" >&2; exit 69; }
+done
+mkdir -p "$root/.bl/sdks"
+# Fingerprint and capture occur after the preparation lock. In particular a
+# waiting caller never adopts a fingerprint computed before its predecessor.
+exec 9>"$root/.bl/sdks/preparation.lock"
+flock -x 9
+fingerprint=$(fingerprint_of_tree)
 directory="$root/.bl/sdks/$fingerprint"
 mkdir -p "$directory"
-exec 9>"$directory/preparation.lock"
-flock -x 9
 retained="$directory/result-sdk"
-if [ ! -f "$retained/artifact.json" ]; then
-  echo 'bl: preparing the immutable SDK on the configured Nix build station' >&2
+
+bounded() {
   systemd-run --user --quiet --collect --wait --pipe --expand-environment=no \
     --working-directory="$root" --property=MemoryMax=4G --property=MemorySwapMax=0 \
-    --property=RuntimeMaxSec=3600 --property=KillMode=control-group \
-    nix-build "$root/nix/prepare-sdk.nix" --argstr root "$root" --argstr product sdk \
-      --out-link "$directory/result-sdk" --max-jobs 0 --option timeout 3300 \
-      --option experimental-features 'nix-command flakes' >"$directory/preparation.log" 2>&1 || {
-        tail -60 "$directory/preparation.log" >&2
-        exit 69
-      }
+    --property=RuntimeMaxSec=3700 --property=KillMode=control-group "$@" 9>&-
+}
+# The dispatcher prints JSON only to stdout. Unit and runtime diagnostics go to
+# a different file and never enter JSON parsers.
+dispatch() {
+  local mode=$1
+  shift
+  bounded "$coordinator/bin/bl" --cold run \
+    "$coordinator/foundry/bin/preparation-operation.bl" -- "$mode" "$job" "$@" \
+    >"$transport/client-$mode.json" 2>"$transport/client-$mode.log"
+}
+verify_selection() {
+  python3 - "$1" "$2" <<'PYVERIFY'
+import json, pathlib, re, sys
+output, coordinator = map(pathlib.Path, sys.argv[1:])
+assert re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/]+', str(output))
+metadata = json.loads((output / 'artifact.json').read_text())
+assert metadata['version'] == 1 and metadata['kind'] == 'sdk'
+assert metadata['target'] == 'x86_64-linux'
+assert metadata['coordinator'] == str(coordinator)
+assert (output / 'preparation-coordinator').is_symlink()
+assert (output / 'preparation-coordinator').resolve(strict=True) == coordinator
+assert (output / 'image/ebin/Elixir.BeamLisp.Launcher.beam').is_file()
+assert (output / 'bin/bl').is_file()
+cm = json.loads((coordinator / 'artifact.json').read_text())
+assert cm['version'] == 1 and cm['kind'] == 'artifact-coordinator-runtime'
+assert (coordinator / 'foundry/bin/preparation-operation.bl').is_file()
+PYVERIFY
+}
+
+if [ -f "$directory/active-job" ]; then
+  job_name=$(cat "$directory/active-job")
+  [[ "$job_name" =~ ^job-[A-Za-z0-9]+$ ]] || { echo 'bl: invalid active SDK job pointer' >&2; exit 69; }
+  job="$directory/$job_name"
+  [ -d "$job" ] && [ ! -L "$job" ] || { echo 'bl: active SDK job directory is missing' >&2; exit 69; }
+else
+  job=$(mktemp -d "$directory/job-XXXXXXXXXXXX")
+  printf '%s\n' "${job##*/}" >"$directory/active-job.tmp"
+  mv -T "$directory/active-job.tmp" "$directory/active-job"
 fi
-readlink -f "$retained"
+# Each wrapper invocation owns separate machine transports. A previous wrapper
+# can die while its managed await service continues writing; never truncate or
+# parse that surviving observer's files when another caller rejoins the job.
+transport=$(mktemp -d "$job/client-XXXXXXXXXXXX")
+# Unique job directories never move: durable handles bind their path/inode.
+if [ ! -L "$job/source-retained" ]; then
+  echo 'bl: capturing the immutable engine source on the configured Nix build station' >&2
+  bounded nix-build "$root/nix/sdk-source.nix" --argstr source "$root" \
+    --out-link "$job/source-retained" --max-jobs 0 --option timeout 3300 \
+    --option experimental-features 'nix-command flakes' \
+    >"$job/source-build.log" 2>&1 || { tail -60 "$job/source-build.log" >&2; exit 69; }
+fi
+engine=$(readlink -f "$job/source-retained")
+# Hash frozen bytes with the same semantic policy. Never relabel a job after
+# mutable edits: its immutable source and original fingerprint are evidence.
+frozen=$(python3 "$root/scripts/sdk-inputs" --root "$engine" --policy "$root/nix/engine-inputs.json")
+if [ "$frozen" != "$fingerprint" ]; then
+  printf '%s\n' "$fingerprint" >"$job/expected-fingerprint"
+  printf '%s\n' "$frozen" >"$job/captured-fingerprint"
+  rm -f "$directory/active-job"
+  echo "bl: engine inputs changed during capture; retained evidence at $job; retry" >&2
+  exit 69
+fi
+if [ ! -L "$job/coordinator-retained" ]; then
+  echo 'bl: preparing the independent immutable preparation coordinator' >&2
+  bounded nix-build "$engine/nix/sdk-artifact.nix" --argstr source "$engine" --argstr product coordinator \
+    --out-link "$job/coordinator-retained" --max-jobs 0 --option timeout 3300 \
+    --option experimental-features 'nix-command flakes' \
+    >"$job/coordinator-build.log" 2>&1 || { tail -60 "$job/coordinator-build.log" >&2; exit 69; }
+fi
+coordinator=$(readlink -f "$job/coordinator-retained")
+python3 - "$engine" "$coordinator" "$job" <<'PYBOOTSTRAP'
+import json, os, pathlib, re, stat, sys
+engine, coordinator, job = map(pathlib.Path, sys.argv[1:])
+for value in (engine, coordinator):
+    assert re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/]+', str(value)) and value.is_dir()
+info = job.lstat()
+assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
+metadata = json.loads((coordinator / 'artifact.json').read_text())
+assert metadata['version'] == 1 and metadata['kind'] == 'artifact-coordinator-runtime'
+assert (coordinator / 'bin/bl').is_file()
+assert (coordinator / 'foundry/bin/preparation-operation.bl').is_file()
+PYBOOTSTRAP
+if [ -f "$retained/artifact.json" ]; then
+  verify_selection "$(readlink -f "$retained")" "$coordinator"
+  emit_selection "$(readlink -f "$retained")"
+  exit 0
+fi
+if [ ! -f "$job/operation.json" ]; then
+  python3 - "$engine" >"$job/operation.tmp" <<'PYOP'
+import json, sys
+print(json.dumps(dict(version=1, kind='sdk', source=sys.argv[1], product='sdk'), sort_keys=True))
+PYOP
+  chmod 600 "$job/operation.tmp"
+  mv -T "$job/operation.tmp" "$job/operation.json"
+fi
+python3 - "$job/operation.json" "$engine" <<'PYREQUEST'
+import json, os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+info = path.lstat()
+assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
+assert info.st_size <= 1048576
+assert json.loads(path.read_text()) == dict(version=1, kind='sdk', source=sys.argv[2], product='sdk')
+PYREQUEST
+# submit is idempotent, including a caller dying after ledger admission but
+# before handle publication. The dispatcher owns reconciliation and ownership.
+if ! dispatch submit; then
+  cat "$transport/client-submit.log" >&2
+  cat "$transport/client-submit.json" >&2
+  exit 69
+fi
+# A queued worker lost before admission can safely resume through the fixed
+# dispatcher. An unknown in-flight worker is never adopted or silently replaced.
+if ! dispatch status; then
+  cat "$transport/client-status.log" "$transport/client-status.json" >&2
+  exit 69
+fi
+recovery=$(python3 - "$transport/client-status.json" <<'PYRECOVERY'
+import json, sys
+reply = json.load(open(sys.argv[1]))
+assert reply['ok'] is True
+value = reply['value']
+print('queued' if value['status'] == 'queued' and value['needsRecovery'] else
+      'unknown' if value['needsRecovery'] else 'none')
+PYRECOVERY
+)
+if [ "$recovery" = queued ]; then
+  if ! dispatch recover; then
+    cat "$transport/client-recover.log" "$transport/client-recover.json" >&2
+    exit 69
+  fi
+  if ! python3 - "$transport/client-recover.json" <<'PYRECOVERED'
+import json, sys
+reply = json.load(open(sys.argv[1]))
+assert reply['ok'] is True
+sys.exit(1 if reply['value']['needsRecovery'] else 0)
+PYRECOVERED
+  then
+    echo "bl: queued SDK worker identity needs explicit recovery; evidence preserved at $job" >&2
+    exit 69
+  fi
+elif [ "$recovery" = unknown ]; then
+  echo "bl: SDK worker outcome needs explicit recovery; roots and ledger preserved at $job" >&2
+  exit 69
+fi
+if ! dispatch await 3600000; then
+  # Failed terminal jobs permit a fresh attempt on the NEXT normal invocation.
+  # Deadlines and unknown ownership retain the active pointer for reconnection.
+  if dispatch status; then
+    state=$(python3 - "$transport/client-status.json" <<'PYSTATE'
+import json, sys
+reply = json.load(open(sys.argv[1]))
+assert reply['ok'] is True
+print(reply['value']['status'])
+PYSTATE
+)
+    case "$state" in failed|cancelled|interrupted) rm "$directory/active-job" ;; esac
+  fi
+  cat "$transport/client-await.log" >&2
+  cat "$transport/client-await.json" >&2
+  exit 69
+fi
+output=$(python3 - "$transport/client-await.json" "$job/operation.json" "$job/retained" <<'PYRESULT'
+import hashlib, json, pathlib, re, sys
+reply = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert reply['ok'] is True
+receipt = reply['value']
+operation = pathlib.Path(sys.argv[2]).read_bytes()
+request = json.loads(operation)
+assert receipt['version'] == 1 and receipt['kind'] == 'preparation-result'
+assert receipt['operation'] == 'sdk' and receipt['product'] == 'sdk'
+assert receipt['source'] == request['source']
+assert receipt['operation-sha256'] == hashlib.sha256(operation).hexdigest()
+output = receipt['output']
+assert re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/]+', output)
+retention = pathlib.Path(sys.argv[3])
+assert receipt['retention-root'] == str(retention)
+assert retention.is_symlink() and str(retention.resolve(strict=True)) == output
+print(output)
+PYRESULT
+)
+verify_selection "$output" "$coordinator"
+ln -sfn "$output" "$directory/result-sdk.tmp"
+mv -T "$directory/result-sdk.tmp" "$retained"
+emit_selection "$output"

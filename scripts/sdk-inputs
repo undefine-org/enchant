@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Canonical declared engine-input fingerprint; no build or runtime is started."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+
+
+def fingerprint(root, policy):
+    expected = {"version", "roots", "excluded", "reserved", "targetRoots", "limits"}
+    if set(policy) != expected or policy["version"] != 1:
+        raise ValueError("unsupported engine-input policy")
+    def beneath(parent, child):
+        return parent == child or child.startswith(parent + "/")
+    for key in ("roots", "excluded", "targetRoots"):
+        if not isinstance(policy[key], list) or not policy[key]:
+            raise ValueError("empty or malformed engine-input paths")
+        for value in policy[key]:
+            if not isinstance(value, str) or any(part in ("", ".", "..") for part in value.split("/")):
+                raise ValueError("engine-input paths must be relative")
+    if not isinstance(policy["reserved"], list) or any(
+            not isinstance(name, str) or not name or "/" in name for name in policy["reserved"]):
+        raise ValueError("invalid reserved engine-input names")
+    limits = policy["limits"]
+    if set(limits) != {"entries", "fileBytes", "totalBytes", "depth"} or any(
+            type(value) is not int or value <= 0 for value in limits.values()):
+        raise ValueError("invalid engine-input limits")
+    records = []
+    entries = total = 0
+    seen = set()
+    def stamp(value):
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+                value.st_ctime_ns, value.st_mode)
+    def directory_stamp(value):
+        return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode),
+                value.st_mtime_ns, value.st_ctime_ns)
+    def walk(directory, relative="", depth=0):
+        nonlocal entries, total
+        if depth > limits["depth"]:
+            raise ValueError("engine-input depth limit exceeded")
+        directory_before = os.stat(directory, follow_symlinks=False)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise ValueError("engine input directory changed type: " + relative)
+        with os.scandir(directory) as iterator:
+            children = []
+            for entry in iterator:
+                entries += 1
+                if entries > limits["entries"]:
+                    raise ValueError("engine-input entry limit exceeded")
+                children.append(entry)
+        for entry in sorted(children, key=lambda item: item.name):
+            path = relative + "/" + entry.name if relative else entry.name
+            if (entry.name in policy["reserved"]
+                    or (entry.name == "target" and any(beneath(parent, path) for parent in policy["targetRoots"]))
+                    or any(beneath(parent, path) for parent in policy["excluded"])):
+                continue
+            if not any(beneath(parent, path) or beneath(path, parent) for parent in policy["roots"]):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            seen.add(path)
+            if stat.S_ISDIR(info.st_mode):
+                records.append([path, "directory"])
+                walk(entry.path, path, depth + 1)
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_size > limits["fileBytes"]:
+                    raise ValueError("engine-input file size limit exceeded: " + path)
+                digest = hashlib.sha256()
+                count = 0
+                descriptor = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    if stamp(before) != stamp(info):
+                        raise ValueError("engine input changed during open: " + path)
+                    while True:
+                        chunk = stream.read(1048576)
+                        if not chunk:
+                            break
+                        count += len(chunk)
+                        total += len(chunk)
+                        if count > limits["fileBytes"] or total > limits["totalBytes"]:
+                            raise ValueError("engine-input byte limit exceeded")
+                        digest.update(chunk)
+                    after = os.fstat(stream.fileno())
+                current = os.lstat(entry.path)
+                if stamp(before) != stamp(after) or stamp(after) != stamp(current) or count != info.st_size:
+                    raise ValueError("engine input changed while hashing: " + path)
+                # NAR's executable flag is the owner execute bit; write/read bits
+                # are normalized when the same tree enters the immutable store.
+                records.append([path, "regular", bool(info.st_mode & stat.S_IXUSR), digest.hexdigest()])
+            else:
+                raise ValueError("selected engine input must be a regular file or directory: " + path)
+        directory_after = os.stat(directory, follow_symlinks=False)
+        if directory_stamp(directory_before) != directory_stamp(directory_after):
+            raise ValueError("engine input directory changed while hashing: " + relative)
+    walk(root)
+    if any(path not in seen for path in policy["roots"]):
+        raise ValueError("required engine-input root is missing")
+    encoded = json.dumps(sorted(records), ensure_ascii=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"beam-lisp-engine-inputs-v1\0" + encoded).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--policy", type=Path)
+    args = parser.parse_args()
+    root = args.root.resolve(strict=True)
+    if root == Path("/") or not root.is_dir():
+        raise ValueError("engine-input root must be a directory below /")
+    policy_path = args.policy or root / "nix/engine-inputs.json"
+    if policy_path.stat().st_size > 65536:
+        raise ValueError("engine-input policy exceeds capacity")
+    print(fingerprint(root, json.loads(policy_path.read_text())))
+
+
+if __name__ == "__main__":
+    main()

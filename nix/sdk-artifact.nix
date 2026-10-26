@@ -21,5 +21,5 @@ let
   };
 in
 assert storeObject source;
-assert builtins.elem product [ "sdk" "compiler" "dependencies" "bl-drop" ];
+assert builtins.elem product [ "sdk" "compiler" "dependencies" "bl-drop" "coordinator" ];
 products.${product}
