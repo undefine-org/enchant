@@ -56,7 +56,9 @@ def plan(boundaries=None):
         roots = list(dict.fromkeys(['compile.world', 'build', *roots]))
     sdk_initialization = bool(set(chosen) & SDK_INITIALIZATION)
     if sdk_initialization:
-        roots = list(dict.fromkeys([*roots, 'proc.reg']))
+        # Generation preparation selects this fixed provider lazily to avoid
+        # a require cycle. A Source-free initialization receiver needs its unit.
+        roots = list(dict.fromkeys([*roots, 'proc.reg', 'reload.source-guard', 'reload', 'reload.binding']))
     return {'version': 1, 'mode': 'complete' if boundaries is None else 'focused',
             'boundaries': chosen, 'universal': UNIVERSAL, 'pipeline': pipeline, 'roots': roots,
             'sdk-initialization': sdk_initialization,

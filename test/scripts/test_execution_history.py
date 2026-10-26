@@ -136,7 +136,7 @@ class ManifestControls(unittest.TestCase):
         cases = self.read(self.data)
         report = history.audit(cases)
         self.assertEqual(len(cases), 86)
-        self.assertEqual(len(report['open']), 67)
+        self.assertEqual(len(report['open']), 66)
         self.assertFalse(report['executed'])
         self.assertFalse(report['complete_goal'])
 

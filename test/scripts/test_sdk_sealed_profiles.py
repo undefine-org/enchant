@@ -2,6 +2,7 @@ import copy
 import json
 from pathlib import Path
 import runpy
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +46,14 @@ class SealedProfiles(unittest.TestCase):
     def test_first_sdk_initialization_is_required_only_for_affected_boundaries(self):
         affected = PROFILE['plan'](['unit-metadata'])
         unrelated = PROFILE['plan'](['filesystem-custody'])
+        self.assertIn('proc.reg', affected['roots'])
+        self.assertIn('reload.source-guard', affected['roots'])
+        # These fixed lazy loads avoid require cycles. Keep the initialization
+        # receiver closed over every such generation preparation provider.
+        source = (ROOT / 'priv/std/reload/generation.bl').read_text()
+        fixed = re.findall(r'BeamLisp.Loader/ensure_loaded "([^"]+)"', source)
+        self.assertTrue(fixed)
+        self.assertTrue(set(fixed).issubset(affected['roots']))
         good = {'status': 'passed', 'fresh-receiver': True, 'source-free': True, 'sdk-source-compiles': 0}
         PROFILE['validate_initialization'](affected, good)
         PROFILE['validate_initialization'](unrelated, None)

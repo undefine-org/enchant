@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
 import subprocess
 import time
 
@@ -35,6 +36,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--seed', type=Path)
+    parser.add_argument('--sdk', type=Path,
+                        help='run consumers on the normally selected immutable SDK; sealed stage remains constructed')
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--audit-only', action='store_true', help='verify all discovery inventories without starting a VM or qualifying execution')
     parser.add_argument('--boundaries', nargs='+',
@@ -44,6 +47,21 @@ def main():
     seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
     if os.path.lexists(output):
         parser.error('output must be absent; keep earlier receipts')
+    sdk = None
+    sdk_fingerprint = None
+    if args.sdk is not None:
+        # Reuse backend selection/verification. This is neither a provider
+        # override nor a second recipe/SDK authority implemented by the gate.
+        selected = subprocess.check_output(
+            [str(root / 'scripts/prepare-checkout-sdk'), '--selection'],
+            cwd=root, text=True).strip().split()
+        if len(selected) != 2 or Path(selected[0]).resolve() != args.sdk.resolve():
+            parser.error('requested SDK is not the normal current backend selection')
+        sdk, sdk_fingerprint = Path(selected[0]).resolve(), selected[1]
+        sdk_seed = (sdk / 'image/priv/bootstrap/seed').resolve()
+        if args.seed is not None and seed != sdk_seed:
+            parser.error('SDK consumer mode requires that SDK exact compiler floor')
+        seed = sdk_seed
     matrix_path = root / 'research/phase-compiler/sdk-boundary-consumers.json'
     matrix = json.loads(matrix_path.read_text())
     profiles = runpy.run_path(str(root / 'scripts/sdk_sealed_profiles.py'))
@@ -114,6 +132,43 @@ def main():
     except (OSError, ValueError, RuntimeError) as error:
         parser.error(str(error))
     output.mkdir(parents=True)
+    workspace = None
+    receiver_files = {}
+    consumer_command = None
+    consumer_env = {}
+    if sdk is not None:
+        workspace = output / 'consumer-sdk'
+        shutil.copytree(sdk / 'image', workspace, symlinks=True)
+        # Host fixture tests intentionally rewrite and restore runtime inputs.
+        # Give them owned copies, keeping every product byte authenticated.
+        for path in [workspace, *workspace.rglob('*')]:
+            if path.is_symlink():
+                continue
+            if path.is_file():
+                relative = str(path.relative_to(workspace))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if digest != hashlib.sha256((sdk / 'image' / relative).read_bytes()).hexdigest():
+                    raise RuntimeError('copied SDK input changed: ' + relative)
+                receiver_files[relative] = digest
+            path.chmod(path.stat().st_mode | 0o200)
+        (workspace / 'env.bl').write_text(
+            '{:paths [' + json.dumps(str(root)) + ' ' + json.dumps(str(root / 'examples'))
+            + '] :env {"BEAM_LISP_DEV" "1"}}\n')
+        (workspace / 'test').symlink_to(root / 'test', target_is_directory=True)
+        boot = output / 'consumer-sdk.exs'
+        boot.write_text('BeamLisp.Launcher.start_app!(System.argv(), %{})\n')
+        descriptor = json.loads((sdk / 'artifact.json').read_text())
+        consumer_command = [str(Path(descriptor['platform']) / 'bin/elixir')]
+        for dependency in sorted((sdk / 'lib').glob('*/ebin')):
+            if not dependency.parent.name.startswith('beam_lisp-'):
+                consumer_command += ['-pa', str(dependency)]
+        consumer_command += ['-pa', str(workspace / 'ebin'), str(boot), '--cold', 'test',
+                             *[str(root / path) for path in tests]]
+        consumer_env = {'BL_ROOT': str(workspace), 'BL_EBIN': str(workspace / 'ebin'),
+                        'BL_DAEMON': 'off', 'BL_BUILD_ID': 'actual-sdk-consumer-receiver',
+                        'BL_SDK_PRODUCT': str(sdk), 'BL_TEST_SOURCE_ROOT': str(root),
+                        'XDG_CACHE_HOME': str(output / 'consumer-cache'),
+                        'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     capture_tools = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools']
 
@@ -121,13 +176,18 @@ def main():
         # Freeze the entire language/runtime source inventory, not just paths
         # known before a run; new/removed files also invalidate the candidate.
         paths = [root / 'env.bl', root / 'flake.nix', root / 'flake.lock', matrix_path, writers_path, Path(__file__).resolve()]
+        if sdk is not None:
+            paths += [sdk / 'artifact.json', workspace / 'env.bl', output / 'consumer-sdk.exs']
         for directory in ['priv', 'test', 'scripts', 'native', 'tooling/drop', 'nix']:
             paths += [p for p in (root / directory).rglob('*') if p.is_file()
                       and (p.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.py', '.exs', '.erl', '.rs', '.toml', '.lock', '.so', '.nix'))
-                           or directory == 'scripts') and 'target' not in p.parts and '__pycache__' not in p.parts]
-        inputs = {str(p.relative_to(root)): sha(p) for p in sorted(set(paths))}
+                           or directory == 'scripts') and 'target' not in p.parts and '__pycache__' not in p.parts
+                      and '.bl' not in p.relative_to(root).parts]
+        inputs = {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): sha(p)
+                  for p in sorted(set(paths))}
         floor = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
-        return {'inputs': inputs, 'floor': floor, 'tools': capture_tools(root)}
+        return {'inputs': inputs, 'floor': floor, 'tools': capture_tools(root),
+                'SDK_receiver_bytes': {path: sha(workspace / path) for path in receiver_files}}
 
     frozen = capture()
     (output / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
@@ -135,14 +195,18 @@ def main():
               'boundaries': [b['id'] for b in selected],
               'mapped_boundaries': [b['id'] for b in matrix['boundaries']], 'stages': {},
               'complete_goal': False, 'full_sdk_build': False,
+              'consumer_scope': 'byte-identical-copy-of-actual-selected-SDK' if sdk else 'private-Source-compiler-floor',
+              'sdk': str(sdk) if sdk else None, 'engine_fingerprint': sdk_fingerprint,
+              'SDK_receiver_initial_files': receiver_files,
               'preparation_seconds': round(time.monotonic() - preparation_started, 3)}
 
-    def stage(name, command):
+    def stage(name, command, cwd=None, extra_env=None):
         if capture() != frozen:
             raise RuntimeError('frozen inputs changed before ' + name)
         start = time.monotonic()
         with (output / (name + '.log')).open('w') as log:
-            done = subprocess.run(command, cwd=root, env=dict(os.environ, BL_TEST_TIMES='1'),
+            done = subprocess.run(command, cwd=cwd or root,
+                                  env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {})},
                                   stdout=log, stderr=subprocess.STDOUT, timeout=1000)
         report['stages'][name] = {'exit': done.returncode, 'seconds': round(time.monotonic()-start, 3)}
         report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
@@ -152,8 +216,11 @@ def main():
             raise RuntimeError('frozen inputs changed during ' + name)
 
     try:
-        stage('consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root), '--seed', str(seed), '--test-timeout', '900',
-                            '--test', *[str(root / p) for p in tests]])
+        if sdk is None:
+            stage('consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root), '--seed', str(seed), '--test-timeout', '900',
+                                '--test', *[str(root / p) for p in tests]])
+        else:
+            stage('consumers', consumer_command, cwd=workspace, extra_env=consumer_env)
         log = (output / 'consumers.log').read_text()
         summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
         counts = re.findall(r'✓ .*?\s+(\d+) passed', log)

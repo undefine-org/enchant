@@ -1,0 +1,211 @@
+;; Fresh native bootstrap only. Private helpers never publish changed SDK code.
+;; Strict public replay attempts publication only in its disposable child; a
+;; defective old SDK may admit it. No lease is removed to manufacture coldness.
+(assert (= (list) (ets/lookup :beam_lisp_vars :bl_sdk_runtime_lease)))
+(ns fixture.sdk-prelease-publication-control)
+
+(def COPIED :Elixir.SdkPreleasePublicationOriginal)
+(def HISTORICAL :Elixir.SdkPreleasePublicationImageOnly)
+(def FIXED :Elixir.SdkPreleasePublicationWithSeed)
+
+(defn- lease-absent! [stage]
+ (let [absent? (= (list) (ets/lookup :beam_lisp_vars :bl_sdk_runtime_lease))]
+  (println :sdk-prelease-custody {:stage stage :lease-absent absent?})
+  (assert absent?)))
+
+(defn- actual-form [source]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "host/env.bl")
+              #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                    (= "unretained_sdk_forwarders!"
+                       (BeamLisp.AOT/stage-symbol
+                        (second (BeamLisp.AOT/stage-items % :list))))))]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))]
+   (String/slice source (:offset position) (- (:end-offset position) (:offset position))))))
+
+(defn- with-row [text replacement]
+ ;; Only selection of the authentic row changes. Proposed-byte comparison,
+ ;; forwarder verification and the real SDK dependencies remain untouched.
+ (let [start "           row (when-not covered"
+       finish "\n      (if-not row out"
+       prefix (String/split text start)]
+  (assert (= 2 (count prefix)))
+  (let [suffix (String/split (second prefix) finish)]
+   (assert (= 2 (count suffix)))
+   (str (first prefix) replacement finish (second suffix)))))
+
+(defn- compile-helper! [scratch module text]
+ (let [file (Path/join scratch (str (Atom/to_string module) ".bl"))
+       before (BeamLisp.Env/capture)]
+  (File/write! file (str "(ns fixture.sdk-prelease-publication-native)\n" text))
+  (try
+   (BeamLisp.AOT/compile_host_file file
+    (list (tuple :module module) (tuple :output_dir scratch) (tuple :load? true)))
+   (finally (BeamLisp.Env/bind before)))
+  (lease-absent! module)))
+
+(defn- observe [module prepared]
+ (try
+  {:status :returned :value (erlang/apply module :unretained_sdk_forwarders! (list prepared))}
+  (catch error {:status :refused :reason (BeamLisp.ExInfo/ex_original error)})))
+
+(defn- image-corruption-control! []
+ ;; Only an exact disposable SDK copy may be mutated. An existing image row's
+ ;; failed verification must throw; it must never become absent seed evidence.
+ (when-let [owned (System/get_env "BL_TEST_SDK_PRELEASE_MUTABLE_ROOT")]
+  (let [root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+        _ (assert (= root (Path/expand owned)))
+        _ (assert (not (String/starts_with? root "/nix/store/")))
+        module (BeamLisp.Emit/module_for "proc.server")
+        row (BeamLisp.AOT/sdk_compiler_row module)
+        identity (Atom/to_string module)
+        path (BeamLisp.AOT/sdk_image_artifact_path root identity)
+        stat (File/lstat! path)
+        _ (assert (= :regular (:type stat)))
+        _ (assert (= 1 (:links stat)))
+        bytes (File/read! path)
+        prepared (list (tuple (tuple module bytes) "<prelease-authenticated-image>"))
+        normal (observe FIXED prepared)]
+   (assert (some? row))
+   (assert (nil? (BeamLisp.AOT/seed_dependency_from_manifest! module (BeamLisp.Bootstrap/manifest))))
+   (assert (= :returned (:status normal)))
+   (assert (contains? (:value normal) module))
+   (try
+    (File/write! path "corrupt actual indexed SDK artifact")
+    (let [fixed (observe FIXED prepared) historical (observe HISTORICAL prepared)]
+     (println :sdk-prelease-image-corruption {:fixed fixed :historical historical})
+     (assert (= {:status :refused :reason :sdk_runtime_artifact_changed} fixed))
+     (assert (= fixed historical)))
+    (finally (File/write! path bytes)))
+   (assert (= bytes (File/read! path)))
+   (assert (= normal (observe FIXED prepared)))
+   (lease-absent! :after-image-corruption))))
+
+(defn- source-only-control! []
+ ;; The canonical physical SDK Source producer, not hand-published receipts.
+ ;; A non-seed SDK unit must remain protected even without an image index.
+ (let [namespace "clojure.string"
+       source (BeamLisp.Loader/source_path namespace)
+       path (Path/join (BeamLisp.Tiers/priv_root) "sdk-code.term")]
+  (assert (not (File/exists? path)))
+  (assert (BeamLisp.AOT/sdk_library_source? namespace source))
+  (BeamLisp.AOT/compile_sdk_source! namespace (BeamLisp.Loader/read_source source) source)
+  (lease-absent! :after-real-source-producer)
+  (let [module (BeamLisp.AOT/ns_body_module namespace)
+        row (BeamLisp.AOT/source_sdk_receipt module)
+        before (erlang/apply module :module_info (list :md5))
+        forms (list (tuple :attribute 1 :module module)
+                    (tuple :attribute 1 :export (list (tuple :history_changed 0)))
+                    (tuple :function 1 :history_changed 0
+                      (list (tuple :clause 1 (list) (list) (list (tuple :atom 1 :changed))))))
+        compiled (compile/forms forms (list :binary :return))
+        _ (assert (= :ok (elem compiled 0)))
+        changed (list (tuple (tuple module (elem compiled 2)) "<prelease-source-only-changed>"))
+        historical (observe HISTORICAL changed)
+        fixed (observe FIXED changed)
+        actual (observe :Elixir.BeamLisp.Env changed)]
+   (assert (some? row))
+   (assert (= row (BeamLisp.AOT/sdk_compiler_row module)))
+   (assert (= before (:md5 row)))
+   (assert (nil? (BeamLisp.AOT/seed_dependency_from_manifest! module (BeamLisp.Bootstrap/manifest))))
+   (assert (not (File/exists? path)))
+   (println :sdk-prelease-source-only {:namespace namespace :receipt-role (:role row)
+             :real-source-producer true :image-index-present false :seed-proof nil
+             :historical historical :fixed fixed :actual actual
+             :code-unchanged (= before (erlang/apply module :module_info (list :md5)))})
+   (assert (= {:status :returned :value {}} historical))
+   (assert (= {:status :refused :reason :sdk_runtime_replacement_requires_handover} fixed))
+   (assert (= before (erlang/apply module :module_info (list :md5))))
+   (when (= "yes" (System/get_env "BL_TEST_SDK_PRELEASE_REQUIRE_ACTUAL"))
+    (let [publication (try (BeamLisp.Env/publish_binaries! changed) :unexpected-success
+                       (catch error (BeamLisp.ExInfo/ex_original error)))]
+     ;; Native diagnostics survive even an admitted bad library body in this
+     ;; disposable VM. No destructive attempt ever runs in the parent VM.
+     (erlang/display {:source-only-sdk-publication publication :before before
+                      :after (erlang/apply module :module_info '(:md5))})
+     (assert (= :sdk_runtime_replacement_requires_handover publication))
+     (assert (= before (erlang/apply module :module_info (list :md5))))))
+   (lease-absent! :after-source-only-controls))))
+
+(let [source-path (Path/join (BeamLisp.Tiers/priv_root) "host/env.bl")
+      source (File/read! source-path)
+      sha (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower)))
+      loaded-sha (BeamLisp.AOT/normalized_attribute
+                   (BeamLisp.Env/module_info :attributes) :bl_source_hash)
+      module :Elixir.BeamLisp.Ns.Body.Core
+      before (BeamLisp.Env/capture)
+      env-md5 (BeamLisp.Env/module_info :md5)
+      original (code/get_object_code module)
+      body-md5 (erlang/apply module :module_info (list :md5))
+      manifest (BeamLisp.Bootstrap/manifest)
+      scratch (Path/join (System/tmp_dir!)
+                (str "sdk-prelease-publication-" (erlang/unique_integer (list :positive))))
+      source-only? (= "yes" (System/get_env "BL_TEST_SDK_PRELEASE_SOURCE_ONLY"))
+      text (actual-form source)
+      historical-row (str "           row (when-not covered\n"
+                     "            (if (File/regular? (Path/join (BeamLisp.Tiers/priv_root) \"sdk-code.term\")) (BeamLisp.AOT/sdk_compiler_row mod)\n"
+                     "                (let [manifest (BeamLisp.Bootstrap/manifest)]\n"
+                     "                 (when (and manifest (BeamLisp.Bootstrap/key_matches? manifest))\n"
+                     "                  (or (BeamLisp.AOT/seed_dependency_from_manifest! mod manifest)\n"
+                     "                      (BeamLisp.AOT/seed_forwarder_dependency_from_manifest! mod manifest))))))]")
+      fixed-row (str "           row (when-not covered\n"
+                 "            (or (BeamLisp.AOT/sdk_compiler_row mod)\n"
+                 "                (let [manifest (BeamLisp.Bootstrap/manifest)]\n"
+                 "                 (when (and manifest (BeamLisp.Bootstrap/key_matches? manifest))\n"
+                 "                  (or (BeamLisp.AOT/seed_dependency_from_manifest! mod manifest)\n"
+                 "                      (BeamLisp.AOT/seed_forwarder_dependency_from_manifest! mod manifest))))))]")]
+ (println :sdk-prelease-source {:source source-path :source-sha256 sha :loaded-env-source-sha256 loaded-sha})
+ (assert (= sha loaded-sha))
+ (assert (= (not source-only?) (File/regular? (Path/join (BeamLisp.Tiers/priv_root) "sdk-code.term"))))
+ (assert (= module (elem original 0)))
+ (assert (nil? (BeamLisp.AOT/sdk_compiler_row module)))
+ (assert (BeamLisp.Bootstrap/key_matches? manifest))
+ (assert (some? (BeamLisp.AOT/seed_dependency_from_manifest! module manifest)))
+ (lease-absent! :before-helpers)
+ (File/mkdir_p! scratch)
+ (try
+  (compile-helper! scratch COPIED text)
+  (compile-helper! scratch HISTORICAL (with-row text historical-row))
+  (compile-helper! scratch FIXED (with-row text fixed-row))
+  (assert (= before (BeamLisp.Env/capture)))
+  (let [forms (list (tuple :attribute 1 :module module)
+                    (tuple :attribute 1 :export (list (tuple :history_changed 0)))
+                    (tuple :function 1 :history_changed 0
+                      (list (tuple :clause 1 (list) (list) (list (tuple :atom 1 :changed))))))
+        compiled (compile/forms forms (list :binary :return))
+        _ (assert (= :ok (elem compiled 0)))
+        identical (list (tuple (tuple module (elem original 1)) "<prelease-identical>"))
+        changed (list (tuple (tuple module (elem compiled 2)) "<prelease-changed>"))
+        normal (observe :Elixir.BeamLisp.Env identical)
+        copied (observe COPIED identical)
+        fixed (observe FIXED identical)
+        bad (observe HISTORICAL changed)
+        protected (observe FIXED changed)
+        actual (observe :Elixir.BeamLisp.Env changed)
+        copied-protected (observe COPIED changed)]
+   (println :sdk-prelease-publication-control
+    {:normal-identical normal :copied-identical copied :fixed-identical fixed
+     :historical-changed bad :fixed-changed protected
+     :actual-changed actual :copied-changed copied-protected
+     :actual-policy (if (= actual protected) :seed-protected :historical-image-only)
+     :core-body-unchanged (= body-md5 (erlang/apply module :module_info (list :md5)))
+     :env-unchanged (= env-md5 (BeamLisp.Env/module_info :md5))})
+   (assert (= {:status :returned :value {}} normal))
+   (assert (= normal copied)) (assert (= normal fixed))
+   (assert (= (if source-only? protected {:status :returned :value {}}) bad))
+   (assert (= {:status :refused :reason :sdk_runtime_replacement_requires_handover} protected))
+   ;; The retained old immutable SDK is useful component feedback. Its actual
+   ;; leaf may still have the bug; only the proposed private leaf is qualified
+   ;; here. Exact-candidate production E21 replay must separately require the
+   ;; actual publication refusal on the newly produced SDK.
+   (assert (or (= protected actual) (= bad actual)))
+   (assert (= actual copied-protected))
+   (if source-only? (source-only-control!) (image-corruption-control!))
+   (assert (= body-md5 (erlang/apply module :module_info (list :md5))))
+   (assert (= env-md5 (BeamLisp.Env/module_info :md5)))
+   (assert (= before (BeamLisp.Env/capture)))
+   (lease-absent! :after-controls)
+   (println "SDK_PRELEASE_PUBLICATION_CONTROL_READY"))
+  (finally
+   (doseq [probe [COPIED HISTORICAL FIXED]] (code/purge probe) (code/delete probe))
+   (File/rm_rf! scratch))))
