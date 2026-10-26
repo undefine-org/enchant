@@ -1,7 +1,7 @@
 # Foundry's job mechanism needs an independent runtime while the target SDK is
 # being produced. Use the verified compiler cohort and immutable framework
 # Source; this package neither depends on nor pretends to be the target SDK.
-{ pkgs, compiler, dependencies, source, platform, foundry }:
+{ pkgs, compiler, dependencies, source, platform, foundry ? import ./foundry-ledger.nix }:
 let
   ledgerFiles = [
     "bin/jobs.bl"
@@ -36,6 +36,7 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   ln -s lib/beam_lisp-0.1.0 "$out/image"
   cp -a ${ledger}/. "$out/foundry/"
   chmod -R u+w "$out/foundry"
+  cp ${./preparation-operation.bl} "$out/foundry/bin/preparation-operation.bl"
   cat > "$out/foundry/env.bl" <<'PROJECT'
   {:name "foundry-artifact-coordinator"
    :paths ["src/foundry/operations" "src/foundry/support" "src/foundry/credentials"]}
@@ -56,6 +57,8 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   export PATH=${platform}/bin:\$PATH
   export FOUNDRY_ROOT="$out/foundry" FOUNDRY_BL="$out/bin/worker"
   export FOUNDRY_TOOL_PATH=${platform}/bin
+  export BL_PREPARATION_COORDINATOR="$out"
+  export BL_PREPARATION_PLATFORM="$(readlink -f ${platform}/artifact-platform)"
   export LANG=C.UTF-8 LC_ALL=C.UTF-8
   export ELIXIR_ERL_OPTIONS='+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1'
   exec ${platform}/bin/elixir "$out/boot.exs" "\$@"
