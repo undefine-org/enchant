@@ -1,7 +1,7 @@
 ; Source-only regressions for exact installed-spec observation. Root runs this
 ; after ordinary SDK acceptance and installation of evolve.candidate.bl.
 (ns proc.evolve-current-rehearsal-test
- (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state] [proc.message-domain]))
 (def SOURCE
  "(ns rehearsal.business)
   (defn accepts [message] (erlang/is_binary message))
@@ -179,3 +179,67 @@
       (is (= "candidate remains usable" (ev/request! pid 2 "candidate remains usable")))
       (is (= live (BeamLisp.Env/fetch_exact! "proc.evolve" "automatic-observation"))))
      (finally (BeamLisp.Env/destroy scope)))))))
+
+(defn- spec-context-probes [scope]
+ (let [source (File/read! (BeamLisp.Loader/source_path "proc.evolve"))
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (= "defn" (BeamLisp.AOT/stage-head %))
+                    (= "prepare-spec" (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))
+       before "(BeamLisp.Env/capture_native_context!)" after "(BeamLisp.Env/capture)"
+       suffix (str (erlang/unique_integer (list :positive)))]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))]
+   (assert (= 2 (count (String/split text before))))
+   (BeamLisp.Env/with_env scope
+    #(mapv (fn [historical?]
+             (let [namespace (str "history.evolve.context." suffix "." (if historical? "raw" "opaque"))]
+              (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+              (BeamLisp.Compiler/eval_string (if historical? (String/replace text before after) text))
+              (BeamLisp.Env/fetch_exact! namespace "prepare-spec"))) [false true])))))
+
+(deftest prepared-spec-context-is-opaque-before-native-bundle-publication
+ (with-owner "rehearsal-prepared-spec-context-causal"
+  (fn [_ fresh pid value]
+   (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id)) grant (atom nil)
+         live (BeamLisp.Env/fetch_exact! "proc.evolve" "prepare-spec")]
+    (try
+     (let [[current historical] (spec-context-probes scope)
+           specs (g/with! fresh
+                   #(let [input (dissoc value :environment)]
+                     {:actual (ev/prepare-spec input) :copied (current input) :raw (historical input)}))
+           opaque (:environment (:copied specs))]
+      (is (= :bl_native_context (elem opaque 0)))
+      (is (= 3 (erlang/tuple_size opaque)))
+      (is (= fresh (:generation (BeamLisp.Env/resolve_native_context! opaque))))
+      (is (= fresh (get-in specs [:raw :environment :generation])))
+      (is (= (dissoc (:actual specs) :environment) (dissoc (:raw specs) :environment)))
+      (is (= :proved (:status (BeamLisp.Ns.Rt/invoke
+            (BeamLisp.Env/fetch_exact! "proc.message-domain" "capture")
+            (list (:accept? (:copied specs)) opaque)))))
+      (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! pid)))
+      (with-counters (mapv #(get value %) [:handler :accept? :check-state :migrate-state :upcast])
+       (fn [counters]
+        (g/with! fresh
+         (fn []
+          (let [before (ets/info :beam_lisp_code_leases :size)
+                refused (try (BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec (:raw specs))
+                          :unexpected-publication (catch error (BeamLisp.ExInfo/ex_original error)))]
+           (is (= :invalid_native_context refused))
+           (is (= before (ets/info :beam_lisp_code_leases :size))))
+          (let [bundle (BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec (:copied specs))]
+           (try
+            (is (= :execution-bundle (:kind (BeamLisp.Env/execution_registration_state bundle))))
+            (finally (BeamLisp.Execution/close! bundle))))))
+        (doseq [mfa counters] (is (= 0 (calls mfa))))))
+      (is (= :prepared (:status (g/with! fresh #(ev/prepare-transition! pid @grant 1 (:copied specs))))))
+      (is (= :cancelled (:status (g/with! fresh #(ev/cancel-transition! pid @grant)))))
+      (reset! grant nil)
+      (is (= "original owner remains usable" (ev/request! pid 1 "original owner remains usable")))
+      (is (= live (BeamLisp.Env/fetch_exact! "proc.evolve" "prepare-spec"))))
+     (finally
+      (when @grant
+       (try (g/with! fresh #(ev/cancel-transition! pid @grant)) (catch _ nil))
+       (try (BeamLisp.Env/abandon_owner_transition! @grant) (catch _ nil)))
+      (BeamLisp.Env/destroy scope)))))))
