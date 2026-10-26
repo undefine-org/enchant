@@ -15,7 +15,6 @@ in (import ../../nix/bounded-build.nix {
   cpuCount = 4;
   commandManager = true;
 }) (pkgs.runCommand "beam-lisp-portable-runtime-control" {} ''
-  set -x
   receiver=/build/receiver
   trap 'status=$?; test ! -f "$out/receiver.log" || cat "$out/receiver.log"; exit "$status"' EXIT
   mkdir -p "$receiver"/{bin,usr/bin,lib,lib64,dev,proc,etc,root,tmp}
@@ -44,6 +43,7 @@ in (import ../../nix/bounded-build.nix {
     done
   done
   cp ${pkgs.stdenv.cc.bintools.dynamicLinker} "$receiver/lib64/ld-linux-x86-64.so.2"
+  cp ${./portable-runtime.bl} "$receiver/tmp/control.bl"
   cp ${drop} "$receiver/bin/bl"
   chmod 755 "$receiver/bin/bl"
   printf 'root:x:0:0:root:/root:/bin/sh\n' > "$receiver/etc/passwd"
@@ -56,8 +56,8 @@ in (import ../../nix/bounded-build.nix {
   ${pkgs.coreutils}/bin/timeout 90 ${pkgs.coreutils}/bin/chroot "$receiver" \
     /bin/env -i HOME=/root PATH=/bin:/usr/bin LD_LIBRARY_PATH=/lib:/lib64 \
       ELIXIR_ERL_OPTIONS='+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1' \
-      /bin/bl --cold eval '(do (assert (not (File/dir? "/nix/store"))) (+ 20 22))' \
+      /bin/bl --cold run /tmp/control.bl \
       > "$out/receiver.log" 2>&1
   grep -x 42 "$out/receiver.log"
-  printf '{"passed":true,"nixStoreVisible":false,"answer":42}\n' > "$out/result.json"
+  printf '{"passed":true,"nixStoreVisible":false,"answer":42,"nativeJson":true}\n' > "$out/result.json"
 '')
