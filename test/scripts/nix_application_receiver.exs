@@ -31,7 +31,9 @@ BeamLisp.eval("""
         closure (invoke "adder" (list 10))
         closed (BeamLisp.Ns.Rt/invoke closure (list 32))
         initialized (BeamLisp.Loader.Server/run #(Process/get :artifact-demo-initialized))]
-    (assert (= 42 answer)) (assert (= 3 value)) (assert (= 42 closed)) (assert (= 1 initialized))
+    (assert (= (String/to_integer (or (System/get_env "BL_APPLICATION_EXPECT_ANSWER") "42")) answer))
+    (when-let [expected (System/get_env "BL_APPLICATION_EXPECT_BASE")]
+      (assert (= (String/to_integer expected) (BeamLisp.Env/fetch! "artifact.demo.values" "base")))) (assert (= 3 value)) (assert (= 42 closed)) (assert (= 1 initialized))
     (BeamLisp.AOT/init_loaded_module namespace (BeamLisp.Emit/module_for namespace))
     (assert (= 1 (BeamLisp.Loader.Server/run #(Process/get :artifact-demo-initialized))))
     (println (str "IMMUTABLE-MULTI answer=" answer " value=" value " closure=" closed " initializer=" initialized))))

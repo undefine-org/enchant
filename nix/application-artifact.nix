@@ -4,6 +4,8 @@ let
   request = builtins.fromJSON (builtins.unsafeDiscardStringContext (if requestPath != null
     then builtins.readFile (/. + requestPath)
     else requestJson));
+  scoped = (request.scope or "full") == "scoped";
+  base = if (request.base or null) == null then null else builtins.storePath request.base;
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
   pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
   storeObject = value: builtins.isString value && builtins.match "/nix/store/[0-9a-z]{32}-[^/]+" value != null;
@@ -42,8 +44,12 @@ let
   '';
 in
 assert (requestJson == null) != (requestPath == null);
-assert builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ];
-assert request.version == 1 && storeObject request.source && storeObject sdk;
+assert (request.version == 1 && builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ])
+  || (request.version == 2 && builtins.attrNames request == [ "base" "ex" "exclude" "jobs" "native" "scope" "source" "sources" "version" "world" ]);
+assert builtins.elem (request.scope or "full") [ "full" "scoped" ];
+assert (request.base or null) == null || (scoped && storeObject request.base);
+assert !scoped || request.world == null;
+assert storeObject request.source && storeObject sdk;
 assert descriptor.version == 1 && descriptor.kind == "sdk" && descriptor.target == "x86_64-linux";
 assert (descriptor.producerAPI or 1) == 2;
 assert builtins.isList request.sources && builtins.all relative request.sources;
@@ -65,12 +71,22 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
   mkdir -p /build/project "$out"
   cp -a --no-preserve=ownership ${source}/. /build/project/
   chmod -R u+w /build/project
+  ${pkgs.lib.optionalString (base != null) ''
+    ${pkgs.python3}/bin/python3 ${./application-inventory.py} verify ${base} ${image} \
+      "$(${pkgs.jq}/bin/jq -r .source ${base}/artifact.json)" >/dev/null
+    test "$(${pkgs.jq}/bin/jq -r '."world-unit" // empty' ${base}/result.json)" = ""
+    cp -a --no-preserve=ownership ${base}/ebin "$out/ebin"
+    if test -d ${base}/units; then cp -a --no-preserve=ownership ${base}/units "$out/units"; fi
+    if test -d ${base}/native; then cp -a --no-preserve=ownership ${base}/native "$out/native"; fi
+    chmod -R u+w "$out"
+  ''}
   export HOME=/build/home XDG_CACHE_HOME=/build/home/.cache BL_DAEMON=off
   export PATH=${platform}/bin:$PATH
   export LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1"
   export BL_ROOT=${image}/image BL_BIN=${image}/bl
   export BL_ARTIFACT_PLATFORM=${platform}/artifact-platform
   ${pkgs.lib.optionalString (nativeSet != null) "export BL_PREPARED_NATIVES=${nativeSet}"}
+  ${pkgs.lib.optionalString (base != null) "export BL_APPLICATION_BASE=${base}"}
   export BL_APPLICATION_REQUEST=${requestFile}
   export BL_APPLICATION_SOURCE=/build/project BL_APPLICATION_OUTPUT="$out"
   mkdir -p "$HOME" "$XDG_CACHE_HOME"
@@ -79,7 +95,7 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
   rm -rf "$out/.bl"
   mkdir -p "$out/native"
   ${pkgs.lib.concatMapStringsSep "\n" (crate: ''
-    ln -s ${products.${crate}}/lib/${crate}.so "$out/native/${crate}.so"
+    ln -sf ${products.${crate}}/lib/${crate}.so "$out/native/${crate}.so"
   '') crates}
   printf '%s\n' '${builtins.toJSON {
     version = 1;

@@ -5,6 +5,8 @@
             [bl.env :as env] [vm.osenv :as osenv] [app-resource :as app]))
 
 (let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
+      base (System/get_env "BL_APPLICATION_BASE")
+      previous (when base (Jason/decode! (File/read! (Path/join base "result.json"))))
       root (System/fetch_env! "BL_APPLICATION_SOURCE")
       out (System/fetch_env! "BL_APPLICATION_OUTPUT")
       project (env/project root)
@@ -14,7 +16,7 @@
       _ (doseq [path (:paths project)] (BeamLisp.Env/add_search_path path))
       relative (fn [path] (when path (Path/join root path)))
       ex (get request "ex")
-      options {:root root :out (Path/join out "ebin")
+      options {:root root :scope (if (= "scoped" (get request "scope")) :scoped :full) :out (Path/join out "ebin")
                :sources (Enum/map (get request "sources") relative)
                :world (relative (get request "world"))
                :exclude (vec (distinct (concat (Enum/map (get request "exclude") relative)
@@ -44,7 +46,18 @@
                               (when-not namespace
                                 (throw (ex-info "Application artifact source requires a namespace" {:file file})))
                               {:namespace (symbol namespace) :file file})))
-                workspace (BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources sources} {})]
+                closure (distinct (mapcat
+                          (fn [source]
+                            (BeamLisp.BuildPlan/nodes_from_resolver (str (:namespace source))
+                              (fn [name]
+                                (when-let [path (BeamLisp.Loader/source_path name)]
+                                  (when (String/starts_with? (Path/expand path) (str root "/"))
+                                    (plan/memo-node name (BeamLisp.Loader/read_source path))))))) sources))
+                workspace-sources (Enum/map closure
+                                    (fn [node] {:namespace (symbol (:ns node))
+                                                :file (BeamLisp.Loader/source_path (:ns node))}))
+                workspace (when (seq sources)
+                            (BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources workspace-sources} {}))]
             (try
               (Enum/map sources
                 (fn [source]
@@ -52,24 +65,56 @@
                         name (str namespace)
                         relative (str "units/" name)
                         directory (Path/join out relative)
+                        _ (when (some #(contains? #{"" "." ".."} %) (String/split name "/"))
+                            (throw (ex-info "Invalid application namespace output path" {:namespace name})))
                         prepared (BeamLisp.AOT/prepare_unit workspace namespace)
+                        _ (when (File/exists? directory) (File/rm_rf! directory))
                         _ (BeamLisp.AOT/emit_unit prepared directory)
                         verified (BeamLisp.AOT/verify_unit directory)]
-                    {:namespace name :directory relative :modules (count (get-in verified [:manifest :modules]))})))
-              (finally (BeamLisp.AOT/close_workspace! workspace)))))
+                    {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))
+              (finally (when workspace (BeamLisp.AOT/close_workspace! workspace))))))
+        incoming (when planning
+                   (Enum/map (:order planning)
+                     (fn [node]
+                       {:namespace (:ns node) :path (Path/relative_to (:path node) root)
+                        :content (:hash node) :interface (:iface node)
+                        :key (get (:key planning) (:path node))
+                        :requires (Enum/map (:reqs node) identity)})))
+        owned (set (Enum/map incoming #(:path %)))
+        retained (filter #(not (contains? owned (get % "path"))) (or (get previous "impact") []))
+        impact (concat (Enum/map retained
+                         (fn [row] {:namespace (get row "namespace") :path (get row "path")
+                                    :content (get row "content") :interface (get row "interface")
+                                    :key (get row "key") :requires (get row "requires")})) incoming)
+        order (when planning
+                (:order (plan/plan (Enum/map impact
+                          (fn [row] {:ns (:namespace row) :path (:path row) :hash (:content row)
+                                     :iface (:interface row) :reqs (:requires row)})))))
+        old-units (into {} (Enum/map (or (get previous "units") []) (fn [row] [(get row "namespace") row])))
+        new-units (into {} (Enum/map (or units []) (fn [row] [(:namespace row) row])))
+        units (when planning
+                (Enum/map order
+                  (fn [node]
+                    (or (get new-units (:ns node))
+                        (let [row (get old-units (:ns node))]
+                          (when-not row (throw (ex-info "Scoped application lost a retained unit" {:namespace (:ns node)})))
+                          {:namespace (get row "namespace") :directory (get row "directory")
+                           :source (:path node) :modules (get row "modules")})))))
+        _ (let [kept (set (Enum/map (or units []) #(:directory %)))]
+            (doseq [row (or (get previous "units") [])]
+              (let [relative (get row "directory")]
+                (when-not (and (String/starts_with? relative "units/")
+                                (not (some #(contains? #{"" "." ".."} %) (String/split relative "/"))))
+                  (throw (ex-info "Invalid retained application unit path" {})))
+                (when-not (contains? kept relative) (File/rm_rf! (Path/join out relative))))))
         resource (app/write-project! project (or (:runtime-out result) (Path/join out "ebin")))]
     (File/write! (Path/join out "result.json")
       (Jason/encode! {:built (:built result) :cached (:cached result)
                      :ex-built (:ex-built result) :errors errors
                      :units (or units (list))
                      :world-unit (when (get request "world") (Path/relative_to (:out result) out))
-                     :impact (when planning
-                               (Enum/map (:order planning)
-                                 (fn [node]
-                                   {:namespace (:ns node) :path (Path/relative_to (:path node) root)
-                                    :content (:hash node) :interface (:iface node)
-                                    :key (get (:key planning) (:path node))
-                                    :requires (Enum/map (:reqs node) identity)})))
+                     :impact (when planning (Enum/map order
+                                                (fn [node] (some #(when (= (:namespace %) (:ns node)) %) impact))))
                      :runtime-out (when (:runtime-out result) (Path/relative_to (:runtime-out result) out))
                      :app-file (when (:ok? resource) (Path/basename (:path resource)))
                      :app-why (:why resource)
