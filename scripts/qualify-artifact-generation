@@ -10,11 +10,52 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import runpy
 import shutil
 import subprocess
 import tempfile
 import time
+
+
+# A producer may start from an authenticated PREVIOUS compiler generation.
+# The demo receiver intentionally requires a current floor; reusing its boot
+# protocol here silently loses Bootstrap.install!'s previous-generation stage.
+# Only the private producer uses this protocol. B/C receivers stay strict.
+PRODUCER_BOOT = r'''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+keys = {BeamLisp.AOTCache.current_compiler_key(), BeamLisp.AOTCache.current_build_key()}
+installation = BeamLisp.Bootstrap.install!(Path.join(File.cwd!(), ".bl/lib/beam_lisp-0.1.0/ebin"),
+  seed_dir: Path.join(File.cwd!(), "priv/bootstrap/seed"))
+case installation do
+  :ok ->
+    unless keys == {manifest["compiler_key"], manifest["build_key"]},
+      do: raise "current producer installation has foreign keys"
+  {:staged, :compiler_key_mismatch} ->
+    if keys == {manifest["compiler_key"], manifest["build_key"]},
+      do: raise "previous producer installation has current keys"
+  other -> raise "producer installation refused: #{inspect(other)}"
+end
+BeamLisp.AOT.boot()
+unless keys == {BeamLisp.AOTCache.current_compiler_key(), BeamLisp.AOTCache.current_build_key()},
+  do: raise "producer compiler inputs changed during bootstrap"
+for {name, _} <- manifest["modules"], String.ends_with?(name, ".beam") do
+  {:ok, {mod, expected}} = :beam_lib.md5(String.to_charlist(Path.join("priv/bootstrap/seed", name)))
+  if :erlang.module_loaded(mod) do
+    role = Keyword.get(mod.module_info(:attributes), :bl_aot_artifact_role)
+    unless role == [:"mutable-forwarder"] or mod.module_info(:md5) == expected,
+      do: raise "producer startup replaced stable predecessor code: #{mod}"
+  end
+end
+File.write!(System.fetch_env!("BL_GENERATION_BOOTSTRAP_RECEIPT"), Jason.encode!(%{
+  "installation" => if(installation == :ok, do: "current", else: "previous-generation"),
+  "seed_compiler_key" => manifest["compiler_key"], "seed_build_key" => manifest["build_key"],
+  "input_compiler_key" => elem(keys, 0), "input_build_key" => elem(keys, 1),
+  "stable_predecessor_unchanged" => true
+}))
+BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))
+'''
 
 
 def sha(path):
@@ -51,7 +92,6 @@ def main():
                       *[p for p in (root / "priv/bootstrap/seed").iterdir() if p.is_file()]})
     inputs = {str(p.relative_to(root)): sha(p) for p in watched}
     (output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
-    boot = runpy.run_path(str(root / "scripts/demo-artifact-production"))["BOOT"]
     deps = sorted((root / "deps").glob("*/ebin"))
     deps += sorted((root / "_build").glob("*/lib/*/ebin"))
     deps = list(dict.fromkeys(p.resolve() for p in deps))
@@ -92,7 +132,7 @@ def main():
                 (app / "priv").symlink_to(image / "priv", target_is_directory=True)
                 shutil.copytree(source, app / "ebin")
                 shutil.copy2(driver, image / "produce.bl")
-                (image / "produce.exs").write_text(boot)
+                (image / "produce.exs").write_text(PRODUCER_BOOT)
                 command = ["elixir"]
                 for dep in deps:
                     command += ["-pa", str(dep)]
@@ -100,6 +140,7 @@ def main():
                 env = {**os.environ, "BL_ROOT": str(image), "BL_DAEMON": "off",
                        "BL_ARTIFACT_DRIVER": str(image / "produce.bl"),
                        "BL_GENERATION_OUTPUT": str(target), "XDG_CACHE_HOME": str(image / "cache"),
+                       "BL_GENERATION_BOOTSTRAP_RECEIPT": str(output / f"{label}.bootstrap.json"),
                        "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
                 # Refuse drift before starting code, as well as after it exits.
                 # Check the bytes actually copied into both compiler locations;
@@ -123,6 +164,7 @@ def main():
                 print(result.stdout[-16000:], end="", flush=True)
                 if result.returncode:
                     raise RuntimeError(f"generation {label} producer failed: {result.returncode}")
+                stage["bootstrap"] = json.loads((output / f"{label}.bootstrap.json").read_text())
                 unchanged()
                 stage["produced"] = True
                 stage["files"] = {p.name: sha(p) for p in sorted(target.iterdir())}
