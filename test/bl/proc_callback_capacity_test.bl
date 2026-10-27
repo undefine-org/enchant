@@ -1,6 +1,24 @@
 (ns proc-callback-capacity-test
  (:require [proc.callback :as callback] [system.ownership :as ownership]))
 
+(defn- pressure-owner! []
+ ;; spawn returns before the owned-start handoff enters the body. Filling the
+ ;; ledger then can kill that pending holder with code_lease_capacity, freeing
+ ;; its pressure rows before the operation under test. Acknowledge actual entry.
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       owner (spawn (fn [] (erlang/send parent [:capacity-owner-ready ticket (erlang/self)])
+                          (receive :never nil)))]
+  (receive [:capacity-owner-ready seen child] :when (and (= seen ticket) (= child owner)) owner
+   (after 5000 (Process/exit owner :kill) (throw :capacity-owner-start-timeout)))))
+
+(defn- stop-pressure-owner! [owner]
+ (let [monitor (Process/monitor owner)]
+  (try
+   (Process/exit owner :kill)
+   (receive [:DOWN seen :process child _] :when (and (= seen monitor) (= child owner)) :ok
+    (after 5000 (throw :capacity-owner-stop-timeout)))
+   (finally (Process/demonitor monitor (list :flush))))))
+
 (defn- fill-ledger! [owner]
  ;; Fixture insertion must share native admission's capacity fence. Otherwise
  ;; background admissions between measurement and insertion make the fixture
@@ -42,7 +60,7 @@
 
 (deftest actual-capacity-and-recovery-traces-conform-to-the-shared-ownership-relation
  (doseq [cancel-after-busy [false true]]
-  (let [owner (spawn (fn [] (receive :never nil))) calls (atom 0)
+  (let [owner (pressure-owner!) calls (atom 0)
         source (BeamLisp.Execution/register! (fn [] (swap! calls inc) 42))
         prepared (BeamLisp.Execution/prepare-handoff! source owner)
         target (:accepted prepared) rows (atom [])
@@ -97,10 +115,10 @@
     (finally
      (clear-ledger! @rows)
      (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target)
-     (Process/exit owner :kill))))))
+     (stop-pressure-owner! owner))))))
 
 (deftest native-handoff-pressure-leaves-the-source-and-prepublished-target-recoverable
- (let [owner (spawn (fn [] (receive :never nil)))
+ (let [owner (pressure-owner!)
        source (BeamLisp.Execution/register! (fn [] 42))
        prepared (BeamLisp.Execution/prepare-handoff! source owner) rows (atom [])]
   (try
@@ -113,10 +131,10 @@
    (is (= {:status :accepted :registration (:accepted prepared)} (BeamLisp.Execution/accept-handoff! prepared)))
    (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
    (finally (clear-ledger! @rows) (BeamLisp.Execution/close! source)
-    (BeamLisp.Execution/close! (:accepted prepared)) (Process/exit owner :kill)))))
+    (BeamLisp.Execution/close! (:accepted prepared)) (stop-pressure-owner! owner)))))
 
 (deftest retention-pressure-is-busy-only-before-entry-and-never-a-provider-retry
- (let [owner (spawn (fn [] (receive :never nil))) calls (atom 0)
+ (let [owner (pressure-owner!) calls (atom 0)
        registration (callback/register! (fn [] (swap! calls inc) :value))
        provider-error (callback/register! (fn [] (erlang/error :code_lease_capacity)))
        rows (atom [])]
@@ -136,7 +154,7 @@
    (is (= {:status :cancelled} (callback/try-invoke! registration [])))
    (is (= 1 @calls))
    (finally (clear-ledger! @rows) (callback/unregister! registration)
-    (callback/unregister! provider-error) (Process/exit owner :kill)))))
+    (callback/unregister! provider-error) (stop-pressure-owner! owner)))))
 
 (deftest a-provider-returning-cancelled-is-still-a-completed-invocation
  (let [registration (callback/register! (fn [] :cancelled))]
