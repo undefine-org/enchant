@@ -131,6 +131,11 @@ def main():
         runpy.run_path(str(root / 'scripts/test_prerequisites.py'))['require'](root, tests)
     except (OSError, ValueError, RuntimeError) as error:
         parser.error(str(error))
+    # Use the existing candidate runner's isolation policy. Env isolation does
+    # not isolate VM-wide native lease ledgers from earlier file lifetimes.
+    isolation = json.loads((root / 'scripts/test-isolation.json').read_text())
+    consumer_groups = (runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['process_groups'](tests, isolation)
+                       if sdk is not None else [tests])
     output.mkdir(parents=True)
     workspace = None
     receiver_files = {}
@@ -221,14 +226,28 @@ def main():
         if capture() != frozen:
             raise RuntimeError('frozen inputs changed before ' + name)
         start = time.monotonic()
+        deadline = start + (1500 if name == 'consumers' else 1000)
+        batches = ([command[:-len(tests)] + [str(root / path) for path in group]
+                    for group in consumer_groups]
+                   if name == 'consumers' and sdk is not None else [command])
+        executions, status = [], 0
         with (output / (name + '.log')).open('w') as log:
-            done = subprocess.run(command, cwd=cwd or root,
-                                  env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {})},
-                                  stdout=log, stderr=subprocess.STDOUT,
-                                  timeout=1500 if name == 'consumers' else 1000)
-        report['stages'][name] = {'exit': done.returncode, 'seconds': round(time.monotonic()-start, 3)}
+            for index, batch in enumerate(batches):
+                if capture() != frozen:
+                    raise RuntimeError('frozen inputs changed before process ' + str(index))
+                began = time.monotonic()
+                done = subprocess.run(batch, cwd=cwd or root,
+                                      env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {})},
+                                      stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=max(1, deadline - began))
+                status = status or done.returncode
+                executions.append({'exit': done.returncode,
+                                   'seconds': round(time.monotonic() - began, 3),
+                                   'tests': consumer_groups[index] if name == 'consumers' and sdk else None})
+        report['stages'][name] = {'exit': status, 'seconds': round(time.monotonic()-start, 3),
+                                 'processes': executions}
         report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
-        if done.returncode:
+        if status:
             raise RuntimeError(name + ' failed; see retained log')
         if capture() != frozen:
             raise RuntimeError('frozen inputs changed during ' + name)
@@ -242,7 +261,7 @@ def main():
         log = (output / 'consumers.log').read_text()
         summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
         counts = re.findall(r'✓ .*?\s+(\d+) passed', log)
-        if summaries != [(str(len(tests)), '0', '0')] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
+        if summaries != [(str(len(group)), '0', '0') for group in consumer_groups] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
             raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
         report['assertions'] = sum(map(int, counts))
         command = [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),

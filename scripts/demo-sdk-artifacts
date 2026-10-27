@@ -73,6 +73,7 @@ def main():
     watched = sorted({Path(__file__).resolve(), *drivers, trace, root / 'scripts/demo-artifact-production',
                       root / 'scripts/check-execution-history', root / 'scripts/sdk_sealed_profiles.py',
                       root / 'scripts/test_timings.py', root / 'env.bl',
+                      root / 'scripts/test-isolation.json', root / 'scripts/qualify-candidate.py',
                       root / 'test/scripts/sdk-contextual-consumer.bl',
                       *[root / row['path'] for group in selected_plan['groups'] for row in group['tests']],
                       *(p for p in (root / 'priv').rglob('*') if p.is_file()
@@ -193,9 +194,35 @@ def main():
             profiles['validate_initialization'](selected_plan, report.get('sdk_initialization'))
         env['XDG_CACHE_HOME'] = str(image / 'empty-consumer-cache')
         if args.contextual_tests:
-            run('contextual-consumer', contextual_driver)
-            report['contextual_consumer'] = json.loads((output / 'contextual-consumer.json').read_text())
+            files = [row['path'] for group in selected_plan['groups'] for row in group['tests']]
+            isolation = json.loads((root / 'scripts/test-isolation.json').read_text())
+            groups = runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['process_groups'](files, isolation)
+            # Even a pipeline-only selection needs its fresh receiver.
+            parts = []
+            for index, paths in enumerate(groups or [[]]):
+                part = dict(selected_plan, pipeline=selected_plan['pipeline'] and index == 0)
+                part['groups'] = [dict(group, tests=[row for row in group['tests'] if row['path'] in paths])
+                                  for group in selected_plan['groups']]
+                part['groups'] = [group for group in part['groups'] if group['tests']]
+                part['assertions'] = sum(row['assertions'] for group in part['groups'] for row in group['tests'])
+                plan_path = output / f'sealed-plan-part-{index}.json'
+                plan_path.write_text(json.dumps(part, indent=2) + '\n')
+                env['BL_SDK_SEALED_PLAN'] = str(plan_path)
+                run('contextual-consumer' if index == 0 else f'contextual-consumer-isolated-{index}', contextual_driver)
+                receipt_path = output / 'contextual-consumer.json'
+                receipt = json.loads(receipt_path.read_text())
+                profiles['validate'](part, receipt)
+                receipt_path.rename(output / f'contextual-consumer-part-{index}.json')
+                parts.append(receipt)
+            env['BL_SDK_SEALED_PLAN'] = str(output / 'sealed-plan.json')
+            by_path = {row['path']: row for part in parts for row in part['files']}
+            receipt = dict(parts[0], pipeline=selected_plan['pipeline'],
+                           files=[by_path[path] for path in files],
+                           assertions=sum(part['assertions'] for part in parts))
+            report['contextual_consumer'] = receipt
+            report['contextual_consumer_processes'] = parts
             profiles['validate'](selected_plan, report['contextual_consumer'])
+            (output / 'contextual-consumer.json').write_text(json.dumps(receipt, indent=2) + '\n')
         run('consumer', drivers[1])
         report['consumer'] = json.loads((output / 'consumer.json').read_text())
         victim = app / 'ebin/Elixir.BeamLisp.Ns.Sdk.Artifact.Consumer.beam'
