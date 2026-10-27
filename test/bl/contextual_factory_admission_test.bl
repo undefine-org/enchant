@@ -1,0 +1,123 @@
+(ns contextual-factory-admission-test
+ (:require [compile.world :as world] [anf :as a] [lower :as lower]))
+
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- loaded? [module] (erlang/module_loaded module))
+(defn- fixture [action]
+ (let [dir (Path/join (System/tmp_dir!) (str "contextual-factory-admission-" (erlang/unique_integer (list :positive))))
+       module :Elixir.ContextualFactoryAdmission]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") "(ns admission) (defn answer [] 42) 42")
+   (File/write! (Path/join dir "world.bl")
+     "{:version 1 :profile 'syntax-v1 :entry ['admission 'current] :sources [{:namespace 'admission :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (world/prepare-unit prepared module)
+         descriptors (:descriptors (first (:plans unit)))]
+    (action {:prepared prepared :unit unit :descriptors descriptors :directory dir :module module}))
+   (finally (File/rm_rf! dir)))))
+
+(defn- attribute [descriptor key]
+ (second (first (filter #(= key (first %)) (:attrs descriptor)))))
+(defn- with-attribute [descriptor key value]
+ (update descriptor :attrs
+  #(Enum/map % (fn [pair] (if (= key (first pair)) [key value] pair)))))
+(defn- identity [descriptor]
+ (erlang/binary_to_term (attribute descriptor :bl_contextual_unit) (list :safe)))
+(defn- with-identity [descriptor change]
+ (with-attribute descriptor :bl_contextual_unit
+   (erlang/term_to_binary (change (identity descriptor)) (list :deterministic))))
+(defn- captured [fixture descriptors]
+ {:manifest {:compiler-key (get-in fixture [:unit :compiler-key])}
+  :beams (Enum/map descriptors (fn [descriptor] (lower/descriptor->beam descriptor {})))})
+(defn- members [fixture descriptors]
+ (BeamLisp.AOT/contextual_unit_members! (captured fixture descriptors)))
+
+(deftest actual-world-v3-unit-has-one-factory-abi-and-an-identical-public-inventory-in-both-roles
+ (fixture
+  (fn [f]
+   (let [descriptors (:descriptors f) capture (captured f descriptors)
+         decoded (BeamLisp.AOT/contextual_unit_members! capture)
+         bindings (erlang/binary_to_term (attribute (first descriptors) :bl_contextual_bindings) (list :safe))
+         exports (get-in f [:prepared :program :unit :exports])]
+    (when-let [output (System/get_env "BL_COMPILER_COMPONENT_OUT")]
+     (File/write! (Path/join output "preboot-captured.term") (erlang/term_to_binary capture)))
+    (is (= 2 (:version bindings)))
+    (is (= exports (:exports bindings)))
+    (is (= 3 (get-in decoded [:metadata :version])))
+    (is (= 1 (get-in decoded [:metadata :factory-abi])))
+    (is (= exports (get-in decoded [:metadata :exports])))
+    (is (= 1 (count exports)))
+    (is (= false (:native-admission decoded)))
+    (is (not (loaded? (:module f))))
+    (is (not (loaded? (elem (get-in decoded [:phase :beam]) 0))))
+    (is (= :runtime (get-in decoded [:runtime :metadata :role])))
+    (is (= :phase (get-in decoded [:phase :metadata :role])))))))
+
+(deftest v2-and-run-only-units-and-extra-runtime-or-phase-entrypoints-refuse-before-loading
+ (fixture
+  (fn [f]
+   (let [descriptors (:descriptors f) runtime (first descriptors) phase (second descriptors)
+         old (Enum/map descriptors #(-> % (with-identity (fn [m] (assoc m :version 2)))
+                         (with-attribute :bl_contextual_unit_version 2)))
+         no-factory (-> runtime
+                       (update :clauses #(Enum/reject % (fn [cl] (= :__bl_unit__ (:fname cl)))))
+                       (assoc :exports (list [:run 0])))
+         extra (fn [descriptor]
+                 (-> descriptor
+                  (update :clauses #(Enum/concat % (list {:op :defn-clause :fname :__bl_init__ :params (list) :guard nil
+                                                    :body (a/remote :erlang :put (list (a/lit :factory-admission-effect) (a/lit true))) :ann {}})))
+                  (update :exports #(Enum/concat % (list [:__bl_init__ 0])))))]
+    (when-let [output (System/get_env "BL_COMPILER_COMPONENT_OUT")]
+     (File/write! (Path/join output "preboot-old.term") (erlang/term_to_binary (captured f old))))
+    (is (= :world-artifact-membership (kind #(members f old))))
+    (is (= :world-artifact-membership (kind #(members f (list no-factory phase)))))
+    (is (= :world-artifact-membership (kind #(members f (list (extra runtime) phase)))))
+    (is (= :world-artifact-membership (kind #(members f (list runtime (extra phase))))))
+    (is (= :undefined (erlang/get :factory-admission-effect)))
+    (is (not (loaded? (:module f))))))))
+
+(deftest malformed-and-disagreeing-export-inventories-refuse-as-passive-data
+ (fixture
+  (fn [f]
+   (let [descriptors (:descriptors f) runtime (first descriptors) phase (second descriptors)
+         reference (first (:exports (identity runtime)))
+         bad [(fn [m] (assoc m :version 3.0)) (fn [m] (assoc m :factory-abi 1.0))
+              (fn [m] (assoc m :unexpected true)) (fn [m] (assoc m :snapshot "short"))
+              (fn [m] (assoc m :exports (list reference reference)))
+              (fn [m] (assoc m :exports (list (assoc reference :phase 1))))
+              (fn [m] (assoc m :exports (list (assoc reference :space 'type))))
+              (fn [m] (assoc m :exports (list (assoc reference :extra true))))]]
+    (doseq [change bad]
+     (is (= :world-artifact-membership
+            (kind #(members f (Enum/map descriptors (fn [descriptor] (with-identity descriptor change))))))))
+    (is (= :world-artifact-membership
+           (kind #(members f (list runtime (with-identity phase (fn [m] (assoc m :exports (list)))))))))
+    (is (= :world-artifact-membership
+           (kind #(members f (list (with-attribute runtime :bl_contextual_unit_version 3.0) phase))))))
+    (is (not (loaded? (:module f)))))))
+
+(deftest bounded-file-capture-and-runtime-only-members-preserve-the-same-abi-without-reader-effects
+ (fixture
+  (fn [f]
+   (let [directory (Path/join (:directory f) "unit")]
+    (BeamLisp.AOT/emit_unit (:unit f) directory)
+    (let [read (world/read-unit directory) runtime (first (:runtime-beams read))
+          runtime-only (BeamLisp.AOT/contextual_unit_members!
+                        {:manifest (:manifest read) :beams (list runtime)})]
+     (is (= 1 (:factory-abi read)))
+     (is (= (:exports read) (get-in runtime-only [:metadata :exports])))
+     (is (= nil (:phase runtime-only)))
+     (is (= false (:native-admission read) (:native-admission runtime-only)))
+     (is (not (loaded? (:module f)))))))))
+
+(deftest binding-reference-shape-is-owned-by-the-native-data-leaf-without-callbacks
+ (fixture
+  (fn [f]
+   (let [reference (first (get-in f [:prepared :program :unit :exports])) marker (atom false)
+         changed (fn [] (reset! marker true))]
+    (is (BeamLisp.CompilerData/binding_reference? reference))
+    (is (not (BeamLisp.CompilerData/binding_reference? changed)))
+    (is (not (BeamLisp.CompilerData/binding_reference? (assoc reference :version 1.0))))
+    (is (not (BeamLisp.CompilerData/binding_reference? (assoc reference :id "short"))))
+    (is (= false @marker))))))

@@ -5,6 +5,7 @@ GROUPS = {
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 88)], ['expand']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24)], ['expand-source', 'expand']),
+    "factory-admission": ([('test/bl/contextual_factory_admission_test.bl', 38), ('test/bl/closed_etf_test.bl', 150), ('test/bl/data_first_order_test.bl', 105)], ['compile.world']),
     "namespace-exports": ([('test/bl/contextual_namespace_exports_test.bl', 41)], ['compile.world', 'system.phase', 'codebase.phase']),
     "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 106)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
     "physical-declaration": ([('test/bl/compiler_physical_declaration_test.bl', 24)], []),
@@ -31,11 +32,11 @@ GROUPS = {
     "filesystem-regressions": ([('test/bl/build_custody_regressions_test.bl', 30)], ['deps-compile', 'selfbuild']),
 }
 BOUNDARIES = {
-    'unit-metadata': ['clauses'], 'source-and-class-proof': ['handoffs', 'capacity'],
-    'preboot-identity': ['clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': [],
-    'constructor-and-scope': ['namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['namespace-exports', 'imports'],
+    'unit-metadata': ['factory-admission', 'clauses'], 'source-and-class-proof': ['handoffs', 'capacity'],
+    'preboot-identity': ['factory-admission', 'clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': ['factory-admission', ],
+    'constructor-and-scope': ['factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['factory-admission', 'namespace-exports', 'imports'],
     'native-custody': ['native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'message-context'],
-    'record-representation': ['returns'], 'contextual-pipeline-identity': ['namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
+    'record-representation': ['factory-admission', 'returns'], 'contextual-pipeline-identity': ['factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
     'contextual-analysis-reports': ['namespace-exports', 'binding-reference', 'ownership', 'ownership-calls', 'native-outcomes', 'loops', 'af'],
     'vector-lookup-default': ['vectors'], 'finite-cleanup-progress': ['loops', 'af'],
     'constructor-evaluation-order': ['returns'], 'execution-clause-identity': ['clauses'],
