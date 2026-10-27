@@ -1,0 +1,56 @@
+(ns namespace-header-test)
+
+(deftest namespace-header-captures-data-without-provider-initialization-or-caller-mutation
+ (let [before (BeamLisp.Env/capture)
+       form (first (BeamLisp.Reader/read_string
+                     "(ns capture \"header docs\" (:require [never.load.provider :as p :refer [answer]]))"))
+       header (BeamLisp.AOT/namespace_header form)]
+  (is (= ["capture"] (vec (keys header))))
+  (is (= (list (tuple "p" "never.load.provider")) (get-in header ["capture" :aliases])))
+  (is (= (list (tuple "answer" "never.load.provider")) (get-in header ["capture" :refers])))
+  (is (= before (BeamLisp.Env/capture)))
+  (is (not (BeamLisp.Env/loaded_ns? "never.load.provider")))))
+
+(deftest namespace-header-refuses-executable-payloads-before-collection-dispatch
+ (let [key :namespace-header-unexpected-effect
+       callback (fn [] (Process/put key :called))
+       deferred (lazy-seq (do (Process/put key :called) (list (tuple :symbol "answer"))))
+       forged (tuple :list
+                (list (tuple :symbol "ns") (tuple :symbol "capture")
+                  (tuple :list (list (tuple :keyword "require")
+                    (tuple :vector (list (tuple :symbol "provider") (tuple :keyword "refer")
+                                          (tuple :vector deferred)))))))]
+  (try
+   (doseq [form [(tuple :list callback) forged]]
+    (is (= :invalid-namespace-header-data
+           (try (BeamLisp.AOT/namespace_header form) nil
+            (catch error (:kind (ex-data error))))))
+    (is (= nil (Process/get key))))
+   (finally (Process/delete key)))))
+
+(deftest an-inert-non-namespace-reader-form-has-no-header
+ (is (= {} (BeamLisp.AOT/namespace_header 42))))
+
+(deftest namespace-header-input-bounds-precede-parsing
+ (doseq [form [(String/duplicate "x" 1048577)
+               (reduce (fn [inner _] (tuple :meta inner {})) 42 (range 128))]]
+  (is (= :invalid-namespace-header-data
+         (try (BeamLisp.AOT/namespace_header form) nil
+          (catch error (:kind (ex-data error))))))))
+
+(deftest namespace-header-runs-in-a-fresh-vm-before-language-or-env-initialization
+ (let [module :Elixir.BeamLisp.AOT
+       target-dir (Path/dirname (List/to_string (code/which module)))
+       sdk-dir (Path/dirname (List/to_string (code/which :Elixir.BeamLisp.CompilerData)))
+       script (str "target = :erlang.binary_to_atom(\"" (Atom/to_string module) "\", :utf8)\n"
+                   "unless :ets.whereis(:beam_lisp_vars) == :undefined, do: raise(\"Env already started\")\n"
+                   "form = {:list, [{:symbol, \"ns\"}, {:symbol, \"preboot\"}, {:list, [{:keyword, \"require\"}, {:vector, [{:symbol, \"provider\"}, {:keyword, \"as\"}, {:symbol, \"p\"}]}]}]}\n"
+                   "header = apply(target, :namespace_header, [form])\n"
+                   "unless header[\"preboot\"][:aliases] == [{\"p\", \"provider\"}], do: raise(\"wrong header\")\n"
+                   "unless :ets.whereis(:beam_lisp_vars) == :undefined, do: raise(\"header started Env\")\n"
+                   "IO.puts(\"HEADER-PREBOOT-OK\")\n")
+       result (System/cmd (System/find_executable "elixir")
+                (list "-pa" sdk-dir "-pa" target-dir "-e" script)
+                (list (tuple :stderr_to_stdout true)))]
+  (is (= 0 (elem result 1)) (elem result 0))
+  (is (String/contains? (elem result 0) "HEADER-PREBOOT-OK"))))
