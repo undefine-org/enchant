@@ -4344,12 +4344,9 @@
               true)))
       false)))
 
-(defn- compile-defn*
-  "The general defn compiler, with an explicit `private?` flag (for defn-).
-
-   Records a linked function variable via Link.defvar. When the definition has
-   a docstring or is private, the result is wrapped so the metadata is written
-   after interning: `value = defvar(...); Env.put_meta(ns, name, %{...}); value`."
+(defn- prepare-defn*
+  "Prepare the compiler-owned declaration data before publication. Nested
+   closure definitions retain their expression semantics, not a linked unit."
   [args private? env]
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
@@ -4395,10 +4392,10 @@
         ; the fast linked path unchanged.
         nested? (not (empty? (:locals env)))]
     (if nested?
-      (compile-def (cons (first args)
+      {:kind :expression :node (compile-def (cons (first args)
                          (concat (if has-doc (list (first rest-args)) (list))
                                  (list (rn/list-node (cons (rn/sym-node "fn") after-attr)))))
-                   env)
+                   env)}
   (let [mod (BeamLisp.Link/module_for (:ns env))
         clauses (parse-fn-clauses after-attr env)
         ; PRE-LINK before compiling the clauses. A non-tail self-reference in
@@ -4420,20 +4417,46 @@
                        clauses))
         location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
                        (erlang/list_to_tuple (list :line (or (:line env) 1))))
-        ; the entries are DATA (def-clause tuples with quoted bodies) embedded
-        ; as one literal; Link.defvar interns them at run time
-        defvar-node (a/remote (kernel-mod-link-literal) :defvar
-                              (list (a/lit (:ns env)) (a/lit name)
-                                    (a/lit entries) (a/lit location)))
         meta (var-meta-map doc private? author)]
-    (if (nil? meta)
-      defvar-node
-      ; value = defvar(...); Env.put_meta(ns, name, meta); value
+    {:version 1 :kind :function-declaration :namespace (:ns env) :name name
+     :entries entries :location location :metadata meta}))))
+
+(defn- compile-defn*
+  "Interactive publication adapts the same declaration consumed by AOT.
+   Clause compilation and metadata interpretation have one owner."
+  [args private? env]
+  (let [declaration (prepare-defn* args private? env)]
+   (if (= :expression (:kind declaration)) (:node declaration)
+    (let [defvar-node (a/remote (kernel-mod-link-literal) :defvar
+                        (list (a/lit (:namespace declaration)) (a/lit (:name declaration))
+                              (a/lit (:entries declaration)) (a/lit (:location declaration))))
+          meta (:metadata declaration)]
+     (if (nil? meta) defvar-node
       (a/lett "value" defvar-node
-              (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
-                                     (list (a/lit (:ns env)) (a/lit name)
-                                           (a/lit meta)))
-                           (a/var "value")))))))))
+       (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
+                      (list (a/lit (:namespace declaration)) (a/lit (:name declaration)) (a/lit meta)))
+                    (a/var "value")))))))))
+
+(defn prepare-function-declaration
+  "Prepare one top-level defn/defn- as canonical clause/metadata data.
+   No publication scaffold is generated or evaluated. The existing selected
+   compiler environment owns name resolution and deterministic prelinking."
+  [form env]
+  (loop [form form env env]
+   (if (= :meta (rn/node-tag form))
+    (let [metadata (rn/node-pos form)
+          author (if (erlang/is_map metadata) (maps/remove :tag (author-meta metadata)) {})]
+     ;; Value-result metadata belongs to expression compilation. Staging may
+     ;; consume declaration metadata on the name, but cannot discard effects
+     ;; or metadata attached to the publication result.
+     (when (seq author)
+      (compile-error (pos-env env metadata) "Function declaration result metadata requires expression compilation"))
+     (recur (rn/node-form form) (pos-env env metadata)))
+    (let [items (when (= :list (rn/node-tag form)) (rn/node-items form))
+          head (when (seq items) (rn/node-name (rn/node-form (first items))))]
+     (when-not (and (contains? #{"defn" "defn-"} head) (empty? (:locals env)))
+      (compile-error env "Function declaration requires a top-level defn or defn-"))
+     (prepare-defn* (rest items) (= "defn-" head) env)))))
 
 (defn- checked-declaration-kind [head args]
   ;; The actual special-form compiler has accepted these arguments already.
@@ -4973,6 +4996,9 @@
   (reset-fresh!))
 
 (defn with_fresh_names [action] (with-fresh-names action))
+
+(defn prepare_function_declaration [form env]
+  (prepare-function-declaration form env))
 
 (defn macroexpand_1
   "Host name for `macroexpand-1`: expand `form` once in namespace `ns`."

@@ -1,0 +1,98 @@
+; Compiler-owned declaration data feeds both publication and actual AOT staging.
+; All calls use the native Compiler front door so component checks exercise edits.
+(ns compiler.function-declaration-test
+ (:require [binding :as binding] [expand :as expand]))
+
+(defn- reader [source] (first (BeamLisp.Reader/read_string source "function-declaration.bl")))
+(defn- namespace [] (str "function.declaration." (erlang/unique_integer (list :positive))))
+(defn- environment [namespace]
+ (assoc (BeamLisp.Compiler/new_env namespace) :file "function-declaration.bl"))
+(defn- prepared [source env]
+ (BeamLisp.Compiler/with_fresh_names
+  #(BeamLisp.Compiler/prepare_function_declaration (reader source) env)))
+(defn- refused? [action] (try (action) false (catch _ true)))
+
+(deftest declaration-preparation-keeps-bodies-and-metadata-unpublished
+ (let [ns (namespace) env (environment ns)
+       declaration (prepared "(defn- work \"doc\" {:audit :selected} ([x] (erlang/error :must-not-run)) ([x y] x))" env)]
+  (is (= #{:version :kind :namespace :name :entries :location :metadata} (set (keys declaration))))
+  (is (= 1 (:version declaration)))
+  (is (= :function-declaration (:kind declaration)))
+  (is (= ns (:namespace declaration)))
+  (is (= "work" (:name declaration)))
+  (is (= [[:fixed 1] [:fixed 2]] (mapv #(vec (take 2 (Tuple/to_list %))) (:entries declaration))))
+  (is (= {:doc "doc" :private true :audit :selected} (:metadata declaration)))
+  (is (= (list (tuple :file "function-declaration.bl") (tuple :line 1)) (:location declaration)))
+  (is (empty? (BeamLisp.Env/ns_definition ns "work")))
+  (is (= :error (BeamLisp.Env/meta ns "work")))
+  ;; Deterministic prelinking is compile-time name planning, not publication.
+  (is (not (erlang/module_loaded (BeamLisp.Link/module_for ns))))))
+
+(deftest publication-preserves-clauses-guards-metadata-and-nested-closures
+ (let [ns (namespace) env (environment ns)
+       form (reader "(defn f \"doc\" {:audit :selected} ([x] :when (int? x) (+ x 1)) ([x y] (+ x y)))")
+       declaration (BeamLisp.Compiler/prepare_function_declaration form env)]
+  (is (empty? (BeamLisp.Env/ns_definition ns "f")))
+  (BeamLisp.Compiler/eval_form form env)
+  (let [f (BeamLisp.Env/fetch_exact! ns "f")]
+   (is (= 42 (BeamLisp.Ns.Rt/invoke f (list 41))))
+   (is (= 42 (BeamLisp.Ns.Rt/invoke f (list 20 22))))
+   (is (refused? #(BeamLisp.Ns.Rt/invoke f (list :invalid)))))
+  (is (= (tuple :ok (:metadata declaration)) (BeamLisp.Env/meta ns "f")))
+  (is (= 42 (BeamLisp.Compiler/eval_string
+                 "(let [captured 40] (defn closed [x] (+ captured x))) (closed 2)" env "function-declaration.bl")))))
+
+(deftest declaration-boundary-refuses-expressions-and-captured-definition-environments
+ (let [env (environment (namespace))]
+  (doseq [source ["42" "(def value 42)" "(fn [x] x)" "(defmacro m [] 42)" "(defn f)" "(defn ^:per-env f [x] x)"]]
+   (is (refused? #(prepared source env))))
+  (is (refused? #(prepared "(defn f [x] captured)" (assoc env :locals {"captured" "captured"}))))))
+
+(defn- actual-stage-function []
+ ;; Compile these exact private Source helpers as an ordinary private probe.
+ ;; No SDK origin, producer receipt or execution admission is fabricated.
+ (let [ns "compiler.declaration-stage-probe"
+       source (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) "priv/host/aot.bl"))
+       wanted #{"stage-refuse" "stage-tag?" "stage-unmeta" "stage-symbol" "stage-items" "stage-function!"}
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+               #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                     (contains? wanted (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))]
+  (assert (= 6 (count forms)))
+  (doseq [form forms] (BeamLisp.Compiler/eval_form form (environment ns)))
+  (BeamLisp.Env/fetch_exact! ns "stage-function!")))
+
+(deftest actual-aot-stager-consumes-the-same-prepared-entries-without-publication
+ (let [ns (namespace) env (environment ns)
+       form (reader "(defn- f \"staged\" ([x] :when (int? x) (+ x 1)) ([x & xs] x))")
+       declaration (BeamLisp.Compiler/with_fresh_names #(BeamLisp.Compiler/prepare_function_declaration form env))
+       stage (actual-stage-function)]
+  (BeamLisp.Compiler/with_fresh_names #(stage form ns "function-declaration.bl"))
+  (is (= (BeamLisp.Emit/attach_body_module (:entries declaration) (BeamLisp.Link/module_for ns))
+         (BeamLisp.Env/ns_definition ns "f")))
+  (is (= (tuple :ok (:metadata declaration)) (BeamLisp.Env/meta ns "f")))
+  (is (not (erlang/module_loaded (BeamLisp.Link/module_for ns))))))
+
+(deftest actual-contextual-reference-identity-survives-function-declaration-preparation
+ (let [source "(fn [x] x)" ns 'contextual-function-declaration
+       selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace ns :digest (crypto/hash :sha256 source)}]}
+       world (binding/world selection [] [])
+       expanded (expand/expression source "function-declaration.bl"
+                  {:selection (binding/select [world] []) :world (:key world) :namespace ns})
+       items (BeamLisp.AOT/stage-items (:reader expanded) :list)
+       form (tuple :list (cons (tuple :symbol "defn")
+                               (cons (tuple :symbol "identity") (rest items))))
+       declaration (BeamLisp.Compiler/prepare_function_declaration form
+                     (assoc (environment (str ns)) :contextual-bindings (:references expanded)))
+       reference (get-in (elem (first (:entries declaration)) 3) [:body :ann :binding-reference])]
+  (is (= 1 (count (:references expanded))))
+  (is (not (nil? reference)))
+  (is (= #{reference} (set (map :reference (vals (:references expanded))))))
+  (is (empty? (BeamLisp.Env/ns_definition (str ns) "identity")))))
+
+(deftest declaration-preparation-preserves-root-source-location-and-refuses-result-metadata
+ (let [env (environment (namespace))
+       declaration (prepared "\n\n\n(defn positioned [x] x)" env)]
+  (is (= (list (tuple :file "function-declaration.bl") (tuple :line 4)) (:location declaration)))
+  (is (refused? #(prepared "^{:audit :result} (defn result [x] x)" env)))
+  (is (empty? (BeamLisp.Env/ns_definition (:ns env) "result")))))
