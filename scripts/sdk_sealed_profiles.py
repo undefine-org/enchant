@@ -5,7 +5,7 @@ GROUPS = {
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 88)], ['expand']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24)], ['expand-source', 'expand']),
-    "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 43)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
+    "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 59)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
     "physical-declaration": ([('test/bl/compiler_physical_declaration_test.bl', 24)], []),
     "boot-isolation": ([('test/bl/contextual_boot_isolation_test.bl', 1)], []),
     "ownership": ([('test/bl/system/ownership_test.bl', 136)], ['compile.world']),
