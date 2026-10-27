@@ -1,0 +1,61 @@
+(ns canonical-call-consumers-test
+ (:require [anf :as a] [system.ir :as ir] [system.smt :as smt]
+           [termination :as termination] [js.actor :as actor]
+           [reload.reconcile-recipe :as recipe]))
+
+(defn- packed [args]
+ (reduce (fn [tail arg] (a/cons-cell arg tail)) (a/empty-list-node) (reverse args)))
+
+(deftest smt-reads-canonical-calls-and-refuses-unknown-argument-tails
+ (let [ctx {:env {} :variants {} :colls #{} :bodies {} :funs {"f" true}}
+       call (a/invoke (a/global "fixture" "f") (packed [(a/lit 42)]))]
+  (is (= '(f 42) (smt/translate-node ctx call)))
+  (is (= :untranslatable (smt/translate-node ctx (assoc call :arguments (a/var "args")))))
+  (is (= :untranslatable
+         (smt/translate-node ctx (assoc call :callee (a/global-exact "foreign" "f")))))
+  (is (= :untranslatable
+         (smt/translate-node ctx (a/remote :Elixir.BeamLisp.Ns.Rt :invoke
+                                  (list (:callee call) (:arguments call))))))))
+
+(deftest smt-keyword-payloads-share-the-canonical-call-and-literal-views
+ (let [ctx {:env {} :variants {"some" {:ctor "Some" :field "some-value"}} :colls #{} :bodies {}}
+       payload (a/invoke (a/lit :some) (packed [(a/global "fixture" "x")]))]
+  (is (= '(some-value x) (smt/translate-node ctx payload)))
+  (is (= '((_ is Some) x)
+         (smt/translate-node ctx (a/remote :Elixir.BeamLisp.Ns.Rt :some? (list payload)))))
+  (is (= '(Some 42) (smt/translate-node ctx (a/mapp [[(a/lit :some) (a/lit 42)]]))))))
+
+(deftest js-native-import-arity-precedes-pruning-for-canonical-calls
+ (let [previous (erlang/get :js-actors-native-links)
+       callee (a/global-exact "native.view" "use")
+       call (a/invoke callee (packed [(a/lit 42)]))]
+  (try
+   (erlang/put :js-actors-native-links {"native.view/use" {:abi :js :arities #{1}}})
+   (is (= true (actor/native-import-call? call)))
+   (is (thrown? (actor/native-import-call? (assoc call :arguments (a/empty-list-node)))))
+   (is (thrown? (actor/native-import-call? (assoc call :arguments (a/var "args")))))
+   (erlang/put :js-actors-native-links {"native.view/use" {:abi :bl :arities #{1}}})
+   (is (= false (actor/native-import-call? call)))
+   (finally
+    (if (= :undefined previous) (erlang/erase :js-actors-native-links)
+     (erlang/put :js-actors-native-links previous))))))
+
+(deftest reconciliation-preserves-canonical-call-operands-in-its-residual
+ (let [call (assoc (a/invoke (a/global-exact "sdk.view" "scalar") (packed [(a/lit 7)])) :ann {:line 9})
+       result (recipe/residualize! call {:sdk-globals {["sdk.view" "scalar" 1] :scalar} :result-kind :data})
+       residual (:body result)]
+  (is (= :invoke (:op residual)))
+  (is (= #{:op :callee :arguments :ann} (set (keys residual))))
+  (is (= (:callee call) (:callee residual)))
+  (is (= (:arguments call) (:arguments residual)))
+  (is (= {:line 9} (:ann residual)))))
+
+(deftest termination-negation-uses-the-canonical-invocation-view
+ (let [source "(loop [i 10] (if (not (> i 0)) i (recur (dec i))))"
+       node (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source) (BeamLisp.Compiler/new_env "canonical.call.fixture"))
+       rewritten (ir/rewrite
+                   (fn [n]
+                    (if (and (= :remote (:op n)) (= :Elixir.BeamLisp.Ns.Rt (:mod n)) (= :not_ (:fun n)))
+                     (a/invoke (a/global "core" "not") (packed (:args n))) n)) node)]
+  (is (= :accepted (:status (termination/check-loop node))))
+  (is (= :accepted (:status (termination/check-loop rewritten))))))
