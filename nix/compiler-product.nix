@@ -1,5 +1,5 @@
-# The existing artifact-only producer emits B, B emits C, and the existing
-# independent fresh-boot checks qualify both. No manifest is rewritten by Nix.
+# One artifact-only producer emits preparation P, then P emits B and B emits C.
+# Fresh boots qualify all three; only exact B/C reproduction can be installed.
 { pkgs, erlang, elixir, src, dependencies, checkoutPlatform, nativeProducts }:
 (import ./bounded-build.nix {
   inherit pkgs;
@@ -30,7 +30,7 @@
     export BL_ARTIFACT_PLATFORM=${checkoutPlatform}/artifact-platform
     python3 scripts/qualify-artifact-generation --root "$PWD" --out "$TMPDIR/reproduction"
     ${pkgs.jq}/bin/jq -e \
-      '.self_reproduction_qualified == true and .changed_files == [] and (.stages | length) == 2 and all(.stages[]; .produced and .fresh_boot_qualified)' \
+      '.self_reproduction_qualified == true and .changed_files == [] and .preparation.generation == "P" and .preparation.produced == true and .preparation.fresh_boot_qualified == true and [.stages[].generation] == ["B", "C"] and (.stages | length) == 2 and all(.stages[]; .produced and .fresh_boot_qualified)' \
       "$TMPDIR/reproduction/result.json"
   '';
   installPhase = ''
