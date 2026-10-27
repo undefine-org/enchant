@@ -2,7 +2,7 @@
 """Run the consumer matrix and genuine small sealed image on one frozen input set.
 
 Run under systemd-run --user --collect --wait --pipe --property=MemoryMax=4G
---property=MemorySwapMax=0 --property=RuntimeMaxSec=1500. No installed files change.
+--property=MemorySwapMax=0 --property=RuntimeMaxSec=2700. No installed files change.
 """
 import argparse
 import hashlib
@@ -155,6 +155,16 @@ def main():
             '{:paths [' + json.dumps(str(root)) + ' ' + json.dumps(str(root / 'examples'))
             + '] :env {"BEAM_LISP_DEV" "1"}}\n')
         (workspace / 'test').symlink_to(root / 'test', target_is_directory=True)
+        # Keep the selected application's release layout even in a private
+        # byte-identical receiver. Cold children inherit this code path and
+        # must resolve priv_dir independently of their cwd.
+        applications = [path for path in (sdk / 'lib').iterdir()
+                        if path.name.startswith('beam_lisp-') and path.is_dir()]
+        if len(applications) != 1:
+            raise RuntimeError('SDK must contain one language application')
+        application_link = output / 'consumer-lib' / applications[0].name
+        application_link.parent.mkdir()
+        application_link.symlink_to(workspace, target_is_directory=True)
         boot = output / 'consumer-sdk.exs'
         boot.write_text('BeamLisp.Launcher.start_app!(System.argv(), %{})\n')
         descriptor = json.loads((sdk / 'artifact.json').read_text())
@@ -162,11 +172,16 @@ def main():
         for dependency in sorted((sdk / 'lib').glob('*/ebin')):
             if not dependency.parent.name.startswith('beam_lisp-'):
                 consumer_command += ['-pa', str(dependency)]
-        consumer_command += ['-pa', str(workspace / 'ebin'), str(boot), '--cold', 'test',
+        consumer_command += ['-pa', str(application_link / 'ebin'), '-pa', str(workspace / 'ebin'), str(boot), '--cold', 'test',
                              *[str(root / path) for path in tests]]
         consumer_env = {'BL_ROOT': str(workspace), 'BL_EBIN': str(workspace / 'ebin'),
                         'BL_DAEMON': 'off', 'BL_BUILD_ID': 'actual-sdk-consumer-receiver',
                         'BL_SDK_PRODUCT': str(sdk), 'BL_TEST_SOURCE_ROOT': str(root),
+                        # Mirror ordinary checkout startup using only fields of
+                        # the authenticated immutable SDK/platform selection.
+                        'BL_ARTIFACT_PLATFORM': str(Path(descriptor['platform']) / 'artifact-platform'),
+                        'BL_PREPARATION_COORDINATOR': descriptor['coordinator'],
+                        'BL_PREPARED_NATIVES': str(Path(descriptor['platform']) / 'native-products'),
                         'XDG_CACHE_HOME': str(output / 'consumer-cache'),
                         'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -187,6 +202,8 @@ def main():
                   for p in sorted(set(paths))}
         floor = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
         return {'inputs': inputs, 'floor': floor, 'tools': capture_tools(root),
+                'SDK_application_link': {'target': os.readlink(application_link),
+                                         'resolved': str(application_link.resolve(strict=True))} if sdk else None,
                 'SDK_receiver_bytes': {path: sha(workspace / path) for path in receiver_files}}
 
     frozen = capture()
@@ -207,7 +224,8 @@ def main():
         with (output / (name + '.log')).open('w') as log:
             done = subprocess.run(command, cwd=cwd or root,
                                   env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {})},
-                                  stdout=log, stderr=subprocess.STDOUT, timeout=1000)
+                                  stdout=log, stderr=subprocess.STDOUT,
+                                  timeout=1500 if name == 'consumers' else 1000)
         report['stages'][name] = {'exit': done.returncode, 'seconds': round(time.monotonic()-start, 3)}
         report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
         if done.returncode:

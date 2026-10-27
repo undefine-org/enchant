@@ -15,7 +15,15 @@ import subprocess
 import time
 
 
-BOOT = '''Application.load(:beam_lisp)
+BOOT = '''root = System.fetch_env!("BL_ROOT")
+library = Path.join(Path.dirname(root), "sdk-runtime-lib/beam_lisp-0.1.0")
+File.mkdir_p!(Path.dirname(library))
+case File.ln_s(root, library) do
+  :ok -> :ok
+  {:error, :eexist} -> {:ok, ^root} = File.read_link(library)
+end
+true = Code.prepend_path(Path.join(library, "ebin"))
+Application.load(:beam_lisp)
 for app <- Application.spec(:beam_lisp, :applications) || [], do: {:ok, _} = Application.ensure_all_started(app)
 :ok = BeamLisp.LazyMemo.ensure_loaded!()
 BeamLisp.AOT.boot()

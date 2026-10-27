@@ -9,7 +9,7 @@ GROUPS = {
     "handoffs": ([('test/bl/native_execution_handoff_test.bl', 46)], []),
     "loops": ([('test/bl/system/ownership_loops_test.bl', 77)], ['compile.world']),
     "af": ([('test/bl/system/af_worklist_test.bl', 75)], ['system.gfp']),
-    "capacity": ([('test/bl/proc_callback_capacity_test.bl', 99)], ['proc.callback', 'system.ownership']),
+    "capacity": ([('test/bl/proc_callback_capacity_test.bl', 101)], ['proc.callback', 'system.ownership']),
     "returns": ([('test/bl/server_return_model_test.bl', 10)], []),
     "clauses": ([('test/bl/execution_clause_identity_test.bl', 5)], []),
     "constructor-calls": ([('test/bl/reload/reconcile_callsite_test.bl', 5)], ['reload.reconcile-callsite', 'proc.reconcile-runtime']),
