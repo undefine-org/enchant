@@ -1,0 +1,115 @@
+(ns proc.supervisor-context-test)
+
+(defserver context-child
+ (init [observer]
+  (erlang/send observer [:context-child-started (erlang/self) (BeamLisp.Env/env_id)])
+  (ok nil)))
+
+(defn- context-of [spec]
+ (elem (nth (elem (:start spec) 2) 2) 1))
+(defn- reason [action]
+ (try (action) :unexpected-success (catch error (or (:original error) error))))
+(defn- started-in [scope]
+ (receive [:context-child-started pid seen] :when (= seen scope) pid
+  (after 5000 (throw :context-child-start-timeout))))
+(defn- stop-tree! [tree]
+ (when tree (Supervisor/stop tree :normal 5000)))
+
+(deftest constructor-context-is-opaque-deduplicated-and-raw-context-is-refused
+ (let [scope (BeamLisp.Env/fork) before (BeamLisp.Env/capture)]
+  (try
+   (let [spec (BeamLisp.Env/with_env scope #(BeamLisp.Supervisor/server :child context-child (erlang/self)))
+         context (context-of spec)
+         again (BeamLisp.Env/with_env scope #(BeamLisp.Supervisor/server :child context-child (erlang/self)))]
+    (is (= :bl_native_context (elem context 0)))
+    (is (= scope (elem context 1)))
+    (is (erlang/is_reference (elem context 2)))
+    (is (= context (context-of again)))
+    (is (= scope (:env (BeamLisp.Env/resolve_native_context! context))))
+    (is (= :invalid_native_context
+           (reason #(BeamLisp.Supervisor/start_server context-child (erlang/self)
+                      (tuple :"$bl_supervised_context" before nil)))))
+    (is (= before (BeamLisp.Env/capture)))
+    (is (= false (receive [:context-child-started _ _] true (after 0 false)))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest opaque-child-context-survives-ordinary-otp-initial-start-and-restart
+ (let [scope (BeamLisp.Env/fork) before (BeamLisp.Env/capture) tree (atom nil)]
+  (try
+   (let [observer (erlang/self)
+         spec (BeamLisp.Env/with_env scope #(BeamLisp.Supervisor/server :child context-child observer))
+         normalized (elem (BeamLisp.Supervisor/native_children (list spec) :native-context
+                            (elem (:start spec) 0) 0 4096) 0)
+         result (Supervisor/start_link normalized (list (tuple :strategy :one_for_one)))]
+    (reset! tree (elem result 1))
+    (is (= (context-of spec) (context-of (first normalized))))
+    (is (= :ok (elem result 0)))
+    (let [first (started-in scope)]
+     (is (Process/alive? first))
+     (is (= :ok (Supervisor/terminate_child @tree :child)))
+     (let [restart (Supervisor/restart_child @tree :child) second (started-in scope)]
+      (is (= :ok (elem restart 0)))
+      (is (not= first second))
+      (is (Process/alive? second))))
+    (is (= before (BeamLisp.Env/capture))))
+   (finally (stop-tree! @tree) (BeamLisp.Env/destroy scope)))))
+
+(deftest native-tree-preserves-constructor-selected-fork-through-restart
+ (let [scope (BeamLisp.Env/fork) before (BeamLisp.Env/capture) tree (atom nil)]
+  (try
+   (let [observer (erlang/self)
+         spec (BeamLisp.Env/with_env scope #(BeamLisp.Supervisor/server :child context-child observer))]
+    (reset! tree (BeamLisp.Supervisor/start_link {:strategy :one-for-one :children (list spec)}))
+    (let [first (started-in scope)]
+     (is (Process/alive? first))
+     (is (= :ok (Supervisor/terminate_child @tree :child)))
+     (let [restart (Supervisor/restart_child @tree :child) second (started-in scope)]
+      (is (= :ok (elem restart 0)))
+      (is (not= first second))
+      (is (Process/alive? second))))
+    (is (= before (BeamLisp.Env/capture))))
+   (finally (stop-tree! @tree) (BeamLisp.Env/destroy scope)))))
+
+(deftest invalid-later-context-refuses-before-native-tree-birth
+ (let [before (BeamLisp.Env/capture)
+       valid (BeamLisp.Supervisor/server :first context-child (erlang/self))
+       invalid {:id :invalid :start (tuple :Elixir.BeamLisp.Supervisor :start_server
+                 (list context-child (erlang/self) (tuple :"$bl_supervised_context" before nil)))}]
+  (is (= :invalid_native_context
+       (reason #(BeamLisp.Supervisor/start_link
+          {:strategy :one-for-one :children (list valid invalid)}))))
+  (is (= before (BeamLisp.Env/capture)))
+  (is (= false (receive [:context-child-started _ _] true (after 0 false))))))
+
+(deftest constructor-metadata-is-bounded-and-retires-with-its-scope
+ (let [scope (BeamLisp.Env/fork) context (atom nil) pooled (atom nil)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [contexts (mapv (fn [n]
+                           (BeamLisp.Env/in_ns (str "supervisor.context." n))
+                           (context-of (BeamLisp.Supervisor/server :child context-child nil)))
+                          (range 256))]
+      (reset! context (first contexts))
+      (reset! pooled (BeamLisp.Env/source_private
+       (fn []
+        (let [row (elem (first (ets/lookup :beam_lisp_source_lease_domains
+                         (tuple scope :native_context (elem @context 2)))) 1)
+              identity (:context-id row)
+              shared (elem (first (ets/lookup :beam_lisp_source_lease_domains
+                                    (tuple :execution_context identity))) 1)]
+         {:identity identity :index (tuple :execution_context_index (:context shared))}))))
+      (is (= 256 (count (set contexts))))
+      (BeamLisp.Env/in_ns "supervisor.context.overflow")
+      (is (= :native_context_capacity
+             (reason #(BeamLisp.Supervisor/server :overflow context-child nil)))))))
+   (finally (BeamLisp.Env/destroy scope)))
+  (is (= :retired_native_context (reason #(BeamLisp.Env/resolve_native_context! @context))))
+  (is (= (list) (BeamLisp.Env/source_private
+       #(ets/lookup :beam_lisp_source_lease_domains (tuple scope :native_context_index)))))
+  (is (= (list) (BeamLisp.Env/source_private
+       #(ets/lookup :beam_lisp_source_lease_domains (tuple scope :native_context_bytes)))))
+  (is (= (list) (BeamLisp.Env/source_private
+       #(ets/lookup :beam_lisp_source_lease_domains (tuple :execution_context (:identity @pooled))))))
+  (is (= (list) (BeamLisp.Env/source_private
+       #(ets/lookup :beam_lisp_source_lease_domains (:index @pooled)))))))
