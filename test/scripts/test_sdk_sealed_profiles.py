@@ -22,7 +22,7 @@ class SealedProfiles(unittest.TestCase):
         self.assertEqual({b['id'] for b in matrix['boundaries']}, set(selection['boundaries']))
         self.assertEqual(list(PROFILE['GROUPS']), [g['id'] for g in selection['groups']])
         # Two added fixture-fill assertions observe capacity under its native fence.
-        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 88 + 34 + 24 + 1 + 24 + 59, selection['assertions'])
+        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 88 + 34 + 24 + 1 + 24 + 106, selection['assertions'])
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])

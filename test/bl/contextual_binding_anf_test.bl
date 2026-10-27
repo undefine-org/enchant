@@ -27,6 +27,14 @@
        node (compiled value) invocation (compiled call)
        frontend (x/compile-expression (:source value) "binding-anf.bl" (:options value))]
   (is (= :binding (:op node)))
+  (is (= :unlinked-contextual-binding
+         (kind #(BeamLisp.Ns.Compiler/compile-contextual-unit
+                  (get-in value [:expanded :reader]) (BeamLisp.Compiler/new_env "binding-anf")
+                  (get-in value [:expanded :references]) (list)))))
+  (is (= :unlinked-contextual-binding
+         (kind #(BeamLisp.Compiler/prepare_program_entry
+                  (get-in value [:expanded :reader]) (BeamLisp.Compiler/new_env "binding-anf")
+                  (get-in value [:expanded :references]) (list)))))
   (is (= (:reference value) (:reference node)))
   (is (= :binding (get-in frontend [:node :op])))
   (is (= (:reference value) (get-in frontend [:node :reference])))
@@ -121,3 +129,50 @@
   (is (= :let (get-in program [:node :op])))
   (is (= (:node program) (:body (elem (first (get-in bundle [:declaration :entries])) 3))))
   (is (= 42 (lower/eval-anf :Elixir.PreparedUnitLinkTest (:node program))))))
+
+(defn- executable-nodes [node]
+ (cons node (Enum/flat_map (a/executable-children node) (fn [child] (executable-nodes child)))))
+
+(deftest unit-linkage-requires-full-identity-and-already-linked-data-targets
+ (let [f (fixture "answer") reference (:reference f) node (a/binding-value reference)
+       other (:reference (fixture "answer ; different world"))
+       phase (assoc reference :phase 1 :id (b/reference-id (:selection f) (:declaration reference) 1))
+       linked (a/link-bindings node {reference (a/lit 42)})]
+  (is (= 42 (:val linked)))
+  (is (= 42 (BeamLisp.AOT/interpret_constructor! linked {} {})))
+  (is (= "42" (:val (js/emit linked {}))))
+  (is (= reference (a/reference-of linked)))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {}))))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {other (a/lit 42)}))))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {phase (a/lit 42)}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node {reference node}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node {reference (a/global "ambient" "answer")}))))
+  (is (= :invalid-anf-binding-link
+         (kind #(a/link-bindings node {reference (a/fnn (list (a/clause (list) nil (a/global "ambient" "answer"))))}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings (a/lit 1) {reference nil}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node (fn [] 42)))))))
+
+(deftest unit-linkage-visits-latent-bodies-guards-cleanup-and-every-native-operand
+ (let [reference (:reference (fixture "answer")) b (a/binding-value reference)
+       clause (a/clause (list (a/pvar "argument")) b b)
+       cases [(a/invoke b b) (a/app b (list b)) (a/lett "local" b b)
+              (a/iff b b b) (a/doo (list b b)) (a/casee b (list clause))
+              (a/fnn (list clause)) (a/tryy b (list clause) b) (a/recv (list clause) b b)
+              (a/tup (list b b)) (a/mapp (list [b b])) (a/cons-cell b b)
+              (a/structt :Example (list [(a/lit :field) b]))
+              (a/remote :erlang :+ (list b b)) (a/arith :add :+ (list b b))]]
+  (doseq [node cases]
+   (let [linked (a/link-bindings node {reference (a/lit 42)})]
+    (is (not (some #(= :binding (:op %)) (executable-nodes linked))))
+    (is (= linked (:body (first (:clauses (module linked))))))))))
+
+(deftest unit-linkage-never-traverses-literal-data-patterns-or-display-annotations
+ (let [reference (:reference (fixture "answer")) fake (a/binding-value reference)
+       marker (atom false) callback (fn [] (reset! marker true))
+       literal (a/lit {:payload fake}) pattern (a/plit {:payload fake})
+       clause (a/clause (list pattern) nil literal)
+       node (assoc (a/casee (a/lit 1) (list clause)) :ann {:display fake :callback callback})
+       linked (a/link-bindings node {})]
+  (is (= node linked))
+  (is (= false @marker))
+  (is (= {:payload fake} (:val (:body (first (:clauses linked))))))))

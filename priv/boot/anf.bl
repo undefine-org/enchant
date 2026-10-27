@@ -545,6 +545,78 @@
     (erlang/is_list x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) x))
     :else x))
 
+;; Unit linkage rewrites executable operands only. Literal payloads, patterns
+;; and annotations remain inert even when they resemble ANF or hold callbacks.
+(declare link-node)
+
+(defn- link-clause [clause bindings]
+ (assoc clause :guard (when (some? (:guard clause)) (link-node (:guard clause) bindings))
+               :body (link-node (:body clause) bindings)))
+
+(defn- link-node [node bindings]
+ (let [op (:op node)]
+  (if (= :binding op)
+   (let [reference (:reference node) target (get bindings reference)]
+    (when-not target
+     (throw (ex-info "Selected binding has no unit target"
+                    {:kind :unlinked-contextual-binding :reference reference})))
+    (assoc target :ann (assoc (merge (:ann target) (:ann node)) :binding-reference reference)))
+   (let [scalars (cond (= :invoke op) [:callee :arguments]
+                       (= :apply op) [:fn]
+                       (= :let op) [:init :body]
+                       (= :if op) [:test :then :else]
+                       (= :case op) [:subj]
+                       (= :try op) [:body :after]
+                       (= :recv op) [:timeout :after]
+                       (= :cons op) [:head :tail]
+                       :else [])
+         sequences (cond (contains? #{:js :arith :remote :apply} op) [:args]
+                          (= :do op) [:stmts] (= :tuple op) [:elems] :else [])
+         clauses (cond (contains? #{:case :fn :recv} op) [:clauses]
+                       (= :try op) [:catch] :else [])
+         pairs (cond (= :map op) [:pairs] (= :struct op) [:fields] :else [])
+         result (reduce (fn [out field]
+                          (if (nil? (get out field)) out
+                           (assoc out field (link-node (get out field) bindings)))) node scalars)
+         result (reduce (fn [out field]
+                          (assoc out field (finite-map (fn [child] (link-node child bindings))
+                                                       (get out field)))) result sequences)
+         result (reduce (fn [out field]
+                          (assoc out field (finite-map (fn [clause] (link-clause clause bindings))
+                                                       (get out field)))) result clauses)]
+    (reduce (fn [out field]
+             (assoc out field (finite-map (fn [pair]
+                               [(link-node (first pair) bindings) (link-node (second pair) bindings)])
+                                          (get out field)))) result pairs)))))
+
+(defn- linked-target? [node]
+ (and (not= :binding (:op node))
+      (every? (fn [child] (linked-target? child)) (executable-children node))))
+
+(defn- static-link-target? [node]
+ (and (not (contains? #{:binding :global} (:op node)))
+      (every? (fn [child] (static-link-target? child)) (executable-children node))))
+
+(defn link-bindings
+ "Resolve selected references through a finite unit-owned ANF target table.
+  Full references are keys, including world/phase/space. Targets must already
+  be linked: no recursive resolver, ambient lookup or executable callback.
+  This pure transformation grants no Source authenticity or native admission."
+ [node bindings]
+ (when-not (and (node-ok? node) (plain-map? bindings))
+  (throw (ex-info "Invalid ANF unit linkage" {:kind :invalid-anf-binding-link})))
+ ;; Check every target before traversal; even unused malformed entries refuse.
+ (doseq [entry (maps/to_list bindings)]
+  (when-not (and (binding-reference? (elem entry 0)) (node-ok? (elem entry 1))
+                 (static-link-target? (elem entry 1)))
+   (throw (ex-info "Invalid ANF binding target" {:kind :invalid-anf-binding-link}))))
+ (let [linked (link-node node bindings)]
+  ;; Future executable grammar additions cannot silently omit substitution.
+  (when-not (linked-target? linked)
+   (throw (ex-info "Unit linkage left an unresolved executable binding"
+                  {:kind :unlinked-contextual-binding})))
+  linked))
+
 (defn module
   "Construct and validate the canonical version-1 ANF module descriptor.
    Collection inputs are eagerly realized once and normalized to proper lists."
