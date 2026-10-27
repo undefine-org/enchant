@@ -1,0 +1,104 @@
+(ns contextual-namespace-initialization-test
+ (:require [expand :as x] [compile.world :as world] [lower :as lower]))
+
+(defn- source [text] {:namespace 'initialization :revision 'current :source text :file "initialization.bl"})
+(defn- prepare [text] (x/prepare-program [(source text)] ['initialization 'current]))
+(defn- run [prepared]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualInitialization." (erlang/unique_integer (list :positive))))
+                 (get-in prepared [:program :node])))
+(defn- kind [action]
+ (try (action) nil (catch error (or (:kind (ex-data error)) (BeamLisp.ExInfo/ex_original error) (:__struct__ error)))))
+(defn- owned-sessions [] (erlang/get :bl_contextual_constructor_sessions))
+
+(deftest top-level-initializers-expand-without-running-and-execute-in-source-order
+ (erlang/erase :contextual-initialization-order)
+ (try
+  (let [prepared (prepare
+         "(ns initialization)
+          (defn answer [] 42)
+          (erlang/put :contextual-initialization-order :first)
+          (erlang/put :contextual-initialization-order [(erlang/get :contextual-initialization-order) :second])
+          [(erlang/get :contextual-initialization-order) (answer)]")
+        program (:program prepared)]
+   (is (= :undefined (erlang/get :contextual-initialization-order)))
+   (is (= (:node program) (:body (elem (first (get-in prepared [:declaration :entries])) 3))))
+   (is (= [[:first :second] 42] (run prepared)))
+   (is (= [:first :second] (erlang/get :contextual-initialization-order)))
+   (is (= :closed (get-in program [:constructor :status]))))
+  (finally (erlang/erase :contextual-initialization-order))))
+
+(deftest declaration-only-entries-have-an-inert-entry-and-export-the-same-phase-library
+ (let [prepared (prepare "(ns initialization) (defsyntax answer [form context] (syntax-literal 42))")
+       library (x/decode-phase-library (x/encode-phase-library (:phase-library prepared)))
+       consumer (x/program [{:namespace 'consumer :revision 'current :file "consumer.bl"
+                             :source "(ns consumer) (import-world 'initialization 'current :only [answer]) (answer)"}]
+                           ['consumer 'current] [library])]
+  (is (= nil (run prepared)))
+  (is (= 0 (get-in prepared [:program :constructor :calls])))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualInitializationPhaseConsumer (:node consumer))))
+  (is (every? #(empty? (:expressions %)) (:units library)))))
+
+(deftest each-initializer-keeps-its-authored-macro-position-and-lexical-scope
+ (let [before (owned-sessions)
+       prepared (prepare "(ns initialization) 0 (defsyntax answer [form context] (syntax-literal 42)) (answer) (answer)")
+       siblings (prepare "(ns initialization) (let [value 1] value) (let [value 42] value)")]
+  (is (= 42 (run prepared)))
+  (is (= 2 (count (get-in prepared [:program :expansions]))))
+  (is (= 2 (get-in prepared [:program :constructor :calls])))
+  (is (= 1 (count (get-in prepared [:program :transformers]))))
+  (is (= 42 (run siblings)))
+  (is (= 2 (count (get-in siblings [:program :references]))))
+  (is (= :binding-not-yet-available
+         (kind #(prepare "(ns initialization) (answer) (defsyntax answer [form context] (syntax-literal 42)) 0"))))
+  (is (= :unbound-identifier
+         (kind #(prepare "(ns initialization) (let [hidden 42] hidden) hidden"))))
+  (is (= before (owned-sessions)))))
+
+(deftest compile-time-budgets-and-failure-cleanup-span-the-whole-initialization-sequence
+ (let [before (owned-sessions)
+       text (str "(ns initialization) (defsyntax answer [form context] (syntax-literal 42)) "
+                 (String/duplicate "(answer) " 129))]
+  (is (= :contextual-macro-budget (kind #(prepare text))))
+  (is (= before (owned-sessions)))
+  (is (= :contextual-entry-phase
+         (kind #(prepare "(ns initialization) 0 (begin-for-syntax (erlang/put :contextual-initialization-order :bad)) 42"))))
+  (is (= :undefined (erlang/get :contextual-initialization-order)))
+  (is (= before (owned-sessions)))))
+
+(deftest later-expansion-refusal-prevents-all-initializers-and-recur-gets-no-synthetic-scope
+ (erlang/erase :contextual-initialization-order)
+ (try
+  (is (= :unbound-identifier
+         (kind #(prepare "(ns initialization) (erlang/put :contextual-initialization-order :bad) missing"))))
+  (is (= :undefined (erlang/get :contextual-initialization-order)))
+  (is (not= nil (kind #(prepare "(ns initialization) 0 (recur)"))))
+  (is (= :undefined (erlang/get :contextual-initialization-order)))
+  (finally (erlang/erase :contextual-initialization-order))))
+
+(deftest a-failed-runtime-initializer-prevents-later-effects
+ (erlang/erase :contextual-initialization-order)
+ (try
+  (let [prepared (prepare "(ns initialization)
+                          (erlang/put :contextual-initialization-order :first)
+                          (erlang/error :initializer-stopped)
+                          (erlang/put :contextual-initialization-order :too-late)")]
+   (is (= :initializer-stopped (kind #(run prepared))))
+   (is (= :first (erlang/get :contextual-initialization-order))))
+  (finally (erlang/erase :contextual-initialization-order))))
+
+(deftest ordinary-world-preparation-and-raw-artifact-emission-use-the-complete-sequence
+ (let [dir (Path/join (System/tmp_dir!) (str "contextual-initialization-" (erlang/unique_integer (list :positive))))
+       module :Elixir.ContextualInitializationArtifact]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") "(ns initialization) 1 2 42")
+   (File/write! (Path/join dir "world.bl")
+      "{:version 1 :profile 'syntax-v1 :entry ['initialization 'current] :sources [{:namespace 'initialization :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         pair (world/artifact prepared module)]
+    (is (not (erlang/module_loaded module)))
+    (is (= module (elem pair 0)))
+    (is (= (tuple :module module) (code/load_binary module '() (elem pair 1))))
+    (is (= 42 (erlang/apply module :run (list))))
+    (is (= :proved (get-in prepared [:phase :status]))))
+   (finally (code/delete module) (code/purge module) (File/rm_rf! dir)))))
