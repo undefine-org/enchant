@@ -613,7 +613,7 @@
              (contains? #{:private :unavailable} (BeamLisp.AOT/sdk_declaration_kind ns name)))
         (and (erlang/is_tuple m)
              (= :ok (erlang/element 1 m))
-             (= true (maps/get :private (erlang/element 2 m) false))))))
+             (= :private (metadata-visibility (erlang/element 2 m)))))))
 
 (defn- reject-private!
   "Stop compiling with a clear error when `target-ns/var` is a PRIVATE var
@@ -3972,17 +3972,11 @@
    result so the metadata is written after interning:
    `value = intern(...); Env.put_meta(ns, name, %{doc: ...}); value`."
   [args env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        rest-args (rest args)
+  (let [header (value-header args)
+        name (:name header) doc (:doc header) init (:value-form header)
         _ (warn-special-name! "def" name env)
-        ; (def name "doc" value) has a string before the value
-        has-doc (and (= 2 (count rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        init (if has-doc (second rest-args) (first rest-args))
         init-node (compile-node init (notail env))
-        author (name-author-meta (first args))
+        author (:author header)
         meta (var-meta-map doc false author)]
     (if (per-env-attr? author)
       (compile-per-env-def name init-node env meta)
@@ -4201,6 +4195,9 @@
       (author-meta m)
       {})))
 
+(defn- metadata-visibility [metadata]
+  (if (= true (:private metadata)) :private :public))
+
 (defn- var-meta-map
   "Build the plain metadata data map for a var, or nil when there is none.
 
@@ -4295,18 +4292,43 @@
                        shapes)]
     (erlang/list_to_tuple (list mod fixed variadic))))
 
+(defn- value-header [args]
+  (let [more (rest args)
+        has-doc (and (= 2 (count more)) (erlang/is_binary (rn/node-form (first more))))]
+    {:name (rn/node-name (rn/node-form (first args))) :name-form (first args)
+     :doc (when has-doc (rn/node-form (first more)))
+     :value-form (if has-doc (second more) (first more))
+     :author (name-author-meta (first args))}))
+
+(defn- function-header [args]
+  (let [more (rest args)
+        has-doc (and (not (empty? more)) (erlang/is_binary (rn/node-form (first more))) (not (empty? (rest more))))
+        after-doc (if has-doc (rest more) more)
+        has-attr (and (seq after-doc) (= :map (rn/node-tag (rn/node-form (first after-doc)))))
+        attrs (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})]
+    {:name (rn/node-name (rn/node-form (first args))) :name-form (first args)
+     :has-doc has-doc :doc-form (when has-doc (first more))
+     :doc (when has-doc (rn/node-form (first more)))
+     :clauses (if has-attr (rest after-doc) after-doc)
+     :author (maps/merge (name-author-meta (first args)) attrs)}))
+
+(defn- checked-function-header [args private? env]
+  (let [header (function-header args) name (:name header)
+        kind (if private? "defn-" "defn") author (:author header) clauses (:clauses header)]
+    (when (per-env-attr? author)
+      (compile-error env (str kind " " name ": ^:per-env is only valid on a `def` value, not a function")))
+    (cond
+      (empty? clauses) (compile-error env (str kind " " name ": expected at least one parameter vector"))
+      (erlang/is_binary (rn/node-form (first clauses)))
+        (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
+      :else nil)
+    (assoc header :metadata (var-meta-map (:doc header) private? author))))
+
 (defn- defn-clauses-of
   "The parsed clauses of a `(defn name doc? attr? clauses…)` argument list —
    the same peeling `compile-defn*` does, factored so the two agree."
   [args env]
-  (let [rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     (not (empty? (rest rest-args))))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        has-attr (and (not (empty? after-doc))
-                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
-        after-attr (if has-attr (rest after-doc) after-doc)]
+  (let [after-attr (:clauses (function-header args))]
     (if (or (empty? after-attr) (erlang/is_binary (rn/node-form (first after-attr))))
       nil
       (parse-fn-clauses after-attr env))))
@@ -4364,39 +4386,11 @@
   "Prepare the compiler-owned declaration data before publication. Nested
    closure definitions retain their expression semantics, not a linked unit."
   [args private? env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        kind (if private? "defn-" "defn")
+  (let [header (checked-function-header args private? env)
+        name (:name header) kind (if private? "defn-" "defn")
         _ (warn-special-name! kind name env)
-        rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     ; a lone string with nothing after is the body, not a doc
-                     (not (empty? (rest rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        ; a `{:map …}` literal after the docstring is Clojure's attr-map: peel
-        ; it and merge into the `^{…}` author metadata (attr keys win on a clash,
-        ; matching genesis `merge_attr`). What remains are the parameter clauses.
-        has-attr (and (not (empty? after-doc))
-                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
-        attr-map (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})
-        after-attr (if has-attr (rest after-doc) after-doc)
-        author (maps/merge (name-author-meta (first args)) attr-map)
-        ; `^:per-env` is a stateful-VALUE-def marker; a function is already
-        ; re-entrant and interns one global fn value (the PLAN-047 invariant),
-        ; so the marker would do nothing on a defn. Reject rather than silently
-        ; ignore it. Mirrors genesis `compile_defn`.
-        _ (when (per-env-attr? author) (compile-error env (str kind " " name ": ^:per-env is only valid on a `def` value, not a function")))
-        ; Parity guards (genesis compile_def_special): a defn with no clauses,
-        ; or a docstring followed by another string instead of a parameter
-        ; vector, is a source error — caught here with the exact message.
-        _ (cond
-            (empty? after-attr)
-              (compile-error env (str kind " " name ": expected at least one parameter vector"))
-            (erlang/is_binary (rn/node-form (first after-attr)))
-              (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
-            :else nil)
+        has-doc (:has-doc header) rest-args (rest args)
+        after-attr (:clauses header) author (:author header) doc (:doc header)
         ; A defn nested inside a scope that BINDS locals (a top-level
         ; `(let [x …] (defn f … x))`, as an unmodified Clojure source writes a
         ; closed-over helper) cannot become a top-level linked module fn: the
@@ -4451,26 +4445,59 @@
                       (list (a/lit (:namespace declaration)) (a/lit (:name declaration)) (a/lit meta)))
                     (a/var "value")))))))))
 
-(defn prepare-function-declaration
-  "Prepare one top-level defn/defn- as canonical clause/metadata data.
-   No publication scaffold is generated or evaluated. The existing selected
-   compiler environment owns name resolution and deterministic prelinking."
-  [form env]
+(defn- declaration-input [form env]
   (loop [form form env (checked-context-env env)]
    (if (= :meta (rn/node-tag form))
     (let [metadata (rn/node-pos form)
           author (if (erlang/is_map metadata) (maps/remove :tag (author-meta metadata)) {})]
-     ;; Value-result metadata belongs to expression compilation. Staging may
-     ;; consume declaration metadata on the name, but cannot discard effects
-     ;; or metadata attached to the publication result.
      (when (seq author)
       (compile-error (pos-env env metadata) "Function declaration result metadata requires expression compilation"))
      (recur (rn/node-form form) (pos-env env metadata)))
-    (let [items (when (= :list (rn/node-tag form)) (rn/node-items form))
-          head (when (seq items) (rn/node-name (rn/node-form (first items))))]
-     (when-not (and (contains? #{"defn" "defn-"} head) (empty? (:locals env)))
+    (let [items (when (= :list (rn/node-tag form)) (rn/node-items form))]
+     {:form form :env env :args (rest items)
+      :head (when (seq items) (rn/node-name (rn/node-form (first items))))}))))
+
+(defn declaration-source
+  "Derive inert metadata and the value Reader form from a supported declaration.
+   Header parsing is shared with publication/prelink preparation. No body is
+   compiled, no Env link is installed and no initializer or metadata executes."
+  [form env]
+  (let [source (declaration-input form env) head (:head source) args (:args source)
+        env (:env source)]
+    (when-not (and (contains? #{"def" "defn" "defn-" "defsyntax"} head) (empty? (:locals env))
+                   (= :symbol (rn/node-tag (rn/node-form (first args)))))
+      (compile-error env "Declaration Source requires def, defn, defn- or defsyntax"))
+    (if (= "def" head)
+      (let [header (value-header args)
+            metadata (var-meta-map (:doc header) false (:author header))]
+        (when-not (or (= 2 (count args))
+                      (and (= 3 (count args)) (some? (:doc header))))
+          (compile-error env "Value declaration requires one initializer"))
+        {:kind head :name (rn/node-form (:name-form header))
+         :metadata metadata :visibility (metadata-visibility metadata)
+         :value-form (:value-form header)})
+      (let [header (checked-function-header args (= "defn-" head) env)
+            _ (parse-fn-clauses (:clauses header) env)
+            name (rn/node-form (:name-form header))
+            position (maps/with (list :line :col :file :offset :end-line :end-col :end-offset :tag)
+                                (or (rn/node-pos (:name-form header)) {}))
+            ;; Declaration metadata has been consumed above. A recursive fn's
+            ;; lexical name retains positions/hints, not var metadata effects.
+            local-name (if (empty? position) name (rn/meta-node name position))
+            forms (if (= "defsyntax" head) (:clauses header)
+                      (cons local-name (:clauses header)))]
+        {:kind head :name (rn/node-form (:name-form header)) :metadata (:metadata header)
+         :visibility (metadata-visibility (:metadata header))
+         :value-form (rn/list-node (cons (rn/sym-node "fn") forms))}))))
+
+(defn prepare-function-declaration
+  "Prepare one top-level defn/defn- as canonical clause/metadata data.
+   Publication and contextual Source share the same declaration header owner."
+  [form env]
+  (let [source (declaration-input form env) head (:head source) env (:env source)]
+    (when-not (and (contains? #{"defn" "defn-"} head) (empty? (:locals env)))
       (compile-error env "Function declaration requires a top-level defn or defn-"))
-     (prepare-defn* (rest items) (= "defn-" head) env)))))
+    (prepare-defn* (:args source) (= "defn-" head) env)))
 
 (defn- checked-declaration-kind [head args]
   ;; The actual special-form compiler has accepted these arguments already.

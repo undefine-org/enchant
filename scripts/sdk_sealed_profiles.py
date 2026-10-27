@@ -4,6 +4,8 @@ GROUPS = {
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 88)], ['expand']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
+    "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24)], ['expand-source', 'expand']),
+    "boot-isolation": ([('test/bl/contextual_boot_isolation_test.bl', 1)], []),
     "ownership": ([('test/bl/system/ownership_test.bl', 136)], ['compile.world']),
     "ownership-calls": ([('test/bl/system/ownership_calls_test.bl', 123)], ['compile.world']),
     "native-outcomes": ([('test/bl/system/ownership_native_test.bl', 207)], ['system.ownership']),
@@ -27,10 +29,10 @@ GROUPS = {
 }
 BOUNDARIES = {
     'unit-metadata': ['clauses'], 'source-and-class-proof': ['handoffs', 'capacity'],
-    'preboot-identity': ['clauses', 'filesystem'], 'sealed-loader': [],
-    'constructor-and-scope': ['imports', 'compiler-entry', 'namespace-initialization', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['imports'],
+    'preboot-identity': ['clauses', 'filesystem', 'boot-isolation'], 'sealed-loader': [],
+    'constructor-and-scope': ['imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['imports'],
     'native-custody': ['native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'message-context'],
-    'record-representation': ['returns'], 'contextual-pipeline-identity': ['imports', 'compiler-entry', 'namespace-initialization', 'clauses'],
+    'record-representation': ['returns'], 'contextual-pipeline-identity': ['imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'clauses'],
     'contextual-analysis-reports': ['ownership', 'ownership-calls', 'native-outcomes', 'loops', 'af'],
     'vector-lookup-default': ['vectors'], 'finite-cleanup-progress': ['loops', 'af'],
     'constructor-evaluation-order': ['returns'], 'execution-clause-identity': ['clauses'],
