@@ -1,0 +1,85 @@
+(ns contextual-binding-anf-test
+ (:require [binding :as b] [expand :as x] [anf :as a] [lower :as lower]
+           [system.ir :as ir] [codebase.phase :as code] [js.emit :as js]))
+(defn- fixture [source]
+ (let [namespace 'binding-anf
+       selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace namespace :digest (crypto/hash :sha256 source)}]}
+       scope (b/scope selection namespace [0] :module)
+       world (b/world selection [scope]
+               [{:namespace namespace :name 'answer :phase 0 :space 'value :kind :function :visibility :public
+                 :path [0] :scopes [(:id scope)] :available-from 0}])
+       selection (b/select [world] [])
+       expanded (x/expression source "binding-anf.bl" {:namespace namespace :world (:key world) :selection selection})]
+  {:world world :selection selection :expanded expanded
+   :source source :options {:namespace namespace :world (:key world) :selection selection}
+   :reference (:reference (first (vals (:references expanded))))}))
+(defn- compiled [fixture]
+ (BeamLisp.Ns.Compiler/compile-contextual (get-in fixture [:expanded :reader])
+  (BeamLisp.Compiler/new_env "binding-anf") (get-in fixture [:expanded :references])))
+(defn- kind [action] (try (action) nil (catch error (or (:kind (ex-data error)) (:__struct__ error)))))
+(defn- module [body]
+ (a/module :Elixir.UnlinkedBindingArtifact
+  (list {:op :defn-clause :fname :run :params (list) :guard nil :body body :ann {}}) (list [:run 0]) (list)))
+
+(deftest selected-global-values-and-calls-retain-explicit-reference-identity
+ (let [value (fixture "answer") call (fixture "(answer)")
+       node (compiled value) invocation (compiled call)
+       frontend (x/compile-expression (:source value) "binding-anf.bl" (:options value))]
+  (is (= :binding (:op node)))
+  (is (= (:reference value) (:reference node)))
+  (is (= :binding (get-in frontend [:node :op])))
+  (is (= (:reference value) (get-in frontend [:node :reference])))
+  (is (= :invoke (:op invocation)))
+  (is (= :binding (get-in invocation [:callee :op])))
+  (is (= (:reference call) (a/reference-of (:callee invocation))))
+  (is (= (list) (a/executable-children node)))
+  (is (= node (get (first (:clauses (module node))) :body)))))
+
+(deftest descriptor-and-constructor-refuse-malformed-reference-data-without-callbacks
+ (let [reference (:reference (fixture "answer")) marker (atom false)
+       corruptions [(dissoc reference :world) (assoc reference :extra true)
+                    (assoc reference :version 1.0) (assoc reference :world "short")
+                    (assoc reference :phase 4097) (assoc reference :phase nil)
+                    (assoc reference :space 'nil) (assoc reference :space (fn [] (reset! marker true)))]]
+  (doseq [changed corruptions]
+   (is (= :invalid-anf-binding-reference (kind #(a/binding-value changed))))
+   (is (not= nil (kind #(module {:op :binding :reference changed :ann {}})))))
+  (is (= false @marker))))
+
+(deftest shared-analysis-keeps-phase-world-and-declaration-identities-distinct
+ (let [f (fixture "answer") reference (:reference f) node (a/binding-value reference)
+       shifted (assoc reference :phase 1 :id (b/reference-id (:selection f) (:declaration reference) 1))
+       other (:reference (fixture "answer ; another revision"))
+       dependency (a/execution-dependencies (list node))]
+  (is (not= (ir/global-key node) (ir/global-key (a/binding-value shifted))))
+  (is (not= (ir/global-key node) (ir/global-key (a/binding-value other))))
+  (is (= (ir/global-key node) (ir/resource-of {} node)))
+  (is (= (ir/global-key node) (ir/alias-for {} node)))
+  (is (= false (:complete dependency)))
+  (is (= :captured-value (:kind (first (:edges dependency)))))
+  (is (= nil (:target (first (:edges dependency)))))
+  (is (= nil (ir/function-shape node)))))
+
+(deftest unlinked-native-and-javascript-emission-never-uses-ambient-resolvers
+ (let [f (fixture "answer") node (a/binding-value (:reference f)) called (atom false)
+       resolver (fn [& args] (reset! called true) "forbidden")]
+  (is (= :unlinked-contextual-binding (kind #(lower/lower-anf node))))
+  (is (= :unlinked-contextual-binding (kind #(lower/descriptor->beam (module node) {}))))
+  (is (= :unlinked-contextual-binding (kind #(js/emit node {:resolve resolver :resolve-exact resolver}))))
+  (is (= :constructor-machine-refused (kind #(BeamLisp.AOT/interpret_constructor! node {} {}))))
+  (is (= false @called))
+  (is (not (erlang/module_loaded :Elixir.UnlinkedBindingArtifact)))))
+
+(deftest phase-dependency-projection-reads-the-binding-field-rather-than-display-annotations
+ (let [program (x/program [{:namespace 'example :revision 'current :file "example.bl"
+                           :source "(ns example) (defn answer [] 42) (answer)"}] ['example 'current])
+       selected (first (filter #(= :public (get-in % [:declaration :visibility])) (vals (:references program))))
+       reference (:reference selected) forged (assoc reference :id (crypto/hash :sha256 "display-only"))
+       node (assoc (a/binding-value reference) :ann {:binding-reference forged})
+       changed (-> program (assoc :node (a/invoke node (a/empty-list-node)) :linked [])
+                           (assoc-in [:coverage :closed-global-linking] false))
+       dependencies (code/dependencies changed)]
+  (is (= reference (a/reference-of node)))
+  (is (some #(and (= :call (:kind %)) (= (:id reference) (:to %))) (:edges dependencies)))
+  (is (not (some #(= (:id forged) (:to %)) (:edges dependencies))))))

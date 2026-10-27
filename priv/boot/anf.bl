@@ -70,6 +70,35 @@
 
 ;; ── constructors (every node threads an :ann, default {}) ────────────────────
 
+(defn- reference-digest? [value]
+ (and (erlang/is_binary value) (= 32 (erlang/byte_size value))))
+
+(defn- binding-reference? [value]
+ ;; Shape only: binding/resolve and the selected-world checker own semantic
+ ;; identity. A well-shaped reference never authenticates Source or code.
+ (and (erlang/is_map value) (= 7 (erlang/map_size value))
+      (erlang/=:= 1 (:version value)) (= :binding-reference (:kind value))
+      (reference-digest? (:world value)) (reference-digest? (:declaration value))
+      (reference-digest? (:id value))
+      (erlang/is_integer (:phase value)) (<= -4096 (:phase value) 4096)
+      (erlang/is_tuple (:space value)) (= 2 (erlang/tuple_size (:space value)))
+      (= :symbol (elem (:space value) 0)) (erlang/is_binary (elem (:space value) 1))
+      (<= 1 (erlang/byte_size (elem (:space value) 1)) 512)))
+
+(defn binding-value
+ "An unresolved selected global value. No mutable namespace lookup or physical
+  address is implied; a unit linker must bind it before executable emission."
+ [reference]
+ (when-not (binding-reference? reference)
+  (throw (ex-info "Invalid ANF binding reference" {:kind :invalid-anf-binding-reference})))
+ {:op :binding :reference reference :ann {}})
+
+(defn reference-of
+ "Executable binding identity is a field on :binding. Its annotations cannot
+  override it. Lexical references retain the compiler's existing annotations."
+ [node]
+ (if (= :binding (:op node)) (:reference node) (get-in node [:ann :binding-reference])))
+
 (defn lit [v] {:op :lit :val v :ann {}})
 (defn var [name] {:op :var :name name :ann {}})
 (defn global [ns name] {:op :global :ns ns :name name :ann {}})
@@ -132,7 +161,7 @@
  (let [op (:op node)
        children
        (cond
-        (contains? #{:lit :var :global :enil} op) (list)
+        (contains? #{:lit :var :global :binding :enil} op) (list)
         (contains? #{:js :arith :remote} op) (:args node)
         (= :invoke op) (list (:callee node) (:arguments node))
         (= :apply op) (cons (:fn node) (:args node))
@@ -249,6 +278,8 @@
     (cond
       (= op :lit) (when (or (not (exact-keys? n [:op :val :ann])) (not (literal-data? (:val n)))) (boundary-error m f path "invalid literal or fields" n))
       (= op :var) (when (or (not (exact-keys? n [:op :name :ann])) (not (erlang/is_binary (:name n)))) (boundary-error m f path "var requires binary :name" n))
+      (= op :binding) (when-not (and (exact-keys? n [:op :reference :ann]) (binding-reference? (:reference n)))
+                        (boundary-error m f path "binding requires a finite selected reference" n))
       (= op :global) (when (or (not (or (exact-keys? n [:op :ns :name :ann]) (and (exact-keys? n [:op :ns :name :lookup :ann]) (= :exact (:lookup n))))) (not (erlang/is_binary (:ns n))) (not (erlang/is_binary (:name n)))) (boundary-error m f path "global requires binary :ns/:name" n))
       (= op :remote)
         (do
@@ -363,6 +394,7 @@
       (cond
         (erlang/== op :lit) (and (keys-exactly? n 3 '(:op :val :ann)) (literal-data? (maps/get :val n)))
         (erlang/== op :var) (and (keys-exactly? n 3 '(:op :name :ann)) (erlang/is_binary (maps/get :name n)))
+        (erlang/== op :binding) (and (keys-exactly? n 3 '(:op :reference :ann)) (binding-reference? (maps/get :reference n)))
         (erlang/== op :global) (and (or (keys-exactly? n 4 '(:op :ns :name :ann))
                                         (and (keys-exactly? n 5 '(:op :ns :name :lookup :ann)) (erlang/== :exact (maps/get :lookup n))))
                                     (erlang/is_binary (maps/get :ns n)) (erlang/is_binary (maps/get :name n)))
@@ -598,6 +630,8 @@
     (list (dependency-edge node :direct-call
             (tuple :mfa (:mod node) (:fun node) (count (:args node))) [:anf :remote]))
     (list (dependency-edge node :direct-call nil [:anf :dynamic-remote])))
+   (= :binding op)
+   (list (dependency-edge node :captured-value nil [:anf :binding (:reference node)]))
    (= :global op)
    ;; A binding is not a physical entry, even for :exact lookups. Resolution
    ;; must authenticate its actual published provider and retained value.
