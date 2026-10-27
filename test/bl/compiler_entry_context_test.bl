@@ -1,0 +1,68 @@
+(ns compiler.entry-context-test (:require [expand :as expand] [binding :as binding]))
+
+(defn- form [source] (first (BeamLisp.Reader/read_string source "entry-context.bl")))
+(defn- environment []
+ (assoc (BeamLisp.Compiler/new_env (str "compiler.entry-context." (erlang/unique_integer (list :positive))))
+        :file "entry-context.bl"))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- invalid-context? [action]
+ (try (action) false
+  (catch error
+   (and (= :Elixir.BeamLisp.CompileError (:__struct__ error))
+        (= "entry-context.bl" (:file error))
+        (String/contains? (:message error) "Invalid contextual reference table")))))
+(def invalid-contexts [nil false true [] (list) {:__struct__ :Elixir.InvalidContext}])
+
+(deftest every-expression-entry-refuses-an-explicit-invalid-context-before-effects
+ (let [key :compiler-entry-context-effect source (form "(Process/put :compiler-entry-context-effect :entered)")
+       caller (BeamLisp.Env/capture)]
+  (try
+   (doseq [references invalid-contexts]
+    (let [env (assoc (environment) :contextual-bindings references)]
+     (is (invalid-context? #(BeamLisp.Compiler/compile source env)))
+     (is (invalid-context? #(BeamLisp.Compiler/eval_form source env)))
+     (let [namespace (BeamLisp.Env/current_ns)]
+      (is (invalid-context? #(BeamLisp.Compiler/eval_string "42" env "entry-context.bl")))
+      (is (invalid-context? #(BeamLisp.Compiler/eval_string "" env "entry-context.bl")))
+      (is (= namespace (BeamLisp.Env/current_ns))))
+     (is (= nil (Process/get key)))
+     (is (invalid-context? #(BeamLisp.Ns.Compiler/compile-contextual source (environment) references)))
+     (is (invalid-context? #(BeamLisp.Compiler/prepare_program_entry source (environment) references)))))
+   (finally (Process/delete key) (BeamLisp.Env/bind caller)))))
+
+(deftest invalid-declaration-context-refuses-before-prelink-or-publication
+ (doseq [references invalid-contexts]
+  (let [env (assoc (environment) :contextual-bindings references)
+        ns (:ns env) source (form "(defn answer [] 42)")]
+   (is (invalid-context? #(BeamLisp.Compiler/prepare_function_declaration source env)))
+   (is (invalid-context? #(BeamLisp.Compiler/compile source env)))
+   (is (= :error (BeamLisp.Env/lookup (tuple :link ns "answer"))))
+   (is (empty? (BeamLisp.Env/ns_definition ns "answer")))
+   (is (not (erlang/module_loaded (BeamLisp.Link/module_for ns)))))))
+
+(deftest empty-context-is-explicit-and-does-not-enable-ambient-name-fallback
+ (let [env (assoc (environment) :contextual-bindings {}) literal (form "42")
+       expected (BeamLisp.Compiler/compile literal env)]
+  (is (= 42 (:val expected)))
+  (is (= expected (BeamLisp.Ns.Compiler/compile-contextual literal env {})))
+  (is (= 42 (BeamLisp.Compiler/eval_form literal env)))
+  (is (refused? #(BeamLisp.Compiler/compile (form "missing") env)))
+  (is (refused? #(BeamLisp.Compiler/eval_form (form "missing") env)))
+  (is (= :function-declaration
+         (:kind (BeamLisp.Compiler/prepare_function_declaration (form "(defn answer [] 42)") env))))))
+
+(deftest direct-and-expanded-entries-keep-the-same-selected-reference
+ (let [source "(let [value 42] value)" ns 'compiler-entry-context
+       selected {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                 :sources [{:namespace ns :digest (crypto/hash :sha256 source)}]}
+       world (binding/world selected [] [])
+       expanded (expand/expression source "entry-context.bl"
+                  {:selection (binding/select [world] []) :world (:key world) :namespace ns})
+       env (assoc (BeamLisp.Compiler/new_env (str ns)) :contextual-bindings (:references expanded))
+       direct (BeamLisp.Compiler/with_fresh_names #(BeamLisp.Compiler/compile (:reader expanded) env))
+       contextual (BeamLisp.Ns.Compiler/compile-contextual (:reader expanded) env (:references expanded))
+       declaration (BeamLisp.Compiler/prepare_program_entry (:reader expanded) env (:references expanded))]
+  (is (= direct contextual))
+  (is (= direct (:body (elem (first (:entries declaration)) 3))))
+  (is (= 1 (count (:references expanded))))
+  (is (= 42 (BeamLisp.Compiler/eval_form (:reader expanded) env)))))
