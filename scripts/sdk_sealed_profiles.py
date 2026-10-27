@@ -6,7 +6,7 @@ GROUPS = {
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 88)], ['expand']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24)], ['expand-source', 'expand']),
-    "factory-admission": ([('test/bl/contextual_factory_admission_test.bl', 38), ('test/bl/closed_etf_test.bl', 150), ('test/bl/data_first_order_test.bl', 105)], ['compile.world']),
+    "factory-admission": ([('test/bl/contextual_factory_admission_test.bl', 40), ('test/bl/closed_etf_test.bl', 150), ('test/bl/data_first_order_test.bl', 105)], ['compile.world']),
     "namespace-exports": ([('test/bl/contextual_namespace_exports_test.bl', 41)], ['compile.world', 'system.phase', 'codebase.phase']),
     "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 106)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
     "physical-declaration": ([('test/bl/compiler_physical_declaration_test.bl', 24)], []),

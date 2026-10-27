@@ -136,7 +136,7 @@ class ManifestControls(unittest.TestCase):
         cases = self.read(self.data)
         report = history.audit(cases)
         self.assertEqual(len(cases), 86)
-        self.assertEqual(len(report['open']), 66)
+        self.assertEqual(len(report['open']), 69)
         self.assertFalse(report['executed'])
         self.assertFalse(report['complete_goal'])
 
@@ -158,22 +158,22 @@ class ManifestControls(unittest.TestCase):
         for edit in [{'producer_sha256': 'changed'}, {'selector': {
                 'path': 'absent.bl', 'namespace': 'absent', 'test': 'absent'}}]:
             data = copy.deepcopy(self.data)
-            case = next(c for c in data['cases'] if c['id'] == 'E02')
+            case = next(c for c in data['cases'] if c.get('baseline') and not c['remaining'])
             case['baseline'].update(edit)
             with self.subTest(edit=edit), self.assertRaises(ValueError):
                 self.read(data)
 
     def test_noop_or_missing_anchor_causal_mutation_is_rejected(self):
-        for edit in [{'after': '(Map/put slots root now)'}, {'before': 'missing anchor'}]:
+        for edit in [{'noop': True}, {'before': 'missing anchor'}]:
             data = copy.deepcopy(self.data)
-            case = next(c for c in data['cases'] if c['id'] == 'E02')
-            case['baseline'].update(edit)
+            case = next(c for c in data['cases'] if c.get('baseline') and not c['remaining'])
+            case['baseline'].update({'after': case['baseline']['before']} if edit.get('noop') else edit)
             with self.subTest(edit=edit), self.assertRaises(ValueError):
                 self.read(data)
 
     def test_causal_binding_requires_both_roles_and_no_remaining_variant(self):
         cases = self.read(self.data)
-        case = copy.deepcopy(next(c for c in cases if c['id'] == 'E02'))
+        case = copy.deepcopy(next(c for c in cases if c.get('baseline') and not c['remaining']))
         self.assertTrue(history.controls_bound(case))
         case['remaining'] = ['a variant still needs proof']
         self.assertFalse(history.controls_bound(case))
