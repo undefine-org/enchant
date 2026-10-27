@@ -11,7 +11,7 @@ GROUPS = {
     "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 106)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
     "physical-declaration": ([('test/bl/compiler_physical_declaration_test.bl', 24)], []),
     "boot-isolation": ([('test/bl/contextual_boot_isolation_test.bl', 1)], []),
-    "canonical-calls": ([('test/bl/canonical_call_consumers_test.bl', 18), ('test/bl/reload/registration_test.bl', 23), ('test/bl/reload/reconcile_residual_structural_test.bl', 41)], ['js.actor', 'system.smt', 'termination', 'reload.reconcile-recipe', 'reload.reconcile-values', 'reload.registration']),
+    "canonical-calls": ([('test/bl/canonical_call_consumers_test.bl', 18), ('test/bl/reload/registration_test.bl', 23), ('test/bl/reload/reconcile_residual_structural_test.bl', 41), ('test/bl/system/linear_call_view_test.bl', 6)], ['system.linear', 'js.actor', 'system.smt', 'termination', 'reload.reconcile-recipe', 'reload.reconcile-values', 'reload.registration']),
     "lsp-calls": ([('test/bl/system/lsp_test.bl', 59), ('test/bl/system/lsp_clause_test.bl', 16)], ['lsp']),
     "typed-analysis": ([('test/bl/typed_analysis_boundary_test.bl', 12)], ['typed']),
     "ownership": ([('test/bl/system/ownership_test.bl', 136)], ['compile.world']),

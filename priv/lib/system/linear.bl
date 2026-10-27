@@ -86,7 +86,7 @@
    heaviest scaffolds: a `for` is ~12 nodes of source and ~450 of IR);
    before the fix a 3-deep `for` measured in the thousands."
   [src ns]
-  (let [node (c/compile-node (first (BeamLisp.Reader/read_string src)) (c/new-env ns))
+  (let [node (c/compile (first (BeamLisp.Reader/read_string src)) (c/new-env ns))
         data (c/read-data src)
         src-size (fn src-size [f] (cond (or (list? f) (vector? f)) (reduce + 1 (map src-size f))
                                         (map? f) (reduce + 1 (map src-size (vals f)))
@@ -173,27 +173,10 @@
   #{"lit" "var" "global" "global-exact" "remote" "app" "lett" "iff" "doo" "casee" "fnn" "tryy"
     "recv" "tup" "mapp" "cons-cell" "structt" "clause"})
 
-;; ── THE TWO SHAPES ONE CONSTRUCTOR CALL TAKES ───────────────────────────
-;
-; `(a/lett self outer inner)` is ONE source form that compiles to one of TWO
-; node shapes, decided by how the prefix `a` happens to resolve in the VM doing
-; the analyzing:
-;
-;   {:op :remote :mod :a :fun :lett :args […]}
-;     the prefix read as a HOST MODULE — a direct remote call; and
-;
-;   {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke
-;    :args [{:op :global :ns "a" :name "lett"} …]}
-;     the prefix read as a beam-lisp VAR, so the call is the general RT.invoke
-;     of a fetched fn. anf.global keeps :ns and :name APART, so the spelling
-;     `a/lett` survives only as the pair ("a", "lett").
-;
-; WHICH SHAPE APPEARS DEPENDS ON AMBIENT VM STATE — whether a namespace named
-; `a` is loaded, or the prefix is resolvable, is a property of the warm daemon,
-; not of the source. A recognizer reading only the first shape reports "no
-; violations" over a source that is nothing BUT constructor calls (BUG-054).
-; Both are read here, and the NAMESPACE is what makes a call a constructor: an
-; arbitrary RT.invoke is never one.
+;; Constructors arrive either as canonical callable invocations or as actual
+;; native remote calls. Read the shared call view; a native RT.invoke call is
+;; not a second spelling of callable invocation. Namespace identity decides
+;; whether the callee belongs to the constructor vocabulary.
 
 (def ^:private constructor-ns
   "The beam-lisp namespaces the ANF constructors live in."
@@ -210,32 +193,22 @@
   (let [i (index-of nm "/")]
     (if (and i (>= i 0)) (subs nm (inc i)) nm)))
 
-(defn- invoke-callee
-  "The callee node of an `RT.invoke(callee, args)` application, or nil — the
-   wrapper a var-resolved prefix compiles to (see the note above)."
-  [n]
-  (when (and (ir/node? n) (= :remote (:op n))
-             (= :Elixir.BeamLisp.Ns.Rt (:mod n)) (= "invoke" (str (:fun n))))
-    (first (:args n))))
-
 (defn- global-callee
-  "The `{:op :global :ns :name}` node a call applies — as the direct target of
-   an `:apply`, or as the callee inside an RT.invoke wrapper — or nil."
+  "The exact global callee of a canonical invocation, or nil."
   [n]
-  (let [f (if (= :apply (:op n)) (:fn n) (invoke-callee n))]
+  (let [f (:callee (ir/call-site n))]
     (when (and (ir/node? f) (= :global (:op f))) f)))
 
 (defn- callee-name
-  "The unqualified callee name of a call node, or nil — reading BOTH shapes."
+  "The unqualified name from the canonical call view or a native remote."
   [n]
   (if-let [f (global-callee n)]
     (unqualified (get-in f [:name]))
     (when (= :remote (:op n)) (str (:fun n)))))
 
 (defn- constructor-call?
-  "A call into anf.bl's constructors, in EITHER shape. The NAMESPACE decides,
-   so an arbitrary RT.invoke is never counted: a var-resolved callee must name
-   `a`/`anf`, and a direct remote must target their module."
+  "A call into anf.bl's constructors. An exact global must name `a`/`anf`;
+   an actual native remote must target a constructor module."
   [n]
   (and (ir/node? n)
        (let [nm (callee-name n)]
