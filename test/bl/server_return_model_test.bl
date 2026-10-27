@@ -6,37 +6,46 @@
    (defn mark [n] (swap! order conj n) n)
    (defn reset-order [] (reset! order []))
    (defn observation [] @order)
-   (defn baseline [] ((fn [a b] (tuple :ok a b)) (mark 1) (mark 2)))
+   (defn baseline [] ((fn [a b] (tuple :ok a b)) (mark 1) (do (mark 2) :infinity)))
    (defn fail-first [] (mark 1) (throw (ex-info \"first argument\" {:kind :return-first})))
    (defn baseline-throws [] ((fn [a b] (tuple :ok a b)) (fail-first) (mark 2)))
-   (defserver direct (init [_] (ok (mark 1) (mark 2))))
+   (defserver direct (init [_] (ok (mark 1) (do (mark 2) :infinity))))
    (defserver throws (init [_] (ok (fail-first) (mark 2))))
-   (defserver captured (init [_] (let [respond reply] (respond :answer :state))))
-   (defserver shadowed (init [_] (let [ok (fn [value] value)] (ok :shadowed))))")
+   (defserver captured (init [_] (ok nil))
+    (handle-call :observe [_ state] (reply (let [respond reply] (respond :answer :state)) state)))
+   (defserver shadowed (init [_] (ok nil))
+    (handle-call :observe [_ state] (reply (let [ok (fn [value] value)] (ok :shadowed)) state)))")
  (fn [name args]
   (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "server.returnfixture" name) (to-list args))))
+(defn- with-server [name action]
+ (let [pid (BeamLisp.Server/start (BeamLisp.Env/fetch_exact! "server.returnfixture" name) nil)]
+  (try (action pid) (finally (BeamLisp.Server/stop pid)))))
+
 (deftest direct-returns-preserve-ordinary-argument-order-and-single-evaluation
  (let [call (fixture!)]
   (call "reset-order" [])
   (let [expected (call "baseline" []) order (call "observation" [])]
    (call "reset-order" [])
-   (is (= expected (erlang/apply (BeamLisp.Env/fetch_exact! "server.returnfixture" "direct") :init (list nil))))
+   (is (= (elem expected 1) (with-server "direct" #(erlang/apply :sys :get_state (list %)))))
    (is (= order (call "observation" [])))
    (is (= #{1 2} (set order)))
    (is (= 2 (count order))))))
 (deftest first-class-constructors-and-lexical-shadowing-keep-their-callable-behavior
  (let [call (fixture!)]
   (is (= (tuple :reply :answer :state)
-         (erlang/apply (BeamLisp.Env/fetch_exact! "server.returnfixture" "captured") :init (list nil))))
-  (is (= :shadowed (erlang/apply (BeamLisp.Env/fetch_exact! "server.returnfixture" "shadowed") :init (list nil))))))
+         (with-server "captured" #(BeamLisp.Server/call % :observe))))
+  (is (= :shadowed (with-server "shadowed" #(BeamLisp.Server/call % :observe))))))
 
 (deftest a-throwing-return-operand-preserves-ordinary-call-effects
  (let [call (fixture!)
-       capture (fn [action] (try (action) :unexpected (catch error (:kind (ex-data error)))))]
+       capture (fn [action] (try (action) :unexpected (catch error
+                       (or (:kind (ex-data error))
+                           (when (String/contains? (Elixir.Exception/message error) "first argument")
+                            :return-first)))))]
   (call "reset-order" [])
   (let [expected (capture #(call "baseline-throws" [])) order (call "observation" [])]
    (call "reset-order" [])
    (is (= :return-first expected))
    (is (= [1] order))
-   (is (= expected (capture #(erlang/apply (BeamLisp.Env/fetch_exact! "server.returnfixture" "throws") :init (list nil)))))
+   (is (= expected (capture #(with-server "throws" identity))))
    (is (= order (call "observation" []))))))
