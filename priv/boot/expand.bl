@@ -544,11 +544,32 @@
                (update :link-order #(cons name %))
                (update :link-active #(dissoc % name))))))))))
 
-(defn- prepare-entry [reader namespace file references links]
- ;; The compiler preserves expression scope before synthesizing the canonical
- ;; entry declaration. Analysis and artifacts project the same compiled body.
- (BeamLisp.Compiler/prepare_program_entry reader
-  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file) references links))
+(defn- runtime-roots [unit state]
+ ;; A namespace exports its declarations, including ones the entry never calls.
+ ;; Provider recipes remain dependencies; each provider's own compilation owns
+ ;; its exports. Phase-only values are never runtime roots.
+ (Enum/reduce (Enum/sort_by (Map/values (:recipes unit)) #(get-in % [:declaration :path]))
+   (tuple (list) state)
+   (fn [recipe result]
+    (let [declaration (:declaration recipe) current (elem result 1)]
+     (if (and (= 0 (:phase declaration)) (contains? #{:function :value} (:kind declaration)))
+      (let [resolved (b/resolve (:selection current)
+                       (s/identifier (:name declaration) (:context unit)) 0 1073741823)
+            _ (when-not (and (= :resolved (:status resolved))
+                              (= (:id declaration) (get-in resolved [:declaration :id])))
+                (refuse! :contextual-export-resolution (:node recipe)))
+            reference (:reference resolved) name (internal-name reference)
+            descriptor {:reference reference :declaration (:declaration resolved)}
+            current (link-reference name descriptor (assoc-in current [:references name] descriptor))]
+       (tuple (if (= :public (:visibility declaration)) (Enum/concat (elem result 0) (list name))
+                  (elem result 0)) current))
+      result)))))
+
+(defn- prepare-entry [reader namespace file references links exports]
+ ;; The compiler preserves expression scope and owns both entry and export
+ ;; projections of this one graph; neither projection evaluates Source.
+ (compiler/prepare-program-unit reader
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file) references links exports))
 
 (defn- demand-transformer [reference state]
  (let [key (:id reference)]
@@ -612,13 +633,15 @@
              (expression-node (contextualize (:node expression) unit)
                (assoc current :position (:position expression)))))
        state (link-dependencies (:dependencies (elem r 1)) (elem r 1))
+       roots (runtime-roots unit state) state (elem roots 1)
        readers (elem r 0)
        reader (cond (empty? readers) nil
                                 (= 1 (count readers)) (first readers)
                                 :else (tuple :list (cons (tuple :symbol "do") readers)))
-       declaration (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state))
+       prepared (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state) (elem roots 0))
+       declaration (:declaration prepared)
        node (:body (elem (first (:entries declaration)) 3))
-       result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node
+       result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node :unit (:unit prepared)
    :provenance (catalog/provenance catalog)
    :selection (b/freeze (:selection state)) :references (:references state)
    :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
