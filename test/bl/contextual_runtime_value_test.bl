@@ -1,0 +1,114 @@
+(ns contextual-runtime-value-test
+ (:require [expand :as expand] [lower :as lower] [system.phase :as phase] [compiler :as compiler] [anf :as a] [compile.world :as world]))
+(defn- unit [namespace text]
+ {:namespace namespace :revision 'current :file (str namespace ".bl") :source text})
+(defn- prepare [text]
+ (expand/program [(unit 'values (str "(ns values) " text))] ['values 'current]))
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom
+                  (str "Elixir.RuntimeValues." (erlang/unique_integer (list :positive)))) (:node program)))
+
+(deftest phase-zero-closure-values-are-runtime-bindings-not-constructor-literals
+ (let [program (prepare "(def offset 40) (def answer (fn [value] (erlang/+ offset value))) (answer 2)")]
+  (is (= 0 (get-in program [:constructor :values])))
+  (is (= 0 (get-in program [:constructor :calls])))
+  (is (= :proved (:status (phase/check program))))
+  (is (= 42 (execute program)))))
+
+(deftest value-initializers-and-expressions-preserve-authored-order-without-preparation-effects
+ (erlang/erase :runtime-value-order)
+ (try
+  (let [program (prepare
+    "(erlang/put :runtime-value-order :first)
+     (def first-value (erlang/get :runtime-value-order))
+     (erlang/put :runtime-value-order :second)
+     (def second-value (erlang/get :runtime-value-order))
+     [first-value second-value]")]
+   (is (= :undefined (erlang/get :runtime-value-order)))
+   (is (= [:first :second] (execute program)))
+   (is (= :second (erlang/get :runtime-value-order))))
+  (finally (erlang/erase :runtime-value-order))))
+
+(deftest initialization-failure-stops-later-bindings-and-expressions
+ (erlang/erase :runtime-value-order)
+ (try
+  (let [program (prepare
+    "(erlang/put :runtime-value-order :started)
+     (def stopped (erlang/error :runtime-value-stop))
+     (erlang/put :runtime-value-order :too-late) stopped")]
+   (is (= :undefined (erlang/get :runtime-value-order)))
+   (is (= :runtime-value-stop
+          (try (execute program) :unexpected-success
+           (catch error (BeamLisp.ExInfo/ex_original error)))))
+   (is (= :started (erlang/get :runtime-value-order))))
+  (finally (erlang/erase :runtime-value-order))))
+
+(deftest archived-runtime-closure-values-retain-private-selected-captures
+ (let [library (expand/decode-phase-library
+                (expand/encode-phase-library
+                 (expand/phase-library [(unit 'provider
+                    "(ns provider) (def ^:private offset 40) (def answer (fn [value] (erlang/+ offset value)))")])))
+       program (expand/program [(unit 'client
+                 "(ns client) (import-world 'provider 'current :only [answer]) (answer 2)")]
+                ['client 'current] [library])]
+  (is (= 0 (get-in program [:constructor :calls])))
+  (is (= :proved (:status (phase/check program))))
+  (is (= 42 (execute program)))))
+
+(deftest function-captures-can-be-constructed-after-their-earlier-source-declaration
+ (let [program (prepare "(defn answer [] offset) (def offset 42) (answer)")]
+  (is (= 42 (execute program)))
+  (is (= 0 (get-in program [:constructor :calls])))))
+
+(deftest module-initialization-runs-once-per-instance-and-entry-only-reads-its-result
+ (erlang/put :runtime-value-order 0)
+ (try
+  (let [program (prepare "(def value 42) (erlang/put :runtime-value-order (erlang/+ (erlang/get :runtime-value-order) 1)) value")
+        instance (lower/eval-anf :Elixir.RuntimeValueInstance (compiler/contextual-unit-factory (:unit program)))]
+   (is (= 1 (erlang/get :runtime-value-order)))
+   (is (= 42 ((:entry instance))))
+   (is (= 42 ((:entry instance))))
+   (is (= 1 (erlang/get :runtime-value-order))))
+  (finally (erlang/erase :runtime-value-order))))
+
+(deftest an-expression-before-a-later-definition-is-captured-at-its-authored-position
+ (erlang/erase :runtime-value-order)
+ (try
+  (let [program (prepare "(erlang/put :runtime-value-order :before) (def value (erlang/get :runtime-value-order))")]
+   (is (= :undefined (erlang/get :runtime-value-order)))
+   (is (= :undefined (execute program)))
+   (is (= :before (erlang/get :runtime-value-order))))
+  (finally (erlang/erase :runtime-value-order))))
+
+(deftest deferred-inputs-refuse-before-any-collection-callback
+ (let [called (atom 0) deferred (lazy-seq (do (swap! called inc) (list)))
+       env (compiler/new-env "values")]
+  (is (thrown? (compiler/prepare-program-unit nil env {} deferred (list) (list))))
+  (is (thrown? (compiler/prepare-program-unit nil env {} (list) (list) deferred)))
+  (is (= 0 @called))))
+
+
+(deftest world-artifact-is-passive-and-its-factory-owns-ordered-initialization
+ (let [dir (Path/join (System/tmp_dir!) (str "runtime-world-" (erlang/unique_integer (list :positive))))
+       module :Elixir.RuntimeWorldOrdered]
+  (File/mkdir_p! dir)
+  (erlang/erase :runtime-world-order)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns values) (erlang/put :runtime-world-order :started) (def offset 40) (def answer (fn [x] (erlang/+ offset x))) (answer 2)")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['values 'current] :sources [{:namespace 'values :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         pair (world/artifact prepared module)]
+    (is (= :undefined (erlang/get :runtime-world-order)))
+    (is (= 2 (get-in prepared [:program :unit :version])))
+    (code/load_binary module '() (elem pair 1))
+    (is (= :undefined (erlang/get :runtime-world-order)))
+    (let [instance (erlang/apply module :__bl_unit__ (list))]
+     (is (= :started (erlang/get :runtime-world-order)))
+     (is (= 42 ((:entry instance))))
+     (erlang/put :runtime-world-order :after)
+     (is (= 42 ((:entry instance))))
+     (is (= :after (erlang/get :runtime-world-order)))))
+   (finally (code/delete module) (code/purge module)
+            (erlang/erase :runtime-world-order) (File/rm_rf! dir)))))

@@ -4994,7 +4994,8 @@
                        (tuple {:name name :reference reference :slot variable :node init}
                               (assoc targets reference (a/var variable))))))
           body (a/link-bindings (compile form env) (elem compiled 1))]
-     {:version 1 :kind :compiled-contextual-unit :initializers (elem compiled 0)
+     {:version 2 :kind :compiled-contextual-unit :initializers (elem compiled 0)
+      :steps (Enum/map (elem compiled 0) (fn [row] {:op :initialize :reference (:reference row)}))
       :entry body :exports (list)}))))
 
 (defn compile-contextual-unit
@@ -5013,13 +5014,12 @@
   (compile-error env "Invalid contextual callable parameters"))
  (let [locals (Map/new (Enum/map parameters #(tuple % %)))
        unit (prepare-contextual-unit form (assoc env :locals locals) references links)
-       body (reduce (fn [inner link] (a/lett (:slot link) (:node link) inner))
-                    (:entry unit) (reverse (:initializers unit)))
+       body (a/contextual-unit-body unit (:entry unit))
        callable (a/fnn (list (a/clause (Enum/map parameters #(a/pvar %)) nil body)))]
   ;; Validate the actual closed callable before returning it. The constructor
   ;; interpreter supplies session-owned values at invocation; no native grant.
-  (a/contextual-unit-entry {:version 1 :kind :compiled-contextual-unit
-                           :initializers (list) :entry callable :exports (list)})))
+  (a/contextual-unit-entry {:version 2 :kind :compiled-contextual-unit
+                           :initializers (list) :steps (list) :entry callable :exports (list)})))
 
 (defn compile-contextual
   "Compile an expanded expression through the canonical compiler. This analysis
@@ -5039,14 +5039,101 @@
          clause (function-clause :run (list) nil node env)]
     (function-declaration "run" (list (tuple :fixed 0 :run clause)) nil env))))
 
+(defn- unit-node-dependencies [node]
+ ;; Reuse the executable grammar owner, including latent bodies and pattern
+ ;; keys. Annotations and literal lookalikes cannot create dependencies.
+ (Enum/uniq (Enum/flat_map (:edges (a/execution-dependencies (list node)))
+  (fn [edge]
+   (let [evidence (:evidence edge)]
+    (if (and (= :captured-value (:kind edge)) (= :anf (get evidence 0)) (= :binding (get evidence 1)))
+     (list (get evidence 2)) (list)))))))
+
+(defn- unit-append-binding [row state]
+ (let [row (select-keys row [:name :reference :slot :node])
+       row (assoc row :node (a/link-bindings (:node row) (:targets state)))]
+  (-> state
+      (update :initializers #(conj % row))
+      (update :steps #(conj % {:op :initialize :reference (:reference row)}))
+      (assoc-in [:targets (:reference row)] (a/var (:slot row))))))
+
+(defn- unit-require-function [reference table env state]
+ (if (contains? (:targets state) reference) state
+  (let [row (get table reference)]
+   (when-not (and row (= :function (:kind row)))
+    (compile-error env "Runtime initialization reads a value before its Source initialization"))
+   (when (contains? (:active state) reference)
+    (compile-error env "Cyclic runtime function initialization"))
+   (let [state (reduce (fn [state dependency] (unit-require-function dependency table env state))
+                 (update state :active #(conj % reference)) (unit-node-dependencies (:node row)))]
+    (update (unit-append-binding row state) :active #(disj % reference))))))
+
+(defn- unit-require-node [node table env state]
+ (reduce (fn [state reference] (unit-require-function reference table env state))
+         state (unit-node-dependencies node)))
+
+(defn- prepare-ordered-program-unit [env references links events]
+ (with-fresh-names
+  (fn []
+   (let [env (checked-context-env (assoc env :contextual-bindings references))
+         _ (when-not (and (erlang/is_list links) (erlang/is_list events))
+             (compile-error env "Runtime initialization requires finite eager lists"))
+         _ (BeamLisp.CompilerData/check_reader_data! (list links events))
+         rows (Enum/map links
+                (fn [link]
+                 (when-not (and (erlang/is_tuple link) (= 2 (erlang/tuple_size link))
+                                (erlang/is_binary (elem link 0)) (not= "" (elem link 0)))
+                  (compile-error env "Invalid runtime initialization link"))
+                 (let [name (elem link 0) descriptor (get references name)
+                       reader (rn/node-form (elem link 1))
+                       head (when (= :list (rn/node-tag reader)) (rn/node-form (first (rn/node-items reader))))]
+                  (when-not (and descriptor (not (local? env name))
+                                 (not= :local (get-in descriptor [:declaration :visibility]))
+                                 (contains? #{:function :value} (get-in descriptor [:declaration :kind])))
+                   (compile-error env "Runtime initialization is not a selected binding"))
+                  (a/binding-value (:reference descriptor))
+                  (when (and (= :function (get-in descriptor [:declaration :kind]))
+                             (not (and (= :list (rn/node-tag reader))
+                                       (= :symbol (rn/node-tag head)) (= "fn" (rn/node-name head)))))
+                   (compile-error env "Runtime function initializer must be an actual function form"))
+                  {:name name :reference (:reference descriptor) :kind (get-in descriptor [:declaration :kind])
+                   :slot (fresh-var name) :node (compile (elem link 1) (notail env))})))
+         table (Map/new (Enum/map rows #(tuple (:reference %) %)))
+         names (Map/new (Enum/map rows #(tuple (:name %) (:reference %))))
+         _ (when-not (and (erlang/is_list events) (= (count rows) (erlang/map_size table)) (= (count rows) (erlang/map_size names)))
+             (compile-error env "Invalid runtime initialization table"))
+         state (reduce
+                 (fn [state event]
+                  (case (:op event)
+                   :initialize
+                   (let [row (get table (get names (:name event)))]
+                    (when-not (and row (not (contains? (:targets state) (:reference row))))
+                     (compile-error env "Repeated or unknown runtime initializer"))
+                    (unit-append-binding row (unit-require-node (:node row) table env state)))
+                   :evaluate
+                   (let [node (compile (:reader event) (notail env))
+                         state (unit-require-node node table env state)]
+                    (update state :steps #(conj % {:op :evaluate :node (a/link-bindings node (:targets state))})))
+                   :capture
+                   (let [node (compile (:reader event) (notail env))
+                         state (unit-require-node node table env state)
+                         slot (fresh-var "unit_result")]
+                    (-> state
+                        (update :steps #(conj % {:op :capture :slot slot :node (a/link-bindings node (:targets state))}))
+                        (assoc :entry (a/var slot))))
+                   (compile-error env "Unknown runtime initialization operation")))
+                 {:initializers [] :steps [] :targets {} :active #{} :entry (a/lit nil)} events)
+         state (reduce (fn [state row] (unit-require-function (:reference row) table env state)) state rows)]
+    {:version 2 :kind :compiled-contextual-unit :initializers (to-list (:initializers state))
+     :steps (to-list (:steps state)) :entry (:entry state) :exports (list)}))))
+
 (defn prepare-program-unit
  "Prepare one runtime unit graph and its canonical expression entry once.
   Export names are compiler-internal selected names derived by the catalog;
   values stay in the same lexical unit as their private dependencies."
- [form env references links exports]
+ [form env references links exports events]
  (when-not (and (erlang/is_list exports) (= (count exports) (count (Enum/uniq exports))))
   (compile-error env "Invalid contextual export table"))
- (let [unit (prepare-contextual-unit form env references links)
+ (let [unit (prepare-ordered-program-unit env references links events)
        targets (Map/new (Enum/map (:initializers unit) (fn [link] (tuple (:name link) (:reference link)))))
        exported (Enum/map exports
                   (fn [name]
@@ -5062,8 +5149,9 @@
 
 (defn contextual-unit-factory
  "Project the same compiled graph as a first-class unit instance. Creating an
-  instance constructs closures; it does not execute the entry thunk. These
-  data grant no provenance, activation, admission or retirement authority."
+  instance executes its ordered module initialization once; its entry reads
+  the captured result. These data grant no provenance, activation, admission
+  or retirement authority."
  [unit]
  (a/contextual-unit-factory unit))
 

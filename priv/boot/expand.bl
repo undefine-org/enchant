@@ -519,8 +519,6 @@
 
 (defn- link-reference [name descriptor state]
  (if (contains? (:linked state) name) state
-  (if-let [constant (get-in state [:constant-readers name])]
-   (-> state (assoc-in [:linked name] constant) (update :link-order #(cons name %)))
   (if-let [identity (when (:evaluation-phase state) (get-in state [:phase-values name]))]
    (-> state (assoc-in [:linked name] :phase-value) (update :link-order #(cons name %)))
   (do
@@ -536,18 +534,17 @@
           unit (get-in state [:catalog :worlds (:world recipe)])
           value? (= :value (get-in recipe [:declaration :kind]))
           phase-value? (and value? (:evaluation-phase state))
-          node (when value?
+          node (when phase-value?
                  (compile-phase-reader (elem r 0) unit state))
-          result (when value?
-                  (if phase-value?
-                   (BeamLisp.AOT/bind_constructor_session! (:constructor-session state) node {} (phase-bindings state))
-                   (BeamLisp.AOT/eval_constructor_session! (:constructor-session state) node {} (phase-bindings state))))
-          reader (cond phase-value? :phase-value value? (quote-reader result (:context unit)) :else (elem r 0))]
-     (-> (cond phase-value? (assoc-in state [:phase-values name] result)
-               value? (assoc-in state [:constant-readers name] reader) :else state)
+          result (when phase-value?
+                   (BeamLisp.AOT/bind_constructor_session! (:constructor-session state) node {} (phase-bindings state)))
+          ;; Phase-zero values are runtime initializers, including closures.
+          ;; Only an actual expansion-phase value belongs to this session.
+          reader (if phase-value? :phase-value (elem r 0))]
+     (-> (if phase-value? (assoc-in state [:phase-values name] result) state)
                (assoc-in [:linked name] reader)
                (update :link-order #(cons name %))
-               (update :link-active #(dissoc % name))))))))))
+               (update :link-active #(dissoc % name)))))))))
 
 (defn- runtime-roots [unit state]
  ;; A namespace exports its declarations, including ones the entry never calls.
@@ -570,11 +567,36 @@
                   (elem result 0)) current))
       result)))))
 
-(defn- prepare-entry [reader namespace file references links exports]
+(defn- runtime-events [unit state expressions]
+ (let [main-world (get-in unit [:world :key])
+       values (Enum/flat_map (unit-links state)
+                (fn [link]
+                 (let [name (elem link 0) descriptor (get-in state [:references name])
+                       reference (:reference descriptor)
+                       recipe (get-in state [:catalog :recipes (:declaration reference)])]
+                  (if (= :value (get-in descriptor [:declaration :kind]))
+                   (list {:world (:world reference) :position (:position recipe)
+                          :event {:op :initialize :name name}}) (list)))))
+       external (Enum/reject values #(= main-world (:world %)))
+       worlds (Enum/uniq (Enum/map external #(:world %)))
+       external-events (Enum/flat_map worlds
+                         (fn [world]
+                          (Enum/map (Enum/sort_by (Enum/filter external #(= world (:world %))) #(:position %)) #(:event %))))
+       last-expression (when (seq expressions) (:position (last expressions)))
+       local-events (Enum/concat
+                      (Enum/filter values #(= main-world (:world %)))
+                      (Enum/map expressions
+                       (fn [expression]
+                        {:position (:position expression)
+                         :event {:op (if (= last-expression (:position expression)) :capture :evaluate)
+                                 :reader (:reader expression)}})))]
+  (Enum/concat external-events (Enum/map (Enum/sort_by local-events #(:position %)) #(:event %)))))
+
+(defn- prepare-entry [reader namespace file references links exports events]
  ;; The compiler preserves expression scope and owns both entry and export
  ;; projections of this one graph; neither projection evaluates Source.
  (compiler/prepare-program-unit reader
-  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file) references links exports))
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file) references links exports events))
 
 (defn- demand-transformer [reference state]
  (let [key (:id reference)]
@@ -635,15 +657,17 @@
        ;; shared across the entire unit, never reset for each initializer.
        r (Enum/map_reduce expressions state
            (fn [expression current]
-             (expression-node (contextualize (:node expression) unit)
-               (assoc current :position (:position expression)))))
+             (let [expanded (expression-node (contextualize (:node expression) unit)
+                              (assoc current :position (:position expression)))]
+              (tuple {:reader (elem expanded 0) :position (:position expression)} (elem expanded 1)))))
        state (link-dependencies (:dependencies (elem r 1)) (elem r 1))
        roots (runtime-roots unit state) state (elem roots 1)
-       readers (elem r 0)
+       readers (Enum/map (elem r 0) #(:reader %))
+       events (runtime-events unit state (elem r 0))
        reader (cond (empty? readers) nil
                                 (= 1 (count readers)) (first readers)
                                 :else (tuple :list (cons (tuple :symbol "do") readers)))
-       prepared (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state) (elem roots 0))
+       prepared (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state) (elem roots 0) events)
        declaration (:declaration prepared)
        node (:body (elem (first (:entries declaration)) 3))
        result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node :unit (:unit prepared)
