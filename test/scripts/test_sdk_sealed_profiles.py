@@ -50,6 +50,13 @@ class SealedProfiles(unittest.TestCase):
         self.assertTrue(fixed.issubset(selection['roots']))
         self.assertNotIn('java.manifest', PROFILE['plan'](['filesystem-custody'])['roots'])
 
+    def test_factory_profile_carries_actual_sealed_fixture_helpers(self):
+        selection = PROFILE['plan'](['sealed-loader'])
+        self.assertIn('test.support.source-fixtures', selection['roots'])
+        producer = (ROOT / 'scripts/demo-sdk-artifacts').read_text()
+        for name in ['source_effect_observer.bl', 'source_instance_guard.bl', 'unit_instance_observer.bl']:
+            self.assertIn("root / 'test/fixtures/" + name + "'", producer)
+
     def test_empty_duplicate_and_unknown_boundaries_refuse(self):
         for requested in [[], ['missing'], ['sealed-loader', 'sealed-loader']]:
             with self.subTest(requested=requested), self.assertRaises(ValueError):
