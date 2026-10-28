@@ -179,7 +179,7 @@
  (let [world (b/world (:selection data) (:scopes data) (Enum/map (:declarations data) #(dissoc % :id)))]
   (when-not (= data (portable-world world)) (refuse! :phase-library-world nil)) world))
 
-(defn- library-units [library]
+(defn- canonical-library [library]
  (BeamLisp.CompilerData/check_first_order! library
   {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
  (when-not (and (erlang/is_map library) (not (contains? library :__struct__))
@@ -189,6 +189,62 @@
                 (= (:digest library) (crypto/hash :sha256 (erlang/term_to_binary (dissoc library :digest) (list :deterministic)))))
   (refuse! :phase-library-integrity nil))
  (when (> (count (:units library)) 128) (refuse! :phase-source-bound nil))
+ (if (= 1 (:version library))
+  ;; Legacy bytes are input data, never a second execution schema. Check their
+  ;; original digest above, then normalize once with explicitly unknown origins.
+  (let [units (Enum/map (:units library)
+               (fn [unit]
+                (when-not (and (erlang/is_map unit) (erlang/is_list (:imports unit)))
+                 (refuse! :phase-library-unit nil))
+                (update unit :imports
+                 (fn [requests]
+                  (Enum/map requests
+                   (fn [request]
+                    (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
+                                   (= #{:provider :revision :phase :shift :only :alias :path}
+                                      (set (keys request))))
+                     (refuse! :phase-library-import nil))
+                    (assoc request :only-origins {})))))))
+        current (assoc (dissoc library :digest) :version 2 :units units)]
+   (assoc current :digest (crypto/hash :sha256 (erlang/term_to_binary current (list :deterministic)))))
+  library))
+
+(defn- check-library-import! [unit world request scope]
+ (let [required #{:provider :revision :phase :shift :only :only-origins :alias :path}
+       allowed (conj required :scope-path)]
+  (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
+                 (every? #(contains? request %) required)
+                 (every? #(contains? allowed %) (keys request))
+                 (symbol? (:provider request)) (symbol? (:revision request))
+                 (erlang/is_integer (:phase request)) (<= 0 (:phase request) 32)
+                 (contains? (get-in unit [:context :scopes]) (:phase request))
+                 (erlang/is_integer (:shift request)) (<= -4096 (:shift request) 4096)
+                 (or (nil? (:alias request)) (symbol? (:alias request)))
+                 (erlang/is_list (:only request)) (<= 1 (count (:only request)) 256)
+                 (every? #(symbol? %) (:only request))
+                 (= (:only request) (Enum/uniq (:only request)))
+                 (erlang/is_list (:path request))
+                 (erlang/is_map (:only-origins request)) (not (contains? (:only-origins request) :__struct__))
+                 (every? #(Enum/member? (:only request) %) (keys (:only-origins request)))
+                 (every? #(or (nil? %) (and (erlang/is_map %) (not (contains? % :__struct__))))
+                          (Map/values (:only-origins request))))
+   (refuse! :phase-library-import nil))
+  (doseq [name (Enum/concat (cons (:provider request) (:only request))
+                 (if (:alias request) (list (:alias request)) (list)))]
+   (b/check-name! name))
+  ;; Revisions are quoted syntax symbols, and can include qualified spelling;
+  ;; they are not unqualified binding names.
+  (s/identifier (:revision request) (:context unit))
+  (when (contains? request :scope-path)
+   (when-not (and (= 3 (count (:path request)))
+                  (= (cons 1 (:path request)) (:scope-path request))
+                  (= 0 (:phase request)) (= 0 (:shift request)))
+    (refuse! :phase-library-import-scope nil)))
+  (let [expected (import-scope (:selection world) (:namespace unit) request)]
+   (when-not (and (= expected scope) (= scope (get-in world [:scopes (:id expected)])))
+    (refuse! :phase-library-import-scope nil)))))
+
+(defn- restore-library-units [library]
  (Enum/map (:units library)
   (fn [unit]
    (let [world (restore-world (:world unit))
@@ -206,6 +262,20 @@
                    (= (count (:imports unit)) (count (:import-scopes unit)))
                    (empty? (:expressions unit)))
      (refuse! :phase-library-unit nil))
+    (s/identifier (:revision unit) context)
+    (when-not (and (erlang/is_list (:imports unit)) (erlang/is_list (:import-scopes unit))
+                   (contains? (get-in unit [:context :scopes]) 0)
+                   (= 'syntax-v1 (get-in world [:selection :profile]))
+                   (= 'beam-v1 (get-in world [:selection :target]))
+                   (= 1 (count (get-in world [:selection :sources])))
+                   (= (:namespace unit) (:namespace (first (get-in world [:selection :sources]))))
+                   (= (count (:import-scopes unit)) (count (Enum/uniq (:import-scopes unit))))
+                   (= (set (Map/values (:scopes world)))
+                      (set (Enum/concat (Enum/map phases #(module-scope (:selection world) (:namespace unit) %))
+                                         (:import-scopes unit)))))
+     (refuse! :phase-library-unit nil))
+    (Enum/each (Enum/zip (:imports unit) (:import-scopes unit))
+      (fn [pair] (check-library-import! unit world (elem pair 0) (elem pair 1))))
     (Enum/each (Map/to_list (:recipes unit))
      (fn [pair]
       (let [id (elem pair 0) recipe (elem pair 1) d (Map/fetch! (:by-id world) id)
@@ -221,6 +291,12 @@
         (refuse! :phase-library-recipe node))
        (when-not (= node (s/from-node (s/to-reader node) context))
         (refuse! :phase-library-context node))))) (assoc unit :world world)))))
+
+(defn- checked-library [input]
+ (let [library (canonical-library input)]
+  (tuple library (restore-library-units library))))
+
+(defn- library-units [input] (elem (checked-library input) 1))
 
 (defn catalog
  "Read finite source revisions once. Multiple revisions of one namespace are
@@ -318,17 +394,17 @@
      (fn [pair] (library-atoms! (elem pair 0) vocabulary) (library-atoms! (elem pair 1) vocabulary)))
   :else nil))
 
-(defn encode-library [library]
- (library-units library)
- (library-atoms! library (library-vocabulary))
- (erlang/term_to_binary library (list :deterministic)))
+(defn encode-library [input]
+ (let [library (elem (checked-library input) 0)]
+  (library-atoms! library (library-vocabulary))
+  (erlang/term_to_binary library (list :deterministic))))
 
 (defn decode-library [bytes]
  (let [vocabulary (library-vocabulary)
        library (BeamLisp.CompilerData/decode_closed_etf! bytes
                  {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
-  (library-units library)
-  (library-atoms! library vocabulary) library))
+  (let [current (elem (checked-library library) 0)]
+   (library-atoms! current vocabulary) current)))
 
 (defn provenance
  "Source coordinates from the catalog, separate from logical binding identity.
