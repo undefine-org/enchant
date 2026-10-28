@@ -17,7 +17,13 @@ if expected_root = System.get_env("BL_RUNTIME_EXPECT_ROOT") do
 end
 {:ok,[manifest]}=:file.consult(String.to_charlist(Path.join(BeamLisp.Bootstrap.seed_dir(),"manifest.term")))
 producer=manifest["compiler_key"]
-unless BeamLisp.AOTCache.current_compiler_key()!=producer, do: raise "source-free control did not lose compiler Source identity"
+support_root = Path.dirname(BeamLisp.Tiers.priv_root())
+for pattern <- ["**/*.bl", "**/*.bl.md", "**/*.phase"] do
+ unless Path.wildcard(Path.join(support_root, pattern)) == [],
+   do: raise("compiled runtime contains Source or phase inputs")
+end
+unless BeamLisp.AOTCache.current_compiler_key()==producer,
+  do: raise("packaged compiler identity does not match its verified floor")
 observed=[BeamLisp.Reader,BeamLisp.Compiler,BeamLisp.Ns.Reader,BeamLisp.Ns.Body.Reader,
           BeamLisp.Ns.Compiler,BeamLisp.Ns.Body.Compiler]
 patterns=Enum.flat_map(observed,fn module ->
@@ -51,13 +57,22 @@ second_owner=Process.whereis(BeamLisp.Env)
 unless first_owner != second_owner and Process.alive?(second_owner), do: raise "runtime did not recover actual Env ownership"
 false=BeamLisp.Env.retire_module!(BeamLisp.Ns.Body.Rt)
 false=BeamLisp.Env.seeded?()
-for {name,expected} <- [{"language",[42,102,42,42]},{"query",[4,6]},
-                        {"mailbox",[42,107,99]},{"cleanup",[42,100,40,200]}] do
- result=BeamLisp.run_runtime_artifact(Path.join(showcases,name),[])
- actual=if is_struct(result,BeamLisp.Vector), do: BeamLisp.Vector.to_list(result), else: result
- unless actual==expected, do: raise "runtime showcase #{name}: #{inspect(actual)}"
- IO.puts("RUNTIME-SHOWCASE #{name} #{inspect(actual,charlists: :as_lists)}")
-end
+showcase_failures = Enum.flat_map(
+ [{"language",[42,102,42,42]},{"query",[4,6]},
+  {"mailbox",[42,107,99]},{"cleanup",[42,100,40,200]}], fn {name,expected} ->
+ try do
+  result=BeamLisp.run_runtime_artifact(Path.join(showcases,name),[])
+  actual=if is_struct(result,BeamLisp.Vector), do: BeamLisp.Vector.to_list(result), else: result
+  unless actual==expected, do: raise "runtime showcase #{name}: #{inspect(actual)}"
+  IO.puts("RUNTIME-SHOWCASE #{name} #{inspect(actual,charlists: :as_lists)}")
+  []
+ rescue
+  error ->
+   message = Exception.message(error)
+   IO.puts(:stderr, "RUNTIME-SHOWCASE-FAILED #{name} #{message}")
+   [{name,message}]
+ end
+end)
 Process.delete(:"contextual-cleanup-log")
 replacement=File.read!(System.fetch_env!("BL_RUNTIME_REPLACEMENT"))
 before=BeamLisp.Ns.Body.Rt.module_info(:md5)
@@ -83,3 +98,4 @@ compiler_calls = Map.delete(calls, {BeamLisp.AOT, :runtime_floor!})
 unless compiler_calls == %{}, do: raise "runtime executed compiler work: #{inspect(compiler_calls)}"
 unless floor_captures == 2, do: raise "warm entries recaptured the support floor: #{floor_captures}"
 IO.puts("STANDALONE-RUNTIME #{inspect(BeamLisp.Vector.to_list(value),charlists: :as_lists)} compiler-calls=0 exact-floor-retained=true compiler-seeded=false env-restarted=true replacement-refused=true floor-captures=#{floor_captures} warm-recaptures=0")
+unless showcase_failures == [], do: raise("runtime showcases failed: #{inspect(showcase_failures)}")

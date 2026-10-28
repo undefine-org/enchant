@@ -19,6 +19,12 @@ count = fn ->
   :ets.tab2list(:beam_lisp_code_leases)
   |> Enum.count(fn {{module, lease_owner, _}, _} -> lease_owner == owner and module in modules end)
 end
+floor_lease = fn ->
+  [{:runtime_floor, proof}] = Agent.get(owner, fn _ ->
+    :ets.lookup(:beam_lisp_source_lease_domains, :runtime_floor)
+  end)
+  proof.lease
+end
 commit = fn -> BeamLisp.Env.commit_runtime_floor!(owner, modules, identity, floor.identity, fingerprints) end
 
 # Contention is retried by the requester. The actual owner must stay responsive.
@@ -74,6 +80,7 @@ try do
   unless BeamLisp.Env.runtime_floor_key!() == floor.identity, do: raise "owner did not finish the image commit"
   :adopted = BeamLisp.Env.runtime_floor_state()
   unless count.() == length(modules), do: raise "image lease is incomplete or duplicated"
+  adopted_lease = floor_lease.()
   BeamLisp.Env.put_key(:bl_runtime_initialized, true)
   # Stop a real initializer at the existing global publication fence. Death
   # must leave the image adopted, so another requester retries initialization.
@@ -106,7 +113,20 @@ try do
   [42, 99, 42] = BeamLisp.run_runtime_artifact("program", []) |> BeamLisp.Vector.to_list()
   42 = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("core", "+"), [40, 2])
   :ready = BeamLisp.Env.runtime_floor_state()
-  unless count.() == length(modules), do: raise "initialization duplicated the adopted lease"
+  ^adopted_lease = floor_lease.()
+  {^modules, ^owner, floor_ref} = adopted_lease
+  [{:bl_sdk_runtime_lease, sdk_proof}] = :ets.lookup(:beam_lisp_vars, :bl_sdk_runtime_lease)
+  {sdk_modules, ^owner, sdk_ref} = sdk_proof.lease
+  unless sdk_ref != floor_ref, do: raise "SDK support reused the floor identity"
+  # SDK support is separately verified and retained. Match both actual handles;
+  # a total count cannot distinguish that retention from duplicate adoption.
+  floor_rows = :ets.tab2list(:beam_lisp_code_leases)
+    |> Enum.filter(fn {{module, lease_owner, _}, _} -> lease_owner == owner and module in modules end)
+  expected = Enum.map(modules, &{&1, floor_ref}) ++
+    Enum.map(Enum.filter(sdk_modules, &(&1 in modules)), &{&1, sdk_ref})
+  actual = Enum.map(floor_rows, fn {{module, _, ref}, _} -> {module, ref} end)
+  unless Enum.sort(actual) == Enum.sort(expected),
+    do: raise "floor membership has a missing, duplicated or unexpected lease"
   false = BeamLisp.Env.seeded?()
   Agent.stop(owner)
   {:ok, replacement_owner} = BeamLisp.Env.start_link([])
