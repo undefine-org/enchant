@@ -5,12 +5,15 @@
 (defn- argv [arguments]
  (reduce (fn [tail argument] {:op :cons :head argument :tail tail :ann {}})
   {:op :enil :ann {}} (reverse arguments)))
-(defn- source-body [body]
- ;; Added only by actual G preparation, after compilation and before exact IR
- ;; validation/emission. No author metadata or Source spelling selects ingress.
- {:op :remote :mod :Elixir.BeamLisp.Env :fun :with_source_execution!
-  :args (list {:op :fn :clauses (list {:pats (list) :guard nil :body body}) :ann {}})
-  :ann (or (:ann body) {})})
+(defn- source-body
+ ;; Named entries and instance-bound closures use the same restrictive native
+ ;; owner. The instance operand is compiler lexical data, never author metadata.
+ ([body] (source-body body nil))
+ ([body instance-target]
+  (let [action {:op :fn :clauses (list {:pats (list) :guard nil :body body}) :ann {}}]
+   {:op :remote :mod :Elixir.BeamLisp.Env :fun :with_source_execution!
+    :args (if instance-target (list instance-target action) (list action))
+    :ann (or (:ann body) {})})))
 (defn initialization-body
  "Inspect a compiler-owned function's eager body without executing its runtime
   Source ingress. Delayed functions inside that body remain guarded."
@@ -87,12 +90,12 @@
        (:enforced (server-entry/input-body module
                     {:fname (first key) :params (second key) :guard (nth key 2) :body node})))))
 
-(defn specialize
+(defn- specialize*
  "Rewrite actual resolved HTTP native calls, including compiler-carried
   definition/module bodies and executable pattern keys. Literal data, pattern
   binders and annotations remain inert.
   Original arguments evaluate exactly once, left-to-right in one proper list."
- [expression context]
+ [expression context instance-target]
  (let [remaining (atom 100000) changes (atom 0)]
   (letfn [(walk [node depth in-body? class-module]
            (when (or (> depth 256) (neg? (swap! remaining dec))) (refuse :source-producer-budget))
@@ -101,6 +104,14 @@
             ;; collection kind so a vector of IR nodes is never destructured
             ;; as a map's key/value entries.
             (map? node)
+             (do
+              ;; Closed unit factories never publish declarations or generate
+              ;; actor/class modules through the named-Source carrier adapter.
+              (when (and instance-target (= :remote (:op node))
+                         (or (and (= :Elixir.BeamLisp.Link (:mod node)) (= :defvar (:fun node)))
+                             (and (contains? #{:Elixir.BeamLisp.Ns.Lower :Elixir.BeamLisp.Ns.Body.Lower} (:mod node))
+                                  (= :reload-descriptor! (:fun node)))))
+               (refuse :runtime-unit-declaration-carrier))
              (if (= :lit (:op node)) node
               (if (:pop node)
                (anf/map-pattern-expressions #(walk % (inc depth) in-body? class-module) node)
@@ -142,7 +153,7 @@
                  (assoc next :body (source-body (:body next)))
                 (and (:source-ingress context) (= :fn (:op next)))
                  (assoc next :clauses
-                   (to-list (mapv (fn [clause] (assoc clause :body (source-body (:body clause)))) (:clauses next))))
+                   (to-list (mapv (fn [clause] (assoc clause :body (source-body (:body clause) instance-target))) (:clauses next))))
                 (and (= :remote (:op next)) (= :Elixir.BeamLisp.Link (:mod next))
                      (= :defvar (:fun next)) (= 4 (count (:args next))))
                  (let [payload (nth (:args next) 2)]
@@ -172,10 +183,49 @@
                 (and (:source-ingress context) in-body? (= :remote (:op next))
                      (not (compiler-call? next)))
                  (source-call next)
-                :else next)))))))
+                :else next))))))))
             (vector? node) (mapv #(walk % (inc depth) in-body? class-module) node)
             (erlang/is_list node) (to-list (mapv #(walk % (inc depth) in-body? class-module) node))
             (erlang/is_tuple node) (erlang/list_to_tuple (to-list (mapv #(walk % (inc depth) in-body? class-module) (erlang/tuple_to_list node))))
             :else node))]
-   (let [result (walk expression 0 false nil)]
+   (let [result (walk expression 0 (some? instance-target) nil)]
     {:expression result :changes @changes}))))
+
+
+(defn specialize
+ "Specialize compiler-owned named Source declarations. Closed runtime units
+  use specialize-unit, whose closures carry their actual instance marker."
+ [expression context] (specialize* expression context nil))
+
+(defn- instance-slot [expression]
+ ;; Choose a deterministic internal lexical name disjoint from every actual
+ ;; variable and pattern binder, using the canonical executable grammar.
+ (let [names
+       (loop [pending (list expression) names #{} left 100000]
+        (if (empty? pending) names
+         (let [node (first pending)]
+          (when (zero? left) (refuse :source-producer-budget))
+          (let [names (if (contains? #{:let :var} (:op node)) (conj names (:name node)) names)
+                names (reduce (fn [out clause]
+                                (reduce (fn [out pattern] (into out (anf/pattern-vars pattern))) out (:pats clause)))
+                        names (Enum/concat (:clauses node (list)) (:catch node (list))))]
+           (recur (Enum/concat (anf/executable-children node) (rest pending)) names (dec left))))))]
+  (loop [index 0]
+   (let [name (str "__bl_source_instance_" index)]
+    (if (contains? names name) (recur (inc index)) name)))))
+
+(defn specialize-unit
+ "Project one validated canonical runtime unit to an instance-bound factory.
+  Capture one actual graph marker before initialization; all runtime closures
+  retain it lexically. This returns ANF, not admission or instance ownership."
+ [unit context]
+ (let [factory (anf/contextual-unit-factory unit)
+       slot (instance-slot factory) target (anf/var slot)
+       result (specialize* factory (assoc context :source-ingress true) target)
+       capture (anf/remote :Elixir.BeamLisp.Env :selected_execution_graph_id (list))
+       expression (anf/lett slot capture (source-body (:expression result) target))]
+  ;; Check the actual enclosing lexical image before any backend emission.
+  (anf/validate-contextual-unit!
+   {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list)
+    :entry expression :exports (list)})
+  (assoc result :expression expression)))
