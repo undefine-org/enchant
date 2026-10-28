@@ -32,6 +32,31 @@ deferred = fn -> send(self(), :unexpected_pattern_realization) end
 nil = apply(mod, :simple_function_clause, [%{function | clauses: [%{clause | pats: deferred}]}])
 receive do :unexpected_pattern_realization -> raise "pattern shape view executed input" after 0 -> :ok end
 %{frames: "__STACKTRACE__", raw: "__STACKTRACE_RAW__"} = apply(mod, :catch_stack_bindings, [])
+aot = BeamLisp.AOT
+spec = {:vector, [{:symbol, "provider"}, {:keyword, "as"}, {:symbol, "p"}, {:keyword, "refer"}, {:vector, [{:symbol, "answer"}]}]}
+^spec = apply(mod, :check_reader_data!, [spec])
+expected = {"provider", "p", ["answer"]}
+^expected = apply(mod, :namespace_require_spec, [spec])
+header = fn request -> {:list, [{:symbol, "ns"}, {:symbol, "preboot"}, {:list, [{:keyword, "require"}, request]}]} end
+%{"preboot" => %{require_specs: [^expected]}} = apply(aot, :namespace_header, [header.(spec)])
+for {flags, reason} <- [
+  {[{:keyword, "as"}], :"missing-option-value"},
+  {[{:keyword, "as"}, 42], :symbol},
+  {[{:keyword, "unknown"}, true], :option},
+  {[{:keyword, "as"}, {:symbol, "p"}, {:keyword, "as"}, {:symbol, "q"}], :"duplicate-option"},
+  {[{:keyword, "refer"}, {:vector, [{:symbol, "x"}, {:symbol, "x"}]}], :"duplicate-refer"}
+] do
+  request = {:vector, [{:symbol, "provider"} | flags]}
+  for {owner, function, value} <- [{mod, :namespace_require_spec, request}, {aot, :namespace_header, header.(request)}] do
+    caught = try do apply(owner, function, [value]); :accepted rescue error in ErlangError -> error.original end
+    {:invalid_namespace_require, ^reason} = caught
+  end
+end
+for {owner, function, value} <- [{mod, :namespace_require_spec, {:vector, deferred}}, {aot, :namespace_header, header.({:vector, deferred})}] do
+  refused = try do apply(owner, function, [value]); false rescue _ -> true end
+  true = refused
+end
+receive do :unexpected_pattern_realization -> raise "require parser executed input" after 0 -> :ok end
 false = :code.is_loaded(BeamLisp.Ns.Compiler) != false
 :undefined = :ets.whereis(:beam_lisp_vars)
-IO.puts("CONTEXTUAL-UNIT-PREBOOT 11 passed; compiler unloaded; namespace table absent")
+IO.puts("CONTEXTUAL-UNIT-PREBOOT 21 passed; compiler unloaded; namespace table absent")
