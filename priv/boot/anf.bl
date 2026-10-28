@@ -130,13 +130,29 @@
   {:callee (:callee node) :arguments (:arguments node)}))
 
 ;; The grammar owns executable children for both production and analysis.
-;; Literal payloads and patterns are inert. Every result is an eager proper
-;; list, so describing dependencies cannot introduce a runtime continuation.
+;; Literal payloads and pattern binders are inert; map-pattern keys are ANF
+;; expressions (the same operands Lower emits). Every result is an eager list.
+(defn pattern-expressions
+ "Executable map keys nested inside a pattern; binding/literal data stay inert."
+ [pattern]
+ (case (:pop pattern)
+  :pmap (BeamLisp.CompilerData/eager_mapcat
+          (fn [pair] (cons (first pair) (pattern-expressions (second pair)))) (:pairs pattern))
+  :pstruct (BeamLisp.CompilerData/eager_mapcat
+             (fn [pair] (pattern-expressions (second pair))) (:fields pattern))
+  :ptuple (BeamLisp.CompilerData/eager_mapcat pattern-expressions (:elems pattern))
+  :pcons (finite-concat (pattern-expressions (:head pattern)) (pattern-expressions (:tail pattern)))
+  :palias (finite-concat (pattern-expressions (:a pattern)) (pattern-expressions (:b pattern)))
+  :pvar (list) :plit (list) :pnil (list)
+  (throw (ex-info "Unknown executable ANF pattern" {:kind :unknown-executable-pattern :pop (:pop pattern)}))))
+
 (defn- executable-clause-children [clauses]
  (BeamLisp.CompilerData/eager_mapcat
   (fn [clause]
-   (if (nil? (:guard clause)) (list (:body clause))
-    (list (:guard clause) (:body clause)))) clauses))
+   (finite-concat
+    (BeamLisp.CompilerData/eager_mapcat pattern-expressions (:pats clause))
+    (if (nil? (:guard clause)) (list (:body clause))
+     (list (:guard clause) (:body clause))))) clauses))
 
 (defn- executable-pair-children [pairs]
  (BeamLisp.CompilerData/eager_mapcat (fn [pair] (list (first pair) (second pair))) pairs))
@@ -535,12 +551,27 @@
     (erlang/is_list x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) x))
     :else x))
 
-;; Unit linkage rewrites executable operands only. Literal payloads, patterns
-;; and annotations remain inert even when they resemble ANF or hold callbacks.
+;; Unit linkage rewrites executable operands, including map-pattern keys.
+;; Literal payloads, pattern binders and annotations stay inert.
 (declare link-node)
 
+(defn map-pattern-expressions
+ "Rewrite only executable pattern keys; literal fields and binders stay data."
+ [f pattern]
+ (case (:pop pattern)
+  :pmap (assoc pattern :pairs (finite-map (fn [pair]
+                  [(f (first pair)) (map-pattern-expressions f (second pair))]) (:pairs pattern)))
+  :pstruct (assoc pattern :fields (finite-map (fn [pair]
+                  [(first pair) (map-pattern-expressions f (second pair))]) (:fields pattern)))
+  :ptuple (assoc pattern :elems (finite-map (fn [p] (map-pattern-expressions f p)) (:elems pattern)))
+  :pcons (assoc pattern :head (map-pattern-expressions f (:head pattern)) :tail (map-pattern-expressions f (:tail pattern)))
+  :palias (assoc pattern :a (map-pattern-expressions f (:a pattern)) :b (map-pattern-expressions f (:b pattern)))
+  :pvar pattern :plit pattern :pnil pattern
+  (throw (ex-info "Unknown executable ANF pattern" {:kind :unknown-executable-pattern :pop (:pop pattern)}))))
+
 (defn- link-clause [clause bindings]
- (assoc clause :guard (when (some? (:guard clause)) (link-node (:guard clause) bindings))
+ (assoc clause :pats (finite-map (fn [p] (map-pattern-expressions (fn [key] (link-node key bindings)) p)) (:pats clause))
+               :guard (when (some? (:guard clause)) (link-node (:guard clause) bindings))
                :body (link-node (:body clause) bindings)))
 
 (defn- link-node [node bindings]
