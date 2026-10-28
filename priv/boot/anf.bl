@@ -132,6 +132,18 @@
 ;; The grammar owns executable children for both production and analysis.
 ;; Literal payloads and pattern binders are inert; map-pattern keys are ANF
 ;; expressions (the same operands Lower emits). Every result is an eager list.
+(defn pattern-vars
+ "Variable names in a checked pattern; keys and literal data do not bind."
+ [pattern]
+ (case (:pop pattern)
+  :pvar (list (:name pattern))
+  :ptuple (BeamLisp.CompilerData/eager_mapcat pattern-vars (:elems pattern))
+  :pcons (finite-concat (pattern-vars (:head pattern)) (pattern-vars (:tail pattern)))
+  :palias (finite-concat (pattern-vars (:a pattern)) (pattern-vars (:b pattern)))
+  :pmap (BeamLisp.CompilerData/eager_mapcat (fn [pair] (pattern-vars (second pair))) (:pairs pattern))
+  :pstruct (BeamLisp.CompilerData/eager_mapcat (fn [pair] (pattern-vars (second pair))) (:fields pattern))
+  (list)))
+
 (defn pattern-expressions
  "Executable map keys nested inside a pattern; binding/literal data stay inert."
  [pattern]
@@ -642,16 +654,63 @@
 (defn- contextual-unit-error! [reason]
  (throw (ex-info "Invalid compiled contextual unit" {:kind :invalid-contextual-unit :reason reason})))
 
+(defn- lexical-clauses [clauses bound direct-parameters?]
+ (BeamLisp.CompilerData/eager_mapcat
+  (fn [clause]
+   (let [names (BeamLisp.CompilerData/eager_mapcat pattern-vars (:pats clause))
+         ;; General patterns lower '_' as a fresh wildcard. Direct Core fn
+         ;; parameters bind it literally, as selected by the shared shape view.
+         scope (reduce (fn [scope name]
+                         (if (and (= "_" name) (not direct-parameters?)) scope
+                          (assoc scope name true))) bound names)
+         keys (BeamLisp.CompilerData/eager_mapcat pattern-expressions (:pats clause))]
+    (finite-concat (finite-map (fn [key] [key bound]) keys)
+                   (when (:guard clause) (list [(:guard clause) scope]))
+                   (list [(:body clause) scope])))) clauses))
+
+(defn- check-lexical-node! [expression bound remaining]
+ (loop [todo (list [expression bound])]
+  (when (seq todo)
+   (when (neg? (swap! remaining dec)) (contextual-unit-error! :lexical-budget))
+   (let [[node scope] (first todo) op (:op node)
+         children
+         (case op
+          :var (do (when-not (contains? scope (:name node))
+                     (throw (ex-info "Unbound variable in contextual unit"
+                              {:kind :invalid-contextual-unit :reason :unbound-variable
+                               :name (:name node) :origin (:ann node)}))) (list))
+          :let (list [(:init node) scope] [(:body node) (assoc scope (:name node) true)])
+          :fn (lexical-clauses (:clauses node) scope
+                (some? (BeamLisp.CompilerData/simple_function_clause node)))
+          :case (cons [(:subj node) scope] (lexical-clauses (:clauses node) scope false))
+          :try (let [handler-scope (reduce (fn [bound name] (assoc bound name true)) scope
+                                     (vals (BeamLisp.CompilerData/catch_stack_bindings)))]
+                 (finite-concat (list [(:body node) scope])
+                                (lexical-clauses (:catch node) handler-scope false)
+                                (when (:after node) (list [(:after node) scope]))))
+          :recv (finite-concat (lexical-clauses (:clauses node) scope false)
+                               (when (:timeout node) (list [(:timeout node) scope]))
+                               (when (:after node) (list [(:after node) scope])))
+          (finite-map (fn [child] [child scope]) (executable-children node)))]
+    (recur (finite-concat children (rest todo)))))))
+
 (defn validate-contextual-unit!
  "Validate one finite compiled recipe before projection or phase facts. Native
   CompilerData owns its shape/bijections; this owner checks canonical executable
-  grammar and closed selected linkage. No code or initializer is executed."
+  grammar, closed selected linkage and ordered lexical scopes. No code or
+  initializer is executed; this is not a type/effect or native-admission proof."
  [unit]
  (try (BeamLisp.CompilerData/check_contextual_unit! unit)
       (catch error (contextual-unit-error! :data)))
  (doseq [node (cons (:entry unit) (map :node (:initializers unit)))]
   (when-not (and (node-ok? node) (static-link-target? node))
    (contextual-unit-error! :executable-image)))
+ (let [remaining (atom 262144)]
+  (loop [links (:initializers unit) bound {}]
+   (if (empty? links) (check-lexical-node! (:entry unit) bound remaining)
+    (let [link (first links)]
+     (check-lexical-node! (:node link) bound remaining)
+     (recur (rest links) (assoc bound (:slot link) true))))))
  unit)
 
 (defn- contextual-unit-body [unit tail]

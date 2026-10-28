@@ -21,6 +21,17 @@ for {bad, reason} <- [
   end
   {:invalid_contextual_unit, ^reason} = caught
 end
+clause = %{pats: [%{pop: :pvar, name: "_"}], guard: nil, body: row.node}
+function = %{op: :fn, clauses: [clause], ann: %{}}
+^clause = apply(mod, :simple_function_clause, [function])
+empty = %{clause | pats: []}
+^empty = apply(mod, :simple_function_clause, [%{function | clauses: [empty]}])
+nil = apply(mod, :simple_function_clause, [%{function | clauses: [%{clause | guard: row.node}]}])
+nil = apply(mod, :simple_function_clause, [%{function | clauses: [%{clause | pats: [%{pop: :pnil}]}]}])
+deferred = fn -> send(self(), :unexpected_pattern_realization) end
+nil = apply(mod, :simple_function_clause, [%{function | clauses: [%{clause | pats: deferred}]}])
+receive do :unexpected_pattern_realization -> raise "pattern shape view executed input" after 0 -> :ok end
+%{frames: "__STACKTRACE__", raw: "__STACKTRACE_RAW__"} = apply(mod, :catch_stack_bindings, [])
 false = :code.is_loaded(BeamLisp.Ns.Compiler) != false
 :undefined = :ets.whereis(:beam_lisp_vars)
-IO.puts("CONTEXTUAL-UNIT-PREBOOT 5 passed; compiler unloaded; namespace table absent")
+IO.puts("CONTEXTUAL-UNIT-PREBOOT 11 passed; compiler unloaded; namespace table absent")
