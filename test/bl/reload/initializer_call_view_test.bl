@@ -1,0 +1,62 @@
+(ns reload.initializer-call-view-test
+ (:require [reload.initializer :as init] [anf :as a] [lower :as lower]))
+
+(defn- ingress [body]
+ (a/remote :Elixir.BeamLisp.Env :with_source_execution!
+  (list (a/fnn (list (a/clause (list) nil body))))))
+(defn- packed [args] (reduce (fn [tail arg] (a/cons-cell arg tail)) a/enil (reverse args)))
+(defn- inline-call [callee args] (init/inline (a/invoke callee (packed args)) {:entries {} :globals {}}))
+(defn- evaluate [node] (lower/eval-anf :Elixir.InitializerCallView node))
+
+(deftest canonical-local-closure-call-inlines-without-executing-source-ingress
+ (let [closure (a/fnn (list (a/clause (list (a/pvar "value")) nil (ingress (a/var "value")))))
+       expression (a/lett "factory" closure (a/invoke (a/var "factory") (packed [(a/lit 42)])))]
+  (is (= 42 (evaluate (init/inline expression {:entries {} :globals {}}))))
+  (is (= 42 (evaluate (inline-call closure [(a/lit 42)]))))))
+
+(deftest arguments-run-before-any-callee-parameter-is-bound-and-in-authored-order
+ (let [key :initializer-call-view-order
+       arg (fn [value] (a/remote :Elixir.Process :put (list (a/lit key) (a/lit value))))
+       closure (a/fnn (list (a/clause (list (a/pvar "left") (a/pvar "right")) nil
+                              (ingress (a/tup (list (a/var "left") (a/var "right")))))))
+       expression (a/lett "left" (a/lit :caller)
+                    (a/invoke closure (packed [(arg :first) (a/doo (list (arg :last) (a/var "left")))])))]
+  (try
+   (Process/put key :before)
+   (is (= (tuple :before :caller) (evaluate (init/inline expression {:entries {} :globals {}}))))
+   (is (= :last (Process/get key)))
+   (finally (Process/delete key)))))
+
+(deftest computed-argument-tails-and-unknown-callees-stay-unexpanded
+ (let [closure (a/fnn (list (a/clause (list) nil (ingress (a/lit 42)))))
+       dynamic (a/invoke closure (a/var "arguments"))
+       unknown (a/invoke (a/var "factory") a/enil)
+       native-wrapper (a/remote :Elixir.BeamLisp.Ns.Rt :invoke (list closure a/enil))]
+  (is (= dynamic (init/inline dynamic {:entries {} :globals {}})))
+  (is (= unknown (init/inline unknown {:entries {} :globals {}})))
+  (is (= native-wrapper (init/inline native-wrapper {:entries {} :globals {}})))))
+
+(deftest inlining-only-removes-the-eager-guard-and-retains-returned-callback-ingress
+ (let [delayed (a/fnn (list (a/clause (list) nil (ingress (a/lit 42)))))
+       factory (a/fnn (list (a/clause (list) nil (ingress delayed))))
+       result (inline-call factory [])]
+  (is (= delayed result))))
+
+(deftest canonical-global-factory-uses-only-the-exact-recorded-target
+ (let [target [:Elixir.RecordedInitializer :factory 1]
+       clause {:op :defn-clause :params (list (a/pvar "value")) :guard nil :body (ingress (a/var "value"))}
+       expression (a/invoke (a/global "sealed" "factory") (packed [(a/lit 42)]))
+       factories {:globals {["sealed" "factory"] {1 target}} :entries {target (list clause)}}]
+  (is (= 42 (evaluate (init/inline expression factories))))
+  (is (= expression (init/inline expression (assoc factories :entries {}))))))
+
+(deftest finite-argument-packaging-does-not-consume-the-expression-depth-budget
+ (let [names (mapv #(str "arg" %) (range 40))
+       closure (a/fnn (list (a/clause (to-list (map a/pvar names)) nil
+                              (ingress (a/tup (list (a/var (first names)) (a/var (last names))))))))
+       args (mapv a/lit (range 40))]
+  (is (= (tuple 0 39) (evaluate (inline-call closure args))))
+  (let [unknown (a/var "unknown")
+        packed-args (assoc (packed [(a/lit 42)]) :ann {:line 17})
+        expression (a/invoke unknown packed-args)]
+   (is (= expression (init/inline expression {:entries {} :globals {}}))))))

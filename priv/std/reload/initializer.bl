@@ -2,7 +2,7 @@
 ; Inline exact fresh factories so their runtime Source entry is never invoked
 ; during preparation. Delayed closures retain their ordinary Source ingress.
 (ns reload.initializer (:require [reload.native-call :as native-call]
-                                [reload.source-producer :as producer]))
+                                [reload.source-producer :as producer] [system.ir :as ir]))
 (defn inline
  [expression factories]
  (let [left (atom 8192)]
@@ -30,6 +30,26 @@
                      (every? #(= :pvar (:pop %)) (:params clause))
                      (not (contains? active target)))
              (invoke clause args locals (conj active target) depth) original)))
+          (arguments [chain args]
+           ;; A finite invocation's cons spine is packaging, not nested source
+           ;; evaluation. Retain its cells/annotations while replacing heads.
+           (loop [node chain values args cells (list)]
+            (if (empty? values)
+             (reduce (fn [tail pair] (assoc (first pair) :head (second pair) :tail tail)) node cells)
+             (recur (:tail node) (rest values) (cons [node (first values)] cells)))))
+          (application [callee args locals active depth original]
+           (let [closure (if (= :var (:op callee)) (get locals (:name callee))
+                           (when (= :fn (:op callee)) callee))
+                 clauses (:clauses closure) clause (first clauses)
+                 target (when (= :global (:op callee))
+                          (get-in factories [:globals [(:ns callee) (:name callee)] (count args)]))]
+            (cond
+             target (factory target args locals active depth original)
+             (and (= 1 (count clauses)) (nil? (:guard clause))
+                  (= (count args) (count (:pats clause)))
+                  (every? #(= :pvar (:pop %)) (:pats clause)))
+              (invoke clause args locals active depth)
+             :else original)))
           (construction-callback [value locals active depth]
            ;; Only the exact first-order SDK collection operations select this
            ;; branch, after the entire initializer passed its construction proof.
@@ -80,19 +100,16 @@
                                    (cons (construction-callback (first args) locals active (inc depth)) (rest args)) args)
                             next (assoc n :args args)]
                         (factory target args locals active depth next))
-              :apply (let [callee (:fn n) args (to-list (mapv #(walk % locals active (inc depth)) (:args n)))
-                           closure (if (= :var (:op callee)) (get locals (:name callee))
-                                     (when (= :fn (:op callee)) callee))
-                           clauses (:clauses closure) clause (first clauses)
-                           target (when (= :global (:op callee))
-                                    (get-in factories [:globals [(:ns callee) (:name callee)] (count args)]))]
-                       (cond
-                        target (factory target args locals active depth (assoc n :args args))
-                        (and (= 1 (count clauses)) (nil? (:guard clause))
-                             (= (count args) (count (:pats clause)))
-                             (every? #(= :pvar (:pop %)) (:pats clause)))
-                         (invoke clause args locals active depth)
-                        :else (assoc n :args args)))
+              :invoke
+               (let [site (ir/call-site n)]
+                (if (some? (:arity site))
+                 (let [args (to-list (mapv #(walk % locals active (inc depth)) (:args site)))
+                       next (assoc n :arguments (arguments (:arguments n) args))]
+                  (application (:callee site) args locals active depth next))
+                 (assoc n :arguments (walk (:arguments n) locals active (inc depth)))))
+              :apply
+               (let [args (to-list (mapv #(walk % locals active (inc depth)) (:args n)))]
+                (application (:fn n) args locals active depth (assoc n :args args)))
               (reduce (fn [out [key value]]
                         (assoc out key (if (contains? #{:ann :meta :params :pats :pat :attrs :exports} key) value
                                         (parts value locals active (inc depth))))) {} n)))))]
