@@ -54,7 +54,7 @@
 (defn- visibility [node namespace file]
  (:visibility (declaration-source node namespace file)))
 
-(defn- describe [descriptor]
+(defn- read-source [descriptor]
  (when-not (and (erlang/is_map descriptor)
                 (= #{:namespace :revision :source :file} (set (keys descriptor)))
                 (symbol? (:namespace descriptor)) (symbol? (:revision descriptor))
@@ -68,18 +68,75 @@
                 :scopes {:all [(:id module)]}}
        forms (s/read (:source descriptor) (:file descriptor) context)
        ns (first forms)
-       _ (when-not (and (= "ns" (head ns)) (= 2 (count (:children ns)))
+       _ (when-not (and (= "ns" (head ns)) (<= 2 (count (:children ns)))
                         (= (:namespace descriptor) (:value (second (:children ns)))))
            (refuse! :phase-namespace ns))
        entries (Enum/map (Enum/with_index (flatten-forms (rest forms) 0 (list)))
                   #(assoc (elem % 0) :position (+ 1 (elem % 1))))
+       prepared {:descriptor descriptor :selection selection :context context :ns ns :entries entries}]
+  prepared))
+
+(defn- source-summary [prepared]
+ (let [descriptor (:descriptor prepared) entries (:entries prepared)
+       definitions (Enum/filter entries #(contains? #{"def" "defn" "defn-" "defsyntax"} (head (:node %))))]
+  {:namespace (:namespace descriptor) :revision (:revision descriptor)
+   :public-names (Enum/sort (Enum/uniq (Enum/map
+     (Enum/filter definitions #(= :public (visibility (:node %) (:namespace descriptor) (:file descriptor))))
+     #(:value (second (:children (:node %)))))))
+   :entry? (some #(not (contains? #{"import-world" "def" "defn" "defn-" "defsyntax"} (head (:node %)))) entries)}))
+
+(defn- namespace-imports [ns providers]
+ ;; Acceptance belongs to CompilerData. Syntax children project only exact
+ ;; refer-name locations after that grammar has checked the request.
+ (Enum/flat_map (Enum/with_index (Enum/drop (:children ns) 2))
+  (fn [clause-pair]
+   (let [clause (elem clause-pair 0) ci (elem clause-pair 1)]
+    (when-not (and (= :list (:tag clause)) (= :keyword (:tag (first (:children clause)))))
+      (refuse! :phase-namespace-clause clause))
+    (when-not (= "require" (:value (first (:children clause))))
+      (refuse! :phase-namespace-clause clause))
+    (Enum/flat_map (Enum/with_index (rest (:children clause)))
+     (fn [spec-pair]
+      (let [spec (elem spec-pair 0) si (elem spec-pair 1)
+            parsed (BeamLisp.CompilerData/namespace_require_spec (s/to-reader spec))
+            target (symbol (elem parsed 0)) alias (when (elem parsed 1) (symbol (elem parsed 1)))
+            refer (elem parsed 2)
+            candidates (Enum/filter providers #(= target (:namespace %)))]
+       (when (empty? candidates) (refuse! :phase-provider-missing spec))
+       (when-not (= 1 (count candidates)) (refuse! :phase-provider-ambiguous spec))
+       (let [provider (first candidates) names (:public-names provider)
+             _ (when (:entry? provider) (refuse! :phase-provider-entry spec))
+             _ (when (empty? names) (refuse! :phase-provider-empty spec))
+             refer-names (if (= :all refer) names (Enum/map refer #(symbol %)))
+             pairs (if (= :vector (:tag spec)) (Enum/chunk_every (rest (:children spec)) 2) (list))
+             refer-node (second (first (Enum/filter pairs #(= "refer" (:value (first %))))))
+             origins (if (= :vector (:tag refer-node))
+                       (Map/new (Enum/map (:children refer-node) #(tuple (:value %) (:origin %)))) {})
+             views (Enum/concat (Enum/concat (list {:only names :alias target :only-origins {}})
+                     (if (and alias (not= alias target)) (list {:only names :alias alias :only-origins {}}) (list)))
+                     (if (empty? refer-names) (list) (list {:only refer-names :alias nil :only-origins origins})))]
+        (Enum/map (Enum/with_index views)
+         (fn [view-pair]
+          (let [path (list ci si (elem view-pair 1))]
+           (assoc (elem view-pair 0) :provider target :revision (:revision provider)
+             :phase 0 :shift 0 :path path :scope-path (cons 1 path)))))))))))))
+
+(defn- import-scope [selection namespace request]
+ (b/scope selection namespace (or (:scope-path request) (cons 0 (:path request))) :import))
+
+(defn- describe [prepared providers]
+ (let [descriptor (:descriptor prepared) selection (:selection prepared)
+       context (:context prepared) ns (:ns prepared) entries (:entries prepared)
+       module (b/scope selection (:namespace descriptor) [0] :module)
        phases (Enum/sort (Enum/uniq
                  (cons 0 (Enum/flat_map entries
                            #(if (= "defsyntax" (head (:node %)))
                               (list (:phase %) (+ 1 (:phase %))) (list (:phase %)))))))
        modules (Enum/map phases #(module-scope selection (:namespace descriptor) %))
-       imports (Enum/map (Enum/filter entries #(= "import-world" (head (:node %)))) (fn [entry] (import-row entry)))
-       import-scopes (Enum/map imports #(b/scope selection (:namespace descriptor) (cons 0 (:path %)) :import))
+       imports (Enum/concat
+                 (Enum/map (Enum/filter entries #(= "import-world" (head (:node %)))) (fn [entry] (import-row entry)))
+                 (namespace-imports ns providers))
+       import-scopes (Enum/map imports #(import-scope selection (:namespace descriptor) %))
        scopes (Enum/concat modules import-scopes)
        context (s/context (assoc context :scopes
                  (Map/put (Map/new (Enum/map (Enum/zip phases modules)
@@ -174,8 +231,14 @@
   {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
  (let [sources (BeamLisp.CompilerData/eager_to_list sources)
        _ (when (> (count sources) 128) (refuse! :phase-source-bound nil))
-       units (Enum/concat (Enum/map sources (fn [descriptor] (describe descriptor)))
-                (Enum/flat_map (BeamLisp.CompilerData/eager_to_list libraries) (fn [library] (library-units library))))
+       prepared (Enum/map sources (fn [descriptor] (read-source descriptor)))
+       archived (Enum/flat_map (BeamLisp.CompilerData/eager_to_list libraries) (fn [library] (library-units library)))
+       providers (Enum/concat (Enum/map prepared #(source-summary %))
+                   (Enum/map archived (fn [unit]
+                    {:namespace (:namespace unit) :revision (:revision unit) :entry? false
+                     :public-names (Enum/sort (Enum/uniq (Enum/map
+                       (Enum/filter (get-in unit [:world :declarations]) #(= :public (:visibility %))) #(:name %))))})))
+       units (Enum/concat (Enum/map prepared (fn [source] (describe source providers))) archived)
        _ (when (> (count units) 128) (refuse! :phase-source-bound nil))
        keys (Enum/map units #(tuple (:namespace %) (:revision %)))
        _ (when-not (= keys (Enum/uniq keys)) (refuse! :phase-source-duplicate nil))
@@ -234,7 +297,7 @@
   '(:version :kind :profile :units :digest :namespace :revision :file :world
     :module :imports :import-scopes :recipes :expressions :context :selection
     :scopes :declarations :sources :target :owner :path :role :id :provider
-    :phase :shift :only :only-origins :alias :node :position :declaration :name :space
+    :phase :shift :only :only-origins :scope-path :alias :node :position :declaration :name :space
     :visibility :available-from :value :function :syntax :public :private :local
     :binding-scope :import :lexical :introduction :use-site :all :tag :origin
     :children :symbol :keyword :scalar :list :vector :set :map :record
