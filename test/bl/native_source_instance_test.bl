@@ -1,0 +1,83 @@
+(ns native-source-instance-test
+ (:require [reload.generation :as generation] [test.support.source-fixtures :as fixtures]))
+(fixtures/effects!)
+(when-not (erlang/function_exported :Elixir.SourceInstanceGuardFixture :enter! 2)
+ (BeamLisp.AOT/compile_host_file
+  (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (File/cwd!)) "test/fixtures/source_instance_guard.bl")
+  (list (tuple :module :Elixir.SourceInstanceGuardFixture) (tuple :load? true)
+        (tuple :output_dir (Path/join (System/tmp_dir!) "bl-source-fixture-beams")))))
+
+(defn- options [value]
+ {:sources {"instance.guard"
+    (str "(ns instance.guard) "
+     "(defn answer [] " value ") "
+     "(defn touch [] (SourceEffectObserverFixture/put :source-instance-effect :called) " value ") "
+     "(defn inside [expected] (SourceInstanceGuardFixture/enter! expected (fn [] (touch))))")}
+  :native-modules #{"SourceEffectObserverFixture" "SourceInstanceGuardFixture"}})
+(defn- marker [graph]
+ (generation/with! graph #(BeamLisp.Env/selected_execution_graph_id)))
+(defn- entry [graph name]
+ (generation/with! graph #(BeamLisp.Env/fetch_exact! (get (:mapping graph) "instance.guard") name)))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error)) (:__struct__ error)))))
+(defn- guarded [expected action] (SourceInstanceGuardFixture/enter! expected action))
+(defn- entered [graph expected name]
+ (generation/with! graph #(guarded expected (entry graph name))))
+
+(deftest closure-instance-witness-restricts-real-native-frames-before-any-body
+ (let [left (generation/prepare! (options 42)) right (generation/prepare! (options 99))
+       left-id (marker left) right-id (marker right)
+       touch-left (entry left "touch") touch-right (entry right "touch")
+       calls (atom 0)]
+  (try
+   (is (not= left-id right-id))
+   (is (thrown? (guarded left-id (fn [] (swap! calls inc)))))
+   (is (= 0 @calls))
+   (is (= 42 (generation/with! left #(guarded left-id touch-left))))
+   (SourceEffectObserverFixture/delete :source-instance-effect)
+   (is (= :source_instance_changed (reason #(generation/with! right (fn [] (guarded left-id touch-right))))))
+   (is (nil? (SourceEffectObserverFixture/get :source-instance-effect)))
+   (doseq [bad [nil {} (tuple :bl-execution-graph (:scope left) (erlang/make_ref))]]
+    (is (= :source_instance_changed (reason #(generation/with! left (fn [] (guarded bad touch-left)))))))
+   (is (nil? (SourceEffectObserverFixture/get :source-instance-effect)))
+   (SourceEffectObserverFixture/delete :source-instance-effect)
+   (let [observed (generation/with! left
+                   (fn []
+                    (Process/put :bl_generation (assoc left :digest "forged-context"))
+                    (reason #(guarded left-id touch-left))))]
+    (is (= :source_execution_context_mismatch observed)))
+   (is (nil? (SourceEffectObserverFixture/get :source-instance-effect)))
+   ;; The genuine marker copied as ordinary data cannot fabricate a frame.
+   (let [before (BeamLisp.Env/capture)]
+    (try
+     (Process/put :bl_generation left)
+     (is (thrown? (guarded left-id (fn [] (swap! calls inc)))))
+     (is (= 0 @calls))
+     (finally (BeamLisp.Env/bind before))))
+   (finally (SourceEffectObserverFixture/delete :source-instance-effect)
+            (generation/retire! left) (generation/retire! right)))))
+
+(deftest already-active-source-cannot-skip-instance-comparison
+ (let [left (generation/prepare! (options 43)) right (generation/prepare! (options 100))
+       left-id (marker left) right-id (marker right)]
+  (try
+   (SourceEffectObserverFixture/delete :source-instance-effect)
+   (is (= :source_instance_changed (reason #(generation/invoke! right "instance.guard/inside" [left-id]))))
+   (is (nil? (SourceEffectObserverFixture/get :source-instance-effect)))
+   (is (= 100 (generation/invoke! right "instance.guard/inside" [right-id])))
+   (is (= :called (SourceEffectObserverFixture/get :source-instance-effect)))
+   (finally (SourceEffectObserverFixture/delete :source-instance-effect)
+            (generation/retire! left) (generation/retire! right)))))
+
+(deftest retired-instance-marker-cannot-be-borrowed-by-a-new-preparation
+ (let [proposal (options 44) old (generation/prepare! proposal) old-id (marker old)]
+  (is (contains? #{:retired :already-retired} (:status (generation/retire! old))))
+  (let [fresh (generation/prepare! proposal) fresh-id (marker fresh)]
+   (try
+    (is (not= old-id fresh-id))
+    (SourceEffectObserverFixture/delete :source-instance-effect)
+    (is (= :source_instance_changed (reason #(entered fresh old-id "touch"))))
+    (is (nil? (SourceEffectObserverFixture/get :source-instance-effect)))
+    (is (= 44 (generation/with! fresh #(guarded fresh-id (entry fresh "answer")))))
+    (finally (SourceEffectObserverFixture/delete :source-instance-effect) (generation/retire! fresh))))))
