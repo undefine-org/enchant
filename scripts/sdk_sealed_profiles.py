@@ -3,7 +3,7 @@
 GROUPS = {
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
-    "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14)], ['expand']),
+    "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14), ('test/bl/compiler_contextual_test.bl', 27), ('test/bl/generation_semantics_test.bl', 18), ('test/bl/compiler_lexical_consumers_test.bl', 13)], ['expand', 'env', 'connector.google.gdrive', 'connector.microsoft.graph', 'bl.cli', 'bl.doc', 'bl.doc.html', 'bl.profile']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24)], ['expand-source', 'expand']),
     "factory-admission": ([('test/bl/contextual_factory_admission_test.bl', 40), ('test/bl/closed_etf_test.bl', 150), ('test/bl/data_first_order_test.bl', 105)], ['compile.world']),

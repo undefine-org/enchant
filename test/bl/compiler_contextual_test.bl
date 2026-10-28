@@ -15,11 +15,11 @@
   (is (not (Enum/any? (nodes (:node program)) #(= :global (:op %)))))
   (is (= "example.bl" (get-in (first references) [:ann :file])))))
 
-(deftest contextual-local-calls-cannot-borrow-the-legacy-global-fallback
+(deftest ordinary-and-contextual-local-calls-have-the-same-lexical-meaning
  (let [form (BeamLisp.Reader/read_one "(let [+ 0] (+ 1 2))")
        contextual (c/compile-contextual form (c/new-env "user") {})
-       legacy (c/compile form (c/new-env "user"))]
-  (is (= 3 (lower/eval-anf :Elixir.ContextualLegacyFallback legacy)))
+       ordinary (c/compile form (c/new-env "user"))]
+  (is (thrown? (lower/eval-anf :Elixir.OrdinaryNoFallback ordinary)))
   (is (thrown? (lower/eval-anf :Elixir.ContextualNoFallback contextual)))))
 
 (deftest omitted-contextual-links-refuse-during-compilation
@@ -36,3 +36,39 @@
    (let [first (c/compile-contextual form env {}) second (c/compile-contextual form env {})]
     (is (= first second)))
    (is (= expected (c/compile form env))))))
+
+(deftest lexical-call-identity-does-not-depend-on-local-kind-or-arity
+ (doseq [context [nil {}]]
+  (let [env (c/new-env "user")
+        compile-form (fn [source]
+                       (let [form (BeamLisp.Reader/read_one source)]
+                        (if context (c/compile-contextual form env context) (c/compile form env))))]
+   (doseq [[source expected] [["(let [count {:answer 42}] (count :answer))" 42]
+                             ["(let [count [42]] (count 0))" 42]
+                             ["(let [+ (fn [x y] x)] (+ 42 0))" 42]]]
+    (is (= expected (lower/eval-anf :Elixir.LexicalLocalValue (compile-form source)))))
+   (doseq [source ["(let [+ nil] (+ 1 2))"
+                   "(let [+ false] (+ 1 2))"
+                   "(let [+ (fn [x] x)] (+ 1 2))"]]
+    (is (thrown? (lower/eval-anf :Elixir.LexicalLocalRefusal (compile-form source))))))))
+
+(deftest a-computed-lexical-callee-is-evaluated-once
+ (let [key :compiler-lexical-callee-evaluations
+       callee (anf/doo
+                (list (anf/remote :Elixir.Process :put
+                        (list (anf/lit key)
+                          (anf/remote :erlang :+
+                           (list (anf/remote :Elixir.Process :get (list (anf/lit key) (anf/lit 0)))
+                                 (anf/lit 1)))))
+                      (anf/fnn (list (anf/clause (list (anf/pvar "x")) nil (anf/var "x"))))))]
+  (try
+   (doseq [context [nil {}]]
+    (Process/delete key)
+    (let [env (assoc (c/new-env "user") :locals {"count" callee})
+          form (BeamLisp.Reader/read_one "(count 42)")
+          node (if context (c/compile-contextual form env context) (c/compile form env))]
+     (is (= 42 (lower/eval-anf :Elixir.LexicalCalleeOnce node)))
+     (is (= 1 (Process/get key)))
+     (is (not (Enum/any? (nodes node)
+                #(and (= :remote (:op %)) (= :invocable? (:fun %))))))))
+   (finally (Process/delete key)))))
