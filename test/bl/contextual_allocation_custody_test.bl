@@ -58,48 +58,69 @@
             (recover key)))))
 
 (deftest queued-allocation-cannot-resurrect-a-scope-after-creator-death
- (let [before (rows) caller (erlang/self) env (Process/whereis :Elixir.BeamLisp.Env)
-       worker (atom nil) scope (atom nil) suspended (atom false) target (tuple :Elixir.Agent :get_and_update 2)]
+ (let [reservations (BeamLisp.Env/fetch_exact! "reload.execution" "prepared")
+       before @reservations caller (erlang/self) env (Process/whereis :Elixir.BeamLisp.Env)
+       worker (atom nil) scope (atom nil) suspended (atom false)]
+  (letfn [(queued [operation]
+           (loop [remaining 500]
+            (let [found (Enum/find (elem (Process/info env :messages) 1)
+                         (fn [message]
+                          (and (erlang/is_tuple message) (= 3 (erlang/tuple_size message))
+                               (= :"$gen_call" (elem message 0))
+                               (= @worker (elem (elem message 1) 0))
+                               (or (nil? operation) (= operation (elem (elem message 2) 0))))))]
+             (if found found
+              (if (= 0 remaining) (throw :allocation-not-queued)
+               (do (receive (after 10 nil)) (recur (dec remaining))))))))]
   (try
+   ;; Resolve the real private SDK entry before suspending its metadata owner.
+   (reset! worker (erlang/spawn
+                   (fn []
+                    (let [reserve-entry (BeamLisp.Env/fetch_exact! "reload.execution" "reserve-contextual-preparation!")]
+                     (erlang/send caller :allocation-worker-ready)
+                     (receive :begin nil)
+                     (BeamLisp.Ns.Rt/invoke reserve-entry (list "allocation-queued"))))))
+   (receive :allocation-worker-ready nil (after 5000 (throw :allocation-worker-not-ready)))
    (sys/suspend env)
    (reset! suspended true)
-   (reset! worker (erlang/spawn (fn [] (reserve "allocation-queued"))))
-   ;; The Env actor is suspended, so a queued allocation cannot complete.
-   ;; Its message contains the actual native allocator callback and sender.
-   (let [message (loop [remaining 500]
-                  (let [messages (elem (Process/info env :messages) 1)
-                        found (Enum/find messages
-                                (fn [message]
-                                 (and (erlang/is_tuple message) (= 3 (erlang/tuple_size message))
-                                      (= :"$gen_call" (elem message 0))
-                                      (= @worker (elem (elem message 1) 0)))))]
-                   (if found found
-                    (if (= 0 remaining) (throw :allocation-not-queued)
-                     (do (receive (after 10 nil)) (recur (dec remaining)))))))
-         added (Map/drop (rows) (maps/keys before)) key (first (maps/keys added))
-         monitor (erlang/monitor :process @worker)]
-    (reset! scope (nth key 3))
+   (erlang/send @worker :begin)
+   (let [first-message (queued nil)
+         added (Map/drop @reservations (maps/keys before)) key (first (maps/keys added))]
     (is (= 1 (count added)))
-    (is (= :claimed (get-in added [key :scope-allocation :state])))
-    (erlang/exit @worker :kill)
-    (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
-    (erlang/demonitor monitor (list :flush))
-    (sys/resume env)
-    (reset! suspended false)
-    ;; A synchronous actor read orders after processing the already queued call.
-    (is (not (registered? @scope)))
-    (recover key)
-    (is (not (registered? @scope)))
-    ;; Replay the captured native callback after destruction as the opposite
-    ;; cross-sender delivery order. A dead creator still cannot recreate it.
-    (is (= :abandoned (Agent/get_and_update :Elixir.BeamLisp.Env (elem (elem message 2) 1))))
-    (is (not (registered? @scope)))
-    (is (= before (rows))))
+    (reset! scope (nth key 3))
+    ;; Fixed SDK lookup can first queue a metadata READ. Hold the actual fresh
+    ;; child fence while allowing that read and the original claim to finish.
+    ;; Then suspend the actor before releasing the allocator through that fence.
+    (when (= :reserved (get-in @reservations [key :scope-allocation :state]))
+     (BeamLisp.Env/with_scope_lock @scope
+      (fn []
+       (sys/resume env)
+       (reset! suspended false)
+       (loop [remaining 500]
+        (when (not= :claimed (get-in @reservations [key :scope-allocation :state]))
+         (if (= 0 remaining) (throw :allocation-claim-missing)
+          (do (receive (after 10 nil)) (recur (dec remaining))))))
+       (sys/suspend env)
+       (reset! suspended true))))
+    (let [message (queued :get_and_update) monitor (erlang/monitor :process @worker)]
+     (is (= :claimed (get-in @reservations [key :scope-allocation :state])))
+     (erlang/exit @worker :kill)
+     (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
+     (erlang/demonitor monitor (list :flush))
+     (sys/resume env)
+     (reset! suspended false)
+     (is (not (registered? @scope)))
+     (recover key)
+     (is (not (registered? @scope)))
+     ;; Replay ONLY the actual allocator update, never an SDK metadata read.
+     (is (= :abandoned (Agent/get_and_update :Elixir.BeamLisp.Env (elem (elem message 2) 1))))
+     (is (not (registered? @scope)))
+     (is (= before @reservations))))
    (finally
     (when @suspended (sys/resume env))
     (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))
-    (doseq [key (maps/keys (Map/drop (rows) (maps/keys before)))] (recover key))
-    (when @scope (BeamLisp.Env/destroy @scope))))))
+    (doseq [key (maps/keys (Map/drop @reservations (maps/keys before)))] (recover key))
+    (when @scope (BeamLisp.Env/destroy @scope)))))))
 
 (deftest closed-parent-retirement-recovers-a-dead-pre-graph-allocation
  (let [before (rows) parent (BeamLisp.Env/fork) caller (erlang/self)
