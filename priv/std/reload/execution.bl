@@ -6,6 +6,106 @@
  (throw (ex-info "Immutable generation refused" (assoc data :kind kind))))
 (defn- with-lock [key action]
  (BeamLisp.Env/with_generation_lock (tuple :sealed-generation key) action))
+(def ^:private prepared (atom {}))
+
+;; One private preparation owner. A row may authenticate prepared code before
+;; initialization completes, but only a ready row can be reused or published.
+;; Runtime instances belong in this row, never in caller-mutable graph state.
+(defn- prepared-generation* [key]
+ (let [row (get @prepared key)]
+  (when (contains? #{:prepared :ready} (:phase row)) (:generation row))))
+
+(defn cached-preparation [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when-let [row (get @prepared key)]
+  (if (= :ready (:phase row))
+   (let [generation (:generation row)]
+    (when (:retired @(:state generation)) (refuse! :retirement-pending {}))
+    generation)
+   (if (and (erlang/is_pid (:owner row)) (Process/alive? (:owner row)))
+    (refuse! :preparation-in-progress {})
+    ;; Caller death is not evidence that initialized resources/code are gone.
+    ;; Keep this bounded reservation until an actual lifecycle recovery exists.
+    (refuse! :runtime-handover-required {:reason :abandoned-preparation})))))
+
+(defn preparation-limit [] 256)
+
+(defn begin-preparation! [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [owner (erlang/self) limit (preparation-limit)]
+  (swap! prepared
+   (fn [rows]
+    (when (contains? rows key) (refuse! :preparation-in-progress {}))
+    (when (>= (count rows) limit) (refuse! :runtime-handover-required {:reason :preparation-capacity}))
+    (assoc rows key {:phase :preparing :owner owner}))))
+ :ok)
+
+(defn record-prepared! [key generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key)]
+  (when-not (and (= :preparing (:phase row)) (= (erlang/self) (:owner row))
+                 (= key (:cache-key generation)))
+   (refuse! :preparation-owner-changed {}))
+  (swap! prepared assoc key {:phase :prepared :owner (erlang/self) :generation generation}))
+ generation)
+
+(defn complete-preparation! [key generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key)]
+  (when-not (and (= :prepared (:phase row)) (= (erlang/self) (:owner row))
+                 (erlang/== generation (:generation row)))
+   (refuse! :preparation-owner-changed {}))
+  (swap! prepared assoc key {:phase :ready :generation generation}))
+ generation)
+
+(defn abandon-preparation! [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (swap! prepared
+  (fn [rows]
+   (let [row (get rows key)]
+    (if (and (= (erlang/self) (:owner row)) (not= :ready (:phase row)))
+     (dissoc rows key) rows))))
+ :ok)
+
+(defn ready-prepared! [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared (:cache-key generation))]
+  (when-not (and (= :ready (:phase row)) (erlang/== generation (:generation row)))
+   (refuse! :unready-prepared-generation {})))
+ generation)
+
+
+(defn prepared-generation
+ "Framework-only projection of the original private preparation; never a grant."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (prepared-generation* key))
+
+(defn forget-preparation!
+ "Remove only this exact preparation after fixed owner cleanup. A later instance
+  occupying the same reusable plan key survives a lost/repeated cleanup reply."
+ [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (swap! prepared
+  (fn [all]
+   (if (erlang/== generation (:generation (get all (:cache-key generation))))
+    (dissoc all (:cache-key generation)) all)))
+ :ok)
+
+(defn attested-prepared!
+ "Read-only exact private preparation-cache identity for trusted framework
+  enrollment. A copied/edited map, caller state, digest/resources flag or live
+  namespace cannot manufacture this receipt. This does not grant execution,
+  root ownership, runtime inheritance or publication authority."
+ ([generation] (attested-prepared! generation false))
+ ([generation allow-retired?]
+ (when-not (and (or (= true allow-retired?) (= false allow-retired?))
+                (erlang/is_map generation)
+                (erlang/== generation (prepared-generation* (:cache-key generation)))
+                (or allow-retired? (not (:retired @(:state generation)))))
+  (refuse! :unattested-prepared-generation {}))
+ generation))
+
 (defn current
  "Selected graph in this execution;identity alone does not confer a lease."
  [] (Process/get :bl_generation))

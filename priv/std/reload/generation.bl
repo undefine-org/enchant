@@ -14,7 +14,6 @@
            [proc.contract :as actor-contract]
            [lower :as lower] [system.ir :as ir] [reload.runtime :as reload]))
 
-(def ^:private prepared (atom {}))
 (def ^:private schema-publications (atom {}))
 ;; Compact SDK-issued native outcomes, never reachable graph.state flags. At
 ;; most the existing256 node-lifetime preparations can leave a tombstone.
@@ -527,7 +526,7 @@
                  (list :bl_sealed_generation_budget {:preparations 0 :namespaces 0})) 1))
  ([used namespaces] (capacity used namespaces 0))
  ([used namespaces source-bytes]
-  (assoc used :source-byte-limit 134217728 :preparation-limit 256 :namespace-limit 4096
+  (assoc used :source-byte-limit 134217728 :preparation-limit (execution/preparation-limit) :namespace-limit 4096
     :status (if (and (< (:preparations used 0) 256)
                      (<= (+ (:namespaces used 0) namespaces) 4096)
                      (<= (+ (:source-bytes used 0) source-bytes) 134217728))
@@ -1101,63 +1100,6 @@
     {:module (elem (erlang/fun_info target :module) 1)
      :function (elem (erlang/fun_info target :name) 1)}))))
 
-;; One private preparation owner. A row may authenticate prepared code before
-;; initialization completes, but only a ready row can be reused or published.
-;; Runtime instances belong in this row, never in caller-mutable graph state.
-(defn- prepared-generation [key]
- (let [row (get @prepared key)]
-  (when (contains? #{:prepared :ready} (:phase row)) (:generation row))))
-
-(defn- cached-preparation [key]
- (when-let [row (get @prepared key)]
-  (if (= :ready (:phase row))
-   (let [generation (:generation row)]
-    (when (:retired @(:state generation)) (refuse! :retirement-pending {}))
-    generation)
-   (if (and (erlang/is_pid (:owner row)) (Process/alive? (:owner row)))
-    (refuse! :preparation-in-progress {})
-    ;; Caller death is not evidence that initialized resources/code are gone.
-    ;; Keep this bounded reservation until an actual lifecycle recovery exists.
-    (refuse! :runtime-handover-required {:reason :abandoned-preparation})))))
-
-(defn- begin-preparation! [key]
- (let [owner (erlang/self) limit (:preparation-limit (capacity))]
-  (swap! prepared
-   (fn [rows]
-    (when (contains? rows key) (refuse! :preparation-in-progress {}))
-    (when (>= (count rows) limit) (refuse! :runtime-handover-required {:reason :preparation-capacity}))
-    (assoc rows key {:phase :preparing :owner owner}))))
- :ok)
-
-(defn- record-prepared! [key generation]
- (let [row (get @prepared key)]
-  (when-not (and (= :preparing (:phase row)) (= (erlang/self) (:owner row))
-                 (= key (:cache-key generation)))
-   (refuse! :preparation-owner-changed {}))
-  (swap! prepared assoc key {:phase :prepared :owner (erlang/self) :generation generation}))
- generation)
-
-(defn- complete-preparation! [key generation]
- (let [row (get @prepared key)]
-  (when-not (and (= :prepared (:phase row)) (= (erlang/self) (:owner row))
-                 (erlang/== generation (:generation row)))
-   (refuse! :preparation-owner-changed {}))
-  (swap! prepared assoc key {:phase :ready :generation generation}))
- generation)
-
-(defn- abandon-preparation! [key]
- (swap! prepared
-  (fn [rows]
-   (let [row (get rows key)]
-    (if (and (= (erlang/self) (:owner row)) (not= :ready (:phase row)))
-     (dissoc rows key) rows))))
- :ok)
-
-(defn- ready-prepared! [generation]
- (let [row (get @prepared (:cache-key generation))]
-  (when-not (and (= :ready (:phase row)) (erlang/== generation (:generation row)))
-   (refuse! :unready-prepared-generation {})))
- generation)
 
 (defn prepare!
  "Compile a validated plan into fresh names in a dedicated environment. Reuses
@@ -1195,9 +1137,9 @@
        key [(env/current) (:digest validated)]]
   (with-lock key
    (fn []
-    (or (cached-preparation key)
+    (or (execution/cached-preparation key)
      (do
-      (begin-preparation! key)
+      (execution/begin-preparation! key)
       (try
        (let [_ (reserve-capacity! (count (:order validated)) (:source-bytes validated))
            planned (assoc (plan* (assoc input :instance (str (erlang/unique_integer (list :positive)))) facts)
@@ -1299,39 +1241,30 @@
       ;; Ordinary development reload must never overwrite prepared providers.
       (swap! reload/live-generations
        (fn [m] (reduce (fn [a name] (assoc a name :sealed)) m (vals (:mapping planned)))))
-      (record-prepared! key generation)
+      (execution/record-prepared! key generation)
       ;; Private-cache identity exists before native original-grant freezing.
       ;; No caller-provided profile/MD5 list is admitted by this hook.
       (try
        (BeamLisp.Env/register_source_profile! generation)
-       (complete-preparation! key generation)
+       (execution/complete-preparation! key generation)
        (catch error
-        (swap! prepared dissoc key)
+        (execution/abandon-preparation! key)
         (swap! reload/live-generations
           (fn [all] (reduce dissoc all (vals (:mapping planned)))))
         (try
          (doseq [module (:modules generation)] (BeamLisp.Env/retire_module! module))
          (finally (env/destroy scope)))
         (throw error))))
-       (finally (abandon-preparation! key)))))))))
+       (finally (execution/abandon-preparation! key)))))))))
 
 (defn prepare-project! [opts]
  (BeamLisp.Env/assert_native_framework_execution!)
  (prepare! (project-plan opts)))
 
 (defn attested-prepared!
- "Read-only exact private preparation-cache identity for trusted framework
-  enrollment. A copied/edited map, caller state, digest/resources flag or live
-  namespace cannot manufacture this receipt. This does not grant execution,
-  root ownership, runtime inheritance or publication authority."
- ([generation] (attested-prepared! generation false))
- ([generation allow-retired?]
- (when-not (and (or (= true allow-retired?) (= false allow-retired?))
-                (erlang/is_map generation)
-                (erlang/== generation (prepared-generation (:cache-key generation)))
-                (or allow-retired? (not (:retired @(:state generation)))))
-  (refuse! :unattested-prepared-generation {}))
- generation))
+ "Exact original preparation identity from the shared execution owner."
+ ([generation] (execution/attested-prepared! generation))
+ ([generation allow-retired?] (execution/attested-prepared! generation allow-retired?)))
 
 (defn- acquire! [generation] (execution/acquire! generation))
 (defn- release-ticket! [generation ticket] (execution/release-ticket! generation ticket))
@@ -1433,7 +1366,7 @@
   Not a multi-owner transaction. Durable activation intent belongs upstream."
  ([slot expected generation] (publish! slot expected generation nil))
  ([slot expected generation fence]
-  (ready-prepared! generation)
+  (execution/ready-prepared! generation)
   (when-not (or (nil? fence) (fn? fence)) (refuse! :invalid-publication-fence {}))
   (if-let [result (with-lock (:id slot) #(publication-result slot expected generation))]
    (coordinate-publication fence (fn [] result))
@@ -1629,7 +1562,7 @@
   own private issued graph/resource association independently."
  [generation]
  (let [saved (get @native-retirements (retirement-key generation))
-       original (prepared-generation (:cache-key generation))]
+       original (execution/prepared-generation (:cache-key generation))]
   (if-not saved
    (do
     ;; A genuine newly prepared instance sharing a completed plan key has no
@@ -1756,7 +1689,7 @@
   (try
    ;; Recover the interruption between private native success and public
    ;; admission closure using only the original matching preparation's state.
-   (when-let [original (prepared-generation (:cache-key generation))]
+   (when-let [original (execution/prepared-generation (:cache-key generation))]
     (when (= (:scope original) (:scope generation))
      (swap! (:state original) assoc :retired true)))
    (if-not
@@ -1769,12 +1702,7 @@
     (do
      ;; All fixed SDK cleanup acknowledged. Removing the original preparation
      ;; and its mutable state cannot erase the compact native outcome.
-     (swap! prepared
-       (fn [all]
-        ;; If the caller lost its reply after deletion, another preparation may
-        ;; now occupy this reusable plan key. Never delete that newer instance.
-        (if (erlang/== generation (:generation (get all (:cache-key generation))))
-         (dissoc all (:cache-key generation)) all)))
+     (execution/forget-preparation! generation)
      (swap! reload/live-generations
        (fn [m] (reduce dissoc m (:live-names (get @native-retirements key)))))
      (swap! native-retirements update key
