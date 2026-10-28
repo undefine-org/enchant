@@ -4,7 +4,7 @@ GROUPS = {
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14), ('test/bl/compiler_contextual_test.bl', 27), ('test/bl/generation_semantics_test.bl', 18), ('test/bl/compiler_lexical_consumers_test.bl', 13)], ['expand', 'env', 'connector.google.gdrive', 'connector.microsoft.graph', 'bl.cli', 'bl.doc', 'bl.doc.html', 'bl.profile']),
-    "namespace-require": ([('test/bl/namespace_require_grammar_test.bl', 62)], []),
+    "namespace-require": ([('test/bl/namespace_require_grammar_test.bl', 62), ('test/bl/namespace_clause_grammar_test.bl', 47)], ['js.build']),
     "namespace-header-imports": ([('test/bl/contextual_namespace_require_test.bl', 33), ('test/bl/contextual_phase_capture_test.bl', 9), ('test/bl/contextual_library_test.bl', 16), ('test/bl/contextual_library_compat_test.bl', 3), ('test/bl/contextual_rename_test.bl', 22), ('test/bl/contextual_query_test.bl', 18)], ['compile.world', 'codebase.refactor']),
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24), ('test/bl/js_declaration_header_test.bl', 14)], ['expand-source', 'expand', 'js.build']),

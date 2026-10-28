@@ -57,6 +57,13 @@ for {owner, function, value} <- [{mod, :namespace_require_spec, {:vector, deferr
   true = refused
 end
 receive do :unexpected_pattern_realization -> raise "require parser executed input" after 0 -> :ok end
+clause = {:list, [{:keyword, "require"}, spec]}
+[^clause] = apply(mod, :namespace_clauses, [["documentation", clause]])
+%{"preboot" => %{require_specs: [^expected]}} = apply(aot, :namespace_header, [{:list, [{:symbol, "ns"}, {:symbol, "preboot"}, "documentation", clause]}])
+for tail <- [[42], ["first", "second"]] do
+  caught = try do apply(mod, :namespace_clauses, [tail]); :accepted rescue error in ErlangError -> error.original end
+  {:invalid_namespace_header, :clause} = caught
+end
 false = :code.is_loaded(BeamLisp.Ns.Compiler) != false
 :undefined = :ets.whereis(:beam_lisp_vars)
-IO.puts("CONTEXTUAL-UNIT-PREBOOT 21 passed; compiler unloaded; namespace table absent")
+IO.puts("CONTEXTUAL-UNIT-PREBOOT 25 passed; compiler unloaded; namespace table absent")

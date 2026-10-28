@@ -1,0 +1,72 @@
+(ns namespace-clause-grammar-test
+ (:require [reader-node :as rn] [compiler :as compiler] [expand :as x] [expand-source :as catalog]
+           [lower :as lower] [js.build :as js]))
+(defn- form [text] (first (BeamLisp.Reader/read_string text "namespace-clauses.bl")))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- source [namespace text] {:namespace namespace :revision 'v1 :source text :file (str namespace ".bl")})
+(defn- fixture [text action]
+ (let [directory (Path/join (System/tmp_dir!) (str "ns-clause-" (erlang/unique_integer (list :positive))))
+       path (Path/join directory "unit.bl")]
+  (File/mkdir_p! directory) (File/write! path text)
+  (try (BeamLisp.Env/isolated :global #(action path))
+   (finally (File/rm_rf! directory)))))
+
+(deftest optional-namespace-docstring-is-data-and-preserves-clause-origins
+ (let [reader (form "(ns client \"docs\" (:require core [core :as c]))")
+       items (rest (rest (rn/node-items (rn/node-form reader))))
+       clauses (BeamLisp.CompilerData/namespace_clauses items)]
+  (is (= (rest items) clauses))
+  (is (= :let (:op (compiler/compile reader (compiler/new-env "clause.caller")))))
+  (is (= (list (tuple "core" nil (list)) (tuple "core" "c" (list)))
+         (get-in (BeamLisp.AOT/namespace_header reader) ["client" :require_specs])))))
+
+(deftest invalid-header-tails-refuse-through-every-shared-consumer
+ (let [before (BeamLisp.Env/capture)]
+  (doseq [text ["(ns bad 42)" "(ns bad \"docs\" 42)" "(ns bad \"first\" \"second\")"
+               "(ns bad nil)" "(ns bad [])" "(ns bad ())" "(ns bad (:unknown core))"]]
+   (let [reader (form text) items (rest (rest (rn/node-items (rn/node-form reader))))]
+    (is (refused? #(BeamLisp.CompilerData/namespace_clauses items)))
+    (is (refused? #(BeamLisp.AOT/namespace_header reader)))
+    (is (refused? #(compiler/compile reader (compiler/new-env "clause.caller")))))
+   (is (refused? #(x/program [(source 'bad text)] ['bad 'v1]))))
+  (is (= before (BeamLisp.Env/capture)))))
+
+(deftest documented-source-headers-link-and-retain-exact-explicit-name-tokens
+ (let [provider (source 'provider "(ns provider \"provider documentation\") (defn answer [] 42)")
+       client (source 'client "(ns client \"client documentation\" (:require [provider :refer [answer]])) (answer)")
+       program (x/program [provider client] ['client 'v1])
+       imports (get-in program [:provenance :imports])
+       explicit (first (filter #(contains? (:only-origins %) 'answer) imports))
+       origin (get-in explicit [:only-origins 'answer])]
+  (is (= 42 (lower/eval-anf :Elixir.DocumentedHeader (:node program))))
+  (is (= "answer" (String/slice (:source client) (:offset origin) (- (:end-offset origin) (:offset origin)))))
+  (is (= 1 (count (filter #(contains? (:only-origins %) 'answer) imports))))))
+
+(deftest js-dependency-table-retains-bare-alias-and-refer-only-requests
+ (fixture "(ns js.header.dependencies \"docs\" (:require core [core :as c] [core :refer [identity]])) (def value 42)"
+  (fn [path]
+   (let [prepared (js/prepare-ns path)]
+    (is (= "js.header.dependencies" (:ns prepared)))
+    (is (= [["core" "core"] ["core" "c"] ["core" "core"]] (:requires prepared)))))))
+
+(deftest js-malformed-header-refuses-before-namespace-staging
+ (fixture "(ns js.header.must-not-stage (:require [core :as])) (def value 42)"
+  (fn [path]
+   (let [before (BeamLisp.Env/capture)]
+    (is (refused? #(js/prepare-ns path)))
+    (is (= before (BeamLisp.Env/capture)))
+    (is (not (BeamLisp.Env/loaded_ns? "js.header.must-not-stage")))))))
+
+(deftest executable-reader-tail-never-dispatches-a-callback
+ (let [called (atom false) callback (fn [] (reset! called true))
+       deferred (lazy-seq (do (reset! called true) (list callback)))]
+  (doseq [value [callback deferred (list callback)]]
+   (is (refused? #(BeamLisp.CompilerData/namespace_clauses value))))
+  (is (= false @called))))
+
+(deftest clause-head-metadata-cannot-drop-a-dependency-from-artifact-capture
+ (let [clause (tuple :list (list (tuple :meta (tuple :keyword "require") {}) (tuple :symbol "core")))
+       header (tuple :list (list (tuple :symbol "ns") (tuple :symbol "metadata.header") clause))]
+  (is (= (list clause) (BeamLisp.CompilerData/namespace_clauses (list clause))))
+  (is (= (list "core") (get-in (BeamLisp.AOT/namespace_header header) ["metadata.header" :requires])))
+  (is (= :let (:op (compiler/compile header (compiler/new-env "clause.caller")))))))
