@@ -1,0 +1,121 @@
+(ns contextual-allocation-custody-test (:require [reload.execution :as execution] [reload.generation :as generation]))
+(defn- owner-call [name args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "reload.execution" name) (to-list args)))
+(defn- rows [] @(BeamLisp.Env/fetch_exact! "reload.execution" "prepared"))
+(defn- reserve [digest] (owner-call "reserve-contextual-preparation!" [digest]))
+(defn- recover [key] (owner-call "recover-contextual-reservation!" [key]))
+(defn- allocate [key] (BeamLisp.Env/fork_prepared_scope! key))
+(defn- reason [action] (try (action) :unexpected-success (catch e (:kind (ex-data e)))))
+(defn- registered? [scope]
+ (Agent/get :Elixir.BeamLisp.Env #(Map/has_key? (get % :envs {}) scope)))
+
+(deftest fresh-allocation-is-once-only-and-abandon-destroys-before-forgetting
+ (let [before (rows) reservation (reserve "allocation-once") key (:key reservation) scope (:scope reservation)]
+  (try
+   (is (registered? scope))
+   (is (= :claimed (get-in (rows) [key :scope-allocation :state])))
+   (is (= :unattested-scope-reservation (reason #(allocate key))))
+   (recover key)
+   (is (registered? scope))
+   (is (contains? (rows) key))
+   (owner-call "abandon-preparation!" [key])
+   (is (not (registered? scope)))
+   (is (= :retired (BeamLisp.Env/with_scope_commit scope (fn [] :alive))))
+   (is (= before (rows)))
+   (finally (BeamLisp.Env/destroy scope) (owner-call "abandon-preparation!" [key])))))
+
+(deftest a-foreign-caller-cannot-consume-or-recover-a-live-preparation
+ (let [reservation (reserve "allocation-foreign") key (:key reservation) caller (erlang/self)]
+  (try
+   (let [worker (erlang/spawn
+                 (fn []
+                  (recover key)
+                  (erlang/send caller [:foreign (reason #(allocate key))])))]
+    (is (= :unattested-scope-reservation
+           (receive [:foreign result] result (after 5000 :missing))))
+    (is (registered? (:scope reservation)))
+    (is (contains? (rows) key)))
+   (finally (owner-call "abandon-preparation!" [key])))))
+
+(deftest dead-caller-recovery-removes-an-allocated-pre-graph-scope
+ (let [before (rows) caller (erlang/self)
+       worker (erlang/spawn (fn [] (erlang/send caller [:reserved (reserve "allocation-dead")])
+                              (receive :stop nil)))
+       monitor (erlang/monitor :process worker)
+       reservation (receive [:reserved r] r (after 5000 (throw :reservation-missing)))
+       key (:key reservation) scope (:scope reservation)]
+  (try
+   (is (registered? scope))
+   (erlang/exit worker :kill)
+   (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
+   (recover key)
+   (is (not (registered? scope)))
+   (is (= before (rows)))
+   (recover key)
+   (is (= before (rows)))
+   (finally (erlang/demonitor monitor (list :flush))
+            (when (Process/alive? worker) (erlang/exit worker :kill))
+            (recover key)))))
+
+(deftest queued-allocation-cannot-resurrect-a-scope-after-creator-death
+ (let [before (rows) caller (erlang/self) env (Process/whereis :Elixir.BeamLisp.Env)
+       worker (atom nil) scope (atom nil) suspended (atom false) target (tuple :Elixir.Agent :get_and_update 2)]
+  (try
+   (sys/suspend env)
+   (reset! suspended true)
+   (reset! worker (erlang/spawn (fn [] (reserve "allocation-queued"))))
+   ;; The Env actor is suspended, so a queued allocation cannot complete.
+   ;; Its message contains the actual native allocator callback and sender.
+   (let [message (loop [remaining 500]
+                  (let [messages (elem (Process/info env :messages) 1)
+                        found (Enum/find messages
+                                (fn [message]
+                                 (and (erlang/is_tuple message) (= 3 (erlang/tuple_size message))
+                                      (= :"$gen_call" (elem message 0))
+                                      (= @worker (elem (elem message 1) 0)))))]
+                   (if found found
+                    (if (= 0 remaining) (throw :allocation-not-queued)
+                     (do (receive (after 10 nil)) (recur (dec remaining)))))))
+         added (Map/drop (rows) (maps/keys before)) key (first (maps/keys added))
+         monitor (erlang/monitor :process @worker)]
+    (reset! scope (nth key 3))
+    (is (= 1 (count added)))
+    (is (= :claimed (get-in added [key :scope-allocation :state])))
+    (erlang/exit @worker :kill)
+    (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
+    (erlang/demonitor monitor (list :flush))
+    (sys/resume env)
+    (reset! suspended false)
+    ;; A synchronous actor read orders after processing the already queued call.
+    (is (not (registered? @scope)))
+    (recover key)
+    (is (not (registered? @scope)))
+    ;; Replay the captured native callback after destruction as the opposite
+    ;; cross-sender delivery order. A dead creator still cannot recreate it.
+    (is (= :abandoned (Agent/get_and_update :Elixir.BeamLisp.Env (elem (elem message 2) 1))))
+    (is (not (registered? @scope)))
+    (is (= before (rows))))
+   (finally
+    (when @suspended (sys/resume env))
+    (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))
+    (doseq [key (maps/keys (Map/drop (rows) (maps/keys before)))] (recover key))
+    (when @scope (BeamLisp.Env/destroy @scope))))))
+
+(deftest closed-parent-retirement-recovers-a-dead-pre-graph-allocation
+ (let [before (rows) parent (BeamLisp.Env/fork) caller (erlang/self)
+       worker (erlang/spawn
+                (fn [] (erlang/send caller [:reserved (BeamLisp.Env/with_env parent #(reserve "allocation-drain"))])
+                       (receive :stop nil)))
+       monitor (erlang/monitor :process worker)
+       reservation (receive [:reserved r] r (after 5000 (throw :reservation-missing)))]
+  (try
+   (erlang/exit worker :kill)
+   (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
+   (BeamLisp.Env/destroy parent)
+   (is (= {:status :retired :pending 0 :retired 1}
+          (generation/retire-contextual-children! parent)))
+   (is (not (registered? (:scope reservation))))
+   (is (= before (rows)))
+   (finally (erlang/demonitor monitor (list :flush))
+            (when (Process/alive? worker) (erlang/exit worker :kill))
+            (recover (:key reservation)) (BeamLisp.Env/destroy parent)))))

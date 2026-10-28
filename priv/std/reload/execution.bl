@@ -72,6 +72,12 @@
 
 (defn abandon-preparation! [key]
  (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key)]
+  (when (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+             (= :preparing (:phase row)) (nil? (:generation row))
+             (= (erlang/self) (:owner row)))
+   ;; Keep the allocation's address until destruction actually finishes.
+   (BeamLisp.Env/destroy (nth key 3))))
  (swap! prepared
   (fn [rows]
    (let [row (get rows key)]
@@ -166,22 +172,56 @@
        (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))))
 
 (defn- reserve-contextual-preparation! [digest]
- ;; Publish the reservation while the parent is still alive. Destruction uses
- ;; the same native scope fence, so a later child-retirement snapshot cannot
- ;; miss a publisher that was admitted before closure. Fork the fresh child
- ;; first: scope-lock ordering forbids taking a child lock under the parent.
- ;; Physical module locks and application code stay outside the parent fence.
+ ;; Record the fresh scope identity BEFORE allocation can reach the Env actor.
+ ;; Parent closure shares this admission fence; child allocation stays outside
+ ;; it, preserving native scope/module lock ordering.
  (BeamLisp.Env/assert_native_framework_execution!)
  (let [parent (BeamLisp.Env/env_id)
-       scope (BeamLisp.Env/fork) key [parent :contextual-unit digest scope]]
+       scope (tuple :env (erlang/make_ref)) key [parent :contextual-unit digest scope]]
   (try
    (let [reservation (BeamLisp.Env/with_scope_commit parent
-                      (fn [] (begin-preparation! key) {:scope scope :key key}))]
+                      (fn []
+                       (begin-preparation! key)
+                       (swap! prepared update key assoc :scope-allocation
+                         {:state :reserved :caps (BeamLisp.Env/caps_of parent)
+                          :max-heap (BeamLisp.Env/heap_of parent)})
+                       {:scope scope :key key}))]
     (when (= :retired reservation) (refuse! :retired-preparation-parent {}))
+    (BeamLisp.Env/fork_prepared_scope! key)
     reservation)
    (catch error
     (BeamLisp.Env/destroy scope)
+    (abandon-preparation! key)
     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
+
+(defn claim-contextual-scope!
+ "Fixed native allocator hook. Consume only this caller's private fresh-scope
+  reservation. Caller-supplied scope IDs or copied records grant no allocation."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key) allocation (:scope-allocation row)]
+  (when-not (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+                 (= (BeamLisp.Env/env_id) (first key))
+                 (= :preparing (:phase row)) (= (erlang/self) (:owner row))
+                 (= :reserved (:state allocation)))
+   (refuse! :unattested-scope-reservation {}))
+  (swap! prepared assoc key (assoc-in row [:scope-allocation :state] :claimed))
+  {:scope (nth key 3) :parent (first key) :caps (:caps allocation) :max-heap (:max-heap allocation)}))
+
+(defn recover-contextual-reservation!
+ "Recover only a dead caller's pre-graph reservation. No initialized graph or
+  resource is forgotten. Destruction completes before dropping the private row."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (with-lock key
+  (fn []
+   (let [row (get @prepared key)]
+    (when (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+               (= :preparing (:phase row)) (nil? (:generation row))
+               (erlang/is_pid (:owner row)) (not (Process/alive? (:owner row))))
+     (BeamLisp.Env/destroy (nth key 3))
+     (swap! prepared (fn [rows] (if (= row (get rows key)) (dissoc rows key) rows)))
+    :ok)))))
 
 (defn prepare-captured-unit!
  "Prepare one activation from the native Loader's complete captured unit.
@@ -220,8 +260,8 @@
     (catch error
      ;; Preparation has executed no application code. Leave shared immutable
      ;; code loaded; deleting a physical module could invalidate another graph.
-     (abandon-preparation! key)
      (BeamLisp.Env/destroy scope)
+     (abandon-preparation! key)
      (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))
 
 (defn- instance-ready! [generation]
