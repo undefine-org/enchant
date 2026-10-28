@@ -4,10 +4,13 @@
            [test.support.source-fixtures :as fixtures]))
 (fixtures/effects!)
 (when-not (erlang/function_exported :Elixir.SourceInstanceGuardFixture :enter! 2)
- (BeamLisp.AOT/compile_host_file
+ (let [before (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.AOT/compile_host_file
   (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (File/cwd!)) "test/fixtures/source_instance_guard.bl")
   (list (tuple :module :Elixir.SourceInstanceGuardFixture) (tuple :load? true)
-        (tuple :output_dir (Path/join (System/tmp_dir!) "bl-source-fixture-beams")))))
+        (tuple :output_dir (Path/join (System/tmp_dir!) "bl-source-fixture-beams"))))
+   (finally (BeamLisp.Env/bind before)))))
 
 (defn- program [text]
  (expand/program [{:namespace 'instance :revision 'current :file "instance.bl" :source (str "(ns instance) " text)}]
@@ -26,17 +29,22 @@
 (defn- options [value]
  {:sources {"unit.consumer"
    (str "(ns unit.consumer) (defn tag [] " value ") "
-        "(defn create [] (SourceUnitInstanceFixture/instantiate)) "
+        "(defn __bl_unit__ [] (SourceUnitInstanceFixture/instantiate)) "
         "(defn call [f args] (apply f args))")}
   :native-modules #{"erlang" "SourceUnitInstanceFixture" "SourceInstanceGuardFixture" "SourceEffectObserverFixture"}})
 (defn- invoke [graph f args] (generation/invoke! graph "unit.consumer/call" [f args]))
+(defn- create [graph]
+ (generation/with! graph #(BeamLisp.Env/invoke_generation_factory!
+                           (BeamLisp.Emit/module_for (get (:mapping graph) "unit.consumer")))))
 
 (deftest runtime-factory-captures-one-marker-and-guards-every-runtime-function-arm
  (let [p (program "(defn answer ([x] x) ([x & more] x)) (answer 42)")
-       expression (:expression (prepared p))
+       factory (:expression (prepared p)) expression (last (:stmts factory))
        guards (filter #(and (= :remote (:op %)) (= :with_source_execution! (:fun %))) (nodes expression))
        captures (filter #(and (= :remote (:op %)) (= :selected_execution_graph_id (:fun %))) (nodes expression))]
   (is (= 1 (count captures)))
+  (is (= :do (:op factory)))
+  (is (= :consume_generation_factory! (:fun (first (:stmts factory)))))
   (is (> (count guards) 2))
   (is (every? #(= 2 (count (:args %))) guards))
   (is (every? #(= (:name expression) (:name (first (:args %)))) guards))
@@ -46,9 +54,9 @@
  (let [unit {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list) :exports (list)
              :entry (a/lett "__bl_source_instance_0" (a/lit 42)
                       (a/fnn (list (a/clause (list) nil (a/var "__bl_source_instance_0")))))}
-       expression (:expression (producer/specialize-unit unit {}))]
+       factory (:expression (producer/specialize-unit unit {})) expression (last (:stmts factory))]
   (is (not= "__bl_source_instance_0" (:name expression)))
-  (is (= expression (:expression (producer/specialize-unit unit {}))))))
+  (is (= factory (:expression (producer/specialize-unit unit {}))))))
 
 (deftest same-physical-factory-closures-stay-bound-to-their-original-actual-graph
  (let [p (program
@@ -67,11 +75,11 @@
                     (list [:instantiate 0]) (list))
        beam (lower/descriptor->beam descriptor {})]
   (code/load_binary module '() (elem beam 1))
-  (is (= :source_instance_changed (reason #(erlang/apply module :instantiate (list)))))
+  (is (= :unadmitted_unit_factory (reason #(erlang/apply module :instantiate (list)))))
   (let [left (generation/prepare! (options 1)) right (generation/prepare! (options 2))]
    (try
-    (let [one (generation/invoke! left "unit.consumer/create" [])
-          two (generation/invoke! right "unit.consumer/create" [])
+    (let [one (create left)
+          two (create right)
           f (get (:exports one) (reference p 'answer))
           g (get (:exports two) (reference p 'answer))
           count-to (get (:exports one) (reference p 'count-to))
