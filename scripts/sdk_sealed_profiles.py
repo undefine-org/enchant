@@ -9,7 +9,7 @@ GROUPS = {
     "namespace-initialization": ([('test/bl/contextual_namespace_initialization_test.bl', 34)], ['compile.world']),
     "declaration-header": ([('test/bl/contextual_declaration_header_test.bl', 24), ('test/bl/js_declaration_header_test.bl', 14)], ['expand-source', 'expand', 'js.build']),
     "factory-admission": ([('test/bl/contextual_factory_admission_test.bl', 40), ('test/bl/closed_etf_test.bl', 150), ('test/bl/data_first_order_test.bl', 105), ('test/bl/contextual_unit_recipe_test.bl', 75)], ['compile.world', 'system.phase', 'codebase.phase']),
-    "lexical-scope": ([('test/bl/contextual_lexical_scope_test.bl', 103), ('test/bl/contextual_try_test.bl', 56), ('test/bl/lower_try_operand_test.bl', 9), ('test/bl/core_aot_test.bl', 16)], ['expand', 'codebase.refactor']),
+    "lexical-scope": ([('test/bl/contextual_lexical_scope_test.bl', 103), ('test/bl/contextual_try_test.bl', 56), ('test/bl/lower_try_operand_test.bl', 9), ('test/bl/core_aot_test.bl', 16)], ['expand', 'codebase.refactor', 'java.manifest']),
     "namespace-exports": ([('test/bl/contextual_namespace_exports_test.bl', 41)], ['compile.world', 'system.phase', 'codebase.phase']),
     "binding-reference": ([('test/bl/contextual_binding_anf_test.bl', 112)], ['expand', 'system.ir', 'codebase.phase', 'js.emit']),
     "physical-declaration": ([('test/bl/compiler_physical_declaration_test.bl', 24)], []),

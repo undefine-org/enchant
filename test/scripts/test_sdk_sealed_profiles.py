@@ -39,6 +39,17 @@ class SealedProfiles(unittest.TestCase):
         self.assertEqual(PROFILE['UNIVERSAL'], selection['universal'])
         self.assertEqual('focused', selection['mode'])
 
+    def test_lexical_catch_selection_includes_dynamic_class_manifest(self):
+        selection = PROFILE['plan'](['unit-metadata'])
+        self.assertIn('java.manifest', selection['roots'])
+        source = '\n'.join((ROOT / path).read_text() for path in
+                           ['priv/boot/compiler.bl', 'priv/boot/anf.bl',
+                            'priv/boot/lower.bl', 'priv/boot/expand.bl'])
+        fixed = set(re.findall(r'BeamLisp.Loader/ensure_loaded "([^"]+)"', source))
+        self.assertTrue(fixed)
+        self.assertTrue(fixed.issubset(selection['roots']))
+        self.assertNotIn('java.manifest', PROFILE['plan'](['filesystem-custody'])['roots'])
+
     def test_empty_duplicate_and_unknown_boundaries_refuse(self):
         for requested in [[], ['missing'], ['sealed-loader', 'sealed-loader']]:
             with self.subTest(requested=requested), self.assertRaises(ValueError):
