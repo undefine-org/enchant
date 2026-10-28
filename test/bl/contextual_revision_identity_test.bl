@@ -1,0 +1,82 @@
+(ns contextual-revision-identity-test
+ (:require [expand :as x] [expand-source :as catalog] [binding :as b] [lower :as lower]))
+(defn- source [namespace revision file text]
+ {:namespace namespace :revision revision :file file :source text})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.RevisionIdentity.R" (erlang/unique_integer (list :positive)))) (:node program)))
+(defn- twin-sources [text]
+ [(source 'provider 'a "a.bl" text) (source 'provider 'z "z.bl" text)])
+(defn- client [body]
+ (source 'client 'v1 "client.bl"
+  (str "(ns client) (import-world 'provider 'a :as a :only [answer]) "
+       "(import-world 'provider 'z :as z :only [answer]) " body)))
+
+(deftest same-content-revisions-retain-worlds-recipes-and-source-provenance
+ (let [providers (twin-sources "(ns provider) (defn answer [] 42)")
+       sources (conj providers (client "(erlang/+ (a/answer) (z/answer))"))
+       c (catalog/catalog sources) reverse-c (catalog/catalog (reverse sources))
+       a (catalog/unit c 'provider 'a) z (catalog/unit c 'provider 'z)
+       program (x/program sources ['client 'v1])
+       reversed (x/program (reverse sources) ['client 'v1])
+       locations (:declarations (catalog/provenance c))]
+  (is (not= (get-in a [:world :key]) (get-in z [:world :key])))
+  (is (= 3 (count (:worlds c))))
+  (is (= 2 (count (:recipes c))))
+  (is (= #{"a.bl" "z.bl"} (set (Enum/map (Map/values locations) #(get-in % [:origin :file])))))
+  (is (= c reverse-c))
+  (is (= (:selection program) (:selection reversed)))
+  (is (= 84 (execute program)))
+  (is (= 84 (execute reversed)))))
+
+(deftest private-helpers-and-transformers-stay-in-each-revision-definition-world
+ (let [providers (twin-sources
+                  "(ns provider) (defn- helper [x] (erlang/+ x 40)) (defsyntax answer [form ctx] (syntax-template (helper input) {'input (syntax-arg form 1)}))")
+       library (x/decode-phase-library (x/encode-phase-library (x/phase-library providers)))
+       program (x/program [(client "(erlang/+ (a/answer 2) (z/answer 2))")] ['client 'v1] [library])]
+  (is (= 3 (:version library)))
+  (is (= 2 (count (set (Enum/map (:units library) #(:revision (first (get-in % [:world :selection :sources]))))))))
+  (is (= 2 (count (:transformers program))))
+  (is (= 2 (count (:expansions program))))
+  (is (= 84 (execute program)))))
+
+(deftest legacy-twins-rekey-all-scopes-declarations-and-syntax-contexts
+ (let [path (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+                       "test/fixtures/phase-library-schemas/v2-twins.etf")
+       library (x/decode-phase-library (File/read! path))
+       program (x/program [(client "(erlang/+ (a/answer) (z/answer))")] ['client 'v1] [library])]
+  (is (= 3 (:version library)))
+  (is (= 2 (count (set (Enum/map (:units library) #(:revision (first (get-in % [:world :selection :sources]))))))))
+  (is (= 2 (count (set (Enum/map (:units library) #(get-in % [:module :world]))))))
+  (is (= #{"a.bl" "z.bl"} (set (Enum/map (Map/values (get-in program [:provenance :declarations])) #(get-in % [:origin :file])))))
+  (is (= 84 (execute program)))
+  (is (= library (x/decode-phase-library (x/encode-phase-library library))))))
+
+(defn- resign [library]
+ (let [data (dissoc library :digest)]
+  (assoc data :digest (crypto/hash :sha256 (erlang/term_to_binary data (list :deterministic))))))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(deftest qualified-source-coordinates-are-validated-before-use
+ (let [base {:version 1 :profile 'syntax-v1 :target 'beam-v1
+             :sources [{:namespace 'provider :digest (crypto/hash :sha256 "same")}]}]
+  (is (not= (b/world-key (assoc-in base [:sources 0 :revision] 'a))
+            (b/world-key (assoc-in base [:sources 0 :revision] 'z))))
+  (doseq [revision [nil "a" (tuple :symbol 42) (tuple :symbol "")]]
+   (is (refused? #(b/world-key (assoc-in base [:sources 0 :revision] revision)))))))
+
+(deftest conversion-and-current-decoding-cannot-launder-inconsistent-identities
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       legacy (BeamLisp.CompilerData/decode_closed_etf!
+                (File/read! (Path/join root "test/fixtures/phase-library-schemas/v2.etf")))
+       mutate-unit (fn [library mutate]
+                     (resign (update library :units #(cons (mutate (first %)) (rest %)))))
+       wrong-module (mutate-unit legacy #(assoc-in % [:module :owner] 'foreign))
+       wrong-context (mutate-unit legacy #(assoc-in % [:context :world] (crypto/hash :sha256 "foreign")))
+       wrong-recipe (mutate-unit legacy
+                     (fn [unit]
+                      (update unit :recipes
+                       #(Map/new (Enum/map (Map/to_list %) (fn [pair]
+                         (tuple (elem pair 0) (assoc-in (elem pair 1) [:declaration :name] 'foreign))))))))
+       current (x/decode-phase-library (erlang/term_to_binary legacy (list :deterministic)))
+       wrong-revision (mutate-unit current #(assoc % :revision 'foreign))]
+  (doseq [library [wrong-module wrong-context wrong-recipe wrong-revision]]
+   (is (refused? #(x/decode-phase-library (erlang/term_to_binary library (list :deterministic))))))))

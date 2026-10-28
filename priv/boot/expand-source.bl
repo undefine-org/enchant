@@ -62,6 +62,7 @@
   (refuse! :phase-source-descriptor nil))
  (let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
                   :sources [{:namespace (:namespace descriptor)
+                             :revision (:revision descriptor)
                              :digest (crypto/hash :sha256 (:source descriptor))}]}
        module (b/scope selection (:namespace descriptor) [0] :module)
        context {:world (b/world-key selection) :namespace (:namespace descriptor) :space 'value
@@ -179,17 +180,63 @@
  (let [world (b/world (:selection data) (:scopes data) (Enum/map (:declarations data) #(dissoc % :id)))]
   (when-not (= data (portable-world world)) (refuse! :phase-library-world nil)) world))
 
+(defn- unit-context [world unit]
+ (let [phases (Enum/filter (keys (get-in unit [:context :scopes])) #(not= :all %))]
+  {:world (:key world) :namespace (:namespace unit) :space 'value
+   :scopes (Map/put (Map/new (Enum/map phases
+                       #(tuple % (list (:id (module-scope (:selection world) (:namespace unit) %))))))
+                   :all (Enum/map (:import-scopes unit) #(:id %)))}))
+
+(defn- declaration-coordinate [d] (tuple (:namespace d) (:phase d) (:space d) (:path d)))
+
+(defn- qualify-library-unit [unit]
+ ;; This is a one-way data conversion. Validate every old identity/context
+ ;; before replacing it; resolution and compilation see only qualified worlds.
+ (let [old (restore-world (:world unit))
+       _ (when (some #(contains? % :revision) (get-in old [:selection :sources]))
+           (refuse! :phase-library-world nil))
+       _ (when-not (and (= (:module unit) (b/scope (:selection old) (:namespace unit) [0] :module))
+                         (= (s/context (:context unit)) (s/context (unit-context old unit))))
+           (refuse! :phase-library-context nil))
+       selection (update (:selection old) :sources
+                   #(Enum/map % (fn [source] (assoc source :revision (:revision unit)))))
+       scopes (Map/new (Enum/map (Map/values (:scopes old))
+                #(tuple (:id %) (b/scope selection (:owner %) (:path %) (:role %)))))
+       declarations (Enum/map (:declarations old)
+                      #(assoc (dissoc % :id) :scopes
+                         (Enum/map (:scopes %) (fn [id] (:id (Map/fetch! scopes id))))))
+       world (b/world selection (Map/values scopes) declarations)
+       by-coordinate (Map/new (Enum/map (:declarations world) #(tuple (declaration-coordinate %) %)))
+       imports (Enum/map (:import-scopes unit)
+                 (fn [scope]
+                  (when-not (= scope (get-in old [:scopes (:id scope)]))
+                   (refuse! :phase-library-import-scope nil))
+                  (Map/fetch! scopes (:id scope))))
+       context (unit-context world (assoc unit :import-scopes imports))
+       recipes (Map/new (Enum/map (Map/to_list (:recipes unit))
+                 (fn [pair]
+                  (let [recipe (elem pair 1) declaration (Map/fetch! (:by-id old) (elem pair 0))
+                        node (s/validate (:node recipe))
+                        _ (when-not (and (= (:declaration recipe) declaration) (= (:world recipe) (:key old))
+                                          (= node (s/from-node (s/to-reader node) (:context unit))))
+                            (refuse! :phase-library-recipe node))
+                        current (Map/fetch! by-coordinate (declaration-coordinate declaration))]
+                   (tuple (:id current) (assoc recipe :declaration current :world (:key world)
+                                          :node (s/from-node (s/to-reader node) context)))))))]
+  (assoc unit :world (portable-world world) :module (b/scope selection (:namespace unit) [0] :module)
+              :import-scopes imports :context context :recipes recipes)))
+
 (defn- canonical-library [library]
  (BeamLisp.CompilerData/check_first_order! library
   {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
  (when-not (and (erlang/is_map library) (not (contains? library :__struct__))
                 (= #{:version :kind :profile :units :digest} (set (keys library)))
-                (contains? #{1 2} (:version library)) (= :contextual-phase-library (:kind library))
+                (contains? #{1 2 3} (:version library)) (= :contextual-phase-library (:kind library))
                 (= 'syntax-v1 (:profile library)) (erlang/is_list (:units library))
                 (= (:digest library) (crypto/hash :sha256 (erlang/term_to_binary (dissoc library :digest) (list :deterministic)))))
   (refuse! :phase-library-integrity nil))
  (when (> (count (:units library)) 128) (refuse! :phase-source-bound nil))
- (if (= 1 (:version library))
+ (if (< (:version library) 3)
   ;; Legacy bytes are input data, never a second execution schema. Check their
   ;; original digest above, then normalize once with explicitly unknown origins.
   (let [units (Enum/map (:units library)
@@ -200,12 +247,17 @@
                  (fn [requests]
                   (Enum/map requests
                    (fn [request]
-                    (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
-                                   (= #{:provider :revision :phase :shift :only :alias :path}
-                                      (set (keys request))))
-                     (refuse! :phase-library-import nil))
-                    (assoc request :only-origins {})))))))
-        current (assoc (dissoc library :digest) :version 2 :units units)]
+                    (if (= 1 (:version library))
+                     (do
+                      (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
+                                     (= #{:provider :revision :phase :shift :only :alias :path}
+                                        (set (keys request))))
+                       (refuse! :phase-library-import nil))
+                      (assoc request :only-origins {}))
+                     request)))))))
+        current (assoc (dissoc library :digest) :version 3 :units (Enum/map units (fn [unit] (qualify-library-unit unit))))
+        _ (BeamLisp.CompilerData/check_first_order! current
+            {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
    (assoc current :digest (crypto/hash :sha256 (erlang/term_to_binary current (list :deterministic)))))
   library))
 
@@ -250,10 +302,7 @@
    (let [world (restore-world (:world unit))
          module (b/scope (:selection world) (:namespace unit) [0] :module)
          phases (Enum/filter (keys (get-in unit [:context :scopes])) #(not= :all %))
-         context {:world (:key world) :namespace (:namespace unit) :space 'value
-                  :scopes (Map/put (Map/new (Enum/map phases
-                                            #(tuple % (list (:id (module-scope (:selection world) (:namespace unit) %))))))
-                                   :all (Enum/map (:import-scopes unit) #(:id %))) }]
+         context (unit-context world unit)]
     (when-not (and (= #{:namespace :revision :file :world :module :imports :import-scopes
                        :recipes :expressions :context} (set (keys unit)))
                    (symbol? (:revision unit)) (erlang/is_binary (:file unit))
@@ -269,6 +318,7 @@
                    (= 'beam-v1 (get-in world [:selection :target]))
                    (= 1 (count (get-in world [:selection :sources])))
                    (= (:namespace unit) (:namespace (first (get-in world [:selection :sources]))))
+                   (= (:revision unit) (:revision (first (get-in world [:selection :sources]))))
                    (= (count (:import-scopes unit)) (count (Enum/uniq (:import-scopes unit))))
                    (= (set (Map/values (:scopes world)))
                       (set (Enum/concat (Enum/map phases #(module-scope (:selection world) (:namespace unit) %))
@@ -349,7 +399,7 @@
                           #(cond-> (assoc (dissoc % :source) :world (portable-world (:world %)))
                              definitions-only? (assoc :expressions (list))))
                           #(tuple (:namespace %) (:revision %)))
-       library {:version 2 :kind :contextual-phase-library :profile 'syntax-v1 :units units}
+       library {:version 3 :kind :contextual-phase-library :profile 'syntax-v1 :units units}
        library (assoc library :digest (crypto/hash :sha256 (erlang/term_to_binary library (list :deterministic))))]
   (library-units library) library))
 
