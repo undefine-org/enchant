@@ -27,7 +27,7 @@ GROUPS = {
     "af": ([('test/bl/system/af_worklist_test.bl', 75)], ['system.gfp']),
     "capacity": ([('test/bl/proc_callback_capacity_test.bl', 101)], ['proc.callback', 'system.ownership']),
     "supervisor-context": ([('test/bl/proc/supervisor_context_test.bl', 32), ('test/bl/sdk_runtime_owner_context_test.bl', 7), ('test/bl/native_server_initializer_extent_test.bl', 19), ('test/bl/system/evidence_test.bl', 18)], ['data.bounded-cache', 'data.cache-pool', 'system.evidence', 'proc.task']),
-    "generation-retirement": ([('test/bl/native_execution_scoped_retirement_test.bl', 32), ('test/bl/reload/preparation_owner_origin_test.bl', 29)], ['reload.generation', 'reload.execution']),
+    "generation-retirement": ([('test/bl/native_execution_scoped_retirement_test.bl', 32), ('test/bl/reload/preparation_owner_origin_test.bl', 29), ('test/bl/native_parent_start_lifetime_test.bl', 6)], ['reload.generation', 'reload.execution', 'vm.manager']),
     "message-context": ([('test/bl/native_execution_callback_analysis_test.bl', 16)], ['proc.message-domain', 'test.support.source-fixtures']),
     "returns": ([('test/bl/server_return_model_test.bl', 10)], []),
     "clauses": ([('test/bl/execution_clause_identity_test.bl', 5), ('test/bl/execution_entry_producer_test.bl', 47)], []),
