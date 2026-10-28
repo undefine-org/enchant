@@ -53,10 +53,13 @@
                  (vals vms))))))
 
 (defn- accepted [result]
- (if (= :realm-identity-conflict (:error result))
+ (cond
+  (= :realm-identity-conflict (:error result))
   (throw (ex-info "realm identity conflicts with an open realm; close it before changing its specification"
                   {:reason :realm-identity-conflict}))
-  result))
+  (= :realm-draining (:error result))
+  (throw (ex-info "realm still has consumers awaiting retirement" {:reason :realm-draining :id (:id result)}))
+  :else result))
 
 ;; state: {:vms {id → vm-value}}
 (defn unique-alias
@@ -95,7 +98,8 @@
       (if (conflict? spec (:vms st))
         (reply {:error :realm-identity-conflict} st)
        (if (contains? (:vms st) id)
-        (reply (get (:vms st) id) st)
+        (reply (if (= :draining (get-in st [:vms id :status]))
+                 {:error :realm-draining :id id} (get (:vms st) id)) st)
         (let [vm (assoc (vmc/spawn-vm spec) :spec-identity (spec-identity spec))]
           (start-schedules! vm)
           (reply vm (assoc st :vms (assoc (:vms st) id vm))))))))
@@ -108,7 +112,9 @@
       (if (conflict? spec (:vms st))
         (reply {:error :realm-identity-conflict} st)
        (if (contains? (:vms st) id)
-        (reply {:vm (get (:vms st) id) :created false} st)
+        (reply (if (= :draining (get-in st [:vms id :status]))
+                 {:error :realm-draining :id id}
+                 {:vm (get (:vms st) id) :created false}) st)
         (let [vm (assoc (vmc/spawn-vm (assoc spec :alias (unique-alias (:alias spec) (vals (:vms st)))))
                         :spec-identity (spec-identity spec))]
           (start-schedules! vm)
@@ -136,6 +142,7 @@
           live? (and previous (Process/alive? (:pid previous)))]
       (cond
         (nil? vm) (reply {:error :realm-closed :id id} st)
+        (= :draining (:status vm)) (reply {:error :realm-draining :id id} st)
         (and live? (not= identity (:identity previous)))
         (reply {:error :service-identity-conflict :slot slot} st)
         live? (reply previous st)
@@ -162,14 +169,20 @@
   (handle-call [:drain id] [_from st]
     (if (contains? (:vms st) id)
       (let [r (vmc/drain (get (:vms st) id))]
-        (reply r (assoc st :vms (dissoc (:vms st) id))))
+        (reply r (if (= :waiting (:status r))
+                   (assoc-in st [:vms id :status] :draining)
+                   (assoc st :vms (dissoc (:vms st) id)))))
       (reply {:halted 0} st)))
 
   ;; shutdown drains every VM (each tears down its own processes + env) and
   ;; then lets the daemon stop — the ONE place a node-wide end is legitimate.
   (handle-call [:shutdown] [_from st]
-    (let [drained (vec (map (fn [vm] (vmc/drain vm)) (vals (:vms st))))]
-      (reply {:drained (count drained)} (assoc st :vms {})))))
+    (let [results (mapv (fn [[id vm]] [id (vmc/drain vm)]) (:vms st))
+          pending (into {} (keep (fn [[id result]]
+                                  (when (= :waiting (:status result))
+                                   [id (assoc (get (:vms st) id) :status :draining)])) results))]
+      (reply {:drained (- (count results) (count pending)) :pending (count pending)}
+             (assoc st :vms pending)))))
 
 (defn start
   "Boot the global daemon (idempotent by name). Returns its pid. The owner
@@ -238,16 +251,20 @@
   "Arm a long-lived side-app in VM `id` under `role`. Returns the pid."
   [id role thunk]
   (let [vm (get-vm id)]
-    (if (nil? vm)
+    (if (= :draining (:status vm))
+      (accepted {:error :realm-draining :id id})
+     (if (nil? vm)
       (throw (ex-info (str "no VM: " id) {:id id}))
-      (vmc/serve vm role thunk))))
+      (vmc/serve vm role thunk)))))
 
 (defn drain
-  "Tear one VM down and drop it from the table. Returns {:halted n}."
+  "Drain one VM. Pending consumers retain a :draining entry for explicit retry;
+   completed retirement drops it. Returns core/drain's lifecycle status."
   [id]
   (call MANAGER [:drain id] :infinity))
 
 (defn shutdown
-  "Drain every VM, then the daemon can stop. Returns {:drained n}."
+  "Drain every VM; retain pending entries. The daemon can stop only with zero
+   :pending. Returns {:drained n :pending n}."
   []
   (call MANAGER [:shutdown] :infinity))
