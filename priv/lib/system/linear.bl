@@ -41,7 +41,8 @@
 ;      cheap: one walk, one hash per node. This is what `lsp/diagnostics`
 ;      surfaces and what the boot build asserts over the whole toolchain.
 ;
-; Tier 1 proves the compiler's source has the property; tier 2 proves the
+; Tier 1 checks a recognized subset of compiler Source (coverage limits below);
+; it is not an unconditional proof of the complete compiler. Tier 2 proves the
 ; property implies the bound; tier 3 measures the artefact. A regression in
 ; any of the three fails a test with the offending function named.
 
@@ -228,21 +229,15 @@
   (contains? #{"var" "lit" "global" "global-exact"} (callee-name n)))
 
 (defn- compiled-init?
-  "Is this let-init the compilation of a child? A call whose callee name
-   starts with `compile` (compile-node, compile-body, compile-each-notail …)
-   or ends in `-node`/`-steps`, or a NON-LEAF constructor call itself.
-   NB: the `compile*` clause still reads only the DIRECT-remote and `:apply`
-   spellings, so a call that compiled to the RT.invoke shape is not seen here
-   — see the BUG-054 note in !tasks/bugs before relying on it."
+  "Conservatively recognize compiled-child producers through the same call
+   view as constructor recognition: compile*, self-apply*, nest-lets*, or a
+   non-leaf constructor. Naming conventions classify children, not authority."
   [init]
-  (or (and (constructor-call? init) (not (leaf-constructor? init)))
-      (and (ir/node? init) (= :apply (:op init)) (ir/node? (:fn init))
-           (= :global (get-in init [:fn :op]))
-           (let [nm (get-in init [:fn :name])]
-             (or (zero? (index-of nm "compile")) (zero? (index-of nm "self-apply"))
-                 (zero? (index-of nm "nest-lets")))))
-      (and (ir/node? init) (= :remote (:op init))
-           (zero? (index-of (str (:fun init)) "compile")))))
+  (let [nm (callee-name init)]
+    (or (and (constructor-call? init) (not (leaf-constructor? init)))
+        (and nm (or (zero? (index-of nm "compile"))
+                    (zero? (index-of nm "self-apply"))
+                    (zero? (index-of nm "nest-lets")))))))
 
 ;; ── PLACEMENT COUNTING ──────────────────────────────────────────────────
 ;;
@@ -303,31 +298,39 @@
    emitted tree}. `children` are the names that denote compiled nodes (params
    by convention + let-bound compiled inits). A let-bound CONSTRUCTOR local
    `l` with direct placements D(l) and itself placed P(l) times contributes
-   P(l)·D(l)(c) to each child c."
+   P(l)·D(l)(c) to each child c. Actual compiler :if arms combine by
+   maximum; emitted constructor arguments still add. This is a conservative
+   bound within the recognized producer vocabulary, not complete coverage."
   [params body]
   (let [lets (atom {})            ; local → init node (constructor-built locals)
         children (atom (set (filter node-name? params)))
-        sites (atom [])           ; top-level constructor sites (not let-inits)
+        ;; Constructor arguments are data for the emitted tree. Only an actual
+        ;; :if in the compiler's executable ANF chooses one source branch.
         walk (fn walk [n in-init?]
-               (when (ir/node? n)
+               (if-not (ir/node? n) {}
                  (cond
                    (= :let (:op n))
                      (do (when (compiled-init? (:init n)) (swap! children conj (:name n)))
                          (when (constructor-call? (:init n)) (swap! lets assoc (:name n) (:init n)))
-                         (walk (:init n) true)
-                         (walk (:body n) false))
+                         (merge-with + (walk (:init n) true) (walk (:body n) false)))
+                   (= :if (:op n))
+                     (merge-with + (walk (:test n) in-init?)
+                       (merge-with max (walk (:then n) in-init?) (walk (:else n) in-init?)))
                    (constructor-call? n)
-                     (do (when (not in-init?) (swap! sites conj n))
-                         (doseq [ch (ir/child-nodes n)] (walk ch false)))
-                   :else (doseq [ch (ir/child-nodes n)] (walk ch in-init?)))))]
-    (walk body false)
+                     (reduce (fn [m ch] (merge-with + m (walk ch false)))
+                       (if in-init? {} (direct-placements n)) (ir/child-nodes n))
+                   :else (reduce (fn [m ch] (merge-with + m (walk ch in-init?)))
+                           {} (ir/child-nodes n)))))
+        top (walk body false)]
+    ;; Branch maxima are componentwise upper bounds. Dependency propagation
+    ;; deliberately forgets correlations, so it may over-report; it must not
+    ;; turn an emitted a/iff's two constructor arguments into alternatives.
     ;; P(l) = top(l) + Σ_other D(other)(l)·P(other). The let chain is acyclic
     ;; (a local's init can only mention EARLIER locals), so P is a fixpoint
     ;; reached by iterating over the locals; each round is one pass, and
     ;; rounds ≤ chain depth. Direct placements are computed once per local.
     (let [ls (deref lets)
           dl (into {} (map (fn [[l init]] [l (direct-placements init)]) ls))
-          top (reduce (fn [m s] (merge-with + m (direct-placements s))) {} (deref sites))
           step (fn [p]
                  (into {} (map (fn [[l _]]
                                  [l (+ (get top l 0)
@@ -432,9 +435,12 @@
 (defn check-compiler
   "Tier 1 over the compiler source: [{:fn :violations}] for every function
    that places a compiled child — a let-bound one or a parameter — more than
-   once in the tree it emits. Empty ⇒ the compiler is emission-linear BY
-   CONSTRUCTION. This is the theorem; tier 3 is its measurement. Raises
-   instead of answering vacuously; see `refuse-vacuity!`."
+   once under the recognized producer/constructor vocabulary. Counts are
+   conservative across compiler-source branches and transitive constructor
+   locals. Empty is conditional on that vocabulary and naming convention;
+   it does not certify complete compiler coverage. Tier 2 proves the arithmetic
+   implication, tier 3 measures actual output. Raises on the wholly blind
+   constructor census; see `refuse-vacuity!`."
   [compiler-src]
   (into []
     (mapcat (fn [[name d]]
