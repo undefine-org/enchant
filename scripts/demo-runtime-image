@@ -28,7 +28,19 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     root, output = args.root.resolve(), args.out.absolute()
-    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    selected = subprocess.check_output([str(root / 'scripts/prepare-checkout-sdk'), '--selection'],
+                                       cwd=root, text=True).strip().split()
+    if len(selected) != 2:
+        parser.error('normal backend returned an invalid SDK selection')
+    sdk, engine = Path(selected[0]).resolve(), selected[1]
+    sdk_image = sdk / 'image'
+    sdk_metadata = json.loads((sdk / 'artifact.json').read_text())
+    platform_bin = Path(sdk_metadata['platform']) / 'bin'
+    elixir = str(platform_bin / 'elixir')
+    tool_path = str(platform_bin) + os.pathsep + os.environ.get('PATH', '')
+    seed = (sdk_image / 'priv/bootstrap/seed').resolve()
+    if args.seed is not None and args.seed.resolve() != seed:
+        parser.error('runtime qualification requires the normal selected SDK floor')
     if os.path.lexists(output):
         parser.error('output must be absent')
     output.mkdir()
@@ -51,12 +63,13 @@ def main():
     variant = args.native_variant.resolve() if args.native_variant else None
     variant_sha = sha(variant) if variant else None
     (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
-    deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / 'deps').glob('*/ebin')),
-                                                  *sorted((root / '_build').glob('*/lib/*/ebin'))]))
+    deps = [p for p in sorted((sdk / 'lib').glob('*/ebin'))
+            if not p.parent.name.startswith('beam_lisp-')]
     boot = runpy.run_path(str(root / 'scripts/demo-artifact-production'))['BOOT']
     report = {'version': 1, 'scope': 'compiled-only-source-free-runtime-bootstrap',
               'status': 'running', 'seconds': {}, 'native_execution_admission': False,
               'sdk_image_qualification': False, 'bundled_erts': False,
+              'runtime_support_sdk': str(sdk), 'engine_fingerprint': engine,
               'native_products': {p.name: sha(p) for p in native_products},
               'native_product_abi_in_target_identity': False,
               'mandatory_native_build_in_target_identity': False,
@@ -64,6 +77,7 @@ def main():
 
     def run(label, command, cwd, env, expected_error=None):
         started = time.monotonic()
+        env = dict(env, PATH=tool_path)
         done = subprocess.run(command, cwd=cwd, env=env, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
         report['seconds'][label] = round(time.monotonic() - started, 3)
@@ -89,7 +103,8 @@ def main():
             app = image / '.bl/lib/beam_lisp-0.1.0'
             app.mkdir(parents=True)
             (app / 'priv').symlink_to(image / 'priv', target_is_directory=True)
-            shutil.copytree(seed, app / 'ebin')
+            shutil.copytree(sdk_image / 'ebin', app / 'ebin')
+            shutil.copy2(sdk_image / 'priv/sdk-code.term', image / 'priv/sdk-code.term')
             shutil.copy2(drivers[0], image / 'producer.bl')
             (image / 'boot.exs').write_text(boot)
             env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off',
@@ -102,7 +117,7 @@ def main():
                 env['BL_RUNTIME_RELEASE_OUT'] = str(output / 'release')
             else:
                 env.pop('BL_RUNTIME_RELEASE_OUT', None)
-            command = ['elixir']
+            command = [elixir]
             for dep in deps:
                 command += ['-pa', str(dep)]
             run('producer', [*command, '-pa', str(app / 'ebin'), str(image / 'boot.exs')], image, env)
@@ -117,8 +132,9 @@ def main():
                 report['release_changed_native_file_refused_before_publication'] = True
         image = output / 'image'
         app = image / 'lib/beam_lisp-0.1.0'
-        shutil.copytree(seed, app / 'ebin')
+        shutil.copytree(sdk_image / 'ebin', app / 'ebin')
         shutil.copytree(seed, app / 'priv/bootstrap/seed')
+        shutil.copy2(sdk_image / 'priv/sdk-code.term', app / 'priv/sdk-code.term')
         native = app / 'priv/native'
         native.mkdir()
         for product in native_products:
@@ -137,12 +153,12 @@ def main():
         env.update(XDG_CACHE_HOME=str(image / 'empty-cache'), BL_DAEMON='off',
                    BL_RUNTIME_REPLACEMENT=str(output / 'runtime-replacement.beam'),
                    ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
-        command = ['elixir', '-pa', str(app / 'ebin'), str(drivers[1])]
+        command = [elixir, '-pa', str(app / 'ebin'), str(drivers[1])]
         if variant:
             library = native / 'lazy_memo.so'
             saved = native / 'lazy_memo.original'
             shutil.copy2(variant, library.with_name(library.name + '.variant'))
-            run('native-loaded-owner', ['elixir', '-pa', str(app / 'ebin'), str(drivers[3])], image, env)
+            run('native-loaded-owner', [elixir, '-pa', str(app / 'ebin'), str(drivers[3])], image, env)
             library.rename(saved)
             try:
                 shutil.copy2(variant, library)
@@ -154,7 +170,7 @@ def main():
                 raise RuntimeError('native variant changed during qualification')
             report.update(mandatory_native_build_in_target_identity=True,
                           loaded_native_owner_qualified=True, changed_native_target_refused=True)
-        run('adoption', ['elixir', '-pa', str(app / 'ebin'), str(drivers[2])], image, env)
+        run('adoption', [elixir, '-pa', str(app / 'ebin'), str(drivers[2])], image, env)
         if 'RUNTIME-ADOPTION before-commit-death=true accepted-caller-death=true' not in (output / 'adoption.log').read_text():
             raise RuntimeError('adoption did not prove actual requester-death boundaries')
         run('consumer', command, image, env)

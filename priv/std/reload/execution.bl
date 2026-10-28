@@ -1,6 +1,6 @@
 ; Exact graph execution and leases. A leaf shared by generation planning and
 ; immutable executable catalogues;never depends on datom/reload/source analysis.
-(ns reload.execution (:require [env]))
+(ns reload.execution)
 
 (defn- refuse! [kind data]
  (throw (ex-info "Immutable generation refused" (assoc data :kind kind))))
@@ -164,6 +164,48 @@
                    (erlang/== generation (:generation current)))
            (assoc rows key (assoc row :phase :instance-failed)) rows))))
        (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))))
+
+(defn prepare-captured-unit!
+ "Prepare one activation from the native Loader's complete captured unit.
+  Passive membership/target validation precedes code publication. The result is
+  an original application preparation, never an SDK grant. No initializer runs.
+  Code bytes may be shared; each activation has its own scope and private row."
+ [verified]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [members (BeamLisp.AOT/contextual_unit_members! verified)
+       metadata (:metadata members) beam (get-in members [:runtime :beam]) module (elem beam 0)
+       runtime-image (BeamLisp.AOT/runtime_image_key)
+       digest (Base/encode16 (crypto/hash :sha256
+                (erlang/term_to_binary (tuple (:manifest verified) metadata (crypto/hash :sha256 (elem beam 1)))
+                                      (list :deterministic))) (list (tuple :case :lower)))]
+  (when-not (= runtime-image (:runtime-image metadata)) (refuse! :compiled-runtime-image-changed {}))
+  ;; Fixed SDK inventory/MFAs are frozen before application bytes are loaded.
+  ;; No caller metadata, namespace spelling or runtime-floor label substitutes.
+  (BeamLisp.Env/ensure_sdk_runtime!)
+  (BeamLisp.AOT/passive_binary_functions! module (elem beam 1))
+  (let [scope (BeamLisp.Env/fork)
+        key [(BeamLisp.Env/env_id) :contextual-unit digest scope]]
+   (try
+    (begin-preparation! key)
+    (let [lease (BeamLisp.Env/retain_exact_binary! beam "captured-contextual-unit.beam")]
+     (try
+      (let [context (BeamLisp.Env/with_env scope #(assoc (BeamLisp.Env/capture) :generation nil))
+            generation {:digest digest :scope scope :context context :modules [module] :mapping {}
+                        :resources {} :protocols {} :application-id (str "unit/" digest)
+                        :native-modules #{"erlang"} :source-ingress-version 1
+                        :classes #{} :server-classes #{} :actor-inputs {} :registries {} :declarations {} :callables {}
+                        :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key}]
+       (record-prepared! key generation)
+       (prepare-instance! generation module (:exports metadata))
+       (BeamLisp.Env/register_source_profile! generation)
+       generation)
+      (finally (BeamLisp.Env/release_code! lease))))
+    (catch error
+     ;; Preparation has executed no application code. Leave shared immutable
+     ;; code loaded; deleting a physical module could invalidate another graph.
+     (abandon-preparation! key)
+     (BeamLisp.Env/destroy scope)
+     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))
 
 (defn- instance-ready! [generation]
  (ready-prepared! generation)
