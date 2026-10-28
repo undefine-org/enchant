@@ -1,5 +1,6 @@
 (ns reload.initializer-call-view-test
- (:require [reload.initializer :as init] [anf :as a] [lower :as lower]))
+ (:require [reload.initializer :as init] [anf :as a] [lower :as lower]
+           [reload.source-producer :as producer]))
 
 (defn- ingress [body]
  (a/remote :Elixir.BeamLisp.Env :with_source_execution!
@@ -7,6 +8,41 @@
 (defn- packed [args] (reduce (fn [tail arg] (a/cons-cell arg tail)) a/enil (reverse args)))
 (defn- inline-call [callee args] (init/inline (a/invoke callee (packed args)) {:entries {} :globals {}}))
 (defn- evaluate [node] (lower/eval-anf :Elixir.InitializerCallView node))
+(defn- compiled [source]
+ (BeamLisp.Compiler/compile (first (BeamLisp.Reader/read_string source))
+   (BeamLisp.Compiler/new_env "initializer-call-view")))
+
+(deftest actual-compiler-function-constructors-inline-through-local-and-direct-calls
+ (doseq [source ["(let [factory (fn [amount] {:value amount :run (fn [] amount)})] (factory 42))"
+                 "((fn [amount] {:value amount :run (fn [] amount)}) 42)"]]
+  (let [expression (compiled source)
+        result (evaluate (init/inline expression {:entries {} :globals {}}))]
+   (is (= 42 (:value result)))
+   (is (= 42 ((:run result)))))))
+
+(deftest returned-closures-retain-the-compiler-self-cell
+ (let [self "compiler-self" reference (a/var self)
+       inner (a/fnn (list (a/clause (list) nil
+                       (a/fnn (list (a/clause (list) nil (a/app reference (list reference))))))))
+       constructor (a/lett self (a/fnn (list (a/clause (list (a/pvar self)) nil inner)))
+                          (a/app reference (list reference)))
+       result (evaluate (init/inline (a/lett "factory" constructor
+                           (a/invoke (a/var "factory") a/enil)) {:entries {} :globals {}}))]
+  ;; Calling the returned closure needs the original outer constructor cell.
+  (is (erlang/is_function (result) 0))))
+
+(deftest actual-source-constructor-keeps-delayed-ingress-after-eager-inlining
+ (let [node (compiled "(let [factory (fn [amount] (fn [] amount))] (factory 42))")
+       expression (:expression (producer/specialize node {:native-modules #{} :source-ingress true}))
+       inlined (init/inline expression {:entries {} :globals {}})
+       nodes (fn nodes [node]
+               (cons node (mapcat nodes (a/executable-children node))))
+       eager (fn eager [node]
+               (if (= :fn (:op node)) [] (cons node (mapcat eager (a/executable-children node)))))]
+  (is (not (some #(and (= :remote (:op %)) (= :Elixir.BeamLisp.Env (:mod %))
+                       (= :with_source_execution! (:fun %))) (eager inlined))))
+  (is (some #(and (= :remote (:op %)) (= :Elixir.BeamLisp.Env (:mod %))
+                  (= :with_source_execution! (:fun %))) (nodes inlined)))))
 
 (deftest canonical-local-closure-call-inlines-without-executing-source-ingress
  (let [closure (a/fnn (list (a/clause (list (a/pvar "value")) nil (ingress (a/var "value")))))
