@@ -165,6 +165,24 @@
            (assoc rows key (assoc row :phase :instance-failed)) rows))))
        (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))))
 
+(defn- reserve-contextual-preparation! [digest]
+ ;; Publish the reservation while the parent is still alive. Destruction uses
+ ;; the same native scope fence, so a later child-retirement snapshot cannot
+ ;; miss a publisher that was admitted before closure. Fork the fresh child
+ ;; first: scope-lock ordering forbids taking a child lock under the parent.
+ ;; Physical module locks and application code stay outside the parent fence.
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [parent (BeamLisp.Env/env_id)
+       scope (BeamLisp.Env/fork) key [parent :contextual-unit digest scope]]
+  (try
+   (let [reservation (BeamLisp.Env/with_scope_commit parent
+                      (fn [] (begin-preparation! key) {:scope scope :key key}))]
+    (when (= :retired reservation) (refuse! :retired-preparation-parent {}))
+    reservation)
+   (catch error
+    (BeamLisp.Env/destroy scope)
+    (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
+
 (defn prepare-captured-unit!
  "Prepare one activation from the native Loader's complete captured unit.
   Passive membership/target validation precedes code publication. The result is
@@ -183,10 +201,9 @@
   ;; No caller metadata, namespace spelling or runtime-floor label substitutes.
   (BeamLisp.Env/ensure_sdk_runtime!)
   (BeamLisp.AOT/passive_binary_functions! module (elem beam 1))
-  (let [scope (BeamLisp.Env/fork)
-        key [(BeamLisp.Env/env_id) :contextual-unit digest scope]]
+  (let [reservation (reserve-contextual-preparation! digest)
+        scope (:scope reservation) key (:key reservation)]
    (try
-    (begin-preparation! key)
     (let [lease (BeamLisp.Env/retain_exact_binary! beam "captured-contextual-unit.beam")]
      (try
       (let [context (BeamLisp.Env/with_env scope #(assoc (BeamLisp.Env/capture) :generation nil))
