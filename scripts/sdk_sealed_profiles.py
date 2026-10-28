@@ -29,7 +29,7 @@ GROUPS = {
     "supervisor-context": ([('test/bl/proc/supervisor_context_test.bl', 32), ('test/bl/sdk_runtime_owner_context_test.bl', 7), ('test/bl/native_server_initializer_extent_test.bl', 19), ('test/bl/system/evidence_test.bl', 18)], ['data.bounded-cache', 'data.cache-pool', 'system.evidence', 'proc.task']),
     "message-context": ([('test/bl/native_execution_callback_analysis_test.bl', 16)], ['proc.message-domain', 'test.support.source-fixtures']),
     "returns": ([('test/bl/server_return_model_test.bl', 10)], []),
-    "clauses": ([('test/bl/execution_clause_identity_test.bl', 5)], []),
+    "clauses": ([('test/bl/execution_clause_identity_test.bl', 5), ('test/bl/execution_entry_producer_test.bl', 47)], []),
     "constructor-calls": ([('test/bl/reload/reconcile_callsite_test.bl', 5)], ['reload.reconcile-callsite', 'proc.reconcile-runtime']),
     "solver-frames": ([('test/bl/execution_solver_protocol_test.bl', 71)], []),
     "solver-lifetime": ([('test/bl/execution_solver_lifetime_test.bl', 47)], []),
