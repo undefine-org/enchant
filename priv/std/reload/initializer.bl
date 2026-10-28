@@ -2,7 +2,7 @@
 ; Inline exact fresh factories so their runtime Source entry is never invoked
 ; during preparation. Delayed closures retain their ordinary Source ingress.
 (ns reload.initializer (:require [reload.native-call :as native-call]
-                                [reload.source-producer :as producer] [system.ir :as ir]))
+                                [reload.source-producer :as producer] [system.ir :as ir] [anf :as anf]))
 (defn inline
  [expression factories]
  (let [left (atom 8192)]
@@ -86,6 +86,18 @@
                          locals (conj active target) (inc depth)) value))
              :let (assoc value :body (construction-callback (:body value) locals active (inc depth)))
              value)))
+          (walk-clause [c locals active depth catch?]
+           ;; Keys read enclosing locals. Only after matching do binders shadow
+           ;; those locals in guard/body; a cached outer factory cannot win.
+           (spend! depth)
+           (let [pats (to-list (mapv (fn [p]
+                                    (anf/map-pattern-expressions #(walk % locals active (inc depth)) p)) (:pats c)))
+                 names (mapcat (fn [p] (anf/pattern-vars p)) (:pats c))
+                 bound (reduce dissoc locals names)
+                 bound (if catch? (reduce dissoc bound (vals (BeamLisp.CompilerData/catch_stack_bindings))) bound)]
+            (assoc c :pats pats
+                     :guard (when (some? (:guard c)) (walk (:guard c) bound active (inc depth)))
+                     :body (walk (:body c) bound active (inc depth)))))
           (parts [value locals active depth]
            (cond
             (map? value) (walk value locals active depth)
@@ -104,6 +116,14 @@
                                 (assoc locals (:name n) init)
                                 (dissoc locals (:name n)))]
                      (assoc n :init init :body (walk (:body n) next active (inc depth)))))
+              :case (assoc n :subj (walk (:subj n) locals active (inc depth))
+                             :clauses (to-list (mapv #(walk-clause % locals active (inc depth) false) (:clauses n))))
+              :recv (cond-> (assoc n :clauses (to-list (mapv #(walk-clause % locals active (inc depth) false) (:clauses n))))
+                      (:timeout n) (assoc :timeout (walk (:timeout n) locals active (inc depth)))
+                      (:after n) (assoc :after (walk (:after n) locals active (inc depth))))
+              :try (cond-> (assoc n :body (walk (:body n) locals active (inc depth))
+                                   :catch (to-list (mapv #(walk-clause % locals active (inc depth) true) (:catch n))))
+                     (:after n) (assoc :after (walk (:after n) locals active (inc depth))))
               :remote (let [args (to-list (mapv #(walk % locals active (inc depth)) (:args n)))
                             target [(:mod n) (:fun n) (count args)]
                             args (if (contains? #{:mapv :map} (get (:sdk factories) target))
