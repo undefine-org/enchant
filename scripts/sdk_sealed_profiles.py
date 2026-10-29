@@ -2,7 +2,7 @@
 
 GROUPS = {
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
-    "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 58)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
+    "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 70)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14), ('test/bl/compiler_contextual_test.bl', 27), ('test/bl/generation_semantics_test.bl', 18), ('test/bl/compiler_lexical_consumers_test.bl', 13)], ['expand', 'env', 'connector.google.gdrive', 'connector.microsoft.graph', 'bl.cli', 'bl.doc', 'bl.doc.html', 'bl.profile']),
