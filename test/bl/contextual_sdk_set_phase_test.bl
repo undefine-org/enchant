@@ -1,23 +1,54 @@
 (ns contextual-sdk-set-phase-test
- (:require [compile.sdk :as sdk] [expand :as expand] [lower :as lower]))
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand]))
 
-(defn- execute [program]
- (lower/eval-anf
-  (erlang/binary_to_atom (str "Elixir.SDKSetPhase" (erlang/unique_integer (list :positive))))
-  (:node program)))
-
-(deftest produced-sdk-set-imports-use-the-same-core-conj-owner-at-both-phases
- ;; Requires the newly produced SDK. The prior immutable SDK records unresolved
- ;; clojure.set/conj and remains the retained negative baseline for this case.
- (let [provider (:source (sdk/capture {:sdk 'clojure.set :revision 'selected :only ['union]}))
-       source {:namespace 'set.client :revision 'current :file "set-client.bl"
-               :source (str "(ns set.client) (import-world 'clojure.set 'selected :only [union]) "
-                            "(begin-for-syntax (import-world 'clojure.set 'selected :only [union])) "
-                            "(defsyntax answer [form ctx] (syntax-literal (union #{1 2} #{2 3}))) "
-                            "[(union #{1 2} #{2 3}) (answer)]")}
-       library (expand/decode-phase-library
-                 (expand/encode-phase-library (expand/phase-library [provider])))]
-  (is (= [#{1 2 3} #{1 2 3}]
-         (execute (expand/program [provider source] ['set.client 'current]))))
-  (is (= [#{1 2 3} #{1 2 3}]
-         (execute (expand/program [source] ['set.client 'current] [library]))))))
+(deftest cold-archive-sdk-imports-carry-dependencies-into-original-runtime-admission
+ ;; This file has a fresh receiver: an earlier selection must not accidentally
+ ;; warm the optional SDK body. Runtime entry uses the admitted world front door.
+ (let [directory (Path/join (System/tmp_dir!) (str "sdk-set-phase-" (erlang/unique_integer (list :positive))))
+       selection {:sdk 'clojure.set :revision 'selected :only ['union]}
+       provider (:source (sdk/capture selection))
+       source (str "(ns set.client) (import-world 'clojure.set 'selected :only [union]) "
+                   "(begin-for-syntax (import-world 'clojure.set 'selected :only [union])) "
+                   "(defsyntax answer [form ctx] (syntax-literal (union #{1 2} #{2 3}))) "
+                   "[(union #{1 2} #{2 3}) (answer)]")]
+  (File/mkdir! directory)
+  (try
+   (is (not (erlang/module_loaded :Elixir.BeamLisp.Ns.Body.Clojure.Set)))
+   (File/write! (Path/join directory "main.bl") source)
+   (File/write! (Path/join directory "phase.bin")
+                (expand/encode-phase-library (expand/phase-library [provider])))
+   ;; Runtime-only forged declarations must refuse during passive capture,
+   ;; before any SDK provider can initialize. The archive itself grants nothing.
+   (File/write! (Path/join directory "forged.bin")
+    (expand/encode-phase-library
+     (expand/phase-library [(assoc provider :source
+       (String/replace (:source provider) "sdk-function-binding-target-changed" "sdk-function-binding-ignored"))])))
+   (File/write! (Path/join directory "main.bl")
+                "(ns set.client) (import-world 'clojure.set 'selected :only [union]) (union #{1} #{2})")
+   (File/write! (Path/join directory "world.bl")
+    (str "'" (pr-str {:version 1 :profile 'syntax-v1 :entry ['set.client 'current]
+                      :sources [{:namespace 'set.client :revision 'current :file "main.bl"}]
+                      :libraries ["forged.bin"]})))
+   (is (= :sdk-phase-declaration-changed
+          (try (world/capture (Path/join directory "world.bl")) nil
+           (catch error (:detail (ex-data error))))))
+   (File/write! (Path/join directory "main.bl")
+    (String/replace source "(syntax-literal (union #{1 2} #{2 3}))" "(throw :macro-evaluated-during-capture)"))
+   (File/write! (Path/join directory "world.bl")
+    (str "'" (pr-str {:version 1 :profile 'syntax-v1 :entry ['set.client 'current]
+                      :sources [{:namespace 'set.client :revision 'current :file "main.bl"}]
+                      :libraries ["phase.bin"]})))
+   (is (= selection (get-in (world/capture (Path/join directory "world.bl")) [:sdk-inputs 0 :selection])))
+   (is (not (erlang/module_loaded :Elixir.BeamLisp.Ns.Body.Clojure.Set)))
+   (File/write! (Path/join directory "main.bl") source)
+   ;; Archive FIRST is the regression: it must supply the same checked SDK
+   ;; dependency metadata before the Loader initializes any provider.
+   (doseq [libraries [["phase.bin"] [selection]]]
+    (File/write! (Path/join directory "world.bl")
+     (str "'" (pr-str {:version 1 :profile 'syntax-v1 :entry ['set.client 'current]
+                       :sources [{:namespace 'set.client :revision 'current :file "main.bl"}]
+                       :libraries libraries})))
+    (let [prepared (world/prepare (Path/join directory "world.bl"))]
+     (is (= selection (get-in prepared [:sdk-inputs 0 :selection])))
+     (is (= [#{1 2 3} #{1 2 3}] (world/execute prepared [])))))
+   (finally (File/rm_rf! directory)))))
