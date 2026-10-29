@@ -2,6 +2,7 @@
 
 GROUPS = {
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
+    "sdk-phase-values": ([('test/bl/contextual_sdk_phase_value_test.bl', 16)], ['compile.sdk', 'compile.world', 'system.execution', 'reload.runtime']),
     "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 70)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
@@ -43,11 +44,11 @@ GROUPS = {
     "filesystem-regressions": ([('test/bl/build_custody_regressions_test.bl', 30)], ['deps-compile', 'selfbuild']),
 }
 BOUNDARIES = {
-    'unit-metadata': ['sdk-mailbox', 'sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'factory-admission', 'clauses'], 'source-and-class-proof': ['handoffs', 'capacity', 'pattern-operands'],
-    'preboot-identity': ['sdk-mailbox', 'sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': ['sdk-mailbox', 'sdk-bindings', 'factory-admission', ],
-    'constructor-and-scope': ['sdk-mailbox', 'sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['sdk-mailbox', 'sdk-bindings', 'namespace-header-imports', 'namespace-require', 'factory-admission', 'namespace-exports', 'imports'],
-    'native-custody': ['sdk-mailbox', 'sdk-bindings', 'pattern-operands', 'canonical-calls', 'native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'generation-retirement', 'message-context'],
-    'record-representation': ['factory-admission', 'returns'], 'contextual-pipeline-identity': ['sdk-mailbox', 'sdk-bindings', 'namespace-header-imports', 'namespace-require', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
+    'unit-metadata': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'factory-admission', 'clauses'], 'source-and-class-proof': ['handoffs', 'capacity', 'pattern-operands'],
+    'preboot-identity': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'factory-admission', ],
+    'constructor-and-scope': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'namespace-header-imports', 'namespace-require', 'factory-admission', 'namespace-exports', 'imports'],
+    'native-custody': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'pattern-operands', 'canonical-calls', 'native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'generation-retirement', 'message-context'],
+    'record-representation': ['factory-admission', 'returns'], 'contextual-pipeline-identity': ['sdk-mailbox', 'sdk-bindings', 'sdk-phase-values', 'namespace-header-imports', 'namespace-require', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
     'contextual-analysis-reports': ['namespace-header-imports', 'namespace-require', 'lexical-scope', 'pattern-operands', 'canonical-calls', 'lsp-calls', 'typed-analysis', 'namespace-exports', 'binding-reference', 'ownership', 'ownership-calls', 'native-outcomes', 'loops', 'af'],
     'vector-lookup-default': ['vectors'], 'finite-cleanup-progress': ['loops', 'af'],
     'constructor-evaluation-order': ['returns'], 'execution-clause-identity': ['clauses'],

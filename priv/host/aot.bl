@@ -5772,6 +5772,51 @@
    :source (:source raw) :source-digest (:source-digest raw)
    :provider-sha256 (:sha256 raw) :clauses clauses})))
 
+(defn sdk_binding!
+ "Project an immutable SDK function or closed literal initializer as compiler
+  data. A literal is artifact data, not the provider's current mutable Var value.
+  No initializer or live getter executes; phase instantiation stays canonical."
+ [ns name]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when-not (and (erlang/is_binary ns) (<= 1 (erlang/byte_size ns) 512)
+                (erlang/is_binary name) (<= 1 (erlang/byte_size name) 512))
+  (erlang/error :invalid_sdk_function_binding))
+ (let [core? (= "core" ns)
+       root (BeamLisp.Tiers/priv_root) module (BeamLisp.Emit/base_module_for ns)
+       seed (when core? (sdk_binding_seed_artifact! module (BeamLisp.Bootstrap/manifest)))
+       raw (when-not core? (BeamLisp.Env/sdk_inventory_metadata! (File/read! (Path/join root "sdk-code.term"))
+                            (Atom/to_string module)))
+       _ (when-not (or seed (and raw (= :mutable-forwarder (:role raw))
+                                  (= ns (:forwarder-namespace raw))
+                                  (= (BeamLisp.AOTCache/compiler_key) (:compiler-key raw))))
+           (erlang/error :unattested_sdk_function_binding))
+       bytes (if seed (:bytes seed) (BeamLisp.AOTCache/read_precompiled_bytes!
+                                     (sdk_image_artifact_path root (Atom/to_string module)) 33554432))
+       _ (when (and raw (not= (:sha256 raw) (crypto/hash :sha256 bytes)))
+           (erlang/error :sdk_runtime_artifact_changed))
+       row (if seed (:row seed) (elem (BeamLisp.Env/sdk_image_metadata! (Atom/to_string module) raw bytes) 1))
+       kinds (:callable-kinds row) kind (when kinds (Map/get (elem kinds 2) name))]
+  (if (not= :value kind) (sdk_function_binding! ns name)
+   (let [declarations (:declarations row)
+         _ (when-not (and declarations (= :value (Map/get (elem declarations 2) name))
+                           (not (BeamLisp.Env/source_sdk_binding_refused? ns name)))
+             (erlang/error :sdk_value_binding_refused))
+         library (BeamLisp.AOT/normalized_attribute
+                   (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+                   :bl_aot_phase_library)
+         initializer (get-in library [:initializers name])]
+    (when-not (and (= 2 (:version library)) (= ns (:namespace library))
+                   (erlang/is_binary (:source-digest library)) (= 32 (erlang/byte_size (:source-digest library)))
+                   (or seed (= (:source-digest raw) (:source-digest library)))
+                   (= :lit (:op initializer)) (contains? initializer :val))
+     (erlang/error :sdk_value_binding_not_literal))
+    (BeamLisp.CompilerData/check_first_order! (:val initializer)
+      {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+    {:version 1 :namespace ns :name name :kind :value :value (:val initializer)
+     :runtime-image (BeamLisp.AOT/runtime_image_key)
+     :source (when raw (:source raw)) :source-digest (when raw (:source-digest raw))
+     :provider-sha256 (crypto/hash :sha256 bytes)}))))
+
 (defn contextual_sdk_namespaces!
  "Recheck every selected SDK binding before Loader starts any provider.
   Selection metadata is a claim to compare with the actual image, never
@@ -5781,7 +5826,7 @@
        inputs (get-in members [:metadata :input-selection :sdk-inputs])]
   (when-not (or (nil? inputs) (and (vector? inputs) (<= (count inputs) 128)))
    (erlang/error :invalid_contextual_sdk_inputs))
-  (mapv
+  (Enum/flat_map (or inputs [])
    (fn [input]
     (let [selection (:selection input) ns (:sdk selection) only (:only selection)]
      (when-not (and (erlang/is_map input) (= #{:selection :bindings} (set (keys input)))
@@ -5790,9 +5835,9 @@
                     (vector? only) (<= 1 (count only) 64) (every? symbol? only)
                     (= (count only) (count (distinct only)))
                     (= (:bindings input)
-                       (mapv #(sdk_function_binding! (str ns) (str %)) (sort-by str only))))
+                       (mapv #(sdk_binding! (str ns) (str %)) (sort-by str only))))
       (erlang/error :contextual_sdk_input_changed))
-     (str ns))) inputs)))
+     (if (some #(= :function (:kind %)) (:bindings input)) (list (str ns)) (list)))))))
 
 (defn- sdk_named_constructor! [ns name arity]
  ;; A compiled-but-uninitialized SDK provider has no runtime Fn binding yet.
