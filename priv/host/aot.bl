@@ -7993,17 +7993,20 @@
      (constructor_refuse :constructor-session-value-not-owned))
     (Map/put out name (elem found 1))))))
 
-(defn- constructor_session_request! [handle expression locals bindings retain?]
+(defn- constructor_session_request!
+ ([handle expression locals bindings retain?]
+  (constructor_session_request! handle expression locals bindings retain? {} nil))
+ ([handle expression locals bindings retain? metadata metadata-cost]
  (let [session (constructor_session! handle)
        _ (when-not (= :open (:status session)) (constructor_refuse :constructor-session-not-open))
        frame (:frame session) previous (erlang/get frame)
        limits {:max-nodes 65536 :max-bytes 1048576 :max-depth 128}
-       state {:counter-frame frame :max-collection 16384 :data-limits limits :resolution-world :kernel-phase}]
+       state (Map/merge metadata {:counter-frame frame :max-collection 16384 :data-limits limits :resolution-world :kernel-phase})]
   (Process/put :bl_contextual_constructor_sessions
    (Map/put (constructor_sessions) handle (assoc session :status :running)))
   (try
    (let [syntax-cost (BeamLisp.CompilerData/first_order_cost! expression limits)
-         _ (constructor_walk_steps! state (:nodes syntax-cost))
+         _ (constructor_walk_steps! state (+ (:nodes syntax-cost) (if metadata-cost (:nodes metadata-cost) 0)))
          env (constructor_session_locals! session locals bindings limits state)
          result (constructor_interpret expression env state)]
     (when (:aborted (erlang/get frame)) (constructor_refuse :constructor-aborted))
@@ -8018,7 +8021,8 @@
             ;; Do not serialize a native closure's captured function graph:
             ;; repeated shared captures can expand exponentially in ETF. Charge
             ;; validated syntax/storage and work already measured by this frame.
-            bytes (+ (:bytes syntax-cost) (* 16 (:nodes syntax-cost))
+            bytes (+ (if metadata-cost (+ (:bytes metadata-cost) (* 16 (:nodes metadata-cost))) 0)
+                     (:bytes syntax-cost) (* 16 (:nodes syntax-cost))
                      (:bytes value-cost) (* 16 (:nodes value-cost))
                      (- (:allocation-bytes previous) (:allocation-bytes current))
                      (* 16 (- (:allocation-nodes previous) (:allocation-nodes current))))
@@ -8048,7 +8052,7 @@
      (Process/put :bl_contextual_constructor_sessions
       (Map/put (constructor_sessions) handle
        (assoc current :status (if succeeded? :open :failed)
-                      :calls (+ 1 (:calls session)) :budget (artifact_budget spent)))))))))
+                      :calls (+ 1 (:calls session)) :budget (artifact_budget spent))))))))))
 
 (defn eval_constructor_session!
  "Evaluate using fixed effect-denying semantics and shared fuel. Optional
@@ -8063,6 +8067,77 @@
   opaque ID. No native function, Source lookup or evaluator callback is accepted."
  [handle expression locals bindings]
  (constructor_session_request! handle expression locals bindings true))
+
+(defn- sdk_phase_children! []
+ ;; ANF is a bootstrap provider, not a std-library constructor. Resolve this
+ ;; ONE fixed compiler visitor from manifest-authenticated seed bytes and its
+ ;; original stable route. Never call a mutable shim/getter or initialize it.
+ (let [manifest (BeamLisp.Bootstrap/manifest) shim :Elixir.BeamLisp.Ns.Anf
+       seed (sdk_binding_seed_artifact! shim manifest)
+       entries (get (sdk_stage_literal_definitions! shim (:bytes seed)) "executable-children")
+       entry (when (= 1 (count entries)) (first entries))
+       module (when entry (elem entry 4)) function (when entry (elem entry 2))
+       target (when module (sdk_binding_seed_artifact! module manifest))]
+  (when-not (and entry (= :fixed (elem entry 0)) (= 1 (elem entry 1))
+                 (= 1 (count (:params (elem entry 3))))
+                 (= :public (get (elem (:declarations (:row seed)) 2) "executable-children"))
+                 (= :function (get (elem (:callable-kinds (:row seed)) 2) "executable-children"))
+                 (= module (get (:forwarder-routes (:row seed)) (tuple function 1)))
+                 (not= :mutable-forwarder (:role (:row target)))
+                 (erlang/function_exported module function 1))
+   (constructor_refuse :unattested-sdk-phase-compiler-visitor))
+  (erlang/make_fun module function 1)))
+
+(defn- sdk_phase_closure! [root metadata]
+ ;; Reuse the canonical executable-operand grammar. Quoted ANF lookalikes and
+ ;; source annotations cannot introduce dependencies. The callable is the fixed
+ ;; authenticated compiler visitor, never supplied application code.
+ (let [children (sdk_phase_children!)]
+  (loop [todo (list root) globals {} remotes {} steps 0]
+   (when (> steps 65536) (constructor_refuse :sdk-phase-closure-bound))
+   (if (empty? todo) {:globals globals :remotes remotes}
+    (let [node (first todo) op (:op node)
+          global (when (= :global op) [(:ns node) (:name node)])
+          remote (when (= :remote op) [(:mod node) (:fun node) (count (:args node))])
+          value (when (and global (not (contains? globals global))) (get (:globals metadata) global))
+          entry (when (and remote (not (contains? remotes remote))) (get (:remotes metadata) remote))
+          next (erlang/++ (erlang/apply children (list node)) (rest todo))
+          next (if value (cons value next) next)
+          next (if entry (cons {:op :fn :clauses (:clauses entry)} next) next)]
+     (recur next (if value (assoc globals global value) globals)
+                 (if entry (assoc remotes remote entry) remotes) (inc steps)))))))
+
+(defn bind_sdk_constructor_session!
+ "Bind a selected authenticated SDK function in this phase session. Its
+  interpreted closure owns reachable ANF metadata; caller expressions never
+  receive an ambient table of SDK private functions or host execution grants."
+ [handle claim]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (constructor_session! handle)
+ (when-not (and (erlang/is_map claim) (= #{:namespace :name :digest} (set (keys claim)))
+                (erlang/is_binary (:namespace claim)) (erlang/is_binary (:name claim))
+                (erlang/is_binary (:digest claim)) (= 64 (erlang/byte_size (:digest claim))))
+  (constructor_refuse :invalid-sdk-phase-binding))
+ (let [binding (sdk_function_binding! (:namespace claim) (:name claim))
+       digest (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
+                             (list (tuple :case :lower)))]
+  (when-not (= digest (:digest claim)) (constructor_refuse :sdk-phase-binding-changed))
+  (when-not (= "core" (:namespace claim)) (constructor_refuse :unsupported-sdk-phase-provider))
+  (let [library (seed_phase_library! "core" (BeamLisp.Bootstrap/manifest))
+        values (Map/new (Enum/map (Map/to_list (:initializers library))
+                         #(tuple ["core" (elem % 0)] (elem % 1))))
+        metadata (constructor_metadata {"core" (:definitions library)} values)
+        root {:op :global :ns "core" :name (:name claim) :lookup :exact}
+        _ (when-not (or (contains? (:globals metadata) ["core" (:name claim)])
+                        (contains? (constructor_pure_core_names) (:name claim)))
+            (constructor_refuse :unsupported-sdk-phase-function))
+        closure (sdk_phase_closure! root metadata)
+        cost (BeamLisp.CompilerData/first_order_cost! closure
+               {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
+   ;; The metadata belongs to this interpreted closure only. Generic eval/bind
+   ;; requests keep an empty SDK metadata table. Charge retained bytes once for
+   ;; this phase instance, in the original shared session accounting.
+   (constructor_session_request! handle root {} {} true closure cost))))
 
 (defn- interpret_phase_constructor! [expression metadata]
  ;; Phase bundles accept and return first-order data. Their temporary recipes

@@ -1,0 +1,91 @@
+(ns contextual-sdk-phase-function-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [lower :as lower]))
+
+(defn- selection [] {:sdk 'core :revision 'selected :only ['identity 'inc 'name]})
+(defn- client [text]
+ {:namespace 'phase.client :revision 'current :file "phase-client.bl" :source (str "(ns phase.client) " text)})
+(defn- example []
+ (client (str "(import-world 'core 'selected :only [inc]) "
+              "(begin-for-syntax (import-world 'core 'selected :only [identity inc name])) "
+              "(defsyntax answer [form ctx] (syntax-literal (inc (identity (:value (syntax-arg form 1)))))) "
+              "(defsyntax label [form ctx] (syntax-literal (name 'ns/answer))) "
+              "[(inc 41) (answer 41) (answer 42) (label)]")))
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.SDKPhaseFunction" (erlang/unique_integer (list :positive))))
+                 (:node program)))
+(defn- refused? [action] (try (action) false (catch _ true)))
+
+(deftest selected-sdk-functions-use-checked-anf-in-the-original-phase-session
+ (let [captured (sdk/capture (selection))
+       program (expand/program [(:source captured) (example)] ['phase.client 'current])]
+  (is (= [42 42 43 "answer"] (execute program)))
+  (is (= 3 (count (:expansions program))))
+  (is (= 3 (get-in program [:constructor :values])))
+  (is (= 1 (count (distinct
+        (map #(get-in % [:reference :declaration])
+         (filter #(and (= 'inc (get-in % [:declaration :name]))
+                       (not= :local (get-in % [:declaration :visibility]))) (vals (:references program))))))))
+  (is (some #(and (= 'inc (get-in % [:declaration :name])) (= 0 (get-in % [:reference :phase])))
+             (vals (:references program))))
+  (is (some #(and (= 'inc (get-in % [:declaration :name])) (= 1 (get-in % [:reference :phase])))
+             (vals (:references program))))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))
+        archived (expand/program [(example)] ['phase.client 'current] [library])]
+   (is (= [42 42 43 "answer"] (execute archived)))
+   (is (every? #(not (contains? % :source)) (:units library))))))
+
+(deftest sdk-private-phase-metadata-is-not-ambient-in-the-caller
+ (let [provider (:source (sdk/capture (selection)))
+       valid (client (str "(begin-for-syntax (import-world 'core 'selected :only [name])) "
+                          "(defsyntax answer [form ctx] (syntax-literal (name 'ns/answer))) (answer)"))
+       invalid (client (str "(begin-for-syntax (import-world 'core 'selected :only [name])) "
+                            "(defsyntax answer [form ctx] (do (name 'ns/answer) "
+                            "(syntax-literal (Elixir.BeamLisp.Ns.Body.Core/qualified-parts \"ns/answer\")))) (answer)"))]
+  (is (= "answer" (execute (expand/program [provider valid] ['phase.client 'current]))))
+  (is (refused? #(expand/program [provider invalid] ['phase.client 'current])))))
+
+(deftest forged-phase-binding-digests-refuse-before-an-imported-body-runs
+ (let [captured (sdk/capture (selection))
+       source (:source captured)
+       original (:source source)
+       ;; The annotation is only a claim. Native binding compares its digest to
+       ;; the same original SDK function descriptor before creating the closure.
+       changed (Enum/reduce (:bindings captured) original
+                 (fn [binding text]
+                  (String/replace text
+                   (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
+                                  (list (tuple :case :lower)))
+                   (String/duplicate "0" 64))))]
+  (is (not= original changed))
+  (is (= :sdk-phase-binding-changed
+         (try (expand/program [(assoc source :source changed) (example)] ['phase.client 'current]) nil
+          (catch error (:detail (ex-data error))))))))
+
+(deftest effectful-sdk-functions-are-not-runtime-grants-at-compile-time
+ (let [provider (:source (sdk/capture {:sdk 'core :revision 'selected :only ['atom]}))
+       source (client (str "(begin-for-syntax (import-world 'core 'selected :only [atom])) "
+                           "(defsyntax bad [form ctx] (syntax-literal (atom 0))) (bad)"))]
+  (is (refused? #(expand/program [provider source] ['phase.client 'current])))))
+
+(deftest sdk-phase-data-is-never-reinterpreted-as-an-executable-recipe
+ (let [provider (:source (sdk/capture {:sdk 'core :revision 'selected :only ['identity]}))
+       source (client (str "(begin-for-syntax (import-world 'core 'selected :only [identity])) "
+                           "(defsyntax value [form ctx] (syntax-literal "
+                           "(identity {:op :remote :mod :erlang :fun :put "
+                           ":args [{:op :lit :val :sdk-phase-lookalike} {:op :lit :val true}]}))) (value)"))]
+  (is (= {:op :remote :mod :erlang :fun :put
+          :args [{:op :lit :val :sdk-phase-lookalike} {:op :lit :val true}]}
+         (execute (expand/program [provider source] ['phase.client 'current]))))
+  (is (= :undefined (erlang/get :sdk-phase-lookalike)))))
+
+(deftest runtime-and-phase-sdk-instances-use-original-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-phase-function-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") (:source (example)))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['phase.client 'current] :sources [{:namespace 'phase.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['identity 'inc 'name]}]}")
+   (is (= [42 42 43 "answer"] (world/execute (world/prepare (Path/join dir "world.bl")) [])))
+   (is (= :undefined (erlang/get :bl_contextual_constructor_sessions)))
+   (finally (File/rm_rf! dir)))))
