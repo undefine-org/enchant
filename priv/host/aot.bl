@@ -455,7 +455,7 @@
    :input-selection :manifest :pipeline :sources :libraries :revision :file :digest :bytes
    :build-key :ns :hash :iface :factory-abi :exports :kind :binding-reference :world :declaration :id :space :symbol
    :sdk-inputs :selection :bindings :sdk :only :clauses :function :minimum-arity :arity
-   :fixed :variadic :source :source-digest :provider-sha256 :md5 :name))
+   :fixed :variadic :source :source-digest :provider-sha256 :declaration-sha256 :md5 :name))
 
 (defn- capture_unit!
  "Read a bounded complete artifact directory, binding its manifest to actual
@@ -5596,6 +5596,85 @@
     (sdk_record_declaration! form ns names :public))
   ;; No class/constructor interning, runtime schema or protocol execution.
   true))
+(defn- sdk_binding_seed_artifact! [module manifest]
+ ;; Bootstrap declarations have their own original manifest, not a std-library
+ ;; row. Read its exact bytes without loading code or running a literal getter.
+ (let [name (str (Atom/to_string module) ".beam")
+       expected (get-in manifest ["modules" name])]
+  (when-not (and expected (= (BeamLisp.AOTCache/compiler_key) (Map/get manifest "compiler_key")))
+   (erlang/error :unattested_sdk_primitive_artifact))
+  (let [bytes (BeamLisp.AOTCache/read_precompiled_bytes!
+               (Path/join (BeamLisp.Bootstrap/seed_dir) name) 33554432)
+        row (BeamLisp.AOT/seed_artifact_metadata! module name expected)]
+   (when-not (and (= expected (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+                  (= (:sha256 row) (crypto/hash :sha256 bytes))
+                  (or (not (erlang/module_loaded module))
+                      (= (:md5 row) (erlang/apply module :module_info (list :md5)))
+                      (and (= :mutable-forwarder (:role row))
+                           (BeamLisp.Env/sdk_forwarder_current? module (:forwarder-routes row)))))
+    (erlang/error (tuple :sdk_primitive_artifact_changed module)))
+   {:bytes bytes :row row})))
+
+(defn- sdk_primitive_function_binding! [name]
+ (let [manifest (BeamLisp.Bootstrap/manifest)
+       rt (sdk_binding_seed_artifact! :Elixir.BeamLisp.Ns.Rt manifest)
+       core (sdk_binding_seed_artifact! :Elixir.BeamLisp.Ns.Core manifest)
+       definitions (sdk_stage_literal_definitions! :Elixir.BeamLisp.Ns.Rt (:bytes rt))
+       getters (Map/get definitions "seed-rows" (list))
+       getter (when (= 1 (count getters)) (first getters))
+       node (when getter (elem getter 3)) body (:body node)
+       rows (when (= :lit (:op body)) (:val body))
+       _ (when-not (and getter (= :fixed (elem getter 0)) (= 0 (elem getter 1))
+                         (= :defn-clause (:op node)) (= (list) (:params node)) (nil? (:guard node))
+                         (erlang/is_list rows) (<= (erlang/length rows) 2048))
+           (erlang/error :unattested_source_kernel_abi))
+       matches (Enum/filter rows (fn [row] (and (erlang/is_list row) (= name (first row)))))
+       primitive (when (= 1 (count matches)) (first matches))
+       _ (when-not (and primitive (= 5 (count primitive))
+                         (erlang/is_atom (nth primitive 1)) (erlang/is_map (nth primitive 2))
+                         (<= (erlang/map_size (nth primitive 2)) 256)
+                         (contains? #{:both :value :link} (nth primitive 4))
+                         (not (BeamLisp.Env/source_sdk_binding_refused? "core" name)))
+           (erlang/error :sdk_function_binding_refused))
+       declaration (:declarations (:row core)) kinds (:callable-kinds (:row core))
+       declared (when declaration (Map/get (elem declaration 2) name))
+       _ (when-not (or (nil? declared)
+                       (and (= :public declared) (= :function (Map/get (elem kinds 2) name))))
+           (erlang/error :sdk_function_binding_refused))
+       module (if (= :rt (nth primitive 1)) :Elixir.BeamLisp.Ns.Rt (nth primitive 1))
+       target (sdk_binding_seed_artifact! module manifest)
+       fixed (Enum/map (nth primitive 2)
+               (fn [arm] {:kind :fixed :minimum-arity (elem arm 0) :arity (elem arm 0) :function (elem arm 1)}))
+       variadic (nth primitive 3)
+       _ (when-not (or (nil? variadic)
+                       (and (erlang/is_list variadic) (= 2 (count variadic))
+                            (erlang/is_integer (first variadic)) (<= 0 (first variadic) 254)
+                            (erlang/is_atom (second variadic))))
+           (erlang/error :invalid_source_kernel_abi))
+       clauses (if variadic (cons {:kind :variadic :minimum-arity (first variadic)
+                                  :arity (inc (first variadic)) :function (second variadic)} fixed) fixed)
+       clauses (Enum/sort_by clauses (fn [clause] (tuple (:minimum-arity clause) (:kind clause))))
+       clauses (Enum/map clauses
+        (fn [clause]
+         (let [module (Map/get (or (:forwarder-routes (:row target)) {})
+                              (tuple (:function clause) (:arity clause)) module)
+               target (sdk_binding_seed_artifact! module manifest)
+               exports (Keyword/get (elem (elem (beam_lib/chunks (:bytes target) (list :exports)) 1) 1) :exports)]
+         (when-not (and (not= :mutable-forwarder (:role (:row target)))
+                        (erlang/is_integer (:arity clause)) (<= 0 (:arity clause) 255)
+                        (erlang/is_atom (:function clause))
+                        (Enum/member? exports (tuple (:function clause) (:arity clause)))
+                        (not (BeamLisp.Env/source_critical_target? module (:function clause))))
+          (erlang/error :sdk_function_binding_target_changed))
+         (assoc clause :module (Atom/to_string module) :function (Atom/to_string (:function clause))
+                       :md5 (:md5 (:row target)) :sha256 (:sha256 (:row target))))))]
+  {:version 1 :namespace "core" :name name :kind :function
+   :runtime-image (BeamLisp.AOT/runtime_image_key)
+   ;; A bootstrap ABI literal is not the original Source text. Absence of a
+   ;; Source provenance row must stay absence, never a fabricated Source hash.
+   :source nil :source-digest nil :provider-sha256 (:sha256 (:row rt))
+   :declaration-sha256 (:sha256 (:row core)) :clauses clauses}))
+
 (defn sdk_function_binding!
  "Project one public function from the selected immutable SDK into compiler
   data. Read authenticated artifact literals, never live namespace Vars or
@@ -5606,6 +5685,7 @@
  (when-not (and (erlang/is_binary ns) (<= 1 (erlang/byte_size ns) 512)
                 (erlang/is_binary name) (<= 1 (erlang/byte_size name) 512))
   (erlang/error :invalid_sdk_function_binding))
+ (if (= "core" ns) (sdk_primitive_function_binding! name)
  (let [root (BeamLisp.Tiers/priv_root)
        inventory (File/read! (Path/join root "sdk-code.term"))
        shim (BeamLisp.Emit/base_module_for ns) identity (Atom/to_string shim)
@@ -5655,7 +5735,7 @@
   {:version 1 :namespace ns :name name :kind :function
    :runtime-image (BeamLisp.AOT/runtime_image_key)
    :source (:source raw) :source-digest (:source-digest raw)
-   :provider-sha256 (:sha256 raw) :clauses clauses}))
+   :provider-sha256 (:sha256 raw) :clauses clauses})))
 
 (defn contextual_sdk_namespaces!
  "Recheck every selected SDK binding before Loader starts any provider.
