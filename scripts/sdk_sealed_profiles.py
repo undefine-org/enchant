@@ -2,7 +2,7 @@
 
 GROUPS = {
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
-    "sdk-macros": ([('test/bl/contextual_sdk_macro_test.bl', 15)], ['compile.sdk', 'compile.world']),
+    "sdk-macros": ([('test/bl/contextual_sdk_macro_test.bl', 26), ('test/bl/contextual_syntax_test.bl', 43)], ['compile.sdk', 'compile.world']),
     "sdk-phase-values": ([('test/bl/contextual_sdk_phase_value_test.bl', 16)], ['compile.sdk', 'compile.world', 'system.execution', 'reload.runtime']),
     "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 70)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),

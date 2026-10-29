@@ -59,3 +59,49 @@
 
 (deftest computed-sdk-macros-never-fall-back-to-live-evaluation
  (is (refused? #(sdk/capture {:sdk 'core :revision 'selected :only ['cond]}))))
+
+(deftest variadic-sdk-templates-splice-user-expressions-with-their-own-context
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['when 'when-not]})
+       source (client (str "(import-world 'core 'selected :only [when when-not]) "
+                           "(let [body 40 sdk_macro_form 999 user 2] "
+                           "[(when true body user) (when false (erlang/error :must-not-run)) "
+                           "(when true) (when-not false (erlang/+ body user))])"))
+       program (expand/program [(:source captured) source] ['macro.client 'current])]
+  (is (= [2 nil nil 42] (execute program)))
+  (is (= 4 (count (:expansions program))))
+  (is (empty? (:linked program)))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))]
+   (is (= [2 nil nil 42] (execute (expand/program [source] ['macro.client 'current] [library])))))
+  (is (refused? #(expand/program [(:source captured)
+                  (client "(import-world 'core 'selected :only [when]) (when)")]
+                 ['macro.client 'current])))))
+
+(deftest sdk-template-projection-ignores-shadowed-mutable-macro-vars
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['when]})
+       scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/intern "core" "when" :ambient-shadow)
+     (is (= (tuple :ok :ambient-shadow) (BeamLisp.Env/lookup (tuple "core" "when"))))
+     (is (= captured (sdk/check! captured)))
+     (is (= 42 (execute (expand/program [(:source captured)
+                    (client "(import-world 'core 'selected :only [when]) (let [answer 42] (when true answer))")]
+                   ['macro.client 'current]))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest variadic-sdk-template-executes-through-original-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-variadic-macro-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns variadic.client) (import-world 'core 'selected :only [when when-not]) (let [body 40 user 2] [(when true body user) (when-not false (erlang/+ body user)) (when true)])")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['variadic.client 'current] :sources [{:namespace 'variadic.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['when 'when-not]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (BeamLisp.AOT/compile_unit (world/prepare-unit prepared :Elixir.SDKVariadicMacroUnit))]
+    (is (= [] (BeamLisp.AOT/contextual_sdk_namespaces! unit)))
+    (is (= [2 42 nil] (world/execute prepared [])))
+    (is (= 3 (count (get-in prepared [:program :expansions])))))
+   (finally (File/rm_rf! dir)))))

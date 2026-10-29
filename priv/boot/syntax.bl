@@ -236,9 +236,50 @@
            (assoc n :context (context (assoc ctx :scopes
                               (Map/put (:scopes ctx) phase (cons scope-id ids))))))) 100000 0) 0))
 
+(defn- template-hole [value budget]
+ (let [splice? (and (erlang/is_map value) (= :contextual-splice (:kind value)))
+       start budget
+       r (if splice?
+          (do
+           (when-not (= #{:kind :children} (set (keys value))) (refuse! :syntax-template-splice))
+           (let [items (finite! (:children value) 100000)
+                 result (Enum/map_reduce items (charge! budget 0)
+                         (fn [child remaining] (visit child (fn [node] node) remaining 0)))]
+            (tuple {:kind :contextual-splice :children (elem result 0)} (elem result 1))))
+          (visit value (fn [node] node) budget 0))]
+  (tuple {:node (elem r 0) :cost (- start (elem r 1)) :splice? splice?} (elem r 1))))
+
+(defn- substitute-template [node holes remaining depth splice-allowed?]
+ (let [remaining (charge! remaining depth)
+       hole (when (identifier? node) (Map/get holes (:value node)))]
+  (if hole
+   (do
+    (when (and (:splice? hole) (not splice-allowed?)) (refuse! :syntax-template-splice-context))
+    ;; Charge every occurrence BEFORE copying its sequence into the result.
+    ;; Sharing a hole's data does not make repeated expansion free.
+    (when (> (:cost hole) remaining) (refuse! :syntax-bound))
+    (tuple (:node hole) (- remaining (:cost hole))))
+   (let [tag (:tag node)]
+    (cond
+     (contains? #{:list :vector :set} tag)
+      (let [r (Enum/map_reduce (:children node) remaining
+               (fn [child budget] (substitute-template child holes budget (+ depth 1) true)))
+            children (Enum/flat_map (elem r 0)
+                      #(if (= :contextual-splice (:kind %)) (:children %) (list %)))]
+       (tuple (assoc node :children children) (elem r 1)))
+     (contains? #{:map :record} tag)
+      (let [r (Enum/map_reduce (:children node) remaining
+               (fn [pair budget]
+                (let [left (substitute-template (first pair) holes budget (+ depth 1) false)
+                      right (substitute-template (second pair) holes (elem left 1) (+ depth 1) false)]
+                 (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
+       (tuple (assoc node :children (elem r 0)) (elem r 1)))
+     :else (tuple node remaining))))))
+
 (defn template
- "Substitute contextual holes without changing their scopes. All other
-  template syntax receives the introduction scope. This does not run macros."
+ "Substitute contextual syntax holes, including bounded sequence splices in
+  list/vector/set elements. Holes keep use-site scopes; introduced syntax gets
+  the introduction scope. Splices cannot replace the root or map/record slots."
  [node holes introduction-scope]
  (digest! introduction-scope)
  (when-not (and (erlang/is_map holes) (not (contains? holes :__struct__)) (<= (erlang/map_size holes) 256))
@@ -246,17 +287,10 @@
  (let [holes (Map/new
               (elem (Enum/map_reduce (Map/to_list holes) 100000
                       (fn [pair budget]
-                       (let [r (visit (elem pair 1) (fn [value] value) budget 0)]
+                       (let [r (template-hole (elem pair 1) budget)]
                         (tuple (tuple (symbol! (elem pair 0)) (elem r 0)) (elem r 1))))) 0))
        introduced (add-scope node introduction-scope :all)]
-  (validate (elem (visit introduced
-          (fn [n]
-           (if (and (identifier? n) (Map/has_key? holes (:value n)))
-            ;; Syntax preserves the caller's context, including a different
-            ;; logical world. The binding selection/controller validates world
-            ;; membership; representation must not merge those two contexts.
-            (Map/fetch! holes (:value n))
-            n)) 100000 0) 0))))
+  (validate (elem (substitute-template introduced holes 100000 0 false) 0))))
 
 (defn- attribute-node [node file inherited]
  (let [origin (or (:origin node) inherited)
