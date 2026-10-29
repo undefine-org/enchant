@@ -8107,6 +8107,27 @@
      (recur next (if value (assoc globals global value) globals)
                  (if entry (assoc remotes remote entry) remotes) (inc steps)))))))
 
+(defn- sdk_phase_library! [binding]
+ ;; The public descriptor already proves the original provider and its stable
+ ;; routes. Re-read exactly those immutable bytes; never inspect live Vars or
+ ;; compile Source to supply a missing phase implementation.
+ (let [namespace (:namespace binding)]
+  (if (= "core" namespace) (seed_phase_library! namespace (BeamLisp.Bootstrap/manifest))
+   (let [module (BeamLisp.Emit/base_module_for namespace)
+         bytes (BeamLisp.AOTCache/read_precompiled_bytes!
+                 (sdk_image_artifact_path (BeamLisp.Tiers/priv_root) (Atom/to_string module)) 33554432)
+         _ (when-not (= (:provider-sha256 binding) (crypto/hash :sha256 bytes))
+             (constructor_refuse :sdk-phase-provider-changed))
+         library (BeamLisp.AOT/normalized_attribute
+                   (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+                   :bl_aot_phase_library)]
+    (when-not (and (= 2 (:version library)) (= namespace (:namespace library))
+                   (= (:source-digest binding) (:source-digest library))
+                   (erlang/is_map (:definitions library)) (<= (erlang/map_size (:definitions library)) 8192)
+                   (erlang/is_map (:initializers library)) (<= (erlang/map_size (:initializers library)) 8192))
+     (constructor_refuse :unsupported-sdk-phase-library))
+    library))))
+
 (defn bind_sdk_constructor_session!
  "Bind a selected authenticated SDK function in this phase session. Its
   interpreted closure owns reachable ANF metadata; caller expressions never
@@ -8122,14 +8143,19 @@
        digest (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
                              (list (tuple :case :lower)))]
   (when-not (= digest (:digest claim)) (constructor_refuse :sdk-phase-binding-changed))
-  (when-not (= "core" (:namespace claim)) (constructor_refuse :unsupported-sdk-phase-provider))
-  (let [library (seed_phase_library! "core" (BeamLisp.Bootstrap/manifest))
-        values (Map/new (Enum/map (Map/to_list (:initializers library))
-                         #(tuple ["core" (elem % 0)] (elem % 1))))
-        metadata (constructor_metadata {"core" (:definitions library)} values)
-        root {:op :global :ns "core" :name (:name claim) :lookup :exact}
-        _ (when-not (or (contains? (:globals metadata) ["core" (:name claim)])
-                        (contains? (constructor_pure_core_names) (:name claim)))
+  (let [namespace (:namespace binding)
+        provider (sdk_phase_library! binding)
+        libraries (if (= "core" namespace) (list provider)
+                    (list (seed_phase_library! "core" (BeamLisp.Bootstrap/manifest)) provider))
+        definitions (Map/new (Enum/map libraries #(tuple (:namespace %) (:definitions %))))
+        values (Enum/reduce libraries {}
+                 (fn [library values]
+                  (Enum/reduce (Map/to_list (:initializers library)) values
+                   (fn [entry values] (Map/put values [(:namespace library) (elem entry 0)] (elem entry 1))))))
+        metadata (constructor_metadata definitions values)
+        root {:op :global :ns namespace :name (:name claim) :lookup :exact}
+        _ (when-not (or (contains? (:globals metadata) [namespace (:name claim)])
+                        (and (= "core" namespace) (contains? (constructor_pure_core_names) (:name claim))))
             (constructor_refuse :unsupported-sdk-phase-function))
         closure (sdk_phase_closure! root metadata)
         cost (BeamLisp.CompilerData/first_order_cost! closure
