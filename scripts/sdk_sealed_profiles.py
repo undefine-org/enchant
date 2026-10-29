@@ -6,7 +6,7 @@ GROUPS = {
     "sdk-phase-functions": ([('test/bl/contextual_sdk_phase_function_test.bl', 22), ('test/bl/contextual_constructor_session_test.bl', 40)], ['compile.sdk', 'compile.world', 'clojure.core-ext', 'clojure.string']),
     "sdk-macros": ([('test/bl/contextual_sdk_macro_test.bl', 26), ('test/bl/contextual_syntax_test.bl', 43)], ['compile.sdk', 'compile.world']),
     "sdk-phase-values": ([('test/bl/contextual_sdk_phase_value_test.bl', 16)], ['compile.sdk', 'compile.world', 'system.execution', 'reload.runtime']),
-    "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 70)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
+    "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 74)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14), ('test/bl/compiler_contextual_test.bl', 27), ('test/bl/generation_semantics_test.bl', 18), ('test/bl/compiler_lexical_consumers_test.bl', 13)], ['expand', 'env', 'connector.google.gdrive', 'connector.microsoft.graph', 'bl.cli', 'bl.doc', 'bl.doc.html', 'bl.profile']),
