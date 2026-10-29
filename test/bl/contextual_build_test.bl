@@ -1,6 +1,7 @@
 ;; Compiler control: exercise the internal producer; normal build/run uses Nix.
 (ns contextual-build-test
- (:require [build :as build] [compile.world :as world] [bl.cli :as cli] [bl.env :as env]))
+ (:require [build :as build] [compile.world :as world] [bl.cli :as cli] [bl.env :as env]
+           [reload.execution :as execution] [reload.generation :as generation] [proc.callback :as callback]))
 
 (defn- restore [name value]
  (if (nil? value) (System/delete_env name) (System/put_env name value)))
@@ -177,7 +178,25 @@
      (is (= 0 calls))
      (is (= 42 (run-program reused))))))))
 
-(deftest changed-builds-coexist-with-escaped-closures-from-the-previous-physical-revision
+;; Delayed application callbacks need actual native registration, not just a
+;; function value whose graph marker happens to name loaded code. This helper
+;; uses the same captured unit/private preparation as Loader, with explicit
+;; caller-owned registration cleanup; it grants no replacement context.
+(defn- with-retained-entry [directory action]
+ (let [g (execution/prepare-captured-unit! (BeamLisp.AOT/verify_unit directory))
+       held (atom nil)]
+  (try
+   (execution/initialize-instance! g)
+   (execution/complete-preparation! (:cache-key g) g)
+   (let [value (execution/invoke-instance-entry! g)
+         registration (execution/with! g #(callback/register! value))]
+    (reset! held registration)
+    (action registration value g))
+   (finally
+    (when @held (callback/unregister! @held))
+    (generation/retire! g)))))
+
+(deftest changed-builds-coexist-with-retained-closures-from-the-previous-physical-revision
  (fixture
   (fn [root opts]
    (File/write! (Path/join root "main.bl") "(ns main) (fn [x] (erlang/+ x 40))")
@@ -185,9 +204,12 @@
          old-package (Path/join root "old-runtime")]
     (is (= [] (:errors old)))
     (world/package-runtime! (:out old) old-package)
-    (let [old-closure (world/run-unit old-package [])]
-     (try
-      (is (= 42 (old-closure 2)))
+    (with-retained-entry old-package
+     (fn [old-closure raw-old old-generation]
+      (is (= :source_instance_changed
+             (try (raw-old 2) :unexpected-success
+              (catch error (BeamLisp.ExInfo/ex_original error)))))
+      (is (= 42 (callback/invoke! old-closure [2])))
       (File/write! (Path/join root "main.bl") "(ns main) (fn [x] (erlang/+ x 50))")
       (let [new (build/produce! opts) new-module (runtime-module new)
             new-package (Path/join root "new-runtime")]
@@ -196,11 +218,15 @@
        (is (= 3 (count (File/ls! (:out new)))))
        (is (= (list (str (Atom/to_string new-module) ".beam")) (File/ls! (:runtime-out new))))
        (world/package-runtime! (:out new) new-package)
-       (let [new-closure (world/run-unit new-package [])]
-        (try
-         (is (= 52 (new-closure 2)))
-         (is (= 42 (old-closure 2)))
-         (is (= 42 ((world/run-unit old-package []) 2)))
+       (with-retained-entry new-package
+        (fn [new-closure raw-new new-generation]
+         (is (= :source_instance_changed
+                (try (execution/with! new-generation #(raw-old 2)) :unexpected-success
+                 (catch error (BeamLisp.ExInfo/ex_original error)))))
+         (is (= 52 (callback/invoke! new-closure [2])))
+         (is (= 42 (callback/invoke! old-closure [2])))
+         (with-retained-entry old-package
+          (fn [reopened _ _] (is (= 42 (callback/invoke! reopened [2])))))
          (is (erlang/module_loaded old-module))
          (is (erlang/module_loaded new-module))
          (is (= 0 (:built (build/produce! opts))))
@@ -208,10 +234,9 @@
          (let [restored (build/produce! opts)]
           (is (= [] (:errors restored)))
           (is (= old-module (runtime-module restored)))
-          (is (= 42 ((world/run-unit (:out restored) []) 2)))
-          (is (= 52 (new-closure 2))))
-         (finally (BeamLisp.Env/retire_module! new-module)))))
-      (finally (BeamLisp.Env/retire_module! old-module))))))))
+          (with-retained-entry (:out restored)
+           (fn [reopened _ _] (is (= 42 (callback/invoke! reopened [2])))))
+          (is (= 52 (callback/invoke! new-closure [2])))))))))))))
 
 (deftest revision-cleanup-refuses-changed-runtime-files-before-publishing-the-new-unit
  (fixture
