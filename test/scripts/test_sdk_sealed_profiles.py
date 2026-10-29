@@ -22,7 +22,8 @@ class SealedProfiles(unittest.TestCase):
         self.assertEqual({b['id'] for b in matrix['boundaries']}, set(selection['boundaries']))
         self.assertEqual(list(PROFILE['GROUPS']), [g['id'] for g in selection['groups']])
         # Two added fixture-fill assertions observe capacity under its native fence.
-        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 106 + 34 + 24 + 1 + 24 + 107 + 41 + 40 + 150 + 105 + 4 + 12 + 75 + 82 + 16 + 4 + 14 + 4 + 7 + 19 + 18 + 27 + 18 + 13 + 71 + 19 + 14 + 4 + 5 + 2 + 2 + 19 + 78 + 13 + 66 + 14 + 103 + 56 + 9 + 16 + 62 + 101 + 47 + 51 + 174 + 47 + 20 + 32 + 16 + 29 + 9 + 25 + 7 + 3 + 23 + 27 + 32 + 29 + 68 + 1 + 20 + 2 + 29 + 16 + 32 + 32 + 43 + 25 + 11 + 6 + 58 + 22 + 28 + 3, selection['assertions'])
+        # One export assertion now explicitly checks raw factory refusal.
+        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 106 + 34 + 24 + 1 + 24 + 107 + 41 + 40 + 150 + 105 + 4 + 12 + 75 + 82 + 16 + 4 + 14 + 4 + 7 + 19 + 18 + 27 + 18 + 13 + 71 + 19 + 14 + 4 + 5 + 2 + 2 + 19 + 78 + 13 + 66 + 14 + 103 + 56 + 9 + 16 + 62 + 101 + 47 + 51 + 174 + 47 + 20 + 32 + 16 + 29 + 9 + 25 + 7 + 3 + 23 + 27 + 32 + 29 + 68 + 1 + 20 + 2 + 29 + 16 + 32 + 32 + 43 + 25 + 11 + 6 + 58 + 22 + 28 + 3 + 1, selection['assertions'])
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])
