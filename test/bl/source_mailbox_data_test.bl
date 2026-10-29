@@ -1,0 +1,94 @@
+(ns source-mailbox-data-test
+ (:require [test.support.source-fixtures :as fixtures] [reload.generation :as g] [expand :as x] [lower :as lower] [anf :as a]))
+
+;; Production APIs are tested through exact Native helper fixtures in component
+;; feedback until the new immutable SDK exists. Fixtures grant no SDK origin.
+(fixtures/source-mailbox!)
+
+(defn- refused [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error)) error))))
+(defn- root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(defn- source [relative] (File/read! (Path/join (root) relative)))
+(defn- owned [extra]
+ (g/prepare!
+  {:application-id (str "source-mailbox-" (erlang/unique_integer (list :positive)))
+   :native-modules #{"erlang" "NativeSourceMailboxFixture" "NativeMailboxProgramFixture"}
+   :sources {"mailbox.host"
+    (str "(ns mailbox.host) "
+      "(defn context [] (NativeSourceMailboxFixture/source_mailbox_context!)) "
+      "(defn post [value] (NativeSourceMailboxFixture/post_source_mailbox_data! value)) "
+      "(defn bad-function [] (NativeSourceMailboxFixture/post_source_mailbox_data! (fn [] 42))) "
+      "(defn bad-reference [] (NativeSourceMailboxFixture/post_source_mailbox_data! (erlang/make_ref))) "
+      "(defn bad-cell [] (NativeSourceMailboxFixture/post_source_mailbox_data! (atom 0))) "
+      "(defn run [] (NativeMailboxProgramFixture/run)) " extra)}}))
+(defn- call [generation name args] (g/invoke! generation (str "mailbox.host/" name) args))
+
+(deftest source-inbox-requires-the-original-admitted-frame
+ (is (= :unadmitted_source_mailbox (refused #(NativeSourceMailboxFixture/source_mailbox_context!))))
+ (is (= :unadmitted_source_mailbox (refused #(NativeSourceMailboxFixture/post_source_mailbox_data! :unadmitted))))
+ (let [generation (owned "")]
+  (try
+   (let [marker (g/with! generation #(BeamLisp.Env/selected_execution_graph_id))]
+    (is (= marker (call generation "context" [])))
+    ;; A genuine retained G without Source entry is still not an inbox frame.
+    (is (= :unadmitted_source_mailbox
+           (g/with! generation #(refused (fn [] (NativeSourceMailboxFixture/post_source_mailbox_data! :native)))))))
+   (finally (g/retire! generation)))))
+
+(deftest self-post-validates-data-before-an-envelope-is-sent
+ (let [generation (owned "")]
+  (try
+   (doseq [name ["bad-function" "bad-reference" "bad-cell"]]
+    (is (= :unsafe-first-order-data (refused #(call generation name [])))))
+   (is (= :unsafe-first-order-data
+          (refused #(call generation "post" [(String/duplicate "x" 1048577)]))))
+   (is (= :empty (receive [:bl_source_mailbox_data _ _] :unexpected (after 0 :empty))))
+   (let [marker (call generation "context" [])]
+    (is (= nil (call generation "post" [[:answer 42]])))
+    (is (= [marker [:answer 42]]
+           (receive [:bl_source_mailbox_data scope value] [scope value] (after 0 :missing)))))
+   (finally (g/retire! generation)))))
+
+(deftest inbox-identities-do-not-open-another-generation-or-rewrite-control-messages
+ (let [left (owned "") right (owned "")]
+  (try
+   (is (not= (call left "context" []) (call right "context" [])))
+   ;; OTP-looking data stays inside the fixed data envelope.
+   (is (= :unsafe-first-order-data (refused #(call left "post" [(tuple :system :caller :get_state)]))))
+   (is (= :empty (receive [:bl_source_mailbox_data _ _] :unexpected (after 0 :empty))))
+   (is (= nil (call left "post" [[:system :caller :get_state]])))
+   (is (= :untouched (receive [:system _ _] :unexpected (after 0 :untouched))))
+   (is (= [:system :caller :get_state]
+          (receive [:bl_source_mailbox_data _ value] value (after 0 :missing))))
+   (finally (g/retire! right) (g/retire! left)))))
+
+(deftest canonical-bracket-example-selects-only-current-inbox-envelopes
+ (let [provider {:namespace 'proc.mailbox :revision 'selected :file "proc-mailbox-component.bl"
+                 :source (String/replace (source "priv/std/proc/mailbox.bl")
+                            "BeamLisp.Env/" "Elixir.NativeSourceMailboxFixture/")}
+       macros {:namespace 'mailbox :revision 'current :file "mailbox.bl"
+               :source (source "test/fixtures/contextual-mailbox/mailbox.bl")}
+       client {:namespace 'showcase :revision 'current :file "main.bl"
+               :source (source "test/fixtures/contextual-mailbox/main.bl")}
+       program (x/program [provider macros client] ['showcase 'current])
+       descriptor (a/module :Elixir.NativeMailboxProgramFixture
+                    (list {:op :defn-clause :fname :run :params (list) :guard nil :body (:node program) :ann {}})
+                    (list [:run 0]) (list))
+       pair (lower/descriptor->beam descriptor {})
+       _ (code/load_binary (first pair) '() (second pair))
+       generation (owned "") other (owned "") marker (call other "context" [])]
+  (try
+   (erlang/send (erlang/self) (tuple :bl_source_mailbox_data marker [:answer 999]))
+   (is (= [42 107 99] (call generation "run" [])))
+   (is (= [:answer 999]
+          (receive [:bl_source_mailbox_data scope value] :when (== scope marker) value (after 0 :missing))))
+   (is (= 3 (count (:expansions program))))
+   (finally (g/retire! other) (g/retire! generation)))))
+
+
+(deftest raw-send-remains-refused-before-admission
+ (let [failure (try (owned "(defn raw-send [] (erlang/send (erlang/self) :source-mailbox-bypass))") nil
+                   (catch error (ex-data error)))]
+  (is (= :unmanaged-compiled-producer (:kind failure)))
+  (is (= "erlang/send" (:symbol failure)))))
