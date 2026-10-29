@@ -7,11 +7,15 @@
  (let [directory (Path/join (System/tmp_dir!) (str "sdk-set-phase-" (erlang/unique_integer (list :positive))))
        selection {:sdk 'clojure.set :revision 'selected :only ['union]}
        provider (:source (sdk/capture selection))
+       old-cache (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+       old-on (System/get_env "BEAM_LISP_AOT_CACHE")
        source (str "(ns set.client) (import-world 'clojure.set 'selected :only [union]) "
                    "(begin-for-syntax (import-world 'clojure.set 'selected :only [union])) "
                    "(defsyntax answer [form ctx] (syntax-literal (union #{1 2} #{2 3}))) "
                    "[(union #{1 2} #{2 3}) (answer)]")]
   (File/mkdir! directory)
+  (System/put_env "BEAM_LISP_AOT_CACHE_DIR" (Path/join directory "cache"))
+  (System/put_env "BEAM_LISP_AOT_CACHE" "on")
   (try
    (is (not (erlang/module_loaded :Elixir.BeamLisp.Ns.Body.Clojure.Set)))
    (File/write! (Path/join directory "main.bl") source)
@@ -41,6 +45,27 @@
    (is (= selection (get-in (world/capture (Path/join directory "world.bl")) [:sdk-inputs 0 :selection])))
    (is (not (erlang/module_loaded :Elixir.BeamLisp.Ns.Body.Clojure.Set)))
    (File/write! (Path/join directory "main.bl") source)
+   ;; Build/cache/runtime-package consumers must preserve the same SDK inputs.
+   ;; Building stays passive: the FIRST actual runtime call is an archive-built
+   ;; artifact in this cold receiver, not a prior explicit SDK selection.
+   (let [path (Path/join directory "world.bl") out (Path/join directory "built")
+         built (world/build! path out false)
+         sdk-selection (fn [directory]
+                         (get-in (BeamLisp.AOT/contextual_unit_members! (BeamLisp.AOT/verify_unit directory))
+                                 [:metadata :input-selection :sdk-inputs 0 :selection]))]
+    (is (= 1 (:compiled built)))
+    (is (= selection (sdk-selection (:out built))))
+    (is (not (erlang/module_loaded :Elixir.BeamLisp.Ns.Body.Clojure.Set)))
+    (is (= [#{1 2 3} #{1 2 3}] (world/run-unit (:out built) [])))
+    (File/rm_rf! out)
+    (let [restored (world/build! path out false)
+          package (Path/join directory "runtime-only")]
+     (is (and (= 1 (:cached restored)) (= 0 (:compiled restored))))
+     (is (= selection (sdk-selection (:out restored))))
+     (is (= [#{1 2 3} #{1 2 3}] (world/run-unit (:out restored) [])))
+     (is (= false (:phase-companion (world/package-runtime! (:out restored) package))))
+     (is (= selection (sdk-selection package)))
+     (is (= [#{1 2 3} #{1 2 3}] (world/run-unit package [])))))
    ;; Archive FIRST is the regression: it must supply the same checked SDK
    ;; dependency metadata before the Loader initializes any provider.
    (doseq [libraries [["phase.bin"] [selection]]]
@@ -51,4 +76,7 @@
     (let [prepared (world/prepare (Path/join directory "world.bl"))]
      (is (= selection (get-in prepared [:sdk-inputs 0 :selection])))
      (is (= [#{1 2 3} #{1 2 3}] (world/execute prepared [])))))
-   (finally (File/rm_rf! directory)))))
+   (finally
+    (if old-cache (System/put_env "BEAM_LISP_AOT_CACHE_DIR" old-cache) (System/delete_env "BEAM_LISP_AOT_CACHE_DIR"))
+    (if old-on (System/put_env "BEAM_LISP_AOT_CACHE" old-on) (System/delete_env "BEAM_LISP_AOT_CACHE"))
+    (File/rm_rf! directory)))))
