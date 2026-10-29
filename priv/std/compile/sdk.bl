@@ -5,8 +5,60 @@
 (defn- refuse! [kind]
  (throw (ex-info "Invalid contextual SDK selection" {:kind kind})))
 
+(defn- macro-template-symbols [value]
+ (cond
+  (symbol? value) [value]
+  (or (erlang/is_list value) (vector? value) (set? value))
+   (Enum/flat_map (to-list value) macro-template-symbols)
+  (erlang/is_map value)
+   (Enum/flat_map (Map/to_list value)
+    #(Enum/concat (macro-template-symbols (elem % 0)) (macro-template-symbols (elem % 1))))
+  :else []))
+
+(defn- macro-template [value replacements]
+ (cond
+  (erlang/is_list value)
+   (cond
+    (= 'unquote (first value))
+     (if (and (= 2 (count value)) (contains? replacements (second value)))
+      (get replacements (second value)) (refuse! :world-sdk-macro-recipe))
+    (contains? #{'syntax-quote 'unquote-splicing} (first value))
+     (refuse! :world-sdk-macro-recipe)
+    :else (Enum/map value #(macro-template % replacements)))
+  (vector? value) (mapv #(macro-template % replacements) value)
+  (set? value) (set (Enum/map (to-list value) #(macro-template % replacements)))
+  (erlang/is_map value)
+   (Map/new (Enum/map (Map/to_list value)
+    #(tuple (macro-template (elem % 0) replacements) (macro-template (elem % 1) replacements))))
+  :else value))
+
+(defn- macro-definition [binding]
+ ;; Convert authenticated declaration DATA, never a live macro function. The
+ ;; resulting defsyntax has the same recipe/session/hygiene path as app syntax.
+ (let [form (:value binding) tail (when (erlang/is_list form) (drop 2 form))
+       tail (if (string? (first tail)) (rest tail) tail)
+       params (first tail) body (second tail)]
+  (when-not (and (= 'defmacro (first form)) (= (symbol (:name binding)) (second form))
+                 (= 2 (count tail)) (vector? params) (<= (count params) 64)
+                 (every? symbol? params) (not (some #(= '& %) params))
+                 (= (count params) (count (distinct params)))
+                 (erlang/is_list body) (= 2 (count body)) (= 'syntax-quote (first body)))
+   (refuse! :world-sdk-macro-recipe))
+  (let [template (second body) names (set (macro-template-symbols template))
+        holes (mapv #(symbol (str "__sdk_template_hole_" %)) (range (count params)))
+        _ (when (some #(contains? names %) holes) (refuse! :world-sdk-macro-recipe))
+        replacements (Map/new (Enum/zip (to-list params) (to-list holes)))
+        form-name 'sdk_macro_form context-name 'sdk_macro_context
+        arguments (Map/new (Enum/map (Enum/with_index holes)
+                    #(tuple (elem % 0) (list 'syntax-arg form-name (inc (elem % 1))))))]
+   (list 'defsyntax (symbol (:name binding)) [form-name context-name]
+    (list 'if (list 'erlang/== (list 'erlang/length (list :children form-name)) (inc (count params)))
+     (list 'syntax-template (macro-template template replacements)
+      (Map/new (Enum/map (Map/to_list arguments) #(tuple (list 'quote (elem % 0)) (elem % 1)))))
+     (list 'throw :sdk-macro-arity))))))
+
 (defn capture
- "Select public SDK functions and closed artifact literals as one Source world.
+ "Select SDK functions, declarative syntax and closed literals in one Source world.
   Revision is a quoted logical label; authenticated provider bytes participate
   in the generated Source digest and therefore the canonical world identity."
  [selection]
@@ -23,9 +75,10 @@
        definitions
        (Enum/map bindings
         (fn [binding]
-         (if (= :value (:kind binding))
-          (list 'def (symbol (:name binding)) (list 'quote (:value binding)))
-         (let [clauses (Enum/map (:clauses binding)
+         (cond
+          (= :macro (:kind binding)) (macro-definition binding)
+          (= :value (:kind binding)) (list 'def (symbol (:name binding)) (list 'quote (:value binding)))
+          :else (let [clauses (Enum/map (:clauses binding)
                         (fn [clause]
                          (let [args (mapv #(symbol (str "sdk_arg_" %)) (range (:arity clause)))
                                parameters (if (= :variadic (:kind clause))

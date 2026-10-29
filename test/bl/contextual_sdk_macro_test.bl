@@ -1,0 +1,61 @@
+(ns contextual-sdk-macro-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [lower :as lower]))
+
+(defn- selection [] {:sdk 'core :revision 'selected :only ['ite]})
+(defn- client [text]
+ {:namespace 'macro.client :revision 'current :file "macro-client.bl"
+  :source (str "(ns macro.client) " text)})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.SDKMacro" (erlang/unique_integer (list :positive))))
+                 (:node program)))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- example []
+ (client (str "(import-world 'core 'selected :only [ite]) "
+              "(let [sdk_macro_form 999 c false yes 40 no 2] "
+              "(ite c (erlang/error :must-not-run) (erlang/+ yes no)))")))
+
+(deftest authenticated-sdk-template-is-a-canonical-hygienic-transformer
+ (let [before (BeamLisp.Env/lookup (tuple "core" "ite"))
+       captured (sdk/capture (selection)) binding (first (:bindings captured))
+       program (expand/program [(:source captured) (example)] ['macro.client 'current])]
+  (is (= :macro (:kind binding)))
+  (is (= before (BeamLisp.Env/lookup (tuple "core" "ite"))))
+  (is (= captured (sdk/check! captured)))
+  (is (= 42 (execute program)))
+  (is (= 1 (count (:expansions program))))
+  (is (empty? (:linked program)))
+  (is (refused? #(sdk/check! (assoc-in captured [:bindings 0 :value] '(defmacro ite [] 0)))))
+  (is (refused? #(expand/program [(:source captured)
+                  (client "(import-world 'core 'selected :only [ite]) (ite true 42)")]
+                 ['macro.client 'current])))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))
+        archived (expand/program [(example)] ['macro.client 'current] [library])]
+   (is (= 42 (execute archived)))
+   (is (every? #(not (contains? % :source)) (:units library))))))
+
+(deftest sdk-template-can-be-instantiated-at-a-higher-expansion-phase
+ (let [captured (sdk/capture (selection))
+       program (expand/program [(:source captured)
+                 (client (str "(begin-for-syntax (import-world 'core 'selected :only [ite])) "
+                              "(defsyntax answer [form ctx] "
+                              "(ite true (syntax-literal 42) (syntax-literal 0))) (answer)"))]
+                ['macro.client 'current])]
+  (is (= 42 (execute program)))
+  (is (= 2 (count (:expansions program))))))
+
+(deftest sdk-macro-template-needs-no-runtime-provider-initializer
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-macro-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") (:source (example)))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['macro.client 'current] :sources [{:namespace 'macro.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['ite]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (BeamLisp.AOT/compile_unit (world/prepare-unit prepared :Elixir.SDKMacroOnlyUnit))]
+    (is (= [] (BeamLisp.AOT/contextual_sdk_namespaces! unit)))
+    (is (= 42 (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest computed-sdk-macros-never-fall-back-to-live-evaluation
+ (is (refused? #(sdk/capture {:sdk 'core :revision 'selected :only ['cond]}))))
