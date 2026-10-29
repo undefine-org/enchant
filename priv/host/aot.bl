@@ -5792,7 +5792,8 @@
   {:version 1 :namespace ns :name name :kind :function
    :runtime-image (BeamLisp.AOT/runtime_image_key)
    :source (:source raw) :source-digest (:source-digest raw)
-   :provider-sha256 (:sha256 raw) :clauses clauses})))
+   :provider-sha256 (:sha256 raw) :sdk-inventory-sha256 (crypto/hash :sha256 inventory)
+   :clauses clauses})))
 
 (defn sdk_binding!
  "Project an immutable SDK function, macro declaration or closed literal as
@@ -7811,6 +7812,18 @@
       (finally (erlang/put key (Map/put (erlang/get key) :value-stack stack)))))))
   (constructor_interpret source {} state)))
 
+(defn- constructor_sdk_ready_call [node state]
+ (let [statements (:stmts node)
+       guard (first statements) call (second statements)
+       arguments (:args guard) argument (first arguments)
+       target [(:mod call) (:fun call) (count (:args call))]]
+  (when (and (= 2 (count statements)) (= :remote (:op guard))
+             (= :Elixir.BeamLisp.Loader (:mod guard)) (= :ensure_ready (:fun guard))
+             (= 1 (count arguments)) (= :lit (:op argument))
+             (erlang/is_binary (:val argument)) (= :remote (:op call))
+             (= (:val argument) (get (:sdk-phase-ready state) target)))
+   call)))
+
 (defn constructor_interpret
  "Effect-denying, bounded actual-ANF interpreter. Caller
   supplies only compiler metadata; it supplies no runtime callback/host grant.
@@ -7867,7 +7880,13 @@
             (constructor_native_operation (fn [] (constructor_invoke callee arguments state)) state))
    :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
    :if (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
-   :do (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state)))
+   :do (if-let [call (constructor_sdk_ready_call n state)]
+         ;; This discharges a runtime initialization precondition using this
+         ;; SDK closure's exact artifact metadata. No loader operation runs;
+         ;; the original pure interpreter still evaluates every callee/operand.
+         (do (constructor_step! state) (constructor_step! state)
+             (constructor_interpret call env state))
+         (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state))))
    :tuple (do (constructor_allocation! (inc (count (:elems n))) 0 state)
               (erlang/list_to_tuple (Enum/map (:elems n) #(constructor_interpret % env state))))
    :map (do (constructor_allocation! (+ 8 (* 8 (count (:pairs n)))) 0 state)
@@ -8117,24 +8136,82 @@
    (constructor_refuse :unattested-sdk-phase-compiler-visitor))
   (erlang/make_fun module function 1)))
 
-(defn- sdk_phase_closure! [root metadata]
+(declare sdk_phase_library!)
+
+(defn- sdk_phase_dependency! [namespace inventory]
+ ;; Join the existing immutable inventory and exact artifact decoder. A
+ ;; dependency is selected by an executable SDK edge, never an ambient Var,
+ ;; Source file, caller-provided library, initializer or runtime getter.
+ (let [module (BeamLisp.Emit/base_module_for namespace) identity (Atom/to_string module)
+       row (BeamLisp.Env/sdk_inventory_metadata! inventory identity)]
+  (when-not (and row (= :mutable-forwarder (:role row))
+                 (= namespace (:forwarder-namespace row))
+                 (= (BeamLisp.AOTCache/compiler_key) (:compiler-key row)))
+   (constructor_refuse :unattested-sdk-phase-dependency))
+  (let [bytes (BeamLisp.AOTCache/read_precompiled_bytes!
+                (sdk_image_artifact_path (BeamLisp.Tiers/priv_root) identity) 33554432)]
+   (when-not (= (:sha256 row) (crypto/hash :sha256 bytes))
+    (constructor_refuse :sdk-phase-dependency-changed))
+   (BeamLisp.Env/sdk_image_metadata! identity row bytes)
+   (sdk_phase_library! {:namespace namespace :provider-sha256 (:sha256 row)
+                        :source-digest (:source-digest row)}))))
+
+(defn- sdk_phase_library_metadata [library]
+ (constructor_metadata {(:namespace library) (:definitions library)}
+  (Map/new (Enum/map (Map/to_list (:initializers library))
+    #(tuple [(:namespace library) (elem % 0)] (elem % 1))))))
+
+(defn- sdk_phase_closure! [root metadata libraries inventory]
  ;; Reuse the canonical executable-operand grammar. Quoted ANF lookalikes and
- ;; source annotations cannot introduce dependencies. The callable is the fixed
- ;; authenticated compiler visitor, never supplied application code.
- (let [children (sdk_phase_children!)]
-  (loop [todo (list root) globals {} remotes {} steps 0]
+ ;; source annotations cannot introduce dependencies. Only missing executable
+ ;; edges can add an authenticated provider; each provider is read once.
+ (let [children (sdk_phase_children!)
+       metadata-cost (BeamLisp.CompilerData/first_order_cost! metadata
+                       {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+       owners (Enum/reduce libraries {}
+                (fn [library out]
+                 (Enum/reduce (Map/keys (:remotes (sdk_phase_library_metadata library))) out
+                  #(Map/put %2 %1 (:namespace library)))))]
+  (loop [todo (list root) globals {} remotes {} steps 0 metadata metadata
+         loaded (set (Enum/map libraries (fn [library] (:namespace library)))) owners owners cost metadata-cost]
    (when (> steps 65536) (constructor_refuse :sdk-phase-closure-bound))
-   (if (empty? todo) {:globals globals :remotes remotes}
+   (if (empty? todo)
+    {:globals globals :remotes remotes :walk-nodes (:nodes cost)
+     :sdk-phase-ready (Map/take owners (Map/keys remotes))}
     (let [node (first todo) op (:op node)
           global (when (= :global op) [(:ns node) (:name node)])
           remote (when (= :remote op) [(:mod node) (:fun node) (count (:args node))])
-          value (when (and global (not (contains? globals global))) (get (:globals metadata) global))
-          entry (when (and remote (not (contains? remotes remote))) (get (:remotes metadata) remote))
-          next (erlang/++ (erlang/apply children (list node)) (rest todo))
-          next (if value (cons value next) next)
-          next (if entry (cons {:op :fn :clauses (:clauses entry)} next) next)]
-     (recur next (if value (assoc globals global value) globals)
-                 (if entry (assoc remotes remote entry) remotes) (inc steps)))))))
+          missing? (or (and global (not (contains? (:globals metadata) global)))
+                       (and remote (not (contains? (:remotes metadata) remote))))
+          namespace (when missing?
+                      (if global (:ns node)
+                       (when inventory
+                        (:forwarder-namespace
+                         (BeamLisp.Env/sdk_inventory_metadata! inventory (Atom/to_string (:mod node)))))))]
+     (if (and namespace (not (contains? loaded namespace)))
+      (do
+       (when (>= (count loaded) 128) (constructor_refuse :sdk-phase-provider-bound))
+       (when-not inventory (constructor_refuse :unattested-sdk-phase-dependency))
+       (let [library (sdk_phase_dependency! namespace inventory)
+             added (sdk_phase_library_metadata library)
+             added-cost (BeamLisp.CompilerData/first_order_cost! added
+                          {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+             total {:nodes (+ (:nodes cost) (:nodes added-cost))
+                    :bytes (+ (:bytes cost) (:bytes added-cost))}]
+        (when (or (> (:nodes total) 262144) (> (:bytes total) 16777216))
+         (constructor_refuse :sdk-phase-provider-metadata-bound))
+        (recur todo globals remotes (inc steps)
+         {:globals (Map/merge (:globals metadata) (:globals added))
+          :remotes (Map/merge (:remotes metadata) (:remotes added))}
+         (conj loaded namespace)
+         (Enum/reduce (Map/keys (:remotes added)) owners #(Map/put %2 %1 namespace)) total)))
+      (let [value (when (and global (not (contains? globals global))) (get (:globals metadata) global))
+            entry (when (and remote (not (contains? remotes remote))) (get (:remotes metadata) remote))
+            next (erlang/++ (erlang/apply children (list node)) (rest todo))
+            next (if value (cons value next) next)
+            next (if entry (cons {:op :fn :clauses (:clauses entry)} next) next)]
+       (recur next (if value (assoc globals global value) globals)
+                   (if entry (assoc remotes remote entry) remotes) (inc steps) metadata loaded owners cost))))))))
 
 (defn- sdk_phase_library! [binding]
  ;; The public descriptor already proves the original provider and its stable
@@ -8179,6 +8256,10 @@
                     (BeamLisp.Compiler/datum (:form declaration))))
    (constructor_refuse :sdk-phase-declaration-changed))
   (let [namespace (:namespace binding)
+        inventory-path (Path/join (BeamLisp.Tiers/priv_root) "sdk-code.term")
+        inventory (when (:sdk-inventory-sha256 binding) (File/read! inventory-path))
+        _ (when (and inventory (not= (:sdk-inventory-sha256 binding) (crypto/hash :sha256 inventory)))
+            (constructor_refuse :sdk-phase-inventory-changed))
         provider (sdk_phase_library! binding)
         libraries (if (= "core" namespace) (list provider)
                     (list (seed_phase_library! "core" (BeamLisp.Bootstrap/manifest)) provider))
@@ -8192,12 +8273,18 @@
         _ (when-not (or (contains? (:globals metadata) [namespace (:name claim)])
                         (and (= "core" namespace) (contains? (constructor_pure_core_names) (:name claim))))
             (constructor_refuse :unsupported-sdk-phase-function))
-        closure (sdk_phase_closure! root metadata)
-        cost (BeamLisp.CompilerData/first_order_cost! closure
-               {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
+        projected (sdk_phase_closure! root metadata libraries inventory)
+        closure (dissoc projected :walk-nodes)
+        retained-cost (BeamLisp.CompilerData/first_order_cost! closure
+                        {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+        ;; Metadata discovery shares the original walk ledger too. Retention
+        ;; charges only the reachable closure, not the temporary provider tables.
+        cost (assoc retained-cost :nodes (+ (:nodes retained-cost) (:walk-nodes projected)))]
    ;; The metadata belongs to this interpreted closure only. Generic eval/bind
    ;; requests keep an empty SDK metadata table. Charge retained bytes once for
    ;; this phase instance, in the original shared session accounting.
+   (when (and inventory (not= inventory (File/read! inventory-path)))
+    (constructor_refuse :sdk-phase-inventory-changed))
    (constructor_session_request! handle root {} {} true closure cost))))
 
 (defn- interpret_phase_constructor! [expression metadata]
