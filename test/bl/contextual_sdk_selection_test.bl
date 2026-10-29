@@ -1,0 +1,126 @@
+(ns contextual-sdk-selection-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [compiler :as compiler]))
+
+(defn- refused? [action]
+ (try (action) false (catch _ true)))
+
+(defn- forge-sdk-claim [unit]
+ ;; Re-emit coherent runtime/phase metadata with an incorrect binding claim.
+ ;; The artifact's ordinary byte membership is valid; SDK admission must still
+ ;; compare the claim to original image evidence before invoking the factory.
+ (update unit :plans
+  #(BeamLisp.CompilerData/eager_map (fn [plan]
+    (update plan :descriptors
+     (fn [descriptors]
+      (BeamLisp.CompilerData/eager_map (fn [descriptor]
+       (update descriptor :attrs
+        (fn [attrs]
+         (BeamLisp.CompilerData/eager_map (fn [attribute]
+          (if (= :bl_contextual_unit (first attribute))
+           [:bl_contextual_unit
+            (erlang/term_to_binary
+             (assoc-in (erlang/binary_to_term (second attribute) (list :safe))
+                       [:input-selection :sdk-inputs 0 :bindings 0 :provider-sha256] "forged")
+             (list :deterministic))]
+           attribute)) attrs)))) descriptors)))) %)))
+
+(deftest sdk-projection-is-passive-exact-and-public
+ (let [before (BeamLisp.Env/lookup (tuple "clojure.string" "upper-case"))
+       binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")
+       clause (first (:clauses binding))]
+  (is (= before (BeamLisp.Env/lookup (tuple "clojure.string" "upper-case"))))
+  (is (= :function (:kind binding)))
+  (is (string? (:module clause)))
+  (is (string? (:function clause)))
+  (is (= 1 (:arity clause)))
+  (is (= :fixed (:kind clause)))
+  (is (= #{1 2} (set (map :arity (:clauses (BeamLisp.AOT/sdk_function_binding! "clojure.string" "join"))))))
+  (is (= (BeamLisp.AOT/runtime_image_key) (:runtime-image binding)))
+  (is (= binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "clojure.string" "ch->str")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "clojure.string" "no-such-binding")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "missing.provider" "answer")))))
+
+(deftest selected-sdk-forwarding-source-has-one-canonical-binding-identity
+ (let [selection {:sdk 'clojure.string :revision 'selected :only ['upper-case]}
+       captured (sdk/capture selection)
+       provider (:source captured)
+       client {:namespace 'sdk.client :revision 'current :file "sdk-client.bl"
+               :source "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")"}
+       program (expand/program [provider client] ['sdk.client 'current])]
+  (is (= captured (sdk/check! captured)))
+  (is (= 'clojure.string (:namespace provider)))
+  (is (String/starts_with? (:file provider) "sdk-forwarding:"))
+  (is (= 2 (count (get-in program [:selection :worlds]))))
+  (is (seq (:references program)))
+  (is (refused? #(sdk/check! (assoc-in captured [:bindings 0 :provider-sha256] "forged"))))
+  (is (refused? #(sdk/capture (assoc selection :only ['ch->str]))))
+  (is (refused? #(sdk/capture (assoc selection :only ['upper-case 'upper-case]))))))
+
+(deftest physical-target-syntax-does-not-use-ambient-aliases
+ (is (= true (compiler/contextual-native-name? "Elixir.BeamLisp.Ns.Body.Clojure.String/upper-case")))
+ (is (= true (compiler/contextual-native-name? "erlang/+")))
+ (is (= false (compiler/contextual-native-name? "String/upcase")))
+ (is (= false (compiler/contextual-native-name? "alias/upper-case")))
+ (is (refused? #(expand/program
+                 [{:namespace 'sdk.client :revision 'current :file "unselected-sdk.bl"
+                   :source "(ns sdk.client) (upper-case \"hello\")"}]
+                 ['sdk.client 'current]))))
+
+(deftest world-file-sdk-selection-executes-through-original-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-world-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")")
+   (File/write! (Path/join dir "world.bl")
+    "'{:version 1 :profile syntax-v1 :entry [sdk.client current] :sources [{:namespace sdk.client :revision current :file \"main.bl\"}] :libraries [{:sdk clojure.string :revision selected :only [upper-case]}]}")
+   (let [captured (world/capture (Path/join dir "world.bl"))
+         prepared (world/prepare-captured captured)]
+    (is (= 1 (count (:sdk-inputs captured))))
+    (is (= 2 (count (:sources captured))))
+    (is (= :proved (get-in prepared [:phase :status])))
+    (let [unit (world/prepare-unit prepared :Elixir.ContextualSDKClaimFixture)
+          verified (BeamLisp.AOT/compile_unit unit)
+          forged (BeamLisp.AOT/compile_unit (forge-sdk-claim unit))]
+     (is (= ["clojure.string"] (BeamLisp.AOT/contextual_sdk_namespaces! verified)))
+     (is (refused? #(BeamLisp.AOT/contextual_sdk_namespaces! forged)))
+     (is (refused? #(BeamLisp.Loader/run_prepared_artifact_unit (forge-sdk-claim unit) (list)))))
+    (is (= "HELLO" (world/execute prepared [])))
+    (let [pair (world/artifact prepared :Elixir.ContextualSDKPassiveFixture)]
+     (is (= false (erlang/module_loaded (first pair)))))
+    (is (refused? #(world/check-inputs! (assoc-in prepared [:sdk-inputs 0 :bindings] [])))))
+   ;; A public SDK selection grants neither private SDK entries nor host effects.
+   (let [binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")
+         module (:module (first (:clauses binding)))]
+    (File/write! (Path/join dir "main.bl")
+     (str "(ns sdk.client) (" module "/ch->str 65)"))
+    (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) []))))
+   (File/write! (Path/join dir "main.bl")
+    "(ns sdk.client) (Elixir.Process/put :contextual-sdk-host-effect true)")
+   (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) [])))
+   (is (= :undefined (erlang/get :contextual-sdk-host-effect)))
+   ;; Archive-only imports retain the executable identity pin independently
+   ;; of the manifest SDK adapter. A mismatched pin must refuse at runtime.
+   (let [captured (sdk/capture {:sdk 'clojure.string :revision 'selected :only ['upper-case]})
+         provider (:source captured)
+         expected (pr-str (list 'quote (erlang/binary_to_list
+                                        (:md5 (first (:clauses (first (:bindings captured))))))))
+         changed (String/replace (:source provider) expected "(quote (0))")]
+    (File/write! (Path/join dir "main.bl")
+     "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")")
+    (File/write! (Path/join dir "world.bl")
+     "'{:version 1 :profile syntax-v1 :entry [sdk.client current] :sources [{:namespace sdk.client :revision current :file \"main.bl\"}] :libraries [\"selected.phase\"]}")
+    (File/write! (Path/join dir "selected.phase")
+     (expand/encode-phase-library (expand/phase-library [provider])))
+    (is (= "HELLO" (world/execute (world/prepare (Path/join dir "world.bl")) [])))
+    (is (not= changed (:source provider)))
+    (File/write! (Path/join dir "selected.phase")
+     (expand/encode-phase-library (expand/phase-library [(assoc provider :source changed)])))
+    (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest selected-sdk-showcase-retains-first-class-calls-and-fixed-overloads
+ (let [prepared (world/prepare "test/fixtures/contextual-sdk/world.bl")]
+  (is (= :proved (get-in prepared [:phase :status])))
+  (is (= ["HELLO BEAM" "a:b"] (world/execute prepared [])))))

@@ -453,7 +453,9 @@
    :restored-from-cache :contextual-runtime-membership :phase-companion
    :role :runtime :phase :profile :entry :snapshot :program-module :phase-module :phase-digest :runtime-image
    :input-selection :manifest :pipeline :sources :libraries :revision :file :digest :bytes
-   :build-key :ns :hash :iface :factory-abi :exports :kind :binding-reference :world :declaration :id :space :symbol))
+   :build-key :ns :hash :iface :factory-abi :exports :kind :binding-reference :world :declaration :id :space :symbol
+   :sdk-inputs :selection :bindings :sdk :only :clauses :function :minimum-arity :arity
+   :fixed :variadic :source :source-digest :provider-sha256 :md5 :name))
 
 (defn- capture_unit!
  "Read a bounded complete artifact directory, binding its manifest to actual
@@ -5594,6 +5596,89 @@
     (sdk_record_declaration! form ns names :public))
   ;; No class/constructor interning, runtime schema or protocol execution.
   true))
+(defn sdk_function_binding!
+ "Project one public function from the selected immutable SDK into compiler
+  data. Read authenticated artifact literals, never live namespace Vars or
+  __bl_ns_defs__. This neither loads nor initializes a provider. Execution
+  still checks the exact public route through the ordinary Source dispatcher."
+ [ns name]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when-not (and (erlang/is_binary ns) (<= 1 (erlang/byte_size ns) 512)
+                (erlang/is_binary name) (<= 1 (erlang/byte_size name) 512))
+  (erlang/error :invalid_sdk_function_binding))
+ (let [root (BeamLisp.Tiers/priv_root)
+       inventory (File/read! (Path/join root "sdk-code.term"))
+       shim (BeamLisp.Emit/base_module_for ns) identity (Atom/to_string shim)
+       raw (BeamLisp.Env/sdk_inventory_metadata! inventory identity)
+       _ (when-not (and raw (= :mutable-forwarder (:role raw))
+                         (= ns (:forwarder-namespace raw))
+                         (= (BeamLisp.AOTCache/compiler_key) (:compiler-key raw)))
+           (erlang/error :unattested_sdk_function_binding))
+       bytes (BeamLisp.AOTCache/read_precompiled_bytes!
+               (sdk_image_artifact_path root identity) 33554432)
+       _ (when-not (= (:sha256 raw) (crypto/hash :sha256 bytes))
+           (erlang/error :sdk_runtime_artifact_changed))
+       row (elem (BeamLisp.Env/sdk_image_metadata! identity raw bytes) 1)
+       declaration (:declarations row) kinds (:callable-kinds row)
+       _ (when-not (and (= :public (Map/get (elem declaration 2) name))
+                         (= :function (Map/get (elem kinds 2) name))
+                         (not (BeamLisp.Env/source_sdk_binding_refused? ns name)))
+           (erlang/error :sdk_function_binding_refused))
+       definitions (sdk_stage_literal_definitions! shim bytes)
+       entries (Map/get definitions name (list))
+       _ (when (= 0 (count entries)) (erlang/error :sdk_function_binding_unavailable))
+       clauses
+       (Enum/map entries
+        (fn [entry]
+         (let [module (elem entry 4) function (elem entry 2)
+               arity (count (:params (elem entry 3)))
+               target (BeamLisp.Env/sdk_inventory_metadata! inventory (Atom/to_string module))
+               object (when target (BeamLisp.AOTCache/read_precompiled_bytes!
+                                    (sdk_image_artifact_path root (Atom/to_string module)) 33554432))
+               exports (when object (beam_lib/chunks object (list :exports)))]
+          (when-not (and target (= :stable-body (:role target))
+                         (= (:compiler-key raw) (:compiler-key target))
+                         (= (:source raw) (:source target))
+                         (= (:source-digest raw) (:source-digest target))
+                         (= module (Map/get (:forwarder-routes row) (tuple function arity)))
+                         (= (:sha256 target) (crypto/hash :sha256 object))
+                         (= :ok (elem exports 0)) (= module (elem (elem exports 1) 0))
+                         (Enum/member? (Keyword/get (elem (elem exports 1) 1) :exports) (tuple function arity))
+                         (or (not (erlang/module_loaded module))
+                             (= (:md5 target) (erlang/apply module :module_info (list :md5)))))
+           (erlang/error :sdk_function_binding_target_changed))
+          ;; The literal table was checked by sdk_image_metadata!, including
+          ;; fixed/variadic parameter counts and the complete route relation.
+          {:kind (elem entry 0) :minimum-arity (elem entry 1) :arity arity
+           :module (Atom/to_string module) :function (Atom/to_string function)
+           :md5 (:md5 target) :sha256 (:sha256 target)}))) ]
+  {:version 1 :namespace ns :name name :kind :function
+   :runtime-image (BeamLisp.AOT/runtime_image_key)
+   :source (:source raw) :source-digest (:source-digest raw)
+   :provider-sha256 (:sha256 raw) :clauses clauses}))
+
+(defn contextual_sdk_namespaces!
+ "Recheck every selected SDK binding before Loader starts any provider.
+  Selection metadata is a claim to compare with the actual image, never
+  permission to load arbitrary modules or initialize application Source."
+ [verified]
+ (let [members (BeamLisp.AOT/contextual_unit_members! verified)
+       inputs (get-in members [:metadata :input-selection :sdk-inputs])]
+  (when-not (or (nil? inputs) (and (vector? inputs) (<= (count inputs) 128)))
+   (erlang/error :invalid_contextual_sdk_inputs))
+  (mapv
+   (fn [input]
+    (let [selection (:selection input) ns (:sdk selection) only (:only selection)]
+     (when-not (and (erlang/is_map input) (= #{:selection :bindings} (set (keys input)))
+                    (erlang/is_map selection) (= #{:sdk :revision :only} (set (keys selection)))
+                    (symbol? ns) (symbol? (:revision selection))
+                    (vector? only) (<= 1 (count only) 64) (every? symbol? only)
+                    (= (count only) (count (distinct only)))
+                    (= (:bindings input)
+                       (mapv #(sdk_function_binding! (str ns) (str %)) (sort-by str only))))
+      (erlang/error :contextual_sdk_input_changed))
+     (str ns))) inputs)))
+
 (defn- sdk_named_constructor! [ns name arity]
  ;; A compiled-but-uninitialized SDK provider has no runtime Fn binding yet.
  ;; Read only its compiler-emitted literal definition table and exact body

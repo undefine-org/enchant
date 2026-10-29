@@ -1,6 +1,7 @@
 """Explicit sealed coverage; focused receipts never certify omitted profiles."""
 
 GROUPS = {
+    "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 42)], ['compile.sdk', 'compile.world', 'clojure.string']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
     "compiler-bootstrap-order": ([('test/bl/compiler_bootstrap_order_test.bl', 4)], []),
     "compiler-entry": ([('test/bl/compiler_entry_context_test.bl', 106), ('test/bl/namespace_header_test.bl', 14), ('test/bl/compiler_contextual_test.bl', 27), ('test/bl/generation_semantics_test.bl', 18), ('test/bl/compiler_lexical_consumers_test.bl', 13)], ['expand', 'env', 'connector.google.gdrive', 'connector.microsoft.graph', 'bl.cli', 'bl.doc', 'bl.doc.html', 'bl.profile']),
@@ -41,11 +42,11 @@ GROUPS = {
     "filesystem-regressions": ([('test/bl/build_custody_regressions_test.bl', 30)], ['deps-compile', 'selfbuild']),
 }
 BOUNDARIES = {
-    'unit-metadata': ['namespace-header-imports', 'namespace-require', 'lexical-scope', 'factory-admission', 'clauses'], 'source-and-class-proof': ['handoffs', 'capacity', 'pattern-operands'],
-    'preboot-identity': ['namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': ['factory-admission', ],
-    'constructor-and-scope': ['namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['namespace-header-imports', 'namespace-require', 'factory-admission', 'namespace-exports', 'imports'],
-    'native-custody': ['pattern-operands', 'canonical-calls', 'native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'generation-retirement', 'message-context'],
-    'record-representation': ['factory-admission', 'returns'], 'contextual-pipeline-identity': ['namespace-header-imports', 'namespace-require', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
+    'unit-metadata': ['sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'factory-admission', 'clauses'], 'source-and-class-proof': ['handoffs', 'capacity', 'pattern-operands'],
+    'preboot-identity': ['sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'clauses', 'filesystem', 'boot-isolation', 'physical-declaration'], 'sealed-loader': ['sdk-bindings', 'factory-admission', ],
+    'constructor-and-scope': ['sdk-bindings', 'namespace-header-imports', 'namespace-require', 'lexical-scope', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'native-outcomes', 'constructor-calls'], 'artifact-profile-and-cache': ['sdk-bindings', 'namespace-header-imports', 'namespace-require', 'factory-admission', 'namespace-exports', 'imports'],
+    'native-custody': ['sdk-bindings', 'pattern-operands', 'canonical-calls', 'native-outcomes', 'handoffs', 'capacity', 'supervisor-context', 'generation-retirement', 'message-context'],
+    'record-representation': ['factory-admission', 'returns'], 'contextual-pipeline-identity': ['sdk-bindings', 'namespace-header-imports', 'namespace-require', 'compiler-bootstrap-order', 'factory-admission', 'namespace-exports', 'imports', 'compiler-entry', 'namespace-initialization', 'declaration-header', 'physical-declaration', 'binding-reference', 'clauses'],
     'contextual-analysis-reports': ['namespace-header-imports', 'namespace-require', 'lexical-scope', 'pattern-operands', 'canonical-calls', 'lsp-calls', 'typed-analysis', 'namespace-exports', 'binding-reference', 'ownership', 'ownership-calls', 'native-outcomes', 'loops', 'af'],
     'vector-lookup-default': ['vectors'], 'finite-cleanup-progress': ['loops', 'af'],
     'constructor-evaluation-order': ['returns'], 'execution-clause-identity': ['clauses'],

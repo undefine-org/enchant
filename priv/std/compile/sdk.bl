@@ -1,0 +1,57 @@
+;; SDK input adapter for the existing contextual Source catalog. The generated
+;; forwarding Source has application authority; it does not become SDK code.
+(ns compile.sdk)
+
+(defn- refuse! [kind]
+ (throw (ex-info "Invalid contextual SDK selection" {:kind kind})))
+
+(defn capture
+ "Select explicitly named public SDK functions as one ordinary Source world.
+  Revision is a quoted logical label; authenticated provider bytes participate
+  in the generated Source digest and therefore the canonical world identity."
+ [selection]
+ (when-not (and (erlang/is_map selection) (= #{:sdk :revision :only} (set (keys selection)))
+                (symbol? (:sdk selection)) (symbol? (:revision selection))
+                (vector? (:only selection)) (<= 1 (count (:only selection)) 64)
+                (every? symbol? (:only selection))
+                (= (count (:only selection)) (count (distinct (:only selection)))))
+  (refuse! :world-sdk-selection))
+ (let [bindings (mapv #(BeamLisp.AOT/sdk_function_binding! (str (:sdk selection)) (str %))
+                      (sort-by str (:only selection)))
+       _ (doseq [binding bindings clause (:clauses binding)]
+           (when-not (= :fixed (:kind clause)) (refuse! :world-sdk-variadic-unavailable)))
+       identity (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary bindings (list :deterministic)))
+                              (list (tuple :case :lower)))
+       definitions
+       (Enum/map bindings
+        (fn [binding]
+         (let [clauses (Enum/map (:clauses binding)
+                        (fn [clause]
+                         (let [args (mapv #(symbol (str "sdk_arg_" %)) (range (:arity clause)))
+                               target (symbol (str (:module clause) "/" (:function clause)))]
+                          ;; Pin the callable in executable Source too. A phase
+                          ;; archive retains this check even without the file
+                          ;; adapter's SDK selection metadata. The check only
+                          ;; narrows execution; native public-MFA/custody checks
+                          ;; still decide whether the call may execute.
+                          (list args
+                           (list 'if
+                            (list 'erlang/=:=
+                             (list 'erlang/binary_to_list
+                              (list 'erlang/get_module_info (keyword (:module clause)) :md5))
+                             (list 'quote (erlang/binary_to_list (:md5 clause))))
+                            (cons target (to-list args))
+                            (list 'erlang/error :sdk-function-binding-target-changed))))))]
+          (cons 'defn (cons (symbol (:name binding)) (to-list clauses))))))
+       source (str "; generated SDK forwarding Source, provider digest " identity "\n"
+                   (pr-str (list 'ns (:sdk selection))) "\n" (Enum/join (Enum/map definitions pr-str) "\n"))]
+  {:selection selection :bindings bindings
+   :source {:namespace (:sdk selection) :revision (:revision selection)
+            :file (str "sdk-forwarding:" (:sdk selection) ":" identity)
+            :source source}}))
+
+(defn check!
+ "Recheck the original SDK evidence without invoking or initializing providers."
+ [captured]
+ (when-not (= captured (capture (:selection captured))) (refuse! :world-sdk-input-changed))
+ captured)
