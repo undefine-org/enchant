@@ -1377,7 +1377,13 @@
             requires (Enum/uniq (Enum/map require_specs (fn [parsed] (elem parsed 0))))
             meta {:aliases (elem acc 0) :refers (elem acc 1)
                   :refer_alls (elem acc 2) :requires requires
-                  :require_specs require_specs}]
+                  :require_specs require_specs
+                  :core-excludes
+                  (BeamLisp.CompilerData/namespace_core_excludes
+                   (Enum/flat_map clauses
+                    (fn [clause]
+                     (if (= "refer-clojure" (elem (unmeta (first (elem clause 1))) 1))
+                      (rest (elem clause 1)) (list)))))}]
         (Map/update ns_meta ns meta (fn [_prev] meta)))
 
     :else ns_meta))
@@ -3932,7 +3938,7 @@
              (= namespace (:val (first args))) (= name (:val (second args))))
     (phase_initializer (nth args 2) namespace name (dec remaining)) node))))
 
-(defn- phase_library_data [namespace definitions operations source-digest value-definitions]
+(defn- phase_library_data [namespace definitions operations source-digest value-definitions namespace-metadata declarations]
  ;; Read the compiler's own initializer operands before macro partitioning.
  ;; Recipes are data: no initializer/factory or published macro Fn executes.
  (let [macro-declarations (Map/new (Enum/flat_map value-definitions
@@ -3960,7 +3966,13 @@
                             (= :lit (:op (first elements))) (= :"$macro" (:val (first elements))))
                    (Map/put out (elem pair 0) (second elements)) out))))]
   {:version 2 :namespace namespace :source-digest source-digest
-   :definitions definitions :initializers values :macros macros :macro-declarations macro-declarations}))
+   :definitions definitions :initializers values :macros macros :macro-declarations macro-declarations
+   ;; Authenticated artifact data, never ambient Env state. Consumers need
+   ;; original lexical shadowing, refers/aliases and exclusions to prove edges.
+   :resolution {:version 1 :header (Map/take namespace-metadata
+                                    (list :aliases :refers :refer_alls :requires :require_specs :core-excludes))
+                :declarations (Map/get declarations namespace {})
+                :callable-kinds (get-in declarations [:callable-kinds namespace] {})}}))
 
 (defn- build_init_ast
   "`__bl_init__/0`'s clause and its value-initializer companion descriptor, as
@@ -3999,6 +4011,10 @@
               (fn [t]
                 (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :add_refer_all
                   (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit t)))))))
+        ns_ops (erlang/++ ns_ops
+                 (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :add_core_excludes
+                         (list (BeamLisp.Emit/lit ns)
+                               (BeamLisp.Emit/lit (Map/get ns_meta :core-excludes (list)))))))
         native_ops
         (let [d (if (Map/has_key? ns_meta :native-declaration)
                   (Map/get ns_meta :native-declaration) (native_declaration ns))]
@@ -4119,7 +4135,7 @@
                  {:op :let :name "$sdk_callables"
                   :init (BeamLisp.Emit/remote (ns_body_module ns) :__bl_callable_values__ (list))
                   :body body :ann {}})))) companion_descriptor generated_beams
-      (phase_library_data ns ns_defs value_ops (Keyword/get unit_attrs :bl_unit_source_digest) value_defs))))
+      (phase_library_data ns ns_defs value_ops (Keyword/get unit_attrs :bl_unit_source_digest) value_defs ns_meta declarations))))
 
 ; ── the runtime-side hook and boot ──────────────────────────────────────────
 
@@ -5959,6 +5975,7 @@
    (doseq [pair (Map/get (:metadata header) :refers)]
     (BeamLisp.Env/add_refer ns (elem pair 0) (elem pair 1)))
    (doseq [target (Map/get (:metadata header) :refer_alls)] (BeamLisp.Env/add_refer_all ns target))
+   (BeamLisp.Env/add_core_excludes ns (Map/get (:metadata header) :core-excludes (list)))
    (stage-declaration-macros! (rest forms) ns)
    (BeamLisp.Compiler/reset_fresh!)
    (doseq [form (rest forms)]
@@ -8504,7 +8521,7 @@
       (doseq [kind [:alias :refer]
               row (BeamLisp.Env/match (tuple (tuple kind namespace :"$1") :_))]
        (BeamLisp.Env/put_key (tuple kind namespace (first row)) nil))
-      (BeamLisp.Env/add_core_excludes namespace (list))
+      (BeamLisp.Env/add_core_excludes namespace (Map/get (:metadata header) :core-excludes (list)))
       (doseq [pair (Map/get (:metadata header) :aliases)]
        (BeamLisp.Env/add_alias namespace (elem pair 0) (elem pair 1)))
       ;; Requires describe resolution, not a metadata execution schedule.
@@ -8558,7 +8575,9 @@
           referred (when-let [definition (maybe-definition referred name)]
                      (constructor_visible! namespace [referred name definition]))
           :else
-           (loop [providers (erlang/++ (Map/get metadata :refer_alls (list)) (list "core" "sugar"))]
+           (loop [providers (erlang/++ (Map/get metadata :refer_alls (list))
+                             (if (Enum/member? (Map/get metadata :core-excludes (list)) name)
+                              (list "sugar") (list "core" "sugar")))]
             (when (seq providers)
              (let [provider (first providers)
                    phase-declaration (constructor_phase_declaration provider name)
@@ -8669,6 +8688,20 @@
     (constructor_context_put! :remote-entries
      (Map/put (Map/get (constructor_context!) :remote-entries {}) key entry))
     entry))))
+
+(defn sdk_constructor_binding_reference
+ "Project the existing Source staging resolver's binding owner into compiler
+  ANF. Names remain data; no Var value or host execution authority escapes."
+ [namespace name]
+ (if-not (constructor_context) :inactive
+  (if-let [owner (constructor_source_owner namespace name)]
+   [(first owner) (second owner)]
+   (when (and (constructor_core_owner? namespace name nil)
+              (Enum/any? (constructor_core_seed_rows!) #(= name (first %))))
+    ;; Binding identity comes from original declaration/ABI bytes. A live Var
+    ;; value is neither needed nor valid provenance for a compiler reference.
+    (sdk_core_function_binding! name)
+    ["core" name]))))
 
 (defn staged_macro_kind
  "Inspect authenticated Source declaration metadata without compiling or
@@ -9145,7 +9178,8 @@
    :else
     (let [unit (constructor_unit! namespace) metadata (:metadata (:header unit))
           refers (Map/new (Map/get metadata :refers (list)))]
-     (and (not (Map/has_key? refers name))
+     (and (not (Enum/member? (Map/get metadata :core-excludes (list)) name))
+          (not (Map/has_key? refers name))
           (nil? (constructor_source_declaration namespace name))
           (not (Enum/any? (Map/get metadata :refer_alls (list))
                  (fn [target] (some? (constructor_source_declaration target name))))))))))
