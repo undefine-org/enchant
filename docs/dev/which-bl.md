@@ -50,6 +50,21 @@ configuration overrides the checkout's default transport policy.
 
 ## Compiler floor and SDK
 
+Use an existing immutable SDK for source preflight without preparing a new
+checkout SDK:
+
+```sh
+scripts/sdk-preflight --sdk /nix/store/EXISTING-beam-lisp-sdk-selection \
+  --out .local/sdk-preflight.json
+```
+
+The preflight reads candidate declarations, checks BEAM and JavaScript target
+selection with finite Veritas cases, queries Codebase require cycles, and runs
+Typed and System analysis on the changed producer modules. Its report binds
+the inspected source snapshot and records unresolved analysis effects. It runs
+in a private directory under a memory and time cap. Source analysis uses the
+existing compiler; release qualification checks the newly produced compiler.
+
 `priv/bootstrap/seed/manifest.term` authenticates the compiler floor by content.
 A compiler change requires regenerating and qualifying that floor. Batch boot
 and host edits before regeneration:
@@ -70,6 +85,23 @@ release. Its precompiled index records every member and digest of each
 compiled unit. A fresh runtime verifies and restores the whole unit before
 initializing it. SDK compilation is build work; runtime admission verifies
 source bytes, code identities and ownership evidence.
+
+SDK preparation retains the previous immutable SDK under `.bl/sdks/current-sdk`.
+Each preparation job freezes that predecessor before building. Library units
+record the exact sources their constructors read, including macro providers.
+An unchanged unit is verified and copied into the new SDK. A changed input
+recompiles its affected units; removing a namespace removes its artifacts.
+Compiler identity and runtime image identity must match before reuse.
+
+Nix tracks dependency compilation, compiler qualification and SDK libraries
+through separate source selections. Editing an ordinary SDK library preserves
+the compiler and dependency products. Editing a native crate preserves sibling
+native products. Cargo retains compiled dependencies separately from the chosen
+crate's Rust body; the real chosen crate always compiles from captured source.
+
+Application builds use their previous verified product with the same exact SDK.
+Full builds prune removed units, scoped builds retain their declared remainder,
+and `--force` recompiles. An identical full request selects the existing product.
 
 Build-driver units use their build-tier key and the same complete-unit loader.
 A shipped SDK carries its sealed index rather than a development
