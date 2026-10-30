@@ -11,7 +11,7 @@ pub(super) fn store_object(path: &str) -> bool {
 /// Build resolution includes the selected trusted recipe/lock, even when the
 /// platform lives outside the application's source tree.
 pub(super) fn stamp_inputs(platform: &Path) -> Vec<String> {
-    let mut inputs: Vec<PathBuf> = ["nix/native-artifact.nix", "nix/native-source.nix", "nix/native-snapshot.nix", "nix/native-workspace.nix", "nix/bounded-build.nix", "flake.lock",
+    let mut inputs: Vec<PathBuf> = ["nix/native-artifact.nix", "nix/native-compile.nix", "nix/native-source.nix", "nix/native-snapshot.nix", "nix/native-workspace.nix", "nix/bounded-build.nix", "flake.lock",
         "nix/artifact-platform.nix", "nix/command-executor.nix", "nix/prepare-platform.nix", "executor.json",
         "tooling/drop/Cargo.toml", "tooling/drop/Cargo.lock"].iter().map(PathBuf::from).collect();
     if let Ok(entries) = std::fs::read_dir(platform.join("tooling/drop/src")) {

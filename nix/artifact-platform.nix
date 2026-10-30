@@ -13,6 +13,7 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   ln -s ${pkgs.procps}/bin/kill "$out/bin/kill"
   cp ${commandExecutor}/executor.json "$out/executor.json"
   ${pkgs.lib.optionalString includeRecipes ''
+  cp ${./native-compile.nix} "$out/nix/native-compile.nix"
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
   cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
   cp ${./native-workspace.nix} "$out/nix/native-workspace.nix"
