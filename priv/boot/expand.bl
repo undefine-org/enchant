@@ -1,6 +1,6 @@
 ;; Ordered contextual elaboration. Reader, binding lookup, macro evaluation and
 ;; ANF compilation each retain their existing owner. No alternate evaluator.
-(ns expand (:require [syntax :as s] [binding :as b] [expand-source :as catalog] [compiler :as compiler] [anf :as anf]))
+(ns expand (:require [syntax :as s] [binding :as b] [expand-source :as catalog] [compiler :as compiler] [anf :as anf] [reader-node :as rn]))
 
 (defn- refuse! [kind node]
  (throw (ex-info (str "Contextual expansion: " kind)
@@ -362,15 +362,95 @@
 (defn- quote-reader [value context]
  (tuple :list (list (tuple :symbol "quote") (s/to-reader (s/from-datum value context)))))
 
+(defn- template-reader [template holes]
+ (tuple :map
+   (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-template"))
+         (tuple (tuple :keyword "template") (quote-reader template (:context template)))
+         (tuple (tuple :keyword "holes") holes))))
+
+(defn- quote-names [node]
+ (cond
+  (s/identifier? node) (list (:value node))
+  (contains? #{:map :record} (:tag node))
+   (Enum/flat_map (:children node) #(Enum/concat (quote-names (first %)) (quote-names (second %))))
+  (:children node) (Enum/flat_map (:children node) quote-names)
+  :else (list)))
+
+(declare quote-source)
+
+(defn- quote-source-children [nodes readers state plan]
+ (Enum/map_reduce (Enum/zip nodes readers) (tuple state plan)
+  (fn [pair current]
+   (let [r (quote-source (elem pair 0) (elem pair 1) (elem current 0) (elem current 1) true)]
+    (tuple (elem r 0) (elem r 1))))))
+
+(defn- quote-source [node reader state plan sequence?]
+ (let [state (tick state) role (compiler/syntax-quote-role reader)
+       children (:children node)]
+  (cond
+   (contains? #{:unquote :splice} role)
+    (do
+     (when-not (= 2 (count children)) (refuse! :syntax-quote-arity node))
+     (when (and (= :splice role) (not sequence?)) (refuse! :syntax-quote-splice-context node))
+     (let [r (expression-node (second children) state)]
+      (if (:hygienic plan)
+       (let [allocated (loop [n (:next plan)]
+                        (let [name (symbol (str "__bl_quote_hole_" n))]
+                         (if (contains? (:reserved plan) name) (recur (+ n 1)) (tuple name (+ n 1)))))
+             name (elem allocated 0)
+             hole (if (= :splice role)
+                    (tuple :map (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-splice"))
+                                     (tuple (tuple :keyword "children") (elem r 0)))) (elem r 0))]
+        (tuple (assoc (s/identifier name (:context node)) :origin (:origin node))
+         (tuple (elem r 1) (-> plan (assoc :next (elem allocated 1))
+                           (update :holes #(cons (tuple name hole) %))))))
+       (tuple (assoc node :children (list (first children) (s/from-node (elem r 0) (:context node))))
+              (tuple (elem r 1) plan)))))
+   (= :nested role)
+    (do
+     (when-not (= 2 (count children)) (refuse! :syntax-quote-arity node))
+     (let [r (quote-source (second children) (second (rn/node-items (rn/node-form reader)))
+                         state (assoc plan :gensyms {}) false)]
+      (tuple (assoc node :children (list (first children) (elem r 0)))
+             (tuple (elem (elem r 1) 0) (assoc (elem (elem r 1) 1) :gensyms (:gensyms plan))))))
+   (contains? #{:list :vector} role)
+    (let [r (quote-source-children children (rn/node-items (rn/node-form reader)) state plan)]
+     (tuple (assoc node :children (elem r 0)) (elem r 1)))
+   (= :map role)
+    (let [r (Enum/map_reduce (Enum/zip children (rn/node-items (rn/node-form reader))) (tuple state plan)
+             (fn [pair current]
+              (let [left (quote-source (first (elem pair 0)) (elem (elem pair 1) 0)
+                                      (elem current 0) (elem current 1) false)
+                    right (quote-source (second (elem pair 0)) (elem (elem pair 1) 1)
+                                        (elem (elem left 1) 0) (elem (elem left 1) 1) false)]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (assoc node :children (elem r 0)) (elem r 1)))
+   (and (= :symbol role) (:hygienic plan))
+    (let [r (compiler/syntax-quote-name (str (:value node)) (:gensyms plan))]
+     (tuple (assoc node :value (symbol (first r))) (tuple state (assoc plan :gensyms (second r)))))
+   :else (tuple node (tuple state plan)))))
+
+(defn- syntax-quote-node [node state]
+ (when-not (= 2 (count (:children node))) (refuse! :syntax-quote-arity node))
+ (let [template (second (:children node))
+       hygienic? (and (:transformer state) (not (:datum-transformer state)))
+       plan {:hygienic hygienic? :gensyms {} :reserved (set (quote-names template)) :next 0 :holes (list)}
+       r (quote-source template (as-reader template) state plan false)
+       current (elem (elem r 1) 0) plan (elem (elem r 1) 1)]
+  (tuple
+   (if hygienic?
+    (template-reader (elem r 0)
+     (tuple :map (Enum/map (Enum/reverse (:holes plan))
+                   #(tuple (tuple :list (list (tuple :symbol "quote") (elem % 0))) (elem % 1)))))
+    (list-reader node (list (as-reader (first (:children node))) (as-reader (elem r 0)))))
+   current)))
+
 (defn- template-node [node state]
  (when-not (:transformer state) (refuse! :syntax-template-outside-transformer node))
  (let [children (:children node)]
   (when-not (= 3 (count children)) (refuse! :syntax-template-arity node))
   (let [holes (expression-node (nth children 2) state)]
-   (tuple (tuple :map
-            (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-template"))
-                  (tuple (tuple :keyword "template") (quote-reader (second children) (:context node)))
-                  (tuple (tuple :keyword "holes") (elem holes 0)))) (elem holes 1)))))
+   (tuple (template-reader (second children) (elem holes 0)) (elem holes 1)))))
 
 (defn- argument-node [node state]
  (let [children (:children node) index (nth children 2 nil)]
@@ -413,6 +493,7 @@
      (cond
       (empty? children) (tuple (list-reader node (list)) state)
       (and kernel? (= "quote" name)) (tuple (as-reader node) state)
+      (and kernel? (= "syntax-quote" name)) (syntax-quote-node node state)
       (and kernel? (= "syntax-template" name)) (template-node node state)
       (and kernel? (= "syntax-arg" name)) (argument-node node state)
       (and kernel? (= "syntax-literal" name)) (literal-node node state)
@@ -513,11 +594,12 @@
        target-phase (+ (:phase reference) (if transformer? 1 0))
        current (assoc state :world (:world recipe) :namespace (:namespace declaration)
                             :phase phase :position (:position recipe)
-                            :reference-shift (- target-phase phase) :transformer transformer? :dependencies {}
+                            :reference-shift (- target-phase phase) :transformer transformer?
+                            :datum-transformer (= :macro (:kind declaration)) :dependencies {}
                             :coordinate-prefix (Enum/concat (list 3 (+ phase 4096)) (:path declaration))
                             :next-scope 0 :next-declaration 0)
        r (expression-node (definition-node recipe unit) current)
-       fields [:world :namespace :phase :position :reference-shift :transformer :dependencies
+       fields [:world :namespace :phase :position :reference-shift :transformer :datum-transformer :dependencies
                :coordinate-prefix :next-scope :next-declaration]
        restored (Enum/reduce fields (elem r 1)
                   (fn [key out] (assoc out key (get state key))))]

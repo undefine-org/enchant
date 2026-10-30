@@ -138,3 +138,80 @@
   (is (= (nth first 0) (nth first 1)))
   (is (= [42 40 41] (subvec first 2)))
   (is (= 'already/qualified (compile-value "`already/qualified")))))
+
+(deftest authored-datum-backticks-elaborate-unquotes-through-original-compiler
+ (let [program (expand/program
+                [(unit 'client "(defmacro add-two [value] `(erlang/+ ~value 2))
+                                (let [value 40] (add-two value))")]
+                ['client 'current])
+       data (expand/program [(unit 'client "(let [value 42] `[~value ~@(quote (40 41))])")] ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= 'datum-v1 (:protocol (first (:expansions program)))))
+  (is (= [42 40 41] (execute data)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest hygienic-backticks-preserve-definition-world-and-use-site-scopes
+ (let [provider (unit 'provider
+                 "(defn ^:private helper [value] (erlang/+ value 2))
+                  (defsyntax answer [form context] `(helper ~(syntax-arg form 1)))")
+       client (unit 'client
+               "(import-world 'provider 'current :only [answer])
+                (let [helper (fn [value] 0) value 40] (answer value))")
+       direct (expand/program [provider client] ['client 'current])
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [provider])))
+       archived (expand/program [client] ['client 'current] [library])]
+  (is (= 42 (execute direct)))
+  (is (= 42 (execute archived)))
+  (is (= 'syntax-v1 (:protocol (first (:expansions archived)))))
+  (is (= :proved (:status (phase/check archived))))
+  (is (every? #(not (contains? % :source)) (:units library)))))
+
+(deftest hygienic-backtick-splices-use-the-original-bounded-template-owner
+ (let [program (expand/program
+                [(unit 'client
+                  "(defsyntax sequence [form context] `(do ~@(erlang/tl (:children form))))
+                   (let [answer 42] (sequence 0 answer))")]
+                ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest generated-quote-holes-cannot-capture-authored-template-identifiers
+ (let [program (expand/program
+                [(unit 'client
+                  "(defsyntax pair [form context] `[~(syntax-arg form 1) '__bl_quote_hole_0])
+                   (pair 42)")]
+                ['client 'current])]
+  (is (= [42 '__bl_quote_hole_0] (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest hygienic-template-gensym-scopes-follow-the-original-nested-quote-grammar
+ (let [sources [(unit 'client
+                 "(defsyntax names [form context] `(quote [x# x# (syntax-quote [x#]) (syntax-quote [x#])]))
+                  (names)")]
+       first (execute (expand/program sources ['client 'current]))
+       second (execute (expand/program sources ['client 'current]))
+       nested-a (nth (erlang/hd (erlang/tl (nth first 2))) 0)
+       nested-b (nth (erlang/hd (erlang/tl (nth first 3))) 0)]
+  (is (= first second))
+  (is (= (nth first 0) (nth first 1)))
+  (is (not= (nth first 0) nested-a))
+  (is (not= nested-a nested-b))))
+
+(deftest contextual-backtick-splices-refuse-outside-list-and-vector-items
+ (doseq [source ["`~@(quote (42))"
+                 "`{:answer ~@(quote (42))}"
+                 "(defsyntax bad [form context] `~@(erlang/tl (:children form))) (bad 42)"
+                 "(syntax-quote 1 2)"]]
+  (is (contains? #{:syntax-quote-splice-context :syntax-quote-arity}
+        (kind #(expand/program [(unit 'client source)] ['client 'current]))))))
+
+(deftest hygienic-backtick-transformers-instantiate-at-higher-phases
+ (let [program (expand/program
+                [(unit 'client
+                  "(begin-for-syntax
+                     (defsyntax wrap [form context] `(syntax-literal ~(syntax-arg form 1))))
+                   (defsyntax answer [form context] (wrap 42)) (answer)")]
+                ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= 2 (count (:expansions program))))
+  (is (= :proved (:status (phase/check program))))))
