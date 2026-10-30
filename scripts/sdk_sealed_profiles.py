@@ -2,7 +2,7 @@
 
 GROUPS = {
     "compiler-data": ([('test/bl/compiler_data_literal_test.bl', 32), ('test/bl/compiler_constructor_data_test.bl', 44), ('test/bl/data_first_order_test.bl', 105)], ['data.first-order']),
-    "member-custody": ([('test/bl/exact_member_lease_test.bl', 36), ('test/bl/code_lease_test.bl', 24)], []),
+    "member-custody": ([('test/bl/class_graph_schema_test.bl', 19), ('test/bl/exact_member_lease_test.bl', 36), ('test/bl/code_lease_test.bl', 24)], ['reload.generation']),
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
     "phase-resolution": ([('test/bl/phase_resolution_metadata_test.bl', 34)], []),
     "sdk-phase-functions": ([('test/bl/contextual_sdk_phase_function_test.bl', 35), ('test/bl/contextual_sdk_set_phase_test.bl', 18), ('test/bl/contextual_constructor_session_test.bl', 50)], ['compile.sdk', 'compile.world', 'clojure.core-ext', 'clojure.string', 'clojure.set']),

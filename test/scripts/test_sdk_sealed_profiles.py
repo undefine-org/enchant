@@ -35,7 +35,7 @@ class SealedProfiles(unittest.TestCase):
         # Membership34 plus one cache numeric-control assert enforce the mandatory v4/class-v1 packet.
         # Class catalog38 covers complete generated inventories, privacy, archive integrity and early custody refusal.
         # Class Source56 covers shared headers, inert descriptors, prelink metadata and ordinary constructor ABI.
-        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 106 + 34 + 24 + 1 + 24 + 107 + 41 + 40 + 150 + 105 + 4 + 12 + 75 + 82 + 16 + 4 + 14 + 4 + 7 + 19 + 18 + 27 + 18 + 13 + 71 + 19 + 14 + 4 + 5 + 2 + 2 + 19 + 78 + 13 + 66 + 14 + 103 + 56 + 9 + 16 + 62 + 101 + 47 + 51 + 174 + 47 + 20 + 32 + 16 + 29 + 9 + 25 + 7 + 3 + 23 + 27 + 32 + 29 + 68 + 1 + 20 + 2 + 29 + 16 + 32 + 32 + 43 + 25 + 11 + 6 + 58 + 12 + 22 + 28 + 3 + 1 + 16 + 26 + 43 + 22 + 40 + 34 + 4 + 10 + 7 + 6 + 2 + 3 + 3 + 10 + 22 + 23 + 79 + 56 + 38 + 35 + 60 + 157 + 52 + 111 + 37 + 86, selection['assertions'])
+        self.assertEqual(1010 + 92 + 71 + 60 + 30 + 5 + 2 + 32 + 16 + 106 + 34 + 24 + 1 + 24 + 107 + 41 + 40 + 150 + 105 + 4 + 12 + 75 + 82 + 16 + 4 + 14 + 4 + 7 + 19 + 18 + 27 + 18 + 13 + 71 + 19 + 14 + 4 + 5 + 2 + 2 + 19 + 78 + 13 + 66 + 14 + 103 + 56 + 9 + 16 + 62 + 101 + 47 + 51 + 174 + 47 + 20 + 32 + 16 + 29 + 9 + 25 + 7 + 3 + 23 + 27 + 32 + 29 + 68 + 1 + 20 + 2 + 29 + 16 + 32 + 32 + 43 + 25 + 11 + 6 + 58 + 12 + 22 + 28 + 3 + 1 + 16 + 26 + 43 + 22 + 40 + 34 + 4 + 10 + 7 + 6 + 2 + 3 + 3 + 10 + 22 + 23 + 79 + 56 + 38 + 35 + 60 + 157 + 52 + 111 + 37 + 86 + 19, selection['assertions'])
         self.assertEqual('complete', selection['mode'])
         self.assertTrue(selection['pipeline'])
         self.assertTrue(selection['solver'])
@@ -64,7 +64,8 @@ class SealedProfiles(unittest.TestCase):
                                  'test/bl/contextual_class_link_test.bl',
                                  'test/bl/contextual_class_emission_test.bl',
                                  'test/bl/contextual_class_program_test.bl',
-                                 'test/bl/aot_generated_class_inventory_test.bl'}.issubset(files))
+                                 'test/bl/aot_generated_class_inventory_test.bl',
+                                 'test/bl/class_graph_schema_test.bl'}.issubset(files))
                 self.assertEqual(PROFILE['UNIVERSAL'], selection['universal'])
 
     def test_focused_custody_avoids_unrelated_analyses_and_retains_universal_integrity(self):
