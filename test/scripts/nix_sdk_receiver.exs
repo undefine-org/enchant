@@ -33,7 +33,8 @@ BeamLisp.eval("""
         (assert (= module (:module proof))) (assert (:image? proof)))
       (assert (= 42 (BeamLisp/eval "(ns portable.fresh-project) (when true (+ 20 22))")))
       (assert (= 42 (BeamLisp/eval "(java.lang.Math/max 20 42)")))
-      (assert (= 3 (BeamLisp/eval "(.length \\"abc\\")"))))
+      (assert (= 3 (BeamLisp/eval "(.length \\"abc\\")")))
+      (assert (= 0 (elem (erlang/trace_info (tuple :Elixir.BeamLisp.AOT :compile_file 2) :call_count) 1))))
     (let [reason (try (BeamLisp.Loader/ensure_loaded namespace) :unexpected
                   (catch error (:original error)))]
       (println "SDK-REFUSAL" (pr-str reason))
