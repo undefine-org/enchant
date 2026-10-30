@@ -4,7 +4,6 @@
 { pkgs, compiler, dependencies, source, platform, foundry ? import ./foundry-ledger.nix }:
 let
   ledgerFiles = [
-    "bin/jobs.bl"
     "src/foundry/operations/deployment-runner.bl"
     "src/foundry/support/deployment-exec.bl"
     "src/foundry/support/deployment-runtime.bl"
@@ -36,6 +35,8 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   ln -s lib/beam_lisp-0.1.0 "$out/image"
   cp -a ${ledger}/. "$out/foundry/"
   chmod -R u+w "$out/foundry"
+  mkdir -p "$out/foundry/bin"
+  cp ${./preparation-jobs.bl} "$out/foundry/bin/jobs.bl"
   cp ${./preparation-operation.bl} "$out/foundry/bin/preparation-operation.bl"
   cat > "$out/foundry/env.bl" <<'PROJECT'
   {:name "foundry-artifact-coordinator"

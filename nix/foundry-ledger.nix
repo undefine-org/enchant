@@ -2,7 +2,7 @@
 let
   root = ../vendor/foundry-ledger;
   manifest = builtins.fromJSON (builtins.readFile (root + "/manifest.json"));
-  expected = [ "bin/jobs.bl" "src/foundry/credentials/deployment-keyring.bl"
+  expected = [ "src/foundry/credentials/deployment-keyring.bl"
     "src/foundry/operations/deployment-runner.bl" "src/foundry/support/cli-kit.bl"
     "src/foundry/support/deployment-exec.bl" "src/foundry/support/deployment-runtime.bl"
     "src/foundry/support/deployment-tar.bl" ];
