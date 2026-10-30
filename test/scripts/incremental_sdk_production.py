@@ -77,7 +77,7 @@ def main():
         if real_value is not None:
             env['BL_INCREMENTAL_REAL_VALUE'] = str(real_value)
         text = command(name + '-consumer', [info['platform'] + '/bin/elixir',
-                       ROOT / 'test/scripts/incremental_sdk_receiver.exs'], env)
+                       ROOT / 'test/scripts/incremental_sdk_receiver.exs'], env, image)
         assert 'INCREMENTAL-CONSUMER passed' in text
 
     def build(name, previous, expected, answer, real_value=None):

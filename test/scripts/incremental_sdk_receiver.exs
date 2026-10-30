@@ -9,7 +9,8 @@ Application.load(:beam_lisp)
 for app <- Application.spec(:beam_lisp, :applications) || [],
     do: ({:ok, _} = Application.ensure_all_started(app))
 BeamLisp.AOT.boot()
-[] = Path.wildcard(image <> "/priv/**/*.bl")
+for extension <- [".bl", ".bl.md", ".bl.org"],
+    do: ([] = Path.wildcard(image <> "/priv/**/*" <> extension))
 pattern = {BeamLisp.AOT, :compile_file, 2}
 :erlang.trace_pattern(pattern, true, [:local, :call_count])
 :ok = BeamLisp.Loader.ensure_loaded("sdk.artifact.consumer")
@@ -22,4 +23,5 @@ if value = System.get_env("BL_INCREMENTAL_REAL_VALUE") do
   actual = BeamLisp.eval("(ns incremental.prototype.real-application (:require [errors :as e])) (e/incremental-prototype-value)")
   true = actual == String.to_integer(value)
 end
+{:call_count, 0} = :erlang.trace_info(pattern, :call_count)
 IO.puts("INCREMENTAL-CONSUMER passed answer=#{answer} sdk-compilations=0 source-free=true")
