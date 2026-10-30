@@ -134,6 +134,7 @@ def main():
                         'BL_PREPARATION_COORDINATOR': coordinator, 'BL_SDK_PRODUCT': sdk}
         run('ordinary-source-free-receiver', [elixir, scripts / 'nix_application_receiver.exs'], image,
             dict(receiver_env, BL_APPLICATION_PRODUCT=ordinary_product), 'IMMUTABLE-MULTI answer=42')
+        bl('java-oracle', ['test', str(repo / 'test/bl/java_oracle_port_test.bl')], output)
 
         bl('ordinary-cli-unchanged', ['build', '--out', str(ordinary)], project)
         assert (ordinary / '.nix-product').resolve(strict=True) == ordinary_product

@@ -31,7 +31,9 @@ BeamLisp.eval("""
       (let [module (BeamLisp.Env/fetch! "proc.owner-registry" "registry")
             proof (BeamLisp.Env/prepare_sdk_class! module)]
         (assert (= module (:module proof))) (assert (:image? proof)))
-      (assert (= 42 (BeamLisp/eval "(ns portable.fresh-project) (when true (+ 20 22))"))))
+      (assert (= 42 (BeamLisp/eval "(ns portable.fresh-project) (when true (+ 20 22))")))
+      (assert (= 42 (BeamLisp/eval "(java.lang.Math/max 20 42)")))
+      (assert (= 3 (BeamLisp/eval "(.length \\"abc\\")"))))
     (let [reason (try (BeamLisp.Loader/ensure_loaded namespace) :unexpected
                   (catch error (:original error)))]
       (println "SDK-REFUSAL" (pr-str reason))
