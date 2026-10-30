@@ -244,6 +244,12 @@
   ;; Fixed SDK inventory/MFAs are frozen before application bytes are loaded.
   ;; No caller metadata, namespace spelling or runtime-floor label substitutes.
   (BeamLisp.Env/ensure_sdk_runtime!)
+  ;; Every captured-unit consumer enters here, including direct activation and
+  ;; serving adapters. Check the complete selection before starting ANY SDK
+  ;; provider or publishing application code; Loader is only an input adapter.
+  (let [namespaces (BeamLisp.AOT/contextual_sdk_namespaces! verified)]
+   (doseq [namespace namespaces]
+    (when-not (= "core" namespace) (BeamLisp.Env/load_sdk_library! namespace))))
   (BeamLisp.AOT/passive_binary_functions! module (elem beam 1))
   (let [reservation (reserve-contextual-preparation! digest)
         scope (:scope reservation) key (:key reservation)]
@@ -280,16 +286,17 @@
  (BeamLisp.Env/assert_native_framework_execution!)
  (with! generation #(BeamLisp.Env/invoke_generation_value! (:entry (instance-ready! generation)) (list))))
 
+(defn- invoke-instance-binding* [generation reference args]
+ (let [exports (:exports (instance-ready! generation))]
+  (when-not (erlang/is_map_key reference exports) (refuse! :unsealed-entrypoint {}))
+  (BeamLisp.Env/invoke_generation_value! (get exports reference) (BeamLisp.CompilerData/eager_to_list args))))
+
 (defn invoke-instance-binding!
  "Invoke one canonical export from this private ready instance. No string/name
   resolver or alternate environment lookup can substitute a different binding."
  [generation reference args]
  (BeamLisp.Env/assert_native_framework_execution!)
- (with! generation
-  (fn []
-   (let [exports (:exports (instance-ready! generation))]
-    (when-not (erlang/is_map_key reference exports) (refuse! :unsealed-entrypoint {}))
-    (BeamLisp.Env/invoke_generation_value! (get exports reference) (BeamLisp.CompilerData/eager_to_list args))))))
+ (with! generation #(invoke-instance-binding* generation reference args)))
 
 
 (defn prepared-generation
@@ -396,14 +403,19 @@
  ;; These immutable bindings were fetched after compilation/validation in the
  ;; graph's private environment. Retention/context checks remain at admission;
  ;; a cached function is never authority to execute a retired graph.
+ (if (:factory (get @prepared (:cache-key generation)))
+  ;; Serving slots and retained registrations use the same private instance as
+  ;; Loader. A canonical unit never falls through to ambient namespace lookup.
+  (invoke-instance-binding* generation entry args)
  (if-let [f (get (:callables generation) entry)]
   (apply f args)
-  (let [parts (String/split entry "/") name (get (:mapping generation) (first parts))]
+  (let [_ (when-not (erlang/is_binary entry) (refuse! :unsealed-entrypoint {}))
+        parts (String/split entry "/") name (get (:mapping generation) (first parts))]
    (when-not (and name (= 2 (count parts))) (refuse! :unsealed-entrypoint {:entrypoint entry}))
    (let [result (BeamLisp.Env/fetch_exact name (second parts))]
     (when-not (and (erlang/is_tuple result) (= :ok (elem result 0)))
      (refuse! :missing-entrypoint {:entrypoint entry}))
-    (apply (elem result 1) args)))))
+    (apply (elem result 1) args))))))
 
 (defn with!
  "Trusted framework execution against a prepared graph, without publication.

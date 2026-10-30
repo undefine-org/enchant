@@ -1,10 +1,16 @@
 (ns contextual-runtime-test
- (:require [compile.world :as world] [bl.cli :as cli] [proc.task :as task]))
+ (:require [compile.world :as world] [bl.cli :as cli] [reload.execution :as execution]
+           [reload.generation :as generation] [proc.callback :as callback]))
 
 (defn- fixture [action]
- (let [root (Path/join (System/tmp_dir!) (str "contextual-runtime-" (erlang/unique_integer (list :positive))))]
+ (let [root (Path/join (System/tmp_dir!) (str "contextual-runtime-" (erlang/unique_integer (list :positive))))
+       parent (BeamLisp.Env/fork)]
   (File/mkdir! root)
-  (try (action root) (finally (File/rm_rf! root)))))
+  (try (BeamLisp.Env/with_env parent #(action root))
+   (finally
+    (BeamLisp.Env/destroy parent)
+    (generation/retire-contextual-children! parent)
+    (File/rm_rf! root)))))
 
 (defn- emit [root name module expression]
  (let [directory (Path/join root name) main (Path/join root (str name ".bl"))
@@ -32,7 +38,9 @@
     (File/rm_rf! unit)
     (is (= [42 99 42] (BeamLisp/run_file package)))
     (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal.PhaseLibrary)))
-    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal)))))))
+    ;; A successful Loader result retains its private preparation under the
+    ;; actual parent until its lifecycle closes; scalar shape is not release.
+    (is (erlang/module_loaded :Elixir.ContextualRuntimeOriginal))))))
 
 (deftest runtime-package-can-be-projected-again-without-a-phase-provider
  (fixture
@@ -46,14 +54,14 @@
     (is (= [42 99 42] (world/run-unit copy [])))
     (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeOriginal.PhaseLibrary)))))))
 
-(deftest compiled-entry-preserves-argv-and-reclaims-closure-free-code
+(deftest compiled-entry-preserves-argv-and-keeps-parent-custody
  (fixture
   (fn [root]
    (let [unit (emit root "argv" :Elixir.ContextualRuntimeArgv "(erlang/get :bl_argv)")
          previous (BeamLisp/argv)]
     (is (= (list "first" "second") (world/run-unit unit ["first" "second"])))
     (is (= previous (BeamLisp/argv)))
-    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeArgv)))
+    (is (erlang/module_loaded :Elixir.ContextualRuntimeArgv))
     (is (= (list "again") (world/run-unit unit ["again"])))))))
 
 (deftest returned-closures-keep-their-code-and-conflicting-bytes-refuse-before-replacement
@@ -61,37 +69,32 @@
   (fn [root]
    (let [unit (emit root "closure" :Elixir.ContextualRuntimeClosure "(fn [x] (erlang/+ x 40))")
          other (emit root "other" :Elixir.ContextualRuntimeClosure "(fn [x] (erlang/+ x 50))")
-         closure (world/run-unit unit [])]
+         g (execution/prepare-captured-unit! (world/read-unit unit)) held (atom nil)]
     (try
-     (is (= 42 (closure 2)))
-     (is (erlang/module_loaded :Elixir.ContextualRuntimeClosure))
-     (is (= :compiled_module_identity_conflict
-            (try (world/run-unit other []) :unexpected
-             (catch error (elem (:original error) 0)))))
-     (is (= 42 (closure 2)))
-     (finally (BeamLisp.Env/retire_module! :Elixir.ContextualRuntimeClosure)))))))
+     (execution/initialize-instance! g)
+     (execution/complete-preparation! (:cache-key g) g)
+     (let [closure (execution/invoke-instance-entry! g)]
+      (is (= :source_instance_changed
+             (try (closure 2) :unexpected (catch error (:original error)))))
+      (reset! held (generation/with! g #(callback/register! closure)))
+      (is (= 42 (callback/invoke! @held [2])))
+      (is (erlang/module_loaded :Elixir.ContextualRuntimeClosure))
+      (is (= :compiled_module_identity_conflict
+             (try (world/run-unit other []) :unexpected
+              (catch error (elem (:original error) 0)))))
+      (is (= 42 (callback/invoke! @held [2]))))
+     (finally (when @held (callback/unregister! @held)) (generation/retire! g)))))))
 
-(deftest actual-running-entry-retains-code-and-identical-concurrent-entry-is-safe
+(deftest unmanaged-mailbox-entry-refuses-before-effects-and-retires-its-failed-factory
  (fixture
   (fn [root]
    (let [unit (emit root "held" :Elixir.ContextualRuntimeHeld
                "(let [owner (erlang/hd (erlang/get :bl_argv))] (erlang/send owner [:runtime-held (erlang/self)]) (receive :finish 42))")
-         owner (erlang/self) first-worker (task/async-nolink #(world/run-unit unit [owner]))
-         first-child (receive [:runtime-held pid] pid (after 10000 (throw :runtime-entry-timeout)))
-         second-worker (task/async-nolink #(world/run-unit unit [owner]))
-         second-child (receive [:runtime-held pid] pid (after 10000 (throw :runtime-entry-timeout)))]
-    (try
-     (is (= false (BeamLisp.Env/retire_module! :Elixir.ContextualRuntimeHeld)))
-     (is (not= first-child second-child))
-     (erlang/send first-child :finish)
-     (is (= 42 (task/await first-worker 10000)))
-     (is (erlang/module_loaded :Elixir.ContextualRuntimeHeld))
-     (erlang/send second-child :finish)
-     (is (= 42 (task/await second-worker 10000)))
-     (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeHeld)))
-     (finally
-      (when (Process/alive? first-child) (erlang/send first-child :finish))
-      (when (Process/alive? second-child) (erlang/send second-child :finish))))))))
+         owner (erlang/self)]
+    (is (= :source_native_target_refused
+           (try (world/run-unit unit [owner]) :unexpected (catch error (:original error)))))
+    (is (= :absent (receive [:runtime-held _] :ran (after 0 :absent))))
+    (is (= false (erlang/module_loaded :Elixir.ContextualRuntimeHeld)))))))
 
 (deftest runtime-tampering-and-extra-members-refuse-before-entry-effects
  (fixture
@@ -133,11 +136,11 @@
                     [:bl_contextual_unit :bl_contextual_unit_version :bl_compiler_key :bl_source_hash])
          forms (to-list
                  (concat (list (tuple :attribute 1 :module module)
-                               (tuple :attribute 1 :export (list (tuple :run 0)))
+                               (tuple :attribute 1 :export (list (tuple :__bl_unit__ 0)))
                                (tuple :attribute 1 :on_load (tuple :init 0)))
                          carried
                          (list
-                          (tuple :function 1 :run 0
+                          (tuple :function 1 :__bl_unit__ 0
                            (list (tuple :clause 1 (list) (list) (list (tuple :integer 1 42)))))
                           (tuple :function 1 :init 0
                            (list (tuple :clause 1 (list) (list)
