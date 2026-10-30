@@ -2,7 +2,7 @@
 
 GROUPS = {
     "compiler-data": ([('test/bl/compiler_data_literal_test.bl', 32), ('test/bl/compiler_constructor_data_test.bl', 44), ('test/bl/data_first_order_test.bl', 105)], ['data.first-order']),
-    "member-custody": ([('test/bl/source_deftype_field_test.bl', 8), ('test/bl/class_custody_entries_test.bl', 21), ('test/bl/contextual_class_activation_test.bl', 26), ('test/bl/source_class_replay_test.bl', 27), ('test/bl/source_class_schema_test.bl', 24), ('test/bl/compiled_class_registry_test.bl', 15), ('test/bl/class_graph_schema_test.bl', 19), ('test/bl/exact_member_lease_test.bl', 36), ('test/bl/code_lease_test.bl', 24)], ['reload.generation']),
+    "member-custody": ([('test/bl/reload/runtime_handle_test.bl', 6), ('test/bl/source_deftype_field_test.bl', 8), ('test/bl/class_custody_entries_test.bl', 21), ('test/bl/contextual_class_activation_test.bl', 26), ('test/bl/source_class_replay_test.bl', 27), ('test/bl/source_class_schema_test.bl', 24), ('test/bl/compiled_class_registry_test.bl', 15), ('test/bl/class_graph_schema_test.bl', 19), ('test/bl/exact_member_lease_test.bl', 36), ('test/bl/code_lease_test.bl', 24)], ['reload.generation', 'datom']),
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
     "phase-resolution": ([('test/bl/phase_resolution_metadata_test.bl', 34)], []),
     "sdk-phase-functions": ([('test/bl/contextual_sdk_phase_function_test.bl', 35), ('test/bl/contextual_sdk_set_phase_test.bl', 18), ('test/bl/contextual_constructor_session_test.bl', 50)], ['compile.sdk', 'compile.world', 'clojure.core-ext', 'clojure.string', 'clojure.set']),
