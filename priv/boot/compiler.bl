@@ -3546,42 +3546,40 @@
    :visibility (metadata-visibility metadata) :descriptor descriptor
    :bindings (apply list bindings) :protocol-forms (or proto-forms (list))})))
 
-(defn- compile-class-source
-  "Compile (defrecord Name [fields...] & protocols) into the block that defines
-   a struct-backed type, interns its constructors, and installs any inline
-   protocol implementations.
+(defn- class-initialization-plan [source env]
+ ;; Class publication, constructor values and inline extensions have one owner.
+ ;; Namespace and lexical projections differ only in where those values bind.
+ (let [mod-var "mod"
+       bindings (map (fn [binding]
+                       (assoc binding :node
+                        (case (:role binding)
+                         :type (a/var mod-var)
+                         :positional-constructor (a/remote (kernel-mod-record-literal) :positional_ctor (list (a/var mod-var)))
+                         :map-constructor (a/remote (kernel-mod-record-literal) :map_ctor (list (a/var mod-var))))))
+                     (:bindings source))]
+  {:namespace (:ns env) :module-variable mod-var :bindings bindings
+   :publication (a/remote (kernel-mod-record-literal) :publish_declaration! (list (a/lit (:descriptor source))))
+   :extensions (record-protocol-extends (:protocol-forms source) mod-var env)}))
 
-   Emits: a `mod = Record.define(ns, Name, fields)` binding, then interns of
-   `Name` (the module), `->Name` (positional constructor), and `map->Name`
-   (map constructor for a record). Any trailing protocol blocks
-   (`Shape (area [s] ...)`) become `Multi.extend_type` calls via
-   `record-protocol-extends`, so a record can implement protocols inline just
-   like a standalone `extend-type`."
-  [source env]
-  (let [kind (if (= "defrecord" (:kind source)) :record :deftype)
-        name (rn/node-name (:name source))
-        ; a FIXED variable named `mod` (not gensym'd), matching the existing
-        ; compiler — there is only one per record definition, so no collision
-        mod-var "mod"
-        descriptor (:descriptor source)
-        define-node (a/remote (kernel-mod-record-literal) :publish_declaration! (list (a/lit descriptor)))
-        base (list
-               ; intern Name -> mod
-               (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) (a/var mod-var)))
-               ; intern ->Name -> positional constructor
-               (a/remote (kernel-mod-env-literal) :intern
-                         (list (a/lit (:ns env)) (a/lit (str "->" name))
-                               (a/remote (kernel-mod-record-literal) :positional_ctor (list (a/var mod-var))))))
-        ; the map-constructor slot: a record interns `map->Name`; a deftype has none
-        map-ctor-stmts (if (= kind :record)
-                         (list (a/remote (kernel-mod-env-literal) :intern
-                                 (list (a/lit (:ns env)) (a/lit (str "map->" name))
-                                       (a/remote (kernel-mod-record-literal) :map_ctor (list (a/var mod-var))))))
-                         (list))
-        ; the inline protocol extends, in source order, each a Multi.extend_type
-        extend-nodes (record-protocol-extends (:protocol-forms source) mod-var env)
-        stmts (apply list (concat base map-ctor-stmts extend-nodes (list (a/var mod-var))))]
-    (a/lett mod-var define-node (a/doo stmts))))
+(defn- class-namespace-node [plan]
+ (let [mod-var (:module-variable plan)
+       interns (map (fn [binding]
+                      (a/remote (kernel-mod-env-literal) :intern
+                       (list (a/lit (:namespace plan)) (a/lit (str (:name binding))) (:node binding))))
+                    (:bindings plan))]
+  (a/lett mod-var (:publication plan)
+   (a/doo (apply list (concat interns (:extensions plan) (list (a/var mod-var))))))))
+
+(defn- class-lexical-node [plan]
+ ;; Build every constructor once before inline protocol registration, preserving
+ ;; ordinary class order. The tuple is a lexical value, never a registry or Var.
+ (let [frame "__class_bindings__"]
+  (a/lett (:module-variable plan) (:publication plan)
+   (a/lett frame (a/tup (map :node (:bindings plan)))
+    (a/doo (apply list (concat (:extensions plan) (list (a/var frame)))))))))
+
+(defn- compile-class-source [source env]
+ (class-namespace-node (class-initialization-plan source env)))
 
 (defn- compile-defrecord [name-form fields-form proto-forms kind env]
  (compile-class-source (class-source name-form fields-form proto-forms kind env) env))
@@ -4462,11 +4460,14 @@
  ([form env] (prepare-class-declaration form env nil))
  ([form env module]
   (let [input (declaration-input form env) env (:env input)
-        source (class-declaration-source form env module)]
+        source (class-declaration-source form env module)
+        plan (class-initialization-plan source env)]
    {:version 1 :kind :class-declaration :namespace (:ns env)
     :name (rn/node-name (:name source)) :module (get-in source [:descriptor :name])
     :descriptor (:descriptor source) :metadata (:metadata source) :bindings (:bindings source)
-    :node (compile-class-source source env)})))
+    :node (class-namespace-node plan) :lexical-node (class-lexical-node plan)
+    :binding-slots (elem (Enum/map_reduce (:bindings source) 1
+                      (fn [binding index] (tuple (assoc binding :index index) (+ 1 index)))) 0)})))
 
 (defn declaration-source
   "Derive inert metadata and the value Reader form from a supported declaration.
