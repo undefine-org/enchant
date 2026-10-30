@@ -155,17 +155,30 @@
   (tuple (self-mod) :registry))
 
 (defn- register
-  "Record a freshly created module's `{kind, ns, name, fields}` entry."
+  "Record one bounded class schema under the original module/registry fences.
+   This helper is a native export too; it must enforce custody independently
+   of the canonical publisher that normally calls it."
   [mod kind ns name fields]
-  ;; Different class origins may publish concurrently. Their per-module
-  ;; locks do not serialize this shared persistent-term map's read/modify/write.
-  ;; Hold this distinct registry fence only for the native map update; never
-  ;; acquire a module lock or run user code while it is held.
-  (BeamLisp.Env/with_generation_lock (tuple :record-registry (self-mod))
-    (fn []
-      (persistent_term/put
-        (registry-key)
-        (Map/put (persistent_term/get (registry-key) {}) mod (tuple kind ns name fields))))))
+  (when-not (and (erlang/is_atom mod) (not (Enum/member? (list nil true false) mod))
+                 (Enum/member? (list :record :deftype) kind)
+                 (erlang/is_binary ns) (<= 1 (erlang/byte_size ns) 512)
+                 (erlang/is_binary name) (<= 1 (erlang/byte_size name) 128)
+                 (erlang/is_list fields) (<= (erlang/length fields) 256)
+                 (Enum/all? fields (fn [field] (erlang/is_atom field))))
+    (erlang/error :invalid_class_registration))
+  (BeamLisp.Env/with_module_locks (list mod) (fn []
+    (let [existing (info mod) wanted (tuple kind ns name fields)]
+      (when (BeamLisp.Env/class_schema_held? mod)
+        (let [metadata (tuple 1 ns name kind (Enum/map fields (fn [field] (Atom/to_string field))))]
+          (when-not (loaded_class_identity? mod metadata)
+            (erlang/error (tuple (if existing :code_leased :leased_class_identity_unregistered) mod)))
+          (when (and existing (not= existing wanted)) (erlang/error (tuple :code_leased mod)))))
+      ;; Only this bounded map update holds the shared registry fence. Module
+      ;; fences are acquired before it, never inside the registry owner turn.
+      (BeamLisp.Env/with_generation_lock (tuple :record-registry (self-mod))
+        (fn []
+          (persistent_term/put (registry-key)
+            (Map/put (persistent_term/get (registry-key) {}) mod wanted))))))))
 
 ; ── type predicates ──────────────────────────────────────────────────────
 
