@@ -4,7 +4,7 @@ GROUPS = {
     "sdk-mailbox": ([('test/bl/source_mailbox_data_test.bl', 22), ('test/bl/contextual_receive_test.bl', 28), ('test/bl/contextual_mailbox_sdk_test.bl', 3)], ['proc.mailbox', 'compile.world', 'test.support.source-fixtures']),
     "phase-resolution": ([('test/bl/phase_resolution_metadata_test.bl', 34)], []),
     "sdk-phase-functions": ([('test/bl/contextual_sdk_phase_function_test.bl', 35), ('test/bl/contextual_sdk_set_phase_test.bl', 18), ('test/bl/contextual_constructor_session_test.bl', 50)], ['compile.sdk', 'compile.world', 'clojure.core-ext', 'clojure.string', 'clojure.set']),
-    "sdk-macros": ([('test/bl/contextual_sdk_macro_test.bl', 49), ('test/bl/contextual_datum_macro_test.bl', 30), ('test/bl/contextual_sdk_macro_binding_test.bl', 22), ('test/bl/contextual_syntax_test.bl', 43)], ['compile.sdk', 'compile.world']),
+    "sdk-macros": ([('test/bl/contextual_sdk_macro_test.bl', 49), ('test/bl/contextual_datum_macro_test.bl', 38), ('test/bl/contextual_sdk_macro_binding_test.bl', 22), ('test/bl/contextual_syntax_test.bl', 43)], ['compile.sdk', 'compile.world']),
     "sdk-phase-values": ([('test/bl/contextual_sdk_phase_value_test.bl', 16)], ['compile.sdk', 'compile.world', 'system.execution', 'reload.runtime']),
     "sdk-bindings": ([('test/bl/contextual_sdk_selection_test.bl', 74)], ['compile.sdk', 'compile.world', 'clojure.string', 'clojure.set']),
     "imports": ([('test/bl/contextual_import_test.bl', 25), ('test/bl/contextual_phase_value_test.bl', 15)], ['compile.world']),
