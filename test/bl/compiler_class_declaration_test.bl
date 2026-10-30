@@ -1,0 +1,96 @@
+(ns compiler-class-declaration-test
+ (:require [compiler :as compiler] [reader-node :as rn] [lower :as lower]))
+
+(defn- namespace! [] (str "class.source.n" (erlang/unique_integer (list :positive))))
+(defn- form [source] (first (BeamLisp.Reader/read_string source "class-declaration.bl")))
+(defn- refused? [action] (try (action) false (catch _ true)))
+
+(deftest class-source-projects-original-descriptor-and-all-generated-bindings-without-effects
+ (erlang/erase :class-source-effect)
+ (try
+  (let [namespace (namespace!) env (compiler/new-env namespace)
+        source (compiler/class-declaration-source
+                (form "(defrecord ^{:private true :audit (erlang/put :class-source-effect :bad)} Packet [^long payload]
+                        Shape (area [this] (erlang/put :class-source-effect :bad)))") env)
+        descriptor (:descriptor source) module (:name descriptor)]
+   (is (= "defrecord" (:kind source)))
+   (is (= 'Packet (:name source)))
+   (is (= (list "payload") (:fields source)))
+   (is (= :private (:visibility source)))
+   (is (= ['Packet '->Packet 'map->Packet] (vec (map :name (:bindings source)))))
+   (is (= [:type :positional-constructor :map-constructor] (vec (map :role (:bindings source)))))
+   (is (= :record (BeamLisp.Record/declaration_kind descriptor namespace "Packet")))
+   (is (= 2 (count (:protocol-forms source))))
+   (is (= :undefined (erlang/get :class-source-effect)))
+   (is (nil? (BeamLisp.Record/info module)))
+   (is (not (erlang/module_loaded module))))
+  (finally (erlang/erase :class-source-effect))))
+
+(deftest ordinary-class-compilation-and-source-projection-use-the-same-scaffold
+ (doseq [[head kind names] [["defrecord" :record ['Packet '->Packet 'map->Packet]]
+                            ["deftype" :deftype ['Packet '->Packet]]]]
+  (let [namespace (namespace!) env (compiler/new-env namespace)
+        reader (form (str "(" head " Packet [a b])"))
+        source (compiler/class-declaration-source reader env)
+        node (compiler/compile reader env)
+        descriptor (:val (first (:args (:init node))))]
+   (is (= (:descriptor source) descriptor))
+   (is (= node (BeamLisp.Compiler/compile reader env)))
+   (is (= kind (BeamLisp.Record/declaration_kind descriptor namespace "Packet")))
+   (is (= names (vec (map :name (:bindings source)))))
+   (is (= :publish_declaration! (:fun (:init node))))
+   (is (= :Elixir.BeamLisp.Record (:mod (:init node))))
+   (is (not (erlang/module_loaded (:name descriptor)))))))
+
+(deftest prelinking-publishes-only-the-same-compiler-owned-type-metadata
+ (let [scope (BeamLisp.Env/fork) namespace (namespace!) env (compiler/new-env namespace)
+       reader (form "(deftype Packet [value])")
+       source (compiler/class-declaration-source reader env)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (is (= :error (BeamLisp.Env/lookup (tuple :class-declaration namespace "Packet"))))
+     (is (= true (compiler/prelink-type reader namespace)))
+     (is (= (tuple :ok (:descriptor source)) (BeamLisp.Env/lookup (tuple :class-declaration namespace "Packet"))))
+     (is (= :error (BeamLisp.Env/lookup (tuple namespace "Packet"))))
+     (is (= :error (BeamLisp.Env/lookup (tuple namespace "->Packet"))))
+     (is (nil? (BeamLisp.Record/info (get-in source [:descriptor :name]))))
+     (is (not (erlang/module_loaded (get-in source [:descriptor :name]))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest class-header-validation-is-shared-before-publication-or-prelinking
+ (doseq [text ["(defrecord [] [x])" "(defrecord Packet (x))"
+               "(deftype Packet [:x])" "(defrecord Packet [42])"]]
+  (let [namespace (namespace!) env (compiler/new-env namespace) reader (form text)]
+   (is (refused? #(compiler/class-declaration-source reader env)))
+   (is (refused? #(compiler/compile reader env)))
+   (is (refused? #(compiler/prelink-type reader namespace)))))
+ (let [env (compiler/new-env (namespace!)) reader (form "(defrecord Packet [])")]
+  (is (refused? #(compiler/class-declaration-source (form "(defn ordinary [] 42)") env)))
+  (is (refused? #(compiler/class-declaration-source reader (assoc env :locals {"local" "value"}))))
+  (is (refused? #(compiler/class-declaration-source reader (assoc env :contextual-bindings false))))
+  (is (= (list "x" "x") (:fields (compiler/class-declaration-source (form "(defrecord Packet [x x])") env))))))
+
+(deftest shared-class-source-retains-original-runtime-constructor-representations
+ (let [scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (doseq [[head kind] [["defrecord" :record] ["deftype" :deftype]]]
+      (let [namespace (namespace!) env (compiler/new-env namespace)
+            reader (form (str "(" head " Packet [payload])"))
+            source (compiler/class-declaration-source reader env)
+            module (lower/eval-anf :Elixir.ClassSourcePublication (compiler/compile reader env))
+            ctor (elem (BeamLisp.Env/lookup (tuple namespace "->Packet")) 1)
+            value (BeamLisp.Ns.Rt/invoke ctor (list 42))]
+       (is (= (get-in source [:descriptor :name]) module))
+       (is (= (list :payload) (BeamLisp.Record/fields_of module)))
+       (if (= :record kind)
+        (do
+         (is (= (Map/put {:payload 42} :__struct__ module) value))
+         (is (= value (BeamLisp.Ns.Rt/invoke (elem (BeamLisp.Env/lookup (tuple namespace "map->Packet")) 1)
+                                           (list {:payload 42})))))
+        (do
+         (is (= (tuple :bl_deftype module (tuple 42)) value))
+         (is (= :error (BeamLisp.Env/lookup (tuple namespace "map->Packet"))))))))))
+   (finally (BeamLisp.Env/destroy scope)))))

@@ -3520,6 +3520,27 @@
                              (a/var mod-var) impls))))
          grouped)))
 
+(defn- class-source [name-form fields-form proto-forms kind env]
+ ;; Ordinary publication, compiler prelinking and inert Source discovery share
+ ;; this one class header and the original native descriptor producer.
+ (when-not (and (= :symbol (rn/node-tag (rn/node-form name-form)))
+                (= :vector (rn/node-tag (rn/node-form fields-form)))
+                (every? #(= :symbol (rn/node-tag (rn/node-form %)))
+                        (rn/node-items (rn/node-form fields-form))))
+  (compile-error env "Class declaration requires a symbol name and a vector of field symbols"))
+ (let [name (rn/node-name (rn/node-form name-form))
+       fields (record-field-names fields-form)
+       descriptor (BeamLisp.Record/declaration_descriptor (:ns env) name kind fields)
+       metadata (var-meta-map nil false (name-author-meta name-form))
+       bindings (concat (list {:name (symbol name) :role :type}
+                              {:name (symbol (str "->" name)) :role :positional-constructor})
+                         (if (= :record kind)
+                          (list {:name (symbol (str "map->" name)) :role :map-constructor}) (list)))]
+  {:kind (if (= :record kind) "defrecord" "deftype")
+   :name (rn/node-form name-form) :fields fields :metadata metadata
+   :visibility (metadata-visibility metadata) :descriptor descriptor
+   :bindings (apply list bindings) :protocol-forms (or proto-forms (list))}))
+
 (defn- compile-defrecord
   "Compile (defrecord Name [fields...] & protocols) into the block that defines
    a struct-backed type, interns its constructors, and installs any inline
@@ -3532,12 +3553,12 @@
    `record-protocol-extends`, so a record can implement protocols inline just
    like a standalone `extend-type`."
   [name-form fields-form proto-forms kind env]
-  (let [name (rn/node-name (rn/node-form name-form))
-        fields (record-field-names fields-form)
+  (let [source (class-source name-form fields-form proto-forms kind env)
+        name (rn/node-name (:name source))
         ; a FIXED variable named `mod` (not gensym'd), matching the existing
         ; compiler — there is only one per record definition, so no collision
         mod-var "mod"
-        descriptor (BeamLisp.Record/declaration_descriptor (:ns env) name kind fields)
+        descriptor (:descriptor source)
         define-node (a/remote (kernel-mod-record-literal) :publish_declaration! (list (a/lit descriptor)))
         base (list
                ; intern Name -> mod
@@ -3553,7 +3574,7 @@
                                        (a/remote (kernel-mod-record-literal) :map_ctor (list (a/var mod-var))))))
                          (list))
         ; the inline protocol extends, in source order, each a Multi.extend_type
-        extend-nodes (record-protocol-extends (or proto-forms (list)) mod-var env)
+        extend-nodes (record-protocol-extends (:protocol-forms source) mod-var env)
         stmts (apply list (concat base map-ctor-stmts extend-nodes (list (a/var mod-var))))]
     (a/lett mod-var define-node (a/doo stmts))))
 
@@ -4293,7 +4314,8 @@
       (let [items (rn/node-items node) head (rn/node-name (rn/node-form (first items)))
             name (rn/node-name (rn/node-form (second items)))
             kind (if (= "defrecord" head) :record :deftype)
-            descriptor (BeamLisp.Record/declaration_descriptor ns name kind (record-field-names (nth items 2)))]
+            descriptor (:descriptor (class-source (second items) (nth items 2) (Enum/drop items 3)
+                                                  kind (new-env ns)))]
         (BeamLisp.Env/put_key (tuple :class-declaration ns name) descriptor)
         true))))
 
@@ -4406,6 +4428,20 @@
     (let [items (when (= :list (rn/node-tag form)) (rn/node-items form))]
      {:form form :env env :args (rest items)
       :head (when (seq items) (rn/node-name (rn/node-form (first items))))}))))
+
+(defn class-declaration-source
+ "Project one class declaration without compilation, publication or registry
+  mutation. Its exact descriptor and generated binding names have the SAME
+  owner as ordinary class compilation and compiler prelink metadata. Protocol
+  bodies remain Reader data; native/artifact custody is a separate obligation."
+ [form env]
+ (let [source (declaration-input form env) head (:head source) args (:args source)
+       env (:env source)]
+  (when-not (and (contains? #{"defrecord" "deftype"} head) (empty? (:locals env))
+                 (>= (count args) 2))
+   (compile-error env "Class Declaration Source requires a top-level defrecord or deftype"))
+  (class-source (first args) (second args) (Enum/drop args 2)
+                (if (= "defrecord" head) :record :deftype) env)))
 
 (defn declaration-source
   "Derive inert metadata and the value Reader form from a supported declaration.
