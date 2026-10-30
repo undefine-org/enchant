@@ -5807,8 +5807,8 @@
  (let [core? (= "core" ns)
        root (BeamLisp.Tiers/priv_root) module (BeamLisp.Emit/base_module_for ns)
        seed (when core? (sdk_binding_seed_artifact! module (BeamLisp.Bootstrap/manifest)))
-       raw (when-not core? (BeamLisp.Env/sdk_inventory_metadata! (File/read! (Path/join root "sdk-code.term"))
-                            (Atom/to_string module)))
+       inventory (when-not core? (File/read! (Path/join root "sdk-code.term")))
+       raw (when inventory (BeamLisp.Env/sdk_inventory_metadata! inventory (Atom/to_string module)))
        _ (when-not (or seed (and raw (= :mutable-forwarder (:role raw))
                                   (= ns (:forwarder-namespace raw))
                                   (= (BeamLisp.AOTCache/compiler_key) (:compiler-key raw))))
@@ -5844,7 +5844,8 @@
     {:version 1 :namespace ns :name name :kind kind :value value
      :runtime-image (BeamLisp.AOT/runtime_image_key)
      :source (when raw (:source raw)) :source-digest (when raw (:source-digest raw))
-     :provider-sha256 (crypto/hash :sha256 bytes)})))))
+     :provider-sha256 (crypto/hash :sha256 bytes)
+     :sdk-inventory-sha256 (when inventory (crypto/hash :sha256 inventory))})))))
 
 (defn contextual_sdk_namespaces!
  "Recheck every selected SDK binding before Loader starts any provider.
@@ -8234,35 +8235,36 @@
      (constructor_refuse :unsupported-sdk-phase-library))
     library))))
 
-(defn sdk_function_declaration_binding!
- "Compare a canonical forwarding declaration with the selected original SDK.
-  Returns inert binding evidence, never Source origin or execution admission."
- [claim declaration]
+(defn- sdk_phase_declaration_binding!
+ "One exact descriptor/declaration comparison for phase SDK carriers."
+ [claim declaration kind]
  (BeamLisp.Env/assert_native_framework_execution!)
  (when-not (and (erlang/is_map claim) (= #{:namespace :name :digest} (set (keys claim)))
                 (erlang/is_binary (:namespace claim)) (erlang/is_binary (:name claim))
                 (erlang/is_binary (:digest claim)) (= 64 (erlang/byte_size (:digest claim))))
   (constructor_refuse :invalid-sdk-phase-binding))
- (let [binding (sdk_function_binding! (:namespace claim) (:name claim))
+ (when-not (contains? #{:function :macro} kind) (constructor_refuse :invalid-sdk-phase-kind))
+ (let [binding (if (= :function kind) (sdk_function_binding! (:namespace claim) (:name claim))
+                (sdk_binding! (:namespace claim) (:name claim)))
+       _ (when-not (= kind (:kind binding)) (constructor_refuse :sdk-phase-kind-changed))
+       expected (if (= :function kind) (BeamLisp.CompilerData/sdk_function_declaration binding)
+                  (BeamLisp.CompilerData/sdk_macro_declaration binding))
        digest (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
                              (list (tuple :case :lower)))]
   (when-not (= digest (:digest claim)) (constructor_refuse :sdk-phase-binding-changed))
   (when-not (and (erlang/is_map declaration)
                  (= #{:namespace :form} (set (keys declaration)))
                  (= (:namespace claim) (:namespace declaration))
-                 (= (BeamLisp.CompilerData/sdk_function_declaration binding)
-                    (BeamLisp.Compiler/datum (:form declaration))))
+                 (= expected (BeamLisp.Compiler/datum (:form declaration))))
    (constructor_refuse :sdk-phase-declaration-changed))
   binding))
 
-(defn bind_sdk_constructor_session!
- "Bind a selected authenticated SDK function in this phase session. Its
-  interpreted closure owns reachable ANF metadata; caller expressions never
-  receive an ambient table of SDK private functions or host execution grants."
- [handle claim declaration]
+(defn- bind_sdk_phase_constructor_session!
+ "Retain one checked SDK function or datum-macro closure in the SAME session."
+ [handle claim declaration kind]
  (BeamLisp.Env/assert_native_framework_execution!)
  (constructor_session! handle)
- (let [binding (sdk_function_declaration_binding! claim declaration)]
+ (let [binding (sdk_phase_declaration_binding! claim declaration kind)]
   (let [namespace (:namespace binding)
         inventory-path (Path/join (BeamLisp.Tiers/priv_root) "sdk-code.term")
         inventory (when (:sdk-inventory-sha256 binding) (File/read! inventory-path))
@@ -8277,10 +8279,16 @@
                   (Enum/reduce (Map/to_list (:initializers library)) values
                    (fn [entry values] (Map/put values [(:namespace library) (elem entry 0)] (elem entry 1))))))
         metadata (constructor_metadata definitions values)
-        root {:op :global :ns namespace :name (:name claim) :lookup :exact}
-        _ (when-not (or (contains? (:globals metadata) [namespace (:name claim)])
-                        (and (= "core" namespace) (contains? (constructor_pure_core_names) (:name claim))))
-            (constructor_refuse :unsupported-sdk-phase-function))
+        root (if (= :macro kind) (get-in provider [:macros (:name claim)])
+                {:op :global :ns namespace :name (:name claim) :lookup :exact})
+        ;; Compiler macros use the ordinary callable ABI: fixed self-application
+        ;; or the $blfn tuple for variadic/overloaded dispatch. Authenticate the
+        ;; recipe above, then let the SAME executable visitor and interpreter
+        ;; validate it; a raw :fn-only check would reject genuine compiled macros.
+        _ (when-not (if (= :macro kind) (erlang/is_map root)
+                      (or (contains? (:globals metadata) [namespace (:name claim)])
+                          (and (= "core" namespace) (contains? (constructor_pure_core_names) (:name claim)))))
+            (constructor_refuse (if (= :macro kind) :unsupported-sdk-phase-macro :unsupported-sdk-phase-function)))
         projected (sdk_phase_closure! root metadata libraries inventory)
         closure (dissoc projected :walk-nodes)
         retained-cost (BeamLisp.CompilerData/first_order_cost! closure
@@ -8294,6 +8302,27 @@
    (when (and inventory (not= inventory (File/read! inventory-path)))
     (constructor_refuse :sdk-phase-inventory-changed))
    (constructor_session_request! handle root {} {} true closure cost))))
+
+(defn sdk_function_declaration_binding!
+ "Compare the exact canonical function carrier with original SDK evidence."
+ [claim declaration]
+ (sdk_phase_declaration_binding! claim declaration :function))
+
+(defn sdk_macro_declaration_binding!
+ "Compare the exact canonical macro carrier with original SDK evidence."
+ [claim declaration]
+ (sdk_phase_declaration_binding! claim declaration :macro))
+
+(defn bind_sdk_constructor_session!
+ "Retain an authenticated SDK function through the original bounded session."
+ [handle claim declaration]
+ (bind_sdk_phase_constructor_session! handle claim declaration :function))
+
+(defn bind_sdk_macro_constructor_session!
+ "Retain an authenticated SDK datum macro through the original bounded session.
+  No initializer, live macro Var, Source compiler or host callback executes."
+ [handle claim declaration]
+ (bind_sdk_phase_constructor_session! handle claim declaration :macro))
 
 (defn- interpret_phase_constructor! [expression metadata]
  ;; Phase bundles accept and return first-order data. Their temporary recipes
