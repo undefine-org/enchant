@@ -1,5 +1,5 @@
 (ns contextual-datum-macro-test
- (:require [expand-source :as catalog] [expand :as expand] [codebase.phase :as code]
+ (:require [binding :as b] [expand-source :as catalog] [expand :as expand] [codebase.phase :as code]
            [system.phase :as phase] [compile.world :as world] [lower :as lower] [compiler :as compiler]))
 
 (defn- unit [namespace text]
@@ -215,3 +215,70 @@
   (is (= 42 (execute program)))
   (is (= 2 (count (:expansions program))))
   (is (= :proved (:status (phase/check program))))))
+
+(deftest datum-backticks-qualify-selected-private-runtime-helpers
+ (let [provider (unit 'provider
+                 "(defn ^:private helper [value] (erlang/+ value 2))
+                  (defmacro answer [value] `(helper ~value))
+                  (defmacro helper-name [] `(quote helper))")
+       client (unit 'client
+               "(import-world 'provider 'current :only [answer helper-name])
+                (let [helper (fn [value] 0) value 40] [(answer value) (helper-name)])")
+       direct (expand/program [provider client] ['client 'current])
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [provider])))
+       archived (expand/program [client] ['client 'current] [library])]
+  (is (= [42 'provider/helper] (execute direct)))
+  (is (= [42 'provider/helper] (execute archived)))
+  (is (= :proved (:status (phase/check archived))))
+  (is (= (:selection archived) (b/validate-selection (:selection archived))))))
+
+(deftest qualified-datum-imports-follow-the-selected-definition-view
+ (doseq [[options expression] [[":only [helper]" "(helper ~value)"]
+                               [":only [helper] :as h" "(h/helper ~value)"]]]
+  (let [sources [(unit 'helpers "(defn helper [value] (erlang/+ value 2))")
+                 (unit 'provider (str "(import-world 'helpers 'current " options ")
+                                       (defmacro answer [value] `" expression ")"))
+                 (unit 'client "(import-world 'provider 'current :only [answer]) (answer 40)")]
+        program (expand/program sources ['client 'current])]
+   (is (= 42 (execute program)))
+   (is (= :proved (:status (phase/check program)))))))
+
+(deftest qualified-datum-results-retain-higher-phase-private-helpers
+ (let [provider (unit 'provider
+                 "(defn ^:private helper [value] (erlang/+ value 2))
+                  (defmacro answer [value] `(helper ~value))")
+       client (unit 'client
+               "(begin-for-syntax (import-world 'provider 'current :only [answer]))
+                (defsyntax literal [form context] (syntax-literal (answer 40))) (literal)")
+       program (expand/program [provider client] ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= :proved (:status (phase/check program))))
+  (is (= #{'syntax-v1 'datum-v1} (set (map :protocol (:expansions program)))))))
+
+(deftest qualified-name-index-is-derived-and-does-not-grant-private-imports
+ (let [sources [(unit 'provider "(defn ^:private helper [value] value) (defmacro identity [value] value)")
+                (unit 'client "(provider/helper 42)")]]
+  (is (= :unbound-identifier (kind #(expand/program sources ['client 'current])))))
+ (let [program (expand/program [(unit 'client "(defn answer [] 42) (client/answer)")] ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= :binding-invalid-selection
+         (kind #(b/validate-selection (assoc (:selection program) :qualified-index {})))))))
+
+(deftest bare-datum-results-retain-the-callers-lexical-context
+ (let [program (expand/program
+                [(unit 'provider "(defmacro identity [value] value)")
+                 (unit 'client "(import-world 'provider 'current :only [identity]) (let [answer 42] (identity answer))")]
+                ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= true (get-in program [:coverage :legacy-datum-macros])))))
+
+(deftest canonical-qualified-datum-cannot-choose-between-selected-revisions
+ (let [old (assoc (unit 'helpers "(defn helper [value] value)") :revision 'old)
+       new (assoc (unit 'helpers "(defn helper [value] (erlang/+ value 2))") :revision 'new)
+       provider (unit 'provider
+                 "(import-world 'helpers 'old :only [helper] :as a)
+                  (import-world 'helpers 'new :only [helper] :as z)
+                  (defmacro answer [value] (Elixir.BeamLisp.Vector/to_list ['helpers/helper value]))")
+       client (unit 'client "(import-world 'provider 'current :only [answer]) (answer 40)")]
+  (is (= :ambiguous-datum-qualification
+         (kind #(expand/program [old new provider client] ['client 'current]))))))

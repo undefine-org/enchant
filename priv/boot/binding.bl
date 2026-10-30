@@ -132,6 +132,18 @@
                          (:space d) (:kind d) (:path d) (:scopes d) (:visibility d) (:available-from d))]
   (assoc d :id (crypto/hash :sha256 (canonical-bytes coordinate)))))
 
+(defn- qualified-entry-key [entry]
+ (tuple (symbol (str (:namespace entry) "/" (:name entry)))
+        (if (:view entry) (get-in entry [:view :phase]) (:phase entry)) (:space entry)))
+
+(defn- insert-qualified [index entries]
+ ;; An index over existing rows, never new declarations or import permission.
+ (Enum/reduce entries index
+  (fn [entry out]
+   (if (= :local (:visibility entry)) out
+    (Map/update out (qualified-entry-key entry) (list entry)
+     #(Enum/sort_by (cons entry %) canonical-bytes))))))
+
 (defn world
  "Build a bounded, immutable indexed table. Scope and declaration rows are
   explicit controller output, not evidence that arbitrary source was checked.
@@ -155,7 +167,7 @@
            (refuse! :binding-duplicate-declaration {}))
        index (Enum/group_by rows #(tuple (:name %) (:phase %) (:space %)))]
   {:version 1 :kind :binding-world :key key :selection selection :scopes registry
-   :declarations rows :index index :owners selected :imports (list)
+   :declarations rows :index index :qualified-index (insert-qualified {} rows) :owners selected :imports (list)
    :owner-index (Enum/group_by rows #(tuple (:namespace %) (:name %) (:space %))) :entry-count (count rows)
    :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))}))
 
@@ -163,8 +175,8 @@
  "Rebuild and compare all serialized fields, including the index. A valid
   table remains ordinary data; this check never authenticates a compiler."
  [value]
- (fields! value #{:version :kind :key :selection :scopes :declarations :index :by-id :owners :imports :owner-index :entry-count}
-                [:version :kind :key :selection :scopes :declarations :index :by-id :owners :imports :owner-index :entry-count])
+ (fields! value #{:version :kind :key :selection :scopes :declarations :index :qualified-index :by-id :owners :imports :owner-index :entry-count}
+                [:version :kind :key :selection :scopes :declarations :index :qualified-index :by-id :owners :imports :owner-index :entry-count])
  (let [base (world (:selection value) (Map/values (:scopes value))
                    (Enum/map (:declarations value) #(dissoc % :id)))
        expected (Enum/reduce (finite! (:imports value) 256) base (fn [request w] (import-view w request)))]
@@ -243,6 +255,7 @@
   (when (> (+ (:entry-count world) (count (:entries projected))) 131072)
    (refuse! :binding-bound {:maximum 131072}))
   (assoc world :index (insert-entries (:index world) (:entries projected))
+               :qualified-index (insert-qualified (:qualified-index world) (:entries projected))
                :entry-count (+ (:entry-count world) (count (:entries projected)))
                :imports (Enum/sort_by (cons request (:imports world))
                           (fn [value] (canonical-bytes value))))))
@@ -306,7 +319,8 @@
    :instance-base (Enum/group_by (Enum/flat_map (Map/values index) (fn [bucket] bucket))
                     #(if (:view %) (get-in % [:view :world]) (:owner-world %)))
    :introduced-scopes (list) :introduced-declarations (list)
-   :scopes registry :index index :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))
+   :scopes registry :index index
+   :qualified-index (insert-qualified {} (Enum/flat_map (Map/values index) (fn [bucket] bucket))) :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))
    :coordinates (Map/new (Enum/map rows
                   #(tuple (tuple (:owner-world %) (:namespace %) (:phase %) (:space %) (:path %)) (:id %))))
    :binding-coordinates (Map/new (Enum/map rows
@@ -339,6 +353,7 @@
       (refuse! :binding-bound {:maximum 131072}))
      (assoc selection :instances (Enum/sort (cons instance (:instances selection)))
                       :index (insert-entries (:index selection) entries)
+                      :qualified-index (insert-qualified (:qualified-index selection) entries)
                       :entry-count (+ (:entry-count selection) (count entries)) :state-key nil))))))
 
 (defn register-scope
@@ -377,6 +392,7 @@
      (refuse! :binding-bound {:maximum 65536}))
     (assoc selection :by-id (Map/put (:by-id selection) (:id d) entry)
                      :index (insert-entries (:index selection) (list entry))
+                     :qualified-index (insert-qualified (:qualified-index selection) (list entry))
                      :coordinates (Map/put (:coordinates selection) coordinate (:id d))
                      :binding-coordinates (Map/put (:binding-coordinates selection) binding-coordinate (:id d))
                      :introduced-declarations (cons entry (:introduced-declarations selection))
@@ -395,9 +411,9 @@
   (assoc selection :introduced-scopes scopes :introduced-declarations declarations :state-key state-key)))
 
 (defn validate-selection [value]
- (fields! value #{:version :kind :key :state-key :worlds :imports :scopes :index :by-id :entry-count
+ (fields! value #{:version :kind :key :state-key :worlds :imports :scopes :index :qualified-index :by-id :entry-count
                   :introduced-scopes :introduced-declarations :coordinates :binding-coordinates :instances :instance-base}
-                [:version :kind :key :state-key :worlds :imports :scopes :index :by-id :entry-count
+                [:version :kind :key :state-key :worlds :imports :scopes :index :qualified-index :by-id :entry-count
                  :introduced-scopes :introduced-declarations :coordinates :binding-coordinates :instances :instance-base])
  (let [base (select (Map/values (:worlds value)) (:imports value))
        instanced (Enum/reduce (finite! (:instances value) 256) base
@@ -436,9 +452,8 @@
        _ (check-name! space) _ (owner! (:owners local-world) (:namespace context))
        ids (scopes! (syn/scopes identifier phase) (:scopes world))
        scope-set (Map/new (Enum/map ids #(tuple % true)))
-       bucket (Map/get (:index world) (tuple name phase space) (list))
-       candidates (Enum/filter bucket
-                    #(and (if (:view %)
+       key (tuple name phase space)
+       applicable? #(and (if (:view %)
                               (and (= (get-in % [:view :namespace]) (:namespace context))
                                    (= (get-in % [:view :world] (:key world)) origin))
                               (or (and (= :local (:visibility %))
@@ -448,7 +463,15 @@
                                                       (Map/get % :owner-world (:key world)))) (:scopes %))))
                                   (and (= (Map/get % :owner-world (:key world)) origin)
                                        (= (:namespace %) (:namespace context)))))
-                           (subset? (if (:view %) (get-in % [:view :scopes]) (:scopes %)) scope-set)))
+                           (subset? (if (:view %) (get-in % [:view :scopes]) (:scopes %)) scope-set))
+       lexical (Enum/filter (Map/get (:index world) key (list)) applicable?)
+       ;; A qualified spelling identifies its origin, not an import alias. If
+       ;; no lexical alias applies, all visible routes to ONE declaration are
+       ;; equivalent. Distinct selected revisions remain ambiguous.
+       candidates (if (seq lexical) lexical
+                    (Enum/uniq_by
+                     (Enum/filter (Map/get (:qualified-index world) key (list)) applicable?)
+                     #(tuple (Map/get % :owner-world (:key world)) (:id %))))
        ;; A greatest candidate must contain every applicable candidate's scopes.
        ;; Compare the union once instead of comparing all pairs of candidates.
        union (Enum/uniq (Enum/flat_map candidates (fn [d] (if (:view d) (get-in d [:view :scopes]) (:scopes d)))))
