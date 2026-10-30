@@ -25,9 +25,10 @@
                :native (get request "native")
                :ex (when ex {:root (relative (get ex "root")) :exclude (get ex "exclude")})
                :log println}
+      unit-counts (atom {:compiled 0 :restored 0})
       result (build/produce! options)
       errors (Enum/map (:errors result) identity)]
-  (when (seq errors) (throw (ex-info "Application production failed" {:errors errors})))
+  (when (seq errors) (throw (ex-info (str "Application production failed: " (pr-str errors)) {:errors errors})))
   ;; Per-request wall-clock history belongs to the coordinator/Nix log. Keep
   ;; actual source/module facts in the immutable product without timestamps.
   (let [log (Path/join out "ebin/build.log")]
@@ -67,10 +68,20 @@
                         directory (Path/join out relative)
                         _ (when (some #(contains? #{"" "." ".."} %) (String/split name "/"))
                             (throw (ex-info "Invalid application namespace output path" {:namespace name})))
-                        prepared (BeamLisp.AOT/prepare_unit workspace namespace)
-                        _ (when (File/exists? directory) (File/rm_rf! directory))
-                        _ (BeamLisp.AOT/emit_unit prepared directory)
-                        verified (BeamLisp.AOT/verify_unit directory)]
+                        prior (when (and base (not (:force? options)) (File/regular? (Path/join directory "artifact-unit.term")))
+                                (BeamLisp.AOT/verify_unit directory))
+                        reusable? (and prior (= name (get-in prior [:manifest :namespace]))
+                          (seq (get-in prior [:manifest :inputs]))
+                          (every? (fn [input]
+                            (when-let [path (BeamLisp.Loader/source_path (:namespace input))]
+                              (= (:sha256 input) (crypto/hash :sha256 (BeamLisp.Loader/read_source path)))))
+                            (get-in prior [:manifest :inputs])))
+                        _ (swap! unit-counts update (if reusable? :restored :compiled) inc)
+                        verified (if reusable? prior
+                          (let [prepared (BeamLisp.AOT/prepare_unit workspace namespace)]
+                            (when (File/exists? directory) (File/rm_rf! directory))
+                            (BeamLisp.AOT/emit_unit prepared directory)
+                            (BeamLisp.AOT/verify_unit directory)))]
                     {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))
               (finally (when workspace (BeamLisp.AOT/close_workspace! workspace))))))
         incoming (when planning
@@ -81,7 +92,9 @@
                         :key (get (:key planning) (:path node))
                         :requires (Enum/map (:reqs node) identity)})))
         owned (set (Enum/map (or incoming []) #(:path %)))
-        retained (filter #(not (contains? owned (get % "path"))) (or (get previous "impact") []))
+        retained (if (= "scoped" (get request "scope"))
+                   (filter #(not (contains? owned (get % "path"))) (or (get previous "impact") []))
+                   (list))
         impact (concat (Enum/map retained
                          (fn [row] {:namespace (get row "namespace") :path (get row "path")
                                     :content (get row "content") :interface (get row "interface")
@@ -109,8 +122,9 @@
                 (when-not (contains? kept relative) (File/rm_rf! (Path/join out relative))))))
         resource (app/write-project! project (or (:runtime-out result) (Path/join out "ebin")))]
     (File/write! (Path/join out "result.json")
-      (Jason/encode! {:built (:built result) :cached (:cached result)
+      (Jason/encode! {:built (:built result) :compiled (:compiled result) :cached (:cached result)
                      :ex-built (:ex-built result) :errors errors
+                     :unit-compiled (:compiled @unit-counts) :unit-restored (:restored @unit-counts)
                      :units (or units (list))
                      :world-unit (when (get request "world") (Path/relative_to (:out result) out))
                      :impact (when planning (Enum/map order

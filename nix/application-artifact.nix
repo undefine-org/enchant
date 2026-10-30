@@ -40,6 +40,17 @@ let
     };
   }) declarations);
   nativeSet = if crates == [] then null else import ./native-bundle.nix { inherit pkgs products; };
+  # A predecessor is a reuse hint, not a new input generation when the entire
+  # full request is unchanged. Avoid an endless chain of identical products.
+  identity = builtins.removeAttrs (request // {
+    scope = request.scope or "full";
+    nativeProducts = declarations;
+  }) [ "version" "base" "force" "attempt" ];
+  prior = if base == null || !(builtins.pathExists (base + "/request-identity.json")) then null
+    else builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile (base + "/request-identity.json")));
+  unchanged = base != null && !scoped && !(request.force or false)
+    && prior == { inherit sdk identity; }
+    && builtins.pathExists (base + "/production-request.json");
   requestFile = pkgs.writeText "beam-lisp-application-request.json" (builtins.toJSON request);
   boot = pkgs.writeText "beam-lisp-application-producer.exs" ''
     for path <- Path.wildcard("${image}/lib/*/ebin"), do: Code.prepend_path(path)
@@ -66,7 +77,7 @@ assert request.version != 4 || (builtins.isBool request.force
   && builtins.length crates == builtins.length (pkgs.lib.unique crates)
   && (request.native || declarations == []));
 assert builtins.elem (request.scope or "full") [ "full" "scoped" ];
-assert (request.base or null) == null || (scoped && storeObject request.base);
+assert (request.base or null) == null || storeObject request.base;
 assert !scoped || request.world == null;
 assert storeObject request.source && storeObject sdk;
 assert descriptor.version == 1 && descriptor.kind == "sdk" && descriptor.target == "x86_64-linux";
@@ -78,7 +89,10 @@ assert builtins.isBool request.native;
 assert builtins.isInt request.jobs && request.jobs >= 1 && request.jobs <= 4;
 assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames request.ex == [ "exclude" "root" ]
   && relative request.ex.root && builtins.isList request.ex.exclude && builtins.all builtins.isString request.ex.exclude);
-(import ./bounded-build.nix {
+if unchanged then import ./application-artifact.nix {
+  inherit sdk;
+  requestJson = builtins.readFile (base + "/production-request.json");
+} else (import ./bounded-build.nix {
   inherit pkgs;
   memoryMiB = 6144;
   diskMiB = 32768;
@@ -96,7 +110,6 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
     test "$(${pkgs.jq}/bin/jq -r '."world-unit" // empty' ${base}/result.json)" = ""
     cp -a --no-preserve=ownership ${base}/ebin "$out/ebin"
     if test -d ${base}/units; then cp -a --no-preserve=ownership ${base}/units "$out/units"; fi
-    if test -d ${base}/native; then cp -a --no-preserve=ownership ${base}/native "$out/native"; fi
     chmod -R u+w "$out"
   ''}
   export HOME=/build/home XDG_CACHE_HOME=/build/home/.cache BL_DAEMON=off
@@ -123,6 +136,8 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
     sdk = toString image;
     target = "x86_64-linux";
   }}' > "$out/artifact.json"
+  printf '%s\n' '${builtins.toJSON { inherit sdk identity; }}' > "$out/request-identity.json"
+  cp ${requestFile} "$out/production-request.json"
   ${pkgs.python3}/bin/python3 ${./application-inventory.py} write "$out"
   ${pkgs.python3}/bin/python3 ${./application-inventory.py} verify "$out" ${image} ${source} >/dev/null
 '')

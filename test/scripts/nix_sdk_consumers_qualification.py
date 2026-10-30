@@ -135,6 +135,42 @@ def main():
         run('ordinary-source-free-receiver', [elixir, scripts / 'nix_application_receiver.exs'], image,
             dict(receiver_env, BL_APPLICATION_PRODUCT=ordinary_product), 'IMMUTABLE-MULTI answer=42')
 
+        bl('ordinary-cli-unchanged', ['build', '--out', str(ordinary)], project)
+        assert (ordinary / '.nix-product').resolve(strict=True) == ordinary_product
+        unrelated = project / 'src/artifact/demo/unrelated.bl'
+        unrelated.write_text('(ns artifact.demo.unrelated) (defn answer [] 7)\n')
+        values = project / 'src/artifact/demo/values.bl'
+        original_values = values.read_text()
+        try:
+            bl('ordinary-cli-added', ['build', '--out', str(ordinary)], project)
+            added = (ordinary / '.nix-product').resolve(strict=True)
+            counts = json.loads((added / 'result.json').read_text())
+            assert (counts['unit-compiled'], counts['unit-restored']) == (1, 2), counts
+            for namespace in ('artifact.demo.values', 'artifact.demo.consumer'):
+                before, after = ordinary_product / 'units' / namespace, added / 'units' / namespace
+                assert {p.name: digest(p) for p in before.iterdir()} == {p.name: digest(p) for p in after.iterdir()}
+            values.write_text(original_values.replace('(+ 20 20)', '(+ 20 30)'))
+            bl('ordinary-cli-macro-edit', ['build', '--out', str(ordinary)], project)
+            edited = (ordinary / '.nix-product').resolve(strict=True)
+            counts = json.loads((edited / 'result.json').read_text())
+            assert (counts['unit-compiled'], counts['unit-restored']) == (2, 1), counts
+            run('ordinary-edited-source-free-receiver', [elixir, scripts / 'nix_application_receiver.exs'], image,
+                dict(receiver_env, BL_APPLICATION_PRODUCT=edited, BL_APPLICATION_EXPECT_ANSWER='52',
+                     BL_APPLICATION_EXPECT_BASE='50'), 'IMMUTABLE-MULTI answer=52')
+            unrelated.unlink()
+            bl('ordinary-cli-deleted', ['build', '--out', str(ordinary)], project)
+            deleted = (ordinary / '.nix-product').resolve(strict=True)
+            counts = json.loads((deleted / 'result.json').read_text())
+            assert (counts['unit-compiled'], counts['unit-restored']) == (0, 2), counts
+            assert not (deleted / 'units/artifact.demo.unrelated').exists()
+            assert not list((deleted / 'ebin').glob('*Unrelated*'))
+        finally:
+            values.write_text(original_values)
+            unrelated.unlink(missing_ok=True)
+        bl('ordinary-cli-restored', ['build', '--out', str(ordinary)], project)
+        ordinary_product = (ordinary / '.nix-product').resolve(strict=True)
+        report['products']['ordinary_restored'] = str(ordinary_product)
+
         bl('application-publication', ['run', str(scripts / 'nix_application_publication.bl')], project,
            {'BL_APPLICATION_CONTROL_SOURCE': project, 'BL_APPLICATION_CONTROL_OUTPUT': output / 'publication',
             'BL_APPLICATION_CONTROL_RESULT': output / 'publication.json'}, 'APPLICATION-PUBLICATION')
