@@ -1,0 +1,117 @@
+(ns reload.native-enumerable-test (:require [reload.generation :as g]))
+
+(deftest sdk-collection-construction-needs-no-native-enum-grant
+ (let [graph (g/prepare! {:sources {"enumerable.sdk"
+              "(ns enumerable.sdk) (defn run [] (set (concat [1 2] [2 3])))"}})]
+  (try
+   (is (= #{1 2 3} (g/invoke! graph "enumerable.sdk/run" [])))
+   (finally (g/retire! graph)))))
+
+(deftest native-enum-reducers-work-over-source-cursors-without-extra-grants
+ (let [graph (g/prepare! {:native-modules #{"Enum"}
+              :sources {"enumerable.application"
+               "(ns enumerable.application) (defn run [] [(Enum/uniq (concat [1 2] [2 3])) (Enum/frequencies (concat [1 2] [2 3]))])"}})]
+  (try
+   (is (= ['(1 2 3) {1 1 2 2 3 1}] (g/invoke! graph "enumerable.application/run" [])))
+   (finally (g/retire! graph)))))
+
+(defn- compile-enumerable-probe! [source module directory]
+ (let [result (BeamLisp.AOT/compile_host_file source
+               (list (tuple :module module) (tuple :output_dir directory) (tuple :load? false)))
+       path (elem result 1)]
+  (when-not (= (tuple :module module)
+               (code/load_binary module (String/to_charlist path) (File/read! path)))
+   (throw :enumerable-probe-load-failed))))
+
+(defn- drain-enumerable-effects []
+ (loop [n 0]
+  (receive :enumerable-unplanned-callback-effect (recur (inc n)) (after 0 n))))
+
+(deftest native-enum-reducer-causal-control-keeps-application-callback-admission
+ (let [directory (Path/join (System/tmp_dir!)
+                   (str "enumerable-reducer-control-" (erlang/unique_integer (list :positive))))
+       fixture :Elixir.ExecutionHistory.EnumerableReducerFixture
+       target :Elixir.ExecutionHistory.EnumerableUnplannedCallback
+       lanes [{:kind :cursor :file "seq_cursor_enumerable.bl"
+               :ns "host.seq-cursor-enumerable"
+               :good :Elixir.ExecutionHistory.CursorReducerGood
+               :bad :Elixir.ExecutionHistory.CursorReducerLanguageCall
+               :live :Elixir.Enumerable.BeamLisp.SeqCursor}
+              {:kind :lazy :file "lazy_seq_enumerable.bl"
+               :ns "host.lazy-seq-enumerable"
+               :good :Elixir.ExecutionHistory.LazyReducerGood
+               :bad :Elixir.ExecutionHistory.LazyReducerLanguageCall
+               :live :Elixir.Enumerable.BeamLisp.LazySeq}]
+       live-md5 (into {} (map (fn [lane] [(:live lane) (erlang/apply (:live lane) :module_info (list :md5))]) lanes))
+       before "(erlang/apply fun (list (erlang/hd c) (erlang/element 2 acc)))"
+       after "(BeamLisp.Ns.Rt/invoke fun (list (erlang/hd c) (erlang/element 2 acc)))"
+       graph (atom nil)]
+  (try
+   (File/mkdir_p! directory)
+   (doseq [lane lanes]
+    (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) (str "host/" (:file lane))))]
+     (is (= 2 (count (String/split source before))) "one exact reducer invocation changes")
+     (when-not (= 2 (count (String/split source before))) (throw :enumerable-reducer-anchor-drift))
+     (doseq [mode [:good :bad]]
+      (let [probe-ns (str "history.enumerable." (name (:kind lane)) "." (name mode))
+            path (Path/join directory (str (name (:kind lane)) "-" (name mode) ".bl"))
+            relocated (String/replace source (str "(ns " (:ns lane) ")") (str "(ns " probe-ns ")"))]
+       (File/write! path (if (= mode :bad) (String/replace relocated before after) relocated))
+       (compile-enumerable-probe! path (get lane mode) (Path/join directory (str (name (:kind lane)) "-" (name mode))))))))
+   ;; Enumerable.Function supplies Enum's ACTUAL reducer to the private host
+   ;; implementation while it consumes a genuine production cursor/lazy node.
+   ;; Only the fixture is an application native dependency. Enum's internal
+   ;; lambda is infrastructure, not an application callback grant. Neither
+   ;; protocol dispatch nor any live SDK module is replaced by this control.
+   (Code/compile_string
+    "defmodule ExecutionHistory.EnumerableUnplannedCallback do
+       def step(value), do: (send(self(), :\"enumerable-unplanned-callback-effect\"); value)
+     end
+     defmodule ExecutionHistory.EnumerableReducerFixture do
+       defp lazy([]), do: nil
+       defp lazy([head | tail]), do: BeamLisp.LazySeq.new(fn -> [head | lazy(tail)] end)
+       defp collection(:cursor), do: BeamLisp.SeqCursor.new([1, 2, 2, 3])
+       defp collection(:lazy), do: lazy([1, 2, 2, 3])
+       def dispatch(kind, mode) do
+         sequence = collection(kind)
+         case mode do
+           :callback ->
+             callback = &ExecutionHistory.EnumerableUnplannedCallback.step/1
+             BeamLisp.Ns.Rt.map(callback, sequence) |> Enum.to_list()
+           _ ->
+             implementation = case {kind, mode} do
+               {:cursor, :good} -> ExecutionHistory.CursorReducerGood
+               {:cursor, :bad} -> ExecutionHistory.CursorReducerLanguageCall
+               {:lazy, :good} -> ExecutionHistory.LazyReducerGood
+               {:lazy, :bad} -> ExecutionHistory.LazyReducerLanguageCall
+             end
+             enumerable = fn acc, reducer -> apply(implementation, :reduce, [sequence, acc, reducer]) end
+             Enum.uniq(enumerable)
+         end
+       end
+     end")
+   (reset! graph (g/prepare!
+    {:sources {"enumerable.reducer.control"
+      "(ns enumerable.reducer.control) (defn run [kind mode] (ExecutionHistory.EnumerableReducerFixture/dispatch kind mode))"}
+     :native-modules #{"ExecutionHistory.EnumerableReducerFixture"}}))
+   (doseq [lane lanes]
+    (is (= '(1 2 3) (g/invoke! @graph "enumerable.reducer.control/run" [(:kind lane) :good])))
+    (let [outcome (try (g/invoke! @graph "enumerable.reducer.control/run" [(:kind lane) :bad]) :wrongly-ran
+                   (catch error (BeamLisp.ExInfo/ex_original error)))]
+     (println :history-E30-native-reducer {:lane (:kind lane) :mutant outcome})
+     (is (= :source_native_target_refused outcome)
+         "restoring language admission wrongly refuses Enum's internal reducer"))
+    (drain-enumerable-effects)
+    (is (= :source_native_target_refused
+         (try (g/invoke! @graph "enumerable.reducer.control/run" [(:kind lane) :callback]) :wrongly-ran
+          (catch error (BeamLisp.ExInfo/ex_original error))))
+        "an unplanned application callback still uses ordinary SDK admission")
+    (is (= 0 (drain-enumerable-effects)))
+    (is (= (get live-md5 (:live lane)) (erlang/apply (:live lane) :module_info (list :md5)))
+        "the real SDK protocol implementation was never replaced"))
+   (finally
+    (when @graph (g/retire! @graph))
+    (drain-enumerable-effects)
+    (doseq [module (concat [fixture target] (mapcat (fn [lane] [(:good lane) (:bad lane)]) lanes))]
+     (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))

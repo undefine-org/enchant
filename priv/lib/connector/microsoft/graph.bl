@@ -196,9 +196,9 @@
 
 (defn- walk-values
   "Follow @odata.nextLink from `url` → {:ok [json …]} | {:error …}."
-  [get url]
+  [http-get url]
   (loop [u url out [] hops 0]
-    (let [r (get u)]
+    (let [r (http-get u)]
       (cond
         (contains? r :error) r
         (> hops 1000) {:error {:status 0 :body "paging did not end"}}
@@ -207,28 +207,28 @@
                 (if (nil? nxt) {:ok out} (recur nxt out (+ hops 1))))))))
 
 (defn acl-fn
-  "`:acl` of the feed: `(fn [get item-key] → {:ok {:grants … :complete? b}} | {:error …})`
+  "`:acl` of the feed: `(fn [http-get item-key] → {:ok {:grants … :complete? b}} | {:error …})`
    — GET …/items/{i}/permissions, paged. SharePoint returns EFFECTIVE grants
    per item with no `inheritedFrom`, which is exactly the unit the ACL facts
    store, so nothing is derived from a parent here."
   [drive-id base opts]
-  (fn [get item-key]
-    (let [r (walk-values get (permissions-url base drive-id (nth item-key 2)))]
+  (fn [http-get item-key]
+    (let [r (walk-values http-get (permissions-url base drive-id (nth item-key 2)))]
       (if (contains? r :error) r
         {:ok (permission-grants opts (:ok r))}))))
 
 (defn members-fn
-  "`:members` of the feed: `(fn [get group-key] → {:ok {:members [person …] :complete? b}} | {:error …})`.
+  "`:members` of the feed: `(fn [http-get group-key] → {:ok {:members [person …] :complete? b}} | {:error …})`.
    An Entra group (`:group`) is expanded with GET /groups/{id}/transitiveMembers
    (GroupMember.ReadBasic.All): persons only — transitive, so nested groups are
    already flattened. A SharePoint site group cannot be expanded with
    client-secret Graph (doc §1) → {:members [] :complete? false}, which a check
    reads as :group-unresolved, never as 'nobody'."
   [base tenant]
-  (fn [get group-key]
+  (fn [http-get group-key]
     (if (not= :group (nth group-key 2))
       {:ok {:members [] :complete? false}}
-      (let [r (walk-values get (members-url base (nth group-key 3)))]
+      (let [r (walk-values http-get (members-url base (nth group-key 3)))]
         (if (contains? r :error) r
           {:ok {:members (into [] (keep (fn [m]
                                           (when (= "#microsoft.graph.user" (get m "@odata.type"))
@@ -248,16 +248,16 @@
    :guest? (= "Guest" (get u "userType"))})
 
 (defn directory-fn
-  "`:directory` of the feed: `(fn [get opts] → {:ok {:people [{:id :key :email :name :title
+  "`:directory` of the feed: `(fn [http-get opts] → {:ok {:people [{:id :key :email :name :title
    :enabled? :guest?} …] :next nil}} | {:error {:status 403 …}})`. GET /users (paged, walked
    to the end, so `:next` is always nil) — Application `User.Read.All`; with opts {:group
    gid} the people of one Entra group instead (…/transitiveMembers, persons only,
    `GroupMember.ReadBasic.All`). A 403 comes back as the error: discovery then falls back
    to people seen in mirrored ACLs."
   [base tenant]
-  (fn [get opts]
+  (fn [http-get opts]
     (let [gid (:group opts)
-          r (walk-values get (if (some? gid) (members-url base gid) (users-url base)))]
+          r (walk-values http-get (if (some? gid) (members-url base gid) (users-url base)))]
       (if (contains? r :error) r
         {:ok {:people (into [] (comp (filter (fn [u] (or (nil? gid) (= "#microsoft.graph.user" (get u "@odata.type")))))
                                      (map (fn [u] (directory-person tenant u))))
@@ -273,14 +273,14 @@
   [drive-id base]
   {:provider :graph
    :namespace drive-id
-   :start-token (fn [get]
-                  (let [r (get (delta-url base drive-id "latest"))]
+   :start-token (fn [http-get]
+                  (let [r (http-get (delta-url base drive-id "latest"))]
                     (if (contains? r :ok)
                       (let [l (get-in r [:ok "@odata.deltaLink"])]
                         (if (nil? l) {:error {:status 0 :body "delta?token=latest answered no deltaLink"}} {:ok l}))
                       r)))
-   :changes (fn [get token]
-              (let [r (get token)]
+   :changes (fn [http-get token]
+              (let [r (http-get token)]
                 (cond
                   (contains? r :ok)
                   (let [b (:ok r)]
@@ -297,9 +297,9 @@
    ;; Graph's children paging is NOT guaranteed complete under concurrent
    ;; writes; a tokenless delta is the only guaranteed enumeration. `from` is a
    ;; 410's Location (already a full delta URL) or nil for the drive root.
-   :enumerate (fn [get from]
+   :enumerate (fn [http-get from]
                 (loop [url (or from (delta-url base drive-id nil)) out [] hops 0]
-                  (let [r (get url)]
+                  (let [r (http-get url)]
                     (cond
                       (contains? r :error) r
                       (> hops 10000) {:error {:status 0 :body "delta enumeration did not end"}}
@@ -312,14 +312,14 @@
                           (some? nxt) (recur nxt out (+ hops 1))
                           (nil? (get b "@odata.deltaLink")) {:error {:status 0 :body "delta enumeration ended without a deltaLink"}}
                           :else {:ok {:items out :cursor (get b "@odata.deltaLink")}}))))))
-   :children (fn [get parent-key page]
-               (let [r (get (or page (children-url base drive-id (nth parent-key 2))))]
+   :children (fn [http-get parent-key page]
+               (let [r (http-get (or page (children-url base drive-id (nth parent-key 2))))]
                  (if (contains? r :ok)
                    {:ok {:items (mapv (fn [it] (item-map drive-id it)) (into [] (or (get-in r [:ok "value"]) [])))
                          :next (get-in r [:ok "@odata.nextLink"])}}
                    r)))
-   :item (fn [get key]
-           (let [r (get (item-url base drive-id (nth key 2)))]
+   :item (fn [http-get key]
+           (let [r (http-get (item-url base drive-id (nth key 2)))]
              (if (contains? r :ok) {:ok (item-map drive-id (:ok r))} r)))
    :parent-key (fn [item] (let [ps (:parents item)]
                             (if (empty? ps) nil (entity drive-id (first ps)))))})
@@ -348,32 +348,32 @@
   "The site at `host` + server-relative `path` (\"/sites/knowledger-test\") →
    {:ok site-json} | {:error …}. GET /sites?search=* needs more than
    Sites.Selected, so browsing starts from addresses an admin configured."
-  [get base host path]
-  (get (str base "/sites/" host ":" path)))
+  [http-get base host path]
+  (http-get (str base "/sites/" host ":" path)))
 
 (defn sites
   "Resolve configured `addresses` [[host path] …] → {:ok [site-json …]} or the
    first error (a site without a grant is a 403 NAMED by the address)."
-  [get base addresses]
+  [http-get base addresses]
   (loop [as (into [] addresses) out []]
     (if (empty? as) {:ok out}
       (let [[h p] (first as)
-            r (site-by-path get base h p)]
+            r (site-by-path http-get base h p)]
         (if (contains? r :error) (assoc r :address [h p])
           (recur (rest as) (conj out (:ok r))))))))
 
 (defn drives
   "The document libraries of `site-id` → {:ok [driveJson …]} | {:error …}."
-  [get base site-id]
-  (let [r (get (str base "/sites/" site-id "/drives"))]
+  [http-get base site-id]
+  (let [r (http-get (str base "/sites/" site-id "/drives"))]
     (if (contains? r :ok) {:ok (into [] (or (get-in r [:ok "value"]) []))} r)))
 
 (defn browse
   "Children of `folder-id` (\"root\" allowed) in `drive-id` as item maps, folders
    first then by name. Live call; writes nothing (entities-and-projections R2)."
-  [get base drive-id folder-id]
+  [http-get base drive-id folder-id]
   (loop [url (children-url base drive-id folder-id) out []]
-    (let [r (get url)]
+    (let [r (http-get url)]
       (if (contains? r :error) r
         (let [out (into out (map (fn [it] (item-map drive-id it)) (or (get-in r [:ok "value"]) [])))
               nxt (get-in r [:ok "@odata.nextLink"])]
@@ -385,8 +385,8 @@
   "One `delta?token=latest` call → {:ok :allowed} | {:error {:status 403 …}}.
    The connect screen uses it to NAME whether Sites.Selected lets delta run
    (docs/22 §2.6 call 4) before a library is bound."
-  [get base drive-id]
-  (let [r (get (delta-url base drive-id "latest"))]
+  [http-get base drive-id]
+  (let [r (http-get (delta-url base drive-id "latest"))]
     (if (contains? r :ok) {:ok :allowed} r)))
 
 ;; ── content ─────────────────────────────────────────────────────────────────

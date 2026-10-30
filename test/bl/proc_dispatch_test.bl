@@ -27,7 +27,7 @@
    (is (= {:running 1 :queued 1} (dispatch/stats server)))
    (let [entry (elem (first (ets/lookup :dispatch-capacity-test :second)) 1)
          before (ets/info :beam_lisp_code_leases :size)]
-    (is (map? (:registration entry)))
+    (is (= :bl-execution (elem (:registration entry) 0)))
     (is (nil? (:registrations entry)))
     (is (= :duplicate (:status (dispatch/submit! server (make-job :second)))))
     (is (= :busy (:status (dispatch/submit! server (make-job :third)))))
@@ -137,7 +137,7 @@
    (throw (ex-info "fixture did not index" {})))
   {:prepared prepared :request request :reserved reserved}))
 
-(deftest handoff-refuses-noncallable-invokers-before-indexing
+(deftest handoff-refuses-fabricated-native-targets-before-indexing
  (let [server (start dispatch/dispatcher (opts :dispatch-invoker-shape-test))
        request (admission/token (erlang/self) 10000)
        reserved (call server [:reserve {:id :shape :request request :replay-safe? false
@@ -147,8 +147,8 @@
   (try
    (is (= :invalid-dispatch-handoff
         (:kind (call server [:prepare :shape (:ticket reserved)
-                 (-> prepared (assoc-in [:source :invoke] nil)
-                              (assoc-in [:accepted :invoke] nil))]))))
+                 (assoc prepared :accepted
+                   (tuple :bl-execution (:owner reserved) (erlang/make_ref)))]))))
    (is (nil? (:registration (elem (first (ets/lookup :dispatch-invoker-shape-test :shape)) 1))))
    (is (= :cancelled (:status (call server [:abort :shape (:ticket reserved)]))))
    (is (= 0 (ets/info :dispatch-invoker-shape-test :size)))
@@ -201,7 +201,7 @@
        tail (String/split (second sections) "(defn release_code!" (list (tuple :parts 2)))
        body (first tail)
        inserted "(insert_code_lease! next)"
-       deletion "(fn [row] (ets/delete_object :beam_lisp_code_leases row))"
+       deletion "(Enum/each (code_lease_rows handle)\n         (fn [row] (ets/delete_object :beam_lisp_code_leases row)))"
        fault (fn [stage]
                (str "(when (erlang/== :" stage " (maps/get :fault-stage admission nil)) "
                     "(erlang/send (maps/get :observer admission) (tuple :handoff-fault :" stage ")) "
@@ -212,8 +212,9 @@
        patched-body (-> body
                       (String/replace inserted (str "(do " inserted " " (fault "after-target") ")"))
                       (String/replace deletion
-                        (str "(fn [row] (ets/delete_object :beam_lisp_code_leases row) "
-                             (fault "after-first-delete") ")")))
+                        (str "(do " (fault "before-source-delete") " (Enum/each (code_lease_rows handle) "
+                             "(fn [row] (ets/delete_object :beam_lisp_code_leases row) "
+                             (fault "after-first-delete") ")))")))
        patched (str (first sections) "(defn handoff_code!" patched-body
                     "(defn release_code!" (second tail))
        ;; The probe must contend on the actual Env's physical lock identity;
@@ -221,6 +222,13 @@
        patched (String/replace patched
                  "(erlang/element 2 (erlang/fun_info (fn [] nil) :module))"
                  ":Elixir.BeamLisp.Env")
+       close-boundary "(consume_execution_registration! (:lease current))"
+       _ (when-not (= 2 (count (String/split patched close-boundary)))
+           (throw (ex-info "Native close fault boundary moved; review fixture" {})))
+       patched (String/replace patched close-boundary
+                 (str "(do " close-boundary
+                      " (erlang/send (Process/get :close-fault-observer) "
+                      "(tuple :handoff-fault :after-close-consume)) (erlang/exit (erlang/self) :kill))"))
        input (str directory "/env-fault.bl") token (BeamLisp.Env/capture)]
   (File/mkdir_p! directory)
   (File/write! input patched)
@@ -235,7 +243,7 @@
 (defn- fault-reached [stage]
  (receive [:handoff-fault seen] :when (= seen stage) true (after 10000 false)))
 
-(deftest killed-native-move-recovers-after-target-insert-and-partial-source-delete
+(deftest killed-native-move-distinguishes-unaccepted-target-from-accepted-payload
  (let [directory (str (System/get_env "HOME") "/tmp/bl-dispatch-fault-"
                      (erlang/unique_integer (list :positive)))
        env-path (code/which :Elixir.BeamLisp.Env)]
@@ -250,15 +258,18 @@
                                   (fn [[event _]] (when (= :run event) (swap! runs inc))))
                            prepared (:prepared slot)]
                       (erlang/apply PROBE :handoff_code!
-                        (list (get-in prepared [:source :lease]) (get-in prepared [:accepted :lease])
+                        (list (:lease (BeamLisp.Env/execution_registration_state (:source prepared)))
+                              (:lease (BeamLisp.Env/execution_registration_state (:accepted prepared)))
                           (assoc (:request slot) :observer parent :fault-stage stage))))))]
      (try
       (is (fault-reached stage))
       (is (await #(not (Process/alive? producer))))
-      (is (await #(= 1 @runs)))
+      ;; Physical scratch rows alone do not admit a callback. Promotion of
+      ;; the private pending payload is the native acceptance boundary.
+      (is (await #(= (if (= :after-target stage) 0 1) @runs)))
       (is (await #(idle? server)))
       (is (= 0 (ets/info table :size)))
-      (is (= 1 @runs))
+      (is (= (if (= :after-target stage) 0 1) @runs))
       (is (= env-path (code/which :Elixir.BeamLisp.Env)))
       (finally (when (Process/alive? producer) (Process/exit producer :kill)) (stop server)))))
    (finally (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))
@@ -296,3 +307,69 @@
     (when (and @server (Process/alive? @server)) (stop @server))
     (when @table (ets/delete @table))
     (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest receiver-death-after-native-promotion-cannot-reopen-the-original-epoch
+ (let [directory (str (System/get_env "HOME") "/tmp/bl-receiver-promotion-fault-"
+                     (erlang/unique_integer (list :positive)))
+       parent (erlang/self) calls (atom 0)
+       receiver (spawn (fn []
+                   (receive [:accept prepared]
+                    (erlang/apply PROBE :accept_execution_handoff!
+                      (list prepared {:owner parent :deadline-ms (+ 10000 (erlang/monotonic_time :millisecond))
+                                      :observer parent :fault-stage :before-source-delete})))))
+       monitor (Process/monitor receiver)
+       source (callback/register! (fn [] (swap! calls inc)))
+       lease (:lease (BeamLisp.Env/execution_registration_state source))
+       prepared (callback/prepare-transfer! source receiver)
+       competing (callback/prepare-transfer! source parent)]
+  (try
+   (compile-fault-probe! directory)
+   (erlang/send receiver [:accept prepared])
+   (is (fault-reached :before-source-delete))
+   (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid receiver)) true
+         (after 10000 false)))
+   (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+   (is (= :cancelled (callback/invoke! source [])))
+   (is (= 0 @calls))
+   ;; The original owner is alive: its physical scratch rows must also be
+   ;; reaped before any competing command can conceal those residual rows.
+   (is (await #(every? (fn [module]
+                        (not (ets/member :beam_lisp_code_leases
+                               (tuple module (elem lease 1) (elem lease 2)))))
+                      (elem lease 0))))
+   (is (await #(= nil (BeamLisp.Env/execution_registration_state (:accepted competing)))))
+   (is (= :cancelled (callback/commit-transfer! competing)))
+   (finally (callback/unregister! source) (callback/unregister! (:accepted prepared))
+    (callback/unregister! (:accepted competing))
+    (when (Process/alive? receiver) (erlang/exit receiver :kill))
+    (Process/demonitor monitor (list :flush))
+    (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))
+
+(deftest interrupted-native-close-is-reaped-without-killing-the-registration-owner
+ (let [directory (str (System/get_env "HOME") "/tmp/bl-native-close-fault-"
+                     (erlang/unique_integer (list :positive)))
+       parent (erlang/self) source (callback/register! (fn [] :never-reenter))
+       lease (:lease (BeamLisp.Env/execution_registration_state source))
+       prepared (callback/prepare-transfer! source parent)
+       closer (atom nil)]
+  (try
+   (compile-fault-probe! directory)
+   (reset! closer (spawn (fn []
+                          ;; Test observer address only; it grants no custody.
+                          (Process/put :close-fault-observer parent)
+                          (erlang/apply PROBE :close_execution_registration! (list source)))))
+   (let [pid @closer monitor (Process/monitor pid)]
+    (is (fault-reached :after-close-consume))
+    (is (receive [:DOWN seen :process stopped _] :when (and (= seen monitor) (= stopped pid)) true
+          (after 10000 false))))
+   (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+   (is (= :cancelled (callback/invoke! source [])))
+   (is (await #(every? (fn [module]
+                        (not (ets/member :beam_lisp_code_leases
+                               (tuple module (elem lease 1) (elem lease 2)))))
+                      (elem lease 0))))
+   (is (await #(= nil (BeamLisp.Env/execution_registration_state (:accepted prepared)))))
+   (is (= :cancelled (callback/commit-transfer! prepared)))
+   (finally (callback/unregister! source) (callback/unregister! (:accepted prepared))
+    (when (and @closer (Process/alive? @closer)) (erlang/exit @closer :kill))
+    (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))

@@ -1,0 +1,187 @@
+(ns artifact-provider.test (:require [artifact :as a] [claim :as claim]))
+(defn- refused? [f]
+  (try (f) false (catch error (= :artifact-refused (:kind (ex-data error))))))
+(deftest request-refuses-unsupported-target-name-and-missing-inputs
+  (is (refused? #(a/request "/tmp" "../escape" "v1" "x86_64-linux")))
+  (is (refused? #(a/request "/tmp" "demo" "v1" "aarch64-linux")))
+  (is (refused? #(a/request "relative" "demo" "v1" "x86_64-linux")))
+  (is (refused? #(a/request "/tmp" "demo" "" "x86_64-linux")))
+  (is (refused? #(a/request "/missing-artifact-source" "demo" "v1" "x86_64-linux"))))
+(deftest product-refuses-mutable-and-traversing-output-addresses
+  (is (refused? #(a/verify! "/tmp/old-library" {"crate" "demo"})))
+  (is (refused? #(a/verify! "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo/../other" {"crate" "demo"}))))
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
+(deftest actual-native-product-identity-and-byte-verification
+  (when-let [output (System/get_env "BL_ARTIFACT_TEST_OUTPUT")]
+    (let [request {"version" 1 "source" (get (Jason/decode! (File/read! (str output "/artifact.json"))) "source") "crate" "lazy_memo" "abi" "beam-lisp-native-lazy_memo-v1" "target" "x86_64-linux"}
+          verified (a/verify! output request)]
+      (is (= (str output "/lib/lazy_memo.so") (:library verified)))
+      (is (refused? #(a/verify! output (assoc request "abi" "wrong-abi"))))
+      (is (refused? #(a/verify! output (assoc request "target" "wrong-target")))))))
+)
+
+(deftest exact-source-and-abi-binding-refuse-a-different-product
+  (let [left {"output" "/nix/store/left" "manifest" {"source" "a" "abi" "v1" "sha256" "same"}}
+        right {"output" "/nix/store/right" "manifest" {"source" "a" "abi" "v2" "sha256" "same"}}
+        report (a/compare left right)]
+    (is (= false (:same-output report)))
+    (is (= [{:field "abi" :before "v1" :after "v2"}] (:changes report)))))
+
+(when (System/get_env "BL_ARTIFACT_PREPARED_TEST_INPUT")
+(deftest prepared-native-inputs-require-complete-source-and-final-byte-identity
+  (let [prepared (System/fetch_env! "BL_ARTIFACT_PREPARED_TEST_INPUT")
+        product (get-in (Jason/decode! (File/read! (Path/join prepared "artifacts.json")))
+                        ["products" "lazy_memo"])
+        source (Path/join (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR") "prepared-native-source")
+        prior (erlang/apply :Elixir.System :get_env (list "BL_PREPARED_NATIVES"))
+        options {:platform "/missing-platform-must-not-be-needed"
+                 :source (get product "source") :crate "lazy_memo"
+                 :abi "beam-lisp-native-lazy_memo-v1"}]
+    (try
+      (erlang/apply :Elixir.System :put_env (list "BL_PREPARED_NATIVES" prepared))
+      (let [resolved (a/resolve-native! options)]
+        (is (= prepared (:prepared-set resolved)))
+        (is (= (str (get product "output") "/lib/lazy_memo.so") (:library resolved))))
+      (File/cp_r! (get product "source") source)
+      (File/mkdir_p! (Path/join source "target"))
+      (File/write! (Path/join source "target/unrelated") "generated noise")
+      (is (= prepared (:prepared-set (a/resolve-native! (assoc options :source source)))))
+      (is (refused? #(a/resolve-native! (assoc options :abi "other-consumer-abi"))))
+      (let [file (Path/join source "Cargo.toml") mode (:mode (File/stat! file))]
+        (File/chmod! file (erlang/bor mode 64))
+        (is (refused? #(a/resolve-native! (assoc options :source source))))
+        (File/chmod! file mode))
+      (File/mkdir_p! (Path/join source ".cargo"))
+      (File/write! (Path/join source ".cargo/additional-input") "changed configuration")
+      (is (refused? #(a/resolve-native! (assoc options :source source))))
+      (File/rm! (Path/join source ".cargo/additional-input"))
+      (File/mkdir! (Path/join source "new-empty-directory"))
+      (is (refused? #(a/resolve-native! (assoc options :source source))))
+      (File/rmdir! (Path/join source "new-empty-directory"))
+      ;; Refuse a file link before following its target.
+      (File/ln_s! (Path/join (get product "source") "Cargo.lock") (Path/join source "linked-input"))
+      (is (refused? #(a/resolve-native! (assoc options :source source))))
+      (erlang/apply :Elixir.System :put_env (list "BL_PREPARED_NATIVES" source))
+      (is (refused? #(a/resolve-native! options)))
+      (finally
+        (if prior (erlang/apply :Elixir.System :put_env (list "BL_PREPARED_NATIVES" prior)) (erlang/apply :Elixir.System :delete_env (list "BL_PREPARED_NATIVES")))
+        (File/rm_rf! source))))))
+
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
+(deftest actual-nix-provider-retains-snapshot-and-build-consumer-selects-store-bytes
+  (let [platform (System/fetch_env! "BL_ARTIFACT_PLATFORM")
+        output (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR")
+        product (a/prepare-native! {:platform platform :source (Path/join (System/fetch_env! "BL_ARTIFACT_SOURCE_ROOT") "native/lazy_memo")
+                                    :crate "lazy_memo" :abi "beam-lisp-native-lazy_memo-v1"
+                                    :retention-dir (Path/join output "retained")})
+        project (Path/join output "consumer")
+        source (Path/join project "native/lazy_memo")
+        destination (Path/join project "priv/native/lazy_memo.so")]
+    (File/write! (Path/join output "product.json") (Jason/encode! product))
+    (let [capsule (a/capsule! product (Path/join output "capsules"))]
+      (is (= "not-recorded" (get (:descriptor capsule) "qualification")))
+      (is (= (:derivation product) (get (:descriptor capsule) "derivation")))
+      (is (= (tuple :ok (:output product)) (File/read_link (Path/join (:directory capsule) "retained")))))
+    (File/mkdir_p! (Path/dirname source))
+    (File/cp_r! (get (:manifest product) "source") source)
+    (File/mkdir_p! (Path/join source "target/release"))
+    (File/write! (Path/join source "target/release/liblazy_memo.so") "unrelated stale library")
+    (is (= (tuple :ok (:output product)) (File/read_link (:retention-root product))))
+    (is (= (get (:request product) "source") (get (:manifest product) "source")))
+    (is (refused? #(a/verify! (:output product) (assoc (:request product) "source" "/nix/store/wrong-source"))))
+    (BeamLisp.Loader/ensure_loaded "build")
+    (let [build (BeamLisp.Env/fetch_exact! "build" "build-native-crate")
+          before (erlang/apply :Elixir.System :get_env (list "BL_NATIVE_PROVIDER"))]
+      (try
+        (erlang/apply :Elixir.System :put_env (list "BL_NATIVE_PROVIDER" "nix"))
+        (let [result (build project "lazy_memo" nil)]
+          (is (= [] (:errors result)))
+          (is (= (tuple :ok (:library product)) (File/read_link destination)))
+          (is (= (File/read! (:library product)) (File/read! destination)))
+          ;; A project-only edit retains the same native product.
+          (File/mkdir_p! (Path/join project "src"))
+          (File/write! (Path/join project "src/app.bl") "(ns app) (def value 2)")
+          (is (= [] (:errors (build project "lazy_memo" nil))))
+          (is (= (tuple :ok (:library product)) (File/read_link destination)))
+          ;; A real foreign publisher excludes even an unchanged selection.
+          (let [parent (erlang/self)
+                [worker watch] (spawn-monitor
+                                 (fn []
+                                   (claim/acquire! (claim/artifact-scope destination) "foreign publisher")
+                                   (erlang/send parent :artifact-held)
+                                   (receive :finish :ok)))]
+            (try
+              (receive :artifact-held :ok (after 5000 (throw :artifact-holder-timeout)))
+              (is (seq (:errors (build project "lazy_memo" nil))))
+              (is (= (tuple :ok (:library product)) (File/read_link destination)))
+              (finally
+                (erlang/exit worker :kill)
+                (receive [:DOWN ref :process pid _] :when (= ref watch) :ok
+                  (after 5000 (throw :artifact-holder-not-down))))))
+          ;; A failed changed source cannot replace the last selected library.
+          (let [lib (Path/join source "src/lib.rs")]
+            (File/chmod! lib 420)
+            (File/write! lib (str (File/read! lib) "\nthis is deliberately invalid rust;\n")))
+          (let [failed (build project "lazy_memo" nil)]
+            (is (seq (:errors failed)))
+            (is (some #(String/contains? % "could not compile") (:errors failed))
+                "the changed snapshot reaches the actual Rust compiler")
+            (is (= (tuple :ok (:library product)) (File/read_link destination)))))
+        (finally (if before (erlang/apply :Elixir.System :put_env (list "BL_NATIVE_PROVIDER" before)) (erlang/apply :Elixir.System :delete_env (list "BL_NATIVE_PROVIDER"))))))))
+)
+
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
+(deftest consumer-metadata-changes-reuse-the-compiled-native-product
+  (let [platform (System/fetch_env! "BL_ARTIFACT_PLATFORM")
+        root (System/fetch_env! "BL_ARTIFACT_SOURCE_ROOT")
+        output (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR")
+        prior (Jason/decode! (File/read! (Path/join output "product.json")))
+        changed (a/prepare-native! {:platform platform :source (Path/join root "native/lazy_memo")
+                                    :crate "lazy_memo" :abi "consumer-$(touch $out/ABI_INJECTED)-v2"
+                                    :retention-dir (Path/join output "retained")})]
+    (is (not= (get prior "output") (:output changed)))
+    (is (= "consumer-$(touch $out/ABI_INJECTED)-v2" (get (:manifest changed) "abi")))
+    (is (not (File/exists? (Path/join (:output changed) "ABI_INJECTED"))))
+    (is (= (get-in prior ["manifest" "compiled"]) (get (:manifest changed) "compiled")))
+    (is (= (get-in prior ["manifest" "sha256"]) (get (:manifest changed) "sha256")))
+    (File/write! (Path/join output "metadata-product.json") (Jason/encode! changed))))
+)
+
+(when (= "1" (System/get_env "BL_ARTIFACT_INTEGRATION"))
+(deftest checkout-executor-staging-authenticates-bytes-before-an-actual-command
+  (let [source (System/fetch_env! "BL_ARTIFACT_SOURCE_ROOT")
+        output (System/fetch_env! "BL_ARTIFACT_OUTPUT_DIR")
+        workspace (Path/join output "command-workspace")
+        prior (System/get_env "BL_ARTIFACT_PLATFORM")
+        printf (System/find_executable "printf")]
+    (assert (some? printf))
+    (File/mkdir_p! workspace)
+    (claim/acquire! workspace "artifact executor consumer")
+    (try
+      ;; A checkout supplies its helper through Nix; Cargo is absent from this
+      ;; test VM's PATH. The default resolver does not depend on project cwd.
+      (System/put_env "BL_ARTIFACT_PLATFORM" source)
+      (let [executor (claim/command-executor)
+            result (claim/command! workspace printf ["staged-command-ok"]
+                                  {:timeout-ms 5000 :memory-bytes 268435456 :output-bytes 1024})]
+        (is (String/starts_with? executor "/nix/store/"))
+        (is (= 0 (elem result 1)))
+        (is (String/contains? (elem result 0) "staged-command-ok"))
+        (is (claim/owned? workspace))
+        (File/write! (Path/join output "executor.json")
+          (Jason/encode! {"path" executor
+                          "sha256" (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! executor))))})))
+      ;; Matching protocol text alone cannot replace authenticated bytes.
+      (let [fake (Path/join output "fake-platform")]
+        (File/mkdir_p! (Path/join fake "bin"))
+        (File/write! (Path/join fake "bin/bl-command-executor") "BEAM_LISP_CUSTODY_COMMAND_V1")
+        (File/write! (Path/join fake "executor.json")
+                     (Jason/encode! {"version" 1 "protocol" "BEAM_LISP_CUSTODY_COMMAND_V1" "sha256" "wrong"}))
+        (System/put_env "BL_ARTIFACT_PLATFORM" fake)
+        (is (= :command-executor-identity
+               (try (claim/command! workspace printf ["must-not-start"] {}) :accepted
+                    (catch error (:kind (ex-data error)))))))
+      (finally
+        (claim/release! workspace)
+        (if prior (System/put_env "BL_ARTIFACT_PLATFORM" prior) (System/delete_env "BL_ARTIFACT_PLATFORM"))))))
+)

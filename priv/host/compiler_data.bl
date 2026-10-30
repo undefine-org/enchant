@@ -35,6 +35,69 @@
 
 (ns host.compiler-data)
 
+(defn- simple_variable_patterns? [patterns remaining]
+ (cond
+  (erlang/== patterns (list)) true
+  (or (erlang/=< remaining 0) (erlang/not (erlang/is_list patterns))) false
+  :else
+   (let [pattern (erlang/hd patterns)]
+    (and (erlang/is_map pattern) (erlang/== :pvar (maps/get :pop pattern nil))
+         (erlang/is_binary (maps/get :name pattern nil))
+         (simple_variable_patterns? (erlang/tl patterns) (erlang/- remaining 1))))))
+
+(defn simple_function_clause
+ "The one unguarded plain-variable clause emitted as direct Core parameters.
+  This bounded shape view runs before language initialization. It never checks
+  or executes the body and supplies no compilation or execution authority."
+ [node]
+ (try
+  (when (and (erlang/is_map node) (erlang/== :fn (maps/get :op node nil)))
+   (let [clauses (maps/get :clauses node nil)]
+    (when (and (erlang/is_list clauses) (erlang/not (erlang/== clauses (list)))
+               (erlang/== (erlang/tl clauses) (list)))
+     (let [clause (erlang/hd clauses)]
+      (when (and (erlang/is_map clause) (erlang/== nil (maps/get :guard clause nil))
+                 (maps/is_key :body clause)
+                 (simple_variable_patterns? (maps/get :pats clause nil) 255))
+       clause)))))
+  (catch _ nil)))
+
+(defn catch_stack_bindings
+ "Fixed catch-scope names: frame lists and VM raw stacks remain distinct.
+  Pure compiler ABI data, available before namespace initialization."
+ []
+ (quote {:frames "__STACKTRACE__" :raw "__STACKTRACE_RAW__"}))
+
+(defn self_application_parts
+  "Recognize the compiler's inert fixed-point function constructor. The outer
+   function only returns the inner function; no user body is run by applying
+   it to itself. This shape alone grants no evaluation or invocation rights."
+  [node]
+  (try
+   (when (and (erlang/is_map node) (erlang/== :let (maps/get :op node nil)))
+    (let [name (maps/get :name node nil) outer (maps/get :init node nil)
+          application (maps/get :body node nil)
+          clauses (when (erlang/is_map outer) (maps/get :clauses outer nil))]
+     (when (and (erlang/is_binary name) (erlang/is_map outer)
+                (erlang/== :fn (maps/get :op outer nil))
+                (erlang/is_list clauses) (erlang/== 1 (erlang/length clauses))
+                (erlang/is_map application) (erlang/== :apply (maps/get :op application nil)))
+      (let [clause (erlang/hd clauses) pats (maps/get :pats clause nil)
+            inner (maps/get :body clause nil) target (maps/get :fn application nil)
+            args (maps/get :args application nil)]
+       (when (and (erlang/== nil (maps/get :guard clause nil))
+                  (erlang/is_list pats) (erlang/== 1 (erlang/length pats))
+                  (erlang/== :pvar (maps/get :pop (erlang/hd pats) nil))
+                  (erlang/== name (maps/get :name (erlang/hd pats) nil))
+                  (erlang/is_map inner) (erlang/== :fn (maps/get :op inner nil))
+                  (erlang/== :var (maps/get :op target nil))
+                  (erlang/== name (maps/get :name target nil))
+                  (erlang/is_list args) (erlang/== 1 (erlang/length args))
+                  (erlang/== :var (maps/get :op (erlang/hd args) nil))
+                  (erlang/== name (maps/get :name (erlang/hd args) nil)))
+        {:outer outer :clause clause :inner inner})))))
+   (catch _ nil)))
+
 (defn- invoke1
   "Call the callable `f` with one argument through the runtime's invocation
    contract — a beam-lisp fn, an Elixir fun, or a callable collection all work."
@@ -57,6 +120,28 @@
     (erlang/length xs)
     xs
     (catch _e (invalid-input!))))
+
+(defn- reference_digest? [value]
+ (and (erlang/is_binary value) (erlang/=:= 32 (erlang/byte_size value))))
+
+(defn binding_reference?
+ "Finite phase-binding reference shape, available before language bootstrap.
+  This validates data only; semantic selection and native admission have their
+  own owners. Every operation here is a native primitive, with no namespace var."
+ [value]
+ (and (erlang/is_map value) (erlang/=:= 7 (erlang/map_size value))
+      (erlang/=:= 1 (maps/get :version value nil))
+      (erlang/=:= :binding-reference (maps/get :kind value nil))
+      (reference_digest? (maps/get :world value nil))
+      (reference_digest? (maps/get :declaration value nil))
+      (reference_digest? (maps/get :id value nil))
+      (let [phase (maps/get :phase value nil) space (maps/get :space value nil)]
+       (and (erlang/is_integer phase) (erlang/=< -4096 phase) (erlang/=< phase 4096)
+            (erlang/is_tuple space) (erlang/=:= 2 (erlang/tuple_size space))
+            (erlang/=:= :symbol (erlang/element 1 space))
+            (erlang/is_binary (erlang/element 2 space))
+            (erlang/=< 1 (erlang/byte_size (erlang/element 2 space)))
+            (erlang/=< (erlang/byte_size (erlang/element 2 space)) 512)))))
 
 (defn eager_to_list
   "A plain Erlang list from a finite compiler collection: a proper list, a
@@ -180,8 +265,8 @@
                      root (erlang/element 4 items) tail (erlang/element 5 items)]
                 (when (> count max-nodes) (first_order_refuse! :node-limit))
                 (when-not (and (erlang/is_integer shift)
-                               (<= 5 shift 30) (= 0 (erlang/rem shift 5))
-                               (erlang/is_tuple tail) (<= 1 (erlang/tuple_size tail) 32))
+                               (and (erlang/=< 5 shift) (erlang/=< shift 30)) (= 0 (erlang/rem shift 5))
+                               (erlang/is_tuple tail) (and (erlang/=< 1 (erlang/tuple_size tail)) (erlang/=< (erlang/tuple_size tail) 32)))
                  (first_order_refuse! :vector-trie))
                 (let [tree-count (- count (erlang/tuple_size tail))]
                  (when-not (and (= 0 (erlang/rem tree-count 32))
@@ -271,7 +356,7 @@
                       (not (erlang/is_map_key :__struct__ (erlang/element 3 v))))
                   (raw_walk! context (erlang/element 3 v)
                     (raw_walk! context (erlang/element 2 v) budget (inc depth)) (inc depth))
-                 constructor-proof
+                 (or constructor-proof (erlang/element 5 context))
                   (loop [index 1 remaining budget]
                    (if (> index (erlang/tuple_size v)) remaining
                     (recur (inc index) (raw_walk! context (erlang/element index v) remaining (inc depth)))))
@@ -281,6 +366,10 @@
                  (let [tag (erlang/map_get :__struct__ v)]
                   (cond (erlang/== :Elixir.BeamLisp.Vector tag) (raw_vector_data! context v budget depth)
                         (erlang/== :Elixir.BeamLisp.Set tag) (raw_set_data! context v budget depth)
+                        (and constructor-proof
+                             (erlang/is_map_key :exceptions constructor-proof)
+                             (erlang/is_map_key v (erlang/map_get :exceptions constructor-proof)))
+                         (raw_plain_map! context v budget depth)
                         :else (first_order_refuse! :foreign-struct)))
                  (raw_plain_map! context v budget depth))
                :else (first_order_refuse! :opaque-value)))))
@@ -290,15 +379,16 @@
   proper lists, plain maps, BL symbols with bounded author metadata, native vectors
   and sets. Thread counters purely; allocate no atom/NIF resource per check.
   Validate opaque/forged structs and vector storage before protocol dispatch."
- [value options constructor-proof]
+ ([value options constructor-proof] (raw_data_remaining! value options constructor-proof false))
+ ([value options constructor-proof native-tuples?]
   (when-not (and (erlang/is_map options) (not (erlang/is_map_key :__struct__ options)))
    (first_order_refuse! :invalid-limits))
   (let [max-nodes (get options :max-nodes 16384) max-bytes (get options :max-bytes 1048576)
         max-depth (get options :max-depth 64)]
-   (when-not (and (int? max-nodes) (<= 1 max-nodes 1000000)
-                  (int? max-bytes) (<= 1 max-bytes 67108864)
-                  (int? max-depth) (<= 1 max-depth 128)) (first_order_refuse! :invalid-limits))
-   (raw_walk! (tuple max-nodes max-bytes max-depth constructor-proof) value (tuple max-nodes max-bytes) 0)))
+   (when-not (and (int? max-nodes) (and (erlang/=< 1 max-nodes) (erlang/=< max-nodes 1000000))
+                  (int? max-bytes) (and (erlang/=< 1 max-bytes) (erlang/=< max-bytes 67108864))
+                  (int? max-depth) (and (erlang/=< 1 max-depth) (erlang/=< max-depth 128))) (first_order_refuse! :invalid-limits))
+   (raw_walk! (tuple max-nodes max-bytes max-depth constructor-proof native-tuples?) value (tuple max-nodes max-bytes) 0))))
 
 (defn- first_order_remaining!
  ([value] (first_order_remaining! value {}))
@@ -309,6 +399,228 @@
   No namespace loading, protocol dispatch or opaque callback invocation."
  ([value] (check_first_order! value {}))
  ([value options] (first_order_remaining! value options) value))
+
+(defn check_compiler_data!
+ "Bounded closed compiler terms, including native tuple literals. Same raw
+  walker and resource/deferred-value refusals as public first-order data; this
+  wider passive data domain grants no callable, provenance or native admission."
+ ([value] (check_compiler_data! value {}))
+ ([value options] (raw_data_remaining! value options nil true) value))
+
+(defn check_reader_data! [form]
+  ;; Reader trees contain native tagged tuples, unlike runtime data/check!'s
+  ;; domain. Walk only raw terms: no Enumerable or application callback.
+  (loop [todo (list (tuple :value form 0)) nodes 16384 bytes 1048576]
+    (if (erlang/=:= (list) todo) form
+      (let [task (erlang/hd todo) pending (erlang/tl todo) mode (elem task 0)]
+        (case mode
+          :map
+          (let [entry (maps/next (elem task 1)) depth (elem task 2)]
+            (if (erlang/=:= :none entry) (recur pending nodes bytes)
+              (recur (cons (tuple :value (elem entry 0) depth)
+                       (cons (tuple :value (elem entry 1) depth)
+                         (cons (tuple :map (elem entry 2) depth) pending))) nodes bytes)))
+          :tuple
+          (let [value (elem task 1) index (elem task 2) depth (elem task 3)]
+            (if (erlang/> index (erlang/tuple_size value)) (recur pending nodes bytes)
+              (recur (cons (tuple :value (erlang/element index value) (erlang/+ depth 1))
+                       (cons (tuple :tuple value (erlang/+ index 1) depth) pending)) nodes bytes)))
+          :value
+          (let [value (elem task 1) depth (elem task 2)
+                next-nodes (erlang/- nodes 1)
+                next-bytes (erlang/- bytes (erlang/+ 8 (if (erlang/is_binary value) (erlang/byte_size value) 0)))]
+            (when (or (erlang/< next-nodes 0) (erlang/< next-bytes 0) (erlang/> depth 64))
+              (erlang/error :invalid_reader_data))
+            (cond
+              (or (erlang/is_atom value) (erlang/is_number value) (erlang/is_binary value))
+              (recur pending next-nodes next-bytes)
+              (erlang/is_list value)
+              (if (erlang/=:= (list) value) (recur pending next-nodes next-bytes)
+                (recur (cons (tuple :value (erlang/hd value) (erlang/+ depth 1))
+                         (cons (tuple :value (erlang/tl value) depth) pending)) next-nodes next-bytes))
+              (erlang/is_tuple value)
+              (recur (cons (tuple :tuple value 1 depth) pending) next-nodes next-bytes)
+              (and (erlang/is_map value) (erlang/not (maps/is_key :__struct__ value)))
+              (recur (cons (tuple :map (maps/iterator value) (erlang/+ depth 1)) pending) next-nodes next-bytes)
+              :else (erlang/error :invalid_reader_data))))))))
+
+
+(defn- namespace_require_refuse! [reason]
+ (erlang/error (tuple :invalid_namespace_require reason)))
+
+(defn- namespace_require_unmeta [node]
+ (if (and (erlang/is_tuple node) (erlang/== 3 (erlang/tuple_size node))
+          (erlang/== :meta (erlang/element 1 node)))
+  (namespace_require_unmeta (erlang/element 2 node)) node))
+
+(defn- namespace_require_tag? [node tag]
+ (and (erlang/is_tuple node) (erlang/== 2 (erlang/tuple_size node))
+      (erlang/== tag (erlang/element 1 node))))
+
+(defn- namespace_require_name! [node]
+ (let [node (namespace_require_unmeta node)]
+  (when-not (and (namespace_require_tag? node :symbol)
+                (erlang/is_binary (erlang/element 2 node))
+                (erlang/> (erlang/byte_size (erlang/element 2 node)) 0))
+   (namespace_require_refuse! :symbol))
+  (erlang/element 2 node)))
+
+(defn namespace_require_spec
+ "Parse one bounded Reader require into {target, alias, refers-or-all}.
+  Compiler and artifact header capture share this inert grammar. No namespace
+  declaration, provider lookup, collection protocol or callback execution."
+ [spec]
+ (check_reader_data! spec)
+ (let [node (namespace_require_unmeta spec)]
+  (if (namespace_require_tag? node :symbol)
+   (tuple (namespace_require_name! node) nil (list))
+   (do
+    (when-not (and (namespace_require_tag? node :vector)
+                   (erlang/is_list (erlang/element 2 node))
+                   (erlang/not (erlang/== (list) (erlang/element 2 node))))
+     (namespace_require_refuse! :shape))
+    (let [items (erlang/element 2 node) target (namespace_require_name! (erlang/hd items))]
+     (loop [flags (erlang/tl items) alias nil refers (list) seen {}]
+      (if (erlang/== flags (list)) (tuple target alias refers)
+       (do
+        (when (erlang/== (erlang/tl flags) (list)) (namespace_require_refuse! :missing-option-value))
+        (let [key (namespace_require_unmeta (erlang/hd flags))
+              value (namespace_require_unmeta (erlang/hd (erlang/tl flags)))]
+         (when-not (and (namespace_require_tag? key :keyword)
+                        (or (erlang/== "as" (erlang/element 2 key))
+                            (erlang/== "refer" (erlang/element 2 key))))
+          (namespace_require_refuse! :option))
+         (let [option (erlang/element 2 key)]
+          (when (maps/is_key option seen) (namespace_require_refuse! :duplicate-option))
+          (if (erlang/== option "as")
+           (recur (erlang/tl (erlang/tl flags)) (namespace_require_name! value) refers (maps/put option true seen))
+           (let [names
+                 (if (and (namespace_require_tag? value :keyword) (erlang/== "all" (erlang/element 2 value))) :all
+                  (do
+                   (when-not (and (namespace_require_tag? value :vector) (erlang/is_list (erlang/element 2 value)))
+                    (namespace_require_refuse! :refer))
+                   (let [parsed (Enum/map (erlang/element 2 value) (fn [name] (namespace_require_name! name)))]
+                    (when-not (erlang/== (erlang/length parsed) (erlang/length (Enum/uniq parsed)))
+                     (namespace_require_refuse! :duplicate-refer)) parsed)))]
+            (recur (erlang/tl (erlang/tl flags)) alias names (maps/put option true seen))))))))))))))
+
+
+(defn namespace_core_excludes
+ "Parse the bounded Reader tail of :refer-clojure once for compiler and
+  artifact capture. Only complete :exclude/vector pairs of symbols are valid."
+ [specs]
+ (check_reader_data! specs)
+ (when-not (erlang/is_list specs) (erlang/error (tuple :invalid_namespace_excludes :shape)))
+ (loop [remaining specs out (list)]
+  (if (erlang/== remaining (list)) out
+   (do
+    (when (erlang/== (erlang/tl remaining) (list))
+     (erlang/error (tuple :invalid_namespace_excludes :missing-value)))
+    (let [key (namespace_require_unmeta (erlang/hd remaining))
+          value (namespace_require_unmeta (erlang/hd (erlang/tl remaining)))]
+     (when-not (and (namespace_require_tag? key :keyword) (erlang/== "exclude" (erlang/element 2 key))
+                    (namespace_require_tag? value :vector) (erlang/is_list (erlang/element 2 value)))
+      (erlang/error (tuple :invalid_namespace_excludes :option)))
+     (recur (erlang/tl (erlang/tl remaining))
+       (erlang/++ out (Enum/map (erlang/element 2 value) (fn [name] (namespace_require_name! name))))))))))
+
+(defn namespace_clauses
+ "Normalize the bounded Reader tail after an ns name. One optional leading
+  docstring is data; remaining forms must be supported keyword-headed clauses.
+  Returns original Reader nodes so exact Source positions remain available."
+ [forms]
+ (check_reader_data! forms)
+ (when-not (erlang/is_list forms) (erlang/error (tuple :invalid_namespace_header :clauses)))
+ (let [clauses (if (and (erlang/not (erlang/== (list) forms))
+                        (erlang/is_binary (namespace_require_unmeta (erlang/hd forms))))
+                 (erlang/tl forms) forms)]
+  (Enum/each clauses
+   (fn [clause]
+    (let [node (namespace_require_unmeta clause)]
+     (when-not (and (namespace_require_tag? node :list)
+                    (erlang/is_list (erlang/element 2 node))
+                    (erlang/not (erlang/== (list) (erlang/element 2 node))))
+      (erlang/error (tuple :invalid_namespace_header :clause)))
+     (let [head (namespace_require_unmeta (erlang/hd (erlang/element 2 node)))]
+      (when-not (and (namespace_require_tag? head :keyword)
+                     (lists/member (erlang/element 2 head) (list "require" "import" "refer-clojure")))
+       (erlang/error (tuple :invalid_namespace_header :clause)))))))
+  clauses))
+
+(defn- contextual_unit_refuse! [reason]
+ (erlang/error (tuple :invalid_contextual_unit reason)))
+
+(defn check_contextual_unit!
+ "Bounded compiled-unit data shape, shared before and after bootstrap.
+  ANF owns executable grammar/projection; selection and native admission are
+  separate. No namespace lookup, Source loading or user callback is involved."
+ [unit]
+ (check_compiler_data! unit {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+ (when-not (and (erlang/is_map unit) (erlang/=:= 6 (erlang/map_size unit))
+                (erlang/=:= 2 (maps/get :version unit nil))
+                (erlang/=:= :compiled-contextual-unit (maps/get :kind unit nil))
+                (erlang/is_list (maps/get :initializers unit nil))
+                (erlang/is_list (maps/get :steps unit nil))
+                (erlang/is_list (maps/get :exports unit nil))
+                (maps/is_key :entry unit))
+  (contextual_unit_refuse! :unit))
+ (let [references
+       (loop [rows (maps/get :initializers unit) names {} slots {} references {}]
+        (if (erlang/== rows (list)) references
+         (let [row (erlang/hd rows)]
+          (when-not (and (erlang/is_map row) (erlang/=:= 4 (erlang/map_size row))
+                         (maps/is_key :node row))
+           (contextual_unit_refuse! :initializer))
+          (let [name (maps/get :name row nil) slot (maps/get :slot row nil)
+                reference (maps/get :reference row nil)]
+           (when-not (and (erlang/is_binary name) (erlang/> (erlang/byte_size name) 0)
+                          (not (maps/is_key name names)))
+            (contextual_unit_refuse! :initializer-name))
+           (when-not (and (erlang/is_binary slot) (erlang/> (erlang/byte_size slot) 0)
+                          (not (maps/is_key slot slots)))
+            (contextual_unit_refuse! :initializer-slot))
+           (when-not (and (binding_reference? reference) (not (maps/is_key reference references)))
+            (contextual_unit_refuse! :initializer-reference))
+           (recur (erlang/tl rows) (maps/put name true names) (maps/put slot true slots)
+                  (maps/put reference true references))))))
+       slots (Enum/reduce (maps/get :initializers unit) {}
+               (fn [row out] (maps/put (maps/get :slot row) true out)))
+       initialized
+       (loop [steps (maps/get :steps unit) seen {} locals slots]
+        (if (erlang/== steps (list)) seen
+         (let [step (erlang/hd steps)]
+          (when-not (erlang/is_map step) (contextual_unit_refuse! :step))
+          (case (maps/get :op step nil)
+           :initialize
+           (let [reference (maps/get :reference step nil)]
+            (when-not (and (erlang/=:= 2 (erlang/map_size step))
+                           (maps/is_key reference references)
+                           (not (maps/is_key reference seen)))
+             (contextual_unit_refuse! :step-reference))
+            (recur (erlang/tl steps) (maps/put reference true seen) locals))
+           :evaluate
+           (do
+            (when-not (and (erlang/=:= 2 (erlang/map_size step)) (maps/is_key :node step))
+             (contextual_unit_refuse! :step-expression))
+            (recur (erlang/tl steps) seen locals))
+           :capture
+           (let [slot (maps/get :slot step nil)]
+            (when-not (and (erlang/=:= 3 (erlang/map_size step)) (maps/is_key :node step)
+                           (erlang/is_binary slot) (erlang/> (erlang/byte_size slot) 0)
+                           (not (maps/is_key slot locals)))
+             (contextual_unit_refuse! :step-slot))
+            (recur (erlang/tl steps) seen (maps/put slot true locals)))
+           (contextual_unit_refuse! :step-operation)))))]
+  (when-not (erlang/=:= (erlang/map_size initialized) (erlang/map_size references))
+   (contextual_unit_refuse! :missing-initialization))
+  (loop [rows (maps/get :exports unit) seen {}]
+   (when-not (erlang/== rows (list))
+    (let [reference (erlang/hd rows)]
+     (when-not (and (binding_reference? reference) (maps/is_key reference references)
+                    (not (maps/is_key reference seen)))
+      (contextual_unit_refuse! :export-reference))
+     (recur (erlang/tl rows) (maps/put reference true seen)))))
+ unit))
 
 (defn first_order_cost!
  "Validate once and report exact raw traversal nodes/bytes for aggregate
@@ -326,12 +638,16 @@
   capsules require exact caller-owned leaf witnesses. Witnesses authorize only
   validation, never invocation. No protocols, namespace lookup or callback runs."
  [value proof]
- (when-not (and (erlang/is_map proof) (= 3 (erlang/map_size proof))
+ (when-not (and (erlang/is_map proof) (or (= 3 (erlang/map_size proof)) (= 4 (erlang/map_size proof)))
                 (erlang/is_map_key :callables proof) (erlang/is_map (erlang/map_get :callables proof))
                 (<= (erlang/map_size (erlang/map_get :callables proof)) 16384)
                 (erlang/is_map_key :recipes proof) (erlang/is_map (erlang/map_get :recipes proof))
                 (<= (erlang/map_size (erlang/map_get :recipes proof)) 4096)
-                (erlang/is_map_key :recipe-frame proof))
+                (erlang/is_map_key :recipe-frame proof)
+                (or (and (= 3 (erlang/map_size proof)) (not (erlang/is_map_key :exceptions proof)))
+                    (and (erlang/is_map_key :exceptions proof)
+                         (erlang/is_map (erlang/map_get :exceptions proof))
+                         (<= (erlang/map_size (erlang/map_get :exceptions proof)) 4096))))
   (first_order_refuse! :invalid-constructor-witness))
  (let [remaining (raw_data_remaining! value
                   {:max-nodes 65536 :max-bytes 1048576 :max-depth 128} proof)]
@@ -400,8 +716,8 @@
           {:kind :unsafe-external-data :reason reason})))
 
 (defn- etf_end! [bytes offset count]
- (let [end (+ offset count)]
-  (when (> end (erlang/byte_size bytes)) (external_data_refuse! :truncated))
+ (let [end (erlang/+ offset count)]
+  (when (erlang/> end (erlang/byte_size bytes)) (external_data_refuse! :truncated))
   end))
 
 (defn- etf_uint! [bytes offset width]
@@ -410,29 +726,29 @@
 
 (defn- etf_sized_leaf! [bytes offset width extra]
  (let [size (etf_uint! bytes offset width)]
-  (tuple (etf_end! bytes (+ offset width) (+ extra size)) 0)))
+  (tuple (etf_end! bytes (erlang/+ offset width) (erlang/+ extra size)) 0)))
 
 (defn- etf_step! [bytes offset]
  (etf_end! bytes offset 1)
- (let [tag (binary/at bytes offset) start (inc offset)]
+ (let [tag (binary/at bytes offset) start (erlang/+ 1 offset)]
   (cond
-   (= tag 97) (tuple (etf_end! bytes start 1) 0)   ; SMALL_INTEGER_EXT
-   (= tag 98) (tuple (etf_end! bytes start 4) 0)   ; INTEGER_EXT
-   (= tag 70) (tuple (etf_end! bytes start 8) 0)   ; NEW_FLOAT_EXT
-   (= tag 99) (tuple (etf_end! bytes start 31) 0)  ; FLOAT_EXT
-   (or (= tag 100) (= tag 118)) (etf_sized_leaf! bytes start 2 0)
-   (or (= tag 115) (= tag 119)) (etf_sized_leaf! bytes start 1 0)
-   (= tag 104) (tuple (etf_end! bytes start 1) (etf_uint! bytes start 1))
-   (= tag 105) (tuple (etf_end! bytes start 4) (etf_uint! bytes start 4))
-   (= tag 106) (tuple start 0)                    ; NIL_EXT
-   (= tag 107) (etf_sized_leaf! bytes start 2 0)   ; STRING_EXT
-   (= tag 108) (tuple (etf_end! bytes start 4) (inc (etf_uint! bytes start 4)))
-   (= tag 109) (etf_sized_leaf! bytes start 4 0)   ; BINARY_EXT
-   (= tag 77) (etf_sized_leaf! bytes start 4 1)    ; BIT_BINARY_EXT
-   (= tag 110) (etf_sized_leaf! bytes start 1 1)   ; SMALL_BIG_EXT + sign
-   (= tag 111) (etf_sized_leaf! bytes start 4 1)   ; LARGE_BIG_EXT + sign
-   (= tag 116) (tuple (etf_end! bytes start 4) (* 2 (etf_uint! bytes start 4)))
-   (= tag 80) (external_data_refuse! :compressed)
+   (erlang/=:= tag 97) (tuple (etf_end! bytes start 1) 0)   ; SMALL_INTEGER_EXT
+   (erlang/=:= tag 98) (tuple (etf_end! bytes start 4) 0)   ; INTEGER_EXT
+   (erlang/=:= tag 70) (tuple (etf_end! bytes start 8) 0)   ; NEW_FLOAT_EXT
+   (erlang/=:= tag 99) (tuple (etf_end! bytes start 31) 0)  ; FLOAT_EXT
+   (or (erlang/=:= tag 100) (erlang/=:= tag 118)) (etf_sized_leaf! bytes start 2 0)
+   (or (erlang/=:= tag 115) (erlang/=:= tag 119)) (etf_sized_leaf! bytes start 1 0)
+   (erlang/=:= tag 104) (tuple (etf_end! bytes start 1) (etf_uint! bytes start 1))
+   (erlang/=:= tag 105) (tuple (etf_end! bytes start 4) (etf_uint! bytes start 4))
+   (erlang/=:= tag 106) (tuple start 0)                    ; NIL_EXT
+   (erlang/=:= tag 107) (etf_sized_leaf! bytes start 2 0)   ; STRING_EXT
+   (erlang/=:= tag 108) (tuple (etf_end! bytes start 4) (erlang/+ 1 (etf_uint! bytes start 4)))
+   (erlang/=:= tag 109) (etf_sized_leaf! bytes start 4 0)   ; BINARY_EXT
+   (erlang/=:= tag 77) (etf_sized_leaf! bytes start 4 1)    ; BIT_BINARY_EXT
+   (erlang/=:= tag 110) (etf_sized_leaf! bytes start 1 1)   ; SMALL_BIG_EXT + sign
+   (erlang/=:= tag 111) (etf_sized_leaf! bytes start 4 1)   ; LARGE_BIG_EXT + sign
+   (erlang/=:= tag 116) (tuple (etf_end! bytes start 4) (erlang/* 2 (etf_uint! bytes start 4)))
+   (erlang/=:= tag 80) (external_data_refuse! :compressed)
    ;; Include future tags in the refusal. Never skip an unrecognized body:
    ;; that could hide a capability inside an otherwise innocuous container.
    :else (external_data_refuse! :runtime-or-unknown-tag))))
@@ -451,29 +767,29 @@
   (let [max-bytes (Map/get options :max-bytes 16777216)
         max-nodes (Map/get options :max-nodes 1000000)
         max-depth (Map/get options :max-depth 128)]
-   (when-not (and (erlang/is_integer max-bytes) (<= 1 max-bytes 67108864)
-                  (erlang/is_integer max-nodes) (<= 1 max-nodes 1000000)
-                  (erlang/is_integer max-depth) (<= 1 max-depth 128))
+   (when-not (and (erlang/is_integer max-bytes) (and (erlang/=< 1 max-bytes) (erlang/=< max-bytes 67108864))
+                  (erlang/is_integer max-nodes) (and (erlang/=< 1 max-nodes) (erlang/=< max-nodes 1000000))
+                  (erlang/is_integer max-depth) (and (erlang/=< 1 max-depth) (erlang/=< max-depth 128)))
     (external_data_refuse! :invalid-limits))
-   (when (> (erlang/byte_size bytes) max-bytes) (external_data_refuse! :byte-limit))
-   (when-not (and (> (erlang/byte_size bytes) 1) (= 131 (binary/at bytes 0)))
+   (when (erlang/> (erlang/byte_size bytes) max-bytes) (external_data_refuse! :byte-limit))
+   (when-not (and (erlang/> (erlang/byte_size bytes) 1) (erlang/=:= 131 (binary/at bytes 0)))
     (external_data_refuse! :version))
    ;; Pending groups store counts, not one stack element per child. The stack
    ;; is O(depth), even for a forged billion-element tuple or map header.
    (loop [offset 1 pending (list (tuple 1 0)) remaining max-nodes]
     (if (erlang/== (list) pending)
-     (do (when-not (= offset (erlang/byte_size bytes))
+     (do (when-not (erlang/=:= offset (erlang/byte_size bytes))
           (external_data_refuse! :trailing-bytes)) bytes)
      (let [group (erlang/hd pending) count (erlang/element 1 group)
            depth (erlang/element 2 group) rest (erlang/tl pending)]
-      (when (> depth max-depth) (external_data_refuse! :depth-limit))
-      (when (<= remaining 0) (external_data_refuse! :node-limit))
+      (when (erlang/> depth max-depth) (external_data_refuse! :depth-limit))
+      (when (erlang/=< remaining 0) (external_data_refuse! :node-limit))
       (let [step (etf_step! bytes offset) children (erlang/element 2 step)
-            left (dec remaining)
-            siblings (if (> count 1) (erlang/++ (list (tuple (dec count) depth)) rest) rest)]
-       (when (> children left) (external_data_refuse! :node-limit))
+            left (erlang/- remaining 1)
+            siblings (if (erlang/> count 1) (erlang/++ (list (tuple (erlang/- count 1) depth)) rest) rest)]
+       (when (erlang/> children left) (external_data_refuse! :node-limit))
        (recur (erlang/element 1 step)
-        (if (> children 0) (erlang/++ (list (tuple children (inc depth))) siblings) siblings)
+        (if (erlang/> children 0) (erlang/++ (list (tuple children (erlang/+ 1 depth))) siblings) siblings)
         left))))))))
 
 (defn decode_closed_etf!
@@ -483,3 +799,72 @@
  ([bytes options]
   (check_closed_etf! bytes options)
   (erlang/binary_to_term bytes (list :safe))))
+
+
+(defn sdk_function_declaration
+ "Canonical SDK forwarding declaration as inert datum. Both Source generation
+  and phase binding compare this exact recipe; it grants no SDK authority."
+ [binding]
+ (check_first_order! binding {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+ (when-not (and (erlang/is_map binding) (= :function (:kind binding))
+                (erlang/is_binary (:namespace binding)) (erlang/is_binary (:name binding))
+                (erlang/is_list (:clauses binding)) (<= 1 (erlang/length (:clauses binding)) 256)
+                (Enum/all? (:clauses binding)
+                 (fn [clause]
+                  (and (erlang/is_map clause) (contains? #{:fixed :variadic} (:kind clause))
+                       (erlang/is_integer (:arity clause)) (<= 0 (:arity clause) 255)
+                       (erlang/is_integer (:minimum-arity clause))
+                       (if (= :fixed (:kind clause)) (= (:arity clause) (:minimum-arity clause))
+                        (= (:arity clause) (inc (:minimum-arity clause))))
+                       (<= 0 (:minimum-arity clause))
+                       (erlang/is_binary (:module clause)) (erlang/is_binary (:function clause))
+                       (erlang/is_binary (:md5 clause)) (= 16 (erlang/byte_size (:md5 clause)))))))
+  (erlang/error :invalid_sdk_function_declaration))
+ (check_first_order!
+ (let [clauses (Enum/map (:clauses binding)
+                        (fn [clause]
+                         (let [args (mapv #(symbol (str "sdk_arg_" %)) (range (:arity clause)))
+                               parameters (if (= :variadic (:kind clause))
+                                            (into (vec (take (:minimum-arity clause) args)) ['& (last args)]) args)
+                               target (symbol (str (:module clause) "/" (:function clause)))]
+                          ;; Pin the callable in executable Source too. A phase
+                          ;; archive retains this check even without the file
+                          ;; adapter's SDK selection metadata. The check only
+                          ;; narrows execution; native public-MFA/custody checks
+                          ;; still decide whether the call may execute.
+                          (list parameters
+                           (list 'if
+                            (list 'erlang/=:=
+                             (list 'erlang/binary_to_list
+                              (list 'erlang/get_module_info (erlang/binary_to_existing_atom (:module clause)) :md5))
+                             (list 'quote (erlang/binary_to_list (:md5 clause))))
+                            (cons target (to-list args))
+                            (list 'erlang/error :sdk-function-binding-target-changed))))))]
+          (cons 'defn
+           (cons (symbol (:name binding))
+            (cons {:sdk-phase {:namespace (:namespace binding) :name (:name binding)
+                               :digest (Base/encode16
+                                (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
+                                (list (tuple :case :lower)))}}
+                  (to-list clauses)))))
+ {:max-nodes 16384 :max-bytes 1048576 :max-depth 64}))
+
+
+(defn sdk_macro_declaration
+ "Canonical phase-only SDK macro carrier. Exact validation selects the original
+  immutable datum-macro recipe; this inert body never grants Source SDK origin."
+ [binding]
+ (check_first_order! binding {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+ (when-not (and (erlang/is_map binding) (= :macro (:kind binding))
+                (erlang/is_binary (:namespace binding)) (erlang/is_binary (:name binding))
+                (erlang/is_list (:value binding)) (= 'defmacro (first (:value binding)))
+                (= (symbol (:name binding)) (second (:value binding))))
+  (erlang/error :invalid_sdk_macro_declaration))
+ (check_first_order!
+  (list 'defsyntax (symbol (:name binding))
+   {:sdk-macro {:namespace (:namespace binding) :name (:name binding)
+                :digest (Base/encode16
+                         (crypto/hash :sha256 (erlang/term_to_binary binding (list :deterministic)))
+                         (list (tuple :case :lower)))}}
+   ['sdk_macro_form 'sdk_macro_context] (list 'throw :sdk-macro-binding-required))
+  {:max-nodes 16384 :max-bytes 1048576 :max-depth 64}))

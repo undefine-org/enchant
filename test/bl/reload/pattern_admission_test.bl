@@ -1,0 +1,69 @@
+(ns reload.pattern-admission-test
+ (:require [reload.source-producer :as producer] [reload.native-call :as native] [anf :as anf] [lower :as lower] [reload.registration :as registration]))
+
+(defn- key-call []
+ (anf/remote :erlang :apply
+  (list (anf/lit :httpc) (anf/lit :request) (anf/cons-cell (anf/lit :request) (anf/empty-list-node)))))
+(defn- nested-pattern [key]
+ (anf/ptuple (list (anf/pcons (anf/pmap (list [key (anf/pvar "value")])) (anf/empty-list-pattern)))))
+(defn- body [pattern]
+ (anf/fnn (list (anf/clause (list pattern) nil (anf/var "value")))))
+(defn- key-of [node]
+ (first (anf/pattern-expressions (first (:pats (first (:clauses node)))))))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest native-pattern-keys-require-the-same-authorization-as-body-calls
+ (let [input (body (nested-pattern (key-call))) seen (atom [])
+       output (native/specialize input #(swap! seen conj %))]
+  (is (= [{:module :httpc :function :request :arity 1}] @seen))
+  (is (= @seen (:targets output)))
+  (is (= :case (:op (key-of (:expression output)))))
+  (is (= :denied-pattern-target
+         (kind #(native/specialize input (fn [_] (throw (ex-info "denied" {:kind :denied-pattern-target})))))))))
+
+(deftest source-pattern-keys-cannot-bypass-http-declaration-checks
+ (let [input (body (nested-pattern (anf/remote :httpc :request (list (anf/lit :request)))))
+       result (producer/specialize input {:source-ingress true :native-modules #{"httpc"}
+                                          :guard-module :guard :guard-function :request})]
+  (is (= :undeclared-native-target
+         (kind #(producer/specialize input {:source-ingress true :native-modules #{}}))))
+  (is (= 1 (:changes result)))
+  (is (= :guard (:mod (key-of (:expression result)))))
+  (is (= :request (:fun (key-of (:expression result)))))))
+
+(deftest compiler-pattern-binders-and-literal-lookalikes-stay-inert
+ (let [call (key-call)
+       pattern (anf/ptuple (list (anf/plit call) (anf/pvar "httpc/request")))
+       input (body pattern)
+       seen (atom 0)
+       output (:expression (producer/specialize input {:source-ingress true :native-modules #{}}))
+       actual-pattern (first (:pats (first (:clauses output))))]
+  (is (= input (:expression (native/specialize input (fn [_] (swap! seen inc))))))
+  (is (= 0 @seen))
+  (is (= pattern actual-pattern))))
+
+(deftest lexical-map-keys-preserve-actual-native-pattern-matching
+ (let [node (anf/lett "key" (anf/lit :answer)
+              (anf/casee (anf/mapp (list [(anf/lit :answer) (anf/lit 42)]))
+               (list (anf/clause (list (anf/pmap (list [(anf/var "key") (anf/pvar "value")])))
+                                nil (anf/var "value")))))
+       native-output (:expression (native/specialize node (fn [_] (throw :unexpected-authorization))))
+       source-output (:expression (producer/specialize node {:source-ingress true :native-modules #{}}))]
+  (is (= 42 (lower/eval-anf :Elixir.PatternNativeLexical native-output)))
+  (is (= 42 (lower/eval-anf :Elixir.PatternSourceLexical source-output)))))
+
+
+(deftest registration-pattern-operands-use-the-declaration-owner-before-initialization
+ (let [call (anf/remote :pattern.sdk :register!
+                    (list (anf/lit :pattern/id) (anf/global "owned.pattern" "callback")))
+       input (body (nested-pattern call))
+       contract {:kind :pattern :arity 2 :id-position 0 :callback-position 1}
+       seen (atom [])
+       output (registration/specialize input {[:pattern.sdk :register! 2] contract} {}
+                (fn [c ident owner callback] (swap! seen conj [(:kind c) ident owner callback])))]
+  (is (= [[:pattern :pattern/id "owned.pattern" "callback"]] @seen))
+  (is (= :pattern/id (:val (key-of (:expression output)))))
+  (is (= :dynamic-executable-registration
+         (kind #(registration/specialize
+                  (body (nested-pattern (assoc call :args (list (anf/var "id") (second (:args call))))))
+                  {[:pattern.sdk :register! 2] contract} {} (fn [& _] (throw :must-not-declare))))))))

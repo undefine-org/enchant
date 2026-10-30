@@ -1,0 +1,180 @@
+(ns system.ownership-native-test (:require [system.ownership :as o]))
+
+(defn- analyze [body]
+ (o/check [{:id 'handoff :body
+             (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one body)
+                                       (BeamLisp.Compiler/new_env "ownership.native.fixture"))}]
+          (o/execution-protocol)))
+(defn- program [body]
+ (str "(let [r (BeamLisp.Execution/register! (fn [] 42))] " body ")"))
+(defn- prepared
+ ([body cleanup] (prepared body cleanup true))
+ ([body cleanup protect-source]
+  (let [inner (str "(let [p (BeamLisp.Execution/prepare-handoff! r :owner)] (try (do " body
+                   " 42) (finally " cleanup ")))")]
+   (program (if protect-source
+              (str "(try " inner " (finally (BeamLisp.Execution/close! r)))") inner)))))
+(def close-both
+ "(BeamLisp.Execution/close! r) (when-let [t (:accepted p)] (BeamLisp.Execution/close! t))")
+
+(deftest real-native-envelopes-have-path-specific-cleanup-obligations
+ (doseq [body ["42"
+               "(when (:accepted p) (BeamLisp.Execution/accept-handoff! p))"
+               "(when (:accepted p) (do (BeamLisp.Execution/accept-handoff! p) (BeamLisp.Execution/accept-handoff! p)))"
+               "(when (:accepted p) (BeamLisp.Execution/accept-handoff! p :admission))"]]
+  (let [r (analyze (prepared body close-both))]
+   (is (= :conditional (:status r)) (pr-str [body r]))
+   (is (empty? (:issues r)))
+   (is (= false (:native-admission r)))))
+ (is (= :refused (:status (analyze (prepared "42" "(BeamLisp.Execution/close! r)")))))
+ (is (= :refused (:status (analyze (prepared "42" close-both false)))))
+ (is (= :refused (:status (analyze (prepared "(when (:accepted p) (BeamLisp.Execution/accept-handoff! p))"
+                          "(when-let [t (:accepted p)] (BeamLisp.Execution/close! t))" false)))))
+ (is (= :conditional (:status (analyze (program
+       "(do (BeamLisp.Execution/close! r) (BeamLisp.Execution/prepare-handoff! r :owner))")))))
+ (is (= nil (BeamLisp/eval "(:accepted :cancelled)")))
+ (is (= :unknown (:status (analyze (prepared
+       "(when-let [t (:accepted p)] (BeamLisp.Execution/invoke! t []))" close-both))))))
+
+(deftest finite-relation-preserves-native-preparation-and-idempotent-acceptance
+ (let [initial {'source {:phase :owned :borrows #{}}}
+       prepare (o/handoff-outcomes initial {:operation :prepare :source 'source :target 'target})
+       pending (:resources (first (filter #(= :prepared (:outcome %)) (:outcomes prepare))))
+       accepts (o/handoff-outcomes pending {:operation :accept :source 'source :target 'target})
+       accepted (:resources (first (filter #(= :accepted (:outcome %)) (:outcomes accepts))))]
+  (is (= false (:native-admission prepare)))
+  (is (= :owned (get-in pending ['source :phase])))
+  (is (= :prepared (get-in pending ['target :phase])))
+  (is (= #{:cancelled :busy :accepted} (set (map :outcome (:outcomes accepts)))))
+  (is (= :moved (get-in accepted ['source :phase])))
+  (is (= :owned (get-in accepted ['target :phase])))
+  (let [again (first (filter #(= :accepted (:outcome %))
+                            (:outcomes (o/handoff-outcomes accepted {:operation :accept :source 'source :target 'target}))))]
+   (is (= accepted (:resources again)))
+   (is (= 'target (get-in again [:return :registration]))))
+  (let [closed (:resources (first (:outcomes (o/handoff-outcomes pending {:operation :close :target 'target}))))]
+   (is (= :owned (get-in closed ['source :phase])))
+   (is (= #{:cancelled} (set (map :outcome (:outcomes
+          (o/handoff-outcomes closed {:operation :accept :source 'source :target 'target})))))))))
+
+;; Check actual native return shapes and observed registrations after each
+;; event against the SAME relation consumed by the compiler analysis. Symbolic
+;; IDs never contain the opaque registrations used by the native fixture.
+(defn- replay-native [commands]
+ (let [receiver (spawn #(receive :stop nil (after 60000 nil)))
+       source (BeamLisp.Execution/register! (fn [] 42))
+       actual (atom {'source source}) preparations (atom {})
+       state (atom {'source {:phase :owned :borrows #{}}})]
+  (try
+   (doseq [command commands]
+    (let [target (:target command)
+          observed
+          (case (:operation command)
+           :prepare
+            (let [p (BeamLisp.Execution/prepare-handoff! source receiver)]
+             (if (= :cancelled p) {:kind :literal :value :cancelled}
+              (do (swap! actual assoc target (:accepted p)) (swap! preparations assoc target p)
+                  (is (= source (:source p)))
+                  {:kind :prepared :source 'source :target target})))
+           :accept
+            (let [r (BeamLisp.Execution/accept-handoff! (get @preparations target))]
+             (cond-> {:kind :status :status (:status r)}
+              (= :accepted (:status r))
+               (assoc :registration (do (is (= (get @actual target) (:registration r))) target))
+              (= :busy (:status r)) (assoc :detail (:kind r))))
+           :close {:kind :literal :value (BeamLisp.Execution/close! (get @actual target))}
+           :owner-down
+            (let [monitor (Process/monitor receiver)]
+             (Process/exit receiver :kill)
+             (receive [:DOWN ref :process pid _] :when (and (= monitor ref) (= receiver pid)) :down
+              (after 10000 (throw :missing-native-owner-death)))
+             {:kind :owner-down}))
+          relation (o/handoff-outcomes @state command)
+          matches (filter #(= observed (:return %)) (:outcomes relation))]
+     (is (= 1 (count matches)) (pr-str [command observed relation]))
+     (when-not (= 1 (count matches)) (throw :native-trace-outside-model))
+     (reset! state (:resources (first matches)))
+     (doseq [[id registration] @actual]
+      (let [phase (get-in @state [id :phase])
+            expected (case phase
+                       :owned :active
+                       :prepared (if (= :owned (get-in @state ['source :phase])) :pending :cancelled)
+                       :cancelled)]
+       (is (= expected (:status (BeamLisp.Execution/observe registration)))
+           (pr-str [commands command id phase]))))))
+   (finally
+    (doseq [[id registration] @actual] (BeamLisp.Execution/close! registration))
+    (when (Process/alive? receiver) (erlang/send receiver :stop))))))
+
+(deftest real-native-traces-conform-to-the-finite-outcome-relation
+ (let [p {:operation :prepare :source 'source :target 'a}
+       q {:operation :prepare :source 'source :target 'b}
+       accept-a {:operation :accept :source 'source :target 'a}
+       accept-b {:operation :accept :source 'source :target 'b}
+       close-source {:operation :close :target 'source}
+       close-a {:operation :close :target 'a}
+       close-b {:operation :close :target 'b}]
+  (doseq [trace [[p accept-a accept-a close-source close-a]
+                 [p accept-a close-source accept-a close-a]
+                 [p close-a accept-a close-source]
+                 [p close-source accept-a close-a]
+                 [p q accept-a accept-b close-b close-a close-source]
+                 [p {:operation :owner-down :targets ['a]} accept-a close-source close-a]
+                 [p accept-a {:operation :owner-down :targets ['a]} accept-a close-source close-a]
+                 [close-source p]
+                 [p q {:operation :owner-down :targets ['a 'b]} accept-a accept-b close-source]]]
+   (replay-native trace))))
+
+(deftest sender-death-before-and-after-acceptance-conforms-without-restoring-the-source
+ (doseq [accept-first [false true]]
+  (let [parent (erlang/self)
+        sender (spawn (fn []
+                       (let [source (BeamLisp.Execution/register! (fn [] 42))
+                             p (BeamLisp.Execution/prepare-handoff! source parent)]
+                        (erlang/send parent [:sender-prepared (erlang/self) p])
+                        (receive :stop nil (after 30000 nil)))))
+        monitor (Process/monitor sender)
+        p (receive [:sender-prepared pid value] :when (= sender pid) value
+           (after 10000 (throw :missing-native-sender-preparation)))
+        choose (fn [resources command returned]
+                  (let [matches (filter #(= returned (:return %))
+                                        (:outcomes (o/handoff-outcomes resources command)))]
+                   (is (= 1 (count matches)))
+                   (:resources (first matches))))
+        prepared (choose {'source {:phase :owned :borrows #{}}}
+                   {:operation :prepare :source 'source :target 'target}
+                   {:kind :prepared :source 'source :target 'target})
+        state (atom prepared)]
+   (try
+    (when accept-first
+     (let [r (BeamLisp.Execution/accept-handoff! p)]
+      (is (= (:accepted p) (:registration r)))
+      (reset! state (choose @state {:operation :accept :source 'source :target 'target}
+                           {:kind :status :status (:status r) :registration 'target}))))
+    (Process/exit sender :kill)
+    (receive [:DOWN ref :process pid _] :when (and (= monitor ref) (= sender pid)) :down
+     (after 10000 (throw :missing-native-sender-death)))
+    (reset! state (choose @state {:operation :owner-down :targets ['source]} {:kind :owner-down}))
+    (let [r (BeamLisp.Execution/accept-handoff! p)
+          outcome (cond-> {:kind :status :status (:status r)}
+                    (= :accepted (:status r)) (assoc :registration 'target))]
+     (reset! state (choose @state {:operation :accept :source 'source :target 'target} outcome))
+     (is (= (if accept-first :accepted :cancelled) (:status r)))
+     (is (= :cancelled (:status (BeamLisp.Execution/observe (:source p)))))
+     (is (= (if accept-first :active :cancelled) (:status (BeamLisp.Execution/observe (:accepted p)))))
+     (is (= (if accept-first {:status :completed :value 42} {:status :cancelled})
+            (BeamLisp.Execution/invoke! (:accepted p) []))))
+    (finally (BeamLisp.Execution/close! (:source p)) (BeamLisp.Execution/close! (:accepted p))
+             (when (Process/alive? sender) (Process/exit sender :kill))
+             (Process/demonitor monitor (list :flush)))))))
+
+(deftest model-data-does-not-become-native-authority
+ (doseq [command [{:operation :prepare :source 'source :target 'source}
+                  {:operation :accept :source 'source :target 'missing}
+                  {:operation :owner-down :targets ['missing]}
+                  {:operation :close :target 'source :authority true}]]
+  (is (thrown? (o/handoff-outcomes {'source {:phase :owned :borrows #{}}} command))))
+ (is (thrown? (o/handoff-outcomes {'source {:phase :owned :callback (fn [] 42)}}
+                                {:operation :close :target 'source})))
+ (let [v1 (assoc (o/execution-protocol) :version 1)]
+  (is (= :unknown (:status (o/check [{:id 'invalid-version :body {:op :lit :val 42 :ann {}}}] v1))))))

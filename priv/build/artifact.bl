@@ -1,0 +1,491 @@
+; Immutable native products supplied by the pinned Nix platform.
+; Native artifacts grant no execution authority: the runtime still checks its ABI.
+(ns artifact (:require [artifact-process :as process] [artifact-jobs :as jobs]
+                       [claim :as claim] [drop :as drop]))
+
+(def schema 1)
+(defn framework-context
+  "Pinned startup configuration, separate from a project's logical :env.
+   This closed accessor exposes no arbitrary process environment variables."
+  []
+  (into {} (Enum/map [[:platform "BL_ARTIFACT_PLATFORM"] [:sdk "BL_SDK_PRODUCT"]
+                      [:checkout "BL_CHECKOUT_ROOT"] [:producer "BL_INTERNAL_PRODUCER"]
+                      [:coordinator "BL_PREPARATION_COORDINATOR"]
+                      [:natives "BL_PREPARED_NATIVES"] [:home "HOME"] [:cache "XDG_CACHE_HOME"]
+                      [:runtime "XDG_RUNTIME_DIR"] [:bus "DBUS_SESSION_BUS_ADDRESS"]]
+             (fn [[kind key]]
+               [kind (erlang/apply :Elixir.System :get_env (list key))]))))
+(defn- refuse [message data] (throw (ex-info message (assoc data :kind :artifact-refused))))
+(defn- immutable-directory! [path]
+  (let [expanded (Path/expand path)
+        link (File/read_link expanded)
+        resolved (if (= :ok (erlang/element 1 link)) (erlang/element 2 link) expanded)]
+    (when-not (and (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" resolved)
+                  (File/dir? resolved))
+      (refuse "A retained immutable store directory is required" {:path path}))
+    resolved))
+(defn- digest [bytes]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+(defn- platform! [options]
+  (let [pinned (immutable-directory! (:platform (framework-context)))
+        selected (if (contains? options :platform) (immutable-directory! (:platform options)) pinned)]
+    (when-not (= selected pinned)
+      (refuse "Artifact recipes must use the pinned startup platform" {}))
+    pinned))
+
+(defn verify-release!
+  "Authenticate the portable output retained by the selected SDK."
+  [sdk]
+  (let [sdk (immutable-directory! sdk)
+        selected (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
+        _ (when-not (and (= 1 (get selected "version")) (= "sdk" (get selected "kind"))
+                         (= "x86_64-linux" (get selected "target")))
+            (refuse "Unsupported SDK release selection" {}))
+        _ (when-not (string? (get selected "release"))
+            (refuse "Selected SDK does not retain a managed Nix release" {:sdk sdk}))
+        output (immutable-directory! (get selected "release"))
+        descriptor (Jason/decode! (File/read! (Path/join output "artifact.json")))
+        file (Path/join output "bl.drop")]
+    (when-not (and (= 1 (get descriptor "version")) (= "release" (get descriptor "kind"))
+                  (= "x86_64-linux" (get descriptor "target")) (= "bl.drop" (get descriptor "file"))
+                  (= (get selected "compiler") (get descriptor "compiler"))
+                  (= :regular (:type (File/lstat! file)))
+                  (= (get descriptor "sha256") (drop/sha256-hex-of file 0 (drop/file-size file))))
+      (refuse "Release identity or bytes disagree with the selected SDK" {:output output}))
+    {:output output :file file :manifest descriptor}))
+
+(defn publish-release!
+  "Copy an already produced immutable release under destination custody."
+  [sdk destination]
+  (let [release (verify-release! sdk)
+        destination (Path/expand destination)
+        temporary (str destination ".nix-" (System/system_time :microsecond)
+                       "-" (erlang/unique_integer (list :positive)))]
+    (claim/with-writer! (claim/artifact-scope destination) "Nix release publication"
+      (fn []
+        (File/mkdir_p! (Path/dirname destination))
+        (let [target (File/open! temporary (list :write :binary :exclusive))]
+          (try
+            (try
+              (let [source (File/open! (:file release) (list :read :binary))]
+                (try
+                  (when-not (= (tuple :ok (drop/file-size (:file release)))
+                               (erlang/apply :file :copy (list source target)))
+                    (refuse "Release copy did not complete" {}))
+                  (finally (File/close source))))
+              (finally (File/close target)))
+            (when-not (= (get-in release [:manifest "sha256"])
+                         (drop/sha256-hex-of temporary 0 (drop/file-size temporary)))
+              (refuse "Release copy digest disagrees" {}))
+            (File/chmod! temporary 493)
+            (File/rename! temporary destination)
+            (assoc release :destination destination)
+            (finally (File/rm temporary))))))))
+(defn- name? [value]
+  (and (string? value) (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]*$" value)))
+(defn selected?
+  "Whether this invocation uses the required Nix native producer."
+  []
+  (= "nix" (or (System/get_env "BL_NATIVE_PROVIDER") "nix")))
+
+(defn request
+  "Validate the finite native product contract. The platform owns the recipe;
+   project input is data. Standalone cdylib crates require a committed lock."
+  [source crate abi target]
+  (when-not (name? crate) (refuse "Native crate name is invalid" {:crate crate}))
+  (when-not (and (string? abi) (> (count abi) 0) (<= (count abi) 128)
+                (not (String/contains? abi (erlang/list_to_binary (list 0)))))
+    (refuse "A native ABI identity is required" {}))
+  (when-not (= "x86_64-linux" target)
+    (refuse "Nix native products currently support x86_64-linux" {:target target}))
+  (when-not (and (string? source) (= :absolute (Path/type source)))
+    (refuse "Native source must be an absolute directory" {}))
+  (doseq [file ["Cargo.toml" "Cargo.lock"]]
+    (when-not (File/regular? (Path/join source file))
+      (refuse (str "Native source requires " file) {:source source})))
+  {"version" schema "source" (Path/expand source) "crate" crate "abi" abi "target" target})
+
+(defn native-request!
+  "Validate standalone or explicitly selected workspace package input."
+  [options]
+  (let [base (request (:source options) (:crate options) (:abi options)
+                      (or (:target options) "x86_64-linux"))]
+    (if (or (contains? options :member) (contains? options :package))
+      (let [member (:member options) package (:package options)]
+        (when-not (and (string? member) (<= 1 (count member) 4096)
+                       (or (= member ".")
+                         (every? (fn [part]
+                                   (and (<= 1 (count part) 255)
+                                        (not (contains? #{"." ".." ".git" ".bl" "target"} part))
+                                        (not (String/starts_with? part "-"))
+                                        (Regex/match? #"^[A-Za-z0-9_.-]+$" part)))
+                                 (String/split member "/"))))
+          (refuse "Native workspace member must be a bounded relative path" {}))
+        (when-not (and (string? package) (<= 1 (count package) 128)
+                       (Regex/match? #"^[A-Za-z0-9_][A-Za-z0-9_-]*$" package))
+          (refuse "Native workspace package name is invalid" {}))
+        (assoc base "version" 2 "member" member "package" package)) base)))
+
+(defn verify!
+  "Verify one actual immutable product against the expected request and bytes.
+   The returned library is a direct store address, ready for a runtime consumer."
+  [output expected]
+  (when-not (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output))
+    (refuse "Artifact output must be a top-level Nix store path" {:output output}))
+  (when-not (and (map? expected) (contains? #{1 2} (get expected "version"))
+                 (= (set (keys expected))
+                    (if (= 2 (get expected "version"))
+                      #{"version" "source" "member" "package" "crate" "abi" "target"}
+                      #{"version" "source" "crate" "abi" "target"}))
+                 (name? (get expected "crate")) (= "x86_64-linux" (get expected "target"))
+                 (string? (get expected "abi")) (> (count (get expected "abi")) 0)
+                 (string? (get expected "source"))
+                 (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" (get expected "source")))
+    (refuse "Artifact verification requires a complete immutable request" {}))
+  (let [options {:source (get expected "source") :crate (get expected "crate")
+                 :abi (get expected "abi") :target (get expected "target")}
+        options (if (= 2 (get expected "version"))
+                  (assoc options :member (get expected "member") :package (get expected "package")) options)]
+    (when-not (= expected (native-request! options))
+      (refuse "Native request is not canonical" {})))
+  (let [manifest (Jason/decode! (File/read! (Path/join output "artifact.json")))
+        library (Path/join output (str "lib/" (get expected "crate") ".so"))]
+    (when-not (and (= (get expected "version") (get manifest "version")) (= "native-library" (get manifest "kind"))
+                  (= (str "lib/" (get expected "crate") ".so") (get manifest "library"))
+                  (every? #(= (get manifest %) (get expected %)) ["crate" "abi" "target" "source"])
+                  (= :regular (:type (File/lstat! library))))
+      (refuse "Native product identity or inventory disagrees" {:output output}))
+    (when-not (= (digest (File/read! library)) (get manifest "sha256"))
+      (refuse "Native product digest disagrees" {:output output}))
+    (when-not (and (string? (get manifest "source"))
+                  (String/starts_with? (get manifest "source") "/nix/store/")
+                  (= "rustc" (get-in manifest ["toolchain" "name"]))
+                  (string? (get-in manifest ["toolchain" "version"]))
+                  (string? (get-in manifest ["toolchain" "identity"]))
+                  (Regex/match? #"^[0-9a-f]{64}$" (get-in manifest ["toolchain" "identity"])))
+      (refuse "Native product omitted its source or toolchain closure" {:output output}))
+    (when (= 2 (get expected "version"))
+      (let [cargo (get manifest "cargoLibrary") compiled (get manifest "compiled")]
+        (when-not (and (= (get expected "member") (get manifest "member"))
+                       (= (get expected "package") (get manifest "package"))
+                       (name? cargo) (string? compiled)
+                       (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" compiled)
+                       (= :regular (:type (File/lstat! (Path/join compiled (str "lib/" cargo ".so")))))
+                       (= (get manifest "sha256")
+                          (digest (File/read! (Path/join compiled (str "lib/" cargo ".so"))))))
+          (refuse "Native workspace provenance or compiled bytes disagree" {}))))
+    {:output output :library library :manifest manifest}))
+
+(defn- cache-root []
+  (let [context (framework-context)]
+    (Path/join (or (:cache context) (Path/join (or (:home context) (System/user_home!)) ".cache"))
+               "beam_lisp/artifacts")))
+
+(defn- source-files! [root]
+  ;; Nix normalizes write bits. Executability and contents remain semantic.
+  ;; Match native-source.nix's reserved names, and never traverse a symlink.
+  (loop [directories (list "") files {}]
+    (when (> (+ (count directories) (count files)) 16384)
+      (refuse "Native source inventory exceeds capacity" {:source root}))
+    (if (empty? directories) files
+      (let [directory (first directories)
+            state (reduce
+                    (fn [state name]
+                      (if (contains? #{".git" "target" ".bl"} name) state
+                        (let [relative (Path/join directory name)
+                              path (Path/join root relative)
+                              info (File/lstat! path)]
+                          (case (:type info)
+                            :directory [(conj (first state) relative)
+                                        (assoc (second state) relative [:directory])]
+                            :regular [(first state)
+                                      (assoc (second state) relative
+                                        [(digest (File/read! path))
+                                         (not= 0 (erlang/band (:mode info) 73))])]
+                            (refuse "Native source must contain only directories and regular files"
+                                    {:path path})))))
+                    [(rest directories) files] (sort (File/ls! (Path/join root directory))))]
+        (recur (first state) (second state))))))
+
+(defn- fresh-directory! [parent label]
+  (File/mkdir_p! parent)
+  (let [directory (Path/join parent (str label "-" (System/system_time :microsecond) "-"
+                                      (erlang/unique_integer (list :positive))))]
+    (File/mkdir! directory)
+    (File/chmod! directory 448)
+    directory))
+
+(defn- managed! [platform executable argv timeout memory stdout]
+  (let [manager (process/tool "systemd-run")
+        unit (str "bl-artifact-" (System/system_time :microsecond) ".service")
+        args (concat ["--user" "--quiet" "--wait" "--collect" "--pipe" "--expand-environment=no"
+                      (str "--unit=" unit) (str "--working-directory=" platform)
+                      (str "--property=MemoryMax=" memory) "--property=MemorySwapMax=0"
+                      (str "--property=RuntimeMaxSec=" (inc (quot timeout 1000)))
+                      "--property=KillMode=control-group" "--" executable] argv)
+        context (framework-context)
+        environment (into {} (filter #(some? (second %))
+                               [["XDG_RUNTIME_DIR" (:runtime context)]
+                                ["DBUS_SESSION_BUS_ADDRESS" (:bus context)]]))
+        result (process/run manager args {:timeout-ms (+ timeout 5000) :limit 65536 :stdout-file stdout :env environment})]
+    (when-not (process/ok? result)
+      (refuse "Artifact preparation failed" {:status (:status result) :detail (:out result)}))
+    (when (> (:size (File/stat! stdout)) 16777216)
+      (refuse "Artifact machine result exceeds capacity" {}))
+    (File/read! stdout)))
+
+(defn- prepare-job! [directory operation timeout]
+  (let [coordinator (:coordinator (framework-context))
+        _ (when-not coordinator
+            (refuse "Managed preparation coordinator is missing from startup configuration" {}))
+        handle (jobs/submit! coordinator (Path/join directory "job") operation)
+        result (jobs/await! handle timeout)]
+    (assoc result "handle" handle)))
+
+(defn verify-application!
+  "Recheck immutable identity and every emitted byte before publication."
+  [output sdk source]
+  (let [platform (immutable-directory! (:platform (framework-context)))
+        output (immutable-directory! output)
+        sdk (immutable-directory! sdk)
+        source (immutable-directory! source)
+        directory (fresh-directory! (cache-root) "application-verification")]
+    (try
+      (Jason/decode!
+        (managed! platform (Path/join platform "bin/python3")
+          [(Path/join platform "nix/application-inventory.py") "verify" output sdk source]
+          30000 268435456 (Path/join directory "result.json")))
+      (finally (File/rm_rf! directory)))))
+
+(defn prepare-application!
+  "Realize an application through the trusted recipe and an exact SDK. Source
+   roots are explicit project-relative input declarations, including supporting
+   files. Every request retains its SDK, source and result independently.
+   This prepares a product; it does not publish files or execute its units."
+  [options]
+  (let [platform (platform! options)
+        sdk (immutable-directory! (:sdk options))
+        source (Path/expand (:source options))
+        roots (:roots options)
+        timeout (or (:timeout-ms options) 3600000)
+        memory 2147483648
+        nix (process/tool "nix")
+        store (process/tool "nix-store")
+        _ (when-not (and (contains? #{nil false true} (:force? options))
+                         (contains? #{nil :full :scoped} (:scope options))
+                         (not (and (= :scoped (:scope options)) (:world options))))
+            (refuse "Invalid application scope, parent product or force flag" {}))
+        _ (when-not (and nix store (File/dir? source) (sequential? roots) (seq roots)
+                         (int? timeout) (>= timeout 1000) (<= timeout 3600000))
+            (refuse "Application preparation requires Nix, declared source roots and bounded time" {}))
+        directory (fresh-directory! (or (:retention-dir options) (cache-root)) "application")
+        run (fn [label executable argv]
+              (managed! platform executable argv timeout memory (Path/join directory (str label ".json"))))
+        _ (run "sdk-retention" store
+               ["--add-root" (Path/join directory "sdk-retained") "--indirect" "--realise" sdk])
+        snapshot-rows (Jason/decode!
+                        (run "source" nix
+                          ["build" "--impure" "--file" (Path/join platform "nix/project-snapshot.nix")
+                           "--argstr" "source" source "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
+                           "--argstr" "excludedJson" (Jason/encode! (Enum/map (or (:excluded-roots options) []) identity))
+                           "--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"]))
+        _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one project snapshot" {}))
+        snapshot (immutable-directory! (get-in (first snapshot-rows) ["outputs" "out"]))
+        request {"version" 1 "source" snapshot "sources" (Enum/map (or (:sources options) []) identity)
+                 "world" (:world options) "exclude" (Enum/map (or (:exclude options) []) identity)
+                 "ex" (when-let [ex (:ex options)] {"root" (:root ex) "exclude" (Enum/map (or (:exclude ex) []) identity)})
+                 "native" (boolean (:native options)) "jobs" (or (:jobs options) 1)}
+        request (if (or (= :scoped (:scope options)) (:base options))
+                  (assoc request "version" 2 "scope" (if (= :scoped (:scope options)) "scoped" "full")
+                    "base" (:base options)) request)
+        request (if (:force? options)
+                  (assoc request "version" 3 "scope" (if (= :scoped (:scope options)) "scoped" "full")
+                                 "base" (:base options) "force" true "attempt" (digest directory)) request)
+        request (if (contains? options :native-products)
+                  (assoc request "version" 4 "scope" (if (= :scoped (:scope options)) "scoped" "full")
+                    "base" (:base options) "force" (boolean (:force? options))
+                    "attempt" (when (:force? options) (digest directory))
+                    "nativeProducts" (Enum/map (:native-products options) identity)) request)
+        _ (when (:base options)
+            (run "base-retention" store
+              ["--add-root" (Path/join directory "base-retained") "--indirect" "--realise"
+               (immutable-directory! (:base options))]))
+        prepared (prepare-job! directory {"version" 1 "kind" "application" "sdk" sdk "request" request} timeout)
+        output (immutable-directory! (get prepared "output"))
+        result (Jason/decode!
+                 (run "verification" (Path/join platform "bin/python3")
+                   [(Path/join platform "nix/application-inventory.py") "verify" output sdk snapshot]))
+        receipt {:output output :sdk sdk :source snapshot :request request :result result
+                 :job (get prepared "handle") :derivation (get prepared "derivation")
+                 :retention-root (get prepared "retention-root")}]
+    (when-not (= (tuple :ok output) (File/read_link (:retention-root receipt)))
+      (refuse "Application retention does not name its product" {}))
+    (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+    receipt))
+
+(defn prepare-native!
+  "Prepare and retain a native product through Nix and a bounded systemd client.
+   Options: :platform (trusted checkout), :source, :crate, :abi, :target,
+   :timeout-ms, :memory-bytes, :retention-dir. Each successful request owns a
+   separate root, so one requester never releases another's retention."
+  [options]
+  (let [expected (native-request! options)
+        platform (platform! options)
+        recipe (Path/join platform "nix/native-artifact.nix")
+        nix (process/tool "nix")
+        manager (process/tool "systemd-run")
+        timeout (or (:timeout-ms options) 300000)
+        memory (or (:memory-bytes options) 1073741824)
+        parent (or (:retention-dir options) (cache-root))]
+    (when-not (and (File/regular? recipe) (File/regular? (Path/join platform "flake.lock")))
+      (refuse "Trusted artifact platform recipe and flake.lock are required" {:platform platform}))
+    (when-not (and nix manager) (refuse "Nix and the systemd user manager are required" {}))
+    (when-not (and (int? timeout) (>= timeout 1000) (<= timeout 3600000)
+                  (int? memory) (>= memory 67108864) (<= memory 8589934592))
+      (refuse "Artifact client resource bounds are invalid" {}))
+    (let [directory (fresh-directory! parent "native")
+          stdout (Path/join directory "result.json")
+          root (Path/join directory "retained")
+          snapshot-output (Path/join directory "snapshot.json")]
+      (try
+        (let [snapshot-rows (Jason/decode!
+                              (managed! platform nix
+                                (concat ["build" "--impure" "--file" (Path/join platform "nix/native-snapshot.nix")
+                                 "--argstr" "source" (get expected "source") "--argstr" "crate" (get expected "crate")]
+                                  (when (= 2 (get expected "version"))
+                                    ["--arg" "version" "2" "--argstr" "member" (get expected "member")
+                                     "--argstr" "package" (get expected "package")])
+                                  ["--json" "--out-link" (Path/join directory "source-retained") "--max-jobs" "0"])
+                                timeout memory snapshot-output))
+              _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one native source snapshot" {}))
+              snapshot (get-in (first snapshot-rows) ["outputs" "out"])
+              _ (when-not (and (string? snapshot) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" snapshot)
+                               (= (tuple :ok snapshot) (File/read_link (Path/join directory "source-retained"))))
+                  (refuse "Native source snapshot lacks its requester root" {}))
+              expected (assoc expected "source" snapshot)
+              prepared (prepare-job! directory {"version" 1 "kind" "native" "request" expected} timeout)
+              root (get prepared "retention-root")]
+          (let [output (get prepared "output")
+                product (verify! output expected)]
+            (when-not (= (tuple :ok output) (File/read_link root))
+              (refuse "Artifact retention does not name its product" {}))
+            (let [receipt (assoc product :request expected :retention-root root
+                                :job (get prepared "handle") :derivation (get prepared "derivation"))]
+              (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+              receipt)))
+        (catch error
+          ;; A submitted durable job may outlive this caller. Preserve its
+          ;; inputs, handle and roots even when await or verification fails.
+          (throw error))
+        (finally (File/rm stdout) (File/rm snapshot-output) (File/rm (Path/join directory "source-root.txt")))))))
+
+(defn resolve-native!
+  "Consume a declared immutable producer input when its complete source and
+   contract match; otherwise prepare through Nix. BL_PREPARED_NATIVES names a
+   retained native-set input supplied by the launcher or packaging producer.
+   This input supplies bytes, never execution authority or test qualification."
+  [options]
+  (let [expected (native-request! options)
+        prepared (:natives (framework-context))
+        product (when prepared
+                  (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" prepared)
+                    (refuse "Prepared native inputs must be an immutable store object" {}))
+                  (let [bundle (Jason/decode! (File/read! (Path/join prepared "artifacts.json")))]
+                    (when-not (and (= schema (get bundle "version"))
+                                   (= "native-set" (get bundle "kind"))
+                                   (= (get expected "target") (get bundle "target"))
+                                   (map? (get bundle "products")))
+                      (refuse "Prepared native input inventory is invalid" {}))
+                    (get-in bundle ["products" (get expected "crate")])))
+        imported (when (and product (= (get expected "abi") (get product "abi")))
+                   (let [snapshot (get product "source")
+                         verified (verify! (get product "output") (assoc expected "source" snapshot))]
+                     (when (= (source-files! (get expected "source")) (source-files! snapshot))
+                       (assoc verified :request (assoc expected "source" snapshot)
+                              :prepared-set prepared))))]
+    (or imported (prepare-native! options))))
+
+(defn retained
+  "List successful per-request receipts without executing Nix or collecting outputs."
+  ([] (retained (cache-root)))
+  ([root]
+   (map (fn [path] (Jason/decode! (File/read! path)))
+        (sort (Path/wildcard (Path/join root "native-*/receipt.json"))))))
+
+
+(defn compare
+  "Explain product changes using two recorded receipts. This compares identities;
+   it does not infer ABI compatibility or permission to activate a product."
+  [left right]
+  (let [read (fn [receipt key] (or (get receipt key) (get receipt (keyword key))))
+        lm (read left "manifest") rm (read right "manifest")
+        fields ["crate" "abi" "target" "source" "toolchain" "sha256"]]
+    {:same-output (= (read left "output") (read right "output"))
+     :changes (vec (keep (fn [field]
+                          (when-not (= (get lm field) (get rm field))
+                            {:field field :before (get lm field) :after (get rm field)})) fields))}))
+
+(defn capsule!
+  "Create a retained reproduction descriptor for a verified artifact. This
+   records identities, not application secrets, mutable data or test authority."
+  [receipt parent]
+  (let [value (fn [key] (or (get receipt key) (get receipt (keyword key))))
+        expected (value "request")
+        product (verify! (value "output") expected)
+        derivation (value "derivation")
+        _ (when-not (and (string? derivation) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+[.]drv$" derivation))
+            (refuse "A capsule requires its recorded derivation identity" {}))
+        directory (fresh-directory! (Path/expand parent) "capsule")
+        stdout (Path/join directory "retain.txt")
+        root (Path/join directory "retained")]
+    (try
+      (let [store (process/tool "nix-store")]
+        (when-not store (refuse "nix-store is required to retain a capsule" {}))
+        (managed! (BeamLisp/cwd) store ["--add-root" root "--indirect" "--realise" (:output product)]
+                  30000 268435456 stdout)
+        (when-not (= (tuple :ok (:output product)) (File/read_link root))
+          (refuse "Capsule root disagrees with its verified product" {}))
+        (let [descriptor {"version" schema "kind" "artifact-capsule"
+                          "request" expected "output" (:output product) "derivation" derivation
+                          "manifest" (:manifest product)
+                          "compiler" (BeamLisp.AOTCache/current_compiler_key)
+                          "loadedNative" (BeamLisp.LazyMemo/runtime_identity!)
+                          "qualification" "not-recorded"}]
+          (File/write! (Path/join directory "capsule.json") (Jason/encode! descriptor))
+          {:directory directory :descriptor descriptor}))
+      (catch error (File/rm_rf! directory) (throw error))
+      (finally (File/rm stdout)))))
+
+(defn prepare-platform!
+  "Stage a trusted checkout's immutable recipes and authenticated command helper.
+   This Nix build owns private outputs and needs no Source filesystem loan."
+  [platform]
+  (let [platform (Path/expand platform)
+        recipe (Path/join platform "nix/prepare-platform.nix")
+        nix (process/tool "nix")
+        _ (when-not (and nix (File/regular? recipe))
+            (refuse "Artifact platform cannot stage its command executor" {:platform platform}))
+        directory (fresh-directory! (cache-root) "platform")
+        stdout (Path/join directory "result.json")
+        root (Path/join directory "retained")]
+    (try
+      (let [rows (Jason/decode!
+                   (managed! platform nix ["build" "--impure" "--file" recipe "--json" "--out-link" root
+                                          "--max-jobs" "0" "--cores" "1" "--option" "timeout" "300"]
+                             300000 1073741824 stdout))
+            _ (when-not (= 1 (count rows)) (refuse "Expected one staged platform" {}))
+            output (get-in (first rows) ["outputs" "out"])
+            _ (when-not (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output))
+                (refuse "Staged platform must be an immutable store object" {}))
+            executor (Path/join output "bin/bl-command-executor")
+            manifest (Jason/decode! (File/read! (Path/join output "executor.json")))]
+        (when-not (and (= 1 (get manifest "version"))
+                       (= "BEAM_LISP_CUSTODY_COMMAND_V1" (get manifest "protocol"))
+                       (= (digest (File/read! executor)) (get manifest "sha256"))
+                       (= (tuple :ok output) (File/read_link root)))
+          (refuse "Staged executor identity or retention disagrees" {}))
+        (let [receipt {:platform output :executor executor :manifest manifest :retention-root root}]
+          (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
+          receipt))
+      (catch error (File/rm_rf! directory) (throw error))
+      (finally (File/rm stdout)))))

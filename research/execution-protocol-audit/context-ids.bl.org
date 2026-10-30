@@ -1,0 +1,140 @@
+#+TITLE: Native callback context IDs and graph snapshots
+
+* What changes at the boundary
+
+The callback row used to contain a complete captured context, including the
+public generation map. Accepting an invocation fetched that whole payload from
+the Env Agent. Graph pins removed per-module retention, but did not remove this
+copy. The native callback row now holds a context ID. Its referenced private
+record holds ordinary binding overlays and a native graph ID, with a live
+reference count. The graph's original immutable generation is stored once per
+prepared graph and read directly by the worker.
+
+Env remains the only custody owner. No second server or executable selector is
+introduced. A context ID is data, never an admitted invocation, code lease or
+resource grant. Source cannot call the internal context-storage operations.
+Public capture/current views retain their existing data semantics.
+
+* Short contexts and long graph lifetimes
+
+Context overlays use the existing private table. Equal overlays within the
+same graph share one record/index. Distinct graph identities cannot share a
+context, even when names and code are otherwise similar. Ordinary native
+handles, mutable references and dynamic restrictions retain their actual
+identity; the index does not claim that equal-looking external resources are
+interchangeable or that a previous capture replaces per-use validation.
+
+An immutable graph snapshot uses persistent_term, keyed by its actual Env
+owner and fresh graph marker. Worker lookup returns that shared value without
+copying it from Agent or ETS. Snapshot memory is bounded by serialized-size
+budgets and native records. Context churn does not create/delete persistent
+terms; those writes occur at graph preparation and final scope destruction.
+Both native pins and legacy physical actor leases keep the snapshot alive.
+Destroyed scopes awaiting legacy custody use the existing module-membership
+index for eventual reclamation, without scanning graphs on ordinary release.
+The native owner's next startup erases snapshots belonging to dead owners.
+Old IDs cannot address a replacement owner's storage.
+
+This choice follows the VM's documented read/copy behavior and write cost:
+[[https://www.erlang.org/docs/27/apps/erts/persistent_term.html][persistent_term documentation]]. Deleting a complex persistent value initiates
+a global GC pass. Retirement is deliberately a rare lifecycle operation; this
+is not a general-purpose per-request cache. Serialized budgets are accounting
+bounds, not precise RSS or latency guarantees.
+
+* Reference ownership follows the actual callback lifecycle
+
+Acceptance rechecks exact source liveness, reserves all needed private rows,
+copies the original restriction and retains the context in one private turn.
+The caller holds physical module fences outside that turn. Private custody
+never waits for a module lock or executes supplied code. Callback, metadata,
+bundle and generic code acceptance share the same borrow helper.
+
+Registration acquires one context reference. A borrowed callback payload
+acquires another before the source epoch can close. Handoff promotion retains
+the accepted target before consuming the source. Close, consumed-epoch cleanup
+and dead-owner cleanup release only the references belonging to their exact
+rows. The final release deletes both context and index. A deterministic race parks
+the borrower after its payload read, kills the source owner, witnesses context
+reclamation and then releases the borrow fence. Admission returns cancellation
+before action entry. Its companion kills the owner after actual entry and
+verifies completion and final context reclamation.
+
+A separate isolated test fills custody through more than10,000 actual
+registrations, fills the remaining rows with accepted blocked borrows, and
+checks refusal at65536 rows before callback entry. It then verifies accepted
+completion and balanced cleanup, including owner-death reclamation. An accepted borrower
+therefore keeps its context after unregister or source-owner death.
+
+The following native audit cell checks the private representation while using
+ordinary public callback registration/invocation. It returns no ID or context.
+
+#+begin_src beam-lisp :id shared-callback-context-lifetime
+(ns execution.context.ids.walkthrough)
+(defn- context-id [registration]
+ (:context-id (BeamLisp.Env/code_callback_payload
+               (:lease (BeamLisp.Env/execution_registration_state registration)))))
+(let [left (BeamLisp.Execution/register! (fn [] 41))
+      right (BeamLisp.Execution/register! (fn [] 42))]
+ (try
+  (assert (some? (context-id left)))
+  (assert (= (context-id left) (context-id right)))
+  (let [identity (context-id right)]
+   (BeamLisp.Execution/close! left)
+   (assert (= {:status :completed :value 42} (BeamLisp.Execution/invoke! right [])))
+   (BeamLisp.Execution/close! right)
+   (assert (= :retired_execution_context
+            (try (BeamLisp.Env/execution_context_value! identity) :unexpected
+             (catch error (:original error))))))
+  {:shared-context true :accepted-value 42 :final-context :reclaimed}
+  (finally (BeamLisp.Execution/close! left) (BeamLisp.Execution/close! right))))
+#+end_src
+#+RESULTS: shared-callback-context-lifetime
+: {:shared-context true, :accepted-value 42, :final-context :reclaimed}
+
+
+* What this does not finish
+
+Managed original-graph attestation and the existing generation proof still run.
+The new context ID is not yet a complete graph/frame-ID migration. Native actor
+and bundle context paths still require migration. Captured application values
+may themselves be large; a callback explicitly capturing a graph/value still
+carries that data independently of its native binding context. Deadline/target
+grants, affine analysis and complete historical-family qualification remain
+separate gates.
+
+Normal epoch closure still scans private custody for pending offers, and owner
+death still scans its private domain table. The pressure fixture uses one owner
+and bulk owner-death reclamation, so it does not qualify large-scale independent
+close throughput. Per-owner/epoch cleanup indices remain a measured-design task;
+context IDs alone do not remove those existing scans or the remaining SDK
+original-graph attestation work.
+
+* Installed qualification and measurements
+
+The installed floor passes300 assertions across13 native execution/lease files.
+Three executable cells pass across this document and the graph-retention
+walkthrough. The isolated real-pressure file passes12 assertions; exact epoch
+cleanup passes14 in its own VM. Fresh B/C compile91 units into139 modules;
+all141 files reproduce identically, and both fresh-boot gates pass. Production
+takes106.188/108.536 seconds; the installed files match both generations.
+
+The durable graph probe runs after those checks in the same warm VM, measuring
+24 registrations and24 real invocations per graph. All72 invocations return42;
+all3 graphs retire. Payload size is erlang.external_size of the actual private
+callback row, including its callable, ID and native ticket metadata. It excludes
+the separately stored context/graph and is not RSS or measured IPC traffic.
+
+| Graph modules | Lease rows | Callback payload/bytes | Registration median/us | Invocation median/us |
+|---------------+------------+------------------------+------------------------+----------------------|
+|             4 |          2 |                    581 |                    116 |                  229 |
+|            10 |          2 |                    580 |                     72 |                  139 |
+|            34 |          2 |                    580 |                     71 |                  141 |
+
+Public graph ETF sizes are6775/7578/11035 bytes. Preparation takes0.597/0.740/
+1.336 seconds in this already-warm VM; the earlier cold candidate's123-second
+lazy setup is not part of these samples. Timings are observations, not portable
+thresholds or a cross-run speedup proof. The direct VM pointer-identity test is
+the separate evidence that graph lookup does not copy through Agent/ETS.
+
+See [[file:context-id-checks.json][scoped qualification receipt]]. Complete frame/actor migration and the wider
+compiler/execution plan remain open; these checks do not claim completion.

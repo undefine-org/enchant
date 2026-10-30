@@ -1,0 +1,58 @@
+(ns reload.preparation-owner-origin-test
+ (:require [reload.execution :as execution] [reload.generation :as generation]))
+
+(when-not (erlang/function_exported :Elixir.PreparationOwnerFixture :call! 2)
+ (let [before (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.AOT/compile_host_file
+  (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (File/cwd!)) "test/fixtures/preparation_owner.bl")
+  (list (tuple :module :Elixir.PreparationOwnerFixture) (tuple :load? true)
+        (tuple :output_dir (Path/join (System/tmp_dir!) "bl-source-fixture-beams"))))
+   (finally (BeamLisp.Env/bind before)))))
+(defn- fixture [key tag]
+ {:cache-key key :digest tag :scope :fixture :state (atom {:retired false})})
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+
+(deftest an-explicit-native-grant-cannot-write-the-private-preparation-owner-from-source
+ (let [key [:owner-source-test (erlang/make_ref)] original (fixture key "original")
+       graph (generation/prepare!
+              {:application-id "preparation-origin"
+               :native-modules #{"PreparationOwnerFixture"}
+               :sources {"preparation.origin"
+                "(ns preparation.origin) (defn attempt [name args] (PreparationOwnerFixture/call! name args))"}})]
+  (try
+   ;; This fixture row is not enrolled as a native graph and grants no lease.
+   (execution/begin-preparation! key)
+   (execution/record-prepared! key original)
+   (execution/complete-preparation! key original)
+   (doseq [[name args] [["begin-preparation!" [[:new-owner-key (erlang/make_ref)]]]
+                        ["record-prepared!" [key (fixture key "replacement")]]
+                        ["complete-preparation!" [key original]]
+                        ["abandon-preparation!" [key]] ["forget-preparation!" [original]]
+                        ["cached-preparation" [key]] ["prepared-generation" [key]]
+                        ["ready-prepared!" [original]]
+                        ["prepare-instance!" [original :not-a-factory (list)]]
+                        ["initialize-instance!" [original]]
+                        ["invoke-instance-entry!" [original]]
+                        ["invoke-instance-binding!" [original nil []]]]]
+    (let [target (BeamLisp.Env/fetch_exact! "reload.execution" name)]
+     (assert (erlang/is_function target))
+     (is (= :native_framework_execution_required
+            (reason #(generation/invoke! graph "preparation.origin/attempt" [target args])))))
+    (is (erlang/== original (execution/cached-preparation key))))
+   (finally (execution/forget-preparation! original) (generation/retire! graph)))))
+
+(deftest stale-cleanup-cannot-erase-a-later-original-under-the-same-plan-key
+ (let [key [:owner-reuse-test (erlang/make_ref)] old (fixture key "old") fresh (fixture key "fresh")]
+  (try
+   (execution/begin-preparation! key) (execution/record-prepared! key old) (execution/complete-preparation! key old)
+   (execution/forget-preparation! old)
+   (execution/begin-preparation! key) (execution/record-prepared! key fresh) (execution/complete-preparation! key fresh)
+   (is (= :ok (execution/forget-preparation! old)))
+   (is (erlang/== fresh (execution/cached-preparation key)))
+   (is (erlang/== fresh (execution/attested-prepared! fresh)))
+   (is (= :unattested-prepared-generation (reason #(execution/attested-prepared! old))))
+   (is (= :unattested-prepared-generation (reason #(execution/attested-prepared! (assoc fresh :digest "edited")))))
+   (finally (execution/forget-preparation! fresh)))))

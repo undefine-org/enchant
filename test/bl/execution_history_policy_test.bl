@@ -1,0 +1,192 @@
+(ns execution.history-policy-test
+ (:require [reload.generation :as g]))
+
+(defn- compile-host! [source module directory]
+ (let [result (BeamLisp.AOT/compile_host_file source
+                (list (tuple :module module) (tuple :output_dir directory) (tuple :load? false)))
+       path (elem result 1)]
+  (when-not (= (tuple :module module) (code/load_binary module (String/to_charlist path) (File/read! path)))
+   (throw :history-policy-probe-load-failed))))
+
+(defn- drain-effects []
+ (loop [n 0]
+  (receive :history-wrapped-target-effect (recur (inc n)) (after 0 n))))
+
+(deftest guarded-constructor-fallback-retains-the-actual-source-native-policy
+ (let [target :Elixir.ExecutionHistory.ConstructorFallbackEffect
+       fixture :Elixir.ExecutionHistory.ConstructorFallbackFixture
+       graph (atom nil)]
+  (try
+   ;; Introduce the forbidden target only inside the declared native fixture;
+   ;; this exercises the SDK fallback in a real Source frame, not an earlier
+   ;; argument check or a caller-supplied generation/admission marker.
+   (Code/compile_string
+    "defmodule ExecutionHistory.ConstructorFallbackEffect do
+       def step(value), do: (send(self(), :\"history-wrapped-target-effect\"); value)
+     end
+     defmodule ExecutionHistory.ConstructorFallbackFixture do
+       def identity(value), do: value
+       def dispatch(shape) do
+         callable = case shape do
+           :allowed -> &__MODULE__.identity/1
+           :plain -> &ExecutionHistory.ConstructorFallbackEffect.step/1
+           :remote -> {:\"$remote\", ExecutionHistory.ConstructorFallbackEffect, :step}
+           :multi -> {:\"$blfn\", %{1 => &ExecutionHistory.ConstructorFallbackEffect.step/1}, nil}
+         end
+         helper = BeamLisp.Env.fetch_exact!(\"proc.reconcile-runtime\", \"start-call!\")
+         BeamLisp.Ns.Rt.invoke(helper, [callable, [:payload], %{version: 1, declaration: \"fake/worker\"}, :start])
+       end
+     end")
+   (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
+   (reset! graph (g/prepare!
+    {:sources {"constructor.fallback.policy"
+      "(ns constructor.fallback.policy) (defn run [shape] (ExecutionHistory.ConstructorFallbackFixture/dispatch shape))"}
+     :native-modules #{"ExecutionHistory.ConstructorFallbackFixture"}}))
+   (is (= :payload (g/invoke! @graph "constructor.fallback.policy/run" [:allowed]))
+       "the actual SDK fallback admits the declared native identity")
+   (doseq [shape [:plain :remote :multi]]
+    (drain-effects)
+    (is (= :source_native_target_refused
+         (try (g/invoke! @graph "constructor.fallback.policy/run" [shape]) :wrongly-ran
+          (catch error (BeamLisp.ExInfo/ex_original error)))))
+    (is (= 0 (drain-effects))))
+   (finally
+    (when @graph (g/retire! @graph))
+    (drain-effects)
+    (doseq [module [fixture target]] (code/purge module) (code/delete module))))))
+
+(deftest E57-wrapped-runtime-targets-keep-the-ordinary-native-policy
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       source (File/read! (Path/join root "priv/boot/rt.bl"))
+       before "(BeamLisp.Env/check_source_invocation! f args)"
+       after "(when (erlang/is_function f) (BeamLisp.Env/check_source_invocation! f args))"
+       directory (Path/join (System/tmp_dir!) (str "history-wrapped-policy-" (erlang/unique_integer (list :positive))))
+       bad :Elixir.ExecutionHistory.RuntimePolicyWrappedBypass
+       live-md5 (BeamLisp.Ns.Rt/module_info :md5)
+       fixture :Elixir.ExecutionHistory.WrappedAuditFixture target :Elixir.ExecutionHistory.UnplannedEffect
+       graph (atom nil)]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-runtime-policy-anchor-drift))
+   (File/mkdir_p! directory)
+   (let [mutant (Path/join directory "mutant.bl")
+         relocated (String/replace source "(ns rt)" "(ns history.runtime.policy)")]
+    (File/write! mutant (String/replace relocated before after))
+    (compile-host! mutant bad (Path/join directory "mutant")))
+   ;; Only this ordinary native fixture is planned. Its payload is introduced
+   ;; inside native code so an earlier argument guard cannot mask this exact
+   ;; runtime-dispatch component. The real Source head/target inventory remains.
+   (Code/compile_string
+    "defmodule ExecutionHistory.UnplannedEffect do
+       def step(value) do
+         send(self(), :\"history-wrapped-target-effect\")
+         String.upcase(value)
+       end
+     end
+     defmodule ExecutionHistory.WrappedAuditFixture do
+       def identity(value), do: value
+       def dispatch(shape, mode) do
+         target = case shape do
+           :remote -> {:\"$remote\", ExecutionHistory.UnplannedEffect, :step}
+           :multi -> {:\"$blfn\", %{1 => &ExecutionHistory.UnplannedEffect.step/1}, nil}
+           :plain -> &ExecutionHistory.UnplannedEffect.step/1
+           :allowed -> {:\"$remote\", __MODULE__, :identity}
+         end
+         if mode == :good do
+           BeamLisp.Ns.Rt.invoke(target, [\"ok\"])
+         else
+           apply(ExecutionHistory.RuntimePolicyWrappedBypass, :\"call-invoke\", [target, [\"ok\"]])
+         end
+       end
+     end")
+   (reset! graph (g/prepare! {:sources {"history.policy.wrapper"
+     "(ns history.policy.wrapper) (defn run [shape mode] (ExecutionHistory.WrappedAuditFixture/dispatch shape mode))"}
+     :native-modules #{"ExecutionHistory.WrappedAuditFixture"}}))
+   (doseq [shape [:remote :multi :plain]]
+    (drain-effects)
+    (let [normal (try (g/invoke! @graph "history.policy.wrapper/run" [shape :good]) :unexpected-success
+                  (catch error (BeamLisp.ExInfo/ex_original error)))]
+     (is (= :source_native_target_refused normal) (str shape))
+     (is (= 0 (drain-effects)) "the refused target never ran"))
+    (let [changed (try (g/invoke! @graph "history.policy.wrapper/run" [shape :bad])
+                   (catch error (BeamLisp.ExInfo/ex_original error)))
+          effects (drain-effects)]
+     (println :history-E57-wrapper {:shape shape :mutant changed :effects effects})
+     (if (= :plain shape)
+      (do (is (= :source_native_target_refused changed)) (is (= 0 effects)))
+      (do (is (= "OK" changed)) (is (= 1 effects))))))
+   (is (= "ok" (g/invoke! @graph "history.policy.wrapper/run" [:allowed :good])))
+   (is (= "ok" (g/invoke! @graph "history.policy.wrapper/run" [:allowed :bad])))
+   (is (= live-md5 (BeamLisp.Ns.Rt/module_info :md5)) "the real runtime was never replaced")
+   (finally
+    (when @graph (g/retire! @graph))
+    (drain-effects)
+    (doseq [module [bad fixture target]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))
+
+(defn- births [action]
+ (let [parent (erlang/self) tag (erlang/make_ref)
+       [tracer monitor] (spawn-monitor
+                        (fn []
+                         (loop [events []]
+                          (receive
+                           [seen :collect] :when (= seen tag) (erlang/send parent [tag events])
+                           event (recur (conj events event))))))
+       previous (Process/flag :trap_exit true)]
+  (try
+   (erlang/trace parent true (list :procs (tuple :tracer tracer)))
+   (let [result (try (action) (catch error (BeamLisp.ExInfo/ex_original error)))]
+    (erlang/trace parent false (list :procs))
+    (let [delivered (erlang/trace_delivered parent)]
+     (receive [:trace_delivered seen ref] :when (and (= parent seen) (= delivered ref)) :ok
+      (after 5000 (throw :history-birth-trace-not-delivered))))
+    (erlang/send tracer [tag :collect])
+    (let [events (receive [seen events] :when (= seen tag) events
+                  (after 5000 (throw :history-birth-trace-missing)))
+          spawned (Enum/filter events #(and (erlang/is_tuple %) (= 5 (erlang/tuple_size %)) (= :spawn (elem % 2))))]
+     {:result result :births (count spawned)}))
+   (finally
+    (erlang/trace parent false (list :procs))
+    (Process/flag :trap_exit previous)
+    (when (Process/alive? tracer) (erlang/exit tracer :kill))
+    (Process/demonitor monitor (list :flush))))))
+
+(deftest E57-malformed-child-validation-precedes-any-linked-supervisor-birth
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/supervisor.bl"))
+       forms (Enum/filter (BeamLisp.Reader/read_string source "priv/host/supervisor.bl")
+              #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                    (= "validated_children" (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))
+       before "(when-not (erlang/== :ok checked) (erlang/error (erlang/element 2 checked)))"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id)) parent (erlang/self)
+       valid {:id :first :start (tuple :Elixir.Task :start_link
+                                (list (fn [] (erlang/send parent :history-unexpected-child-effect))))}
+       variants [(list valid {:id :malformed :start :invalid}) (list valid valid)]
+       options (list (tuple :strategy :one_for_one))]
+  (try
+   (is (= 1 (count forms)))
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 1 (count forms)) (throw :history-supervisor-validator-drift))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (doseq [[namespace mutant?] [["history.supervisor.validated" false] ["history.supervisor.unchecked" true]]]
+      (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+      (let [position (BeamLisp.FormMeta/meta (first forms))
+            text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))
+            form (if mutant?
+                   (first (BeamLisp.Reader/read_string (String/replace text before "nil")))
+                   (first forms))]
+       (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace))))
+     (let [good (BeamLisp.Env/fetch_exact! "history.supervisor.validated" "validated_children")
+           bad (BeamLisp.Env/fetch_exact! "history.supervisor.unchecked" "validated_children")]
+      (doseq [children variants]
+       (let [actual (births #(BeamLisp.Supervisor/start_native_link children options))
+             normal (births #(Supervisor/start_link (good children options) options))
+             changed (births #(Supervisor/start_link (bad children options) options))]
+        (println :history-E57-supervisor {:actual actual :normal normal :mutant changed})
+        (is (= 0 (:births actual)))
+        (is (= 0 (:births normal)))
+        (is (= 1 (:births changed)))
+        (is (not= (:result normal) (:result changed)))
+        (is (receive :history-unexpected-child-effect false (after 0 true))
+            "even the valid first worker never executes"))))))
+   (finally (BeamLisp.Env/destroy scope)))))

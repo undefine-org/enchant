@@ -1,0 +1,63 @@
+;; Compiler control: exercise the internal producer; normal build/run uses Nix.
+(ns world.build.driver (:require [build :as build]))
+(defn- observe [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn (fn []
+                 (loop [calls {:macro 0 :reader 0}]
+                  (receive
+                   [:trace _ :call [:Elixir.BeamLisp.AOT :eval_constructor_session! _]] (recur (update calls :macro inc))
+                   [:trace _ :call [:Elixir.BeamLisp.Reader :read_syntax _]] (recur (update calls :reader inc))
+                   [:finish seen] :when (= seen ticket) (erlang/send parent [:macro-calls ticket calls])
+                   _ (recur calls)))))]
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) true (list :local))
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.Reader :read_syntax 2) true (list :local))
+  (erlang/trace parent true (list :call (tuple :tracer tracer)))
+  (try
+   (let [value (action) barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= seen barrier) :ready (after 5000 (throw :trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:macro-calls seen calls] :when (= seen ticket) calls (after 5000 (throw :trace-timeout)))])
+   (finally
+    (erlang/trace parent false (list :call))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :eval_constructor_session! 4) false (list :local))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.Reader :read_syntax 2) false (list :local))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(let [phase (System/fetch_env! "BL_WORLD_BUILD_PHASE") output (System/fetch_env! "BL_WORLD_BUILD_OUTPUT")
+      runtime (Path/join output "runtime")]
+ (if (= "consumer" phase)
+  (let [packaged? (= "yes" (System/get_env "BL_WORLD_RUNTIME_PACKAGE"))
+        module (if packaged?
+                 (first (:beam (:runtime (BeamLisp.AOT/contextual_unit_members! (BeamLisp.AOT/verify_unit runtime)))))
+                 (elem (elem (beam_lib/chunks (File/read! (Path/join runtime (first (File/ls! runtime)))) (list :attributes)) 1) 0))
+        phase-name (str (Atom/to_string module) ".PhaseLibrary")
+        phase-loaded? (fn [] (some #(= phase-name (Atom/to_string (elem % 0))) (code/all_loaded)))]
+   (assert (= :error (System/fetch_env "BL_WORLD_BUILD_MANIFEST")))
+   (assert (= (if (= "yes" (System/get_env "BL_WORLD_RUNTIME_PACKAGE")) 2 1) (count (File/ls! runtime))))
+   (assert (not (phase-loaded?)))
+   (let [packaged? (= "yes" (System/get_env "BL_WORLD_RUNTIME_PACKAGE"))
+         [value counters] (if packaged? (observe #(BeamLisp/run_file runtime))
+                           (do
+                            (assert (= (tuple :module module) (code/load_binary module '()
+                                      (File/read! (Path/join runtime (str (Atom/to_string module) ".beam"))))))
+                            [(erlang/apply module :run (list)) {:macro 0 :reader 0}]))]
+    (when packaged? (assert (= 0 (:reader counters))) (assert (= 0 (:macro counters))))
+    (assert (= [42 99 42] value))
+    (assert (not (phase-loaded?)))
+    (File/write! (Path/join output "consumer.json")
+      (Jason/encode! {:status "passed" :value (to-list value) :phase-provider-present false :input-sources-selected false
+                      :runtime-package packaged? :macro-evaluator-calls (:macro counters) :reader-calls (:reader counters)}))))
+  (let [[result calls] (observe #(build/produce! {:world (System/fetch_env! "BL_WORLD_BUILD_MANIFEST")
+                                             :out (Path/join output phase)}))]
+   (assert (= [] (:errors result)))
+   (assert (= 1 (:built result)))
+   (if (= "producer" phase)
+    (do (assert (= 1 (:compiled result))) (assert (> (:macro calls) 0)))
+    (do (assert (= 0 (:compiled result))) (assert (= 1 (:cached result))) (assert (= 0 (:macro calls)))
+        (if (= "yes" (System/get_env "BL_WORLD_RUNTIME_PACKAGE"))
+         (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "compile.world" "package-runtime!") (list (:out result) runtime))
+         (File/cp_r! (:runtime-out result) runtime))))
+   (File/write! (Path/join output (str phase ".json"))
+    (Jason/encode! {:status "passed" :compiled (:compiled result) :cached (:cached result)
+                   :macro-evaluator-calls (:macro calls) :reader-calls (:reader calls) :native-admission (:native-admission result)}))))
+ (println "WORLD-BUILD" phase "passed"))

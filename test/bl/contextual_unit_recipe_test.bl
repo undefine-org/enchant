@@ -1,0 +1,126 @@
+(ns contextual-unit-recipe-test
+ (:require [anf :as a] [compiler :as c] [lower :as lower] [expand :as x]
+           [system.phase :as phase] [codebase.phase :as facts]))
+
+(defn- reference [name]
+ {:version 1 :kind :binding-reference :world (crypto/hash :sha256 "world")
+  :declaration (crypto/hash :sha256 (str "declaration:" name))
+  :id (crypto/hash :sha256 (str "reference:" name)) :space 'value :phase 0})
+(defn- recipe []
+ {:version 2 :kind :compiled-contextual-unit
+  :initializers (list {:name "left" :reference (reference "left") :slot "left_1" :node (a/lit 40)}
+                      {:name "right" :reference (reference "right") :slot "right_2" :node (a/lit 2)})
+  :steps (list {:op :initialize :reference (reference "left")}
+               {:op :initialize :reference (reference "right")})
+  :entry (a/remote :erlang :+ (list (a/var "left_1") (a/var "right_2")))
+  :exports (list (reference "left") (reference "right"))})
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- invalid-recipes [unit]
+ (let [left (first (:initializers unit)) right (second (:initializers unit))]
+  [(assoc unit :version 1.0)
+   (assoc unit :extra true)
+   (assoc unit :initializers (list left (assoc right :name (:name left))))
+   (assoc unit :initializers (list left (assoc right :slot (:slot left))))
+   (assoc unit :initializers (list left (assoc right :reference (:reference left))))
+   (assoc unit :initializers (list (assoc left :slot "") right))
+   (assoc unit :initializers (list (assoc left :name "") right))
+   (assoc unit :initializers (list (assoc left :extra true) right))
+   (assoc unit :initializers (vec (:initializers unit)))
+   (assoc unit :exports (list (reference "missing")))
+   (assoc unit :exports (list (:reference left) (:reference left)))]))
+
+(deftest canonical-unit-projections-share-one-validated-recipe
+ (let [unit (recipe)
+       instance (lower/eval-anf :Elixir.ContextualRecipeFactory (a/contextual-unit-factory unit))]
+  (is (= unit (BeamLisp.CompilerData/check_contextual_unit! unit)))
+  (is (= unit (a/validate-contextual-unit! unit)))
+  (is (= (a/contextual-unit-factory unit) (c/contextual-unit-factory unit)))
+  (is (= (a/contextual-unit-entry unit) (c/contextual-unit-entry unit)))
+  (is (= [40 2] [(get (:exports instance) (reference "left")) (get (:exports instance) (reference "right"))]))
+  (is (= 42 ((:entry instance))))))
+
+(deftest shape-bijections-refuse-through-every-projection-before-effects
+ (doseq [unit (invalid-recipes (recipe))]
+  (is (thrown? (BeamLisp.CompilerData/check_contextual_unit! unit)))
+  (is (= :invalid-contextual-unit (kind #(a/contextual-unit-entry unit))))
+  (is (= :invalid-contextual-unit (kind #(a/contextual-unit-factory unit))))
+  (is (= :invalid-contextual-unit (kind #(c/contextual-unit-factory unit))))))
+
+(deftest executable-grammar-and-selected-linkage-cannot-be-hidden-in-unused-initializers
+ (let [unit (recipe) left (first (:initializers unit)) right (second (:initializers unit))]
+  (doseq [node [(assoc (a/lit 40) :extra true)
+               (a/global "ambient" "value") (a/binding-value (reference "missing"))]]
+   (let [changed (assoc unit :initializers (list (assoc left :node node) right))]
+    (is (= :invalid-contextual-unit (kind #(a/contextual-unit-entry changed))))
+    (is (= :invalid-contextual-unit (kind #(a/contextual-unit-factory changed))))))))
+
+(deftest lazy-and-callable-payloads-refuse-without-realization-or-invocation
+ (let [effects (atom 0) unit (recipe)
+       deferred (lazy-seq (do (swap! effects inc) (list)))
+       executable (fn [] (swap! effects inc))]
+  (doseq [changed [(assoc unit :initializers deferred) (assoc unit :exports deferred)
+                   (assoc unit :entry (a/lit executable))]]
+   (is (= :invalid-contextual-unit (kind #(a/contextual-unit-factory changed)))))
+  (is (= 0 @effects))))
+
+(deftest unused-initializers-cannot-hide-unlinked-values-in-pattern-keys
+ (doseq [key [(a/global "ambient" "key") (a/binding-value (reference "missing"))]]
+  (let [unit (recipe) left (first (:initializers unit)) right (second (:initializers unit))
+        hidden (a/fnn (list (a/clause (list (a/pmap (list [key (a/pvar "value")]))) nil (a/var "value"))))
+        changed (assoc unit :initializers (list (assoc left :node hidden) right))]
+   (is (= :invalid-contextual-unit (kind #(a/contextual-unit-entry changed))))
+   (is (= :invalid-contextual-unit (kind #(a/contextual-unit-factory changed)))))))
+
+(deftest fresh-phase-facts-refuse-a-divergent-or-aliased-unit-image
+ (let [program (:program (x/prepare-program
+                          [{:namespace 'recipe :revision 'current :file "recipe.bl"
+                            :source "(ns recipe) (def left 40) (def right 2) [left right]"}]
+                          ['recipe 'current]))
+       unit (:unit program) left (first (:initializers unit)) right (second (:initializers unit))]
+  (is (= :proved (:status (phase/check program))))
+  (doseq [changed [(assoc-in program [:unit :entry] (a/lit :different))
+                   (assoc-in program [:unit :initializers] (list left (assoc right :slot (:slot left))))
+                   (assoc-in program [:unit :initializers] (list left (assoc right :name (:name left))))]]
+   (is (= :invalid-contextual-unit (kind #(facts/facts changed))))
+   (is (= :refused (:status (phase/check changed)))))))
+
+
+(deftest facts-check-the-whole-data-image-before-comparing-projections
+ (let [program (:program (x/prepare-program
+                          [{:namespace 'recipe :revision 'current :file "recipe.bl" :source "(ns recipe) 42"}]
+                          ['recipe 'current]))
+       effects (atom 0)
+       deferred (lazy-seq (do (swap! effects inc) (list)))
+       executable (fn [] (swap! effects inc))]
+  (doseq [node [deferred executable]]
+   (is (thrown? (facts/facts (assoc program :node node))))
+   (is (= 0 @effects)))))
+
+(deftest initialization-schedule-is-a-total-bijection-with-private-capture-slots
+ (let [base (recipe) left (reference "left") right (reference "right")
+       bad [(assoc base :version 1)
+            (dissoc base :steps)
+            (assoc base :steps (list))
+            (assoc base :steps (list {:op :initialize :reference left} {:op :initialize :reference left}))
+            (assoc base :steps (list {:op :initialize :reference left} {:op :initialize :reference (reference "foreign")}))
+            (update base :steps #(cons {:op :capture :slot "left_1" :node (a/lit nil)} %))
+            (update base :steps #(cons {:op :evaluate :node (a/lit nil) :extra true} %))
+            (update base :steps #(cons {:op :unknown :node (a/lit nil)} %))]]
+  (doseq [unit bad]
+   (is (thrown? (BeamLisp.CompilerData/check_contextual_unit! unit)))
+   (is (= :invalid-contextual-unit (kind #(a/contextual-unit-entry unit)))))))
+
+(deftest schedule-expressions-and-captures-obey-the-same-lexical-boundary
+ (let [base (recipe)
+       prefix (list {:op :initialize :reference (reference "left")}
+                    {:op :initialize :reference (reference "right")})
+       unit (assoc base :steps
+              (Enum/concat prefix (list {:op :evaluate :node (a/var "left_1")}
+                                   {:op :capture :slot "result" :node (:entry base)}))
+                       :entry (a/var "result"))]
+  (is (= 42 (lower/eval-anf :Elixir.ScheduledUnitResult (a/contextual-unit-entry unit))))
+  (is (= 42 ((:entry (lower/eval-anf :Elixir.ScheduledUnitFactory (a/contextual-unit-factory unit))))))
+  (is (= :invalid-contextual-unit
+          (kind #(a/contextual-unit-entry (update unit :steps (fn [steps] (cons {:op :evaluate :node (a/var "left_1")} steps)))))))
+  (is (= :invalid-contextual-unit
+          (kind #(a/contextual-unit-entry (update unit :steps (fn [steps] (cons {:op :capture :slot "result" :node (a/lit 0)} steps)))))))))

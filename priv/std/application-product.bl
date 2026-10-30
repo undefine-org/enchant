@@ -1,0 +1,244 @@
+;; Normal application production: prepare immutable bytes first, then select
+;; them under the existing output writer. Compiler production stays in build.
+(ns application-product
+  (:require [artifact :as artifact] [claim :as claim] [bl.env :as env] [build-log :as blog]
+            [bl.native-declarations :as native-declarations]))
+
+(defn- relative! [root path]
+  (let [relative (Path/relative_to (Path/expand path root) root)]
+    (when (or (= :absolute (Path/type relative)) (= ".." relative)
+              (String/starts_with? relative "../"))
+      (throw (ex-info "Application inputs must belong to their declared project root"
+               {:kind :application-source-closure :path path :root root})))
+    relative))
+
+(defn- atomic-link! [source destination]
+  (if (= (tuple :ok source) (File/read_link destination)) false
+    (let [temporary (str destination ".nix-" (System/system_time :microsecond)
+                         "-" (erlang/unique_integer (list :positive)))]
+      (File/mkdir_p! (Path/dirname destination))
+      (try
+        (File/ln_s! source temporary)
+        (File/rename! temporary destination)
+        true
+        (finally (File/rm temporary))))))
+
+(defn- ebin-files [product]
+  (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" product)
+    (throw (ex-info "Application selection must name an immutable product" {})))
+  (let [inventory (Jason/decode! (File/read! (Path/join product "inventory.json")))
+        world (get (Jason/decode! (File/read! (Path/join product "result.json"))) "world-unit")]
+    (Enum/flat_map (get inventory "entries")
+      (fn [entry]
+        (let [path (get entry "path")]
+          (if (and (String/starts_with? path "ebin/")
+                   (or (and (= "directory" (get entry "type")) (= path world))
+                       (and (= "file" (get entry "type"))
+                            (not (and world (String/starts_with? path (str world "/"))))))
+                   (not (contains? #{"ebin/build.log" "ebin/compile.beam_lisp"} path)))
+            (let [relative (String/replace_prefix path "ebin/" "")
+                  parts (String/split relative "/")]
+              (when (some #(contains? #{"" "." ".." ".bl" ".claim" ".nix-product"} %) parts)
+                (throw (ex-info "Invalid application output member" {:path path})))
+              (list relative)) (list)))))))
+
+(defn prepare!
+  "Capture declared source/supporting roots and use the exact running SDK."
+  [options]
+  (let [root (Path/expand (or (:root options) (BeamLisp/cwd)))
+        project (env/project root)
+        _ (when (seq (:errors project))
+            (throw (ex-info "Invalid application declaration" {:errors (:errors project)})))
+        jobs (or (:jobs options) 1)
+        _ (when-not (and (int? jobs) (> jobs 0))
+            (throw (ex-info "Application parallel width must be a positive integer" {})))
+        ex (when (and (:ex options) (File/dir? (get-in options [:ex :root]))) (:ex options))
+        out (Path/expand (:out options) root)
+        sources (Enum/map (or (:sources options) []) #(relative! root %))
+        world (:world options)
+        natives (when (:native options)
+                  (native-declarations/discover! root (get-in project [:build :native])))
+        world-inputs (when world
+                       (BeamLisp.Loader/ensure_loaded "compile.world")
+                       (:inputs ((BeamLisp.Env/fetch! "compile.world" "capture") world)))
+        paths (concat (filter #(File/exists? %) (concat (:paths project) (get-in project [:build :paths])))
+                      (get-in project [:build :inputs]) (:inputs options) (:sources options)
+                      (Enum/map (or world-inputs []) (fn [input] (:path input)))
+                      (when ex (list (:root ex)))
+                      (Enum/map (or natives []) (fn [entry] (:source entry)))
+                      (filter #(File/regular? %) [(Path/join root "env.bl") (Path/join root "bl.lock")]))
+        roots (vec (distinct (Enum/map paths #(relative! root %))))
+        relative-out (Path/relative_to out root)
+        excluded (if (or (= :absolute (Path/type relative-out)) (= ".." relative-out)
+                         (String/starts_with? relative-out "../")) [] [relative-out])]
+    (when (= root out)
+      (throw (ex-info "An application output cannot replace its project root" {:kind :application-output-root})))
+    (artifact/prepare-application!
+      {:sdk (:sdk (artifact/framework-context)) :source root :roots roots
+       :excluded-roots (conj excluded "priv/native")
+       :sources sources :world (when world (relative! root world))
+       :exclude (Enum/map (or (:exclude options) []) #(relative! root %))
+       :ex (when ex {:root (relative! root (:root ex)) :exclude (:exclude ex)})
+       :native (:native options) :jobs (min 4 jobs) :force? (:force? options)
+       :native-products (Enum/map (or natives [])
+                          (fn [entry]
+                            (into {} (Enum/map (assoc entry :source (relative! root (:source entry)))
+                                       (fn [[key value]] [(Atom/to_string key) value])))))
+       :scope (:scope options) :base (:base options)})))
+
+(defn select!
+  "Select a prepared product without replacing the directory that owns its
+   writer claim. Every filesystem link names immutable bytes. The generation
+   pointer is published last; preparation failures never reach this boundary."
+  [receipt out]
+  (when-not (claim/owned? out)
+    (throw (ex-info "Application publication requires output custody" {:kind :application-output-unclaimed})))
+  (when (= :ok (elem (File/read_link (Path/join out ".nix-sdk")) 0))
+    (throw (ex-info "SDK and application products require separate output workspaces" {})))
+  (let [product (:output receipt)
+        result (artifact/verify-application! product (:sdk receipt) (:source receipt))
+        previous (File/read_link (Path/join out ".nix-product"))
+        files (ebin-files product)
+        units (Enum/map (or (get result "units") [])
+                (fn [unit]
+                  (let [relative (get unit "directory")
+                        _ (when-not (and (String/starts_with? relative "units/")
+                                         (not (some #(contains? #{"" "." ".."} %) (String/split relative "/"))))
+                            (throw (ex-info "Invalid application unit member" {})))
+                        directory (Path/join product relative)]
+                    ;; Authenticate the complete unit before any output changes.
+                    (BeamLisp.AOT/verify_unit directory)
+                    directory)))
+        world (when-let [relative (get result "world-unit")]
+                (when-not (and (String/starts_with? relative "ebin/")
+                              (not (some #(contains? #{"" "." ".."} %) (String/split relative "/"))))
+                  (throw (ex-info "Invalid contextual application unit member" {})))
+                (let [directory (Path/join product relative)]
+                  (BeamLisp.AOT/verify_unit directory)
+                  directory))
+        cached (= previous (tuple :ok product))]
+    (doseq [relative files]
+      (atomic-link! (Path/join product (str "ebin/" relative)) (Path/join out relative)))
+    (when (File/dir? (Path/join product "units"))
+      (atomic-link! (Path/join product "units") (Path/join out "units")))
+    (when (and (= :ok (elem previous 0)) (not cached))
+      (let [old (elem previous 1)]
+        (when (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" old)
+          (when (and (not (File/dir? (Path/join product "units")))
+                     (= (tuple :ok (Path/join old "units")) (File/read_link (Path/join out "units"))))
+            (File/rm! (Path/join out "units")))
+          (doseq [relative (ebin-files old)]
+            (when (and (not (some #(= relative %) files))
+                       (= (tuple :ok (Path/join old (str "ebin/" relative)))
+                          (File/read_link (Path/join out relative))))
+              (File/rm! (Path/join out relative)))))))
+    {:cached? cached :units units :world-unit world :product product :receipt receipt :result result}))
+
+(defn select-sdk!
+  "Project the already prepared SDK for an engine-checkout build. The stable
+   output directory keeps its claim; all selected code remains immutable."
+  [sdk options]
+  (let [out (Path/expand (:out options))
+        _ (when (and (:root options) (= out (Path/expand (:root options))))
+            (throw (ex-info "An SDK output cannot replace its checkout root" {})))
+        metadata (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
+        _ (when-not (and (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" sdk)
+                         (= 1 (get metadata "version")) (= "sdk" (get metadata "kind"))
+                         (= "x86_64-linux" (get metadata "target"))
+                         (File/regular? (Path/join sdk "image/ebin/beam_lisp.app")))
+            (throw (ex-info "Engine build requires its prepared SDK" {})))]
+    (claim/with-writer! out "Nix SDK selection"
+      (fn []
+        (when (= :ok (elem (File/read_link (Path/join out ".nix-product")) 0))
+          (throw (ex-info "SDK and application products require separate output workspaces" {})))
+        (doseq [name ["image" "lib" ".nix-sdk"]]
+          (let [existing (File/lstat (Path/join out name))]
+            (when (and (= :ok (elem existing 0)) (not= :symlink (:type (elem existing 1))))
+              (throw (ex-info "SDK output projection would replace an unrelated entry" {:name name})))))
+        (let [cached (= (tuple :ok sdk) (File/read_link (Path/join out ".nix-sdk")))]
+          (atomic-link! (Path/join sdk "image") (Path/join out "image"))
+          (atomic-link! (Path/join sdk "lib") (Path/join out "lib"))
+          (atomic-link! sdk (Path/join out ".nix-sdk"))
+          (when-let [log (:log options)] (log (str "beam-lisp SDK: " sdk)))
+          {:built (if cached 0 1) :compiled 0 :cached (if cached 1 0)
+           :errors [] :ex-built 0 :manifest {} :lock-wait-us 0
+           :product sdk :sdk? true :app-resource true :app-file "beam_lisp.app"
+           :native {:built 0 :cached 0 :artifacts [] :errors []}})))))
+
+(defn build!
+  "Normal application build: Nix production followed by claimed publication.
+   Compiler/SDK bootstrap uses its separate internal producer entry."
+  [options]
+  (let [root (Path/expand (or (:root options) (BeamLisp/cwd)))
+        out (Path/expand (:out options) root)]
+    (try
+      (when-not (contains? #{nil :full :scoped} (:scope options))
+        (throw (ex-info "Unknown application build scope; nothing was pruned" {:kind :application-product-scope})))
+      (when (and (= :scoped (:scope options)) (:world options))
+        (throw (ex-info "Contextual World products require a full build" {:kind :application-product-scope})))
+      (when (:sdk-artifacts? options)
+        (throw (ex-info "SDK production belongs to the trusted SDK recipe" {:kind :application-product-sdk})))
+      (claim/with-writer! out "Nix application selection"
+        (fn []
+          (let [previous (File/read_link (Path/join out ".nix-product"))
+                base (when (and (not (:force? options)) (not (:world options)) (= :ok (elem previous 0)))
+                       (let [product (elem previous 1)
+                             descriptor (Jason/decode! (File/read! (Path/join product "artifact.json")))]
+                         (when (and (= (get descriptor "sdk") (:sdk (artifact/framework-context)))
+                                    (not (get (Jason/decode! (File/read! (Path/join product "result.json"))) "world-unit")))
+                           (artifact/verify-application! product (:sdk (artifact/framework-context)) (get descriptor "source"))
+                           product)))
+                receipt (prepare! (assoc options :root root :out out :base base))
+                product (:output receipt)
+                projection (erlang/binary_to_term (File/read! (Path/join product "producer-projection.term")))
+                manifest (into {} (Enum/map (:manifest projection)
+                           (fn [[path entry]]
+                             [(Path/join root (relative! "/build/project" path)) entry])))
+                runtime-manifest (when (:runtime-manifest projection)
+                                   (into {} (Enum/map (:runtime-manifest projection)
+                                     (fn [[path entry]]
+                                       [(Path/join root (relative! "/build/project" path)) entry]))))
+                native-files (if (File/dir? (Path/join product "native"))
+                               (File/ls! (Path/join product "native")) [])
+                natives (Enum/map native-files
+                          (fn [name]
+                            (when-not (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]*[.]so$" name)
+                              (throw (ex-info "Invalid native application member" {})))
+                            [(elem (File/read_link (Path/join product (str "native/" name))) 1)
+                             (Path/join root (str "priv/native/" name))]))]
+            (claim/with-artifacts! (Enum/map natives second) "application native selection"
+              (fn []
+                (let [selected (select! receipt out)
+                      cached (and (:cached? selected) (not (:force? options)))
+                      result (:result selected)
+                      _ (BeamLisp.Loader/ensure_loaded "build")
+                      _ ((BeamLisp.Env/fetch! "build" "write-manifest")
+                          (or (:manifest options) (Path/join out "compile.beam_lisp")) manifest)
+                      _ (blog/write! (or (:log-path options) (Path/join out "build.log"))
+                          (blog/facts-of (blog/state-of-manifest manifest)))
+                      native-built (count (filter identity (Enum/map natives
+                                             (fn [[source destination]] (atomic-link! source destination)))))]
+                  (atomic-link! product (Path/join out ".nix-product"))
+                  (when-let [log (:log options)] (log (str "beam-lisp application: " product)))
+                  {:built (if cached 0 (get result "built"))
+                   :compiled (if cached 0 (get result "compiled" (get result "built")))
+                   :cached (if cached (count manifest) (get result "cached"))
+                   :ex-built (if cached 0 (get result "ex-built"))
+                   :lock-wait-us 0 :errors [] :manifest manifest
+                   :runtime-manifest runtime-manifest
+                   :product product :artifact-units (:units selected) :receipt receipt
+                   :world-unit (:world-unit selected)
+                   :runtime-out (when-let [path (get result "runtime-out")]
+                                  (Path/join out (String/replace_prefix path "ebin/" "")))
+                   :out (if-let [path (:out projection)]
+                          (Path/join out (relative! (Path/join product "ebin") path)) out)
+                   :profile (:profile projection) :native-admission (:native-admission projection)
+                   :app-resource (get result "app-resource")
+                   :app-file (get result "app-file") :app-why (get result "app-why")
+                   :native {:built native-built :cached (- (count natives) native-built)
+                            :artifacts (vec (Enum/map natives second)) :errors []}}))))))
+      (catch error
+        {:built 0 :compiled 0 :cached 0 :ex-built 0 :lock-wait-us 0 :manifest {}
+         :native {:built 0 :cached 0 :artifacts [] :errors []}
+         :errors [(str "Nix application production failed: " (ex-message error)
+                       (when-let [detail (:detail (ex-data error))] (str "\n" detail)))]}))))

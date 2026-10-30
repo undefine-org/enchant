@@ -18,6 +18,7 @@ rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep, other, over_budg
 mod collector;
 mod collector_schedule;
 mod seen;
+mod file_lock;
 use collector::{register, unregister, Key, Node, Traced};
 
 /// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must
@@ -1638,6 +1639,11 @@ fn collector_status() -> &'static str {
 #[rustler::nif(name = "nif_loaded?")]
 fn loaded() -> bool {
     true
+}
+
+#[rustler::nif(name = "nif_runtime_identity")]
+fn runtime_identity() -> &'static str {
+    env!("BEAM_LISP_NATIVE_BUILD_ID")
 }
 
 // Rustler's init macro currently supplies no unload hook. This entry follows

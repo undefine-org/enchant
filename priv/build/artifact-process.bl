@@ -1,0 +1,287 @@
+; Shared bounded process adapter, adapted from Foundry deployment-exec.
+; Source pin: 1e945f2aedcef4c26ccada8d8208bd76aecec4a7.
+; Artifact jobs add an OS service boundary; process groups alone do not contain setsid.
+; Bounded argv execution and separate machine stdout. The process-group guard
+; cleans up ordinary children; the artifact caller supplies a systemd service
+; for descendants that create new sessions. Result fields match Foundry's
+; status/exit/out/truncated/pid/error contract.
+
+(ns artifact-process)
+
+(def env-bin "/usr/bin/env")
+
+;; Where system tools live: FHS hosts (/usr/bin, /bin) and NixOS (only
+;; /usr/bin/env and /bin/sh are FHS there; everything else is under the
+;; system profile). First existing wins; nil when the tool is absent.
+(def tool-dirs ["/run/current-system/sw/bin" "/usr/bin" "/bin"])
+
+(defn explicit-tool-dirs
+  "Absolute directories named by FOUNDRY_TOOL_PATH, in order (the operator's
+   pinned secret-tools package). Empty/unset → []. A malformed entry is refused
+   fail-closed rather than silently skipped: a bad entry must not fall through
+   to a system tool of the same name.
+
+   This is the ONE list every consumer resolves against — `tool`, `tool-path`
+   and the child PATH built by `deployment-runtime/step-path` — so a tool that
+   resolves is also a tool that runs."
+  []
+  (let [v (or (erlang/apply :Elixir.System :get_env (list "BL_ARTIFACT_TOOL_PATH"))
+              (erlang/apply :Elixir.System :get_env (list "FOUNDRY_TOOL_PATH")))]
+    (if (or (nil? v) (= "" v))
+      []
+      (let [parts (String/split v ":")]
+        (doseq [p parts]
+          (when-not (and (String/starts_with? p "/")
+                         (not (some (fn [c] (or (= c 10) (= c 13) (= c 9) (= c 0)))
+                                    (erlang/binary_to_list (str p)))))
+            (throw (ex-info (str "Artifact tool path entry is not an absolute directory path: " (pr-str p))
+                            {"kind" "artifact-process"}))))
+        parts))))
+
+(defn tool-dirs-all
+  "Pinned startup platform, explicit operator tools, then system tools. Project
+   command overlays do not select framework executables."
+  []
+  (let [selected (erlang/apply :Elixir.System :get_env (list "BL_ARTIFACT_PLATFORM"))
+        link (when selected (File/read_link selected))
+        platform (if (and link (= :ok (elem link 0))) (elem link 1) selected)
+        pinned (when (and (string? platform)
+                          (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" platform))
+                 (list (Path/join platform "bin")))]
+    (vec (concat pinned (explicit-tool-dirs) tool-dirs))))
+
+(defn tool
+  "Absolute path of system tool `name`, or nil."
+  [name]
+  (some (fn [d] (let [p (str d "/" name)] (when (File/regular? p) p))) (tool-dirs-all)))
+
+(defn tool-path
+  "The PATH a child gets by default: the same dirs `tool` searches."
+  []
+  (join ":" (tool-dirs-all)))
+
+(defn- tuple [& xs] (erlang/list_to_tuple (to-list xs)))
+(defn- chars [s] (erlang/binary_to_list (str s)))
+
+(defn- executable? [p]
+  (and (string? p) (String/starts_with? p "/") (File/regular? p)))
+
+(defn- signal-group! [sig pgid]
+  (when (and (int? pgid) (> pgid 1) (tool "kill"))
+    (try (System/cmd (tool "kill") (list sig "--" (str "-" pgid))
+                     (list (tuple :stderr_to_stdout true)))
+         (catch e nil)))
+  nil)
+
+(defn kill-group!
+  "SIGKILL process group `pgid`. Idempotent: an already-gone group is not an
+   error."
+  [pgid]
+  (signal-group! "-KILL" pgid))
+
+(defn term-group!
+  "SIGTERM process group `pgid` (a polite stop)."
+  [pgid]
+  (signal-group! "-TERM" pgid))
+
+;; The session leader's first output line: its own pid, which IS the new
+;; session's process-group id. Reading it from the child is exact; inferring it
+;; from /proc after setsid's fork is a race (measured: it returned the wrong pid).
+(def pgid-marker "@@foundry-pgid ")
+
+(defn- env-argv
+  "`setsid -w env -i K=V … /bin/sh -c LEADER N exe args…`: the shell leads a
+   new session+group, announces `$$`, then runs the program (fed exactly N
+   stdin bytes through `head -c`, so it sees EOF — an Erlang port cannot
+   half-close a child's stdin). The shell text is a fixed literal; every value
+   travels as a positional parameter, never interpolated."
+  [env exe args stdin-bytes stdout-file]
+  (let [env (if (contains? (or env {}) "PATH") env (assoc (or env {}) "PATH" (tool-path)))
+        leader (cond
+                 (and stdout-file (int? stdin-bytes))
+                 (str "echo \"" pgid-marker "$$\"; umask 077; set -C; out=$1; shift; head -c \"$0\" | \"$@\" >\"$out\"")
+                 stdout-file
+                 (str "echo \"" pgid-marker "$$\"; umask 077; set -C; out=$1; shift; exec \"$@\" >\"$out\" </dev/null")
+                 (int? stdin-bytes)
+                 (str "echo \"" pgid-marker "$$\"; head -c \"$0\" | exec \"$@\"")
+                 :else (str "echo \"" pgid-marker "$$\"; exec \"$@\" </dev/null"))]
+    (to-list
+      (concat ["-w" env-bin "-i"]
+              (map (fn [k] (str k "=" (get env k))) (sort (keys env)))
+              ["/bin/sh" "-c" leader (str (or stdin-bytes 0))]
+              (when stdout-file [stdout-file]) [exe]
+              args))))
+
+(defn- read-pgid
+  "Receive the leader's announcement. → [pgid leftover-binary] or [nil acc]
+   when the child died or stayed silent past `ms`."
+  [port acc ms]
+  (let [i (index-of acc "\n")]
+    (if (and (some? i) (String/starts_with? acc pgid-marker))
+      [(try (erlang/binary_to_integer (subs acc (count pgid-marker) i)) (catch e nil))
+       (subs acc (inc i))]
+      (receive
+        [p [:data d]] :when (== p port) (read-pgid port (str acc d) ms)
+        (after ms [nil acc])))))
+
+(defn- split-lines
+  "→ [complete-lines rest] for buffered text."
+  [buf]
+  (let [parts (String/split buf "\n")]
+    (if (String/ends_with? buf "\n")
+      [(vec (butlast parts)) ""]
+      [(vec (butlast parts)) (last parts)])))
+
+(defn- private-output? [path]
+  (and (string? path) (String/starts_with? path "/")
+       (loop [part path first? true]
+         (let [r (erlang/apply :file :read_link_info (list part))
+               st (when (= :ok (erlang/element 1 r)) (erlang/element 2 r))]
+           (and (if first? (= :error (erlang/element 1 r))
+                    (and st (not= :symlink (erlang/element 3 st))))
+                (let [parent (Path/dirname part)]
+                  (or (= part parent) (recur parent false))))))
+       (let [r (erlang/apply :file :read_link_info (list (Path/dirname path)))]
+         (and (= :ok (erlang/element 1 r))
+              (= 0 (erlang/band (erlang/element 8 (erlang/element 2 r)) 63))))))
+
+(defn spawn
+  "Start `exe` with `args`. → {:port p :pid n :pgid n} or {:error msg}. `pgid`
+   is the child's own process group (kill it to stop every descendant). The
+   caller owns the port (it dies with the calling BEAM process)."
+  [exe args opts]
+  (cond
+    (and (get opts :stdout-file) (not (private-output? (get opts :stdout-file))))
+    {:error "stdout-file must be new, beneath a private directory, without symlink ancestors"}
+    (nil? (tool "setsid")) {:error "setsid (util-linux) is not installed"}
+    (not (executable? exe)) {:error (str "executable not found or not executable: " exe)}
+    (and (some? (get opts :cwd)) (not (File/dir? (get opts :cwd))))
+    {:error (str "working directory not found: " (get opts :cwd))}
+    :else
+    (try
+      (let [stdin (get opts :stdin)
+            port (erlang/open_port
+                   (tuple :spawn_executable (chars (tool "setsid")))
+                   (to-list
+                     (concat [:binary :exit_status :stderr_to_stdout :use_stdio
+                              (tuple :args (to-list (map chars (env-argv (get opts :env) exe (to-list (map str args))
+                                                                         (when (some? stdin) (erlang/byte_size (str stdin))) (get opts :stdout-file)))))]
+                             (if (some? (get opts :cwd)) [(tuple :cd (chars (get opts :cwd)))] []))))
+            pid (erlang/element 2 (erlang/port_info port :os_pid))
+            [pgid leftover] (read-pgid port "" 5000)]
+        (when (some? stdin) (erlang/port_command port (str stdin)))
+        ;; whatever arrived with the announcement is real output: requeue it
+        (when (not= "" leftover)
+          (erlang/send (erlang/self) (tuple port (tuple :data leftover))))
+        {:port port :pid pid :pgid pgid})
+      (catch e {:error (str "could not start " exe ": " (ex-message e))}))))
+
+(defn- now-ms [] (System/monotonic_time :millisecond))
+
+(defn binary-part-safe
+  "The first `n` bytes of binary `b` (n clamped to its size)."
+  [b n]
+  (let [sz (erlang/byte_size b)]
+    (if (>= n sz) b (erlang/binary_part b 0 n))))
+
+(defn- collect
+  "Receive from `port` until exit, deadline or cancel. State threads the
+   buffer, kept text, byte count and truncation. `pid` is the process group."
+  [port pid st opts]
+  (let [deadline (get st :deadline)
+        left (max 0 (- deadline (now-ms)))
+        poll (min left (or (get opts :poll-ms) 250))
+        on-line (get opts :on-line)
+        limit (or (get opts :limit) 1048576)
+        cancel? (get opts :cancel?)]
+    (receive
+      [p [:data d]] :when (== p port)
+      ;; keep at most `limit` bytes in total; past it, drain and drop
+      (let [room (max 0 (- limit (get st :bytes)))
+            keep (binary-part-safe d room)
+            over? (> (erlang/byte_size d) room)
+            [lines rest] (split-lines (str (get st :buf) keep))]
+        (when (fn? on-line) (doseq [l lines] (on-line l)))
+        (when (and over? (not (get st :truncated)) (fn? (get opts :on-truncate)))
+          ((get opts :on-truncate) limit))
+        (collect port pid
+                 (assoc st :bytes (+ (get st :bytes) (erlang/byte_size keep))
+                        :buf rest
+                        :out (str (get st :out) keep)
+                        :truncated (or (get st :truncated) over?))
+                 opts))
+      [p [:exit_status code]] :when (== p port)
+      (do (when (and (fn? on-line) (not= "" (get st :buf))) (on-line (get st :buf)))
+          (assoc st :status :exited :exit code))
+      (after poll
+        (cond
+          (>= (now-ms) deadline)
+          (do (kill-group! pid) (assoc st :status :timed-out))
+          (and (fn? cancel?) (cancel?))
+          (do (term-group! pid)
+              (receive [p [:exit_status code]] :when (== p port) (assoc st :status :cancelled :exit code)
+                (after 500 (do (kill-group! pid) (assoc st :status :cancelled)))))
+          :else (collect port pid st opts))))))
+
+(defn- flush-port!
+  "Drop any message still queued from `port`, so a long-lived caller's mailbox
+   does not accumulate a finished child's output."
+  [port]
+  (receive
+    [p _] :when (== p port) (flush-port! port)
+    (after 0 nil)))
+
+(defn- guard-owner! [pgid]
+  ;; A killed diagnostic worker cannot run its finally block. Monitor its
+  ;; lifetime in another BEAM process so its OS process group cannot survive.
+  (let [owner (erlang/self)]
+    (erlang/spawn
+      (fn []
+        (let [ref (erlang/monitor :process owner)]
+          (receive
+            [:DOWN r :process p _reason] :when (and (= r ref) (= p owner)) (kill-group! pgid)
+            :finished (erlang/demonitor ref (list :flush))))))))
+
+(defn run
+  "Run `exe` with `args` to completion. opts: :env :cwd :stdin :timeout-ms
+   :limit :on-line :on-truncate :cancel? :on-spawn. Never throws."
+  ([exe args] (run exe args {}))
+  ([exe args opts]
+   (let [s (spawn exe args opts)]
+     (if (:error s)
+       {:status :spawn-failed :exit nil :out "" :truncated false :pid nil :error (:error s)}
+       (let [port (:port s) pid (:pgid s)
+             guardian (guard-owner! pid)
+             _ (when (fn? (get opts :on-spawn)) ((get opts :on-spawn) pid))
+             st (try
+                  (collect port pid {:deadline (+ (now-ms) (or (get opts :timeout-ms) 60000))
+                                     :bytes 0 :buf "" :out "" :truncated false}
+                           opts)
+                  (finally
+                    (kill-group! pid)
+                    (try (erlang/port_close port) (catch e nil))
+                    (flush-port! port)
+                    (erlang/send guardian :finished)))
+             status (get st :status)]
+         {:status status
+          :exit (get st :exit)
+          :out (get st :out)
+          :truncated (boolean (get st :truncated))
+          :pid pid
+          :error (case status
+                   :timed-out (str "timeout after " (quot (or (get opts :timeout-ms) 60000) 1000) " s")
+                   :cancelled "cancelled"
+                   :exited (when (not= 0 (get st :exit)) (str "exited with code " (get st :exit)))
+                   nil)})))))
+
+(defn ok? [r] (and (= :exited (:status r)) (= 0 (:exit r))))
+
+(defn last-json
+  "The last line of `text` that decodes as a JSON object, or nil. Helpers print
+   one JSON object last; diagnostics may precede it."
+  [text]
+  (let [lines (reverse (filter (fn [l] (String/starts_with? (String/trim l) "{"))
+                               (String/split (or text "") "\n")))]
+    (some (fn [l] (try (let [v (Jason/decode! (String/trim l))] (when (map? v) v))
+                       (catch e nil)))
+          lines)))

@@ -1,20 +1,6 @@
-; build/claim.bl — WHO IS BUILDING THIS DIRECTORY.
-;
-; A build writes a directory; two builds writing one produce a tree that is
-; neither. The usual answer is a lock, and a lock is a poor answer: it cannot say
-; who holds it or whether its holder is still alive, so a killed build wedges the
-; directory forever. Mix's `_build/<env>/lib/<app>/.mix/compile.lock` is 0 bytes
-; naming nobody (measured), and cargo's target lock is the same shape.
-;
-; A CLAIM is the same exclusion, made readable: a small file naming the owner's
-; pid, when it took the claim, and what it is building. A claim whose holder is
-; gone is swept rather than honoured — that is the difference between a claim and
-; a lock, and it is what makes a killed build recoverable.
-;
-; Liveness is asked of the OS, not of a heartbeat: on Linux `/proc/<pid>` is the
-; answer (a claim from this VM or another), and where that is not available the
-; answer is conservatively "alive" — refusing to build is recoverable, stomping
-; another build is not.
+; A workspace has kernel custody and a readable owner. The permanent sibling
+; lock inode survives clear!/restaging. The OS releases custody after crashes;
+; stale diagnostic text cannot wedge a workspace or authorize a second writer.
 
 (ns claim
   (:require [core] [release :as rel]))
@@ -30,25 +16,27 @@
   (rel/text (erlang/apply :os :getpid (list))))
 
 (defn read-claim
-  "The claim at `dir` as `{:pid :at :bin}`, or nil when there is none (or it is
+  "The claim at `dir` as `{:pid :at :bin :token?}`, or nil when there is none (or it is
    unreadable — an unreadable claim is no claim).
 
    A claim file is ONE FACT, space-separated, the same idiom as the build log and
-   the lock: `[:claim <pid> <at-ms> <what>]`. The first version wrote a map with
+   the lock: `[:claim-v2 <pid> <at-ms> <cohort> <what>]` (legacy claims still read). The first version wrote a map with
    `pr-str` and read it back with `read-string` — and bl's reader answers NODES,
    not values, so the map test failed, every claim read as nil, and the exclusion
    silently did nothing. The suite caught it: a claim written by another process
    was not seen. A format that needs no reader cannot have that bug."
   [dir]
-  (let [p (path-for dir)]
-    (if (File/exists? p)
-      (let [parts (String/split (String/trim (File/read! p)) " ")]
-        (if (and (= "[:claim" (first parts)) (>= (count parts) 4))
-          {:pid (nth parts 1)
-           :at (nth parts 2)
-           :bin (String/replace (nth parts 3) "]" "")}
-          nil))
-      nil)))
+  (let [r (File/read (path-for dir))]
+    (when (= :ok (elem r 0))
+      (let [parts (String/split (String/trim (elem r 1)) " ")]
+        (cond
+          (and (= "[:claim-v2" (first parts)) (>= (count parts) 5))
+          {:pid (nth parts 1) :at (nth parts 2) :token (nth parts 3)
+           :bin (String/trim_trailing (Enum/join (Enum/drop parts 4) " ") "]")}
+          (and (= "[:claim" (first parts)) (>= (count parts) 4))
+          {:pid (nth parts 1) :at (nth parts 2)
+           :bin (String/trim_trailing (Enum/join (Enum/drop parts 3) " ") "]")}
+          :else nil)))))
 
 (defn alive?
   "Whether the process that wrote `c` is still running. Linux answers with
@@ -62,52 +50,268 @@
       (File/dir? "/proc") (File/dir? (Path/join "/proc" (str pid)))
       :else true)))
 
+(defn- workspace-path [dir]
+  (or (BeamLisp.AOT/physical_sdk_path (Path/expand dir)) (Path/expand dir)))
+(defn- handle-key [dir] (tuple :build-claim (workspace-path dir)))
+
+(defn- lock-anchor [dir]
+  (let [physical (workspace-path dir) base (Path/basename physical)
+        anchors (if (= base ".bl") ".bl-locks" ".bl")]
+    (Path/join (Path/join (Path/join (Path/dirname physical) anchors) "locks") base)))
+
+(defn- owned-handle? [dir handle]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (BeamLisp.LazyMemo/nif_file_claim_owned handle (lock-anchor dir) (path-for dir)))
+
+(defn owned? [dir]
+  (if-let [handle (Process/get (handle-key dir))]
+    (owned-handle? dir handle)
+    false))
+
+(defn- lock! [dir]
+  (File/mkdir_p! dir)
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (BeamLisp.LazyMemo/nif_file_lock (lock-anchor dir) false true))
+(defn- followers-lock! [dir shared]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (BeamLisp.LazyMemo/nif_file_lock (str (lock-anchor dir) ".followers") shared true))
+(defn- holder [dir]
+  (or (read-claim dir) {:pid "unknown" :at "unknown" :bin "build"}))
+
 (defn held-by
-  "The claim holding `dir` that we must NOT take, or nil when it is free, ours,
-   or stale. Returns the claim map so the caller can NAME the owner."
+  "Observe writer and child custody. Only this process's writer is reentrant."
   [dir]
-  (let [c (read-claim dir)]
-    (cond
-      (nil? c) nil
-      (= (:pid c) (owner-pid)) nil
-      (alive? c) c
-      :else nil)))
+  (if (owned? dir) nil
+    (let [r (lock! dir)]
+      (if (not= :ok (elem r 0)) (holder dir)
+        (try
+          (let [followers (followers-lock! dir false)]
+            (if (= :ok (elem followers 0))
+              (do (BeamLisp.LazyMemo/nif_file_unlock (elem followers 1)) nil)
+              (assoc (holder dir) :custody :child)))
+          (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1))))))))
 
 (defn acquire!
-  "Take the claim on `dir`, sweeping a stale one. Returns
-   `{:ok? bool :swept bool :held claim}` — `:held` is set, and `:ok?` false, when
-   a LIVE build holds it (the caller reports that owner rather than waiting)."
+  "Take writer custody, then exclude any child of an earlier writer before
+   publishing a new cohort token. A parent crash cannot authorize restaging
+   while its compiler child is still using the workspace."
   [dir what]
-  (let [cur (read-claim dir)
-        stale? (and (some? cur) (not (alive? cur)))
-        other (held-by dir)]
-    (if (some? other)
-      {:ok? false :swept false :held other}
+  (if (owned? dir) {:ok? true :swept false :held nil}
+    (do
+      (File/mkdir_p! dir)
+      (BeamLisp.LazyMemo/ensure_loaded!)
+      (let [prior (read-claim dir)
+            r (BeamLisp.LazyMemo/nif_file_claim (lock-anchor dir) (path-for dir) what)
+            status (elem r 0)]
+        (if (= :ok status)
+          (do (Process/put (handle-key dir) (elem r 1))
+              {:ok? true :swept (some? prior) :held nil})
+          {:ok? false :swept false
+           :held (if (= :child status) (assoc (holder dir) :custody :child) (holder dir))})))))
+
+(defn follower-context
+  "Exact parent claim for a child. Compare it AFTER taking shared child custody;
+   a child starting after a replacement writer's claim must refuse before work."
+  [dir]
+  (when-not (owned? dir) (throw (ex-info "Workspace claim required" {:kind :workspace-unclaimed})))
+  (tuple (str (lock-anchor dir) ".followers") (Path/expand (path-for dir)) (File/read! (path-for dir))))
+
+(defn with-follower [context action]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (let [r (BeamLisp.LazyMemo/nif_file_lock (elem context 0) true true)]
+    (when-not (= :ok (elem r 0))
+      (throw (ex-info "Workspace custody changed" {:kind :stale-workspace-claim})))
+    (try
+      (when-not (= (tuple :ok (elem context 2)) (File/read (elem context 1)))
+        (throw (ex-info "Workspace custody changed" {:kind :stale-workspace-claim})))
+      (action)
+      (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1))))))
+
+(defn- with-read-loans! [paths action]
+  (if (empty? paths) (action)
+    (let [r (BeamLisp.LazyMemo/nif_file_lock (first paths) true true)]
+      (when-not (= :ok (elem r 0))
+        (throw (ex-info "Command read custody is held" {:kind :command-read-held :path (first paths)})))
+      (try (with-read-loans! (rest paths) action)
+        (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1)))))))
+
+(defn command-executor
+  "Locate a compatible executor. Managed platforms bind its exact bytes through
+   their immutable executor manifest; drops carry their own stock launcher."
+  []
+  (let [platform (System/get_env "BL_ARTIFACT_PLATFORM")
+        platform (when platform
+                   (if (File/regular? (Path/join platform "bin/bl-command-executor"))
+                     platform
+                     (do
+                       (BeamLisp.Loader/ensure_loaded "artifact")
+                       (:platform (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "artifact" "prepare-platform!") (list platform))))))
+        managed (when platform (Path/join platform "bin/bl-command-executor"))
+        manifest (when platform (Path/join platform "executor.json"))]
+    (if platform
       (do
-        (File/mkdir_p! dir)
-        (File/write! (path-for dir)
-                     (str "[:claim " (owner-pid) " " (erlang/system_time :millisecond)
-                          " " what "]"))
-        {:ok? true :swept stale? :held nil}))))
+       (when-not (and managed (File/regular? managed) (File/regular? manifest))
+         (throw (ex-info "Managed command executor is absent" {:kind :command-executor-unavailable})))
+       (let [record (Jason/decode! (File/read! manifest))
+            bytes (File/read! managed)
+            digest (String/downcase (Base/encode16 (crypto/hash :sha256 bytes)))]
+        (when-not (and (= 1 (get record "version"))
+                       (= "BEAM_LISP_CUSTODY_COMMAND_V1" (get record "protocol"))
+                       (= digest (get record "sha256")))
+          (throw (ex-info "Managed command executor identity disagrees" {:kind :command-executor-identity})))
+        managed))
+      (or (System/get_env "BL_BIN")
+          (Path/join (or (System/get_env "BL_ROOT")
+                         (Path/dirname (or (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+                                          (BeamLisp.Tiers/priv_root))))
+                     ".bl/launcher/release/drop-launcher")))))
+
+(defn command!
+  "Run an external writer under an OS command domain. The manager holds actual
+   filesystem loans until every descendant exits, independently of the caller,
+   launcher and inherited descriptors. This conveys no Source invocation grant.
+   Unsupported/missing executors refuse; no raw-command fallback is permitted."
+  [root program arguments options]
+  (let [context (follower-context root)
+        executor (command-executor)
+        bytes (File/read executor)]
+    ;; Compatibility refusal precedes executing an old launcher which might
+    ;; otherwise resolve/boot an unrelated SDK for the new internal verb.
+    (when-not (and (= :ok (elem bytes 0))
+                   (not= :nomatch (binary/match (elem bytes 1) "BEAM_LISP_CUSTODY_COMMAND_V1")))
+      (throw (ex-info "Native command executor is missing or incompatible"
+                     {:kind :command-executor-unavailable :path executor})))
+    (let [environment (Map/merge (System/get_env) (Map/new (or (:env options) (list))))
+          executable (if (= :absolute (Path/type program)) program
+                       (os/find_executable (String/to_charlist program)
+                         (String/to_charlist (or (Map/get environment "PATH") ""))))
+          _ (when (= false executable) (throw (ex-info "Command executable is unavailable" {:kind :command-executable-missing :program program})))
+          request {:version 1 :follower (Tuple/to_list context)
+                   :program (if (string? executable) executable (List/to_string executable))
+                   :argv (to-list arguments) :cwd (Path/expand (or (:cd options) (BeamLisp/cwd)))
+                   :read_locks (to-list (or (:read-locks options) []))
+                   :limits {:timeout_ms (or (:timeout-ms options) 2700000)
+                            :memory_bytes (or (:memory-bytes options) 8589934592)
+                            :output_bytes (or (:output-bytes options) 16777216)}}
+          base (list (tuple :stderr_to_stdout true) (tuple :env (to-list (or (:env options) (list)))))
+          opts (if (:into options) (cons (tuple :into (:into options)) base) base)]
+      (when (or (> (count (:read_locks request)) 15)
+                (some #(not= :absolute (Path/type %)) (:read_locks request)))
+        (throw (ex-info "Command read loans require at most15 absolute addresses"
+                       {:kind :command-read-capacity})))
+      (with-read-loans! (:read_locks request)
+        #(System/cmd executor (list "--custody-command" (Jason/encode! request)) opts)))))
+
+(defn with-writer!
+  "Run one operation under actual workspace admission; preserve a caller's
+   existing claim. This grants filesystem custody, not Source invocation."
+  [root what action]
+  (let [ours (owned? root) acquired (if ours {:ok? true} (acquire! root what))]
+    (when-not (:ok? acquired)
+      (throw (ex-info "Build workspace is in use" {:kind :build-workspace-held :held (:held acquired)})))
+    (try (action) (finally (when-not ours (release! root))))))
+
+(defn artifact-scope
+  "The shared publication scope for one installed file. All native producers
+   use this address; metadata stays outside the published file."
+  [destination]
+  (Path/join (Path/join (Path/join (Path/dirname destination) ".bl") "artifact-custody")
+             (Path/basename destination)))
+
+(defn with-artifacts!
+  "Hold each destination through a multi-artifact observation/publication.
+   Refusal unwinds earlier acquisitions; preexisting actual ownership survives."
+  [destinations what action]
+  (let [scopes (sort (distinct (map #(artifact-scope (Path/expand %)) destinations)))]
+    (letfn [(hold [remaining]
+              (if (empty? remaining) (action)
+                (with-writer! (first remaining) what #(hold (rest remaining)))))]
+      (hold scopes))))
+
+(defn- scope-path! [path]
+  ;; Build workspaces are mutable. Do not reuse the SDK path cache's assumption
+  ;; that an already resolved ancestor remains immutable. Resolve existing
+  ;; components freshly, including a symlink above a not-yet-existing target.
+  (loop [current (Path/expand path) suffix [] links 0 steps 0]
+    (when (or (> links 32) (> steps 512))
+      (throw (ex-info "Cannot resolve workspace scope" {:kind :build-workspace-scope :path path})))
+    (let [link (File/read_link current) info (File/lstat current)]
+      (cond
+        (= :ok (elem link 0))
+        (recur (Path/expand (elem link 1) (Path/dirname current)) suffix (inc links) (inc steps))
+        (= :ok (elem info 0))
+        (let [physical (BeamLisp.AOT/physical_sdk_path_walk current)]
+          (when-not physical
+            (throw (ex-info "Cannot resolve workspace scope" {:kind :build-workspace-scope :path path})))
+          (reduce Path/join physical (reverse suffix)))
+        (= :enoent (elem info 1))
+        (recur (Path/dirname current) (conj suffix (Path/basename current)) links (inc steps))
+        :else (throw (ex-info "Cannot inspect workspace scope" {:kind :build-workspace-scope :path path}))))))
+
+(defn- anchor-path? [path]
+  (loop [parts (Path/split path)]
+    (cond
+      (< (count parts) 2) false
+      (and (contains? #{".bl" ".bl-locks"} (first parts)) (= "locks" (second parts))) true
+      :else (recur (rest parts)))))
+
+(defn- clear-entry-plan [path keep depth]
+  (when (> depth 256)
+    (throw (ex-info "Workspace clear traversal limit" {:kind :build-workspace-scope :path path})))
+  (let [info (File/lstat! path) name (Path/basename path)]
+    (cond
+      (or (= path keep) (anchor-path? path)
+          (and (= :symlink (:type info)) (contains? #{".bl" ".bl-locks"} name)))
+      {:actions [] :kept true}
+      (= name ".claim")
+      (throw (ex-info "Nested workspace requires its own explicit drain"
+               {:kind :build-workspace-nested-claim :path path}))
+      (= :directory (:type info))
+      (let [children (mapv #(clear-entry-plan (Path/join path %) keep (inc depth)) (sort (File/ls! path)))
+            kept (some #(:kept %) children)
+            actions (vec (mapcat #(:actions %) children))]
+        {:actions (if kept actions (conj actions [:directory path])) :kept kept})
+      :else {:actions [[:file path]] :kept false})))
+
+(defn- clear-owned! [dir root]
+  (when-not (owned? root)
+    (throw (ex-info "Workspace claim required" {:kind :workspace-unclaimed})))
+  (let [physical (scope-path! root) target (scope-path! dir)
+        prefix (Path/split physical)]
+    (when (or (anchor-path? target) (not= prefix (take (count prefix) (Path/split target))))
+      (throw (ex-info "Clear target is outside writable workspace scope"
+               {:kind :build-workspace-scope :root root :path dir})))
+    (let [barrier (followers-lock! root false)]
+      (when-not (= :ok (elem barrier 0))
+        (throw (ex-info "Workspace compiler followers are still active" {:kind :build-workspace-held :custody :child})))
+      (try
+        ;; Validate the whole deletion plan before any removal. Symlinks inside
+        ;; the tree are unlinked, never traversed; permanent anchors survive.
+        (let [keep (Path/join physical ".claim")
+              plan (when (File/dir? target)
+                     (vec (mapcat #(:actions (clear-entry-plan (Path/join target %) keep 0))
+                                  (sort (File/ls! target)))))]
+          (File/mkdir_p! target)
+          (doseq [[kind path] plan]
+            (if (= :directory kind) (File/rmdir! path) (File/rm! path)))
+          :ok)
+        (finally (BeamLisp.LazyMemo/nif_file_unlock (elem barrier 1)))))))
 
 (defn clear!
-  "Empty `dir` and keep it, and keep the claim on it. A build that rewrites a
-   directory it holds a claim on must not use `rm_rf!`: the claim file lives IN the
-   directory, so wiping it hands the directory to the next builder mid-build (the
-   self-build did exactly that, and a second build then wiped its staging root while
-   the first was compiling from it). Everything but the claim goes."
-  [dir]
-  (File/mkdir_p! dir)
-  (let [keep (path-for dir)]
-    (doseq [entry (to-list (File/ls! dir))]
-      (let [p (Path/join dir entry)]
-        (when (not= p keep) (File/rm_rf! p)))))
-  :ok)
+  "Clear an admitted workspace, preserving its claim and permanent anchors.
+   The two-argument form clears a descendant under an already owned root.
+   Active compiler followers, escaping paths and nested workspace claims refuse."
+  ([dir]
+   (when (anchor-path? (scope-path! dir))
+     (throw (ex-info "Cannot clear permanent lock anchors" {:kind :build-workspace-scope :path dir})))
+   (with-writer! dir "workspace clear" #(clear-owned! dir dir)))
+  ([dir root] (clear-owned! dir root)))
 
 (defn release!
-  "Drop the claim on `dir` if it is ours. Never removes someone else's."
+  "Release this BEAM process's claim, removing its diagnostic before unlock."
   [dir]
-  (let [c (read-claim dir)]
-    (when (and (some? c) (= (:pid c) (owner-pid)))
-      (File/rm (path-for dir)))
-    :ok))
+  (when-let [handle (Process/delete (handle-key dir))]
+    (when (owned-handle? dir handle)
+      (try (File/rm (path-for dir))
+           (finally (BeamLisp.LazyMemo/nif_file_unlock handle)))))
+  :ok)

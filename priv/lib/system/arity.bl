@@ -1,3 +1,5 @@
+;; Prepared contextual programs use check-anf (system.arity.anf). The Source
+;; and mutable-runtime discussion below describes the legacy editor adapter.
 ; system/arity.bl — a call must hand its callee an arity the callee HAS.
 ;
 ; ── The bug this names ───────────────────────────────────────────────────
@@ -64,22 +66,12 @@
 ; through a local value carries no static callee and is not read.
 
 (ns system.arity
-  (:require [codebase :as cb]))
+  (:require [system.source :as cb] [system.arity.anf :as anf] [diag]))
 
 ; The upper bound for ENUMERATING a callee's arities. It answers two questions:
 ; "is this a fn at all?" (a variadic fn is invocable at any high arity) and
 ; "what arities does it accept?" (for the message).
 (def ^:private max-arity 24)
-
-(defn- src-ns
-  "The namespace `src` declares — `BeamLisp.Loader/declared_ns`, the SAME head
-   scan the loader uses to accept a file, so a resolution here cannot disagree
-   with the resolution a load would do."
-  [src]
-  (try
-    (let [n (BeamLisp.Loader/declared_ns src)]
-      (if (string? n) n "user"))
-    (catch _e "user")))
 
 (defn- source-facts
   "The calls in `src`, and the names `src` defines.
@@ -88,7 +80,7 @@
    defines something (and what it is called), `walk-calls` records every call
    under it with the head AS WRITTEN, its argument count and its line."
   [in-ns src]
-  (let [forms (BeamLisp.Reader/read_string src)
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
         defn-name (fn [form] (cb/defn-form form))
         locals (into #{} (keep defn-name forms))
         calls (first
@@ -97,7 +89,7 @@
                                          in-ns form (first acc) (second acc)))
                         [[] 100000]
                         forms))]
-    {:locals locals :calls calls}))
+    {:locals locals :bound-of (cb/bound-by-caller forms) :calls calls}))
 
 (defn- defined?
   "Whether namespace `ns` publicly defines `name` itself — no refer and no core
@@ -108,7 +100,8 @@
 (defn- fetch-value
   "The value of `name` in `ns`, or nil when this VM cannot say."
   [ns name]
-  (try (BeamLisp.Env/fetch! ns name) (catch _e nil)))
+  (let [result (BeamLisp.Env/fetch ns name)]
+    (when (and (tuple? result) (= :ok (elem result 0))) (elem result 1))))
 
 (defn- callee-value
   "The value a call site's head resolves to, or nil when the VM cannot say.
@@ -159,35 +152,79 @@
      :msg (str callee " is called with " n " argument" (if (= 1 n) "" "s")
                "; the resolved fn accepts " (accepted value))}))
 
-(defn- consider
-  "The finding for one call site, or nil when the oracle is satisfied — or when
-   the oracle cannot be asked at all."
-  [in-ns locals site]
-  (let [callee (str (:call/callee site))
-        n (:call/arity site)]
-    (if (contains? locals callee)
-      nil
-      (let [v (callee-value in-ns callee)]
-        (when (and (some? v)
-                   (some? (a-callable v))
-                   (not (invocable-at? v n)))
-          (finding site v))))))
+(defn- assess [in-ns locals bound-of site]
+ (let [name (str (:call/callee site))]
+  (cond
+   (contains? (get bound-of (:call/caller site) #{}) name)
+   {:status :unknown :reason :lexical-callable}
+   (contains? locals name)
+   {:status :unknown :reason :local-signature}
+   :else (let [value (callee-value in-ns name)]
+    (cond (nil? value) {:status :unknown :reason :unresolved-callee}
+          (nil? (a-callable value)) {:status :unknown :reason :non-callable-or-macro}
+          (invocable-at? value (:call/arity site)) {:status :proved}
+          :else {:status :refused :finding (dissoc (finding site value) :fn :line :col)})))))
+
+(defn- failure [error]
+ {:status :error :coverage {:complete false}
+  :findings [] :obligations []
+  :diagnostics [(diag/error :arity-analysis-error
+                 (str "Arity analysis failed: " (ex-message error)) {} {})]})
+
+(defn check-forms
+ "Explicit arity verdict and coverage. Local/dynamic/unavailable signatures
+  remain unknown obligations. Analyzer errors never become an empty pass."
+ [in-ns forms]
+ (try
+  (let [facts (source-facts in-ns forms)
+        result (reduce
+                (fn [state site]
+                 (let [key [(:call/callee site) (:call/arity site)]
+                       answer (if (contains? (:answers state) key)
+                                (get (:answers state) key)
+                                (assess in-ns (:locals facts) (:bound-of facts) site))
+                       obligation (merge (select-keys site [:call/caller :call/callee
+                                                           :call/arity :call/line])
+                                         (dissoc answer :finding))
+                       finding (:finding answer)]
+                  (-> state
+                   (assoc-in [:answers key] answer)
+                   (update :obligations conj obligation)
+                   (update :findings (fn [findings]
+                    (if finding (conj findings (assoc finding :fn (str (:call/caller site))
+                                                   :line (or (:call/line site) 0) :col 0)) findings))))))
+                {:answers {} :obligations [] :findings []} (:calls facts))
+        obligations (:obligations result)
+        counts (frequencies (map :status obligations))
+        unknown (get counts :unknown 0) refused (get counts :refused 0)]
+   {:status (cond (pos? refused) :refused (pos? unknown) :unknown :else :proved)
+    :coverage {:complete (= 0 unknown) :sites (count obligations)
+               :proved (get counts :proved 0) :unknown unknown :refused refused}
+    :obligations obligations :findings (:findings result) :diagnostics []})
+  (catch error (failure error))))
+
+(defn check-source
+ "Qualification entry: parse failure is :error, missing evidence is :unknown.
+  Existing editor diagnostics keep their quiet best-effort interface."
+ [src]
+ (try
+  (let [forms (BeamLisp.Reader/read_string src)
+        in-ns (or (BeamLisp.Loader/declared_ns src) "user")]
+   (check-forms in-ns forms))
+  (catch error (failure error))))
+
+(defn diagnostics-forms
+ "Best-effort editor findings. Qualification consumers use check-forms."
+ [in-ns forms]
+ (:findings (check-forms in-ns forms)))
 
 (defn diagnostics
-  "One diagnostic per call site whose resolved callee cannot take that many
-   arguments — positioned on the call's own line.
-
-   A source this tier cannot read yields NO findings: an analyzer that cannot
-   run is not evidence about the program, and a tier that throws turns every
-   file it cannot compile into a red suite. `bl check`'s other tiers keep their
-   own verdict on the file."
+  "Arity diagnostics for source text; prepared consumers supply parsed forms."
   [src]
-  (try
-    (let [in-ns (src-ns src)
-          facts (source-facts in-ns src)
-          locals (:locals facts)
-          calls (:calls facts)]
-      (into []
-            (keep (fn [site] (consider in-ns locals site))
-                  calls)))
-    (catch _e [])))
+  (:findings (check-source src)))
+
+(defn check-anf
+ "Pure lexical ANF analysis; no source walker or runtime value lookup.
+  Explicit worlds call system.arity.anf directly to avoid legacy dependencies."
+ ([node] (anf/check node))
+ ([node options] (anf/check node options)))

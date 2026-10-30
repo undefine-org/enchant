@@ -1,0 +1,589 @@
+#+TITLE: One compiler, several worlds
+#+DATE: 2026-10-23
+
+* The executable path
+
+=expand/program= is the explicit =syntax-v1= compiler entry. It reads actual
+source units, resolves contextual bindings, expands transformers, closes global
+links lexically, and calls =compiler/compile-contextual=. The existing ANF and
+native backend execute the result. The ordinary Loader keeps its legacy path.
+
+The frontend lives in the boot tier: =syntax= owns representation and Reader
+conversion; =binding= owns indexed lookup; =expand-source= owns source-derived
+declarations and imports; =expand= owns ordered elaboration and linking.
+=codebase.phase= projects the resulting snapshot. =system.phase= checks the
+recorded resolutions. =typed= consumes reference IDs; =errors= renders the
+original spans. None of these analysis records grant native admission.
+
+=lower-core= owns Core call operand binding and the per-compilation name
+supply. =lower= delegates that construction while retaining ANF lowering.
+This leaf precedes =lower= in the dependency graph, so compiling the backend
+does not call a newly introduced helper through its still-old namespace shim.
+
+Run the cells from the repository root:
+
+#+begin_example
+./bin/bl --cold doc run research/phase-compiler/language.bl.org
+#+end_example
+
+* An intentional binder and an implementation temporary
+
+The fixture's =bind= form accepts a vector containing a user binder and its
+initializer. Its template also introduces its own =tmp=. Substitution preserves
+the user's binder and body together, while the implementation temporary keeps
+its definition and introduction scopes:
+
+#+begin_example
+(defsyntax bind [form context]
+ (syntax-template
+  (let [tmp initial user tmp] body)
+  {'initial (syntax-arg (syntax-arg form 1) 1)
+   'user (syntax-arg (syntax-arg form 1) 0)
+   'body (syntax-arg form 2)}))
+
+(let [tmp 2]
+ (bind [answer 40] (erlang/+ answer tmp))) ; 42
+#+end_example
+
+This uses the existing Reader's lists and vectors. It adds no bracket parser.
+The same fixture imports an old macro and a new function named =answer= from
+two revisions of =library=. The old macro retains its private old =helper=.
+A third macro computes a literal from a =begin-for-syntax= constant.
+
+#+begin_src beam-lisp :id compiled-worlds
+(ns phase.language.walkthrough
+ (:require [expand :as x] [lower :as lower] [system.phase :as phase]
+           [codebase.phase :as code] [codebase.refactor :as refactor]))
+
+(def sources
+ (mapv (fn [[namespace revision file]]
+         {:namespace namespace :revision revision :file file
+          :source (File/read! (str "test/fixtures/contextual-language/" file))})
+   [['library 'old "library-old.bl"] ['library 'new "library-new.bl"]
+    ['forms 'current "forms.bl"] ['showcase 'current "main.bl"]]))
+
+(let [program (x/program sources ['showcase 'current])
+      checked (phase/check program)
+      value (lower/eval-anf :Elixir.PhaseLanguageWalkthrough (:node program))]
+ (assert (= [42 102 42 42] value))
+ (assert (= :proved (:status checked)))
+ (assert (= 4 (count (get-in program [:selection :worlds]))))
+ (assert (= 3 (count (:expansions program))))
+ (assert (= :closed (get-in program [:constructor :status])))
+ {:value value :binding-check (:status checked)
+  :scope (:scope checked) :native-admission (:native-admission checked)})
+#+end_src
+
+#+RESULTS: compiled-worlds
+: {:scope :contextual-binding-resolution, :value [42 102 42 42], :native-admission false, :binding-check :proved}
+
+
+* Portable phases without a provider source file
+
+=expand/phase-library= produces first-order contextual Reader recipes, canonical
+declarations and original source digests. It omits source text and derived
+indexes. =encode-phase-library= and =decode-phase-library= own the finite format
+vocabulary, bounded closed-ETF decoding and content validation. Consumers
+reconstruct indexes. This
+integrity check is separate from producer authentication and SDK authority.
+
+#+begin_src beam-lisp :id portable-worlds
+(let [providers (vec (take 3 sources))
+      library (x/phase-library providers)
+      bytes (x/encode-phase-library library)
+      restored (x/decode-phase-library bytes)
+      program (x/program [(nth sources 3)] ['showcase 'current] [restored])
+      value (lower/eval-anf :Elixir.PhaseLibraryWalkthrough (:node program))]
+ (assert (= [42 102 42 42] value))
+ (assert (every? #(not (contains? % :source)) (:units restored)))
+ (assert (= :proved (:status (phase/check program))))
+ {:value value :provider-source-text false :indexes :rebuilt})
+#+end_src
+#+RESULTS: portable-worlds
+: {:value [42 102 42 42], :provider-source-text false, :indexes :rebuilt}
+
+
+* Phases describe module instances
+
+Module scopes are distinct at each relevant phase. A shifted transformer
+selects a module instance containing its private declarations and imports.
+Its template's module scopes shift; lexical and introduction scopes remain
+shared. Caller holes retain their original contexts. A phase-one transformer
+parameter therefore cannot capture a phase-zero template helper.
+
+This follows the distinction between [[https://docs.racket-lang.org/reference/syntax-model.html][Racket's module and lexical contexts]] and
+[[https://docs.racket-lang.org/guide/phases.html][module-relative phases]]. It is a closed profile, rather than a claim of Racket
+compatibility. Imports select namespace and revision with quoted symbols:
+
+#+begin_example
+(import-world 'library 'old :as old :only [answer])
+(begin-for-syntax
+ (import-world 'library 'old :only [calc]))
+#+end_example
+
+* Lookup coordinates and effective phases
+
+A definition body resolves names in its original source coordinates. Its
+selected module instance can execute at another phase. Both value references
+and transformer references now pass through one qualification operation.
+Transformer images are cached by effective reference ID, not the body's
+unshifted lookup phase. Templates shift into the caller's lookup coordinates;
+using the effective shift there would shift an already projected body twice.
+
+The macro context's =:phase= is the effective evaluation phase, =:use-phase=
+the effective use phase, and =:lookup-phase= the evaluation phase in the
+caller's lookup coordinates. Traces retain the call's lookup phase, position,
+reference shift and both instance/lookup shifts. =codebase.phase= projects
+macro heads and value uses into one occurrence relation. =system.phase=
+rechecks both, including ordered macro availability and instance arithmetic.
+
+The version-two analysis envelopes distinguish =:binding-snapshot= from
+=:snapshot=. The latter hashes expanded ANF, transformer images, references,
+origins and obligations as well as the binding selection. A macro can observe
+its file label: identical source bytes and binding IDs alone do not identify
+the resulting expansion. The facts, dependency/impact and phase APIs share
+this expanded snapshot; rename receipts retain both identities explicitly.
+Occurrence collections must be eager. Analysis refuses lazy input without
+forcing it, caps occurrences at 100,000 and admits its first-order snapshot
+image under a 262,144-node / 16 MiB / depth-128 budget.
+
+This matters when a shifted transformer's body invokes another transformer:
+
+#+begin_src beam-lisp :id nested-phases
+(let [unit (fn [namespace source]
+             {:namespace namespace :revision 'current :file (str namespace ".bl") :source source})
+      units [(unit 'inner
+               "(ns inner) (defsyntax leaf [form ctx] (syntax-literal (:phase ctx)))")
+             (unit 'outer
+               (str "(ns outer) (begin-for-syntax (import-world 'inner 'current :only [leaf])) "
+                    "(defsyntax outer [form ctx] (syntax-literal (leaf)))"))
+             (unit 'client
+               (str "(ns client) (begin-for-syntax (import-world 'outer 'current :only [outer])) "
+                    "(defsyntax answer [form ctx] (syntax-literal (outer))) (answer)"))]
+      program (x/program units ['client 'current])
+      phases (Enum/sort (Enum/map (:expansions program) #(get-in % [:transformer :phase])))
+      value (lower/eval-anf :Elixir.NestedPhaseWalkthrough (:node program))]
+ (assert (= 3 value))
+ (assert (= '(0 1 2) phases))
+ (assert (= :proved (:status (phase/check program))))
+ {:value value :transformer-use-phases phases :binding-check :proved})
+#+end_src
+#+RESULTS: nested-phases
+: {:value 3, :binding-check :proved, :transformer-use-phases (0 1 2)}
+
+
+The final runtime value is just =3=. The compile-time path uses transformers
+at phases 0, 1 and 2; the innermost evaluates at phase 3. Regression tests also
+cover one transformer cached at two effective phases, negative shifts and
+definition-site helper values at the correctly projected phase.
+
+* Refactor the user binder without touching the macro temporary
+
+The same snapshot supports an impact graph and source edits. A rename takes a
+declaration ID and a quoted symbol, never a text search. The Reader provides
+exact Unicode codepoint spans. Units are identified by namespace and revision,
+so two revisions can share a file label without sharing edits. The operation
+returns edited source for review and performs no file writes.
+
+It recompiles the actual edited source, checks binding coordinates across the
+changed world hashes, and requires alpha-equivalent runtime ANF. ANF's existing
+alpha comparison now pairs both let binders and clause patterns. The edit pass
+sorts token spans and walks each source once; it retains comments and formatting.
+
+#+begin_src beam-lisp :id refactor-and-impact
+(let [before (x/program sources ['showcase 'current])
+      declarations (Map/values (get-in before [:selection :by-id]))
+      user (Enum/find declarations #(and (= 'answer (:name %)) (= :local (:visibility %))))
+      offset (Enum/find declarations #(and (= 'offset (:name %)) (= 1 (:phase %))))
+      impact (code/impact before [(:id offset)])
+      result (refactor/rename-program sources ['showcase 'current] (:id user) 'result)
+      after (:program result)
+      value (lower/eval-anf :Elixir.PhaseRenamedWalkthrough (:node after))]
+ (assert (= :verified (:status result)))
+ (assert (= 2 (count (:edits result))))
+ (assert (= [42 102 42 42] value))
+ (assert (:entry-affected impact))
+ (assert (= :proved (:status (phase/check after))))
+ {:renamed-occurrences (count (:edits result)) :value value
+  :compile-time-impact (:entry-affected impact) :binding-check :proved})
+#+end_src
+#+RESULTS: refactor-and-impact
+: {:value [42 102 42 42], :binding-check :proved, :renamed-occurrences 2, :compile-time-impact true}
+
+
+Impact includes the compile-time =offset= even though it is absent from runtime
+code. Each revision and effective phase retains its own reference identity.
+Dependencies are projected from annotated ANF and transformer images; they are
+not guessed from source spellings.
+
+Refactoring has a deliberately explicit coverage boundary. Generated bindings
+cannot be edited as user tokens. A user binder passed through a hygienic hole
+can be edited. Global function renames include their recursive self, selected
+imports and qualified uses, but require every selected definition to have been
+analyzed. They refuse arbitrary syntax constructors, shared phase exports and
+missing archived source. Local edits are checked against the compiled entry.
+This is a closed-program transformation check, not a proof about native source
+text observers or execution admission.
+
+* A bracket grammar with compile-time checking and one runtime pass
+
+The [[file:../../test/fixtures/contextual-query/query.bl][query provider]] builds a small grammar from existing Reader vectors:
+
+#+begin_example
+(query [row '(1 2 3)]
+ [:where (erlang/> row 1)]
+ [:select (erlang/* row 2)]) ; (4 6)
+#+end_example
+
+Three private =begin-for-syntax= functions check vector arities, binder shape
+and clause labels. The transformer rejects malformed syntax during expansion.
+It preserves the user's binder with both user expressions, introduces its own
+input/filtermap locals, and emits one =lists:filtermap= callback. Input runs
+once; predicates and selected projections run in row order. There is no
+intermediate filtered list or runtime query parser. This is a finite-list
+example, not a database optimizer or a claim of completed effect checking.
+
+The new capability is the shared contract: the grammar, phase-only helpers,
+hygiene, archive consumption, dependency queries and refactoring use the same
+binding identities. The filter/map algorithm and Reader delimiters are reused.
+Changing =row= through =codebase.refactor= edits the user tokens and recompiles
+against the archived macro without its source text.
+
+#+begin_src beam-lisp :id bracket-query
+(let [provider {:namespace 'query :revision 'current :file "query.bl"
+                :source (File/read! "test/fixtures/contextual-query/query.bl")}
+      entry {:namespace 'showcase :revision 'current :file "main.bl"
+             :source (File/read! "test/fixtures/contextual-query/main.bl")}
+      archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+      program (x/program [entry] ['showcase 'current] [archive])
+      value (lower/eval-anf :Elixir.PhaseQueryWalkthrough (:node program))]
+ (assert (= '(4 6) value))
+ (assert (empty? (:linked program)))
+ (assert (= 1 (count (:expansions program))))
+ (assert (= :proved (:status (phase/check program))))
+ {:value value :runtime-helper-links (count (:linked program)) :binding-check :proved})
+#+end_src
+#+RESULTS: bracket-query
+: {:value (4 6), :binding-check :proved, :runtime-helper-links 0}
+
+
+The independent artifact demonstration also supports this fixture:
+
+#+begin_example
+scripts/demo-contextual-language --scenario query --out .local/contextual-query-demo
+#+end_example
+
+It uses the same producer/recompiler/consumer harness as the multi-world
+showcase. A fresh recompiler receives entry source and the phase archive,
+reproduces identical BEAM bytes, and a separate consumer executes those bytes
+without any provider source.
+
+* Ownership and limits
+
+One AOT constructor session owns all macro and constant evaluation in a
+program. It fixes the primitive policy, shares fuel and allocation budgets,
+releases temporary callables after each response, refuses use from another
+process, and becomes unusable after failure. The controller closes it on every
+exit. No evaluator callback is accepted. =def= values in this profile are
+bounded first-order constants; =defn= bodies remain ordinary compiled code.
+
+The profile currently admits symbols and vector binding patterns; =let=,
+=loop=, =fn=, =if=, =do=, =recur=, =throw=, =receive= and quotation; scalar and collection
+expressions; explicit =erlang/= calls; and the contextual transformer forms.
+Functions admit inline, named, multiple and variadic guarded clauses through
+the compiler's =function-layout= API. A guard sees direct formal parameters;
+outer locals and variables introduced by a destructuring prelude refuse, as
+in the existing compiler. Clause bodies keep their ordinary lexical context.
+Receive matching supports scalar/keyword literals, identifiers, vectors and
+keyword-keyed maps. Each clause has its own scope; its guard and body share
+that scope, while timeout expressions remain in the surrounding scope. The
+restricted guard operators come from the existing compiler vocabulary and
+retain its intrinsic semantics. They are not ordinary function references or
+macro calls. Guard variable uses retain their selected binding annotations.
+Cyclic module imports, cyclic global initialization, other binding patterns,
+unexpanded special forms and runtime author-metadata expressions refuse.
+Self-recursive functions are supported. Mutually recursive global linking
+remains outside this closed profile. Native effects remain explicit unknown
+obligations; the proved phase report covers binding resolution and availability.
+
+For an independent producer and source-free native consumer, run:
+
+#+begin_example
+scripts/demo-contextual-language --out .local/contextual-language-demo
+#+end_example
+
+The complete compiler generation gate remains
+=scripts/qualify-artifact-generation=. It produces and fresh-boots B and C and
+compares every emitted file, including the boot-owned frontend. The compiler
+uses its existing bootstrap profile to reproduce these units; this does not
+claim that every legacy source has migrated to =syntax-v1=.
+
+The earlier [[file:language-checks.json][scoped qualification receipt]] records 348 assertions, both executable
+cells, and 89 units / 135 modules / 137 byte-identical generated files in B and
+C. The original floor and generated C both emit the same 14,412-byte showcase.
+Its 38,354-byte phase archive supports recompilation without provider source.
+The source-free consumer returns =[42 102 42 42]=. These checks qualify the
+closed compiler path; native execution and ownership migration retain their
+separate gates.
+
+The newer [[file:refactor-checks.json][refactoring receipt]] records the exact changed frontend and its
+399-assertion regression batch, plus fresh B/C reproduction. The
+[[file:query-checks.json][query receipt]] records the query tests, four literate cells and both fresh
+source-free demonstrations from the generated C compiler. Receipts qualify
+their recorded input hashes; a later source edit requires the relevant gates
+to be renewed.
+
+The [[file:qualified-phase-checks.json][qualified-phase receipt]] covers the nested-phase repair and version-two
+analysis. Its compiler regression batch passes 447 assertions; the final five
+affected consumer files pass 107 assertions after snapshot hardening. All five
+literate cells and both generated-C source-free demonstrations pass. Fresh B/C
+reproduce every artifact. The receipt separately records the generation's
+inputs and later analysis-only changes; the boot compiler inputs are unchanged.
+
+* A bracket grammar can introduce a selective receive binder
+
+The [[file:../../test/fixtures/contextual-mailbox/mailbox.bl][mailbox provider]] exports a contextual transformer with a private phase-one
+validator. Its bracket pairs a keyword message tag with the user's binder:
+
+#+begin_example
+(await-reply [:answer value] (erlang/+ value 2) 0 :missing)
+#+end_example
+
+This expands to a timeout binding and ordinary native =receive=. The user's
+binder carries use-site context into the message pattern and body. The internal
+timeout binder retains definition-site context, so a caller's =timeout= is
+unaffected. The existing compiler owns clause grouping, guard operators,
+pattern alternatives and lowering. Expansion uses its Reader-index layout to
+attach scopes rather than maintaining a second receive parser.
+
+The [[file:../../test/fixtures/contextual-mailbox/main.bl][entry]] queues an unrelated message before the answer, consumes both selectively,
+then takes the absent-message timeout. Its result is =[42 107 99]=. There is no
+runtime grammar parser or phase-one helper in the emitted entry. This is a
+language demonstration, not an actor lifetime or native effect proof.
+
+#+begin_src beam-lisp :id contextual-mailbox
+(let [provider {:namespace 'mailbox :revision 'current :file "mailbox.bl"
+                :source (File/read! "test/fixtures/contextual-mailbox/mailbox.bl")}
+      client {:namespace 'showcase :revision 'current :file "main.bl"
+              :source (File/read! "test/fixtures/contextual-mailbox/main.bl")}
+      archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+      program (x/program [client] ['showcase 'current] [archive])
+      value (lower/eval-anf :Elixir.PhaseMailboxWalkthrough (:node program))
+      checked (phase/check program)]
+ (assert (= [42 107 99] value))
+ (assert (= 3 (count (:expansions program))))
+ (assert (= :proved (:status checked)))
+ (assert (empty? (:linked program)))
+ {:value value :expansions (count (:expansions program)) :binding-check (:status checked)})
+#+end_src
+#+RESULTS: contextual-mailbox
+: {:value [42 107 99], :expansions 3, :binding-check :proved}
+
+
+#+begin_example
+scripts/demo-contextual-language --scenario mailbox --out .local/contextual-mailbox-demo
+#+end_example
+
+The same producer/archive/recompiler/consumer pipeline used by the earlier
+showcases accepts this scenario. Provider source is absent during recompilation;
+the consumer runs only emitted BEAM. The [[file:../../test/bl/contextual_receive_test.bl][focused regression]] also checks map,
+tuple and literal matching, clause/timeout isolation, restricted guards and
+semantic rename through a pattern, its guard and body.
+
+The [[file:receive-checks.json][receive receipt]] separates the earlier failed bootstrap/integration checks
+from final-source checks. Clause indexing materializes the source forms once
+as a vector; expansion does not repeatedly walk the original list to find each
+pattern, guard and body. The compiler layout itself keeps eager native lists.
+These preparation choices add no parser or extra matching pass at runtime.
+
+* Compile-time clauses must agree with native guards
+
+Guarded phase-one helpers use the same clause layout and binding IDs as runtime
+functions. The mailbox validator now uses a guarded private =vector-arity?=
+helper. It is archived with the transformer, evaluated by the existing bounded
+constructor machine and absent from the runtime entry.
+
+Integration exposed a semantic mismatch in that machine: it accepted any truthy
+guard result and propagated ordinary guard BIF errors. Native clauses accept
+only =true= and skip a clause when an admitted guard operation fails. The
+machine now implements that distinction locally to guard evaluation. Ordinary
+=if= remains truthy. A failing subexpression aborts the entire guard, so its
+failure cannot become a false value in a surrounding equality test.
+
+The machine's existing private frame identifies that control transfer. Budget
+failures, unsafe effects, unsupported primitives and opaque-data refusals still
+escape; they are not failed clauses. Primitive admission remains the existing
+closed policy. A runtime guard operator whose primitive is not modeled by the
+machine still refuses compile-time evaluation. This change adds no native grant
+or second evaluator.
+
+#+begin_src beam-lisp :id guarded-constructor-parity
+(let [program (x/program
+               [{:namespace 'guard-example :revision 'current :file "guard-example.bl"
+                 :source "(ns guard-example) ((fn ([x] :when 42 0) ([x] 42)) 1)"}]
+               ['guard-example 'current])
+      runtime (lower/eval-anf :Elixir.PhaseGuardWalkthrough (:node program))
+      compile-time (BeamLisp.AOT/interpret_constructor! (:node program) {} {})]
+ (assert (= 42 runtime))
+ (assert (= runtime compile-time))
+ {:runtime runtime :compile-time compile-time})
+#+end_src
+#+RESULTS: guarded-constructor-parity
+: {:runtime 42, :compile-time 42}
+
+
+* Protected regions include operand evaluation
+
+The guard integration exposed a backend contract too. The prepared ANF retained
+its catch, but a nested call inside a nonthrowing Core BIF could escape that
+catch. A direct OTP Core probe reproduced the escape, and binding the operand
+first preserved protection. Binding only the outer result did not fix it.
+
+=lower-core= now sequences compound call operands as explicit Core lets in
+source order. Variables and literals need no binding. Both remote calls and
+function application use this owner. This keeps evaluation inside its enclosing
+region and lets ordinary Core optimization remove redundant bindings. The
+regression checks direct/nested throws, aggregate controls and argument effects.
+The resulting lets also require source annotations on their final call. The
+published-function regression caught a BIF reporting its caller's line instead
+of its own; =lower-core/annotate-call= preserves that call location without
+rewriting the operands' individual locations. Fresh-image qualification checks
+the original failing line too.
+
+Fresh generation qualification now checks those semantics and native/interpreted
+guard agreement in each produced image. Its =--seed= argument selects an
+explicit initial bootstrap floor; actual copied source and compiler bytes are
+verified before any producer VM starts and rechecked afterward. The initial
+floor is an input, not a claim of qualified output.
+
+=scripts/install-seed CANDIDATE= runs the existing source/inventory/digest judge
+and manifest-last publisher without starting the application being repaired.
+The ordinary launcher correctly refuses a stale SDK inventory before reaching
+an installer. This bootstrap entry does not hotload candidate code or weaken
+that runtime refusal. The installed bytes are checked against the actual
+qualified C output. A changed candidate is refused without modifying the floor.
+
+Recovery also distinguishes the executing compiler's identity from the target
+Source identity. =current_build_key= used to combine live driver sources with
+the memoized executing compiler key. It now recomputes both live contributions
+without resetting either executing key. Installation checks these target keys
+again immediately before publishing. =--compiler-root= selects an explicit
+coherent recovery image when the target checkout cannot bootstrap itself.
+The preboot host gate also found two postboot replay calls using generic
+language invocation for a known native closure. Explicit =erlang/apply= keeps
+that host's emitted dependencies within its established preboot contract.
+The same emitted-atom dependency check now runs in =check-source-floor= before
+application startup. Recovery can therefore reject that regression before
+paying for complete B/C production.
+
+The [[file:guard-checks.json][guard and Core qualification receipt]] records the scoped checks, earlier
+failures, exact installed generation and renewed source-free demonstrations.
+
+* Bracket syntax can introduce an exception-safe extent
+
+The =ensuring= macro takes =[resource expression]=, a body, and cleanup. Its
+private phase-one validator checks the binding vector. Template substitution
+preserves the user's binder and its body; the existing compiler implements
+=try= and =finally=, including failure and unmatched typed-catch propagation.
+The template adds no evaluator or runtime protocol.
+
+=compiler/try-layout= owns grouping and original Reader indexes.
+=compiler/catch-layout= owns normalized-catch binder/type roles and implicit
+handler locals. Expansion gives each handler an independent lexical scope.
+The compiler's =__STACKTRACE__= and =__EXCEPTION_KIND__= values enter that scope
+through explicit lexical aliases; they receive binding IDs and cannot leak
+into the protected body, another handler, or cleanup. A synthetic implicit
+binder has no authored token, so source renaming refuses it.
+
+#+begin_src beam-lisp :id archived-cleanup-extent
+(let [provider {:namespace 'control :revision 'current :file "control.bl"
+                :source (File/read! "test/fixtures/contextual-cleanup/control.bl")}
+      archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+      client {:namespace 'showcase :revision 'current :file "main.bl"
+              :source (File/read! "test/fixtures/contextual-cleanup/main.bl")}
+      program (x/program [client] ['showcase 'current] [archive])
+      result (lower/eval-anf :Elixir.PhaseCleanupWalkthrough (:node program))]
+ (assert (= [42 100 40 200] result))
+ (assert (= :proved (:status (phase/check program))))
+ (assert (empty? (:linked program)))
+ {:value result :expansions (count (:expansions program))})
+#+end_src
+#+RESULTS: archived-cleanup-extent
+: {:value [42 100 40 200], :expansions 2}
+
+Typed catch module names remain canonical compiler literals and are recorded
+as native obligations. The phase report proves binding resolution; it does not
+prove cleanup effects or resource ownership. Duplicate =finally= clauses now
+refuse at the shared compiler owner instead of silently dropping later cleanup.
+Contextual compilation ignores ambient class imports for those literals. The
+compiler also owns =contextual-native-name?=, the profile's explicit =erlang/=
+escape grammar. Its target selection bypasses ambient aliases, imports and
+namespace discovery. Macro argument access uses ordinary keyword invocation,
+so compiler-generated access needs no extra native qualifier escape.
+Poisoned ambient imports and aliases must leave both results and ANF unchanged;
+the legacy class-import control still retains its established behavior.
+The bounded constructor now interprets the same =:try= node. Its private Source
+exception control is distinct from machine refusal. Unsafe effects, opaque data
+and exhausted budgets abort evaluation, bypass user handlers and skip user
+cleanup. A normal Source exception follows handler ordering and cleanup.
+
+=check-source-floor --test FILE ...= runs the actual test CLI against a fresh
+private candidate before installation or B/C production. It keeps the SDK's
+physical source root intact and exposes authored test fixtures separately.
+The CLI owns isolation and its failure status remains a failure of this check.
+
+See the [[file:try-checks.json][exception-scope and cleanup qualification receipt]] for the exact generation,
+ambient-state controls and independent-process demonstrations.
+
+* Exceptions can participate in compile-time values
+
+The validation fixture specializes =ratio [numerator denominator] fallback=.
+Its private phase-one constant recovers from division by zero; its private
+helper also catches arithmetic failure. The macro returns literal syntax.
+At runtime the specialized ratios contain no division or handler code, and a
+caller-local =bias= cannot capture the provider's phase-one =bias=.
+
+#+begin_src beam-lisp :id archived-exception-specialization
+(let [provider {:namespace 'validation :revision 'current :file "validation.bl"
+                :source (File/read! "test/fixtures/contextual-validation/validation.bl")}
+      archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+      client {:namespace 'showcase :revision 'current :file "main.bl"
+              :source (File/read! "test/fixtures/contextual-validation/main.bl")}
+      program (x/program [client] ['showcase 'current] [archive])
+      result (lower/eval-anf :Elixir.PhaseExceptionWalkthrough (:node program))]
+ (assert (= [42 99 42] result))
+ (assert (= :proved (:status (phase/check program))))
+ (assert (empty? (:linked program)))
+ {:value result :expansions (count (:expansions program))})
+#+end_src
+#+RESULTS: archived-exception-specialization
+: {:value [42 99 42], :expansions 3}
+
+The engine models raw =erlang/throw=, =error=, =exit= and frame-list =raise= as
+private frame-owned control. The language's =(throw value)= uses the existing
+ExInfo owner. Native execution never receives the interpreter's private signal.
+An uncaught Source exception fails its session; caught exceptions keep spending
+the same aggregate fuel. Failure classes for anonymous functions and cases are
+explicit in the existing native lowerer, rather than inferred by Core pattern
+optimization.
+
+Normalized exception values need exact current-frame witnesses. The shared raw
+checker walks their fields without invoking protocols; ordinary first-order
+inputs/results still reject exception structs and foreign capabilities. Owned
+callables may remain inside a handled exception but cannot escape a failed
+request. Source metadata cannot manufacture these private witnesses.
+
+Frames expose a bounded projection of actual interpreter VM frames: module,
+function, arity, file and line. Arguments and formatting metadata are removed;
+stack-dependent message details therefore reflect this bounded phase view.
+The native backend retains its own raw catch token; the interpreter carries
+frame lists and never invokes =raw_raise= with them.
+
+Elixir's normalizer can call a formatter selected by =error_info= and may inspect
+payloads. Projection removes formatter hooks, and raw validation bounds admitted
+payloads before normalization. A native hook control executes once; the bounded
+interpreter executes none. See the pinned
+[[https://github.com/elixir-lang/elixir/blob/v1.20.4/lib/elixir/lib/exception.ex][Elixir normalizer source]]. This grants no native execution or ownership proof.
+
+See the [[file:exception-checks.json][bounded exception and specialization receipt]] for parity, refusal,
+normalizer-hook controls, exact B/C reproduction and the five source-free demos.

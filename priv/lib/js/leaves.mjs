@@ -24,9 +24,9 @@ import * as J from "./interop.mjs";
 import * as A from "./abi.mjs";
 import * as C from "./actor/module.mjs";
 import { exactCandidates, ENV } from "./env.mjs";
-import { LAZY_LEAVES } from "./lazy.mjs";
+import { LAZY_LEAVES, cell } from "./lazy.mjs";
 import { HOST_LEAVES, bindTable, registerModule, resolveRemote, mangle } from "./host-leaves.mjs";
-import { LINKS } from "./core-links.mjs";
+import { LINKS, RETURN_CONSTRUCTOR_SHAPES } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
 const OK = R.kw("ok"), ERROR = R.kw("error");
@@ -96,6 +96,7 @@ export const LEAVES = {
   "erlang/tuple_size/1": (t) => (t instanceof Tup ? t.items.length : badarg("tuple_size", t)),
   "erlang/is_tuple/1": (x) => x instanceof Tup,
   "erlang/is_list/1": (x) => isList(x),
+  "erlang/not/1": (x) => x === true ? false : x === false ? true : badarg("not", x),
   "erlang/is_atom/1": (x) => x instanceof Kw || x === true || x === false || x === null,
   "erlang/list_to_tuple/1": (l) => new Tup(arr(l)),
   "erlang/tuple_to_list/1": (t) => list(t.items),
@@ -154,11 +155,13 @@ export const LEAVES = {
   "maps/from_list/1": (l) => { let m = R.EMPTY_MAP; for (const p of arr(l)) m = m.assoc(p.items[0], p.items[1]); return m; },
   "maps/to_list/1": (m) => list([...m.entries()].map(([k, v]) => T(k, v))),
   "maps/merge/2": (a, b) => { let m = a; for (const [k, v] of b.entries()) m = m.assoc(k, v); return m; },
+  "maps/values/1": (m) => list([...m.entries()].map(([, v]) => v)),
   "maps/keys/1": (m) => list([...m.entries()].map(([k]) => k)),
   "maps/size/1": (m) => m.cnt,
   "maps/remove/2": (k, m) => m.dissoc(k),
 
   // string (Erlang's, over charlists)
+  "string/chr/2": (cs, cp) => { const i = arr(cs).indexOf(cp); return i < 0 ? 0 : i + 1; },
   "string/to_integer/1": toInteger,
   "string/to_float/1": toFloat,
   "string/cspan/2": (cs, delims) => {
@@ -205,7 +208,77 @@ const PDICT = new Map();
 const nextGensym = (() => { let n = 0; return () => ++n; })();
 const UNDEFINED = R.kw("undefined");
 const pkey = (k) => R.printStr(k);
+
+// Enum predicates consume one Enumerable cell at a time: all?/empty? must
+// not realize a deferred tail just to answer about the prefix.
+function* enumerable(c) {
+  if (c === null || c === undefined || typeof c === "string") {
+    const error = new BLError("Enumerable protocol is not implemented for " + R.printStr(c));
+    error.blType = R.kw("Elixir.Protocol.UndefinedError");
+    throw error;
+  }
+  for (let p = cell(c); p !== null; p = cell(p.t)) {
+    if (!(p instanceof Cons)) return badarg("Enumerable", c);
+    yield p.h;
+  }
+}
+
+// These are passive CompilerData shape views (host/compiler_data.bl), over
+// this host's values. They grant no Source execution or native admission.
+const field = (m, k) => m instanceof HMap ? m.get(R.kw(k), null) : null;
+const integer = (x) => typeof x === "bigint" || Number.isSafeInteger(x);
+const byteSize = (s) => new TextEncoder().encode(s).length;
+function bindingReference(value) {
+  const digest = (x) => typeof x === "string" && x.length <= 32 && byteSize(x) === 32;
+  const phase = field(value, "phase"), space = field(value, "space");
+  return value instanceof HMap && value.cnt === 7 &&
+    R.keyEq(field(value, "version"), 1) && field(value, "kind") === R.kw("binding-reference") &&
+    ["world", "declaration", "id"].every(k => digest(field(value, k))) &&
+    integer(phase) && phase >= -4096 && phase <= 4096 &&
+    space instanceof Tup && space.items.length === 2 && space.items[0] === R.kw("symbol") &&
+    typeof space.items[1] === "string" && space.items[1].length >= 1 && space.items[1].length <= 512 && byteSize(space.items[1]) <= 512;
+}
+function simpleFunctionClause(node) {
+  if (field(node, "op") !== R.kw("fn")) return null;
+  const clauses = field(node, "clauses");
+  if (!(clauses instanceof Cons) || clauses.t !== EMPTY) return null;
+  const clause = clauses.h;
+  if (!(clause instanceof HMap) || field(clause, "guard") !== null || !clause.has(R.kw("body"))) return null;
+  let pats = field(clause, "pats"), remaining = 255;
+  while (pats !== EMPTY) {
+    if (--remaining < 0 || !(pats instanceof Cons) || field(pats.h, "pop") !== R.kw("pvar") ||
+        typeof field(pats.h, "name") !== "string") return null;
+    pats = pats.t;
+  }
+  return clause;
+}
 Object.assign(LEAVES, {
+  "Elixir.BeamLisp.CompilerData/binding_reference?/1": bindingReference,
+  "Elixir.BeamLisp.CompilerData/simple_function_clause/1": simpleFunctionClause,
+  "Elixir.BeamLisp.CompilerData/catch_stack_bindings/0": () => R.hashMap(R.kw("frames"), "__STACKTRACE__", R.kw("raw"), "__STACKTRACE_RAW__"),
+  "Elixir.BeamLisp.CompilerData/eager_to_list/1": (c) => list(eagerList(c)),
+  // Elixir Enumerable callback convention: element first, accumulator last.
+  "Elixir.Enum/all?/2": (c, f) => { for (const x of enumerable(c)) if (!R.truthy(A.invoke(f, x))) return false; return true; },
+  "Elixir.Enum/each/2": (c, f) => { for (const x of enumerable(c)) A.invoke(f, x); return OK; },
+  "Elixir.Enum/empty?/1": (c) => enumerable(c).next().done,
+  "Elixir.Enum/group_by/2": (c, f) => {
+    let groups = R.EMPTY_MAP;
+    for (const x of enumerable(c)) { const k = A.invoke(f, x); groups = groups.assoc(k, new Cons(x, groups.get(k, EMPTY))); }
+    let out = R.EMPTY_MAP;
+    for (const [k, xs] of groups) out = out.assoc(k, R.reverseI(xs));
+    return out;
+  },
+  "Elixir.Enum/map/2": (c, f) => list(eagerList(c).map((x) => A.invoke(f, x))),
+  "Elixir.Enum/flat_map/2": (c, f) => list(eagerList(c).flatMap((x) => eagerList(A.invoke(f, x)))),
+  "Elixir.Enum/reduce/3": (c, acc, f) => eagerList(c).reduce((a, x) => A.invoke(f, x, a), acc),
+  "Elixir.Enum/sort/1": (c) => list(eagerList(c).sort(R.compare)),
+  "Elixir.Enum/uniq/1": (c) => { const out = []; let seen = R.EMPTY_SET; for (const x of eagerList(c)) if (!seen.has(x)) { seen = seen.conj(x); out.push(x); } return list(out); },
+  "Elixir.Enum/zip/2": (a, b) => { const xs = eagerList(a), ys = eagerList(b); return list(xs.slice(0, ys.length).map((x, i) => T(x, ys[i]))); },
+  "Elixir.Enum/drop/2": (c, n) => { const xs = eagerList(c); return list(n < 0 ? xs.slice(0, Math.max(0, xs.length + n)) : xs.slice(n)); },
+  "Elixir.Map/get/2": (m, k) => m.get(k, null),
+  "Elixir.Map/to_list/1": (m) => list(m.entries().map(([k, v]) => T(k, v))),
+  "lists/seq/2": (a, b) => { if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || b < a - 1) return badarg("seq", T(a, b)); return list(Array.from({length: Math.max(0, b - a + 1)}, (_, i) => a + i)); },
+  "lists/all/2": (f, xs) => { for (const x of arr(xs)) { const v = A.invoke(f, x); if (v === false) return false; if (v !== true) return badarg("all predicate", v); } return true; },
   "Elixir.BeamLisp.CompilerData/eager_map/2": (f, c) => list(eagerList(c).map((x) => A.invoke(f, x))),
   "Elixir.BeamLisp.CompilerData/eager_map/3": (f, a, b) => { const xs = eagerList(a), ys = eagerList(b), n = Math.min(xs.length, ys.length); const o = []; for (let i = 0; i < n; i++) o.push(A.invoke(f, xs[i], ys[i])); return list(o); },
   "Elixir.BeamLisp.CompilerData/eager_filter/2": (f, c) => list(eagerList(c).filter((x) => R.truthy(A.invoke(f, x)))),
@@ -218,6 +291,7 @@ Object.assign(LEAVES, {
   // erlang:get/put answer the atom `undefined` for a missing key, not nil
   "erlang/get/1": (k) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED),
   "erlang/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED; PDICT.set(pkey(k), v); return old; },
+  "Elixir.Process/get/1": (k) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null),
   "Elixir.Process/get/2": (k, d) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : d),
   "Elixir.Process/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null; PDICT.set(pkey(k), v); return old; },
   "Elixir.System/unique_integer/1": (() => { let n = 0; return () => ++n; })(),
@@ -238,6 +312,15 @@ Object.assign(LEAVES, {
   "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(A.invoke(f, a, b)) ? -1 : 1))),
   "maps/filter/2": (f, m) => { let o = R.EMPTY_MAP; for (const [k, v] of m.entries()) if (R.truthy(A.invoke(f, k, v))) o = o.assoc(k, v); return o; },
   "maps/without/2": (ks, m) => { let o = m; for (const k of arr(ks)) o = o.dissoc(k); return o; },
+  "maps/with/2": (ks, m) => {
+    if (!(m instanceof HMap)) return badarg("with map", m);
+    let out = R.EMPTY_MAP;
+    for (let p = ks; p !== EMPTY; p = p.t) {
+      if (!(p instanceof Cons)) return badarg("with keys", ks);
+      if (m.has(p.h)) out = out.assoc(p.h, m.get(p.h));
+    }
+    return out;
+  },
 
   "Elixir.BeamLisp.Link/module_for/1": moduleFor,
   // a JS compile never loads beams: there is nothing for settle to rebuild
@@ -256,6 +339,7 @@ Object.assign(LEAVES, {
 
   // the loader, in a page: every namespace the page has is already loaded
   // (built in), so probes answer from the registry and loads are no-ops
+  "Elixir.BeamLisp.Loader/declare_require/3": () => OK,
   "Elixir.BeamLisp.Loader/ensure_loaded/1": () => OK,
   // the readiness guard the compiler puts before a direct call into another
   // namespace (when that namespace was already loaded at compile time)
@@ -273,6 +357,11 @@ Object.assign(LEAVES, {
   "Elixir.BeamLisp.Server/module_for/2": (ns, name) => {
     const camel = (seg) => seg.split(/[-_]/).map((p) => (p ? p[0].toUpperCase() + p.slice(1) : "")).join("");
     return R.kw("Elixir.BeamLisp.Server." + (ns + "." + name).split(".").map(camel).join("."));
+  },
+  // Generated from the actual native Server vocabulary by this build.
+  "Elixir.BeamLisp.Server/return_constructor_shapes/0": () => {
+    if (RETURN_CONSTRUCTOR_SHAPES === null) throw new BLError("missing generated Server return vocabulary");
+    return RETURN_CONSTRUCTOR_SHAPES;
   },
   "Elixir.BeamLisp.Server/return_constructors/0": () => R.EMPTY_MAP,
   // `~@`: a vector or list spreads, nil is empty, a map yields its entries

@@ -190,6 +190,12 @@ pub fn stamp(root: &Path) -> String {
     for input in BUILD_INPUTS {
         walk_input(root, &root.join(input), &mut rows);
     }
+    let provider = std::env::var("BL_NATIVE_PROVIDER").unwrap_or_else(|_| "nix".into());
+    rows.push(format!("native-provider {provider}"));
+    if provider == "nix" {
+        let platform = std::env::var_os("BL_ARTIFACT_PLATFORM").map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
+        rows.extend(nix_artifact::stamp_inputs(&platform));
+    }
     rows.sort();
     rows.push(format!("HEAD {}", head_commit(root).unwrap_or_default()));
     sha256_hex(rows.join("\n").as_bytes())

@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Run execution-analysis edits in one capped, isolated SDK consumer.
+
+The production sources are copied with namespace/import names retargeted only.
+This is component evidence, not compiler-floor or packaged-release acceptance.
+No leased SDK function is overwritten, no installed image is modified, and no
+one-off VM is started per test file.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCES = {
+    "anf": "priv/boot/anf.bl",
+    "system.ir": "priv/lib/system/ir.bl",
+    "typed": "priv/std/typed.bl",
+    "codebase": "priv/std/codebase.bl",
+    "codebase.boundary": "priv/lib/codebase/boundary.bl",
+    "system.source": "priv/lib/system/source.bl",
+    "system.arity": "priv/lib/system/arity.bl",
+    "system.analyze": "priv/lib/system/analyze.bl",
+    "system.incr": "priv/lib/system/incr.bl",
+    "system.evidence": "priv/lib/system/evidence.bl",
+    "system.publication": "priv/lib/system/publication.bl",
+    "system.execution": "priv/lib/system/execution.bl",
+}
+TESTS = [
+    "test/bl/codebase_call_only_test.bl",
+    "test/bl/typed_coverage_test.bl",
+    "test/bl/codebase_boundary_test.bl",
+    "test/bl/execution_ir_children_test.bl",
+    "test/bl/execution_entry_schema_test.bl",
+    "test/bl/execution_entry_producer_test.bl",
+    "test/bl/system/arity_coverage_test.bl",
+    "test/bl/system/analysis_coverage_test.bl",
+    "test/bl/system/arity_test.bl",
+    "test/bl/system/analyze_test.bl",
+    "test/bl/system/analyze_multi_arity_test.bl",
+    "test/bl/system/incremental_evidence_test.bl",
+]
+BOOT = r'''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+BeamLisp.AOT.boot()
+root = System.fetch_env!("BL_EXECUTION_COMPONENT")
+BeamLisp.Env.add_search_path(Path.join(root, "sources"))
+tests = File.read!(Path.join(root, "tests.json")) |> Jason.decode!()
+for path <- tests do
+  IO.puts("COMPONENT reading #{path}")
+  BeamLisp.Reader.read_string(File.read!(path), path)
+end
+BeamLisp.Loader.ensure_loaded("execution.component.system.arity")
+checker = BeamLisp.Env.fetch!("execution.component.system.arity", "check-source")
+preflight = for path <- Path.wildcard(Path.join(root, "sources/**/*.bl")) do
+  result = BeamLisp.Ns.Rt.invoke(checker, [File.read!(path)])
+  status = Map.fetch!(result, :status)
+  if status in [:refused, :error] do
+    IO.inspect(result, label: "COMPONENT arity preflight #{path}", limit: :infinity)
+    raise "source arity preflight #{status}: #{path}"
+  end
+  %{source: path, status: status, coverage: Map.fetch!(result, :coverage)}
+end
+File.write!(Path.join(root, "arity-preflight.json"), Jason.encode!(preflight))
+started = System.monotonic_time(:millisecond)
+IO.puts("EXECUTION-COMPONENT ready; copied source and isolated namespaces")
+worker = Task.async(fn -> BeamLisp.TestRT.run_suite(tests, []) end)
+await = fn await ->
+  case Task.yield(worker, 30_000) do
+    {:ok, result} -> result
+    {:exit, reason} -> raise "component worker exited: #{inspect(reason)}"
+    nil ->
+      IO.inspect(Process.info(worker.pid, [:status, :current_stacktrace]), label: "COMPONENT waiting")
+      await.(await)
+  end
+end
+result = await.(await)
+elapsed = System.monotonic_time(:millisecond) - started
+IO.inspect(result, label: "EXECUTION-COMPONENT")
+receipt = %{kind: "retargeted-source-component", totals: result, elapsed_ms: elapsed}
+File.write!(Path.join(root, "result.json"), Jason.encode!(receipt))
+if Map.get(result, :tests, 0) == 0 or
+   Map.get(result, :fail, 0) + Map.get(result, :error, 0) > 0,
+  do: System.halt(1)
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    images = parser.add_mutually_exclusive_group(required=True)
+    images.add_argument("--sdk-image", type=Path)
+    images.add_argument("--bootstrap-image", type=Path,
+                        help="source application with a coherent generated floor")
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("tests", nargs="*")
+    args = parser.parse_args()
+    image = (args.sdk_image or args.bootstrap_image).resolve()
+    required = ["priv/bootstrap/seed/manifest.term"]
+    if args.sdk_image:
+        required += ["priv/precompiled.term", "priv/sdk-code.term"]
+    if not all((image / path).is_file() for path in required):
+        parser.error("image is missing its required floor or SDK inventory")
+    with tempfile.TemporaryDirectory(prefix="bl-execution-component-") as temporary:
+        work = args.work_dir.resolve() if args.work_dir else Path(temporary)
+        work.mkdir(parents=True, exist_ok=True)
+        sources = work / "sources"
+        if sources.exists():
+            shutil.rmtree(sources)
+        tests = args.tests or TESTS
+        snapshots = {}
+        for name, path in SOURCES.items():
+            source = ROOT / path
+            original = source.read_text()
+            prefix = "execution.component."
+            modified = original.replace(f"(ns {name}", f"(ns {prefix}{name}", 1)
+            # codebase has an annotated ns form. Replace its declared name at
+            # its actual whitespace-delimited namespace line, not code strings.
+            if name == "codebase":
+                modified = original.replace("\n  codebase\n", "\n  execution.component.codebase\n", 1)
+            for dependency in SOURCES:
+                modified = modified.replace(f"[{dependency} :as ", f"[{prefix}{dependency} :as ")
+                modified = modified.replace(f"[{dependency}]", f"[{prefix}{dependency} :as {dependency}]")
+                modified = modified.replace(f'"{dependency}"', f'"{prefix}{dependency}"')
+            target = sources / "execution/component" / (name.replace(".", "/") + ".bl")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(modified)
+            snapshots[path] = hashlib.sha256(source.read_bytes()).hexdigest()
+        copied_tests = []
+        for path in tests:
+            source = ROOT / path
+            modified = source.read_text()
+            for dependency in SOURCES:
+                modified = modified.replace(f"[{dependency} :as ", f"[execution.component.{dependency} :as ")
+                modified = modified.replace(f"[{dependency}]", f"[execution.component.{dependency} :as {dependency}]")
+                modified = modified.replace(f'"{dependency}"', f'"execution.component.{dependency}"')
+            target = work / "cases" / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(modified)
+            copied_tests.append(str(target))
+            snapshots[path] = hashlib.sha256(source.read_bytes()).hexdigest()
+        (work / "tests.json").write_text(json.dumps(copied_tests))
+        identities = {path: hashlib.sha256((image / path).read_bytes()).hexdigest()
+                      for path in required}
+        (work / "inputs.json").write_text(json.dumps({"sources": snapshots,
+            "image": str(image), "image_kind": "sdk" if args.sdk_image else "bootstrap",
+            "image_identities": identities}, indent=2))
+        driver = work / "check.exs"
+        driver.write_text(BOOT)
+        unit = f"bl-execution-component-{os.getpid()}"
+        command = ["systemd-run", "--user", "--collect", "--wait", "--pipe", "--quiet",
+                   f"--unit={unit}", f"--working-directory={image}",
+                   "--property=MemoryMax=6G", "--property=MemorySwapMax=0",
+                   "--property=RuntimeMaxSec=300", f"--setenv=BL_ROOT={image}",
+                   f"--setenv=BL_EXECUTION_COMPONENT={work}", "--setenv=BL_DAEMON=off",
+                   "--setenv=ELIXIR_ERL_OPTIONS=+S 4:4 +SDcpu 2:2 +SDio 1:1", "elixir"]
+        for path in sorted(image.parent.glob("*/ebin")):
+            command += ["-pa", str(path)]
+        command += ["-pa", str(image / "ebin"), str(driver)]
+        try:
+            result = subprocess.call(command)
+        finally:
+            subprocess.run(["systemctl", "--user", "stop", unit],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for path, digest in snapshots.items():
+            if hashlib.sha256((ROOT / path).read_bytes()).hexdigest() != digest:
+                raise SystemExit(f"input changed during component check: {path}")
+        for path, digest in identities.items():
+            if hashlib.sha256((image / path).read_bytes()).hexdigest() != digest:
+                raise SystemExit(f"image changed during component check: {path}")
+        return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

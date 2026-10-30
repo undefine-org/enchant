@@ -1,0 +1,40 @@
+(ns compiler-bootstrap-order-test (:require [reader-node :as rn]))
+
+(defn- selected-forms [source]
+ (Enum/filter (BeamLisp.Reader/read_string source "priv/boot/compiler.bl")
+  (fn [form]
+   (and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head form))
+        (contains? #{"metadata-visibility" "private-var?"}
+          (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items form :list))))))))
+
+(defn- publish-and-call [forms namespace subject]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+     (BeamLisp.Env/put_meta subject "private-value" {:private true})
+     (BeamLisp.Env/put_meta subject "public-value" {:private false})
+     (Enum/reduce forms nil
+      (fn [form result]
+       (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace))
+       (BeamLisp.Link/settle)
+       (if (= "private-var?" (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items form :list))))
+        (let [module (BeamLisp.Emit/module_for namespace)]
+         {:private (erlang/apply module :private-var? (list subject "private-value"))
+          :public (erlang/apply module :private-var? (list subject "public-value"))})
+        result)))))
+   (catch error (println :bootstrap-order-error (ex-data error)) (throw error))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest actual-private-guard-can-run-as-soon-as-it-is-published-during-bootstrap
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       source (File/read! (Path/join root "priv/boot/compiler.bl")) forms (selected-forms source)
+       native-before (BeamLisp.Compiler/module_info :md5)
+       good (publish-and-call forms "compiler.bootstrap-order.good" "compiler.bootstrap-order.subject")
+       bad (try (publish-and-call (Enum/reverse forms) "compiler.bootstrap-order.mutant" "compiler.bootstrap-order.subject")
+                :unexpected-acceptance (catch error :guard-called-before-helper))]
+  (is (= 2 (count forms)))
+  (is (= {:private true :public false} good))
+  (is (= :guard-called-before-helper bad))
+  (is (= native-before (BeamLisp.Compiler/module_info :md5)))))

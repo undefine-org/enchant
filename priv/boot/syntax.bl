@@ -1,0 +1,345 @@
+;; Boot-owned contextual syntax over the actual Reader. No second parser.
+(ns syntax (:require [reader-node :as rn]))
+
+(defn- refuse! [kind]
+ (throw (ex-info (str "Syntax contract: " kind) {:kind kind})))
+
+(defn- finite! [value maximum]
+ (when-not (or (vector? value) (erlang/is_list value)) (refuse! :syntax-collection))
+ (let [items (try (BeamLisp.CompilerData/eager_to_list value)
+              (catch Elixir.ArgumentError _ (refuse! :syntax-collection)))]
+  (when (> (count items) maximum) (refuse! :syntax-bound)) items))
+
+(defn- digest! [value]
+ (when-not (and (erlang/is_binary value) (= 32 (erlang/byte_size value)))
+  (refuse! :syntax-scope)) value)
+
+(defn- symbol! [value]
+ (when-not (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value))
+                (= :symbol (elem value 0)) (erlang/is_binary (elem value 1))
+                (<= 1 (erlang/byte_size (elem value 1)) 512))
+  (refuse! :syntax-symbol)) value)
+
+(defn- phase! [value]
+ (when-not (or (= :all value) (and (erlang/is_integer value) (<= -4096 value 4096)))
+  (refuse! :syntax-phase)) value)
+
+(defn context
+ "Explicit lexical context. :scopes maps phases (or :all) to finite scope IDs.
+  Locations live on syntax nodes, independently of semantic context."
+ [value]
+ (when-not (and (erlang/is_map value)
+                (= #{:world :namespace :space :scopes} (set (keys value)))
+                (erlang/is_map (:scopes value)) (not (contains? (:scopes value) :__struct__))
+                (<= (erlang/map_size (:scopes value)) 64))
+  (refuse! :syntax-context))
+ (digest! (:world value)) (symbol! (:namespace value)) (symbol! (:space value))
+ (assoc value :scopes
+  (into {} (Enum/map (Map/to_list (:scopes value))
+             (fn [pair]
+              (tuple (phase! (elem pair 0))
+                     (Enum/sort (Enum/uniq (Enum/map (finite! (elem pair 1) 128) (fn [id] (digest! id)))))))))))
+
+(defn identifier? [value]
+ (and (erlang/is_map value) (erlang/=:= 1 (:version value)) (= :syntax (:kind value)) (= :symbol (:tag value))))
+
+(defn- charge! [remaining depth]
+ (when (or (<= remaining 0) (> depth 128)) (refuse! :syntax-bound))
+ (- remaining 1))
+
+(defn- scalar? [value]
+ (or (nil? value) (boolean? value) (number? value)
+     (and (string? value) (<= (erlang/byte_size value) 1048576))))
+
+(defn- origin-budget! [value remaining depth]
+ (let [remaining (charge! remaining depth)]
+  (cond
+   (or (erlang/is_atom value) (scalar? value)) remaining
+   (erlang/is_tuple value)
+    (do (when (> (erlang/tuple_size value) remaining) (refuse! :syntax-bound))
+        (Enum/reduce (erlang/tuple_to_list value) remaining
+          #(origin-budget! %1 %2 (+ depth 1))))
+   (erlang/is_list value)
+    (Enum/reduce (finite! value remaining) remaining #(origin-budget! %1 %2 (+ depth 1)))
+   (and (erlang/is_map value) (not (contains? value :__struct__)))
+    (do (when (> (* 2 (erlang/map_size value)) remaining) (refuse! :syntax-bound))
+        (Enum/reduce (Map/to_list value) remaining
+          (fn [pair budget]
+           (origin-budget! (elem pair 1) (origin-budget! (elem pair 0) budget (+ depth 1)) (+ depth 1)))))
+   :else (refuse! :syntax-origin))))
+
+(defn- context-budget! [ctx origin remaining depth]
+ (let [cost (Enum/reduce (Map/values (:scopes ctx)) 0 (fn [ids total] (+ total (count ids))))
+       remaining (- remaining cost)]
+  (when (< remaining 0) (refuse! :syntax-bound))
+  (when-not (or (nil? origin) (and (erlang/is_map origin) (not (contains? origin :__struct__))))
+   (refuse! :syntax-origin))
+  (if origin (origin-budget! origin remaining depth) remaining)))
+
+(defn- wrap-node [node ctx remaining depth]
+ (let [remaining (charge! remaining depth) form (rn/node-form node)
+       tag (rn/node-tag form) origin (rn/node-pos node)
+       remaining (context-budget! ctx origin remaining depth)
+       base {:version 1 :kind :syntax :context ctx :origin origin :tag tag}
+       recur-node (fn [child budget] (wrap-node child ctx budget (+ depth 1)))]
+  (cond
+   (contains? #{:list :vector :set} tag)
+    (let [r (Enum/map_reduce (finite! (rn/node-items form) 100000) remaining recur-node)]
+     (tuple (assoc base :children (elem r 0)) (elem r 1)))
+   (contains? #{:map :record} tag)
+    (let [items (if (= :map tag) (rn/node-items form) (elem form 2))
+          r (Enum/map_reduce (finite! items 50000) remaining
+             (fn [pair budget]
+              (when-not (and (erlang/is_tuple pair) (= 2 (erlang/tuple_size pair)))
+               (refuse! :syntax-reader-node))
+              (let [left (recur-node (elem pair 0) budget)
+                    right (recur-node (elem pair 1) (elem left 1))]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (cond-> (assoc base :children (elem r 0)) (= :record tag) (assoc :value (elem form 1))) (elem r 1)))
+   (= :symbol tag)
+    (tuple (assoc base :value (symbol! form)) remaining)
+   (= :keyword tag)
+    (do (when-not (and (= 2 (erlang/tuple_size form)) (erlang/is_binary (elem form 1)))
+          (refuse! :syntax-reader-node))
+        (tuple (assoc base :value (elem form 1)) remaining))
+   (= :scalar tag)
+    (do (when-not (scalar? form)
+          (refuse! :syntax-reader-node))
+        (tuple (assoc base :value form) remaining))
+   :else (refuse! :syntax-reader-node))))
+
+(defn from-node [node explicit-context]
+ (elem (wrap-node node (context explicit-context) 100000 0) 0))
+
+(defn identifier [quoted-symbol explicit-context]
+ (from-node (symbol! quoted-symbol) explicit-context))
+
+(defn read
+ "Wrap the actual Reader result. file is attribution, not a file to read."
+ [source file explicit-context]
+ (when-not (and (erlang/is_binary source) (<= (erlang/byte_size source) 1048576)
+                (or (nil? file) (erlang/is_binary file)))
+  (refuse! :syntax-source))
+ (let [ctx (context explicit-context)]
+  (elem (Enum/map_reduce (BeamLisp.Reader/read_syntax source file) 100000
+          (fn [node budget] (wrap-node node ctx budget 0))) 0)))
+
+(defn scopes [identifier phase]
+ (when-not (identifier? identifier) (refuse! :syntax-identifier))
+ (phase! phase)
+ (when (= :all phase) (refuse! :syntax-phase))
+ (let [ctx (context (:context identifier))]
+  (Enum/sort (Enum/uniq (Enum/concat (Map/get (:scopes ctx) :all (list))
+                                    (Map/get (:scopes ctx) phase (list)))))))
+
+(defn- visit [node action remaining depth]
+ (let [remaining (charge! remaining depth)]
+  (when-not (and (erlang/is_map node) (erlang/=:= 1 (:version node)) (= :syntax (:kind node)))
+   (refuse! :syntax-node))
+  (let [ctx (context (:context node)) tag (:tag node)
+        expected (cond-> #{:version :kind :context :origin :tag}
+                    (contains? #{:list :vector :set :map :record} tag) (conj :children)
+                    (contains? #{:scalar :symbol :keyword :record} tag) (conj :value))
+        _ (when-not (= expected (set (keys node))) (refuse! :syntax-node))
+        _ (when (and (= :scalar tag) (not (scalar? (:value node)))) (refuse! :syntax-datum))
+        _ (when (and (contains? #{:keyword :record} tag)
+                      (not (and (erlang/is_binary (:value node)) (<= (erlang/byte_size (:value node)) 512))))
+            (refuse! :syntax-node))
+        remaining (context-budget! ctx (:origin node) remaining depth)
+        r (cond
+           (contains? #{:list :vector :set} tag)
+            (Enum/map_reduce (finite! (:children node) 100000) remaining
+             (fn [child budget] (visit child action budget (+ depth 1))))
+           (contains? #{:map :record} tag)
+            (Enum/map_reduce (finite! (:children node) 50000) remaining
+             (fn [pair budget]
+              (when-not (and (erlang/is_list pair) (= 2 (erlang/length pair)))
+               (refuse! :syntax-node))
+              (let [left (visit (first pair) action budget (+ depth 1))
+                    right (visit (second pair) action (elem left 1) (+ depth 1))]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))
+           (contains? #{:symbol :keyword :scalar} tag) (tuple nil remaining)
+           :else (refuse! :syntax-node))
+        normalized (cond-> (assoc node :context ctx) (some? (elem r 0)) (assoc :children (elem r 0)))]
+   (when (= :symbol tag) (symbol! (:value node)))
+   (tuple (action normalized) (elem r 1)))))
+
+(defn validate [node]
+ (elem (visit node (fn [value] value) 100000 0) 0))
+
+(defn map-identifiers
+ "Transform identifiers through the same bounded syntax visitor. This is pure
+  representation: the caller supplies context; binding resolution owns lookup."
+ [node action]
+ (validate (elem (visit node (fn [n] (if (identifier? n) (action n) n)) 100000 0) 0)))
+
+(defn to-reader
+ "Explicit context erasure, preserving the actual Reader tree and spans."
+ [node]
+ (elem (visit node
+         (fn [n]
+          (let [tag (:tag n)
+                form (cond
+                       (= :symbol tag) (:value n)
+                       (= :scalar tag) (:value n)
+                       (= :keyword tag) (tuple :keyword (:value n))
+                       (= :record tag) (tuple :record (:value n)
+                                         (Enum/map (:children n) #(tuple (first %) (second %))))
+                       (= :map tag) (tuple :map (Enum/map (:children n) #(tuple (first %) (second %))))
+                       :else (tuple tag (:children n)))]
+           (if (:origin n) (tuple :meta form (:origin n)) form))) 100000 0) 0))
+
+(defn to-datum
+ "Forget context and spans, producing ordinary language data. Record creation
+  requires an expander/compiler, so record nodes refuse this pure conversion."
+ [node]
+ (elem (visit node
+         (fn [n]
+          (let [tag (:tag n)]
+           (cond
+            (contains? #{:symbol :scalar} tag) (:value n)
+            (= :keyword tag) (keyword (:value n))
+            (= :list tag) (:children n)
+            (= :vector tag) (BeamLisp.Vector/new (:children n))
+            (= :set tag) (BeamLisp.Set/new (:children n))
+            (= :map tag) (Map/new (Enum/map (:children n) #(tuple (first %) (second %))))
+            :else (refuse! :syntax-record-datum)))) 100000 0) 0))
+
+(defn- datum-node [value remaining depth]
+ (let [remaining (charge! remaining depth)
+       tag (cond (symbol? value) :symbol (vector? value) :vector (set? value) :set
+                 (erlang/is_list value) :list
+                 (and (erlang/is_map value) (not (contains? value :__struct__))) :map
+                 (keyword? value) :keyword :else :scalar)]
+  (cond
+   (contains? #{:list :vector :set} tag)
+    (let [items (if (= :set tag) (BeamLisp.Set/to_list value) (finite! value 100000))
+          r (Enum/map_reduce items remaining #(datum-node %1 %2 (+ depth 1)))]
+     (tuple (tuple tag (elem r 0)) (elem r 1)))
+   (= :map tag)
+    (let [r (Enum/map_reduce (Map/to_list value) remaining
+             (fn [pair budget]
+              (let [left (datum-node (elem pair 0) budget (+ depth 1))
+                    right (datum-node (elem pair 1) (elem left 1) (+ depth 1))]
+               (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (tuple :map (elem r 0)) (elem r 1)))
+   (= :symbol tag) (tuple (symbol! value) remaining)
+   (= :keyword tag) (tuple (tuple :keyword (name value)) remaining)
+   (scalar? value) (tuple value remaining)
+   :else (refuse! :syntax-datum))))
+
+(defn from-datum [datum explicit-context]
+ (from-node (elem (datum-node datum 100000 0) 0) explicit-context))
+
+(defn add-scope
+ "Add a controller-selected scope to a tree, at a phase or at every phase."
+ [node scope-id phase]
+ (digest! scope-id) (phase! phase)
+ (elem (visit node
+         (fn [n]
+          (let [ctx (:context n)
+                ids (Map/get (:scopes ctx) phase (list))]
+           (assoc n :context (context (assoc ctx :scopes
+                              (Map/put (:scopes ctx) phase (cons scope-id ids))))))) 100000 0) 0))
+
+(defn- template-hole [value budget]
+ (let [splice? (and (erlang/is_map value) (= :contextual-splice (:kind value)))
+       start budget
+       r (if splice?
+          (do
+           (when-not (= #{:kind :children} (set (keys value))) (refuse! :syntax-template-splice))
+           (let [items (finite! (:children value) 100000)
+                 result (Enum/map_reduce items (charge! budget 0)
+                         (fn [child remaining] (visit child (fn [node] node) remaining 0)))]
+            (tuple {:kind :contextual-splice :children (elem result 0)} (elem result 1))))
+          (visit value (fn [node] node) budget 0))]
+  (tuple {:node (elem r 0) :cost (- start (elem r 1)) :splice? splice?} (elem r 1))))
+
+(defn- substitute-template [node holes remaining depth splice-allowed?]
+ (let [remaining (charge! remaining depth)
+       hole (when (identifier? node) (Map/get holes (:value node)))]
+  (if hole
+   (do
+    (when (and (:splice? hole) (not splice-allowed?)) (refuse! :syntax-template-splice-context))
+    ;; Charge every occurrence BEFORE copying its sequence into the result.
+    ;; Sharing a hole's data does not make repeated expansion free.
+    (when (> (:cost hole) remaining) (refuse! :syntax-bound))
+    (tuple (:node hole) (- remaining (:cost hole))))
+   (let [tag (:tag node)]
+    (cond
+     (contains? #{:list :vector :set} tag)
+      (let [r (Enum/map_reduce (:children node) remaining
+               (fn [child budget] (substitute-template child holes budget (+ depth 1) true)))
+            children (Enum/flat_map (elem r 0)
+                      #(if (= :contextual-splice (:kind %)) (:children %) (list %)))]
+       (tuple (assoc node :children children) (elem r 1)))
+     (contains? #{:map :record} tag)
+      (let [r (Enum/map_reduce (:children node) remaining
+               (fn [pair budget]
+                (let [left (substitute-template (first pair) holes budget (+ depth 1) false)
+                      right (substitute-template (second pair) holes (elem left 1) (+ depth 1) false)]
+                 (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
+       (tuple (assoc node :children (elem r 0)) (elem r 1)))
+     :else (tuple node remaining))))))
+
+(defn template
+ "Substitute contextual syntax holes, including bounded sequence splices in
+  list/vector/set elements. Holes keep use-site scopes; introduced syntax gets
+  the introduction scope. Splices cannot replace the root or map/record slots."
+ [node holes introduction-scope]
+ (digest! introduction-scope)
+ (when-not (and (erlang/is_map holes) (not (contains? holes :__struct__)) (<= (erlang/map_size holes) 256))
+  (refuse! :syntax-template))
+ (let [holes (Map/new
+              (elem (Enum/map_reduce (Map/to_list holes) 100000
+                      (fn [pair budget]
+                       (let [r (template-hole (elem pair 1) budget)]
+                        (tuple (tuple (symbol! (elem pair 0)) (elem r 0)) (elem r 1))))) 0))
+       introduced (add-scope node introduction-scope :all)]
+  (validate (elem (substitute-template introduced holes 100000 0 false) 0))))
+
+(defn- attribute-node [node file inherited]
+ (let [origin (or (:origin node) inherited)
+       origin (when origin (if (:file origin) origin (assoc origin :file file)))
+       inherited (when origin (select-keys origin [:file :line :col :offset :end-line :end-col :end-offset]))
+       node (assoc node :origin origin)]
+  (cond
+   (contains? #{:list :vector :set} (:tag node))
+    (assoc node :children (Enum/map (:children node) #(attribute-node % file inherited)))
+   (contains? #{:map :record} (:tag node))
+    (assoc node :children (Enum/map (:children node)
+                            #(list (attribute-node (first %) file inherited)
+                                   (attribute-node (second %) file inherited))))
+   :else node)))
+
+(defn with-file
+ "Supply enclosing Reader spans and file attribution for compilation. A child
+  without its own span inherits the enclosing span, as Compiler's pos-env does.
+  Author metadata is never inherited. Entirely generated trees stay unlocated."
+ [node file]
+ (when-not (and (erlang/is_binary file) (<= (erlang/byte_size file) 4096))
+  (refuse! :syntax-source))
+ (attribute-node (validate node) file nil))
+
+(defn for-compiler
+ "Use inherited Reader positions, and refuse runtime author-metadata
+  expressions in the closed profile. Type hints remain compiler advice."
+ [node file]
+ (elem (visit (with-file node file)
+         (fn [n]
+          (when (Enum/any? (Map/keys (or (:origin n) {}))
+                  #(not (contains? #{:file :line :col :offset :end-line :end-col :end-offset :tag} %)))
+           (refuse! :syntax-profile-metadata)) n) 100000 0) 0))
+
+(defn shift-context
+ "Shift phase-specific module scopes. Lexical/introduction scopes in :all
+  remain shared. This is representation, not module instantiation or lookup."
+ [explicit-context delta]
+ (when-not (and (erlang/is_integer delta) (<= -4096 delta 4096)) (refuse! :syntax-phase))
+ (let [ctx (context explicit-context)]
+  (context (assoc ctx :scopes
+             (Map/new (Enum/map (Map/to_list (:scopes ctx))
+                        #(tuple (if (= :all (elem % 0)) :all (+ delta (elem % 0))) (elem % 1))))))))
+
+(defn shift-phase [node delta]
+ (elem (visit node #(assoc % :context (shift-context (:context %) delta)) 100000 0) 0))

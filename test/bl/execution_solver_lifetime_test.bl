@@ -1,0 +1,139 @@
+(ns execution.solver-lifetime-test)
+
+(defn- foreign-call [action]
+ (let [parent (erlang/self) tag (erlang/make_ref)
+       [pid monitor] (spawn-monitor
+                       (fn []
+                        (System/put_env "BL_Z3_READ_TIMEOUT" "50")
+                        (erlang/send parent
+                         [tag (try (action) :accepted
+                                (catch error (BeamLisp.ExInfo/ex_original error)))])))]
+  (try
+   (receive [seen result] :when (= seen tag) result (after 2000 :missing-foreign-result))
+   (finally
+    (when (Process/alive? pid) (erlang/exit pid :kill))
+    (Process/demonitor monitor (list :flush))))))
+
+(deftest every-effectful-port-entry-refuses-a-foreign-owner-before-writing-or-closing
+ (doseq [kind [:command :check :scoped :check-here :reason :close]]
+  (let [port (BeamLisp.Z3Port/open)
+        action (fn []
+                 (case kind
+                  :command (BeamLisp.Z3Port/raw_command port "(assert false)")
+                  :check (BeamLisp.Z3Port/raw_check port "(assert false)\n" false)
+                  :scoped (BeamLisp.Z3Port/raw_scoped port "(assert false)" false)
+                  :check-here (BeamLisp.Z3Port/raw_check_here port {})
+                  :reason (BeamLisp.Z3Port/raw_reason port "unknown" "")
+                  :close (BeamLisp.Z3Port/close port)))]
+   (try
+    (is (= :z3_port_owner_required (foreign-call action)) (str kind))
+    (is (BeamLisp.Z3Port/alive? port) (str "foreign caller closed " kind))
+    (when (BeamLisp.Z3Port/alive? port)
+     (is (= "sat" (:status (BeamLisp.Z3Port/raw_check_here port {})))
+         (str "foreign caller changed the conversation through " kind)))
+    (finally (BeamLisp.Z3Port/close port))))))
+
+(defn- with-fake-port [script action]
+ (let [port (erlang/open_port (tuple :spawn_executable "/bin/sh")
+              (list :binary :stream :use_stdio (tuple :args (list "-c" script))))]
+  (try (action port)
+   (finally (when (BeamLisp.Z3Port/alive? port) (erlang/port_close port))))))
+
+(deftest transport-chunks-cannot-renew-the-command-deadline-and-an-incomplete-frame-retires
+ (let [before (System/get_env "BL_Z3_READ_TIMEOUT")]
+  (try
+   (System/put_env "BL_Z3_READ_TIMEOUT" "40")
+   (with-fake-port
+    (str "while IFS= read -r line; do\n"
+         "case \"$line\" in\n"
+         " *bl-ok*) printf '%s\\n' \"$line\" | cut -d '\"' -f 2 ;;\n"
+         " *) for i in 1 2 3 4 5 6 7 8; do printf 'progress\\n'; sleep 0.02; done ;;\n"
+         "esac\ndone\n")
+    (fn [port]
+     (let [started (erlang/monotonic_time :millisecond)
+           result (BeamLisp.Z3Port/raw_command port "(chatter)")
+           elapsed (- (erlang/monotonic_time :millisecond) started)]
+      (is (= false (:ok result)))
+      (is (< elapsed 150) (str "frame took " elapsed "ms for a40ms budget"))
+      (is (= false (BeamLisp.Z3Port/alive? port)))
+      (is (thrown? (BeamLisp.Z3Port/raw_command port "(reset)"))))))
+   (finally
+    (if (nil? before) (System/delete_env "BL_Z3_READ_TIMEOUT")
+     (System/put_env "BL_Z3_READ_TIMEOUT" before))))))
+
+(defn- with-budget [ms action]
+ (let [previous (System/get_env "BL_Z3_READ_TIMEOUT")]
+  (try
+   (System/put_env "BL_Z3_READ_TIMEOUT" (str ms)) (action)
+   (finally
+    (if (nil? previous) (System/delete_env "BL_Z3_READ_TIMEOUT")
+     (System/put_env "BL_Z3_READ_TIMEOUT" previous))))))
+
+(deftest status-and-model-core-or-reason-share-the-original-deadline
+ (with-budget 300
+  (fn []
+   (doseq [kind [:check-model :scoped-model :core :reason]]
+    (let [status (case kind :core "unsat" :reason "unknown" "sat")]
+     (with-fake-port
+      (str "while IFS= read -r line; do\ncase \"$line\" in\n"
+           " *check-sat*) sleep 0.18; printf '" status "\\n' ;;\n"
+           " *get-model*|*get-unsat-core*|*get-info*) sleep 0.18; printf '(complete)\\n' ;;\n"
+           "esac\ndone\n")
+      (fn [port]
+       (let [previous (Process/get :bl_z3_conversation)
+             error (try
+                    (case kind
+                     :check-model (BeamLisp.Z3Port/raw_check port "" true)
+                     :scoped-model (BeamLisp.Z3Port/raw_scoped port "" true)
+                     :core (BeamLisp.Z3Port/raw_check_here port {:core? true})
+                     :reason (BeamLisp.Z3Port/raw_check_here port {}))
+                    :unexpected-value
+                    (catch e (ex-message e)))]
+        (is (and (string? error) (String/contains? error "z3 timeout")) (str kind " returned " error))
+        (is (= false (BeamLisp.Z3Port/alive? port)) (str kind))
+        (is (= previous (Process/get :bl_z3_conversation)) "conversation scope is restored")))))))))
+
+(deftest an-incomplete-model-is-never-returned-as-a-value
+ (with-budget 50
+  (fn []
+   (with-fake-port
+    (str "while IFS= read -r line; do\ncase \"$line\" in\n"
+         " *check-sat*) printf 'sat\\n' ;;\n"
+         " *get-model*) printf '(incomplete' ;;\nesac\ndone\n")
+    (fn [port]
+     (is (thrown? (BeamLisp.Z3Port/raw_check port "" true)))
+     (is (= false (BeamLisp.Z3Port/alive? port))))))))
+
+(deftest a-dead-transport-refuses-promptly-and-preserves-unrelated-messages
+ (with-budget 2000
+  (fn []
+   (with-fake-port "IFS= read -r line\nexit 0\n"
+    (fn [port]
+     (let [tag (erlang/make_ref) started (erlang/monotonic_time :millisecond)]
+      (erlang/send (erlang/self) [tag :unrelated])
+      (let [result (BeamLisp.Z3Port/raw_command port "(close-before-ack)")]
+       (is (= false (:ok result)))
+       (is (= "z3 exited before acknowledgement" (:error result)))
+       (is (< (- (erlang/monotonic_time :millisecond) started) 1000))
+       (is (= false (BeamLisp.Z3Port/alive? port)))
+       (is (receive [seen :unrelated] :when (= seen tag) true (after 0 false))))))))))
+
+(deftest reply-capacity-refuses-and-retires-each-reader-before-unbounded-retention
+ ;; Inject tagged bytes into a real owned port's mailbox; the public I/O entry
+ ;; still checks native custody. This controls chunk size, not OS scheduling.
+ (let [oversized (String/duplicate "x" 16777217)]
+  (doseq [kind [:command :status :model]]
+   (with-fake-port "while IFS= read -r line; do :; done\n"
+    (fn [port]
+     (when (= kind :model)
+      (erlang/send (erlang/self) (tuple port (tuple :data "sat\n"))))
+     (erlang/send (erlang/self) (tuple port (tuple :data oversized)))
+     (let [error (try
+                  (case kind
+                   :command (BeamLisp.Z3Port/raw_command port "(query)")
+                   :status (BeamLisp.Z3Port/raw_check port "" false)
+                   :model (BeamLisp.Z3Port/raw_check port "" true))
+                  :unexpected-value
+                  (catch e (BeamLisp.ExInfo/ex_original e)))]
+      (is (= :z3_reply_capacity error) (str kind))
+      (is (= false (BeamLisp.Z3Port/alive? port)))))))))

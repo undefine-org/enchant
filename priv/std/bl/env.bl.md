@@ -25,7 +25,8 @@ as data. A broken `env.bl` degrades what the tree can do — its tasks, its port
 
 ```beam-lisp silent
 (ns bl.env
-  (:require [bl.util :as u] [bl.loading-policy :as loading]))
+  (:require [bl.util :as u] [bl.loading-policy :as loading]
+            [bl.native-declarations :as native-declarations]))
 ```
 
 ## Discovery
@@ -135,9 +136,12 @@ worst kind of configuration bug.
   Unsupported policies are errors. See [loading](loading.bl).
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
-- `:build` — `{:paths :seed :out :native :jobs :ex :exclude}`: which roots hold
+- `:build` — `{:world :paths :inputs :seed :out :native :jobs :ex :exclude}`: which roots hold
   build sources, where the output goes, which crates are native, how wide to
-  compile, and which sources must NEVER be compiled. `:exclude` holds paths
+  compile, and which sources must NEVER be compiled. `:native` accepts path/glob
+  strings and workspace maps with `:source`, `:member`, `:package`, `:crate` and
+  `:abi`. The source names the complete Cargo workspace root; crate names its
+  BL library alias. `:exclude` holds paths
   RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
   here): each names a FILE (matched exactly) or a DIRECTORY (every source
   beneath it — the separator is what makes `src/foo` miss `src/foobar`).
@@ -489,8 +493,10 @@ problems reports all three in one pass.
     (not (map? v)) [nil [":build must be a map"]]
     :else
       (let [[paths perr]  (norm-strings (:paths v) ":build :paths" root)
-            [native nerr] (norm-strings (:native v) ":build :native" root)
+            [inputs ierr] (norm-strings (:inputs v) ":build :inputs" root)
+            [native nerr] (native-declarations/normalize (:native v) root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
+            [world werr]  (norm-opt-string (:world v) ":build :world" root)
             [out oerr]    (norm-opt-string (:out v) ":build :out" root)
             ; Sources never compiled: entry programs that bind listeners on
             ; load. A FILE matches exactly; a DIRECTORY matches every source
@@ -510,16 +516,19 @@ problems reports all three in one pass.
                   [{:root r :exclude x}
                    (concat rerr xerr
                            (unknown-errs ex [:root :exclude] ":build :ex"))]))
-            errs (concat perr nerr serr oerr jerr xerr exerr
-                         (unknown-errs v [:paths :seed :out :native :jobs :ex :exclude] ":build"))]
+            mixed (if (and world (or (seq paths) (seq native) seed exv (seq xcl)))
+                       [":build :world cannot be combined with source/native/substrate selections"] [])
+            errs (concat perr ierr nerr serr werr oerr jerr xerr exerr mixed
+                         (unknown-errs v [:world :paths :inputs :seed :out :native :jobs :ex :exclude] ":build"))]
         [(if (empty? errs)
-           {:paths paths
+           (cond-> {:paths paths
+            :inputs inputs
             :seed seed
             :out out
             :native native
             :jobs (or jobs 1)
             :exclude xcl
-            :ex exv}
+            :ex exv} world (assoc :world world))
            nil)
          errs])))
 

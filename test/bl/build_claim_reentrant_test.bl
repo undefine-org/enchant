@@ -1,0 +1,170 @@
+(ns build-claim-reentrant.test (:require [claim :as c]))
+
+(defn- key-for [dir] ((BeamLisp.Env/fetch_exact! "claim" "handle-key") dir))
+(defn- anchor [dir] ((BeamLisp.Env/fetch_exact! "claim" "lock-anchor") dir))
+(defn- with-directory [action]
+ (let [root (Path/join (System/tmp_dir!) (str "bl-reentrant-" (erlang/unique_integer (list :positive))))
+       dir (Path/join root "workspace")]
+  (File/mkdir_p! dir)
+  (try (action dir) (finally (c/release! dir) (File/rm_rf! root)))))
+
+(deftest nested-claims-preserve-the-live-handle-and-cohort-through-path-aliases
+ (with-directory
+  (fn [dir]
+   (is (:ok? (c/acquire! dir "outer")))
+   (let [key (key-for dir) handle (Process/get key) record (File/read! (c/path-for dir))
+         alias (str dir "-alias")]
+    (File/ln_s! dir alias)
+    (is (c/owned? dir)) (is (c/owned? alias))
+    (is (:ok? (c/acquire! alias "inner")))
+    (is (= handle (Process/get key)))
+    (is (= record (File/read! (c/path-for dir))))
+    (BeamLisp.LazyMemo/nif_file_unlock handle)
+    (is (not (c/owned? dir)) "a retained closed native reference grants nothing")
+    (is (:ok? (c/acquire! dir "fresh after external close")))
+    (is (not= handle (Process/get key)))
+    (is (not= record (File/read! (c/path-for dir))))
+    (is (c/owned? dir))
+    (c/release! dir)
+    (is (not (c/owned? dir)))
+    (is (not (File/exists? (c/path-for dir))))))))
+
+(deftest forged-and-foreign-markers-neither-admit-nor-delete-or-unlock-another-owner
+ (with-directory
+  (fn [dir]
+   (let [parent (erlang/self) key (key-for dir)
+         worker (spawn (fn []
+                         (c/acquire! dir "actual owner")
+                         (erlang/send parent [:held (Process/get (key-for dir))])
+                         (receive :finish :ok)))
+         borrowed (receive [:held value] value (after 5000 (throw :claim-owner-not-ready)))
+         record (File/read! (c/path-for dir))]
+    (try
+     (doseq [marker [:marker (erlang/make_ref) {:handle borrowed} borrowed]]
+      (Process/put key marker)
+      (is (not (c/owned? dir)))
+      (is (some? (c/held-by dir)))
+      (is (not (:ok? (c/acquire! dir "forged reentrancy"))))
+      (c/release! dir)
+      (is (= record (File/read! (c/path-for dir))))
+      (is (= :busy (elem (BeamLisp.LazyMemo/nif_file_lock (anchor dir) false true) 0))))
+     (is (try (BeamLisp.LazyMemo/nif_file_unlock borrowed) false (catch error true))
+         "an active borrowed process-owned descriptor cannot be closed")
+     (is (= :busy (elem (BeamLisp.LazyMemo/nif_file_lock (anchor dir) false true) 0)))
+     (finally (Process/delete key) (erlang/exit worker :kill)))))))
+
+(deftest shared-vm-scoped-and-wrong-anchor-handles-never-certify-a-writer
+ (with-directory
+  (fn [dir]
+   (let [key (key-for dir) path (anchor dir)]
+    (doseq [[held-path shared monitored] [[path false true] [path true true] [path false false] [(str path "-other") false true]]]
+     (let [result (BeamLisp.LazyMemo/nif_file_lock held-path shared monitored) handle (elem result 1)]
+      (try
+       (is (= :ok (elem result 0)))
+       (File/write! (c/path-for dir) "diagnostic remains")
+       (Process/put key handle)
+       (is (not (c/owned? dir)))
+       (c/release! dir)
+       (is (= "diagnostic remains" (File/read! (c/path-for dir))))
+       (is (= :busy (elem (BeamLisp.LazyMemo/nif_file_lock held-path false true) 0))
+           "invalid marker cleanup does not close some other lease")
+       (finally (Process/delete key) (BeamLisp.LazyMemo/nif_file_unlock handle)))))))))
+
+(deftest replaced-or-missing-anchors-invalidate-retained-descriptors-without-creating-files
+ (with-directory
+  (fn [dir]
+   (c/acquire! dir "old inode")
+   (let [path (anchor dir) key (key-for dir) old (Process/get key)]
+    (try
+     (File/rename! path (str path "-old"))
+     (is (not (c/owned? dir)))
+     (is (not (File/exists? path)) "custody inspection cannot recreate its missing anchor")
+     (File/write! path "new inode")
+     (is (not (c/owned? dir)))
+     (is (:ok? (c/acquire! dir "new inode")))
+     (is (c/owned? dir))
+     (is (not= old (Process/get key)))
+     (finally (BeamLisp.LazyMemo/nif_file_unlock old)))))))
+
+(deftest the-original-marker-only-mutation-admits-a-competing-writer
+ (with-directory
+  (fn [dir]
+   (let [source (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+                                     "priv/build/claim.bl"))
+         before "(if-let [handle (Process/get (handle-key dir))]\n    (owned-handle? dir handle)\n    false)"
+         after "(some? (Process/get (handle-key dir)))"
+         parent (erlang/self) key (key-for dir)
+         worker (spawn (fn [] (c/acquire! dir "actual writer")
+                         (erlang/send parent :writer-ready) (receive :finish :ok)))]
+    (try
+     (receive :writer-ready :ok (after 5000 (throw :mutation-writer-not-ready)))
+     (is (= 2 (count (String/split source before))))
+     (when-not (= 2 (count (String/split source before))) (throw :claim-mutation-anchor-drift))
+     (BeamLisp.TestRT/declarations
+      #(BeamLisp.Compiler/eval_string
+        (-> source (String/replace "(ns claim" "(ns history.claim.marker")
+                   (String/replace before after))))
+     (Process/put key :not-a-native-resource)
+     (is (not (c/owned? dir)))
+     (is (some? (c/held-by dir)))
+     (is (not (:ok? (c/acquire! dir "competing writer"))))
+     (let [owned (BeamLisp.Env/fetch_exact! "history.claim.marker" "owned?")
+           held (BeamLisp.Env/fetch_exact! "history.claim.marker" "held-by")
+           acquire (BeamLisp.Env/fetch_exact! "history.claim.marker" "acquire!")]
+      (is (owned dir))
+      (is (nil? (held dir)))
+      (is (:ok? (acquire dir "competing writer"))))
+     (is (= "actual writer" (:bin (c/read-claim dir))))
+     (finally (Process/delete key) (erlang/exit worker :kill)))))))
+
+(deftest a-genuine-generic-writer-handle-cannot-skip-surviving-follower-admission
+ (with-directory
+  (fn [dir]
+   (c/acquire! dir "old cohort")
+   (let [context (c/follower-context dir) parent (erlang/self) key (key-for dir)
+         [worker watch] (spawn-monitor
+                        (fn [] (c/with-follower context
+                                 (fn [] (erlang/send parent :follower-held) (receive :finish :ok)))))]
+    (try
+     (receive :follower-held :ok (after 5000 (throw :follower-not-ready)))
+     (c/release! dir)
+     (let [generic (BeamLisp.LazyMemo/nif_file_lock (anchor dir) false true) handle (elem generic 1)]
+      (try
+       (is (= :ok (elem generic 0)))
+       (Process/put key handle)
+       (is (not (c/owned? dir)))
+       (is (not (:ok? (c/acquire! dir "must not skip follower"))))
+       (finally (Process/delete key) (BeamLisp.LazyMemo/nif_file_unlock handle))))
+     (is (= :child (:custody (:held (c/acquire! dir "still waiting")))))
+     (erlang/send worker :finish)
+     (receive [:DOWN seen :process pid :normal] :when (and (= seen watch) (= pid worker)) :ok
+      (after 5000 (throw :follower-not-finished)))
+     (is (:ok? (c/acquire! dir "after follower")))
+     (is (c/owned? dir))
+     (finally (Process/delete key) (erlang/exit worker :kill) (Process/demonitor watch (list :flush))))))))
+
+(deftest native-publication-mints-the-cohort-and-never-follows-a-diagnostic-symlink
+ (with-directory
+  (fn [dir]
+   (c/acquire! dir "first")
+   (let [old (c/read-claim dir) record (File/read! (c/path-for dir))
+         outside (str dir "-outside") path (c/path-for dir)]
+    (try
+     (c/release! dir)
+     (File/write! outside "outside unchanged")
+     (File/ln_s! outside path)
+     (let [claimed (BeamLisp.LazyMemo/nif_file_claim (anchor dir) path record)
+           handle (elem claimed 1)]
+      (try
+       (is (= :ok (elem claimed 0)))
+       (is (BeamLisp.LazyMemo/nif_file_claim_owned handle (anchor dir) path))
+       (is (not= (:token old) (:token (c/read-claim dir))) "caller text cannot nominate a prior cohort")
+       (is (= "outside unchanged" (File/read! outside)))
+       ;; Diagnostic content does not grant or revoke the actual resource.
+       (Process/put (key-for dir) handle)
+       (File/rm! path)
+       (is (c/owned? dir))
+       (c/release! dir)
+       (is (not (BeamLisp.LazyMemo/nif_file_claim_owned handle (anchor dir) path)))
+       (finally (Process/delete (key-for dir)) (BeamLisp.LazyMemo/nif_file_unlock handle))))
+     (finally (File/rm outside)))))))

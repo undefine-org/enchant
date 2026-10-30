@@ -1,0 +1,61 @@
+(ns compiler.physical-declaration-test (:require [anf :as anf] [lower :as lower]))
+(defn- reader [source] (first (BeamLisp.Reader/read_string source "physical-declaration.bl")))
+(defn- environment []
+ (assoc (BeamLisp.Compiler/new_env "physical.declaration.shared") :file "physical-declaration.bl" :contextual-bindings {}))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- emit! [declaration module]
+ (let [clauses (Enum/map (:entries declaration) #(elem % 3))
+       exports (Enum/uniq (Enum/map clauses (fn [clause] [(:fname clause) (count (:params clause))])))
+       pair (lower/descriptor->beam (anf/module module clauses exports (list)) {})]
+  (code/load_binary module '() (elem pair 1))))
+(defn- sum-source [offset]
+ (reader (str "(defn total [n accumulator] (if (erlang/=:= n 0) (erlang/+ accumulator " offset
+              ") (recur (erlang/- n 1) (erlang/+ accumulator n))))")))
+(defn- unload! [module] (code/delete module) (code/purge module))
+
+(deftest identical-logical-namespaces-recur-within-their-explicit-physical-revision
+ (let [old :Elixir.PhysicalDeclarationOld new :Elixir.PhysicalDeclarationNew
+       environment (environment)
+       a (BeamLisp.Compiler/prepare_function_declaration (sum-source 10) environment old)
+       b (BeamLisp.Compiler/prepare_function_declaration (sum-source 100) environment new)]
+  (try
+   (is (= (:namespace a) (:namespace b)))
+   (is (= :error (BeamLisp.Env/lookup (tuple :link (:ns environment) "total"))))
+   (is (empty? (BeamLisp.Env/ns_definition (:ns environment) "total")))
+   (is (= (tuple :module old) (emit! a old)))
+   (is (= (tuple :module new) (emit! b new)))
+   (is (= 16 (erlang/apply old :total (list 3 0))))
+   (is (= 106 (erlang/apply new :total (list 3 0))))
+   (is (= 16 (erlang/apply old :total (list 3 0))))
+   (is (not (erlang/module_loaded (BeamLisp.Link/module_for (:ns environment)))))
+   (finally (unload! old) (unload! new)))))
+
+(deftest variadic-recur-and-first-class-values-retain-the-chosen-physical-module
+ (let [module :Elixir.PhysicalDeclarationVariadic
+       declaration (BeamLisp.Compiler/prepare_function_declaration
+                    (reader "(defn choose ([n] (erlang/+ n 10)) ([n & rest] (if (erlang/=:= n 0) (erlang/length rest) (recur (erlang/- n 1) rest))))")
+                    (environment) module)]
+  (try
+   (is (= (tuple :module module) (emit! declaration module)))
+   (let [shapes (BeamLisp.Emit/fixed_variadic (:entries declaration))
+         value (BeamLisp.Emit/fn_value module (elem shapes 0) (elem shapes 1))]
+    (is (= 13 (BeamLisp.Ns.Rt/invoke value (list 3))))
+    (is (= 3 (BeamLisp.Ns.Rt/invoke value (list 3 :a :b :c))))
+    (is (= 2 (erlang/apply module :choose__bl_v (list 5 (list :a :b))))))
+   (finally (unload! module)))))
+
+(deftest a-namespace-default-is-not-a-physical-revision-selection
+ (let [module :Elixir.PhysicalDeclarationCounterfactual
+       declaration (BeamLisp.Compiler/prepare_function_declaration (sum-source 10) (environment))]
+  (try
+   (is (= (tuple :module module) (emit! declaration module)))
+   (is (= 10 (erlang/apply module :total (list 0 0))))
+   (is (refused? #(erlang/apply module :total (list 1 0))))
+   (finally (unload! module)))))
+
+(deftest malformed-physical-targets-refuse-before-prelink-publication-or-body-effects
+ (let [env (environment) source (sum-source 10)]
+  (doseq [module [nil true false "Elixir.NotAnAtom" [] {}]]
+   (is (refused? #(BeamLisp.Compiler/prepare_function_declaration source env module))))
+  (is (= :error (BeamLisp.Env/lookup (tuple :link (:ns env) "total"))))
+  (is (empty? (BeamLisp.Env/ns_definition (:ns env) "total")))))

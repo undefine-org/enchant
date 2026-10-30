@@ -1,0 +1,230 @@
+;; Recorded product facts only. Explanation never loads units, starts a realm,
+;; invokes a producer or turns a receipt into execution authority.
+(ns artifact.impact)
+
+(def ^:private max-file-bytes 8388608)
+(def ^:private max-nodes 4096)
+(def ^:private max-edges 32768)
+(def ^:private max-union-nodes 8192)
+
+(defn- refuse! [message]
+  (throw (ex-info message {:kind :artifact-impact-input})))
+
+(defn- value [record text key]
+  (if (contains? record text) (get record text) (get record key)))
+
+(defn- text! [input limit label optional?]
+  (when-not (or (and optional? (nil? input))
+               (and (string? input) (> (erlang/byte_size input) 0)
+                    (<= (erlang/byte_size input) limit)))
+    (refuse! (str "Invalid recorded artifact " label)))
+  input)
+
+(defn- items! [input limit label]
+  (when-not (or (erlang/is_list input) (vector? input))
+    (refuse! (str "Expected a recorded " label " array")))
+  (let [items (Enum/take input (inc limit))]
+    (when (> (count items) limit) (refuse! (str "Recorded " label " exceeds capacity")))
+    items))
+
+(defn- array [items] (Enum/map items identity))
+
+(defn- identity-of [receipt]
+  (when-not (map? receipt) (refuse! "Expected a recorded artifact receipt"))
+  {"output" (text! (value receipt "output" :output) 4096 "output" false)
+   "sdk" (text! (value receipt "sdk" :sdk) 4096 "SDK" true)
+   "source" (text! (value receipt "source" :source) 4096 "source" true)})
+
+(defn- field-change [field left right]
+  (when-not (= left right) {"field" field "before" left "after" right}))
+
+(defn- changes [left right fields]
+  (array (keep (fn [field] (field-change field (get left field) (get right field))) fields)))
+
+(defn- node! [row]
+  (when-not (map? row) (refuse! "Expected a recorded impact node"))
+  (let [requires (items! (value row "requires" :requires) max-nodes "requirements")]
+    {"namespace" (text! (value row "namespace" :namespace) 512 "namespace" false)
+     "path" (text! (value row "path" :path) 4096 "source path" false)
+     "content" (text! (value row "content" :content) 256 "content digest" true)
+     "interface" (text! (value row "interface" :interface) 256 "interface digest" true)
+     "key" (text! (value row "key" :key) 256 "closure key" true)
+     "requires" (array (sort (distinct (Enum/map requires #(text! % 512 "requirement" false)))))}))
+
+(defn- graph! [result]
+  (when-not (map? result) (refuse! "Expected a recorded application result"))
+  (let [impact (value result "impact" :impact)]
+    ;; A World result currently has no ordinary namespace graph. Absence is
+    ;; different from a present, explicitly empty product graph.
+    (when-not (nil? impact)
+      (first
+        (reduce
+          (fn [[graph edges] row]
+            (when-not (map? row) (refuse! "Expected a recorded impact node"))
+            (let [raw-requires (items! (value row "requires" :requires) max-nodes "requirements")
+                  edges (+ edges (count raw-requires))]
+              ;; Charge raw entries before normalization, so repeated edges
+              ;; cannot hide expensive input behind a small distinct set.
+              (when (> edges max-edges) (refuse! "Recorded impact edges exceed capacity"))
+              (let [node (node! row) name (get node "namespace")]
+                (when (contains? graph name) (refuse! "Duplicate recorded impact namespace"))
+                [(assoc graph name node) edges])))
+          [{} 0] (items! impact max-nodes "impact nodes"))))))
+
+(defn- graph-coverage [graph]
+  (if (nil? graph)
+    {"namespace-graph" "unavailable" "project-coverage" "not-established"}
+    {"namespace-graph" "recorded-product-namespaces"
+     "project-coverage" "not-established"
+     "nodes" (count graph)
+     "outside-graph-requires"
+       (array (sort (distinct
+         (filter #(not (contains? graph %))
+           (mapcat #(get % "requires") (vals graph))))))}))
+
+(defn- missing-facts [node]
+  (when node
+    (array (filter #(nil? (get node %)) ["content" "interface" "key"]))))
+
+(defn- node-change [name before after]
+  (let [fields ["path" "content" "interface" "key" "requires"]
+        changed (when (and before after) (changes before after fields))
+        status (cond (nil? before) "added" (nil? after) "removed"
+                     (seq changed) "changed" :else "same-recorded-facts")]
+    {"namespace" name "status" status
+     "changes" (or changed (list))
+     "before" before "after" after
+     "missing-before-facts" (missing-facts before)
+     "missing-after-facts" (missing-facts after)
+     "rebuild" "not-established"}))
+
+(defn- reverse-edges [before after]
+  (reduce
+    (fn [edges node]
+      (reduce (fn [acc requirement]
+                (assoc acc requirement (conj (or (get acc requirement) #{}) (get node "namespace"))))
+              edges (get node "requires")))
+    {} (concat (vals (or before {})) (vals (or after {})))))
+
+(defn- reachable [edges seeds]
+  ;; A two-list FIFO visits each namespace once without copying the remaining
+  ;; queue at every step. Sorted seeds/edges make the first shortest witness
+  ;; stable; it is a require-path witness, not a rebuild proof.
+  (loop [pending (array seeds) back (list)
+         found (into {} (Enum/map seeds
+                         (fn [name] [name {"cause" name "through" nil "distance" 0}])))]
+    (if (empty? pending)
+      (if (empty? back) found (recur (array (reverse back)) (list) found))
+      (let [name (first pending) witness (get found name)
+            next-state
+              (reduce
+                (fn [[queue known] dependent]
+                  (if (contains? known dependent) [queue known]
+                    [(cons dependent queue)
+                     (assoc known dependent {"cause" (get witness "cause") "through" name
+                                              "distance" (inc (get witness "distance"))})]))
+                [back found] (sort (get edges name #{})))]
+        (recur (rest pending) (first next-state) (second next-state))))))
+
+(defn- counts [result]
+  (into {} (Enum/map [["built" :built] ["cached" :cached] ["ex-built" :ex-built]]
+             (fn [[field key]]
+               (let [n (value result field key)]
+                 (when-not (or (nil? n) (and (int? n) (<= 0 n) (<= n 65536)))
+                   (refuse! "Invalid recorded producer count"))
+                 [field n])))))
+
+(defn- application-explanation [left right]
+  (let [li (identity-of left) ri (identity-of right)
+        lr (value left "result" :result) rr (value right "result" :result)
+        before (graph! lr) after (graph! rr)
+        comparable? (and (some? before) (some? after))
+        names (when comparable? (sort (distinct (concat (keys before) (keys after)))))
+        _ (when (> (count (or names [])) max-union-nodes)
+            (refuse! "Combined recorded impact nodes exceed capacity"))
+        rows (Enum/map (or names []) #(node-change % (get before %) (get after %)))
+        seeds (array (Enum/map (filter #(not= "same-recorded-facts" (get % "status")) rows)
+                                  #(get % "namespace")))
+        reached (when comparable? (reachable (reverse-edges before after) seeds))]
+    {"version" 1 "kind" "application-impact-explanation"
+     "evidence" "recorded-data-only" "runtime-compatibility" "not-assessed"
+     "identity-changes" (changes li ri ["output" "sdk" "source"])
+     "coverage" {"before" (graph-coverage before) "after" (graph-coverage after)
+                  "comparable-namespace-graphs" comparable?}
+     "producer-counts" {"before" (counts lr) "after" (counts rr)
+                         "scope" "whole-recorded-production"}
+     "namespaces" rows
+     "summary" (when comparable?
+                 (into {} (Enum/map ["added" "removed" "changed" "same-recorded-facts"]
+                            (fn [status] [status (count (filter #(= status (get % "status")) rows))]))))
+     "dependency-impact-candidates"
+       (Enum/map (sort (filter #(> (get-in reached [% "distance"]) 0) (keys (or reached {}))))
+         (fn [name]
+           (merge (get reached name)
+             {"namespace" name "evidence" "recorded-require-path"
+              "recorded-closure-key-status"
+                (let [old-key (get-in before [name "key"]) new-key (get-in after [name "key"])]
+                  (cond (or (nil? old-key) (nil? new-key)) "unavailable"
+                        (= old-key new-key) "same" :else "changed"))
+              "rebuild" "not-established"})))
+     "candidate-scope" "recorded-namespace-changes-only"
+     "limits" {"nodes-per-graph" max-nodes "edges-per-graph" max-edges
+                "combined-nodes" max-union-nodes "combined-edges" (* 2 max-edges)}}))
+
+(defn- native-manifest! [receipt]
+  (let [manifest (value receipt "manifest" :manifest)]
+    (when-not (and (map? manifest) (= "native-library" (value manifest "kind" :kind)))
+      (refuse! "Expected a recorded native-library manifest"))
+    (into {}
+      (concat
+        (Enum/map [["crate" :crate] ["abi" :abi] ["target" :target] ["source" :source]
+                   ["sha256" :sha256] ["compiled" :compiled] ["library" :library]
+                   ["member" :member] ["package" :package] ["cargoLibrary" :cargoLibrary]]
+          (fn [[field key]]
+            [field (text! (value manifest field key) 4096 field
+                     (contains? #{"compiled" "member" "package" "cargoLibrary"} field))]))
+        (list ["toolchain"
+          (let [toolchain (value manifest "toolchain" :toolchain)]
+            (when-not (map? toolchain) (refuse! "Expected a recorded native toolchain"))
+            (into {} (Enum/map [["name" :name] ["version" :version] ["identity" :identity]]
+                       (fn [[field key]] [field (text! (value toolchain field key) 4096 field false)]))))])))))
+
+(defn- native-explanation [left right]
+  (let [li (identity-of left) ri (identity-of right)
+        before (native-manifest! left) after (native-manifest! right)]
+    {"version" 1 "kind" "native-impact-explanation"
+     "evidence" "recorded-data-only" "runtime-compatibility" "not-assessed"
+     "same-recorded-output" (= (get li "output") (get ri "output"))
+     "same-recorded-library-digest" (and (some? (get before "sha256"))
+                                         (= (get before "sha256") (get after "sha256")))
+     "same-recorded-compiled-output" (and (some? (get before "compiled"))
+                                          (= (get before "compiled") (get after "compiled")))
+     "changes" (changes before after ["crate" "abi" "target" "source" "member" "package" "cargoLibrary"
+                                      "toolchain" "compiled" "library" "sha256"])}))
+
+(defn explain
+  "Compare bounded recorded native/application facts. No I/O, product
+   verification, production, activation or compatibility admission occurs."
+  [left right]
+  (when-not (and (map? left) (map? right)) (refuse! "Expected two recorded artifact receipts"))
+  (let [left-app? (map? (value left "result" :result))
+        right-app? (map? (value right "result" :result))]
+    (when-not (= left-app? right-app?) (refuse! "Cannot compare different recorded product kinds"))
+    (if left-app? (application-explanation left right) (native-explanation left right))))
+
+(defn- read-receipt! [path]
+  (text! path 4096 "receipt path" false)
+  (when-not (= :regular (:type (File/stat! path))) (refuse! "Receipt must be a regular file"))
+  (let [file (File/open! path (list :read :binary))]
+    (try
+      (let [bytes (IO/binread file (inc max-file-bytes))]
+        (when-not (and (string? bytes) (<= (erlang/byte_size bytes) max-file-bytes))
+          (refuse! "Recorded receipt exceeds capacity or is empty"))
+        (Jason/decode! bytes))
+      (finally (File/close file)))))
+
+(defn explain-files!
+  "Read two bounded receipt JSON files and compare their recorded facts.
+   Output/product paths inside receipts are never followed."
+  [left-path right-path]
+  (explain (read-receipt! left-path) (read-receipt! right-path)))

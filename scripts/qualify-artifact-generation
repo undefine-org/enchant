@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Prepare the current compiler, then boot and compare two reproductions.
+
+Use a process-tree cap (MemoryMax=6G, MemorySwapMax=0, RuntimeMaxSec=1200).
+Each generation uses a fresh private image and one serial producer VM. The
+checkout floor is never installed or replaced. Output must be absent.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+# A producer may start from an authenticated PREVIOUS compiler generation.
+# The demo receiver intentionally requires a current floor; reusing its boot
+# protocol here silently loses Bootstrap.install!'s previous-generation stage.
+# Only the private producer uses this protocol. B/C receivers stay strict.
+PRODUCER_BOOT = r'''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+keys = {BeamLisp.AOTCache.current_compiler_key(), BeamLisp.AOTCache.current_build_key()}
+installation = BeamLisp.Bootstrap.install!(Path.join(File.cwd!(), ".bl/lib/beam_lisp-0.1.0/ebin"),
+  seed_dir: Path.join(File.cwd!(), "priv/bootstrap/seed"))
+case installation do
+  :ok ->
+    unless keys == {manifest["compiler_key"], manifest["build_key"]},
+      do: raise "current producer installation has foreign keys"
+  {:staged, :compiler_key_mismatch} ->
+    if keys == {manifest["compiler_key"], manifest["build_key"]},
+      do: raise "previous producer installation has current keys"
+  other -> raise "producer installation refused: #{inspect(other)}"
+end
+BeamLisp.AOT.boot()
+unless keys == {BeamLisp.AOTCache.current_compiler_key(), BeamLisp.AOTCache.current_build_key()},
+  do: raise "producer compiler inputs changed during bootstrap"
+for {name, _} <- manifest["modules"], String.ends_with?(name, ".beam") do
+  {:ok, {mod, expected}} = :beam_lib.md5(String.to_charlist(Path.join("priv/bootstrap/seed", name)))
+  if :erlang.module_loaded(mod) do
+    role = Keyword.get(mod.module_info(:attributes), :bl_aot_artifact_role)
+    unless role == [:"mutable-forwarder"] or mod.module_info(:md5) == expected,
+      do: raise "producer startup replaced stable predecessor code: #{mod}"
+  end
+end
+File.write!(System.fetch_env!("BL_GENERATION_BOOTSTRAP_RECEIPT"), Jason.encode!(%{
+  "installation" => if(installation == :ok, do: "current", else: "previous-generation"),
+  "seed_compiler_key" => manifest["compiler_key"], "seed_build_key" => manifest["build_key"],
+  "input_compiler_key" => elem(keys, 0), "input_build_key" => elem(keys, 1),
+  "stable_predecessor_unchanged" => true
+}))
+BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))
+'''
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--seed", type=Path,
+                        help="explicit initial bootstrap compiler floor; defaults to the checkout floor")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--producer-timeout", type=int, default=240,
+                        help="bounded seconds per producer generation (maximum 1200)")
+    args = parser.parse_args()
+    if not 1 <= args.producer_timeout <= 1200:
+        parser.error("--producer-timeout must be between 1 and 1200 seconds")
+    root, output = args.root.resolve(), args.out.absolute()
+    initial_seed = (args.seed or root / "priv/bootstrap/seed").resolve()
+    if not initial_seed.is_dir() or any(
+            not p.is_file() or p.is_symlink() or
+            (p.name != "manifest.term" and p.suffix not in (".beam", ".app"))
+            for p in initial_seed.iterdir()):
+        parser.error("initial seed must be a directory of regular artifact files")
+    initial_seed_files = {p.name: sha(p) for p in sorted(initial_seed.iterdir())}
+    if "manifest.term" not in initial_seed_files:
+        parser.error("initial seed must contain manifest.term")
+    # lexists also refuses dangling links; mkdir owns a new directory exclusively.
+    if os.path.lexists(output):
+        parser.error(f"output must be absent: {output}")
+    output.mkdir(parents=True)
+    driver = root / "test/scripts/artifact-generation.bl"
+    watched = sorted({root / "env.bl", Path(__file__).resolve(), driver,
+                      root / "scripts/check-source-floor", root / "scripts/demo-artifact-production",
+                      *(p for p in (root / "priv/native").iterdir()
+                        if p.is_file() and p.suffix in (".so", ".dylib", ".dll")),
+                      *[p for p in (root / "priv").rglob("*.bl")],
+                      *[p for p in (root / "priv/bootstrap/seed").iterdir() if p.is_file()]})
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    (output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
+    deps = sorted((root / "deps").glob("*/ebin"))
+    deps += sorted((root / "_build").glob("*/lib/*/ebin"))
+    deps = list(dict.fromkeys(p.resolve() for p in deps))
+    report = {"version": 1, "kind": "artifact-generation-qualification", "stages": [],
+              "initial_seed": str(initial_seed), "initial_seed_files": initial_seed_files,
+              "floor_installed": False, "native_execution_admission": False,
+              "self_reproduction_qualified": False}
+
+    def save():
+        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    def unchanged():
+        for path, digest in inputs.items():
+            if sha(root / path) != digest:
+                raise RuntimeError(f"qualification input changed: {path}")
+        if initial_seed_files != {p.name: sha(p) for p in sorted(initial_seed.iterdir())
+                                  if p.is_file() and not p.is_symlink()} or any(
+                not p.is_file() or p.is_symlink() for p in initial_seed.iterdir()):
+            raise RuntimeError("initial bootstrap compiler floor changed during qualification")
+
+    source = initial_seed
+    previous_files = initial_seed_files
+    save()
+    try:
+        # The predecessor's optimizer/backend may differ from current Source.
+        # P crosses that compiler boundary; only B/C establish reproduction.
+        # Every generation uses the same producer and strict fresh-boot gate.
+        for label in ("P", "B", "C"):
+            target = output / label
+            stage = {"generation": label, "producer_floor": str(source), "produced": False,
+                     "fresh_boot_qualified": False}
+            if label == "P":
+                report["preparation"] = stage
+            else:
+                report["stages"].append(stage)
+            save()
+            with tempfile.TemporaryDirectory(prefix=f"bl-generation-{label}-") as temporary:
+                image = Path(temporary)
+                subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+                shutil.rmtree(image / "priv/bootstrap/seed")
+                shutil.copytree(source, image / "priv/bootstrap/seed")
+                shutil.copy2(root / "env.bl", image / "env.bl")
+                app = image / ".bl/lib/beam_lisp-0.1.0"
+                app.mkdir(parents=True)
+                (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+                shutil.copytree(source, app / "ebin")
+                shutil.copy2(driver, image / "produce.bl")
+                (image / "produce.exs").write_text(PRODUCER_BOOT)
+                command = ["elixir"]
+                for dep in deps:
+                    command += ["-pa", str(dep)]
+                command += ["-pa", str(app / "ebin"), str(image / "produce.exs")]
+                env = {**os.environ, "BL_ROOT": str(image), "BL_DAEMON": "off",
+                       "BL_ARTIFACT_DRIVER": str(image / "produce.bl"),
+                       "BL_GENERATION_OUTPUT": str(target), "XDG_CACHE_HOME": str(image / "cache"),
+                       "BL_GENERATION_BOOTSTRAP_RECEIPT": str(output / f"{label}.bootstrap.json"),
+                       "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+                # Refuse drift before starting code, as well as after it exits.
+                # Check the bytes actually copied into both compiler locations;
+                # a source that changes and changes back during cp is not a
+                # coherent compiler snapshot merely because its final hash fits.
+                expected_seed = previous_files
+                for copied in (image / "priv/bootstrap/seed", app / "ebin"):
+                    if expected_seed != {p.name: sha(p) for p in sorted(copied.iterdir()) if p.is_file()}:
+                        raise RuntimeError(f"copied compiler floor differs from generation {label} inputs")
+                for path, digest in inputs.items():
+                    if path == "env.bl" or (path.startswith("priv/") and
+                                            not path.startswith("priv/bootstrap/seed/")):
+                        if sha(image / path) != digest:
+                            raise RuntimeError(f"copied source differs from qualification input: {path}")
+                unchanged()
+                started = time.monotonic()
+                try:
+                    result = subprocess.run(command, cwd=image, env=env, text=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            timeout=args.producer_timeout)
+                except subprocess.TimeoutExpired as error:
+                    partial = error.stdout or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode(errors="replace")
+                    (output / f"{label}.producer.log").write_text(partial)
+                    print(partial[-16000:], end="", flush=True)
+                    raise RuntimeError(f"generation {label} producer exceeded {args.producer_timeout} seconds") from error
+                stage["producer_seconds"] = round(time.monotonic() - started, 3)
+                (output / f"{label}.producer.log").write_text(result.stdout)
+                print(result.stdout[-16000:], end="", flush=True)
+                if result.returncode:
+                    raise RuntimeError(f"generation {label} producer failed: {result.returncode}")
+                stage["bootstrap"] = json.loads((output / f"{label}.bootstrap.json").read_text())
+                unchanged()
+                stage["produced"] = True
+                stage["files"] = {p.name: sha(p) for p in sorted(target.iterdir())}
+                save()
+            # The official fresh-application/descriptor gate owns its private
+            # image. It also checks startup did not replace stable compiler bytes.
+            started = time.monotonic()
+            checked = subprocess.run(["python3", str(root / "scripts/check-source-floor"),
+                                      "--root", str(root), "--seed", str(target)], cwd=root,
+                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150)
+            stage["fresh_boot_seconds"] = round(time.monotonic() - started, 3)
+            (output / f"{label}.boot.log").write_text(checked.stdout)
+            print(checked.stdout[-16000:], end="", flush=True)
+            if checked.returncode:
+                raise RuntimeError(f"generation {label} fresh boot failed: {checked.returncode}")
+            unchanged()
+            stage["fresh_boot_qualified"] = True
+            save()
+            source = target
+            previous_files = stage["files"]
+        first, second = report["stages"]
+        changed = sorted(name for name in first["files"].keys() | second["files"].keys()
+                         if first["files"].get(name) != second["files"].get(name))
+        report["changed_files"] = changed
+        report["self_reproduction_qualified"] = not changed
+        if changed:
+            raise RuntimeError(f"B and C differ: {changed}")
+        print("ARTIFACT-GENERATION: B and C booted freshly and reproduce every file byte-for-byte", flush=True)
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        report["error"] = str(error)
+        # Failed Nix derivations retain stdout/stderr but do not publish $out.
+        # Keep the causal diagnostic there as well as in the local packet.
+        print("ARTIFACT-GENERATION FAILED: " + str(error), file=sys.stderr, flush=True)
+        return 1
+    finally:
+        save()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

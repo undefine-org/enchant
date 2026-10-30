@@ -21,13 +21,26 @@
   (erlang/send controller [:work-finished id :done])
   (catch error (erlang/send controller [:work-finished id (if (= :cancelled (:kind (ex-data error))) :cancelled :failed)]))
   (finally (callback/unregister! registration))))
+(defn- await-work [controller id]
+ ;; The receiver holds the offer before acceptance. If it exits at any point,
+ ;; native owner cleanup closes both pending and accepted target epochs.
+ (receive [:work-run prepared]
+  (try
+   (let [registration (callback/commit-transfer! prepared)]
+    (when-not (= :cancelled registration) (execute controller id registration)))
+   (finally (callback/unregister! (:accepted prepared))))
+  (after 5000 nil)))
+(defn- close-job! [job]
+ (when (:source-registration job) (callback/unregister! (:source-registration job)))
+ (when (:target-registration job) (callback/unregister! (:target-registration job))))
 (defn- finished [state id status]
  (if-let [job (get-in state [:jobs id])]
   (if (observation/active? job)
    (do
+    (close-job! job)
     (when (:cancel-timer job) (erlang/cancel_timer (:cancel-timer job)))
     (assoc-in state [:jobs id]
-    (assoc (dissoc job :cancel-timer) :status (if (= :cancelling (:status job)) :cancelled status)
+    (assoc (dissoc job :cancel-timer :source-registration :target-registration) :status (if (= :cancelling (:status job)) :cancelled status)
                :finished (now) :cancel-ms (when (:cancel-at job) (- (now) (:cancel-at job)))))) state) state))
 (defn- initial-state [opts]
  (let [active (:max-active opts 4) history (:history opts 32)]
@@ -37,20 +50,26 @@
    :owner-ref (erlang/monitor :process (:lifetime-owner opts))}))
 (proc.server/defserver work-owner
  (init [opts] (Process/flag :trap_exit true) (ok (initial-state opts)))
- (handle-call [:submit metadata registration] [_from state]
+ (handle-call [:submit metadata prepared] [_from state]
   (if (>= (count (filter observation/active? (vals (:jobs state)))) (:max-active state))
-   (do (callback/unregister! registration)
+   (do (callback/unregister! (:accepted prepared))
        (reply {:ok false :message "Work capacity exhausted"} state))
-   (let [id (pr-str (erlang/make_ref)) controller (erlang/self)
-         pid (spawn-link (fn []
-               (scope/bind! (:realm state))
-               (receive [:work-run retained] (execute controller id retained))))
-         retained (callback/transfer! registration pid)
-         job (merge (select-keys metadata [:title :source :generation])
-              {:id id :pid pid :ref (erlang/monitor :process pid) :status :running :started (now) :ordinal (erlang/unique_integer (list :monotonic :positive)) :progress 0})]
-    (when (:realm state) (owner/adopt (:realm state) :private-work pid))
-    (erlang/send pid [:work-run retained])
-    (reply {:id id} (trim (assoc-in state [:jobs id] job))))))
+   (let [accepted (BeamLisp.Execution/accept-handoff! prepared)]
+    (if-not (= :accepted (:status accepted))
+     (do (callback/unregister! (:accepted prepared))
+         (reply {:ok false :message "Work admission unavailable"} state))
+     (let [registration (:registration accepted)
+           id (pr-str (erlang/make_ref)) controller (erlang/self)
+           pid (spawn-link (fn [] (scope/bind! (:realm state)) (await-work controller id)))
+           offer (callback/prepare-transfer! registration pid)
+           job (merge (select-keys metadata [:title :source :generation])
+                {:id id :pid pid :ref (erlang/monitor :process pid) :status :running
+                 :source-registration registration :target-registration (:accepted offer)
+                 :started (now) :ordinal (erlang/unique_integer (list :monotonic :positive)) :progress 0})
+           after (trim (assoc-in state [:jobs id] job))]
+      (when (:realm state) (owner/adopt (:realm state) :private-work pid))
+      (erlang/send pid [:work-run offer])
+      (reply {:id id} after))))))
  (handle-call [:cancel id] [_from state]
   (let [job (get-in state [:jobs id])]
    (if (observation/active? job)
@@ -64,7 +83,7 @@
                         :cancel-at (or (:cancel-at j) (now)))))))
     (reply {:ok false :message "Work is no longer active"} state))))
  (handle-call [:snapshot] [_from state]
-  (reply (mapv (fn [job] (-> job (dissoc :pid :ref :ordinal :cancel-timer)
+  (reply (mapv (fn [job] (-> job (dissoc :pid :ref :ordinal :cancel-timer :source-registration :target-registration)
           (assoc :elapsed-ms (- (or (:finished job) (now)) (:started job)))))
           (sort-by (fn [j] (- (:ordinal j))) (vals (:jobs state)))) state))
  (handle-info [:work-progress id value] [state]
@@ -81,16 +100,22 @@
  (handle-info _ [state] (noreply state))
  (terminate [_reason state]
   (doseq [job (vals (:jobs state))]
+   (close-job! job)
    (when (and (observation/active? job) (Process/alive? (:pid job))) (erlang/exit (:pid job) :kill))) :ok))
 (defn start! ([] (start! {})) ([opts]
  (let [realm (scope/current)
        pid (core/start work-owner (assoc opts :realm realm :lifetime-owner (erlang/self)) {})]
   (when realm (owner/adopt realm :private-work-owner pid)) pid)))
 (defn submit! [owner metadata action]
- (let [registration (callback/register! action)
-       retained (callback/transfer! registration owner)]
-  (if (= :cancelled retained) {:ok false :message "Work owner unavailable"}
-   (call owner [:submit metadata retained]))))
+ (let [registration (callback/register! action)]
+  (try
+   (let [prepared (callback/prepare-transfer! registration owner)]
+    (if (= :cancelled prepared) {:ok false :message "Work owner unavailable"}
+     (call owner [:submit metadata prepared])))
+   (finally
+    ;; Only close our old epoch: a lost reply cannot revoke the receiver's
+    ;; accepted work. The receiver closes/refuses its own target on every path.
+    (callback/unregister! registration)))))
 (defn cancel! [owner id] (call owner [:cancel id]))
 (defn snapshot [owner] (call owner [:snapshot]))
 (defn stop! [owner] (when owner (core/stop owner)) :ok)

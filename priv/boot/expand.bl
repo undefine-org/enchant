@@ -1,0 +1,924 @@
+;; Ordered contextual elaboration. Reader, binding lookup, macro evaluation and
+;; ANF compilation each retain their existing owner. No alternate evaluator.
+(ns expand (:require [syntax :as s] [binding :as b] [expand-source :as catalog] [compiler :as compiler] [anf :as anf] [reader-node :as rn]))
+
+(defn- refuse! [kind node]
+ (throw (ex-info (str "Contextual expansion: " kind)
+          {:kind kind :origin (:origin node)})))
+
+(defn- tick [state]
+ (when (<= (:remaining state) 0) (refuse! :expansion-budget nil))
+ (update state :remaining dec))
+
+(defn- source-world [state]
+ (Map/fetch! (get-in state [:selection :worlds]) (:world state)))
+
+(defn- fresh-scope [state role]
+ (let [w (source-world state) n (:next-scope state)
+       scope (b/scope (:selection w) (:namespace state)
+               (Enum/concat (or (:coordinate-prefix state) (list 1)) (list n)) role)]
+  (tuple scope (assoc state :next-scope (+ n 1)
+                           :selection (b/register-scope (:selection state) scope)))))
+
+(defn- as-reader [node] (s/to-reader node))
+
+(defn- list-reader [node children]
+ (let [form (tuple :list children)]
+  (if (:origin node) (tuple :meta form (:origin node)) form)))
+
+(defn- spelling [node]
+ (when (s/identifier? node) (elem (:value node) 1)))
+
+(defn- internal-name [reference]
+ (str "__bl_binding_" (Base/encode16 (:id reference) (list (tuple :case :lower)))))
+
+(defn- lookup-result [node state]
+ (b/resolve (:selection state) node (:phase state)
+   (if (= (:world state) (get-in node [:context :world])) (:position state) 1073741823)))
+
+(defn- qualified-reference [original state]
+ (let [shift (Map/get state :reference-shift 0) phase (+ (:phase original) shift)]
+  (if (= 0 shift) original
+   (assoc original :phase phase :id (b/reference-id (:selection state) (:declaration original) phase)))))
+
+(defn- reference-reader [node result state definition?]
+ (let [shift (Map/get state :reference-shift 0)
+       reference (qualified-reference (:reference result) state)
+       name (internal-name reference)
+       syntax (assoc node :value (symbol name))
+       occurrence {:reference reference :name (:value node) :origin (:origin node)
+                   :context (:context node) :lookup-phase (:phase state) :position (:position result)
+                   :reference-shift shift :definition definition?}
+       descriptor {:reference reference :declaration (:declaration result)}
+       state (if (= :local (get-in result [:declaration :visibility])) state
+                 (assoc-in state [:dependencies name] descriptor))]
+  (tuple (as-reader syntax)
+         (-> state (assoc-in [:references name] descriptor)
+                   (update :occurrences #(cons occurrence %))))))
+
+(defn- resolve-symbol [node state]
+ (let [result (lookup-result node state)]
+  (when-not (= :resolved (:status result))
+   (throw (ex-info "Identifier does not have a unique available binding"
+            {:kind (case (:status result) :unbound :unbound-identifier :ambiguous :ambiguous-identifier
+                         :not-yet-available :binding-not-yet-available :invalid-binding-result)
+             :name (:value node) :origin (:origin node) :resolution result})))
+  result))
+
+(defn- bind-symbol [node state]
+ (let [name (spelling node)]
+  (if (contains? #{"&" "_"} name) (tuple (as-reader node) state)
+   (let [n (:next-declaration state)
+         declaration {:namespace (:namespace state) :name (:value node) :phase (:phase state)
+                      :space (get-in node [:context :space]) :kind :value :visibility :local
+                      :available-from 0
+                      :path (Enum/concat (or (:coordinate-prefix state) (list 1)) (list n))
+                      :scopes (s/scopes node (:phase state))}
+         state (assoc state :next-declaration (+ n 1)
+                            :selection (b/bind (:selection state) (:world state) declaration))]
+    (reference-reader node (resolve-symbol node state) state true)))))
+
+(declare expression-node)
+(declare pattern-node)
+(declare demand-transformer)
+(declare guard-node)
+
+(defn- expression-nodes [nodes state]
+ (Enum/map_reduce nodes state (fn [node current] (expression-node node current))))
+
+(defn- pattern-node [node state]
+ (cond
+  (s/identifier? node) (bind-symbol node state)
+  (= :vector (:tag node))
+   (let [r (Enum/map_reduce (:children node) state
+             (fn [child current]
+              (if (= :keyword (:tag child)) (tuple (as-reader child) current)
+                  (pattern-node child current))))]
+    (tuple (tuple :vector (elem r 0)) (elem r 1)))
+  :else (refuse! :unsupported-contextual-pattern node)))
+
+(defn- scoped [nodes scope]
+ (Enum/map nodes #(s/add-scope % (:id scope) :all)))
+
+(defn- let-node [node state]
+ (let [children (:children node) head (first children) bindings (second children)
+       _ (when-not (and (= :vector (:tag bindings)) (even? (count (:children bindings))))
+           (refuse! :invalid-contextual-bindings bindings))]
+  (loop [items (:children bindings) body (Enum/drop children 2) current state output (list)]
+   (if (empty? items)
+    (let [r (expression-nodes body current)]
+     (tuple (list-reader node
+              (cons (as-reader head) (cons (tuple :vector (Enum/reverse output)) (elem r 0)))) (elem r 1)))
+    (let [initial (expression-node (second items) current)
+          allocated (fresh-scope (elem initial 1) :lexical) scope (elem allocated 0)
+          pattern (pattern-node (s/add-scope (first items) (:id scope) :all) (elem allocated 1))]
+     ;; Scope the rest of the SOURCE before expanding any macro inside it.
+     (recur (scoped (Enum/drop items 2) scope) (scoped body scope) (elem pattern 1)
+            (cons (elem initial 0) (cons (elem pattern 0) output))))))))
+
+(defn- fn-clause [forms layout state]
+ (let [parameters (first forms)]
+  (when-not (= :vector (:tag parameters)) (refuse! :invalid-contextual-parameters parameters))
+  (let [allocated (fresh-scope state :lexical) scope (elem allocated 0)
+        params (pattern-node (s/add-scope parameters (:id scope) :all) (elem allocated 1))
+        guard (if (some? (:guard-index layout))
+                (guard-node (s/add-scope (nth forms (:guard-index layout)) (:id scope) :all) (elem params 1))
+                (tuple nil (elem params 1)))
+        r (expression-nodes (scoped (Enum/drop forms (:body-offset layout)) scope) (elem guard 1))
+        prefix (if (some? (:guard-index layout))
+                 (list (elem params 0) (as-reader (second forms)) (elem guard 0))
+                 (list (elem params 0)))]
+   (tuple (Enum/concat prefix (elem r 0)) (elem r 1)))))
+
+(defn- fn-node [node state]
+ (let [children (:children node) head (first children)
+       layout (compiler/function-layout (Enum/map (rest children) (fn [child] (as-reader child))) (:origin node))
+       named? (some? (:name layout))
+       allocated (when named? (fresh-scope state :lexical))
+       self (when named? (bind-symbol (s/add-scope (second children) (:id (elem allocated 0)) :all)
+                                      (elem allocated 1)))
+       forms (vec (if named? (scoped (Enum/drop children 2) (elem allocated 0)) (rest children)))
+       current (if named? (elem self 1) state)
+       prefix (if named? (list (as-reader head) (elem self 0)) (list (as-reader head)))]
+  (if (:inline? layout)
+   (let [r (fn-clause forms (first (:clauses layout)) current)]
+    (tuple (list-reader node (Enum/concat prefix (elem r 0))) (elem r 1)))
+   (let [r (Enum/map_reduce (:clauses layout) current
+             (fn [clause-layout current]
+              (let [clause (nth forms (:clause-index clause-layout))]
+               (when-not (= :list (:tag clause)) (refuse! :invalid-contextual-clause clause))
+               (let [r (fn-clause (:children clause) clause-layout current)]
+                (tuple (list-reader clause (elem r 0)) (elem r 1))))))]
+    (tuple (list-reader node (Enum/concat prefix (elem r 0))) (elem r 1))))))
+
+(defn- native-name? [node]
+ ;; The compiler owns the closed escape grammar as well as its target.
+ (compiler/contextual-native-name? (spelling node)))
+
+(defn- match-node [node state]
+ ;; Matching and parameter destructuring have different map grammars. Keep
+ ;; this adapter literal: actual pattern alternatives stay in Compiler.
+ (let [state (tick state)]
+  (cond
+   (s/identifier? node)
+    (if (= "&" (spelling node)) (refuse! :unsupported-contextual-match node)
+      (bind-symbol node state))
+   (contains? #{:scalar :keyword} (:tag node)) (tuple (as-reader node) state)
+   (= :vector (:tag node))
+    (let [r (Enum/map_reduce (:children node) state (fn [child current] (match-node child current)))]
+     (tuple (tuple :vector (elem r 0)) (elem r 1)))
+   (= :map (:tag node))
+    (let [r (Enum/map_reduce (:children node) state
+              (fn [pair current]
+               (when-not (= :keyword (:tag (first pair)))
+                (refuse! :unsupported-contextual-match-key (first pair)))
+               (let [r (match-node (second pair) current)]
+                (tuple (tuple (as-reader (first pair)) (elem r 0)) (elem r 1)))))]
+     (tuple (tuple :map (elem r 0)) (elem r 1)))
+   :else (refuse! :unsupported-contextual-match node))))
+
+(defn- guard-node [node state]
+ (let [state (tick state)]
+  (cond
+   (s/identifier? node) (reference-reader node (resolve-symbol node state) state false)
+   (contains? #{:scalar :keyword} (:tag node)) (tuple (as-reader node) state)
+   (= :list (:tag node))
+    (let [head (first (:children node)) name (spelling head)]
+     (when-not (compiler/guard-operator? name)
+      (refuse! :unsupported-contextual-guard head))
+     (let [r (Enum/map_reduce (rest (:children node)) state (fn [child current] (guard-node child current)))]
+      (tuple (list-reader node (cons (as-reader head) (elem r 0)))
+        (update (elem r 1) :native-obligations
+          #(cons {:name (:value head) :origin (:origin head) :kind :guard-intrinsic
+                  :phase (+ (:phase state) (Map/get state :reference-shift 0))} %)))))
+   :else (refuse! :unsupported-contextual-guard node))))
+
+(defn- receive-node [node state]
+ (let [forms (vec (rest (:children node)))
+       layout (compiler/receive-layout (Enum/map forms (fn [form] (as-reader form))) (:origin node))
+       _ (when (> (count (:after-indexes layout)) 1)
+           (refuse! :contextual-receive-timeout-count node))
+       clauses
+       (Enum/reduce (:clauses layout) (tuple {} state)
+        (fn [clause acc]
+         (when (nil? (:body-index clause)) (refuse! :contextual-receive-body node))
+         (let [allocated (fresh-scope (elem acc 1) :lexical) scope (elem allocated 0)
+               contextual (fn [index] (s/add-scope (nth forms index) (:id scope) :all))
+               pattern (match-node (contextual (:pattern-index clause)) (elem allocated 1))
+               guard (if (some? (:guard-index clause))
+                       (guard-node (contextual (:guard-index clause)) (elem pattern 1))
+                       (tuple nil (elem pattern 1)))
+               body (expression-node (contextual (:body-index clause)) (elem guard 1))
+               output (-> (elem acc 0)
+                          (assoc (:pattern-index clause) (elem pattern 0))
+                          (assoc (:body-index clause) (elem body 0)))
+               output (if (some? (:guard-index clause))
+                        (assoc output (:guard-index clause) (elem guard 0)) output)]
+          (tuple output (elem body 1)))))
+       timeout
+       (Enum/reduce (:after-indexes layout) clauses
+        (fn [index acc]
+         (let [form (nth forms index) children (:children form)]
+          (when-not (= 3 (count children)) (refuse! :contextual-receive-timeout-arity form))
+          (let [r (expression-nodes (rest children) (elem acc 1))]
+           (tuple (assoc (elem acc 0) index
+                    (list-reader form (cons (as-reader (first children)) (elem r 0)))) (elem r 1))))))
+       output (Enum/map (Enum/with_index forms)
+                (fn [pair] (Map/get (elem timeout 0) (elem pair 1) (as-reader (elem pair 0)))))]
+  (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem timeout 1))))
+
+(defn- raw-catch-node [node state]
+ (let [children (:children node) binder (second children)
+       _ (when-not (and (= :vector (:tag binder)) (= 3 (count (:children binder)))
+                       (every? (fn [child] (s/identifier? child)) (:children binder)))
+           (refuse! :contextual-raw-catch-bindings binder))
+       allocated (fresh-scope state :lexical) scope (elem allocated 0)
+       bound (pattern-node (s/add-scope binder (:id scope) :all) (elem allocated 1))
+       body (expression-nodes (scoped (Enum/drop children 2) scope) (elem bound 1))]
+  (tuple (list-reader node (cons (as-reader (first children)) (cons (elem bound 0) (elem body 0))))
+         (elem body 1))))
+
+(defn- catch-node [node state]
+ (let [children (:children node) layout (compiler/catch-layout (as-reader node) (:origin node))
+       allocated (fresh-scope state :lexical) scope (elem allocated 0)
+       bound (bind-symbol (s/add-scope (nth children (:binder-index layout)) (:id scope) :all)
+                          (elem allocated 1))
+       implicit-scope (fresh-scope (elem bound 1) :lexical) inner (elem implicit-scope 0)
+       aliases (Enum/map_reduce (list :stack :kind) (elem implicit-scope 1)
+                 (fn [role current]
+                  (let [name (get-in layout [:implicit-locals role])
+                        identifier (-> (s/identifier (symbol name) (:context node))
+                                       (s/add-scope (:id scope) :all)
+                                       (s/add-scope (:id inner) :all))
+                        binding (bind-symbol identifier current)]
+                   ;; These RHS names are exact locals supplied by Compiler's
+                   ;; catch handler, never an Env or contextual lookup fallback.
+                   (tuple (list (elem binding 0) (tuple :symbol name)) (elem binding 1)))))
+       body (expression-nodes (scoped (scoped (Enum/drop children (:body-offset layout)) scope) inner)
+                              (elem aliases 1))
+       bridge (tuple :list
+                (cons (tuple :symbol "let")
+                  (cons (tuple :vector (Enum/concat (elem aliases 0))) (elem body 0))))
+       prefix (if (some? (:type-index layout))
+                (list (as-reader (first children)) (as-reader (nth children (:type-index layout))) (elem bound 0))
+                (list (as-reader (first children)) (elem bound 0)))]
+  (tuple (list-reader node (Enum/concat prefix (list bridge)))
+   (if (some? (:type-index layout))
+    (let [type (nth children (:type-index layout))]
+     (update (elem body 1) :native-obligations
+       #(cons {:name (:value type) :origin (:origin type) :kind :catch-type
+               :phase (+ (:phase state) (Map/get state :reference-shift 0))} %)))
+    (elem body 1)))))
+
+(defn- try-node [node state]
+ (let [forms (vec (rest (:children node)))
+       layout (compiler/try-layout (Enum/map forms (fn [form] (as-reader form))) (:origin node))
+       expand-indexes (fn [indexes action acc]
+                       (Enum/reduce indexes acc
+                         (fn [index current]
+                          (let [r (action (nth forms index) (elem current 1))]
+                           (tuple (assoc (elem current 0) index (elem r 0)) (elem r 1))))))
+       body (expand-indexes (:body-indexes layout) (fn [form current] (expression-node form current)) (tuple {} state))
+       catches (expand-indexes (:catch-indexes layout) (fn [form current] (catch-node form current)) body)
+       raw (expand-indexes (:raw-indexes layout) (fn [form current] (raw-catch-node form current)) catches)
+       after (expand-indexes (:finally-indexes layout)
+               (fn [form current]
+                (let [r (expression-nodes (rest (:children form)) current)]
+                 (tuple (list-reader form (cons (as-reader (first (:children form))) (elem r 0))) (elem r 1)))) raw)
+       output (Enum/map (Enum/with_index forms) #(get (elem after 0) (elem % 1)))]
+  (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem after 1))))
+
+(defn- datum-macro-environment [node state]
+ ;; Preserve the ordinary &env ABI: visible local symbol -> authored spelling.
+ ;; Resolve against the SAME phase/scopes instead of exposing runtime values,
+ ;; the private constructor session or a second lexical environment registry.
+ (let [context (:context (first (:children node)))]
+  (Enum/reduce (Map/values (get-in state [:selection :by-id])) {}
+   (fn [declaration out]
+    (if (not= :local (:visibility declaration)) out
+     (let [name (:name declaration)
+           result (b/resolve (:selection state) (s/identifier name context) (:phase state) (:position state))]
+      (if (and (= :resolved (:status result)) (= (:id declaration) (get-in result [:declaration :id])))
+       (assoc out name (str name)) out)))))))
+
+(defn- qualified-datum-name [declaration]
+ (symbol (str (:namespace declaration) "/" (:name declaration))))
+
+(defn- datum-result-syntax [reader context state]
+ ;; datum-v1 has namespace qualification, not per-node provenance. Bare names
+ ;; retain caller context; qualified names may use the macro's selected module
+ ;; and imports. The SAME resolver checks phase, visibility and unique origin.
+ (let [definition (:definition-context context)]
+  (s/map-identifiers (s/from-node reader (:use-context context))
+   (fn [node]
+    (if (not (String/contains? (str (:value node)) "/")) node
+     (let [selected (assoc node :context definition)
+           result (b/resolve (:selection state) selected (:phase state) 1073741823)]
+      (case (:status result)
+       :resolved selected
+       :ambiguous (refuse! :ambiguous-datum-qualification node)
+       :not-yet-available (refuse! :binding-not-yet-available node)
+       node)))))))
+
+(defn- macro-node [node result state]
+ (when (or (<= (Map/get state :macro-budget 0) 0) (>= (Map/get state :macro-depth 0) 64))
+  (refuse! :contextual-macro-budget node))
+ (let [depth (Map/get state :macro-depth 0)
+       state (-> state (update :macro-budget dec) (assoc :macro-depth (+ 1 depth)))
+       allocated (fresh-scope state :introduction) scope (elem allocated 0) state (elem allocated 1)
+       lookup (:reference result) reference (qualified-reference lookup state) declaration (:declaration result)
+       delta (- (:phase lookup) (:phase declaration))
+       instance-shift (- (:phase reference) (:phase declaration))
+       ;; Definition bodies resolve in their original coordinates, then project
+       ;; references into the selected phase instance. Templates must remain in
+       ;; the caller's lookup coordinates; evaluator images use effective ones.
+       state (assoc state :selection
+               (b/instantiate (b/instantiate (:selection state) (:world reference) delta)
+                              (:world reference) instance-shift))
+       unit (get-in state [:catalog :worlds (:world reference)])
+       context {:version 1 :definition-context
+                 (s/shift-context (:context unit) delta)
+                :use-context (:context (first (:children node))) :introduction-scope (:id scope)
+                :lookup-phase (+ 1 (:phase state))
+                :use-phase (+ (:phase state) (Map/get state :reference-shift 0))
+                :phase (+ 1 (:phase state) (Map/get state :reference-shift 0)) :origin (:origin node)}]
+  (when-not (:catalog state)
+   (refuse! :contextual-macro-controller-unavailable node))
+  ;; Fixed compiler interface. No caller-supplied evaluator or runtime macro Fn.
+  (let [demand (demand-transformer reference state)
+        protocol (get-in (elem demand 1) [:transformer-protocols (:id reference)] 'syntax-v1)
+        arguments (if (= 'datum-v1 protocol)
+                    (cons (s/to-datum node)
+                     (cons (datum-macro-environment node state)
+                           (Enum/map (rest (:children node)) (fn [child] (s/to-datum child)))))
+                    (list node context))
+        expanded (BeamLisp.AOT/eval_constructor_session! (:constructor-session state)
+                   {:op :apply :fn (elem demand 0)
+                    :args (Enum/map arguments (fn [value] {:op :lit :val value}))} {}
+                   (get-in (elem demand 1) [:transformer-bindings (:id reference)] {}))
+        materialize (fn [value]
+                      (if (= :contextual-literal (:kind value))
+                        (s/from-datum (:value value) (:definition-context context)) value))
+        syntax (s/validate
+                (if (= 'datum-v1 protocol)
+                 (assoc (datum-result-syntax (compiler/datum-macro-result expanded) context (elem demand 1))
+                        :origin (:origin node))
+                 (if (= :contextual-template (:kind expanded))
+                   (s/template (s/shift-phase (:template expanded) delta)
+                     (Map/new (Enum/map (Map/to_list (:holes expanded))
+                                #(tuple (elem % 0) (materialize (elem % 1))))) (:id scope))
+                   (materialize expanded))))
+        syntax (s/for-compiler syntax (get-in state [:catalog :worlds (:world state) :file]))
+        trace {:transformer reference :origin (:origin node) :protocol protocol
+               :instance-shift instance-shift :lookup-shift delta
+               :lookup-phase (:phase state) :position (:position result)
+               :reference-shift (Map/get state :reference-shift 0)
+               :head-origin (:origin (first (:children node)))
+               :name (:value (first (:children node))) :context (:context (first (:children node)))}]
+   (let [r (expression-node syntax (update (elem demand 1) :expansions #(cons trace %)))]
+    (tuple (elem r 0) (assoc (elem r 1) :macro-depth depth))))))
+
+(defn- quote-reader [value context]
+ (tuple :list (list (tuple :symbol "quote") (s/to-reader (s/from-datum value context)))))
+
+(defn- template-reader [template holes]
+ (tuple :map
+   (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-template"))
+         (tuple (tuple :keyword "template") (quote-reader template (:context template)))
+         (tuple (tuple :keyword "holes") holes))))
+
+(defn- quote-names [node]
+ (cond
+  (s/identifier? node) (list (:value node))
+  (contains? #{:map :record} (:tag node))
+   (Enum/flat_map (:children node) #(Enum/concat (quote-names (first %)) (quote-names (second %))))
+  (:children node) (Enum/flat_map (:children node) (fn [child] (quote-names child)))
+  :else (list)))
+
+(declare quote-source)
+
+(defn- quote-source-children [nodes readers state plan]
+ (Enum/map_reduce (Enum/zip nodes readers) (tuple state plan)
+  (fn [pair current]
+   (let [r (quote-source (elem pair 0) (elem pair 1) (elem current 0) (elem current 1) true)]
+    (tuple (elem r 0) (elem r 1))))))
+
+(defn- quote-source [node reader state plan sequence?]
+ (let [state (tick state) role (compiler/syntax-quote-role reader)
+       children (:children node)]
+  (cond
+   (contains? #{:unquote :splice} role)
+    (do
+     (when-not (= 2 (count children)) (refuse! :syntax-quote-arity node))
+     (when (and (= :splice role) (not sequence?)) (refuse! :syntax-quote-splice-context node))
+     (let [r (expression-node (second children) state)]
+      (if (:hygienic plan)
+       (let [allocated (loop [n (:next plan)]
+                        (let [name (symbol (str "__bl_quote_hole_" n))]
+                         (if (contains? (:reserved plan) name) (recur (+ n 1)) (tuple name (+ n 1)))))
+             name (elem allocated 0)
+             hole (if (= :splice role)
+                    (tuple :map (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-splice"))
+                                     (tuple (tuple :keyword "children") (elem r 0)))) (elem r 0))]
+        (tuple (assoc (s/identifier name (:context node)) :origin (:origin node))
+         (tuple (elem r 1) (-> plan (assoc :next (elem allocated 1))
+                           (update :holes #(cons (tuple name hole) %))))))
+       (tuple (assoc node :children (list (first children) (s/from-node (elem r 0) (:context node))))
+              (tuple (elem r 1) plan)))))
+   (= :nested role)
+    (do
+     (when-not (= 2 (count children)) (refuse! :syntax-quote-arity node))
+     (let [r (quote-source (second children) (second (rn/node-items (rn/node-form reader)))
+                         state (assoc plan :gensyms {}) false)]
+      (tuple (assoc node :children (list (first children) (elem r 0)))
+             (tuple (elem (elem r 1) 0) (assoc (elem (elem r 1) 1) :gensyms (:gensyms plan))))))
+   (contains? #{:list :vector} role)
+    (let [r (quote-source-children children (rn/node-items (rn/node-form reader)) state plan)]
+     (tuple (assoc node :children (elem r 0)) (elem r 1)))
+   (= :map role)
+    (let [r (Enum/map_reduce (Enum/zip children (rn/node-items (rn/node-form reader))) (tuple state plan)
+             (fn [pair current]
+              (let [left (quote-source (first (elem pair 0)) (elem (elem pair 1) 0)
+                                      (elem current 0) (elem current 1) false)
+                    right (quote-source (second (elem pair 0)) (elem (elem pair 1) 1)
+                                        (elem (elem left 1) 0) (elem (elem left 1) 1) false)]
+               (tuple (list (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (assoc node :children (elem r 0)) (elem r 1)))
+   (and (= :symbol role) (:hygienic plan))
+    (let [r (compiler/syntax-quote-name (str (:value node)) (:gensyms plan))]
+     (tuple (assoc node :value (symbol (first r))) (tuple state (assoc plan :gensyms (second r)))))
+   (and (= :symbol role) (:datum-transformer state)
+        (not (compiler/syntax-quote-literal-name? (str (:value node)))))
+    (let [local (lookup-result node state)
+          result (when-not (= :local (get-in local [:declaration :visibility]))
+                   (b/resolve (:selection state) node (- (:phase state) 1) (:position state)))
+          selected (when (and (= :resolved (:status result))
+                              (not (contains? #{:macro :syntax} (get-in result [:declaration :kind]))))
+                     (:declaration result))]
+     (tuple (if selected (assoc node :value (qualified-datum-name selected)) node) (tuple state plan)))
+   :else (tuple node (tuple state plan)))))
+
+(defn- syntax-quote-node [node state]
+ (when-not (= 2 (count (:children node))) (refuse! :syntax-quote-arity node))
+ (let [template (second (:children node))
+       hygienic? (and (:transformer state) (not (:datum-transformer state)))
+       plan {:hygienic hygienic? :gensyms {} :reserved (set (quote-names template)) :next 0 :holes (list)}
+       r (quote-source template (as-reader template) state plan false)
+       current (elem (elem r 1) 0) plan (elem (elem r 1) 1)]
+  (tuple
+   (if hygienic?
+    (template-reader (elem r 0)
+     (tuple :map (Enum/map (Enum/reverse (:holes plan))
+                   #(tuple (tuple :list (list (tuple :symbol "quote") (elem % 0))) (elem % 1)))))
+    (list-reader node (list (as-reader (first (:children node))) (as-reader (elem r 0)))))
+   current)))
+
+(defn- template-node [node state]
+ (when-not (:transformer state) (refuse! :syntax-template-outside-transformer node))
+ (let [children (:children node)]
+  (when-not (= 3 (count children)) (refuse! :syntax-template-arity node))
+  (let [holes (expression-node (nth children 2) state)]
+   (tuple (template-reader (second children) (elem holes 0)) (elem holes 1)))))
+
+(defn- argument-node [node state]
+ (let [children (:children node) index (nth children 2 nil)]
+  (when-not (and (= 3 (count children)) (= :scalar (:tag index))
+                 (erlang/is_integer (:value index)) (<= 0 (:value index) 64))
+   (refuse! :syntax-argument-index node))
+  (let [form (expression-node (second children) state)
+        items (tuple :list (list (tuple :keyword "children") (elem form 0)))
+        tail (Enum/reduce (List/duplicate nil (:value index)) items
+               (fn [_ value] (tuple :list (list (tuple :symbol "erlang/tl") value))))]
+   (tuple (tuple :list (list (tuple :symbol "erlang/hd") tail)) (elem form 1)))))
+
+(defn- literal-node [node state]
+ (when-not (and (:transformer state) (= 2 (count (:children node))))
+  (refuse! :syntax-literal-contract node))
+ (let [r (expression-node (second (:children node)) state)]
+  (tuple (tuple :map (list (tuple (tuple :keyword "kind") (tuple :keyword "contextual-literal"))
+                           (tuple (tuple :keyword "value") (elem r 0)))) (elem r 1))))
+
+(defn- expression-node [node state]
+ (let [state (tick state) tag (:tag node)]
+  (cond
+   (s/identifier? node) (reference-reader node (resolve-symbol node state) state false)
+   (contains? #{:scalar :keyword} tag) (tuple (as-reader node) state)
+   (contains? #{:vector :set} tag)
+    (let [r (expression-nodes (:children node) state)]
+     (tuple (tuple tag (elem r 0)) (elem r 1)))
+   (= :map tag)
+    (let [r (Enum/map_reduce (:children node) state
+              (fn [pair current]
+               (let [left (expression-node (first pair) current)
+                     right (expression-node (second pair) (elem left 1))]
+                (tuple (tuple (elem left 0) (elem right 0)) (elem right 1)))))]
+     (tuple (tuple :map (elem r 0)) (elem r 1)))
+   (= :list tag)
+    (let [children (:children node) head (first children) name (spelling head)
+          binding (when (s/identifier? head)
+                    (lookup-result head state))
+          kernel? (or (nil? binding) (= :unbound (:status binding)))]
+     (cond
+      (empty? children) (tuple (list-reader node (list)) state)
+      (and kernel? (= "quote" name)) (tuple (as-reader node) state)
+      (and kernel? (= "syntax-quote" name)) (syntax-quote-node node state)
+      (and kernel? (= "syntax-template" name)) (template-node node state)
+      (and kernel? (= "syntax-arg" name)) (argument-node node state)
+      (and kernel? (= "syntax-literal" name)) (literal-node node state)
+      (and kernel? (contains? #{"let" "let*" "loop" "loop*"} name)) (let-node node state)
+      (and kernel? (contains? #{"fn" "fn*"} name)) (fn-node node state)
+      (and kernel? (= "receive" name)) (receive-node node state)
+      (and kernel? (= "try" name)) (try-node node state)
+      (and kernel? (contains? #{"if" "do" "recur" "throw"} name))
+       (let [r (expression-nodes (rest children) state)]
+        (tuple (list-reader node (cons (as-reader head) (elem r 0))) (elem r 1)))
+      (and kernel? (native-name? head))
+       (let [r (expression-nodes (rest children) state)]
+        (tuple (list-reader node (cons (as-reader head) (elem r 0)))
+               (update (elem r 1) :native-obligations
+                 #(cons {:name (:value head) :origin (:origin head)
+                         :phase (+ (:phase state) (Map/get state :reference-shift 0))} %))))
+      :else
+       (let [result (when (s/identifier? head) (resolve-symbol head state))]
+        (if (contains? #{:macro :syntax} (get-in result [:declaration :kind]))
+         (macro-node node result state)
+         (let [r (expression-nodes children state)]
+          (tuple (list-reader node (elem r 0)) (elem r 1)))))))
+   :else (refuse! :unsupported-contextual-expression node))))
+
+(defn expression
+ "Elaborate one actual Reader expression against selected logical worlds.
+  Actual source bytes must match the selected root revision. Source transformer
+  demands are owned by program, which derives its catalog from actual Reader
+  units; this expression adapter accepts no evaluator callback."
+ [source file options]
+ (when-not (and (erlang/is_map options)
+                (every? #(contains? #{:selection :world :namespace :phase} %) (keys options)))
+  (refuse! :invalid-expansion-options nil))
+ (let [graph (b/validate-selection (:selection options))
+       w (Map/get (:worlds graph) (:world options)) namespace (:namespace options)
+       input (when w (Enum/find (get-in w [:selection :sources]) #(= namespace (:namespace %))))
+       _ (when-not (and (erlang/is_binary source) input (= (:digest input) (crypto/hash :sha256 source)))
+           (refuse! :expansion-source-mismatch nil))
+       phase (Map/get options :phase 0)
+       module (b/scope (:selection w) namespace [0] :module)
+       graph (b/register-scope graph module)
+       context {:world (:key w) :namespace namespace :space 'value :scopes {:all [(:id module)]}}
+       forms (s/read source file context)
+       _ (when-not (= 1 (count forms)) (refuse! :expansion-expression-count nil))
+       state {:selection graph :world (:key w) :namespace namespace :phase phase :position 0
+              :next-scope 0 :next-declaration 0 :remaining 1000000
+              :references {} :occurrences (list) :expansions (list) :native-obligations (list)}
+       result (expression-node (s/for-compiler (first forms) (or file "<expression>")) state) state (elem result 1)]
+  {:version 1 :kind :expanded-expression :reader (elem result 0)
+   :selection (b/freeze (:selection state)) :references (:references state)
+   :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
+   :native-obligations (Enum/reverse (:native-obligations state))
+   :coverage {:contextual-bindings true :binding-annotations true :native-effects-complete false}}))
+
+(defn compile-expression
+ "Compile selected local/global expressions through canonical ANF. Global
+  bindings retain logical identity; executable emission requires unit linkage."
+ [source file options]
+ (let [expanded (expression source file options)]
+  (assoc expanded :node
+    (compiler/compile-contextual (:reader expanded)
+      (assoc (BeamLisp.Compiler/new_env (str (:namespace options))) :file file) (:references expanded)))))
+
+(defn- contextualize [node unit]
+ (Enum/reduce (get-in unit [:context :scopes :all]) (s/for-compiler node (:file unit)) #(s/add-scope %2 %1 :all)))
+
+(defn- definition-node [recipe unit]
+ (let [node (:node recipe)
+       source (compiler/declaration-source (s/to-reader node)
+                (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+       value (s/from-node (:value-form source) (:context node))]
+  (contextualize
+    (if (= :value (get-in recipe [:declaration :kind])) value
+        (assoc value :origin (:origin node))) unit)))
+
+(declare link-reference)
+
+(defn- link-dependencies [dependencies state]
+ (Enum/reduce (Enum/sort_by (Map/to_list dependencies)
+                (fn [entry]
+                 (let [descriptor (elem entry 1) reference (:reference descriptor)
+                       declaration (:declaration descriptor)
+                       unit (get-in state [:catalog :worlds (:world reference)])]
+                  (tuple (:namespace unit) (:revision unit) (:phase reference) (:space declaration) (:path declaration))))) state
+  (fn [entry current] (link-reference (elem entry 0) (elem entry 1) current))))
+
+(defn- unit-links [state]
+ ;; Catalog dependency order is shared by runtime and constructor preparation.
+ ;; Only opaque phase values live outside the compiled lexical ANF bindings.
+ (Enum/map (Enum/reverse (Enum/reject (:link-order state)
+                          #(= :phase-value (get-in state [:linked %]))))
+   (fn [name] (tuple name (get (:linked state) name)))))
+
+(defn- in-definition [recipe reference state transformer?]
+ (let [unit (Map/fetch! (get-in state [:catalog :worlds]) (:world recipe))
+       declaration (:declaration recipe)
+       phase (+ (:phase declaration) (if transformer? 1 0))
+       target-phase (+ (:phase reference) (if transformer? 1 0))
+       current (assoc state :world (:world recipe) :namespace (:namespace declaration)
+                            :phase phase :position (:position recipe)
+                            :reference-shift (- target-phase phase) :transformer transformer?
+                            :datum-transformer (= :macro (:kind declaration)) :dependencies {}
+                            :coordinate-prefix (Enum/concat (list 3 (+ phase 4096)) (:path declaration))
+                            :next-scope 0 :next-declaration 0)
+       r (expression-node (definition-node recipe unit) current)
+       fields [:world :namespace :phase :position :reference-shift :transformer :datum-transformer :dependencies
+               :coordinate-prefix :next-scope :next-declaration]
+       restored (Enum/reduce fields (elem r 1)
+                  (fn [key out] (assoc out key (get state key))))]
+  (tuple (elem r 0) (:dependencies (elem r 1)) restored)))
+
+(defn- phase-bindings [state]
+ (Map/new (Enum/flat_map (:link-order state)
+             (fn [name] (if (= :phase-value (get-in state [:linked name]))
+                          (list (tuple name (get-in state [:phase-values name]))) (list))))))
+
+(defn- compile-phase-reader ([reader unit state] (compile-phase-reader reader unit state :expression))
+ ([reader unit state kind]
+ (let [parameters (Enum/sort (maps/keys (phase-bindings state)))
+       callable (compiler/compile-contextual-callable reader
+                  (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit))
+                  (:references state) (unit-links state) parameters kind)]
+  ;; This invocation is a constructor-session expression. Its arguments resolve
+  ;; only against that session's actual bindings; the callable itself is closed.
+  (anf/invoke callable
+    (reduce (fn [tail name] (anf/cons-cell (anf/var name) tail))
+            (anf/empty-list-node) (reverse parameters))))))
+
+(defn- class-recipe? [recipe]
+ (contains? #{"defrecord" "deftype"} (spelling (first (:children (:node recipe))))))
+
+(defn- link-class [recipe reference state]
+ (when (:evaluation-phase state) (refuse! :contextual-phase-class-required (:node recipe)))
+ (let [unit (get-in state [:catalog :worlds (:world recipe)])
+       declaration (:declaration recipe) path (to-list (butlast (:path declaration)))
+       siblings (Enum/sort_by (Enum/filter (Map/values (:recipes unit))
+                    #(and (class-recipe? %) (= (:phase declaration) (get-in % [:declaration :phase]))
+                          (= path (to-list (butlast (get-in % [:declaration :path]))))))
+                  #(get-in % [:declaration :path]))
+       _ (when (>= (count (:class-groups state)) 128) (refuse! :contextual-class-budget (:node recipe)))
+       module (Module/concat :Elixir.BeamLisp.Contextual.Class
+                (str "C" (Base/encode16 (crypto/hash :sha256
+                  (erlang/term_to_binary (tuple :contextual-class-v1 (:world recipe) path (:phase reference)
+                                               (BeamLisp.AOT/runtime_image_key)) (list :deterministic)))
+                                      (list (tuple :case :lower)))))
+       source (compiler/class-declaration-source (s/to-reader (:node recipe))
+                 (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+       _ (when-not (= (count siblings) (count (:bindings source))) (refuse! :contextual-class-inventory (:node recipe)))
+       members (Enum/map (Enum/zip siblings (:bindings source))
+                  (fn [pair]
+                   (let [sibling (elem pair 0) d (:declaration sibling)
+                         ref {:version 1 :kind :binding-reference :world (:world sibling) :declaration (:id d)
+                              :id (b/reference-id (:selection state) (:id d) (:phase reference))
+                              :phase (:phase reference) :space (:space d)}]
+                    {:name (internal-name ref) :reference ref :declaration d :role (:role (elem pair 1))})))
+       names (set (Enum/map members (fn [member] (:name member))))
+       current (Enum/reduce members state
+                  (fn [member current]
+                   (-> current (assoc-in [:references (:name member)] (select-keys member [:reference :declaration]))
+                               (assoc-in [:link-active (:name member)] true))))
+       current (assoc current :world (:world recipe) :namespace (:namespace declaration)
+                    :phase (:phase declaration) :position (:position recipe)
+                    :reference-shift (- (:phase reference) (:phase declaration))
+                    :coordinate-prefix (Enum/concat (list 4 (+ (:phase declaration) 4096)) path)
+                    :next-scope 0 :next-declaration 0 :dependencies {})
+       node (contextualize (:node recipe) unit)
+       expanded (Enum/map_reduce (Enum/drop (:children node) 3) current
+                  (fn [part current]
+                   (if (= :list (:tag part))
+                    (let [fn-form (assoc part :children (cons (s/identifier 'fn (:context part)) (rest (:children part))))
+                          r (fn-node fn-form current)
+                          items (rn/node-items (rn/node-form (elem r 0)))]
+                     (tuple (list-reader part (cons (as-reader (first (:children part))) (rest items))) (elem r 1)))
+                    (let [resolved (resolve-symbol part current)
+                          d (:declaration resolved)
+                          r (reference-reader part resolved current false)]
+                     (when-not (= :value (:kind d)) (refuse! :contextual-protocol-binding part))
+                     (tuple (tuple :symbol (str (:namespace d) "/" (:name d))) (elem r 1))))))
+       reader (list-reader node (Enum/concat (Enum/map (Enum/take (:children node) 3) (fn [child] (as-reader child))) (elem expanded 0)))
+       fields [:world :namespace :phase :position :reference-shift :coordinate-prefix :next-scope :next-declaration]
+       restored (Enum/reduce fields (elem expanded 1) (fn [current-key out] (assoc out current-key (get state current-key))))
+       dependencies (Map/drop (:dependencies (elem expanded 1)) (to-list names))
+       linked (link-dependencies dependencies restored)]
+  (Enum/reduce members (update linked :class-groups (fn [groups] (conj (or groups #{}) module)))
+   (fn [member current]
+    (-> current
+        (assoc-in [:linked (:name member)] {:version 1 :kind :class-binding :form reader
+                 :namespace (str (:namespace unit)) :module module :role (:role member)})
+        (update :link-order #(cons (:name member) %))
+        (update :link-active #(dissoc % (:name member))))))))
+
+(defn- link-reference [name descriptor state]
+ (if (contains? (:linked state) name) state
+  (if-let [identity (when (:evaluation-phase state) (get-in state [:phase-values name]))]
+   (-> state (assoc-in [:linked name] :phase-value) (update :link-order #(cons name %)))
+  (do
+   (when (contains? (:link-active state) name) (refuse! :contextual-initialization-cycle nil))
+   (when (>= (erlang/map_size (:link-active state)) 128) (refuse! :contextual-link-depth nil))
+   (let [reference (:reference descriptor)
+         recipe (get-in state [:catalog :recipes (:declaration reference)])]
+    (when-not recipe (refuse! :contextual-definition-missing nil))
+    (if (class-recipe? recipe)
+     (link-class recipe reference state)
+     (do
+    (when-not (contains? #{:function :value} (get-in recipe [:declaration :kind]))
+     (refuse! :contextual-runtime-transformer nil))
+    (let [unit (get-in state [:catalog :worlds (:world recipe)])
+          claim (when (and (:evaluation-phase state) (= :function (get-in recipe [:declaration :kind])))
+                  (get-in (compiler/declaration-source (s/to-reader (:node recipe))
+                            (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+                          [:metadata :sdk-phase]))]
+     (if claim
+      (let [identity (BeamLisp.AOT/bind_sdk_constructor_session! (:constructor-session state) claim
+                       {:namespace (str (:namespace unit)) :form (s/to-reader (:node recipe))})]
+       (-> state (assoc-in [:phase-values name] identity)
+                 (assoc-in [:linked name] :phase-value) (update :link-order #(cons name %))))
+      (let [r (in-definition recipe reference (assoc-in state [:link-active name] true) false)
+            state (link-dependencies (elem r 1) (elem r 2))
+            unit (get-in state [:catalog :worlds (:world recipe)])
+            value? (= :value (get-in recipe [:declaration :kind]))
+            phase-value? (and value? (:evaluation-phase state))
+            node (when phase-value?
+                   (compile-phase-reader (elem r 0) unit state))
+            result (when phase-value?
+                     (BeamLisp.AOT/bind_constructor_session! (:constructor-session state) node {} (phase-bindings state)))
+            ;; Phase-zero values are runtime initializers, including closures.
+            ;; Only an actual expansion-phase value belongs to this session.
+            reader (if phase-value? :phase-value (elem r 0))]
+       (-> (if phase-value? (assoc-in state [:phase-values name] result) state)
+                 (assoc-in [:linked name] reader)
+                 (update :link-order #(cons name %))
+                 (update :link-active #(dissoc % name)))))))))))))
+
+(defn- runtime-roots [unit state]
+ ;; A namespace exports its declarations, including ones the entry never calls.
+ ;; Provider recipes remain dependencies; each provider's own compilation owns
+ ;; its exports. Phase-only values are never runtime roots.
+ (Enum/reduce (Enum/sort_by (Map/values (:recipes unit)) #(get-in % [:declaration :path]))
+   (tuple (list) state)
+   (fn [recipe result]
+    (let [declaration (:declaration recipe) current (elem result 1)]
+     (if (and (= 0 (:phase declaration)) (contains? #{:function :value} (:kind declaration)))
+      (let [resolved (b/resolve (:selection current)
+                       (s/identifier (:name declaration) (:context unit)) 0 1073741823)
+            _ (when-not (and (= :resolved (:status resolved))
+                              (= (:id declaration) (get-in resolved [:declaration :id])))
+                (refuse! :contextual-export-resolution (:node recipe)))
+            reference (:reference resolved) name (internal-name reference)
+            descriptor {:reference reference :declaration (:declaration resolved)}
+            current (link-reference name descriptor (assoc-in current [:references name] descriptor))]
+       (tuple (if (= :public (:visibility declaration)) (Enum/concat (elem result 0) (list name))
+                  (elem result 0)) current))
+      result)))))
+
+(defn- runtime-events [unit state expressions]
+ (let [main-world (get-in unit [:world :key])
+       values (Enum/flat_map (unit-links state)
+                (fn [link]
+                 (let [name (elem link 0) descriptor (get-in state [:references name])
+                       reference (:reference descriptor)
+                       recipe (get-in state [:catalog :recipes (:declaration reference)])]
+                  (if (= :value (get-in descriptor [:declaration :kind]))
+                   (list {:world (:world reference) :position (:position recipe)
+                          :event {:op :initialize :name name}}) (list)))))
+       external (Enum/reject values #(= main-world (:world %)))
+       worlds (Enum/uniq (Enum/map external #(:world %)))
+       external-events (Enum/flat_map worlds
+                         (fn [world]
+                          (Enum/map (Enum/sort_by (Enum/filter external #(= world (:world %))) #(:position %)) #(:event %))))
+       last-expression (when (seq expressions) (:position (last expressions)))
+       local-events (Enum/concat
+                      (Enum/filter values #(= main-world (:world %)))
+                      (Enum/map expressions
+                       (fn [expression]
+                        {:position (:position expression)
+                         :event {:op (if (= last-expression (:position expression)) :capture :evaluate)
+                                 :reader (:reader expression)}})))]
+  (Enum/concat external-events (Enum/map (Enum/sort_by local-events #(:position %)) #(:event %)))))
+
+(defn- prepare-entry [reader namespace file references links exports events]
+ ;; The compiler preserves expression scope and owns both entry and export
+ ;; projections of this one graph; neither projection evaluates Source.
+ (compiler/prepare-program-unit reader
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file) references links exports events))
+
+(defn- demand-transformer [reference state]
+ (let [key (:id reference)]
+  (if-let [cached (get-in state [:transformers key])]
+   (tuple cached state)
+   (let [recipe (get-in state [:catalog :recipes (:declaration reference)])]
+    (when-not (contains? #{:syntax :macro} (get-in recipe [:declaration :kind]))
+     (refuse! :contextual-transformer-missing nil))
+    (when (contains? (:transformer-active state) key) (refuse! :contextual-transformer-cycle nil))
+    (let [unit (get-in state [:catalog :worlds (:world recipe)])
+          declaration (compiler/declaration-source (s/to-reader (:node recipe))
+                        (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+          claim (get-in declaration [:metadata :sdk-macro])]
+     (if claim
+      (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! (:constructor-session state) claim
+                       {:namespace (str (:namespace unit)) :form (s/to-reader (:node recipe))})
+            name (internal-name reference)
+            node (assoc-in (anf/var name) [:ann :binding-reference] reference)]
+       (tuple node (-> state (assoc-in [:transformers key] node)
+                         (assoc-in [:transformer-protocols key] 'datum-v1)
+                         (update :opaque-transformers #(conj (or % #{}) key))
+                         (assoc-in [:transformer-bindings key] {name identity}))))
+      (let [r (in-definition recipe reference
+              (assoc state :linked {} :link-order (list) :link-active {}
+                           :evaluation-phase true
+                           :transformer-active (assoc (:transformer-active state) key true)) true)
+          linked (link-dependencies (elem r 1) (elem r 2))
+          unit (get-in state [:catalog :worlds (:world recipe)])
+          datum? (= :macro (get-in recipe [:declaration :kind]))
+          node (compile-phase-reader (elem r 0) unit linked (if datum? :datum-macro :expression))
+          restored (-> linked (assoc :linked (:linked state) :link-order (:link-order state)
+                                     :link-active (:link-active state)
+                                     :transformer-active (:transformer-active state)
+                                     :evaluation-phase (:evaluation-phase state))
+                              (assoc-in [:transformer-protocols key] (if datum? 'datum-v1 'syntax-v1))
+                              (assoc-in [:transformer-bindings key] (phase-bindings linked))
+                              (assoc-in [:transformers key] node))]
+     (tuple node restored))))))))
+
+(defn phase-library
+ "Produce portable first-order contextual recipes for source-free imports."
+ [sources] (catalog/library sources))
+
+(defn encode-phase-library [library] (catalog/encode-library library))
+(defn decode-phase-library [bytes] (catalog/decode-library bytes))
+
+(defn- prepare-program* [sources entry libraries bundle?]
+ (let [catalog (catalog/catalog sources libraries)
+       entry (BeamLisp.CompilerData/eager_to_list entry)
+       _ (when-not (= 2 (count entry)) (refuse! :contextual-entry nil))
+       unit (catalog/unit catalog (first entry) (second entry))
+       _ (Enum/each (Map/values (:units catalog))
+           (fn [other]
+            (when (and (not= (tuple (:namespace other) (:revision other))
+                              (tuple (:namespace unit) (:revision unit)))
+                       (not (empty? (:expressions other))))
+             (refuse! :contextual-provider-expression (:node (first (:expressions other)))))))
+       expressions (:expressions unit)
+       _ (doseq [expression expressions]
+           (when-not (= 0 (:phase expression))
+             (refuse! :contextual-entry-phase (:node expression))))
+       session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [state {:catalog catalog :constructor-session session :selection (:selection catalog) :world (get-in unit [:world :key])
+              :namespace (:namespace unit) :phase 0 :position 0 :reference-shift 0
+              :next-scope 0 :next-declaration 0 :remaining 1000000 :macro-budget 128 :macro-depth 0 :transformer false
+              :class-groups #{} :references {} :dependencies {} :occurrences (list) :expansions (list)
+              :native-obligations (list) :linked {} :link-order (list) :link-active {}
+              :transformers {} :transformer-active {} :transformer-bindings {} :transformer-protocols {} :opaque-transformers #{} :phase-values {}
+              :evaluation-phase false}
+       ;; Each root keeps its authored position and module scope. Expansion
+       ;; fuel, references, transformer caches and the constructor session are
+       ;; shared across the entire unit, never reset for each initializer.
+       r (Enum/map_reduce expressions state
+           (fn [expression current]
+             (let [expanded (expression-node (contextualize (:node expression) unit)
+                              (assoc current :position (:position expression)))]
+              (tuple {:reader (elem expanded 0) :position (:position expression)} (elem expanded 1)))))
+       state (link-dependencies (:dependencies (elem r 1)) (elem r 1))
+       roots (runtime-roots unit state) state (elem roots 1)
+       readers (Enum/map (elem r 0) #(:reader %))
+       events (runtime-events unit state (elem r 0))
+       reader (cond (empty? readers) nil
+                                (= 1 (count readers)) (first readers)
+                                :else (tuple :list (cons (tuple :symbol "do") readers)))
+       prepared (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state) (elem roots 0) events)
+       declaration (:declaration prepared)
+       node (:body (elem (first (:entries declaration)) 3))
+       result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node :unit (:unit prepared) :classes (:classes prepared)
+   :provenance (catalog/provenance catalog)
+   :selection (b/freeze (:selection state)) :references (:references state)
+   :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
+   :native-obligations (Enum/reverse (:native-obligations state))
+   :linked (Enum/reverse (:link-order state)) :transformers (:transformers state)
+   :constructor (assoc (BeamLisp.AOT/constructor_session_status session) :status :closed)
+   :coverage {:contextual-bindings true :closed-global-linking true :binding-annotations true
+              :native-effects-complete false
+              :transformer-implementation-images (empty? (:opaque-transformers state))
+              :legacy-datum-macros (boolean (some #(= 'datum-v1 (:protocol %)) (:expansions state)))}}]
+    (if bundle? {:program result :declaration declaration :phase-library (catalog/definitions-library catalog)} result))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+
+(defn program
+ "Compile a closed syntax-v1 source catalog. Entry is [namespace revision],
+  both quoted symbols. No Env fallback; transformers use bounded ANF semantics."
+ ([sources entry] (program sources entry []))
+ ([sources entry libraries] (compiler/with-fresh-names #(prepare-program* sources entry libraries false))))
+
+(defn prepare-program
+ "Prepare the canonical entry declaration, its exact runtime ANF projection
+  and phase exports from one catalog/session. Ordered runtime initializers
+  share that preparation; declaration-only entries return nil. No target code
+  is loaded and no runtime initializer executes during preparation."
+ ([sources entry] (prepare-program sources entry []))
+ ([sources entry libraries] (compiler/with-fresh-names #(prepare-program* sources entry libraries true))))

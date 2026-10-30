@@ -1,0 +1,87 @@
+;; Run with an existing qualified SDK. This reads the candidate tree as data.
+(ns tooling.sdk-preflight
+  (:require [sdk-source-selection :as selection] [codebase :as code]
+            [typed] [system.analyze :as analysis]
+            [veritas :as v] [bl.json :as json] [datom]))
+
+(defn verdict [rows]
+  (select-keys (v/for-all nil "candidate" (apply v/one-of rows)
+                 '(= :beam (:target candidate)))
+    [:modality :engine :why :witness :seed :samples :trials]))
+
+(let [root (System/fetch_env! "SDK_PREFLIGHT_ROOT")
+      output (System/fetch_env! "SDK_PREFLIGHT_OUTPUT")
+      priv (Path/join root "priv")
+      rows (Enum/flat_map (BeamLisp.Tiers/sources priv)
+             (fn [path]
+               (let [relative (Path/relative_to path priv)]
+                 (if (or (String/starts_with? relative "boot/") (= relative "std/multi.bl")
+                         (String/ends_with? path "-fixture.bl")) []
+                   (try
+                     (if-let [info (selection/describe (BeamLisp.Loader/read_source path) path)]
+                       (list (assoc info :file relative)) [])
+                     (catch error
+                       (list {:file relative :target :invalid :requires [] :error (ex-message error)})))))))
+      rows (Enum/filter rows some?)
+      beam (Enum/filter rows #(= :beam (:target %)))
+      javascript (Enum/filter rows #(= :javascript (:target %)))
+      source-errors (Enum/filter rows #(= :invalid (:target %)))
+      targets (into {} (Enum/map rows (fn [row] [(:namespace row) (:target row)])))
+      target-errors (Enum/flat_map beam
+                      (fn [row] (Enum/flat_map (:requires row)
+                        (fn [dependency]
+                          (if (= :javascript (get targets dependency))
+                            (list {:file (:file row) :namespace (:namespace row) :requires dependency}) [])))))
+      connection (code/connect-codebase)
+      edges (Enum/flat_map rows (fn [row]
+              (Enum/map (:requires row) (fn [dependency]
+                {:ns/name (:namespace row) :ns/requires dependency}))))
+      _ (datom/transact! connection
+          (Enum/map (Enum/with_index edges) (fn [[row index]] (assoc row :db/id (+ 1000 index)))))
+      cycles (code/require-cycles (datom/db connection))
+      samples [{:source "(ns ordinary)" :expected :beam}
+               {:source "(ns js.helper) (defn answer [] 42)" :expected :beam}
+               {:source "(ns ^:js browser.native)" :expected :javascript}
+               {:source "(ns ^{:interop :javascript} browser.native)" :expected :javascript}
+               {:source "(defn fragment [] 42)" :expected nil}
+               {:source "'(ns ^:js quoted.namespace)" :expected nil}]
+      parser-proof (select-keys
+                     (v/for-all nil "sample" (apply v/one-of samples)
+                       '(and (= (:expected sample) (:target (sdk-source-selection/describe (:source sample))))
+                             (= (= :beam (:expected sample))
+                                (sdk-source-selection/beam-source? (:source sample)))))
+                     [:modality :engine :why :witness])
+      changed ["priv/build/sdk-source-selection.bl" "priv/build/unit-store.bl" "priv/lib/java/manifest.bl"]
+      analyses
+      (Enum/map changed
+        (fn [relative]
+          (try
+          (let [text (BeamLisp.Loader/read_source (Path/join root relative))
+                namespace (BeamLisp.Loader/declared_ns text)
+                facts (code/index-source {} namespace text {:mode :calls})
+                types (typed/check-source text namespace)
+                program (analysis/prepare-program text)
+                result (analysis/analyze-prepared program {} (set (keys (:bodies program))))]
+            {:file relative :namespace namespace
+             :functions (count (:fn facts)) :calls (count (:calls facts))
+             :requires (:requires facts) :typed-warnings (:warnings types)
+             :analysis-coverage (:coverage result)
+             :summaries (Enum/map (Map/to_list (:summaries result))
+                          (fn [[name summary]]
+                            {:name name :footprint (pr-str (:footprint summary))
+                             :returns (pr-str (:returns summary))
+                             :termination (pr-str (:termination summary))}))})
+            (catch error {:file relative :error (ex-message error)}))))
+      report {:scope "read-only-source-target-and-analysis-preflight"
+              :runtime (System/get_env "BL_SDK_PRODUCT") :root root
+              :selected-count (count rows) :beam-count (count beam)
+              :javascript-only javascript
+              :source-errors source-errors
+              :target-dependency-errors target-errors :require-cycles cycles
+              :declaration-cases parser-proof
+              :original-selection (verdict rows) :beam-selection (verdict beam)
+              :analyses analyses}]
+  (File/write! output (json/encode report))
+  (println (str "SDK-PREFLIGHT namespaces=" (count rows) " javascript=" (count javascript)
+                " beam=" (count beam) " original=" (pr-str (:modality (:original-selection report)))
+                " filtered=" (pr-str (:modality (:beam-selection report))))))

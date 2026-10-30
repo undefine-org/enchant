@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Read SDK candidate sources with an existing immutable SDK; build nothing."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--sdk', type=Path, required=True, help='existing immutable SDK selection')
+parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+parser.add_argument('--out', type=Path, required=True)
+args = parser.parse_args()
+root, sdk, output = args.root.resolve(strict=True), args.sdk.resolve(strict=True), args.out.resolve()
+if not re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/]+', str(sdk)):
+    parser.error('--sdk must resolve to an immutable store product')
+metadata = json.loads((sdk / 'artifact.json').read_text())
+assert (metadata['version'], metadata['kind']) == (1, 'sdk')
+output.parent.mkdir(parents=True, exist_ok=True)
+
+def source_snapshot():
+    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in (root / 'priv').rglob('*')
+            if path.is_file() and path.name.endswith(('.bl', '.bl.md', '.bl.org'))}
+
+before = source_snapshot()
+with tempfile.TemporaryDirectory(prefix='sdk-preflight-') as temporary:
+    work = Path(temporary)
+    # Only this new reader helper enters the old runtime's project path.
+    # Existing SDK namespaces keep their immutable implementation.
+    helpers = work / 'helpers'
+    helpers.mkdir()
+    helper = root / 'priv/build/sdk-source-selection.bl'
+    helper_bytes = helper.read_bytes()
+    (helpers / helper.name).write_bytes(helper_bytes)
+    driver = Path(__file__).resolve().with_suffix('.bl')
+    driver_bytes = driver.read_bytes()
+    frozen_driver = work / driver.name
+    frozen_driver.write_bytes(driver_bytes)
+    result = work / 'result.json'
+    command = ['systemd-run', '--user', '--quiet', '--collect', '--wait', '--pipe',
+               '--expand-environment=no', '--working-directory=' + str(work),
+               '--property=MemoryMax=3G', '--property=MemorySwapMax=0',
+               '--property=RuntimeMaxSec=300',
+               '--setenv=SDK_PREFLIGHT_ROOT=' + str(root),
+               '--setenv=SDK_PREFLIGHT_OUTPUT=' + str(result),
+               str(sdk / 'bin/bl'), '--cold', '-p', str(helpers), 'run',
+               str(frozen_driver)]
+    subprocess.run(command, check=True, timeout=320)
+    report = json.loads(result.read_text())
+    report['selector_sha256'] = hashlib.sha256(helper_bytes).hexdigest()
+    report['selector_changed_during_analysis'] = helper.read_bytes() != helper_bytes
+    report['driver_sha256'] = hashlib.sha256(driver_bytes).hexdigest()
+    report['driver_changed_during_analysis'] = driver.read_bytes() != driver_bytes
+    after = source_snapshot()
+    report['source_snapshot_sha256'] = hashlib.sha256(
+        json.dumps(before, sort_keys=True).encode()).hexdigest()
+    report['sources_changed_during_analysis'] = sorted(
+        path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+    stage = output.with_name(output.name + '.tmp')
+    stage.write_text(json.dumps(report, indent=2) + '\n')
+    os.replace(stage, output)
+    print(output)
+    if (report['beam-selection']['modality'] != 'proven'
+            or report['declaration-cases']['modality'] != 'proven'
+            or report['source-errors']
+            or report['selector_changed_during_analysis']
+            or report['driver_changed_during_analysis']
+            or report['sources_changed_during_analysis']
+            or report['target-dependency-errors']
+            or report['require-cycles']
+            or any(row.get('error') or not row['analysis-coverage']['complete']
+                   for row in report['analyses'])):
+        raise SystemExit(1)

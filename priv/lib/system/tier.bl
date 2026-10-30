@@ -26,7 +26,7 @@
 ; is no scaffold shape at this tier to keep up with.
 
 (ns system.tier
-  (:require [system.ir :as ir]))
+  (:require [system.ir :as ir] [system.ir.identity :as identity]))
 
 
 ; ── the traversal pair ──────────────────────────────────────────────────
@@ -53,6 +53,7 @@
       (contains? #{:lit :var :global :enil} o) n
       (= o :arith)  (assoc n :args (map-list f (:args n)))
       (= o :remote) (assoc n :args (map-list f (:args n)))
+      (= o :invoke) (assoc n :callee (f (:callee n)) :arguments (f (:arguments n)))
       (= o :apply)  (assoc n :fn (f (:fn n)) :args (map-list f (:args n)))
       (= o :let)    (assoc n :init (f (:init n)) :body (f (:body n)))
       (= o :if)     (assoc n :test (f (:test n)) :then (f (:then n)) :else (f (:else n)))
@@ -77,95 +78,20 @@
 ; The compiler invents fresh names for let-bound locals, so raw `=` can
 ; never certify "same program" — compiling one source twice already fails
 ; it. The honest statement is alpha-equivalence: same tree modulo the
-; names of let-bound locals and the :ann metadata. Only :let names need
-; the environment (patterns are compared literally: a meaning-preserving
-; transform renames no pattern), so pattern-bearing nodes extend nothing.
-
-(defn- fresh
-  "A name no source program can carry — unique per BEAM, no state to reset."
-  [base]
-  (str base "_" (erlang/unique_integer (list :positive))))
-
-(declare alpha=)
-
-(defn- alpha-args
-  "Pairwise alpha= over two child lists under the same environment."
-  [xs ys env]
-  (and (= (count xs) (count ys))
-       (every? (fn [pr] (alpha= (first pr) (second pr) env))
-               (map list xs ys))))
-
-(defn- alpha-clauses
-  "Pairwise over clauses: patterns literal, guard/body under the shared env
-   (patterns bind the SAME names on both sides — the transform under test
-   never touches them)."
-  [xs ys env]
-  (and (= (count xs) (count ys))
-       (every? (fn [pr]
-                 (let [cx (first pr) cy (second pr)]
-                   (and (= (:pats cx) (:pats cy))
-                        (alpha= (:guard cx) (:guard cy) env)
-                        (alpha= (:body cx) (:body cy) env))))
-               (map list xs ys))))
-
-(defn- alpha-maybe
-  "alpha= over an optional child (nil :after/:timeout/:guard)."
-  [x y env]
-  (if (nil? x) (nil? y) (and (some? y) (alpha= x y env))))
+; names of lexical locals and the :ann metadata. Let bindings and clause
+; patterns extend the same paired environment; repeated pattern variables
+; preserve their equality constraints.
 
 (defn alpha=
-  "Alpha-equivalence of two ANF trees: same op structure, same literals,
-   same globals and free names, let-bound locals equal up to consistent
-   renaming, :ann ignored everywhere. env is [ma mb], renaming tokens for
-   each side's bound names."
+  "Lexical alpha-equivalence through the shared identity owner. Free names,
+   repeated pattern constraints and semantic node fields retain meaning.
+   Unknown executable grammar refuses equivalence. Optional paired environments
+   map corresponding outer variables to shared tokens."
   ([x y] (alpha= x y [{} {}]))
   ([x y env]
-   (if (or (nil? x) (nil? y))
-     (= x y)
-     (if (not (and (ir/node? x) (ir/node? y)))
-       (= x y)
-       (and
-         (= (:op x) (:op y))
-         (let [o (:op x)
-               ma (first env) mb (second env)]
-           (cond
-             (= o :lit)    (= (:val x) (:val y))
-             (contains? #{:enil} o) true
-             (= o :var)    (= (get ma (:name x) (:name x)) (get mb (:name y) (:name y)))
-             (= o :global) (and (= (:name x) (:name y)) (= (:ns x) (:ns y)) (= (:lookup x) (:lookup y)))
-             (= o :arith)  (and (= (:fun x) (:fun y)) (= (:bif x) (:bif y))
-                                (alpha-args (:args x) (:args y) env))
-             (= o :remote) (and (= (dissoc x :ann :args) (dissoc y :ann :args))
-                                (alpha-args (:args x) (:args y) env))
-             (= o :apply)  (and (alpha= (:fn x) (:fn y) env)
-                                (alpha-args (:args x) (:args y) env))
-             (= o :let)    (and (alpha= (:init x) (:init y) env)
-                                (let [token (fresh "alpha")]
-                                  (alpha= (:body x) (:body y)
-                                          (list (assoc ma (:name x) token)
-                                                (assoc mb (:name y) token)))))
-             (= o :if)     (and (alpha= (:test x) (:test y) env)
-                                (alpha= (:then x) (:then y) env)
-                                (alpha= (:else x) (:else y) env))
-             (= o :do)     (alpha-args (:stmts x) (:stmts y) env)
-             (= o :case)   (and (alpha= (:subj x) (:subj y) env)
-                                (alpha-clauses (:clauses x) (:clauses y) env))
-             (= o :fn)     (alpha-clauses (:clauses x) (:clauses y) env)
-             (= o :try)    (and (alpha= (:body x) (:body y) env)
-                                (alpha-clauses (:catch x) (:catch y) env)
-                                (alpha-maybe (:after x) (:after y) env))
-             (= o :recv)   (and (alpha-clauses (:clauses x) (:clauses y) env)
-                                (alpha-maybe (:timeout x) (:timeout y) env)
-                                (alpha-maybe (:after x) (:after y) env))
-             (= o :tuple)  (alpha-args (:elems x) (:elems y) env)
-             (= o :map)    (alpha-args (mapcat identity (:pairs x))
-                                       (mapcat identity (:pairs y)) env)
-             (= o :cons)   (and (alpha= (:head x) (:head y) env)
-                                (alpha= (:tail x) (:tail y) env))
-             (= o :struct) (and (= (dissoc x :ann :fields) (dissoc y :ann :fields))
-                                (alpha-args (mapcat identity (:fields x))
-                                            (mapcat identity (:fields y)) env))
-             :else false)))))))
+   (try (= (identity/body-identity x (first env))
+           (identity/body-identity y (second env)))
+    (catch _ false))))
 
 ; ── the showcase: analysis on the raised tier ───────────────────────────
 

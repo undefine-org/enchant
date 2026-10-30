@@ -1,0 +1,60 @@
+(ns execution.history.unprotected-native-refresh)
+
+(defn artifact-name
+  "THE name a crate's cdylib is installed under AND loaded under. Both the
+   build (which installs it) and the loader (which asks for it) derive from
+   here, so they cannot disagree — BUG-070 was this name existing twice, once
+   bare in the build and once `.so` at load."
+  [crate]
+  (str crate ".so"))
+
+(defn- native-refresh-digest [value]
+  (String/downcase (Base/encode16 (crypto/hash :sha256
+    (erlang/term_to_binary value (list :deterministic))))))
+
+(defn- native-refresh-crates [root]
+  (sort (filter #(File/regular? (Path/join % "Cargo.toml"))
+                (Path/wildcard (Path/join root "native/*")))))
+
+(defn- native-refresh-inputs [root producer cargo]
+  (let [files (sort (mapcat
+                (fn [crate]
+                  (concat (Path/wildcard (Path/join crate "src/**/*.rs"))
+                          (filter File/regular?
+                            (map #(Path/join crate %)
+                              ["Cargo.toml" "Cargo.lock" ".cargo/config.toml" "build.rs"]))))
+                (native-refresh-crates root)))]
+    (native-refresh-digest
+      [1 (Path/expand root) producer cargo
+       (mapv #(tuple (Path/relative_to % root) (crypto/hash :sha256 (File/read! %))) files)])))
+
+(defn- native-refresh-artifacts [root]
+  (mapv #(Path/join (Path/join root "priv/native") (artifact-name (Path/basename %)))
+        (native-refresh-crates root)))
+
+(defn- native-refresh-state [root inputs]
+  (let [artifacts (native-refresh-artifacts root)]
+    (when (every? File/regular? artifacts)
+      (native-refresh-digest
+        [inputs (mapv #(tuple % (crypto/hash :sha256 (File/read! %))) artifacts)]))))
+
+(defn- refresh-native-root [root producer cargo build]
+  (let [inputs (native-refresh-inputs root producer cargo)
+        state (native-refresh-state root inputs)
+        receipt (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-refresh")
+                           (native-refresh-digest (Path/expand root)))]
+    (if (and (BeamLisp.AOTCache/enabled?) state (= (tuple :ok state) (File/read receipt)))
+      {:built 0 :cached (count (native-refresh-artifacts root))
+       :artifacts (native-refresh-artifacts root) :errors []}
+      (let [result (build root)]
+        (when (and (BeamLisp.AOTCache/enabled?) (empty? (:errors result))
+                   (= inputs (native-refresh-inputs root producer cargo)))
+          (when-let [after (native-refresh-state root inputs)]
+            (File/mkdir_p! (Path/dirname receipt))
+            (let [tmp (str receipt ".tmp-" (erlang/apply :os :getpid (list)) "-"
+                           (erlang/unique_integer (list :positive)))]
+              (try
+                (File/write! tmp after)
+                (File/rename! tmp receipt)
+                (finally (File/rm tmp))))))
+        result))))

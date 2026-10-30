@@ -1,0 +1,92 @@
+(ns contextual-lexical-scope-test
+ (:require [anf :as a] [compiler :as compiler] [lower :as lower]
+           [expand :as expand] [system.phase :as phase] [codebase.phase :as facts]))
+(defn- unit [entry]
+ {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list) :entry entry :exports (list)})
+(defn- failure [action] (try (action) nil (catch error (ex-data error))))
+(defn- invoke [function values]
+ (a/invoke function (reduce (fn [tail value] (a/cons-cell value tail)) (a/empty-list-node) (reverse values))))
+(defn- closure [patterns guard body] (a/fnn (list (a/clause patterns guard body))))
+(defn- run [node]
+ (lower/eval-anf :Elixir.ContextualLexicalScope (a/contextual-unit-entry (unit node))))
+
+(deftest unbound-variables-refuse-in-every-executable-scope-before-projection
+ (let [missing (a/var "missing")
+       bad [(a/var "missing")
+            (a/lett "missing" missing (a/lit 42))
+            (a/tup (list (a/lett "missing" (a/lit 42) missing) missing))
+            (a/iff (a/lit true) (a/lett "missing" (a/lit 42) missing) missing)
+            (closure (list (a/pvar "value")) nil missing)
+            (a/tup (list (closure (list (a/pvar "missing")) nil (a/lit 42)) missing))
+            (closure (list (a/pvar "value")) missing (a/lit 42))
+            (a/casee (a/lit 42) (list (a/clause (list (a/pvar "value")) nil missing)))
+            (closure (list (a/pmap (list [(a/var "value") (a/pvar "value")]))) nil (a/lit 42))
+            (a/casee (a/lit 42) (list (a/clause (list (a/pvar "_")) nil (a/var "_"))))
+            (closure (list (a/pvar "_")) (a/lit true) (a/var "_"))
+            (a/recv (list (a/clause (list (a/pvar "value")) nil (a/lit 42))) (a/lit 0) (a/var "value"))
+            (a/tryy (a/var "__STACKTRACE__") (list) nil)
+            (a/tryy (a/lit 42) (list (a/clause (list (a/pvar "class") (a/pvar "reason")) nil (a/lit 42)))
+                    (a/var "reason"))]]
+  (doseq [node bad]
+   (let [recipe (unit node)]
+    (doseq [project [a/contextual-unit-entry a/contextual-unit-factory compiler/contextual-unit-factory]]
+     (let [result (failure #(project recipe))]
+      (is (= :invalid-contextual-unit (:kind result)))
+      (is (= :unbound-variable (:reason result)))))))))
+
+(deftest valid-lexical-scopes-agree-with-actual-native-lowering
+ (doseq [node
+  [(a/lett "x" (a/lit 40) (a/lett "y" (a/arith :add :+ (list (a/var "x") (a/lit 2))) (a/var "y")))
+   (a/lett "captured" (a/lit 40)
+    (invoke (closure (list (a/pvar "value")) nil (a/arith :add :+ (list (a/var "captured") (a/var "value")))) [(a/lit 2)]))
+   (a/lett "key" (a/lit :key)
+    (a/casee (a/mapp (list [(a/lit :key) (a/lit 42)]))
+      (list (a/clause (list (a/pmap (list [(a/var "key") (a/pvar "value")]))) nil (a/var "value")))))
+   (invoke (closure (list (a/pvar "_")) nil (a/arith :add :+ (list (a/var "_") (a/lit 1)))) [(a/lit 41)])
+   (a/lett "_" (a/lit 41)
+    (invoke (closure (list (a/pvar "_")) (a/lit true) (a/arith :add :+ (list (a/var "_") (a/lit 1)))) [(a/lit 999)]))
+   (a/tryy (a/remote :erlang :error (list (a/lit :example)))
+    (list (a/clause (list (a/pvar "class") (a/pvar "reason")) nil
+            (a/doo (list (a/var "__STACKTRACE__") (a/var "__STACKTRACE_RAW__") (a/lit 42))))) nil)]]
+  (is (= 42 (run node)))))
+
+(deftest initializer-slots-are-available-only-after-their-own-construction
+ (let [reference (fn [name] {:version 1 :kind :binding-reference :world (crypto/hash :sha256 "world")
+                             :id (crypto/hash :sha256 name) :declaration (crypto/hash :sha256 (str "declaration:" name))
+                             :space 'value :phase 0})
+       left {:name "left" :slot "left_1" :reference (reference "left") :node (a/lit 42)}
+       right {:name "right" :slot "right_2" :reference (reference "right") :node (a/var "left_1")}
+       recipe (assoc (unit (a/var "right_2")) :initializers (list left right)
+                 :steps (list {:op :initialize :reference (:reference left)}
+                              {:op :initialize :reference (:reference right)}))]
+  (is (= 42 (lower/eval-anf :Elixir.ContextualOrderedScope (a/contextual-unit-entry recipe))))
+  (doseq [node [(a/var "left_1") (a/var "right_2") (closure (list) nil (a/var "right_2"))]]
+   (let [changed (assoc recipe :initializers (list (assoc left :node node) right))]
+    (is (= :unbound-variable (:reason (failure #(a/contextual-unit-factory changed)))))))))
+
+(deftest compiler-catches-share-real-frame-and-raw-stack-bindings-with-lowering
+ (let [compile-source (fn [source]
+                        (let [program (expand/program [{:namespace 'scope :revision 'current :file "scope.bl"
+                                                        :source (str "(ns scope) " source)}] ['scope 'current])]
+                         (lower/eval-anf :Elixir.ContextualCatchScope (:node program))))
+       normalized (compile-source "(try (erlang/error :example) (catch e [__EXCEPTION_KIND__ __STACKTRACE__]))")
+       raw (compile-source "(try (erlang/error :example) (catch-raw [kind reason stack] [kind reason (erlang/is_list stack)]))")]
+  (is (= :error (first normalized)))
+  (is (erlang/is_list (second normalized)))
+  (is (= [:error :example true] raw))))
+
+(deftest fresh-phase-facts-cannot-certify-a-coherent-but-lexically-open-unit
+ (let [program (expand/program [{:namespace 'scope :revision 'current :file "scope.bl" :source "(ns scope) 42"}] ['scope 'current])
+       open (a/lett "value" (a/var "missing") (a/var "value"))
+       changed (assoc program :node open :unit (unit open))]
+  (is (= :invalid-contextual-unit (:kind (failure #(facts/facts changed)))))
+  (is (= :refused (:status (phase/check changed))))))
+
+(deftest data-role-views-never-evaluate-a-function-body
+ (let [effects (atom 0) body (fn [] (swap! effects inc))
+       clause {:pats (list (a/pvar "value")) :guard nil :body body}
+       function {:op :fn :clauses (list clause) :ann {}}]
+  (is (= clause (BeamLisp.CompilerData/simple_function_clause function)))
+  (is (= nil (BeamLisp.CompilerData/simple_function_clause (assoc-in function [:clauses] (list (assoc clause :guard (a/lit true)))))))
+  (is (= {:frames "__STACKTRACE__" :raw "__STACKTRACE_RAW__"} (BeamLisp.CompilerData/catch_stack_bindings)))
+  (is (= 0 @effects))))

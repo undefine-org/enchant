@@ -1,0 +1,94 @@
+;; E63 uses the actual fixture generator and historical repaired guards. No
+;; production module is replaced and no absent native product counts as a pass.
+(ns execution.history-prerequisites-test
+ (:require [datom.store-fjall :as fj] [vm.native]))
+
+(defn- source-root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+
+(defn- generate-fixture [source namespace template directory]
+ (let [rewritten (-> source
+                  (String/replace "(ns datom.store-lock.test" (str "(ns " namespace))
+                  (String/replace "(File/read! (fixture))" (str "(File/read! " (pr-str template) ")"))
+                  (String/replace "(System/tmp_dir!)" (pr-str directory)))]
+  (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string rewritten))
+  ((BeamLisp.Env/fetch_exact! namespace "child-beam-dir"))))
+
+(defn- run-native-fixture [directory]
+ (let [args (BeamLisp.Env/fetch_exact! (BeamLisp.Env/current_ns) "child-args")]
+  (System/cmd (System/find_executable "erl")
+   (to-list (concat ["+S" "2:2" "+SDcpu" "1:1" "+SDio" "1"] (args directory [])))
+   (list (tuple :stderr_to_stdout true)))))
+
+(deftest E63-actual-fixture-derives-the-full-loaded-native-ABI
+ (let [root (source-root) path "test/bl/datom/store_lock_test.bl"
+       source (File/read! (Path/join root path))
+       template (Path/join root "test/fixtures/Elixir.BeamLisp.Native.Datom.StoreFjall.erl")
+       before "(= :module_info (elem entry 0))"
+       after "(or (= :module_info (elem entry 0)) (= (tuple :fjall_resolve_prefixes 2) entry))"
+       directory (Path/join (System/tmp_dir!) (str "history-fixture-abi-" (erlang/unique_integer (list :positive))))
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (is (fj/available?) "the actual native backend is required")
+   (when-not (fj/available?) (throw :history-fixture-native-required))
+   (is (= [(Path/expand template)] (sort (Path/wildcard (Path/join root "test/fixtures/**/*.erl"))))
+       "new authored Erlang fixtures require inventory/compile coverage")
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-fixture-ABI-anchor-drift))
+   (File/mkdir_p! directory)
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [native :Elixir.BeamLisp.Native.Datom.StoreFjall
+           original-md5 (erlang/apply native :module_info (list :md5))
+           expected (set (remove #(= :module_info (elem % 0)) (erlang/apply native :module_info (list :exports))))
+           good (generate-fixture source "history.fixture.good" template directory)
+           beam (Path/join good "Elixir.BeamLisp.Native.Datom.StoreFjall.beam")
+           chunks (beam_lib/chunks (String/to_charlist beam) (list :exports))
+           exports (elem (first (elem (elem chunks 1) 1)) 1)
+           actual (set (remove #(contains? #{:main :module_info} (elem % 0)) exports))
+           normal (run-native-fixture good)
+           bad (generate-fixture (String/replace source before after) "history.fixture.missing-export" template directory)
+           changed (run-native-fixture bad)]
+      (println :history-E63-ABI {:exports (count expected) :normal normal :mutant changed})
+      (is (contains? expected (tuple :fjall_resolve_prefixes 2)))
+      (is (= expected actual) "every actual loaded export has an arity-correct fixture stub")
+      (is (= 0 (elem normal 1)))
+      (is (includes? (elem normal 0) "CHILD-DONE"))
+      (is (= 1 (elem changed 1)))
+      (is (includes? (elem changed 0) "LOAD-FAILED"))
+      (is (includes? (elem changed 0) "fjall_resolve_prefixes/2"))
+      (is (not (includes? (elem changed 0) "CHILD-DONE")))
+      (is (= original-md5 (erlang/apply native :module_info (list :md5)))))))
+   (finally (BeamLisp.Env/destroy scope) (File/rm_rf! directory)))))
+
+(deftest E63-historical-test-guards-compile-before-their-bodies-run
+ (let [root (source-root)
+       ;; These are the three actual guard repairs in c1d5327e, not invented
+       ;; guard examples. Declare the real files; never run their effectful tests.
+       cases [["test/bl/datom/conn_lifetime_borrow_test.bl" "datom.conn-lifetime-borrow-test"
+               "(= writer expected-writer)" "(= writer (:writer c))" "`writer`"]
+              ["test/bl/proc/canonical_reconcile_bridge_test.bl" "proc.canonical-reconcile-bridge-test"
+               "(= dead expected-pid)" "(= dead @pid)" "`deref`"]
+              ["test/bl/proc/queue_family_storage_test.bl" "proc.queue-family-storage-test"
+               "(or (= first-id id) (= second-id id))" "(contains? (set ids) id)" "`contains?`"]]]
+  (doseq [[path namespace before after offending] cases]
+   (let [source (File/read! (Path/join root path))
+         scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+    (try
+     (is (includes? source before))
+     (when-not (includes? source before) (throw :history-fixture-guard-anchor-drift))
+     (BeamLisp.Env/with_env scope
+      (fn []
+       (let [good (String/replace source (str "(ns " namespace) "(ns history.guard.good")
+             bad (-> source (String/replace (str "(ns " namespace) "(ns history.guard.mutant")
+                            (String/replace before after))
+             normal (try (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string good)) :compiled
+                      (catch error (ex-message error)))
+             changed (try (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string bad)) :unexpected-success
+                       (catch error (ex-message error)))]
+        (println :history-E63-guard {:path path :normal normal :mutant changed})
+        (is (= :compiled normal))
+        (is (not= :unexpected-success changed))
+        (is (and (string? changed) (includes? (String/downcase changed) "guard"))
+            "reject specifically an illegal guard, not an unrelated fixture failure")
+        (is (and (string? changed) (includes? changed offending))))))
+     (finally (BeamLisp.Env/destroy scope)))))))

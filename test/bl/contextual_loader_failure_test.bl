@@ -1,0 +1,113 @@
+(ns contextual-loader-failure-test
+ (:require [compile.world :as world] [reload.execution :as execution]
+           [reload.generation :as generation] [anf :as a]))
+
+(defn- preparations [] @(BeamLisp.Env/fetch_exact! "reload.execution" "prepared"))
+(defn- failure [action]
+ (try (action) [:unexpected-success]
+  (catch error [__EXCEPTION_KIND__
+                (if (= :throw __EXCEPTION_KIND__) error (BeamLisp.ExInfo/ex_original error))
+                __STACKTRACE__])))
+(defn- fixture [source module action]
+ (let [dir (Path/join (System/tmp_dir!) (str "loader-failure-" (erlang/unique_integer (list :positive))))
+       before (preparations)]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") (str "(ns loader.failure) " source))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['loader.failure 'current] :sources [{:namespace 'loader.failure :revision 'current :file \"main.bl\"}] :libraries []}")
+   (action (world/prepare-unit (world/prepare (Path/join dir "world.bl")) module))
+   (finally
+    ;; A failing causal control must not leave its real SDK preparations behind.
+    ;; Two passes let same-code siblings close admission before physical cleanup.
+    (let [added (maps/values (Map/drop (preparations) (maps/keys before)))]
+     (doseq [_ [0 1]] (Enum/each added #(generation/retire! (:generation %)))))
+    (File/rm_rf! dir)))))
+
+(deftest loader-retires-failed-factories-without-changing-the-original-exception
+ (doseq [[source module kind value]
+         [["(erlang/error :loader-initializer-error)" :Elixir.LoaderFailedError :error :loader-initializer-error]
+          ["(erlang/throw :loader-initializer-throw)" :Elixir.LoaderFailedThrow :throw :loader-initializer-throw]]]
+  (fixture source module
+   (fn [unit]
+    (let [before (preparations) context (BeamLisp.Env/capture) argv (BeamLisp/argv)
+          result (failure #(BeamLisp.Loader/run_prepared_artifact_unit unit (list "failed")))]
+     (is (= kind (first result)))
+     (is (= value (second result)))
+     (is (not (empty? (nth result 2))))
+     (is (= before (preparations)))
+     (is (not (erlang/module_loaded module)))
+     (is (= context (BeamLisp.Env/capture)))
+     (is (= argv (BeamLisp/argv))))))))
+
+(deftest loader-retires-a-malformed-returned-instance-through-the-same-owner
+ (fixture "42" :Elixir.LoaderMalformedInstance
+  (fn [unit]
+   (let [plan (first (:plans unit)) descriptors (:descriptors plan)
+         runtime (update (first descriptors) :clauses
+                   #(Enum/map % (fn [clause]
+                      (update clause :body (fn [body] (a/lett "__discarded_instance" body (a/lit {})))))))
+         unit (assoc unit :plans (cons (assoc plan :descriptors (cons runtime (rest descriptors)))
+                                      (rest (:plans unit))))
+         before (preparations)
+         result (try (BeamLisp.Loader/run_prepared_artifact_unit unit (list)) :unexpected-success
+                  (catch error (:kind (ex-data error))))]
+    (is (= :invalid-unit-instance result))
+    (is (= before (preparations)))
+    (is (not (erlang/module_loaded :Elixir.LoaderMalformedInstance)))))))
+
+(deftest failed-loader-cleanup-retains-a-real-shared-consumer-and-a-retryable-row
+ (fixture "(if (erlang/get :loader-failure-test) (erlang/error :loader-shared-failure) 42)"
+          :Elixir.LoaderSharedFailure
+  (fn [unit]
+   (let [captured (BeamLisp.AOT/compile_unit unit)
+         sibling (execution/prepare-captured-unit! captured)
+         pending (atom nil)]
+    (try
+     (Process/put :loader-failure-test false)
+     (execution/initialize-instance! sibling)
+     (execution/complete-preparation! (:cache-key sibling) sibling)
+     (let [before (preparations)]
+      (Process/put :loader-failure-test true)
+      (is (= :loader-shared-failure
+             (second (failure #(BeamLisp.Loader/run_prepared_artifact_unit unit (list))))))
+      (let [added (Map/drop (preparations) (maps/keys before))
+            row (first (maps/values added)) failed (:generation row)]
+       (reset! pending failed)
+       (is (= 1 (count added)))
+       (is (= :instance-failed (:phase row)))
+       (is (erlang/== failed (generation/attested-prepared! failed)))
+       (is (= 42 (execution/invoke-instance-entry! sibling)))
+       (is (= :retired (:status (generation/retire! sibling))))
+       (is (= :retired (:status (generation/retire! failed))))
+       (is (= (dissoc before (:cache-key sibling)) (preparations)))))
+     (finally
+      (Process/delete :loader-failure-test)
+      (generation/retire! sibling)
+      (when @pending (generation/retire! @pending))))))))
+
+(deftest loader-retires-an-initialized-instance-when-its-entry-fails
+ (fixture "42" :Elixir.LoaderFailedEntry
+  (fn [unit]
+   (let [plan (first (:plans unit)) descriptors (:descriptors plan)
+         entry (a/fnn (list (a/clause (list) nil
+                             (a/remote :erlang :error (list (a/lit :loader-entry-failed))))))
+         runtime (update (first descriptors) :clauses
+                   #(Enum/map % (fn [clause]
+                      (update clause :body
+                       (fn [body]
+                        (a/lett "__original_instance" body
+                         (a/mapp (list [(a/lit :version) (a/lit 1)]
+                                      [(a/lit :kind) (a/lit :contextual-unit-instance)]
+                                      [(a/lit :entry) entry]
+                                      [(a/lit :exports)
+                                       (a/remote :erlang :map_get
+                                        (list (a/lit :exports) (a/var "__original_instance")))]))))))))
+         unit (assoc unit :plans (cons (assoc plan :descriptors (cons runtime (rest descriptors)))
+                                      (rest (:plans unit))))
+         before (preparations)
+         result (failure #(BeamLisp.Loader/run_prepared_artifact_unit unit (list)))]
+    (is (= :error (first result)))
+    (is (= :loader-entry-failed (second result)))
+    (is (= before (preparations)))
+    (is (not (erlang/module_loaded :Elixir.LoaderFailedEntry)))))))

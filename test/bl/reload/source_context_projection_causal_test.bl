@@ -1,0 +1,112 @@
+(ns reload.source-context-projection-causal-test
+ (:require [reload.generation :as g] [proc.evolve :as ev]))
+
+(defn- reason [action]
+ (try {:status :returned :value (action)}
+  (catch error {:status :refused :reason (BeamLisp.ExInfo/ex_original error)})))
+
+(defn- projection-probes! [directory]
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/env.bl"))
+       forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (= "defn" (BeamLisp.AOT/stage-head %))
+                    (= "source_capture_context!" (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))
+       before "(if-not (source_data_decode_required?) (capture)"
+       after "(if-not false (capture)"]
+  (assert (= 1 (count forms)))
+  (let [position (BeamLisp.FormMeta/meta (first forms))
+        text (String/slice source (:offset position) (- (:end-offset position) (:offset position)))]
+   (assert (= 2 (count (String/split text before))))
+   (doseq [[module historical?] [[:Elixir.History.SourceProjectionCurrent false]
+                                [:Elixir.History.SourceProjectionRaw true]]]
+    (let [body (if historical? (String/replace text before after) text)
+          qualified (reduce (fn [text helper]
+                              (String/replace text (str "(" helper ")")
+                                (str "(BeamLisp.Env/" helper ")")))
+                            body ["source_data_decode_required?" "capture" "source_context_state!"])
+          path (Path/join directory (str (Atom/to_string module) ".bl"))]
+     (File/write! path (str "(ns history.source-projection-native)\n" qualified))
+     (BeamLisp.AOT/compile_host_file path
+       (list (tuple :module module) (tuple :output_dir directory) (tuple :load? true))))))))
+
+(deftest raw-context-cannot-roundtrip-through-the-source-binding-boundary
+ (let [directory (Path/join (System/tmp_dir!) (str "source-projection-control-" (erlang/unique_integer (list :positive))))
+       graph (atom nil) previous (BeamLisp.Env/capture)
+       live (BeamLisp.Env/module_info :md5)]
+  (try
+   (File/mkdir_p! directory)
+   (try (projection-probes! directory) (finally (BeamLisp.Env/bind previous)))
+   (reset! graph (g/prepare! {:application-id "source-context-projection-causal"
+    :stable-namespaces #{"env"}
+    :native-modules #{"History.SourceProjectionCurrent" "History.SourceProjectionRaw"}
+    :sources {"context.projection"
+      "(ns context.projection (:require [env]))
+       (defn actual [] (env/capture))
+       (defn copied [] (History.SourceProjectionCurrent/source_capture_context!))
+       (defn historical [] (History.SourceProjectionRaw/source_capture_context!))
+       (defn bind-token [token] (env/bind token) :bound)"}}))
+   (let [actual (g/invoke! @graph "context.projection/actual" [])
+         copied (g/invoke! @graph "context.projection/copied" [])
+         historical (reason #(g/invoke! @graph "context.projection/historical" []))]
+    (is (= 7 (count actual))) (is (= 7 (count copied)))
+    (is (= (dissoc actual :ns) (dissoc copied :ns)))
+    (is (= 1 (:source-context-version copied)))
+    (is (= false (contains? copied :generation)))
+    (is (= false (contains? copied :admission)))
+    (is (= :returned (:status historical)))
+    (is (= @graph (:generation (:value historical))))
+    (is (> (count (:value historical)) 7))
+    (is (= :bound (g/invoke! @graph "context.projection/bind-token" [actual])))
+    (is (= :bound (g/invoke! @graph "context.projection/bind-token" [copied])))
+    (let [refused (reason #(g/invoke! @graph "context.projection/bind-token" [(:value historical)]))]
+     (println :history-E74-raw-roundtrip (select-keys refused [:status :reason]))
+     (is (= :refused (:status refused)))
+     (is (= :source_context_scope_refused (:reason refused))))
+    (is (= previous (BeamLisp.Env/capture)))
+    (is (= live (BeamLisp.Env/module_info :md5)))
+    (is (= :retired (:status (g/retire! @graph)))))
+   (catch error (println :projection-control-setup-error (ex-data error)) (throw error))
+   (finally
+    (when @graph (g/retire! @graph))
+    (doseq [module [:Elixir.History.SourceProjectionCurrent :Elixir.History.SourceProjectionRaw]]
+     (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))
+
+(deftest every-prepared-sdk-spec-context-expires-with-its-private-generation-scope
+ (let [graph (g/prepare! {:application-id "prepared-sdk-context-retirement"
+    :sources {"context.spec"
+      "(ns context.spec)
+       (defn handler [message state] {:reply message :state state})
+       (defn accepts [_] true) (defn valid [_] true)
+       (defn spec [digest] {:version 1 :digest digest :handler handler :accept? accepts :check-state valid})"}})
+       contexts (g/with! graph
+         #(mapv (fn [namespace]
+                  (BeamLisp.Env/with_ns namespace
+                   (fn [] (:environment (ev/prepare-spec (g/invoke! graph "context.spec/spec" [(:digest graph)]))))))
+                ["context.spec.one" "context.spec.two" "context.spec.three"]))]
+  (try
+   (is (= 3 (count (set contexts))))
+   (doseq [context contexts]
+    (is (= :bl_native_context (elem context 0)))
+    (is (= graph (:generation (BeamLisp.Env/resolve_native_context! context)))))
+   (let [scope (:scope graph)
+         index-key (tuple scope :native_context_index)
+         saved (BeamLisp.Env/source_private (fn [] (mapv (fn [context]
+                       (let [row (elem (first (ets/lookup :beam_lisp_source_lease_domains
+                                               (tuple scope :native_context (elem context 2)))) 1)
+                             identity (:context-id row)
+                             value (elem (first (ets/lookup :beam_lisp_source_lease_domains
+                                                 (tuple :execution_context identity))) 1)]
+                        {:identity identity :index (tuple :execution_context_index (:context value))})) contexts)))]
+    (is (= 1 (count (BeamLisp.Env/source_private #(ets/lookup :beam_lisp_source_lease_domains index-key)))))
+    (is (= :retired (:status (g/retire! graph))))
+    (is (= (list) (BeamLisp.Env/source_private #(ets/lookup :beam_lisp_source_lease_domains index-key))))
+    (is (= (list) (BeamLisp.Env/source_private #(ets/lookup :beam_lisp_source_lease_domains (tuple scope :native_context_bytes)))))
+    (doseq [context contexts]
+     (is (= {:status :refused :reason :retired_native_context}
+            (reason #(BeamLisp.Env/resolve_native_context! context)))))
+    (doseq [item saved]
+     (is (= {:status :refused :reason :retired_execution_context}
+            (reason #(BeamLisp.Env/execution_context_value! (:identity item)))))
+     (is (= (list) (BeamLisp.Env/source_private #(ets/lookup :beam_lisp_source_lease_domains (:index item)))))))
+   (finally (g/retire! graph)))))

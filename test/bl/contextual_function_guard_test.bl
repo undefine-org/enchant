@@ -1,0 +1,128 @@
+(ns contextual-function-guard-test
+ (:require [compiler :as compiler] [reader-node :as rn] [expand :as x] [lower :as lower]
+           [system.phase :as phase] [codebase.refactor :as refactor]))
+
+(defn- unit [source]
+ {:namespace 'client :revision 'current :file "client.bl" :source (str "(ns client) " source)})
+(defn- program [source] (x/program [(unit source)] ['client 'current]))
+(defn- execute [p]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualFunctionGuard." (erlang/unique_integer (list :positive))))
+  (:node p)))
+(defn- refused [action] (try (action) nil (catch e (:kind (ex-data e)))))
+
+(deftest canonical-function-layout-retains-name-and-clause-coordinates
+ (let [form (BeamLisp.Reader/read_one "(fn down ([n] :when (> n 0) (down (erlang/- n 1))) ([n] 42))")
+       layout (compiler/function-layout (rest (rn/node-items form)) (compiler/new-env "client"))]
+  (is (= "down" (:name layout)))
+  (is (= false (:inline? layout)))
+  (is (= [[0 2 3] [1 nil 1]]
+         (mapv (fn [clause] [(:clause-index clause) (:guard-index clause) (:body-offset clause)])
+          (:clauses layout)))))
+ (let [form (BeamLisp.Reader/read_one "(fn [x] :when (int? x) x)")
+       layout (compiler/function-layout (rest (rn/node-items form)) (compiler/new-env "client"))]
+  (is (= true (:inline? layout)))
+  (is (= nil (:clause-index (first (:clauses layout)))))
+  (is (= 2 (:guard-index (first (:clauses layout)))))))
+
+(deftest inline-named-multiple-and-variadic-clauses-retain-native-dispatch
+ (is (= 42 (execute (program "((fn [x] :when (int? x) (erlang/+ x 2)) 40)"))))
+ (is (= [42 0] (execute (program
+                 "(let [f (fn ([x] :when (> x 0) (erlang/+ x 1)) ([x] 0))] [(f 41) (f 0)])"))))
+ (is (= 42 (execute (program
+                 "((fn down ([n] :when (> n 0) (down (erlang/- n 1))) ([n] 42)) 3)"))))
+ (is (= [42 42] (execute (program
+                 (str "(let [f (fn ([x] :when (int? x) x) "
+                      "([x & more] :when (pos? x) (erlang/+ x (erlang/length more))))] [(f 42) (f 40 9 8)])"))))))
+
+(deftest failed-guard-does-not-run-its-body
+ (is (= [42 0] (execute (program
+                 (str "(do (erlang/put :contextual-guard-body 0) "
+                      "(let [f (fn ([x] :when nil (do (erlang/put :contextual-guard-body 99) x)) ([x] 42))] "
+                      "[(f 1) (erlang/get :contextual-guard-body)]))"))))))
+
+(deftest guards-cannot-borrow-other-clauses-outer-locals-or-destructuring-preludes
+ (is (= :unbound-identifier
+        (refused #(program "(fn ([x] :when (> x 0) x) ([y] x))"))))
+ (is (thrown? (program "(let [outer 1] (fn [x] :when (> outer 0) x))")))
+ (is (thrown? (program "(fn [[x]] :when (> x 0) x)")))
+ (is (= :unsupported-contextual-guard
+        (refused #(program "(let [predicate (fn [x] true)] (fn [x] :when (predicate x) x))"))))
+ (is (thrown? (program "(fn [x] :when (> x 0))"))))
+
+(deftest function-parameter-rename-includes-guard-and-body
+ (let [sources [(unit "(let [f (fn [value] :when (> value 0) value)] (f 42))")]
+       p (x/program sources ['client 'current])
+       target (Enum/find (Map/values (get-in p [:selection :by-id])) #(= 'value (:name %)))
+       changed (refactor/rename-program sources ['client 'current] (:id target) 'answer)]
+  (is (= :verified (:status changed)))
+  (is (= 3 (count (:edits changed))))
+  (is (= 42 (execute (:program changed))))
+  (is (= :proved (:status (phase/check (:program changed)))))))
+
+(deftest archived-phase-one-helper-uses-the-same-guarded-function-compiler
+ (let [provider {:namespace 'forms :revision 'old :file "forms.bl"
+                 :source (str "(ns forms) (begin-for-syntax "
+                           "(defn- pick ([n] :when (> n 0) (erlang/+ n 2)) ([n] 42))) "
+                           "(defsyntax answer [form context] (syntax-literal (pick 40)))")}
+       archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       client (unit "(import-world 'forms 'old :only [answer]) (answer)")
+       p (x/program [client] ['client 'current] [archive])]
+  (is (= 42 (execute p)))
+  (is (= :proved (:status (phase/check p))))
+  (is (= 1 (count (:expansions p))))
+  (is (empty? (:linked p)))
+  (is (= :closed (get-in p [:constructor :status])))))
+
+(deftest compile-time-guards-agree-with-native-clause-failure-semantics
+ (doseq [guard ["42" ":yes" "(+ 1 2)" "(> (tuple-size x) 0)"
+                 "(= (tuple-size x) false)" "(= (rem x 0) 1)"]]
+  (let [clauses (str "([x] :when " guard " 0) ([x] 42)")
+        native (execute (program (str "((fn " clauses ") 42)")))
+        provider {:namespace 'forms :revision 'old :file "forms.bl"
+                  :source (str "(ns forms) (begin-for-syntax (defn- pick " clauses ")) "
+                            "(defsyntax answer [form context] (syntax-literal (pick 42)))")}
+        archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+        client (unit "(import-world 'forms 'old :only [answer]) (answer)")]
+   (is (= 42 native))
+   (is (= native (execute (x/program [client] ['client 'current] [archive])))))))
+
+(deftest constructor-guard-refusals-are-not-ordinary-failed-clauses
+ (let [path (str (BeamLisp/cwd) "/.local/execution/constructor-guard-must-not-write")
+       expression {:op :case :subj {:op :lit :val 1}
+                   :clauses [{:pats [{:pop :pvar :name "x"}]
+                              :guard {:op :remote :mod :Elixir.File :fun :write!
+                                      :args [{:op :lit :val path} {:op :lit :val "unexpected"}]}
+                              :body {:op :lit :val 0}}
+                             {:pats [{:pop :pvar :name "x"}] :guard nil :body {:op :lit :val 42}}]}]
+  (is (= false (File/exists? path)))
+  (is (= :constructor-machine-refused
+         (try (BeamLisp.AOT/interpret_constructor! expression {} {}) nil
+          (catch e (:kind (ex-data e))))))
+  (is (= false (File/exists? path)))))
+
+(deftest guard-mode-restores-ordinary-body-errors-and-if-truthiness
+ (let [p (program "((fn [x] :when true (erlang/tuple_size x)) 42)")]
+  (is (= :Elixir.ArgumentError
+         (try (BeamLisp.AOT/interpret_constructor! (:node p) {} {}) nil
+          (catch e (:__struct__ e)))))
+  (is (= :Elixir.ArgumentError
+         (try (execute p) nil (catch e (:__struct__ e))))))
+ (let [p (program "(erlang/tuple_size 42)")]
+  (is (= :Elixir.ArgumentError
+         (try (BeamLisp.AOT/interpret_constructor! (:node p) {} {:guard-failure-ticket :spoofed}) nil
+          (catch e (when (erlang/is_map e) (maps/get :__struct__ e nil)))))))
+ (let [p (program "(if 42 :truthy :falsey)")]
+  (is (= :truthy (BeamLisp.AOT/interpret_constructor! (:node p) {} {})))
+  (is (= :truthy (execute p)))))
+
+(deftest a-constructor-budget-refusal-inside-a-guard-still-refuses-the-program
+ (let [call {:op :remote :mod :constructor_guard_budget :fun :loop :args (list)}
+       expression {:op :case :subj {:op :lit :val 1}
+                   :clauses [{:pats [{:pop :pvar :name "x"}] :guard call :body {:op :lit :val 0}}
+                             {:pats [{:pop :pvar :name "x"}] :guard nil :body {:op :lit :val 42}}]}
+       metadata {:remotes {[:constructor_guard_budget :loop 0]
+                           {:clauses [{:pats (list) :guard nil :body call}]}}}
+       error (try (BeamLisp.AOT/interpret_constructor! expression {} metadata) nil
+               (catch e (ex-data e)))]
+  (is (= :constructor-machine-refused (:kind error)))
+  (is (= :depth-budget (:detail error)))))

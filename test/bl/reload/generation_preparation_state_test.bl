@@ -1,0 +1,81 @@
+; Native framework component controls over the existing SDK-private owner.
+; Fixture graph records below grant no native profile, lease or Source authority.
+(ns reload.generation-preparation-state-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]))
+
+(defn- owner-call [name args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "reload.execution" name) (to-list args)))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- key [] [:preparation-state-test (erlang/make_ref)])
+(defn- graph [key] {:cache-key key :digest "fixture" :scope :fixture :state (atom {:retired false})})
+
+(deftest prepared-code-identity-is-not-ready-publication-or-cache-reuse
+ (let [key (key) graph (graph key)]
+  (try
+   (owner-call "begin-preparation!" [key])
+   (is (= :preparation-in-progress (kind #(owner-call "cached-preparation" [key]))))
+   (is (= :unattested-prepared-generation (kind #(generation/attested-prepared! graph))))
+   (owner-call "record-prepared!" [key graph])
+   (is (= graph (generation/attested-prepared! graph)))
+   (is (= :preparation-in-progress (kind #(owner-call "cached-preparation" [key]))))
+   (is (= :unready-prepared-generation (kind #(owner-call "ready-prepared!" [graph]))))
+   (is (= :unready-prepared-generation (kind #(generation/publish! nil nil graph))))
+   (owner-call "complete-preparation!" [key graph])
+   (is (= graph (owner-call "cached-preparation" [key])))
+   (is (= graph (owner-call "ready-prepared!" [graph])))
+   (owner-call "abandon-preparation!" [key])
+   (is (= graph (owner-call "cached-preparation" [key])))
+   (swap! (:state graph) assoc :retired true)
+   (is (= :retirement-pending (kind #(owner-call "cached-preparation" [key]))))
+   (is (= :unattested-prepared-generation (kind #(generation/attested-prepared! graph))))
+   (is (= graph (generation/attested-prepared! graph true)))
+   (finally
+    ;; Test-only cleanup uses the private cache cell; production has no setter.
+    (swap! (BeamLisp.Env/fetch_exact! "reload.execution" "prepared") dissoc key)))))
+
+(deftest reentrant-and-foreign-completion-cannot-replace-the-preparation-owner
+ (let [key (key) graph (graph key) parent (erlang/self)]
+  (try
+   (owner-call "begin-preparation!" [key])
+   (is (= :preparation-in-progress (kind #(owner-call "begin-preparation!" [key]))))
+   (is (= :preparation-owner-changed (kind #(owner-call "record-prepared!" [key (assoc graph :cache-key :wrong)]))))
+   (owner-call "record-prepared!" [key graph])
+   (is (= :preparation-owner-changed (kind #(owner-call "complete-preparation!" [key (assoc graph :scope :other)]))))
+   (let [pid (erlang/spawn
+               (fn []
+                (let [result (kind #(owner-call "complete-preparation!" [key graph]))]
+                 (owner-call "abandon-preparation!" [key])
+                 (erlang/send parent [:foreign-result key result]))))]
+    (is (= :preparation-owner-changed
+           (receive [:foreign-result seen result] :when (= key seen) result (after 5000 :missing))))
+    (is (= graph (generation/attested-prepared! graph))))
+   (finally (owner-call "abandon-preparation!" [key])))
+  (is (nil? (owner-call "cached-preparation" [key])))))
+
+(deftest dead-owner-reservation-is-not-evidence-of-resource-retirement
+ (let [key (key) parent (erlang/self)
+       pid (erlang/spawn (fn [] (owner-call "begin-preparation!" [key]) (erlang/send parent [:reserved key])))
+       monitor (erlang/monitor :process pid)]
+  (try
+   (is (= :reserved (receive [:reserved seen] :when (= key seen) :reserved (after 5000 :missing))))
+   (receive [:DOWN seen :process _ _] :when (= monitor seen) nil (after 5000 (throw :owner-not-dead)))
+   (is (= :runtime-handover-required (kind #(owner-call "cached-preparation" [key]))))
+   (owner-call "abandon-preparation!" [key])
+   (is (= :runtime-handover-required (kind #(owner-call "cached-preparation" [key]))))
+   (finally
+    (erlang/demonitor monitor (list :flush))
+    (swap! (BeamLisp.Env/fetch_exact! "reload.execution" "prepared") dissoc key)))))
+
+
+(deftest failed-source-preparation-releases-only-its-own-reservation
+ (let [proposal {:sources {"preparation.failed" "(ns preparation.failed) (defn answer [x] (recur))"}}
+       plan (generation/plan proposal)
+       key [(BeamLisp.Env/env_id) (:digest plan)]]
+  (is (= :Elixir.BeamLisp.CompileError
+         (try (generation/prepare! proposal) :unexpected-success
+          (catch error (:__struct__ error)))))
+  (is (nil? (owner-call "cached-preparation" [key])))
+  (is (= :Elixir.BeamLisp.CompileError
+         (try (generation/prepare! proposal) :unexpected-success
+          (catch error (:__struct__ error)))))
+  (is (nil? (owner-call "cached-preparation" [key])))))

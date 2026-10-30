@@ -1,0 +1,69 @@
+(ns contextual-class-program-test
+ (:require [expand :as expand] [compiler :as compiler] [anf :as a] [lower :as lower]
+           [codebase.phase :as codebase] [system.phase :as phase]))
+(defn- unit [namespace revision text]
+ {:namespace namespace :revision revision :file (str namespace ".bl") :source (str "(ns " namespace ") " text)})
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- execute [program] (lower/eval-anf :Elixir.ContextualClassProgramFactory (a/contextual-unit-factory (:unit program))))
+(defn- cleanup [program] (doseq [descriptor (:classes program)] (BeamLisp.Env/retire_module! (:name descriptor))))
+
+(deftest actual-import-only-links-one-complete-private-frame-without-initializing
+ (let [provider (unit 'class-provider 'current "(defrecord Packet [payload])")
+       client (unit 'class-client 'current "(import-world 'class-provider 'current :as p :only [->Packet]) (p/->Packet 42)")
+       program (expand/program [provider client] ['class-client 'current])
+       module (:name (first (:classes program)))]
+  (try
+   (is (= 1 (count (:classes program))))
+   (is (= 3 (count (get-in program [:unit :initializers]))))
+   (is (= :proved (get-in (phase/analyze program) [:report :status])))
+   (is (= (list) (get-in program [:unit :exports])))
+   (is (nil? (BeamLisp.Record/info module)))
+   (is (not (erlang/module_loaded module)))
+   (let [instance (execute program)]
+    (is (= (Map/put {:payload 42} :__struct__ module) ((:entry instance))))
+    (is (= :error (BeamLisp.Env/lookup (tuple "class-provider" "Packet")))))
+   (finally (cleanup program)))))
+
+(deftest archived-class-recipes-link-through-the-same-owner-without-provider-source
+ (let [provider (unit 'archived-class 'current "(deftype Opaque [payload])")
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [provider])))
+       client (unit 'archive-client 'current "(import-world 'archived-class 'current :as a :only [->Opaque]) (a/->Opaque 42)")
+       program (expand/program [client] ['archive-client 'current] [library])
+       module (:name (first (:classes program)))]
+  (try
+   (is (not (contains? (first (:units library)) :source)))
+   (is (= 1 (count (:classes program))))
+   (is (= :proved (get-in (phase/analyze program) [:report :status])))
+   (is (not (erlang/module_loaded module)))
+   (is (= (tuple :bl_deftype module (tuple 42)) ((:entry (execute program)))))
+   (finally (cleanup program)))))
+
+(deftest selected-class-identity-preserves-revision-and-quoted-logical-owner
+ (let [left (unit 'revised-class 'left "(defrecord Packet [payload])")
+       right (unit 'revised-class 'right "(defrecord Packet [payload extra])")
+       client (unit 'revision-client 'current
+                "(import-world 'revised-class 'left :as a :only [->Packet])
+                 (import-world 'revised-class 'right :as b :only [->Packet]) [(a/->Packet 40) (b/->Packet 2 3)]")
+       program (expand/program [left right client] ['revision-client 'current])]
+  (try
+   (is (= 2 (count (:classes program))))
+   (is (= 2 (count (set (map :name (:classes program))))))
+   (is (= :proved (get-in (phase/analyze program) [:report :status])))
+   (is (every? #(= (tuple "revised-class" "Packet")
+                    (tuple (elem (BeamLisp.Record/declaration_metadata %) 1) (elem (BeamLisp.Record/declaration_metadata %) 2))) (:classes program)))
+   (let [values ((:entry (execute program)))]
+    (is (= 40 (:payload (first values))))
+    (is (= 3 (:extra (second values))))
+    (is (not= (erlang/map_get :__struct__ (first values)) (erlang/map_get :__struct__ (second values)))))
+   (finally (cleanup program)))))
+
+(deftest class-inventory-is-in-the-facts-snapshot-and-private-imports-stay-private
+ (let [source (unit 'facts-class 'current "(defrecord Packet [payload])")
+       program (expand/program [source] ['facts-class 'current])
+       original (:snapshot (codebase/facts program))]
+  (is (not= original (:snapshot (codebase/facts (assoc program :classes (list))))))
+  (is (not (erlang/module_loaded (:name (first (:classes program)))))))
+ (is (= :binding-import-private
+        (kind #(expand/program [(unit 'private-class 'current "(defrecord ^:private Packet [payload])")
+                                (unit 'private-client 'current "(import-world 'private-class 'current :only [->Packet])")]
+                               ['private-client 'current])))))

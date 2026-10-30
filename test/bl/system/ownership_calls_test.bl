@@ -1,0 +1,137 @@
+(ns system.ownership-calls-test
+ (:require [system.ownership :as o] [system.phase :as phase] [expand :as x] [lower :as lower]
+           [compile.world :as world]))
+
+;; Inert logical adapter assumptions. No such native module is executed.
+(def protocol
+ {:version 1 :id 'logical-call-lifetimes
+  :rules
+  {[:remote :Elixir.OwnershipCalls :acquire 0] {:action :acquire :throws :never :runtime []}
+   [:remote :Elixir.OwnershipCalls :release 1] {:action :release :arg 0 :throws :never :runtime []}
+   [:remote :Elixir.OwnershipCalls :use 1] {:action :use :arg 0 :result :scalar :throws :never :runtime []}
+   [:remote :Elixir.OwnershipCalls :fail 0] {:action :pure :result :scalar :throws :before :runtime []}
+   [:remote :Elixir.OwnershipCalls :coin 0] {:action :pure :result :scalar :throws :never :runtime []}}})
+(defn- node [source]
+ (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one source)
+                           (BeamLisp.Compiler/new_env "ownership.calls.fixture")))
+(defn- report
+ ([source] (report source protocol {}))
+ ([source contracts options]
+  (o/check [{:id 'fixture :body (node source)}] contracts options)))
+(defn- status [source] (:status (report source)))
+(defn- unit [namespace revision source]
+ {:namespace namespace :revision revision :file (str namespace ".bl") :source source})
+
+(deftest actual-local-helpers-and-higher-order-calls
+ (doseq [source
+  ["(let [close (fn [r] (OwnershipCalls/release r)) r (OwnershipCalls/acquire)] (close r))"
+   "((fn [f x] (f x)) (fn [r] (OwnershipCalls/release r)) (OwnershipCalls/acquire))"
+   "(let [r (OwnershipCalls/acquire) close (fn [] (OwnershipCalls/release r))] (close))"
+   "(let [make (fn [] (OwnershipCalls/acquire)) r (make)] (OwnershipCalls/release r))"
+   "(let [r (OwnershipCalls/acquire) id (fn [x] x) alias (id r)] (OwnershipCalls/release alias))"
+   "(let [r (OwnershipCalls/acquire) make (fn [x] (fn [] (OwnershipCalls/release x))) close (make r)] (close))"
+   "(let [r (OwnershipCalls/acquire) pick (if (OwnershipCalls/coin) (fn [x] (OwnershipCalls/release x)) (fn [x] (OwnershipCalls/release x)))] (pick r))"]]
+  (let [r (report source)]
+   (is (= :proved (:status r)) (pr-str [source r]))
+   (is (pos? (get-in r [:summaries :contexts])))))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) close (fn [x] (OwnershipCalls/release x))] (do (close r) (OwnershipCalls/use r)))")))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) close (fn [x] (OwnershipCalls/release x))] (do (close r) (close r)))")))
+ (is (= :refused (status "(let [make (fn [] (OwnershipCalls/acquire))] (make))"))))
+
+(deftest latent-functions-and-exception-edges
+ (is (= :proved (status "(let [unused (fn [] (OwnershipCalls/acquire))] 42)")))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) unused (fn [] (OwnershipCalls/release r))] 42)")))
+ (is (= :proved (status "(let [r (OwnershipCalls/acquire) fail (fn [] (OwnershipCalls/fail))] (try (fail) (finally (OwnershipCalls/release r))))")))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) fail (fn [] (OwnershipCalls/fail))] (do (fail) (OwnershipCalls/release r)))")))
+ (is (= :proved (status "(let [r (OwnershipCalls/acquire) wrong (fn [x] x)] (try (wrong) (finally (OwnershipCalls/release r))))")))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) wrong (fn [x] x)] (do (wrong) (OwnershipCalls/release r)))"))))
+
+(deftest reusable-summaries-and-distinct-allocation-contexts
+ (let [r (report "(let [f (fn [x] x)] (do (f 1) (f 2) (f 3)))")]
+  (is (= :proved (:status r)))
+  (is (= 1 (get-in r [:summaries :contexts])))
+  (is (= 2 (get-in r [:summaries :hits]))))
+ (let [r (report "(let [make (fn [] (OwnershipCalls/acquire)) a (make) b (make)] (do (OwnershipCalls/release a) (OwnershipCalls/release b)))")]
+  (is (= :proved (:status r)) (pr-str r))
+  (is (= 2 (get-in r [:summaries :contexts])))
+  (is (= 0 (get-in r [:summaries :hits]))))
+ (is (= :refused (status "(let [make (fn [] (OwnershipCalls/acquire)) a (make) b (make)] (do (OwnershipCalls/release a) (OwnershipCalls/release a)))")))
+ (is (= :refused (status "(let [release (fn [r] (OwnershipCalls/release r)) a (OwnershipCalls/acquire) b (OwnershipCalls/acquire)] (do (release a) (OwnershipCalls/use a) (release b)))"))))
+
+(deftest reuse-rechecks-resource-phases-captures-and-argument-truth
+ (let [r (report "(let [r (OwnershipCalls/acquire) use (fn [x] (OwnershipCalls/use x))] (do (use r) (use r) (use r) (OwnershipCalls/release r)))")]
+  (is (= :proved (:status r)))
+  (is (= 1 (get-in r [:summaries :contexts])))
+  (is (= 2 (get-in r [:summaries :hits]))))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) use (fn [x] (OwnershipCalls/use x))] (do (use r) (OwnershipCalls/release r) (use r)))")))
+ (is (= :proved (status "(let [r (OwnershipCalls/acquire) close (fn [flag] (if flag (OwnershipCalls/release r) 0))] (do (close false) (close true)))")))
+ (is (= :refused (status "(let [r (OwnershipCalls/acquire) close (fn [flag] (if flag (OwnershipCalls/release r) 0))] (do (close true) (close true)))"))))
+
+(deftest unsupported-clauses-and-budget-exhaustion-are-unknown
+ (doseq [source ["((fn [x] :when x x) 42)"
+                 "((fn [[x]] x) [42])"
+                 "((fn recur-helper [x] (do (recur-helper x) 42)) 42)"]]
+  (is (= :unknown (status source)) source))
+ (is (= :ownership-summary-budget
+        (:kind (report "(let [f (fn [x] x) g (fn [x] (f x))] (g 42))" protocol {:max-summaries 1}))))
+ (is (= :ownership-budget-options
+        (:kind (report "42" protocol {:max-summaries 513})))))
+
+(deftest inherited-report-history-does-not-defeat-summary-reuse
+ (let [contracts (assoc-in protocol [:rules [:remote :Elixir.OwnershipCalls :use 1] :runtime] [:adapter-custody])
+       r (report "(let [r (OwnershipCalls/acquire) use (fn [x] (OwnershipCalls/use x))] (do (use r) (use r) (use r) (OwnershipCalls/release r)))"
+                 contracts {})]
+  (is (= :conditional (:status r)))
+  (is (= 1 (get-in r [:summaries :contexts])))
+  (is (= 2 (get-in r [:summaries :hits])))
+  (is (= #{:adapter-custody} (set (map :kind (:runtime-obligations r)))))))
+
+(defn- words [n]
+ (if (zero? n) [[]]
+  (vec (mapcat (fn [prefix] (map #(conj prefix %) [:use :release])) (words (dec n))))))
+(deftest helper-boundaries-preserve-the-independent-lifetime-language
+ (let [traces (mapcat words (range 6))]
+  (is (= 63 (count traces)))
+  (doseq [trace traces]
+   (let [expected (and (= :release (last trace)) (every? #{:use} (butlast trace)))
+         source (str "(let [r (OwnershipCalls/acquire) use (fn [x] (OwnershipCalls/use x)) release (fn [x] (OwnershipCalls/release x))] (do "
+                     (apply str (map #(str "(" (name %) " r) ") trace)) "0))")
+         r (report source)]
+    (is (= (if expected :proved :refused) (:status r)) (pr-str [trace r]))))))
+
+(deftest contextual-world-callees-keep-their-actual-captures
+ (let [program (x/program
+                [(unit 'helpers 'old "(ns helpers) (defn wrap [x] (fn [] x))")
+                 (unit 'helpers 'new "(ns helpers) (defn wrap [x] (fn [] 99))")
+                 (unit 'main 'current
+                  "(ns main) (import-world 'helpers 'old :as old :only [wrap]) (import-world 'helpers 'new :as new :only [wrap]) ((old/wrap 42))")]
+                ['main 'current])
+       r (o/analyze program)
+       actual (lower/eval-anf :Elixir.OwnershipCallsWorldExample (:node program))]
+  (is (= 42 actual))
+  (is (= :proved (:status r)) (pr-str r))
+  (is (= 2 (get-in r [:summaries :contexts])))
+  (is (= false (:native-admission r)))))
+
+(deftest shared-phase-report-exposes-real-summary-reuse
+ (let [program (x/program [(unit 'main 'current
+                           "(ns main) (defn id [x] x) (do (id 1) (id 2) (id 3))")]
+                          ['main 'current])
+       analysis (phase/analyze program)
+       r (world/describe {:program program :manifest {:entry ['main 'current]}
+                          :phase (:report analysis) :facts (:facts analysis)
+                          :ownership (:ownership analysis) :arity {:status :proved :scope :arity}})]
+  (is (= "proved" (:ownership-check r)))
+  (is (= 1 (:ownership-contexts r)))
+  (is (= 2 (:ownership-summary-hits r)))
+  (is (= (get-in analysis [:facts :snapshot]) (get-in analysis [:ownership :snapshot])))
+  (is (= :entry-local (get-in analysis [:ownership :summaries :scope])))
+  (is (= false (get-in analysis [:ownership :summaries :reuse-across-snapshots])))))
+
+(deftest actual-native-helper-keeps-runtime-obligations
+ (let [r (report "(let [close (fn [r] (BeamLisp.Execution/close! r)) r (BeamLisp.Execution/register! (fn [] 42))] (try 42 (finally (close r))))"
+                 (o/execution-protocol) {})]
+  (is (= :conditional (:status r)) (pr-str r))
+  (is (= #{:native-registration-context :native-context :close-and-drain}
+         (set (map :kind (:runtime-obligations r)))))
+  (is (empty? (:issues r)))))

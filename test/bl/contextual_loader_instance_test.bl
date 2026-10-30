@@ -1,0 +1,91 @@
+(ns contextual-loader-instance-test
+ (:require [compile.world :as world] [reload.execution :as execution] [reload.generation :as generation]
+           [lower :as lower] [anf :as a]))
+
+(defn- fixture [action]
+ (let [dir (Path/join (System/tmp_dir!) (str "loader-instance-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns loader.instance) (def token (erlang/unique_integer)) (defn answer [x] (erlang/+ x 40)) token")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['loader.instance 'current] :sources [{:namespace 'loader.instance :revision 'current :file \"main.bl\"}] :libraries []}")
+   (action (world/prepare (Path/join dir "world.bl")) dir)
+   (finally (File/rm_rf! dir)))))
+(defn- reference [prepared name]
+ (:reference (first (filter #(and (= name (get-in % [:declaration :name]))
+                                  (not= :local (get-in % [:declaration :visibility])))
+                            (vals (get-in prepared [:program :references]))))))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+
+(deftest native-owner-restricts-factory-prologue-before-compiler-ingress
+ (fixture
+  (fn [prepared dir]
+   (let [unit (world/prepare-unit prepared :Elixir.LoaderUnrestrictedPrologue)
+         descriptors (:descriptors (first (:plans unit)))
+         runtime (update (first descriptors) :clauses
+                   #(Enum/map % (fn [clause]
+                      (update clause :body (fn [body]
+                        {:op :do :stmts (list
+                          (a/remote :Elixir.BeamLisp.Env :assert_native_framework_execution! (list))
+                          body) :ann {}})))))
+         captured {:manifest {:compiler-key (:compiler-key unit)}
+                   :beams (Enum/map (cons runtime (rest descriptors)) #(lower/descriptor->beam % {}))}
+         g (execution/prepare-captured-unit! captured)]
+    (try
+     ;; Passive metadata and an original preparation do not make application
+     ;; instructions framework code, even before the generated claim prefix.
+     (is (= :native_framework_execution_required (reason #(execution/initialize-instance! g))))
+     (finally (generation/retire! g)))))))
+
+(deftest actual-captured-code-has-original-preparation-and-one-private-instance
+ (fixture
+  (fn [prepared dir]
+   (let [module :Elixir.LoaderOriginalInstance unit (world/prepare-unit prepared module)
+         captured (BeamLisp.AOT/compile_unit unit) before (BeamLisp.Env/capture)
+         g (execution/prepare-captured-unit! captured)]
+    (try
+     (is (erlang/== g (generation/attested-prepared! g)))
+     (is (not (contains? g :instance)))
+     (is (= :unready-prepared-generation (reason #(execution/invoke-instance-entry! g))))
+     (is (= :unadmitted_unit_factory (reason #(erlang/apply module :__bl_unit__ (list)))))
+     (execution/initialize-instance! g)
+     (execution/complete-preparation! (:cache-key g) g)
+     (let [token (execution/invoke-instance-entry! g)]
+      (is (erlang/is_integer token))
+      (is (= token (execution/invoke-instance-entry! g))))
+     (is (= 42 (execution/invoke-instance-binding! g (reference prepared 'answer) [2])))
+     (is (= before (BeamLisp.Env/capture)))
+     (is (= :unit_factory_already_entered
+            (reason #(execution/with! g (fn [] (BeamLisp.Env/invoke_generation_factory! module))))))
+     (finally (generation/retire! g)))))))
+
+(deftest separate-activations-share-immutable-code-and-retain-independent-values
+ (fixture
+  (fn [prepared dir]
+   (let [module :Elixir.LoaderSharedInstances captured (BeamLisp.AOT/compile_unit (world/prepare-unit prepared module))
+         first (execution/prepare-captured-unit! captured) second (execution/prepare-captured-unit! captured)]
+    (try
+     (doseq [g [first second]]
+      (execution/initialize-instance! g) (execution/complete-preparation! (:cache-key g) g))
+     (is (= (:modules first) (:modules second)))
+     (is (not= (:scope first) (:scope second)))
+     (is (not= (execution/invoke-instance-entry! first) (execution/invoke-instance-entry! second)))
+     (is (= :waiting (:status (generation/retire! first))))
+     (is (= 42 (execution/invoke-instance-binding! second (reference prepared 'answer) [2])))
+     (is (= :retired (:status (generation/retire! second))))
+     (is (= :retired (:status (generation/retire! first))))
+     (finally (generation/retire! first) (generation/retire! second)))))))
+
+(deftest loader-creates-a-new-activation-and-restores-caller-context
+ (fixture
+  (fn [prepared dir]
+   (let [unit (world/prepare-unit prepared :Elixir.LoaderPublicActivation)
+         before (BeamLisp.Env/capture) argv (BeamLisp/argv)
+         first (BeamLisp.Loader/run_prepared_artifact_unit unit (list "first"))
+         second (BeamLisp.Loader/run_prepared_artifact_unit unit (list "second"))]
+    (is (not= first second))
+    (is (= before (BeamLisp.Env/capture)))
+    (is (= argv (BeamLisp/argv)))))))

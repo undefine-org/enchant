@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Qualify compiled-only bootstrap with a real producer and source-free consumer.
+
+Use a whole-process-tree memory/time cap. Output must be absent. This fixture
+materializes genuine compiler-floor bytes; it mints no SDK ownership receipts.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--native-variant', type=Path,
+                        help='a separately built, callable LazyMemo product with a different build identity')
+    parser.add_argument('--release', action='store_true',
+                        help='also assemble, relocate and execute a source-free bundled ERTS release')
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    selected = subprocess.check_output([str(root / 'scripts/prepare-checkout-sdk'), '--selection'],
+                                       cwd=root, text=True).strip().split()
+    if len(selected) != 2:
+        parser.error('normal backend returned an invalid SDK selection')
+    sdk, engine = Path(selected[0]).resolve(), selected[1]
+    sdk_image = sdk / 'image'
+    sdk_metadata = json.loads((sdk / 'artifact.json').read_text())
+    platform_bin = Path(sdk_metadata['platform']) / 'bin'
+    elixir = str(platform_bin / 'elixir')
+    tool_path = str(platform_bin) + os.pathsep + os.environ.get('PATH', '')
+    seed = (sdk_image / 'priv/bootstrap/seed').resolve()
+    if args.seed is not None and args.seed.resolve() != seed:
+        parser.error('runtime qualification requires the normal selected SDK floor')
+    if os.path.lexists(output):
+        parser.error('output must be absent')
+    output.mkdir()
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    native_products = sorted(p for p in (root / 'priv/native').iterdir()
+                             if p.is_file() and p.suffix in ('.so', '.dylib', '.dll'))
+    drivers = [root / 'test/scripts/runtime-image-producer.bl', root / 'test/scripts/runtime-image-consumer.exs',
+               root / 'test/scripts/runtime-image-adoption.exs',
+               root / 'test/scripts/runtime-native-identity.exs',
+               root / 'test/scripts/runtime-release-native-control.bl']
+    watched = sorted({Path(__file__).resolve(), *drivers, *native_products, root / 'env.bl',
+                      root / 'scripts/demo-artifact-production',
+                      *(root / 'native/lazy_memo/src').rglob('*.rs'),
+                      *(root / 'native/lazy_memo' / name for name in ('Cargo.toml', 'Cargo.lock', 'build.rs')),
+                      *(p for pattern in ('*.bl', '*.bl.md')
+                        for p in (root / 'priv').rglob(pattern)
+                        if p.is_file() and not p.is_relative_to(root / 'priv/native')),
+                      *(p for name in ('validation', 'language', 'query', 'mailbox', 'cleanup')
+                        for p in (root / f'test/fixtures/contextual-{name}').glob('*.bl'))})
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    seed_inputs = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+    variant = args.native_variant.resolve() if args.native_variant else None
+    variant_sha = sha(variant) if variant else None
+    (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
+    deps = [p for p in sorted((sdk / 'lib').glob('*/ebin'))
+            if not p.parent.name.startswith('beam_lisp-')]
+    boot = runpy.run_path(str(root / 'scripts/demo-artifact-production'))['BOOT']
+    report = {'version': 1, 'scope': 'compiled-only-source-free-runtime-bootstrap',
+              'status': 'running', 'seconds': {}, 'native_execution_admission': False,
+              'sdk_image_qualification': False, 'bundled_erts': False,
+              'runtime_support_sdk': str(sdk), 'engine_fingerprint': engine,
+              'native_products': {p.name: sha(p) for p in native_products},
+              'native_product_abi_in_target_identity': False,
+              'mandatory_native_build_in_target_identity': False,
+              'native_variant_sha256': variant_sha}
+
+    def run(label, command, cwd, env, expected_error=None):
+        started = time.monotonic()
+        env = dict(env, PATH=tool_path)
+        done = subprocess.run(command, cwd=cwd, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        report['seconds'][label] = round(time.monotonic() - started, 3)
+        (output / f'{label}.log').write_text(done.stdout)
+        print(done.stdout[-6000:], end='', flush=True)
+        if expected_error:
+            if not done.returncode or expected_error not in done.stdout or 'STANDALONE-RUNTIME' in done.stdout:
+                raise RuntimeError(f'{label} did not refuse at the expected boundary')
+        elif done.returncode:
+            raise RuntimeError(f'{label} failed with exit {done.returncode}')
+        if inputs != {p: sha(root / p) for p in inputs}:
+            raise RuntimeError('Source/driver inputs changed during qualification')
+        if seed_inputs != {p.name: sha(p) for p in seed.iterdir() if p.is_file()}:
+            raise RuntimeError('candidate floor changed during qualification')
+
+    try:
+        with tempfile.TemporaryDirectory(prefix='bl-runtime-producer-') as temporary:
+            image = Path(temporary)
+            subprocess.run(['cp', '-a', '--reflink=auto', str(root / 'priv'), str(image / 'priv')], check=True)
+            shutil.rmtree(image / 'priv/bootstrap/seed')
+            shutil.copytree(seed, image / 'priv/bootstrap/seed')
+            shutil.copy2(root / 'env.bl', image / 'env.bl')
+            app = image / '.bl/lib/beam_lisp-0.1.0'
+            app.mkdir(parents=True)
+            (app / 'priv').symlink_to(image / 'priv', target_is_directory=True)
+            shutil.copytree(sdk_image / 'ebin', image / 'ebin')
+            (app / 'ebin').symlink_to(image / 'ebin', target_is_directory=True)
+            shutil.copy2(sdk_image / 'priv/sdk-code.term', image / 'priv/sdk-code.term')
+            shutil.copy2(drivers[0], image / 'producer.bl')
+            (image / 'boot.exs').write_text(boot)
+            env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off',
+                       BL_ARTIFACT_DRIVER=str(image / 'producer.bl'),
+                       BL_RUNTIME_IMAGE_OUT=str(output),
+                       BL_RUNTIME_IMAGE_WORLD=str(root / 'test/fixtures/contextual-validation/world.bl'),
+                       XDG_CACHE_HOME=str(image / 'cache'),
+                       ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+            if args.release:
+                env['BL_RUNTIME_RELEASE_OUT'] = str(output / 'release')
+            else:
+                env.pop('BL_RUNTIME_RELEASE_OUT', None)
+            command = [elixir]
+            for dep in deps:
+                command += ['-pa', str(dep)]
+            run('producer', [*command, '-pa', str(app / 'ebin'), str(image / 'boot.exs')], image, env)
+            if args.release and variant:
+                env.update(BL_ARTIFACT_DRIVER=str(drivers[4]),
+                           BL_RUNTIME_NATIVE_CONTROL=str(variant),
+                           BL_RUNTIME_RELEASE_CONTROL_UNIT=str(output / 'program'),
+                           BL_RUNTIME_RELEASE_CONTROL_OUT=str(output / 'refused-release'))
+                run('release-native-refusal', [*command, '-pa', str(app / 'ebin'), str(image / 'boot.exs')], image, env)
+                if (output / 'refused-release').exists():
+                    raise RuntimeError('refused release retained its uncommitted workspace')
+                report['release_changed_native_file_refused_before_publication'] = True
+        image = output / 'image'
+        app = image / 'lib/beam_lisp-0.1.0'
+        shutil.copytree(sdk_image / 'ebin', app / 'ebin')
+        shutil.copytree(seed, app / 'priv/bootstrap/seed')
+        shutil.copy2(sdk_image / 'priv/sdk-code.term', app / 'priv/sdk-code.term')
+        native = app / 'priv/native'
+        native.mkdir()
+        for product in native_products:
+            shutil.copy2(product, native / product.name)
+            if sha(native / product.name) != report['native_products'][product.name]:
+                raise RuntimeError('copied native product differs from the selected producer input')
+        shutil.copytree(output / 'program', image / 'program')
+        (image / 'showcases').mkdir()
+        for name in ('language', 'query', 'mailbox', 'cleanup'):
+            # The parent also owns workspace-claim anchors. Only complete
+            # selected runtime units belong in the consumer, never build state.
+            shutil.copytree(output / 'showcases' / name, image / 'showcases' / name)
+        if any(image.rglob('*.bl')) or any(image.rglob('*.phase')):
+            raise RuntimeError('runtime fixture contains compiler/application Source or phase archives')
+        env = {k: v for k, v in os.environ.items() if k not in ('BL_ROOT', 'BL_SEED_DIR', 'BL_BOOTSTRAP_SEED')}
+        env.update(XDG_CACHE_HOME=str(image / 'empty-cache'), BL_DAEMON='off',
+                   BL_RUNTIME_REPLACEMENT=str(output / 'runtime-replacement.beam'),
+                   ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+        command = [elixir, '-pa', str(app / 'ebin'), str(drivers[1])]
+        if variant:
+            library = native / 'lazy_memo.so'
+            saved = native / 'lazy_memo.original'
+            shutil.copy2(variant, library.with_name(library.name + '.variant'))
+            run('native-loaded-owner', [elixir, '-pa', str(app / 'ebin'), str(drivers[3])], image, env)
+            library.rename(saved)
+            try:
+                shutil.copy2(variant, library)
+                run('native-target-refusal', command, image, env, 'compiled_runtime_image_changed')
+            finally:
+                library.unlink()
+                saved.rename(library)
+            if sha(variant) != variant_sha:
+                raise RuntimeError('native variant changed during qualification')
+            report.update(mandatory_native_build_in_target_identity=True,
+                          loaded_native_owner_qualified=True, changed_native_target_refused=True)
+        run('adoption', [elixir, '-pa', str(app / 'ebin'), str(drivers[2])], image, env)
+        if 'RUNTIME-ADOPTION before-commit-death=true accepted-caller-death=true' not in (output / 'adoption.log').read_text():
+            raise RuntimeError('adoption did not prove actual requester-death boundaries')
+        run('consumer', command, image, env)
+        if 'STANDALONE-RUNTIME [42, 99, 42] compiler-calls=0' not in (output / 'consumer.log').read_text():
+            raise RuntimeError('consumer did not prove its runtime result and compiler-work boundary')
+        target = app / 'priv/bootstrap/seed/Elixir.BeamLisp.Ns.Body.Rt.beam'
+        original = target.read_bytes()
+        try:
+            target.write_bytes(b'changed runtime bytes')
+            run('changed-floor', command, image, env, 'runtime-floor-bytes-changed')
+        finally:
+            target.write_bytes(original)
+        report.update(status='passed', value=[42, 99, 42], compiler_calls=0,
+                      compiler_seeded=False, exact_floor_retained=True,
+                      source_free=True, changed_floor_refused=True, env_restarted=True,
+                      retained_runtime_replacement_refused=True, adoption_caller_death_qualified=True,
+                      interrupted_initializer_retry_qualified=True, stale_epoch_completion_refused=True,
+                      floor_captures=2, warm_floor_recaptures=0,
+                      adoption_request_bytes=int(re.search(r'request-bytes=(\d+)', (output / 'adoption.log').read_text()).group(1)),
+                      showcases={'language': [42, 102, 42, 42], 'query': [4, 6],
+                                 'mailbox': [42, 107, 99], 'cleanup': [42, 100, 40, 200]})
+        if args.release:
+            release = output / 'relocated-release'
+            (output / 'release').rename(release)
+            forbidden = [p for p in release.rglob('*')
+                         if p.name == '.bl' or p.suffix in ('.bl', '.phase', '.rs')]
+            if forbidden:
+                raise RuntimeError(f'release contains Source, phase or build state: {forbidden[:4]}')
+            receipt = release / 'runtime-image.term'
+            if not receipt.is_file():
+                raise RuntimeError('runtime release did not publish its completion receipt')
+            release_env = dict(env, BL_RUNTIME_MAIN='programs/validation',
+                               BL_RUNTIME_SHOWCASES='programs', BL_RUNTIME_EXPECT_ROOT=str(release))
+            release_env.pop('BL_RUNTIME_RELEASE_OUT', None)
+            run('release-consumer', [str(release / 'bin/bl'), 'eval',
+                 'Code.require_file(System.fetch_env!("BL_RUNTIME_HARNESS"))'], release,
+                dict(release_env, BL_RUNTIME_HARNESS=str(drivers[1])))
+            run('release-launcher', [str(release / 'bin/run'), 'first-argument'], output, release_env)
+            if '[42 99 42]' not in (output / 'release-launcher.log').read_text():
+                raise RuntimeError('bundled runtime launcher did not return its program value')
+            report.update(bundled_erts=True, source_free_release=True, relocated_release=True,
+                          bundled_beam_executable=True, external_release_code_paths=False)
+    except Exception as error:
+        report.update(status='error', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(f'Passed. Artifacts and receipts: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

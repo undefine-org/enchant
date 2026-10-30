@@ -126,14 +126,27 @@
 
 ; ── the manifest ────────────────────────────────────────────────────────────
 
-(defn- read_manifest!
+(defn- consult_bytes
+  "OTP's term reader over one immutable byte snapshot, without evaluation."
+  [bytes]
+  (let [io (erlang/element 2 (StringIO/open bytes))]
+    (try
+      (loop [terms '()]
+        (let [r (io/read io "")]
+          (cond
+            (erlang/== :eof r) (tup :ok (Enum/reverse terms))
+            (erlang/== :ok (erlang/element 1 r))
+            (recur (erlang/++ (lst (erlang/element 2 r)) terms))
+            :else r)))
+      (finally (StringIO/close io)))))
+
+(defn- read_manifest_uncached!
   "The committed seed's manifest as data. The manifest is an Erlang TERM
-   (`manifest.term`), read with `:file.consult/1`: PARSED, never evaluated, so
-   the seed cannot run a line at the instant it is trusted. `consult` answers
-   `{:ok, terms}` — a LIST of the file's forms — and a manifest is exactly ONE
-   map, so any other shape is refused, never unwrapped."
-  [path]
-  (let [r (file/consult path)]
+   (`manifest.term`), parsed by OTP from captured bytes, never evaluated.
+   A manifest is exactly ONE map; every other shape is refused."
+  [path input]
+  (let [r (if (erlang/== :ok (erlang/element 1 input))
+            (consult_bytes (erlang/element 2 input)) input)]
     (cond
       (and (erlang/is_tuple r)
            (erlang/== :ok (erlang/element 1 r))
@@ -156,6 +169,23 @@
                "The self-hosted compiler boots from a committed seed; a floor with\n"
                "no readable `manifest.term` has nothing to stage. Regenerate it with\n"
                "`bl seed`.\n"))))))
+
+(defn- read_manifest!
+  "Reuse parsing, never file freshness. Every request reads the current bytes;
+   only an exact byte match reuses a previous parse. One entry bounds retention.
+   Parsing that captured snapshot prevents a concurrent writer from giving the
+   cache a value derived from different bytes."
+  [path]
+  (let [input (File/read path)
+        key (tup (erlang/element 2 (erlang/fun_info (fn [] nil) :module)) :manifest-parse)
+        cached (persistent_term/get key nil)]
+    (if (and cached (erlang/== path (erlang/element 1 cached))
+                   (erlang/== :ok (erlang/element 1 input))
+                   (erlang/== (erlang/element 2 input) (erlang/element 2 cached)))
+      (erlang/element 3 cached)
+      (let [value (read_manifest_uncached! path input)]
+        (persistent_term/put key (tup path (erlang/element 2 input) value))
+        value))))
 
 (defn- sha256
   "Lowercase hex sha256, the digest the manifest records."
@@ -287,6 +317,68 @@
     (and (erlang/is_list which)
          (let [path (List/to_string which)]
            (claimed? (Path/dirname path) (Path/basename path) key)))))
+
+(defn packaged_keys!
+  "Recover a Source-absent compiler's identity from its complete installed
+   floor. Every file and every loaded stable member must match. This does not
+   admit SDK code or replace the live Source identity used by checkouts."
+  []
+  (let [m (manifest) modules (Map/get m "modules")
+        compiler (Map/get m "compiler_key") build (Map/get m "build_key")]
+    (when-not (and (erlang/== "beam-lisp-bootstrap-seed-v2" (Map/get m "schema"))
+                   (erlang/== (System/version) (Map/get m "elixir"))
+                   (erlang/== (erlang/list_to_binary (erlang/system_info :otp_release)) (Map/get m "otp"))
+                   (erlang/is_binary compiler) (erlang/== 64 (erlang/byte_size compiler))
+                   (erlang/is_binary build) (erlang/== 64 (erlang/byte_size build))
+                   (erlang/is_map modules) (erlang/=< 1 (erlang/map_size modules))
+                   (erlang/=< (erlang/map_size modules) 256)
+                   (Enum/all? '("Elixir.BeamLisp.AOTCache.beam" "Elixir.BeamLisp.Bootstrap.beam"
+                                "Elixir.BeamLisp.Tiers.beam" "Elixir.BeamLisp.AOT.beam"
+                                "Elixir.BeamLisp.Env.beam" "Elixir.BeamLisp.Compiler.beam"
+                                "Elixir.BeamLisp.Ns.Rt.beam" "Elixir.BeamLisp.Ns.Core.beam")
+                     (fn [name] (Map/has_key? modules name))))
+      (erlang/error :invalid_packaged_compiler_floor))
+    (Enum/reduce modules 268435456
+      (fn [entry remaining]
+        (let [name (erlang/element 1 entry) digest (erlang/element 2 entry)
+              _ (when-not (and (erlang/is_binary name) (erlang/== name (Path/basename name))
+                               (String/ends_with? name ".beam") (erlang/=< (erlang/byte_size name) 512)
+                               (erlang/not (String/contains? name "\\")))
+                  (erlang/error :invalid_packaged_compiler_member))
+              path (Path/join (seed_dir) name) stat (File/lstat! path)
+              _ (when-not (and (erlang/== :regular (Map/get stat :type))
+                               (erlang/=< (Map/get stat :size) (erlang/min remaining 33554432)))
+                  (erlang/error :packaged_compiler_member_bound))
+              bytes (BeamLisp.AOTCache/read_precompiled_bytes! path (erlang/min remaining 33554432))
+              parsed (beam_lib/md5 bytes)
+              module (erlang/element 1 (erlang/element 2 parsed))]
+          (when-not (and (erlang/== digest (sha256 bytes))
+                         (erlang/== name (cat (Atom/to_string module) ".beam")))
+            (erlang/error :packaged_compiler_bytes_changed))
+          (when (erlang/module_loaded module)
+            (let [attrs (Keyword/get (erlang/element 2 (erlang/element 2
+                          (beam_lib/chunks bytes '(:attributes)))) :attributes)
+                  raw-role (Keyword/get attrs :bl_aot_artifact_role)
+                  role (if (and (erlang/is_list raw-role) (erlang/== 1 (erlang/length raw-role)))
+                         (erlang/hd raw-role) raw-role)]
+              ;; Mutable namespace shims are checked by the existing route
+              ;; owner at use; an executable stable replacement never matches.
+              (when-not (or (erlang/== role :mutable-forwarder)
+                            (loaded_is? module bytes))
+                (erlang/error (tup :packaged_compiler_loaded_code_changed module)))))
+          (erlang/- remaining (erlang/byte_size bytes)))))
+    (tup compiler build)))
+
+(defn packaged_member?
+  "Preboot membership of one exact loaded floor member. No declaration reader,
+   Core var, initializer or mutable-route recovery is available at this phase."
+  [module]
+  (let [m (manifest) name (cat (Atom/to_string module) ".beam")
+        expected (Map/get (Map/get m "modules" (maps/new)) name)]
+    (and expected (erlang/== (Map/get m "compiler_key") (BeamLisp.AOTCache/compiler_key))
+      (let [bytes (BeamLisp.AOTCache/read_precompiled_bytes! (Path/join (seed_dir) name) 33554432)]
+        (and (erlang/== expected (sha256 bytes))
+             (Code/ensure_loaded? module) (loaded_is? module bytes))))))
 
 (defn- stamped_key
   "A beam's `bl_compiler_key` attribute, read WITHOUT loading it. FLOOR beams

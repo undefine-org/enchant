@@ -1,0 +1,199 @@
+(ns contextual-session-retirement-test
+ (:require [compile.world :as world] [reload.execution :as execution]
+           [reload.generation :as generation] [vm.session :as session]
+           [vm.client :as client] [vm.manager :as manager] [vm.spec :as spec]
+           [vm.paths :as paths] [vm.idle :as idle]))
+
+(defn- exchange [root tag payload]
+ (let [endpoint (:ok (paths/endpoints root))
+       connected (gen_tcp/connect (tuple :local (erlang/binary_to_list (:sock endpoint))) 0
+                   (list (tuple :inet_backend :inet) :local :binary (tuple :packet 4) (tuple :active false)) 5000)
+       socket (elem connected 1) id (crypto/strong_rand_bytes 16)]
+  (assert (= :ok (elem connected 0)))
+  (try
+   (gen_tcp/send socket (erlang/term_to_binary
+     (tuple :bl 1 :hello {:tree (paths/fingerprint root) :token (File/read! (:token endpoint))})))
+   (assert (= :ok (elem (gen_tcp/recv socket 0 5000) 0)))
+   (gen_tcp/send socket (erlang/term_to_binary (tuple :bl 1 tag id payload)))
+   (loop [output ""]
+    (let [received (gen_tcp/recv socket 0 5000)]
+     (if (not= :ok (elem received 0)) {:code :missing :output output}
+      (let [frame (BeamLisp.Env/decode_data_term! (elem received 1))]
+       (case (elem frame 2)
+        :exit {:code (elem frame 4) :output output}
+        :stdout (recur (str output (elem frame 5)))
+        :stderr (recur (str output (elem frame 5)))
+        (recur output))))))
+   (finally (gen_tcp/close socket)))))
+(defn- control [root op] (exchange root :control op))
+(defn- pending? [response]
+ (and (= 1 (:code response)) (String/contains? (:output response) "retirement pending")))
+(defn- implementation-mfa [namespace name arity]
+ ;; Private SDK values can be local bridges. Trace the actual declaration's
+ ;; provider, shared by Source and sealed SDK callers, rather than that bridge.
+ (let [definition (first (filter #(and (= :fixed (elem % 0)) (= arity (elem % 1)))
+                                 (get (BeamLisp.Env/ns_defs namespace) name)))]
+  (assert definition)
+  (tuple (elem definition 4) (elem definition 2) arity)))
+
+(defn- fixture [module action]
+ (let [root (Path/join (System/tmp_dir!) (str "session-custody-" (erlang/unique_integer (list :positive))))
+       listener (atom nil) graph (atom nil) held (atom nil)]
+  (File/mkdir_p! (Path/join root "priv/boot"))
+  (File/write! (Path/join root "priv/boot/core.bl") "")
+  (File/write! (Path/join root "main.bl") "(ns session.unit) (defn callback [] (fn [] 42)) 42")
+  (File/write! (Path/join root "world.bl")
+   "{:version 1 :profile 'syntax-v1 :entry ['session.unit 'current] :sources [{:namespace 'session.unit :revision 'current :file \"main.bl\"}] :libraries []}")
+  (try
+   (let [started (session/start root {:ui false :commands-only true :idle 60})]
+    (when-not (:ok started) (throw (ex-info "Session fixture could not start" {:result started})))
+    (reset! listener (:ok started)))
+   (let [vm (manager/get-vm (:id (spec/read root)))
+         prepared (world/prepare (Path/join root "world.bl"))
+         reference (:reference (first (filter #(and (= 'callback (get-in % [:declaration :name]))
+                                                    (not= :local (get-in % [:declaration :visibility])))
+                                      (vals (get-in prepared [:program :references])))))]
+    (reset! graph (BeamLisp.Env/with_env (:env vm)
+                   #(execution/prepare-captured-unit! (BeamLisp.AOT/compile_unit (world/prepare-unit prepared module)))))
+    (execution/initialize-instance! @graph)
+    (execution/complete-preparation! (:cache-key @graph) @graph)
+    (reset! held (execution/with! @graph
+                  #(BeamLisp.Execution/register! (execution/invoke-instance-binding! @graph reference []))))
+    (action root @listener vm @graph @held))
+   (catch error
+    (println :SESSION-RETIREMENT-ERROR (ex-data error) __STACKTRACE__)
+    (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+   (finally
+    (when @held (BeamLisp.Execution/close! @held))
+    (when @listener (session/stop @listener))
+    (when @graph (generation/retire! @graph))
+    (persistent_term/erase (tuple :vm_session :stop))
+    (File/rm_rf! root)))))
+
+(deftest pending-wire-controls-preserve-listener-and-refuse-restart-and-new-commands
+ (fixture :Elixir.SessionWireCustody
+  (fn [root listener vm graph held]
+   (let [watcher (persistent_term/get session/PT-IDLE nil)
+         record (persistent_term/get session/PT-RECORD nil)]
+    (is (pending? (control root (tuple :close root))))
+    (is (pending? (control root (tuple :restart root))))
+    (is (= (:env vm) (:env (manager/get-vm (:id vm)))))
+    (is (pending? (control root :stop)))
+    (is (= 1 (client/stop root)))
+    (is (= 1 (client/restart root)))
+    (is (not (persistent_term/get (tuple :vm_session :stop) false)))
+    (is (pending? (exchange root :request {:cwd root :argv (list "eval" "(println :unexpected)") :env {}})))
+    (is (= 0 (idle/running)))
+    (is (= :waiting (:status (session/stop listener))))
+    (is (= watcher (persistent_term/get session/PT-IDLE nil)))
+    (is (Process/alive? watcher))
+    (is (= record (persistent_term/get session/PT-RECORD nil)))
+    (is (= 0 (:code (control root :realms))))
+    (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! held [])))
+    (BeamLisp.Execution/close! held)
+    (is (= 0 (:code (control root :stop))))
+    (is (persistent_term/get (tuple :vm_session :stop) false))))))
+
+(deftest foreground-owner-waits-for-retry-while-actual-consumer-custody-remains
+ (fixture :Elixir.SessionForegroundCustody
+  (fn [root listener vm graph held]
+   (let [caller (erlang/self)
+         target (implementation-mfa "vm.client" "wait-for-stop" 0)
+         finish (BeamLisp.Env/fetch_exact! "vm.client" "finish-session")
+         worker (erlang/spawn (fn []
+                  (receive :begin nil)
+                  (BeamLisp.Ns.Rt/invoke finish (list listener))
+                  (erlang/send caller :foreground-finished)))]
+    (try
+     (erlang/trace_pattern target true (list :local))
+     (erlang/trace worker true (list :call (tuple :tracer caller)))
+     (persistent_term/put (tuple :vm_session :stop) true)
+     (erlang/send worker :begin)
+     ;; First wait sees stop=true, so a second entry proves the pending-stop
+     ;; branch kept the owner and reentered the foreground wait, without timing.
+     (receive [:trace pid :call _] :when (= pid worker) nil (after 10000 (throw :missing-first-wait)))
+     (is (= :waiting (receive [:trace pid :call _] :when (= pid worker) :waiting (after 10000 :missing))))
+     (is (Process/alive? worker))
+     (is (not (persistent_term/get (tuple :vm_session :stop) true)))
+     (is (= 0 (:code (control root :realms))))
+     (BeamLisp.Execution/close! held)
+     (is (= 0 (:code (control root :stop))))
+     (is (= :finished (receive :foreground-finished :finished (after 10000 :missing))))
+     (finally
+      (erlang/trace_pattern target false (list :local))
+      (when (Process/alive? worker) (Process/exit worker :kill))))))))
+
+(deftest accepted-request-counter-prevents-realm-teardown-until-work-finishes
+ (fixture :Elixir.SessionInflightCustody
+  (fn [root listener vm graph held]
+   (idle/begin!)
+   (try
+    (is (= {:status :waiting :pending 1} (session/stop listener)))
+    (is (= :ready (:status (manager/get-vm (:id vm)))))
+    (is (= :alive (BeamLisp.Env/with_scope_commit (:env vm) (fn [] :alive))))
+    (is (pending? (control root :stop)))
+    (is (pending? (exchange root :request {:cwd root :argv (list "eval" "42") :env {}})))
+    (is (= 1 (idle/running)))
+    (finally (idle/end!)))
+   (is (= :waiting (:status (session/stop listener))))
+   (is (= :draining (:status (manager/get-vm (:id vm)))))
+   (BeamLisp.Execution/close! held)
+   (is (= 0 (:code (control root :stop)))))))
+
+(deftest control-outcomes-preserve-terminal-failure-and-historical-eof-distinction
+ (is (= 1 (client/outcome :stop {:ok :exit :code 1})))
+ (is (= 7 (client/outcome (tuple :close "/x") {:ok :exit :code 7})))
+ (is (= 1 (client/outcome :stop {:ok :exit})))
+ (is (= 0 (client/outcome :stop {:error :closed})))
+ (is (= 1 (client/outcome (tuple :close "/x") {:error :closed}))))
+
+(deftest stop-racing-before-request-counter-increment-refuses-before-dispatch
+ (fixture :Elixir.SessionCounterRace
+  (fn [root listener vm graph held]
+   (let [caller (erlang/self) saved (persistent_term/get idle/PT-IN-FLIGHT nil)
+         lock (tuple idle/CELL-LOCK caller) nodes (list (erlang/node))
+         target (tuple :global :set_lock 2)
+         handler (BeamLisp.Env/fetch_exact! "vm.session" "request-handler")
+         dispatch-target (implementation-mfa "vm.session" "dispatch-command" 2)
+         dispatch-module (elem dispatch-target 0) dispatch-name (elem dispatch-target 1)
+         id (crypto/strong_rand_bytes 16)
+         request (tuple :request id {:cwd root :argv (list "eval" "(println :unexpected-dispatch)") :env {}})
+         worker (erlang/spawn (fn []
+                  (receive :begin nil)
+                  (BeamLisp.Ns.Rt/invoke handler
+                   (list request (fn [bytes] (erlang/send caller [:frame (BeamLisp.Env/decode_data_term! bytes)]))))
+                  (erlang/send caller :request-finished)))]
+    (try
+     (assert (= 0 (idle/running)))
+     ;; Exercise the real lazy counter's existing lock. The worker passes the
+     ;; first admission check, then blocks BEFORE incrementing the counter.
+     (global/set_lock lock nodes)
+     (persistent_term/erase idle/PT-IN-FLIGHT)
+     (erlang/trace_pattern target true (list :local))
+     (erlang/trace_pattern dispatch-target true (list :local))
+     (erlang/trace worker true (list :call (tuple :tracer caller)))
+     (erlang/send worker :begin)
+     (is (= idle/CELL-LOCK
+            (receive [:trace pid :call mfa] :when (= pid worker) (elem (first (elem mfa 2)) 0)
+              (after 5000 :missing))))
+     (is (= :waiting (:status (session/stop listener))))
+     (global/del_lock lock nodes)
+     (let [code (loop []
+                 (receive [:frame frame] (if (= :exit (elem frame 2)) (elem frame 4) (recur))
+                          (after 10000 :missing)))]
+      (is (= 1 code)))
+     (is (= :finished (receive :request-finished :finished (after 5000 :missing))))
+     (let [barrier (erlang/trace_delivered :all)]
+      (receive [:trace_delivered :all seen] :when (= seen barrier) nil
+               (after 5000 (throw :trace-not-delivered))))
+     (is (= :refused
+            (receive [:trace pid :call [module function arguments]]
+              :when (and (= pid worker) (= dispatch-module module) (= dispatch-name function))
+               :dispatched (after 0 :refused))))
+     (is (= 0 (idle/running)))
+     (finally
+      (global/del_lock lock nodes)
+      (erlang/trace_pattern target false (list :local))
+      (erlang/trace_pattern dispatch-target false (list :local))
+      (when (Process/alive? worker) (Process/exit worker :kill))
+      (if saved (persistent_term/put idle/PT-IN-FLIGHT saved) (persistent_term/erase idle/PT-IN-FLIGHT))))))))

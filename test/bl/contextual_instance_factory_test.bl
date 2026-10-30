@@ -1,0 +1,106 @@
+(ns contextual-instance-factory-test
+ (:require [expand :as expand] [anf :as a] [lower :as lower]
+           [reload.source-producer :as producer] [reload.generation :as generation]
+           [test.support.source-fixtures :as fixtures]))
+(fixtures/effects!)
+(fixtures/instance-guard!)
+
+(defn- program [text]
+ (expand/program [{:namespace 'instance :revision 'current :file "instance.bl" :source (str "(ns instance) " text)}]
+                 ['instance 'current]))
+(defn- prepared [program]
+ (producer/specialize-unit (:unit program) {:native-modules #{"erlang" "SourceEffectObserverFixture"}}))
+(defn- nodes [node]
+ (loop [todo (list node) out []]
+  (if (empty? todo) out
+   (recur (Enum/concat (a/executable-children (first todo)) (rest todo)) (conj out (first todo))))))
+(defn- reference [program name]
+ (:reference (first (filter #(and (= name (get-in % [:declaration :name])) (not= :local (get-in % [:declaration :visibility]))) (vals (:references program))))))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error)) (:__struct__ error)))))
+(defn- options [value]
+ {:sources {"unit.consumer"
+   (str "(ns unit.consumer) (defn tag [] " value ") "
+        "(defn __bl_unit__ [] (SourceUnitInstanceFixture/instantiate)) "
+        "(defn call [f args] (apply f args))")}
+  :native-modules #{"erlang" "SourceUnitInstanceFixture" "SourceInstanceGuardFixture" "SourceEffectObserverFixture"}})
+(defn- invoke [graph f args] (generation/invoke! graph "unit.consumer/call" [f args]))
+(defn- create [graph]
+ (generation/with! graph #(BeamLisp.Env/invoke_generation_factory!
+                           (BeamLisp.Emit/module_for (get (:mapping graph) "unit.consumer")))))
+
+(deftest runtime-factory-captures-one-marker-and-guards-every-runtime-function-arm
+ (let [p (program "(defn answer ([x] x) ([x & more] x)) (answer 42)")
+       factory (:expression (prepared p)) expression (last (:stmts factory))
+       guards (filter #(and (= :remote (:op %)) (= :with_source_execution! (:fun %))) (nodes expression))
+       captures (filter #(and (= :remote (:op %)) (= :selected_execution_graph_id (:fun %))) (nodes expression))]
+  (is (= 1 (count captures)))
+  (is (= :do (:op factory)))
+  (is (= :consume_generation_factory! (:fun (first (:stmts factory)))))
+  (is (> (count guards) 2))
+  (is (every? #(= 2 (count (:args %))) guards))
+  (is (every? #(= (:name expression) (:name (first (:args %)))) guards))
+  (is (= :let (:op expression)))))
+
+(deftest runtime-marker-slot-cannot-be-shadowed-by-an-authored-local
+ (let [unit {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list) :exports (list)
+             :entry (a/lett "__bl_source_instance_0" (a/lit 42)
+                      (a/fnn (list (a/clause (list) nil (a/var "__bl_source_instance_0")))))}
+       factory (:expression (producer/specialize-unit unit {})) expression (last (:stmts factory))]
+  (is (not= "__bl_source_instance_0" (:name expression)))
+  (is (= factory (:expression (producer/specialize-unit unit {}))))))
+
+(deftest same-physical-factory-closures-stay-bound-to-their-original-actual-graph
+ (let [p (program
+          "(defn answer [x] (erlang/+ x 40))
+           (defn flex ([x] (erlang/+ x 40)) ([x & more] (erlang/+ x 40)))
+           (defn make [n] (fn [x] (erlang/+ n x)))
+           (defn bomb [] (erlang/error :unit-body-ran))
+           (defn count-to [n] (if (erlang/< n 42) (recur (erlang/+ n 1)) n))
+           42")
+       expression (:expression (prepared p))
+       ;; This native fixture is explicitly granted by the genuine SDK graph.
+       ;; It does not claim produced Source/SDK authority or admission.
+       module :Elixir.SourceUnitInstanceFixture
+       descriptor (a/module module
+                    (list {:op :defn-clause :fname :instantiate :params (list) :guard nil :body expression :ann {}})
+                    (list [:instantiate 0]) (list))
+       beam (lower/descriptor->beam descriptor {})]
+  (code/load_binary module '() (elem beam 1))
+  (is (= :unadmitted_unit_factory (reason #(erlang/apply module :instantiate (list)))))
+  (let [left (generation/prepare! (options 1)) right (generation/prepare! (options 2))]
+   (try
+    (let [one (create left)
+          two (create right)
+          f (get (:exports one) (reference p 'answer))
+          g (get (:exports two) (reference p 'answer))
+          count-to (get (:exports one) (reference p 'count-to))
+          bomb (get (:exports one) (reference p 'bomb))
+          make (get (:exports one) (reference p 'make))
+          flex (get (:exports one) (reference p 'flex))]
+     (is (= (erlang/fun_info f :module) (erlang/fun_info g :module)))
+     (is (= (erlang/fun_info f :new_uniq) (erlang/fun_info g :new_uniq)))
+     (is (not= f g))
+     (is (= 42 (invoke left f [2])))
+     (is (= 42 (invoke left count-to [0])))
+     (is (= 42 (invoke left flex [2])))
+     (is (= 42 (invoke left flex [2 99])))
+     (is (= :source_instance_changed (reason #(invoke right flex [2 99]))))
+     (is (= :source_instance_changed (reason #(invoke right f [2]))))
+     (is (= :source_instance_changed (reason #(invoke right bomb []))))
+     (is (= :unit-body-ran (reason #(invoke left bomb []))))
+     (is (= 43 (invoke right g [3])))
+     (is (= 42 (invoke left (:entry one) [])))
+     (let [nested (invoke left make [40])]
+      (is (= 42 (invoke left nested [2])))
+      (is (= :source_instance_changed (reason #(invoke right nested [2]))))))
+    (finally (generation/retire! left) (generation/retire! right))))))
+
+
+(deftest closed-runtime-factories-refuse-named-declaration-carriers-before-emission
+ (let [carrier (a/remote :Elixir.BeamLisp.Link :defvar (list))
+       unit {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list)
+             :exports (list) :entry carrier}]
+  (is (= :runtime-unit-declaration-carrier (reason #(producer/specialize-unit unit {}))))
+  (is (map? (producer/specialize-unit (assoc unit :entry (a/lit carrier)) {})))))

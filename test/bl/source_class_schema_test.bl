@@ -1,0 +1,71 @@
+(ns source-class-schema-test (:require [reload.generation :as generation]))
+(defn- reason [action] (try (action) nil (catch-raw [kind reason stack] reason)))
+(defn- fixture [kind action]
+ (let [ns (str "source.schema.n" (erlang/unique_integer (list :positive)))
+       descriptor (BeamLisp.Record/declaration_descriptor ns "Handle" kind (list "payload"))
+       module (:name descriptor) bytes (BeamLisp.Emit/compile_descriptor descriptor)]
+  (try
+   (BeamLisp.Env/publish_binaries! (list bytes) "source-schema-test")
+   (action module descriptor)
+   (finally (BeamLisp.Env/retire_module! module)))))
+(defn- modules [module] {module (erlang/apply module :module_info (list :md5))})
+
+(deftest schema-capture-does-not-initialize-and-constructors-require-registration
+ (fixture :deftype (fn [module descriptor]
+  (let [owned (modules module) schemas (BeamLisp.Env/source_class_schemas! owned (list module))
+        schema (get schemas module)]
+   (is (nil? (BeamLisp.Record/info module)))
+   (is (= (tuple 1 (elem schema 1) "Handle" :deftype (list "payload")) schema))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :positional_ctor)))
+   (BeamLisp.Record/publish_declaration! descriptor)
+   (is (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :positional_ctor))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :map_ctor)))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :unknown)))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module nil schema :positional_ctor)))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) nil :positional_ctor)))))))
+
+(deftest records-have-both-factories-and-registry-drift-invalidates-frozen-schema
+ (fixture :record (fn [module descriptor]
+  (BeamLisp.Record/publish_declaration! descriptor)
+  (let [owned (modules module) schema (get (BeamLisp.Env/source_class_schemas! owned (list module)) module)
+        changed (BeamLisp.Record/declaration_descriptor (elem schema 1) "Handle" :record (list "changed"))]
+   (is (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :positional_ctor))
+   (is (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :map_ctor))
+   (BeamLisp.Record/publish_declaration! changed)
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :map_ctor)))
+   (is (not= schema (get (BeamLisp.Env/source_class_schemas! (modules module) (list module)) module)))))))
+
+(deftest invalid-or-unowned-class-inventories-refuse
+ (fixture :deftype (fn [module descriptor]
+  (is (= :source_execution_context_mismatch (reason #(BeamLisp.Env/source_class_schemas! {} (list module)))))
+  (is (= :invalid_source_class_inventory (reason #(BeamLisp.Env/source_class_schemas! (modules module) (list module module)))))
+  (is (= :source_execution_context_mismatch (reason #(BeamLisp.Env/source_class_schemas! {module "wrong-md5"} (list module)))))
+  (is (= :source_execution_context_mismatch (reason #(BeamLisp.Env/source_class_schemas! {} (list "module")))))
+  (is (= {} (BeamLisp.Env/source_class_schemas! {} (list)))))))
+
+(deftest actual-original-generation-class-inventory-has-consistent-schemas
+ (let [g (generation/prepare! {:application-id (str "source-schema-graph-" (erlang/unique_integer (list :positive)))
+         :sources {"schema.profile" "(ns schema.profile) (deftype Handle [payload]) (defn make [x] (->Handle x))"}})]
+  (try
+   (let [owned (Map/new (Enum/map (BeamLisp.Vector/to_list (:modules g)) (fn [m] (tuple m (erlang/apply m :module_info (list :md5))))))
+         schemas (BeamLisp.Env/source_class_schemas! owned (BeamLisp.Set/to_list (:classes g)))
+         module (first (Map/keys schemas))]
+    (is (= 1 (count schemas)))
+    (is (BeamLisp.Env/source_class_constructor_valid? module (get owned module) (get schemas module) :positional_ctor))
+    (is (= (tuple :bl_deftype module (tuple 42)) (generation/invoke! g "schema.profile/make" [42]))))
+   (finally (generation/retire! g)))))
+
+(deftest identical-code-md5-does-not-hide-deftype-registry-drift
+ (fixture :deftype (fn [module descriptor]
+  (BeamLisp.Record/publish_declaration! descriptor)
+  (let [owned (modules module) schema (get (BeamLisp.Env/source_class_schemas! owned (list module)) module)]
+   (BeamLisp.Record/publish_declaration!
+    (BeamLisp.Record/declaration_descriptor (elem schema 1) "Handle" :deftype (list "changed")))
+   (is (= owned (modules module)))
+   (is (not (BeamLisp.Env/source_class_constructor_valid? module (get owned module) schema :positional_ctor)))
+   (is (= (tuple :source_class_schema_conflict module)
+          (reason #(BeamLisp.Env/source_class_schemas! owned (list module)))))))))
+
+(deftest owned-executable-membership-does-not-make-a-class
+ (is (= (tuple :source_class_schema_conflict :Elixir.BeamLisp.Env)
+        (reason #(BeamLisp.Env/source_class_schemas! (modules :Elixir.BeamLisp.Env) (list :Elixir.BeamLisp.Env))))))

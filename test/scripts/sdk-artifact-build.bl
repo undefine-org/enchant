@@ -1,0 +1,107 @@
+;; Compiler control: exercise the internal producer; normal build/run uses Nix.
+(ns sdk.artifact.build (:require [build :as build] [build-log :as log] [app-resource :as app] [unit-store]))
+
+(def patterns
+ {:prepare (tuple :Elixir.BeamLisp.AOT :prepare_unit 2)
+  :legacy-compile (tuple :Elixir.BeamLisp.AOT :compile_file 2)
+  :source-init (tuple :Elixir.BeamLisp.AOT :load_unit 2)
+  :publication (tuple :Elixir.BeamLisp.Env :publish_binaries! 1)
+  :restore (tuple :Elixir.BeamLisp.AOTCache :restore_prepared 2)})
+
+(defn- measured [action]
+ (doseq [pattern (vals patterns)]
+  (erlang/trace_pattern pattern false (list :local :call_count))
+  (assert (= 1 (erlang/trace_pattern pattern true (list :local :call_count)))))
+ (let [tracer (Process/get :sdk_artifact_tracer)]
+  (erlang/trace :all true (list :call :set_on_spawn (tuple :tracer tracer))))
+ (try
+  (let [started (erlang/monotonic_time :millisecond) result (action)
+        counts (into {} (map (fn [[name pattern]] [name (elem (erlang/trace_info pattern :call_count) 1)]) patterns))]
+   (println "SDK-ARTIFACT-OBSERVED" (pr-str counts) (pr-str (:errors result)))
+   (assert (= 0 (:legacy-compile counts)))
+   (assert (= 0 (:source-init counts)))
+   (let [barrier (erlang/trace_delivered :all) ticket (erlang/make_ref)
+         targets (to-list (mapcat :modules (vals (:manifest result))))]
+    (receive [:trace_delivered :all seen] :when (= seen barrier) :ready (after 5000 (throw :trace-timeout)))
+    (erlang/send (Process/get :sdk_artifact_tracer) (tuple :finish (erlang/self) ticket targets))
+    (let [publications (receive [:sdk_artifact_publications seen report] :when (= seen ticket) report
+                         (after 5000 (throw :trace-timeout)))]
+     (println "SDK-ARTIFACT-PUBLICATIONS"
+       (pr-str {:targets (:targets publications) :infrastructure-modules (count (:all publications))}))
+     (assert (= {} (:targets publications)))
+     [result (assoc counts :target-publications (count (:targets publications)))
+      (- (erlang/monotonic_time :millisecond) started)])))
+  (finally
+   (erlang/trace :all false (list :call :set_on_spawn))
+   (doseq [pattern (vals patterns)] (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(defn- files [manifest output]
+ (into {} (mapcat (fn [[_ row]]
+                   (map (fn [mod]
+                          (let [name (str (Atom/to_string mod) ".beam")]
+                           [name (crypto/hash :sha256 (File/read! (Path/join output name)))]))
+                        (:modules row))) manifest)))
+
+(doseq [namespace ["build" "build-log" "unit-store"]]
+  (BeamLisp.Loader/ensure_loaded namespace))
+
+(let [root (BeamLisp.Tiers/priv_root) output (System/fetch_env! "BL_SDK_ARTIFACT_OUT")
+      paths (mapv (fn [path] (Path/join root path))
+              ["lib/js/actor.bl" "lib/js/build.bl" "lib/js/emit.bl"
+               "std/sdk/artifact/provider.bl" "std/sdk/artifact/consumer.bl"
+               "std/typed.bl" "std/errors.bl" "std/proc/task.bl" "std/vm/owner.bl"
+               "std/proc/owner-registry.bl" "std/sdk/artifact/java-projection.bl"
+               "lib/java/manifest.bl"])
+      total (count paths)
+      base {:sources paths :root root :jobs 2 :sdk-artifacts? true}
+      before (BeamLisp.Env/capture)
+      reports (atom [])
+      run (fn [name opts expected-compiled expected-cached]
+            (let [destination (Path/join output name)
+                  [result counts ms] (measured #(build/produce! (merge base {:out destination} opts)))]
+             (assert (= [] (:errors result)))
+             (assert (= expected-compiled (:compiled result)))
+             (assert (= expected-cached (:cached result)))
+             (assert (= expected-compiled (:prepare counts)))
+             (assert (= before (BeamLisp.Env/capture)))
+             (assert (not (BeamLisp.Env/loaded_ns? "sdk.artifact.consumer")))
+             (let [report {:stage name :compiled (:compiled result) :cached (:cached result)
+                           :built (:built result) :calls counts :milliseconds ms}]
+              (swap! reports conj report)
+              (println "SDK-ARTIFACT-BUILD" name (pr-str report)))
+             result))
+      initial (run "first" {} total 0)
+      original (files (:manifest initial) (Path/join output "first"))
+      _ (run "first" {} 0 0)
+      restored (run "restored" {:previous (Path/join output "first")} 0 total)
+      forced (run "forced" {:force? true} total 0)]
+ (assert (= original (files (:manifest restored) (Path/join output "restored"))))
+ (assert (= original (files (:manifest forced) (Path/join output "forced"))))
+ (let [victim (first (:modules (get (:manifest initial) (first paths))))]
+  (File/write! (Path/join output (str "first/" (Atom/to_string victim) ".beam")) "corrupt")
+  (run "first" {} 0 1))
+ ;; A unit from another tier generation must compile even when its sources
+ ;; and the global compiler/runtime identities are unchanged.
+ (let [index-file (Path/join output "restored/unit-index.json")
+       original-index (File/read! index-file)
+       index (Jason/decode! original-index)]
+   (try
+     (File/write! index-file
+       (Jason/encode! (assoc-in index ["units" "js.actor" "key"] "another-tier-generation")))
+     (run "tier-key-change" {:previous (Path/join output "restored")} 1 (- total 1))
+     (finally (File/write! index-file original-index))))
+ ;; A macro value changes: only its provider and actual consumer rebuild.
+ (File/write! (Path/join root "std/sdk/artifact/provider.bl") "(ns sdk.artifact.provider) (def base 50) (defmacro forty [] base)\n")
+ (let [changed (run "changed" {:previous (Path/join output "restored")} 2 (- total 2))
+       ebin (Path/join (Path/dirname root) "ebin")
+       _ (build/assemble-outputs! (:manifest changed) (Path/join output "changed") ebin)
+       inventory (BeamLisp.AOT/write_sdk_inventory! root (:manifest changed) ebin (Path/join root "sdk-code.term"))]
+  (assert (> inventory 7))
+  (build/write-precompiled-index! (:manifest changed) ebin (Path/join root "precompiled.term"))
+  (let [applications (Application/spec :beam_lisp :applications) mod (Application/spec :beam_lisp :mod)]
+   (assert (:ok? (app/write! (Path/join ebin "beam_lisp.app") "beam_lisp" "0.1.0" (app/modules-in ebin) applications mod))))
+  (File/write! (Path/join output "producer.json")
+    (Jason/encode! {:status "passed" :runs (to-list @reports) :sdk-code-modules inventory
+                    :initializers-deferred true :target-publications 0 :force-identical true
+                    :profile-in-log (every? :preparation-key (vals (:manifest changed)))})))
+ (println "SDK-ARTIFACT-PRODUCER passed"))

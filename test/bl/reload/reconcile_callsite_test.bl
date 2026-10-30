@@ -1,0 +1,46 @@
+; Compiler metadata below selects a transformation, never a runtime graph or
+; actor authority. Evaluate the actual emitted ANF against ordinary dispatch.
+(ns reload.reconcile-callsite-test
+ (:require [reload.reconcile-callsite :as callsite] [proc.reconcile-runtime :as runtime]
+           [anf :as anf] [lower :as lower]))
+
+(defn- observe [rewrite?]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       namespace (if rewrite? "callsite.shadow.changed" "callsite.shadow.original")]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Compiler/eval_string
+      (str "(ns " namespace ") (def events (atom [])) (def worker :original-class) "
+           "(def ^:per-env start (do (swap! events conj :callee) "
+           " (fn [class opts] (swap! events conj :called) [class opts]))) "
+           "(defn option [] (swap! events conj :argument) {:n 42})"))
+     (let [global (fn [name] {:op :global :ns namespace :name name :ann {}})
+           expression (anf/invoke (global "start")
+                        (anf/cons-cell (global "worker")
+                         (anf/cons-cell (anf/invoke (global "option") (anf/empty-list-node)) (anf/empty-list-node))))
+           context {:targets {[:Elixir.BeamLisp.Server :start 2]
+                              {:class-position 0 :argument-position 1 :operation :start :arity 2}}
+                    :canonical {[namespace "worker"] {:version 1 :declaration "compiler-data/worker"}}}
+           result (if rewrite? (callsite/specialize expression context) {:expression expression :changes []})
+           events (BeamLisp.Env/fetch_exact! namespace "events") before @events
+           value (lower/eval-anf (if rewrite? :Elixir.ReconcileCallsiteChanged :Elixir.ReconcileCallsiteOriginal)
+                                  (:expression result))]
+      {:before before :events @events :value value :changes (count (:changes result))})))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest scoped-shadowing-preserves-callee-argument-order-and-single-evaluation
+ (let [ordinary (observe false) changed (observe true)]
+  (is (= [] (:before ordinary) (:before changed)) "analysis never initializes the callee")
+  (is (= [:original-class {:n 42}] (:value ordinary) (:value changed)))
+  (is (= [:callee :argument :called] (:events ordinary) (:events changed))
+      (pr-str [ordinary changed]))
+  (is (= 1 (:changes changed)) "exercise the guarded specialization, not an unchanged expression")))
+
+(deftest a-real-sdk-constructor-and-source-shaped-recipe-do-not-create-admission
+ (is (= :unsealed-reconcile-constructor
+      (try
+       (runtime/start-call! (BeamLisp.Env/fetch_exact! "core" "start") (list :fake-class)
+                            {:version 1 :declaration "compiler-data/worker"} :start)
+       :wrongly-started
+       (catch error (:kind (ex-data error)))))))

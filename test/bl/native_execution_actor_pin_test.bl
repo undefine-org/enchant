@@ -1,0 +1,83 @@
+(ns native-execution-actor-pin-test
+ (:require [reload.generation :as generation]))
+
+(defn- graph []
+ (generation/prepare!
+  {:application-id "native-actor-pins"
+   :stable-namespaces #{"reload.execution" "proc.super"}
+   :sources {"actor.pin"
+    (str "(ns actor.pin (:require [reload.execution :as execution] [proc.super :as super])) "
+         "(defserver owner (init [_] (ok {:owned (execution/owned?)})) "
+         " (handle-call :read [_ st] (reply {:owned (execution/owned?) :initial st} st))) "
+         "(defn class [] owner) (defn start-owner [] (start owner nil)) "
+         "(super/defsupervisor tree (child :owner owner nil {})) "
+         "(defn start-tree [] (start-link tree))")}}))
+(defn- marker [g]
+ (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope g))))
+(defn- rows [lease]
+ (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ (elem lease 1) (elem lease 2)) true)))
+(defn- native-owner [pid]
+ (elem (first (ets/lookup :beam_lisp_vars (tuple :bl_generation_owner pid))) 1))
+(defn- await [predicate]
+ (loop [left 1000]
+  (cond (predicate) true (zero? left) false
+   :else (do (Process/sleep 5) (recur (dec left))))))
+
+(deftest actual-actor-owns-one-graph-pin-through-callback-and-down
+ (let [g (graph) pid (generation/invoke! g "actor.pin/start-owner" [])
+       lease (:lease (native-owner pid))]
+  (try
+   (is (= (list (marker g)) (elem lease 0)))
+   (is (= 1 (count (rows lease))))
+   (is (= {:owned true :initial {:owned true}} (call pid :read)))
+   (is (= :waiting (:status (generation/retire! g))))
+   (stop pid)
+   (is (await #(empty? (rows lease))))
+   (is (= :retired (:status (generation/retire! g))))
+   (finally (when (Process/alive? pid) (stop pid)) (generation/retire! g)))))
+
+(deftest actual-supervisor-and-child-own-independent-graph-pins
+ (let [g (graph) tree (generation/invoke! g "actor.pin/start-tree" [])
+       child (elem (first (Supervisor/which_children tree)) 1)
+       parent-lease (:lease (native-owner tree)) child-lease (:lease (native-owner child))]
+  (try
+   (is (= (list (marker g)) (elem parent-lease 0)))
+   (is (= (list (marker g)) (elem child-lease 0)))
+   (is (= 1 (count (rows parent-lease))))
+   (is (= 1 (count (rows child-lease))))
+   (is (not= (elem parent-lease 2) (elem child-lease 2)))
+   (is (= {:owned true :initial {:owned true}} (call child :read)))
+   (finally (stop tree) (generation/retire! g)))))
+
+(deftest pending-start-is-pinned-by-env-until-real-creator-death
+ (let [g (graph) parent (erlang/self) capability (atom nil)
+       worker (spawn
+               #(generation/with! g
+                  (fn []
+                   (let [class (generation/invoke! g "actor.pin/class" [])
+                         cap (BeamLisp.Env/begin_server_start! class)]
+                    (erlang/send parent [:pending-actor-pin cap])
+                    (receive :finish :ok)))))
+       graph-id (marker g) env-owner (Process/whereis :Elixir.BeamLisp.Env)
+       pending-rows (fn []
+                     (filter (fn [row]
+                               (let [component (elem (elem row 0) 0)]
+                                (or (= graph-id component) (some #(= component %) (:modules g)))))
+                       (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ env-owner :_) true))))]
+  (try
+   (reset! capability (receive [:pending-actor-pin cap] cap (after 10000 nil)))
+   (is (some? @capability))
+   (let [observed (BeamLisp.Env/server_start_observation (elem @capability 2))]
+    (is (= :pending (:phase observed)))
+    (is (= env-owner (:custody-owner observed)))
+    (is (= true (:retained observed))))
+   (is (= 1 (count (pending-rows))))
+   (is (= graph-id (elem (elem (first (pending-rows)) 0) 0)))
+   (erlang/send worker :finish)
+   (is (await #(not (Process/alive? worker))))
+   (is (await #(nil? (BeamLisp.Env/server_start_observation (elem @capability 2)))))
+   (is (empty? (pending-rows)))
+   (finally
+    (erlang/send worker :finish)
+    (when (Process/alive? worker) (Process/exit worker :kill))
+    (generation/retire! g)))))

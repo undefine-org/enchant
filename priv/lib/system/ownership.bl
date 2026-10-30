@@ -1,0 +1,712 @@
+;; Finite lifecycle analysis of actual ANF. Contracts are assumptions, never
+;; executable adapters or native authority. Unknown paths cannot prove safety.
+(ns system.ownership
+ (:require [anf :as anf] [system.ir :as ir] [system.gfp :as gfp] [errors :as errors]
+           [codebase.phase :as code]))
+
+(defn- fail! [kind]
+ (throw (ex-info "Ownership analysis boundary refused" {:kind kind})))
+(defn- scalar [] {:refs #{} :truth #{true false} :shape :scalar})
+(defn- opaque [] {:refs #{} :truth #{true false} :shape :unknown})
+(defn- literal-value [v]
+ (cond-> {:refs #{} :shape :scalar :truth #{(and (some? v) (not= false v))}}
+  (or (nil? v) (keyword? v)) (assoc :literal v)))
+(defn- origin [node] (select-keys (:ann node) [:file :line :col :end-line :end-col]))
+(defn- call-key [call]
+ (if (= :remote (:mode call)) [:remote (:mod call) (:fun call) (:arity call)]
+  (when-let [ref (get-in call [:callee :ann :binding-reference])]
+   [:binding (:id ref) (:arity call)])))
+
+(defn execution-protocol
+ "Logical registration lifetime contracts for the fixed native API. Every
+  accepted native use still needs actual custody/context/code/deadline checks.
+  These records do not establish adapter conformance or grant admission."
+ []
+ {:version 2 :id 'native-execution-lifecycle-v2
+  :rules
+  {[:remote :Elixir.BeamLisp.Execution :register! 1]
+    {:action :acquire :throws :before :runtime [:native-registration-context]}
+   [:remote :Elixir.BeamLisp.Execution :register! 2]
+    {:action :acquire :throws :before :runtime [:native-registration-context]}
+   [:remote :Elixir.BeamLisp.Execution :invoke! 2]
+    {:action :use :arg 0 :throws :unknown :result :unknown :runtime [:callback-custody :deadline :callback-effects]}
+   [:remote :Elixir.BeamLisp.Execution :close! 1]
+    {:action :native-close :arg 0 :throws :never :idempotent true
+     :runtime [:native-context :close-and-drain]}
+   [:remote :Elixir.BeamLisp.Execution :prepare-handoff! 2]
+    {:action :native-prepare :arg 0 :throws :before :runtime [:native-handoff-preparation]}
+   [:remote :Elixir.BeamLisp.Execution :accept-handoff! 1]
+    {:action :native-accept :arg 0 :throws :before :runtime [:native-owner :handoff-epoch]}
+   [:remote :Elixir.BeamLisp.Execution :accept-handoff! 2]
+    {:action :native-accept :arg 0 :throws :before :runtime [:native-owner :handoff-epoch :native-admission-grant]}}})
+
+(defn- protocol! [protocol]
+ (BeamLisp.CompilerData/check_first_order! protocol {:max-nodes 16384 :max-depth 32 :max-bytes 1048576})
+ (when-not (and (= #{:version :id :rules} (set (keys protocol))) (contains? #{1 2} (:version protocol))
+                (symbol? (:id protocol)) (erlang/is_map (:rules protocol))
+                (<= (count (:rules protocol)) 256)) (fail! :ownership-protocol))
+ (doseq [[key rule] (:rules protocol)]
+  (when-not (and (vector? key)
+                 (or (and (= :remote (first key)) (= 4 (count key))
+                           (erlang/is_atom (nth key 1)) (erlang/is_atom (nth key 2)))
+                     (and (= :binding (first key)) (= 3 (count key)) (erlang/is_binary (nth key 1))))
+                 (int? (last key)) (<= 0 (last key) 64)
+                 (erlang/is_map rule)
+                 (every? #{:action :arg :throws :runtime :idempotent :result} (keys rule))
+                 (contains? #{:acquire :borrow :move :accept :release :escape :use :pure
+                              :native-prepare :native-accept :native-close} (:action rule))
+                 (or (= 2 (:version protocol))
+                     (not (contains? #{:native-prepare :native-accept :native-close} (:action rule))))
+                 (contains? #{:before :after :never :unknown} (:throws rule))
+                 (vector? (:runtime rule)) (<= (count (:runtime rule)) 32)
+                 (every? keyword? (:runtime rule))
+                 (or (not (contains? rule :idempotent)) (contains? #{true false} (:idempotent rule)))
+                 (or (not (contains? rule :result)) (contains? #{:scalar :unknown} (:result rule)))
+                 (or (contains? #{:acquire :pure} (:action rule))
+                     (and (int? (:arg rule)) (<= 0 (:arg rule)) (< (:arg rule) (last key)))))
+   (fail! :ownership-rule)))
+ protocol)
+
+(defn handoff-outcomes
+ "Finite cleanup-obligation relation for native handoff outcomes. IDs are
+  symbolic data, not native registrations. This neither executes a command
+  nor proves custody; real owner/epoch/admission/death fences remain runtime.
+  A cancelled observation can leave a prepublished target needing cleanup."
+ [resources command]
+ (BeamLisp.CompilerData/check_first_order! [resources command]
+  {:max-nodes 65536 :max-depth 96 :max-bytes 4194304})
+ (when-not (and (map? resources) (<= (count resources) 512) (map? command)
+                (or (and (= :close (:operation command)) (= #{:operation :target} (set (keys command))))
+                    (and (= :owner-down (:operation command)) (= #{:operation :targets} (set (keys command)))
+                         (vector? (:targets command)) (<= (count (:targets command)) 512)
+                         (every? #(contains? resources %) (:targets command)))
+                    (and (contains? #{:prepare :accept} (:operation command))
+                         (= #{:operation :source :target} (set (keys command)))))
+                (every? (fn [[id row]]
+                          (and (some? id) (map? row)
+                               (contains? #{:owned :prepared :moved :released} (:phase row))
+                               (or (nil? (:borrows row)) (empty? (:borrows row))))) resources))
+  (fail! :ownership-handoff-model-input))
+ (let [source (:source command) target (:target command)
+       source-phase (get-in resources [source :phase]) target-phase (get-in resources [target :phase])
+       result (fn [state outcome returned] {:resources state :outcome outcome :return returned})
+       cancelled (result resources :cancelled {:kind :status :status :cancelled})
+       accepted (fn [state] (result state :accepted {:kind :status :status :accepted :registration target}))
+       outcomes
+       (case (:operation command)
+        :owner-down
+         [(result (reduce #(assoc-in %1 [%2 :phase] :released) resources (:targets command))
+                  :owner-down {:kind :owner-down})]
+        :close
+         (do (when-not (contains? resources target) (fail! :ownership-handoff-model-target))
+             [(result (assoc-in resources [target :phase] :released) :closed {:kind :literal :value :ok})])
+        :prepare
+         (do (when-not (and (contains? resources source) (some? target) (not (contains? resources target)))
+               (fail! :ownership-handoff-model-preparation))
+             (if (= :owned source-phase)
+              [(result resources :cancelled {:kind :literal :value :cancelled})
+               (result (assoc resources target {:phase :prepared :borrows #{} :handoff-source source})
+                       :prepared {:kind :prepared :source source :target target})]
+              [(result resources :cancelled {:kind :literal :value :cancelled})]))
+        :accept
+         (do (when-not (and (contains? resources source) (contains? resources target)
+                            (= source (get-in resources [target :handoff-source])))
+               (fail! :ownership-handoff-model-acceptance))
+             (cond
+              (= :owned target-phase) [cancelled (accepted resources)]
+              (and (= :prepared target-phase) (= :owned source-phase))
+               [cancelled
+                (result resources :busy {:kind :status :status :busy :detail :code-retention-capacity})
+                (accepted (-> resources (assoc-in [source :phase] :moved)
+                              (assoc-in [target :phase] :owned)))]
+              :else [cancelled])))]
+  {:version 1 :scope :native-handoff-cleanup-obligations :native-admission false :outcomes outcomes}))
+
+;; The graph records actual abstract transitions, including exceptional exits.
+;; It uses the existing greatest-fixpoint engine to ask AG(no bad/opaque state).
+(defn- point! [engine state path]
+ (let [key [path (dissoc state :point)] found (get-in @engine [:index key])]
+  (if (some? found) (assoc state :point found)
+   (let [id (count (:states @engine))]
+    (when (>= id (:max-states @engine)) (fail! :ownership-state-budget))
+    (swap! engine (fn [all] (-> all (assoc-in [:index key] id)
+                               (assoc-in [:states id] (dissoc state :point)))))
+    (assoc state :point id)))))
+(defn- edge! [engine from state path]
+ (let [next (point! engine state path)]
+  (when (some? from) (swap! engine update-in [:edges from] (fn [out] (conj (or out #{}) (:point next)))))
+  next))
+(defn- issue [state kind node detail]
+ (update state :issues conj {:kind kind :origin (origin node) :detail detail :certainty :possible}))
+(defn- unknown [state kind node]
+ (-> state (assoc :opaque true) (issue kind node nil)))
+(defn- value [state v] (assoc state :value v))
+(defn- token [id] {:refs #{id} :truth #{true} :shape :resource})
+(defn- aggregate [values]
+ {:refs (reduce into #{} (map :refs values)) :truth #{true} :shape :aggregate
+  :opaque (some #(or (:opaque %) (= :unknown (:shape %))) values)})
+(defn- envelope [shape fields]
+ {:shape shape :fields fields :refs (reduce into #{} (map :refs (vals fields))) :truth #{true}})
+
+(declare visit iterate-clause)
+(defn- work! [engine]
+ (when (<= (:remaining @engine) 0) (fail! :ownership-step-budget))
+ (swap! engine update :remaining dec))
+(defn- visit-position [node state path engine depth tail?]
+ (mapv #(assoc % :loop-tail (:loop-tail state))
+       (visit node (assoc state :loop-tail tail?) path engine depth)))
+(defn- cap! [engine paths]
+ (when (> (count paths) (:max-paths @engine)) (fail! :ownership-path-budget))
+ paths)
+(defn- sequence-nodes [nodes paths env-path engine depth]
+ (reduce (fn [paths [index node]]
+           (cap! engine
+            (mapcat (fn [state]
+                      (if (= :normal (:exit state))
+                       (visit-position node state (conj env-path index) engine depth
+                                       (and (:loop-tail state) (= index (dec (count nodes))))) [state])) paths)))
+         paths (map-indexed (fn [index item] [index item]) nodes)))
+
+(defn- operands [nodes state path engine depth]
+ (reduce (fn [paths [index node]]
+           (cap! engine
+            (mapcat (fn [entry]
+                      (if (= :normal (:exit (:state entry)))
+                       (let [retained (:retained-refs (:state entry))
+                             suspended (reduce into retained (map :refs (:values entry)))]
+                        (map (fn [next] {:state (assoc next :retained-refs retained)
+                                         :values (conj (:values entry) (:value next))})
+                             (visit-position node (assoc (:state entry) :retained-refs suspended)
+                                             (conj path index) engine depth false)))
+                       [entry])) paths)))
+         [{:state state :values []}] (map-indexed (fn [index item] [index item]) nodes)))
+
+(defn- resource-argument [state values rule node]
+ (let [v (get values (:arg rule)) refs (:refs v)]
+  (if (and (= :resource (:shape v)) (= 1 (count refs)))
+   [(first refs) state]
+   [nil (unknown state :ownership-unresolved-resource node)])))
+
+(defn- closure-value [node state path]
+ ;; A finite recipe from actual ANF, not an executable host callback. Preserve
+ ;; only names observed in the body; parameters shadow captures on invocation.
+ (let [names (atom #{}) todo (atom (list node))]
+  (loop [left 4096]
+   (when (and (seq @todo) (> left 0))
+    (let [n (first @todo)]
+     (reset! todo (concat (ir/child-nodes n) (rest @todo)))
+     (when (= :var (:op n)) (swap! names conj (:name n)))
+     (recur (dec left)))))
+  (let [captured (select-keys (:env state) @names)]
+   (value (if (seq @todo) (unknown state :ownership-latent-budget node) state)
+          {:refs (reduce into #{} (map :refs (vals captured)))
+           :truth #{true} :shape :closure
+           :function {:id path :node node :env captured}}))))
+
+(defn- return-from-call [caller result]
+ (assoc result :env (:env caller)
+               :loop (:loop caller) :loop-tail (:loop-tail caller)
+               :protected-depth (:protected-depth caller) :retained-refs (:retained-refs caller)
+               :issues (into (:issues caller) (:issues result))
+               :obligations (into (:obligations caller) (:obligations result))
+               :opaque (or (:opaque caller) (:opaque result))))
+
+(defn- fresh-resource-id [state path]
+ (loop [id [:allocation path] salt 0]
+  (if (contains? (:resources state) id)
+   (recur [:allocation path salt] (inc salt)) id)))
+
+(defn- simple-clause? [clause]
+ (let [names (map :name (filter #(= :pvar (:pop %)) (:pats clause)))]
+  (and (nil? (:guard clause))
+       (every? #(contains? #{:pvar :pwild} (:pop %)) (:pats clause))
+       (= (count names) (count (distinct names))))))
+
+(defn- local-call [node callable args state path engine depth]
+ (let [function (:function callable) clauses (get-in function [:node :clauses])
+       matches (filter #(= (count args) (count (:pats %))) clauses)
+       supported? simple-clause?]
+  (cond
+   (empty? matches) [(assoc state :exit :raised :value (opaque))]
+   ;; Selecting the first unconditional matching clause is exact. A guarded
+   ;; or destructuring predecessor cannot be silently skipped.
+   (not (supported? (first matches)))
+    [(value (unknown state :ownership-unsupported-call-clause node) (opaque))]
+   :else
+    (let [clause (first matches)
+          bound (reduce (fn [env [pattern argument]]
+                          (if (= :pvar (:pop pattern)) (assoc env (:name pattern) argument) env))
+                        (:env function) (map (fn [p v] [p v]) (:pats clause) args))
+          retained (reduce into (:retained-refs state) (map :refs (vals (:env state))))
+          input (assoc state :env bound :value (scalar) :issues #{} :obligations #{} :opaque false
+                             :loop nil :loop-tail false :protected-depth 0 :retained-refs retained)
+          ;; The entire semantic input is part of the context, including
+          ;; resource phases, aliases and captures. Inherited report facts do
+          ;; not affect execution: summarize local deltas and union them back
+          ;; into every caller. Points are graph addresses, not semantic input.
+          key [(:id function) (:node function) (dissoc input :point)]
+          known (get-in @engine [:summaries key])]
+     (cond
+      (= :active (:status known))
+       [(value (unknown state :ownership-recursive-call node) (opaque))]
+      (= :complete (:status known))
+       (do
+        (swap! engine update :summary-hits inc)
+        ;; Each reuse has its own return edge. Reconnecting the old body exit
+        ;; to several callers invents call/return cycles and defeats AF checks.
+        (mapv (fn [[index terminal]]
+                (edge! engine (:point state) (return-from-call state terminal)
+                       [path :summary-return index]))
+              (map-indexed (fn [i v] [i v]) (:terminals known))))
+      :else
+       (let [id (count (:summaries @engine))]
+        (when (>= id (:max-summaries @engine)) (fail! :ownership-summary-budget))
+        (let [path [:call-context id]
+              initial (edge! engine (:point state) input [path :entry])]
+         (swap! engine assoc-in [:summaries key] {:status :active :initial (:point initial)})
+         (let [terminals (if (:self function)
+                           (iterate-clause clause (:self function) callable
+                            (assoc initial :env (:env function)) args path engine depth)
+                           (visit (:body clause) initial path engine depth))]
+          (swap! engine assoc-in [:summaries key]
+                 {:status :complete :initial (:point initial) :terminals terminals})
+          (mapv #(return-from-call state %) terminals)))))))))
+
+(defn- apply-rule [node call rule values state path]
+ (let [action (:action rule) id (fresh-resource-id state path)
+       state (reduce (fn [state requirement]
+                       (update state :obligations conj
+                        {:kind requirement :site path :callee (call-key call) :origin (origin node)}))
+                     state (:runtime rule))
+       [target state] (if (contains? #{:acquire :pure} action) [nil state]
+                        (resource-argument state values rule node))
+       prior (get-in state [:resources target]) phase (:phase prior)
+       bad (fn [state kind] (issue state kind node {:resource target :phase phase :action action}))]
+  (cond
+   (= :pure action) (value (if (= :scalar (:result rule)) state
+                            (unknown state :ownership-unknown-result node))
+                          (if (= :scalar (:result rule)) (scalar) (opaque)))
+   (= :acquire action)
+    (if (some #(seq (:refs %)) values)
+     (value (unknown state :ownership-retained-argument node) (opaque))
+     (-> state (assoc-in [:resources id] {:phase :owned :borrows #{}})
+               (value (token id))))
+   (nil? target) (value state (opaque))
+   (= :use action)
+    (let [state (if (contains? #{:owned :borrowed} phase) state (bad state :ownership-use-after-transfer))]
+     (value (if (= :scalar (:result rule)) state (unknown state :ownership-unknown-result node))
+            (if (= :scalar (:result rule)) (scalar) (opaque))))
+   (= :borrow action)
+    (if (= :owned phase)
+     (-> state (update-in [:resources target :borrows] conj id)
+         (assoc-in [:resources id] {:phase :borrowed :parent target}) (value (token id)))
+     (value (bad state :ownership-borrow-without-owner) (opaque)))
+   (= :move action)
+    (if (and (= :owned phase) (empty? (:borrows prior)))
+     (-> state (assoc-in [:resources target :phase] :pending)
+         (assoc-in [:resources id] {:phase :pending :parent target :transfer true}) (value (token id)))
+     (value (bad state :ownership-move-without-exclusive-owner) (opaque)))
+   (= :accept action)
+    (if (and (:transfer prior) (= :pending phase)
+             (= :pending (get-in state [:resources (:parent prior) :phase])))
+     (-> state (assoc-in [:resources (:parent prior) :phase] :moved)
+         (assoc-in [:resources target :phase] :accepted)
+         (assoc-in [:resources id] {:phase :owned :borrows #{}}) (value (token id)))
+     (value (bad state :ownership-invalid-acceptance) (opaque)))
+   (= :escape action)
+    (value (if (and (= :owned phase) (empty? (:borrows prior)))
+             (assoc-in state [:resources target :phase] :escaped)
+             (bad state :ownership-invalid-escape)) (scalar))
+   (= :release action)
+    (cond
+     (= :borrowed phase) (-> state (assoc-in [:resources target :phase] :released)
+                             (update-in [:resources (:parent prior) :borrows] disj target)
+                             (value (scalar)))
+     (and (= :released phase) (:idempotent rule)) (value state (scalar))
+     (and (= :owned phase) (empty? (:borrows prior)))
+      (-> state (assoc-in [:resources target :phase] :released) (value (scalar)))
+     :else (value (bad state :ownership-invalid-release) (scalar)))
+   :else (value (unknown state :ownership-unknown-rule node) (opaque)))))
+
+(defn- native-rule-results [node call rule values state path]
+ (let [state (reduce (fn [s requirement]
+                       (update s :obligations conj
+                        {:kind requirement :site path :callee (call-key call) :origin (origin node)}))
+                     state (:runtime rule))
+       action (:action rule) input (get values (:arg rule))
+       [target state] (if (= :native-accept action) [nil state]
+                       (resource-argument state values rule node))
+       source-value (get-in input [:fields :source]) target-value (get-in input [:fields :accepted])
+       valid-preparation? (and (= :native-handoff (:shape input))
+                               (= :resource (:shape source-value)) (= 1 (count (:refs source-value)))
+                               (= :resource (:shape target-value)) (= 1 (count (:refs target-value))))
+       command (cond
+                 (and (= :native-prepare action) target)
+                  {:operation :prepare :source target :target (fresh-resource-id state path)}
+                 (and (= :native-close action) target) {:operation :close :target target}
+                 (and (= :native-accept action) valid-preparation?)
+                  {:operation :accept :source (first (:refs source-value)) :target (first (:refs target-value))})]
+  (if-not command [(value (unknown state :ownership-unresolved-native-handoff node) (opaque))]
+   (mapv (fn [outcome]
+           (let [returned (:return outcome)
+                 v (case (:kind returned)
+                     :literal (literal-value (:value returned))
+                     :prepared (envelope :native-handoff {:source (token (:source returned))
+                                                         :accepted (token (:target returned))})
+                     :status (envelope :record
+                              (cond-> {:status (literal-value (:status returned))}
+                               (contains? returned :registration) (assoc :registration (token (:registration returned)))
+                               (contains? returned :detail) (assoc :kind (literal-value (:detail returned))))))]
+            (value (assoc state :resources (:resources outcome)) v)))
+         (:outcomes (handoff-outcomes (:resources state) command))))))
+
+(defn- keyword-projection [node state values]
+ (let [key (:literal (first values)) collection (second values) default (get values 2 (literal-value nil))]
+  (cond
+   (contains? #{:native-handoff :record} (:shape collection))
+    (value state (get (:fields collection) key default))
+   (and (contains? collection :literal) (contains? #{nil :cancelled} (:literal collection)))
+    (value state default)
+   :else (value (unknown state :ownership-unknown-projection node) (opaque)))))
+
+(defn- call-node [node state path engine depth]
+ (let [call (ir/call-site node)
+       nodes (if (= :remote (:mode call)) (:args call) (cons (:callee call) (:args call)))]
+  (mapcat
+   (fn [{:keys [state values]}]
+    (if (not= :normal (:exit state)) [state]
+     (let [rule (get-in @engine [:protocol :rules (call-key call)])
+           args (if (= :remote (:mode call)) values (vec (rest values)))]
+      (if-not (and rule (some? (:arity call)))
+       (cond
+        (and (not= :remote (:mode call)) (contains? #{1 2} (:arity call))
+             (keyword? (:literal (first values))))
+         [(keyword-projection node state values)]
+        (and (not= :remote (:mode call)) (some? (:arity call)) (= :closure (:shape (first values)))
+             (:loop-tail state) (= (:protected-depth state) (get-in state [:loop :barrier]))
+             (= (:function (first values)) (get-in state [:loop :function :function]))
+             (= (:arity call) (get-in state [:loop :arity])))
+         [(assoc state :exit :recur :recur-values args)]
+        (and (not= :remote (:mode call)) (some? (:arity call)) (= :closure (:shape (first values))))
+         (local-call node (first values) args state path engine depth)
+        :else [(value (unknown state :ownership-unknown-call node) (opaque))])
+       (let [results (if (contains? #{:native-prepare :native-accept :native-close} (:action rule))
+                       (native-rule-results node call rule args state path)
+                       [(apply-rule node call rule args state path)])
+             raised (fn [state] (assoc state :exit :raised :value (opaque)))]
+        (case (:throws rule)
+         :never results
+         :before (conj results (raised state))
+         :after (into results (map raised results))
+         :unknown (conj results (raised (unknown state :ownership-exception-effect node)))))))))
+   (operands nodes state (conj path :arguments) engine depth))))
+
+(defn- after-node [node states path engine depth]
+ (if (nil? node) states
+  (mapcat
+   (fn [before]
+    (map (fn [after]
+           (if (= :normal (:exit after))
+            (assoc after :exit (:exit before) :value (:value before)) after))
+         (visit node (assoc before :exit :normal) path engine depth))) states)))
+
+(defn- collect-released [state]
+ ;; Active obligations never disappear. Completed rows can be forgotten only
+ ;; when no current or suspended caller alias (including captures) can name
+ ;; them. Keep parent/borrow links transitively to prevent allocation-site ABA.
+ (let [resources (:resources state)
+       named (reduce into (:retained-refs state) (map :refs (vals (:env state))))
+       roots (into named (keep (fn [[id row]]
+                                 (when (contains? #{:owned :borrowed :pending :prepared} (:phase row)) id)) resources))
+       live (loop [live roots]
+              (let [next (reduce (fn [out id]
+                                  (let [row (get resources id)]
+                                   (cond-> (into out (:borrows row))
+                                    (:parent row) (conj (:parent row))
+                                    (:handoff-source row) (conj (:handoff-source row))))) live live)]
+               (if (= live next) live (recur next))))]
+  (assoc state :resources (select-keys resources live))))
+
+(defn- iterate-clause [clause self function state values path engine depth]
+ (let [caller state target {:self self :arity (count values) :control path
+                             :barrier (:protected-depth state) :function function}
+            marker {:shape :scaffold-self :control path :truth #{true}
+                    :refs (reduce into #{} (map :refs (vals (:env caller))))}
+            retained (reduce into (:retained-refs state) (map :refs (vals (:env state))))
+            restore (fn [next]
+                       (assoc next :env (:env caller) :loop (:loop caller)
+                                   :loop-tail (:loop-tail caller) :retained-refs (:retained-refs caller)
+                                   :protected-depth (:protected-depth caller)))]
+       (loop [frontier [{:state state :values values}] seen {} terminals []]
+        (if (empty? frontier) (mapv restore terminals)
+         (let [item (first frontier) old (:state item)
+               bound (reduce (fn [env [pattern argument]]
+                               (if (= :pvar (:pop pattern)) (assoc env (:name pattern) argument) env))
+                             (assoc (:env caller) self marker)
+                             (map (fn [p v] [p v]) (:pats clause) (:values item)))
+               next (-> old (assoc :env bound :loop target :loop-tail true :retained-refs retained
+                                   :exit :normal :value (scalar))
+                            (dissoc :recur-values) collect-released)
+               key (dissoc next :point) previous (get seen key)]
+          (if (some? previous)
+           (do
+            (swap! engine update :loop-back-edges inc)
+            (swap! engine update-in [:edges (:point old)] #(conj (or % #{}) previous))
+            (recur (vec (rest frontier)) seen terminals))
+           (do
+            (when (>= (:loop-states @engine) (:max-loop-states @engine)) (fail! :ownership-loop-budget))
+            (swap! engine update :loop-states inc)
+            (let [initial (edge! engine (:point old) next [path :loop-entry])
+                  exits (visit (:body clause) initial (conj path :loop-body) engine depth)
+                  back (filter #(= :recur (:exit %)) exits)
+                  finished (remove #(= :recur (:exit %)) exits)]
+             (recur (into (vec (rest frontier)) (map (fn [s] {:state s :values (:recur-values s)}) back))
+                    (assoc seen key (:point initial)) (cap! engine (into terminals finished)))))))))))
+
+(defn- loop-node [node state path engine depth]
+ (let [inner (ir/scaffold-inner (:fn node)) clauses (:clauses inner) clause (first clauses)
+       supported? (and (= 1 (count clauses)) (simple-clause? clause)
+                       (= (count (:pats clause)) (count (:args node))))]
+  (if-not supported? [(value (unknown state :ownership-loop-clause node) (opaque))]
+   (mapcat (fn [{:keys [state values]}]
+             (if (not= :normal (:exit state)) [state]
+              (iterate-clause clause (:name (:fn node)) nil state values path engine depth)))
+    (operands (:args node) state (conj path :loop-arguments) engine depth)))))
+
+(defn- recur-node [node state path engine depth]
+ (let [target (:loop state)]
+  (if-not (and target (ir/recur? node (:self target)) (:loop-tail state)
+                (= :scaffold-self (get-in state [:env (:self target) :shape]))
+                (= (:control target) (get-in state [:env (:self target) :control]))
+                (= (:barrier target) (:protected-depth state))
+                (= (:arity target) (count (ir/recur-vals node))))
+   [(value (unknown state :ownership-unsupported-recursion node) (opaque))]
+   (mapv (fn [{:keys [state values]}]
+           (if (= :normal (:exit state)) (assoc state :exit :recur :recur-values values) state))
+         (operands (ir/recur-vals node) state (conj path :recur-arguments) engine depth)))))
+
+(defn- visit [node state path engine depth]
+ (when (<= depth 0) (fail! :ownership-step-budget))
+ (work! engine)
+ (let [state (edge! engine (:point state) state [path :enter]) start (:point state)
+       depth (dec depth) op (:op node)
+       result
+       (cond
+        (= :lit op) [(value state (literal-value (:val node)))]
+        (= :enil op) [(value state (scalar))]
+        (= :var op)
+         (let [v (get-in state [:env (:name node)] (opaque))]
+          [(value (if (or (= :unknown (:shape v)) (:opaque v))
+                    (unknown state :ownership-unknown-variable node) state) v)])
+        (= :global op) [(value (unknown state :ownership-ambient-global node) (opaque))]
+        (ir/anf-loop? node) (loop-node node state path engine depth)
+        (ir/recur? node) (recur-node node state path engine depth)
+        (ir/self-scaffold? node)
+         (mapv #(assoc-in % [:value :function :self] (:name node))
+               (visit (ir/scaffold-inner node) state (conj path :closure) engine depth))
+        (and (ir/knot? node) (= (:name (:fn node)) (get-in state [:loop :self]))
+             (= :scaffold-self (get-in state [:env (:name (:fn node)) :shape]))
+             (= (get-in state [:loop :control]) (get-in state [:env (:name (:fn node)) :control]))
+             (get-in state [:loop :function]))
+         [(value state (get-in state [:loop :function]))]
+        (= :let op)
+         (mapcat (fn [next]
+                   (if (not= :normal (:exit next)) [next]
+                    (let [old (:env next)]
+                     (map #(assoc % :env old)
+                      (visit (:body node) (assoc-in next [:env (:name node)] (:value next))
+                             (conj path :body) engine depth)))))
+                 (visit-position (:init node) state (conj path :init) engine depth false))
+        (= :do op) (sequence-nodes (:stmts node) [state] path engine depth)
+        (= :if op)
+         (mapcat (fn [next]
+                   (if (not= :normal (:exit next)) [next]
+                    (mapcat (fn [truth]
+                              (visit (if truth (:then node) (:else node)) next
+                                     (conj path (if truth :then :else)) engine depth))
+                            (get-in next [:value :truth] #{true false}))))
+                 (visit-position (:test node) state (conj path :test) engine depth false))
+        (= :try op)
+         (let [barrier (:protected-depth state)
+               protected (assoc state :protected-depth (inc barrier))
+               body (visit (:body node) protected (conj path :protected) engine depth)
+               caught
+               (mapcat (fn [next]
+                         (if (or (= :normal (:exit next)) (empty? (:catch node))) [next]
+                          ;; Unknown exception matching explores every handler
+                          ;; and the unhandled path unless the last is total.
+                          (let [handlers (:catch node)
+                                total? (fn [cl] (and (nil? (:guard cl))
+                                                 (every? #(contains? #{:pvar :pwild} (:pop %)) (:pats cl))))
+                                handled (mapcat (fn [[index clause]]
+                                                  (let [env (:env next)
+                                                        scoped (reduce #(assoc %1 %2 (opaque)) env (ir/clause-pattern-vars clause))]
+                                                   (map #(assoc % :env env)
+                                                    (visit (:body clause) (cond-> (assoc next :env scoped :exit :normal)
+                                                                         (some? (:guard clause))
+                                                                         (unknown :ownership-handler-guard clause)
+                                                                         (some #(seq (ir/pattern-expressions %)) (:pats clause))
+                                                                         (unknown :ownership-handler-pattern-keys clause))
+                                                           (conj path [:catch index]) engine depth))))
+                                                (map-indexed (fn [index item] [index item]) handlers))]
+                           (if (some total? handlers) handled (cons next handled))))) body)]
+          (mapv #(assoc % :protected-depth barrier)
+                (after-node (:after node) caught (conj path :after) engine depth)))
+        (= :fn op) [(closure-value node state path)]
+        (ir/call-site node) (call-node node state path engine depth)
+        (= :arith op)
+         (mapcat (fn [{:keys [state values]}]
+                   (if (= :normal (:exit state))
+                    [(value state (scalar)) (assoc state :exit :raised :value (opaque))]
+                    [state]))
+                 (operands (ir/child-nodes node) state path engine depth))
+        (contains? #{:tuple :map :cons} op)
+         (map (fn [{:keys [state values]}]
+                (if (= :normal (:exit state))
+                 (let [v (aggregate values)]
+                  (value (if (:opaque v) (unknown state :ownership-unknown-aggregate node) state) v)) state))
+              (operands (ir/child-nodes node) state path engine depth))
+        :else [(value (unknown state :ownership-unsupported-node node) (opaque))])]
+  (cap! engine
+   (mapv #(edge! engine (or (:point %) start) % [path :exit]) result))))
+
+(defn- finish [state node]
+ (let [out (:value state)
+       state (if (and (= :normal (:exit state)) (seq (:refs out)))
+               (issue state :ownership-returned-resource node {:resources (:refs out)}) state)
+       state (if (and (= :normal (:exit state)) (= :unknown (:shape out)))
+               (unknown state :ownership-unknown-return node) state)]
+  (reduce (fn [state [id resource]]
+            (if (contains? #{:owned :borrowed :pending :prepared} (:phase resource))
+             (issue state :ownership-unfinished-lifetime node {:resource id :phase (:phase resource)}) state))
+          state (:resources state))))
+
+(defn- cleanup-progress [engine states edges]
+ (let [active? (fn [id point]
+                 (contains? #{:owned :borrowed :pending :prepared}
+                            (get-in states [point :resources id :phase])))
+       ;; This finite graph pass must not build retained LazySeq recipes for
+       ;; every state/resource pair. Its admission budget is the engine's work
+       ;; bound, independent of unrelated VM-wide lazy-cache occupancy.
+       points (maps/keys states)
+       resources (reduce (fn [out [point state]]
+                           (reduce (fn [out id] (if (active? id point) (conj out id) out))
+                                   out (maps/keys (:resources state)))) #{} states)
+       unresolved
+       (reduce (fn [out id]
+               (let [released (gfp/af points
+                                (fn [point] (work! engine) (get edges point #{}))
+                                (fn [point] (work! engine) (not (active? id point))))
+                     pending (Enum/filter points #(and (active? id %) (not (contains? released %))))]
+                (if (seq pending)
+                 (conj out {:resource id :states (count pending) :sample (vec (Enum/take pending 16))}) out)))
+             [] resources)]
+  {:scope :finite-cleanup-inevitability :status (if (seq unresolved) :unknown :proved)
+   :resources (count resources) :unresolved (count unresolved) :witnesses (vec (Enum/take unresolved 32))
+   :termination :not-proved :native-admission false}))
+
+(defn- failure-evidence [kind reason stack]
+ ;; Keep only VM-supplied names and arities. Never inspect a reason, retain
+ ;; stack arguments, or invoke a user exception/printing protocol here.
+ (let [tag (cond
+             (erlang/is_atom reason) reason
+             (and (erlang/is_map reason) (erlang/is_map_key :__struct__ reason)
+                  (erlang/is_atom (erlang/map_get :__struct__ reason)))
+              (erlang/map_get :__struct__ reason)
+             (and (erlang/is_tuple reason) (> (erlang/tuple_size reason) 0)
+                  (erlang/is_atom (erlang/element 1 reason)))
+              (erlang/element 1 reason)
+             :else :opaque)
+       frames (Enum/map (Enum/take stack 8)
+                (fn [frame]
+                  (let [arity (erlang/element 3 frame)]
+                   {:module (erlang/element 1 frame) :function (erlang/element 2 frame)
+                    :arity (if (erlang/is_integer arity) arity (erlang/length arity))}))) ]
+  {:class kind :reason tag :frames (vec frames)}))
+
+(defn check
+ "Check entry ANF against a finite first-order lifecycle protocol. Proof is
+  relative to those contracts; native guards remain runtime obligations.
+  Refusal means a possible abstract violation, not a concrete execution proof."
+ ([entries protocol] (check entries protocol {}))
+ ([entries protocol options]
+  (try
+   (protocol! protocol)
+   (when-not (and (erlang/is_map options)
+                  (every? #{:max-steps :max-states :max-paths :max-summaries :max-loop-states} (keys options))
+                  (every? (fn [[key maximum]]
+                            (let [n (get options key maximum)] (and (int? n) (<= 1 n maximum))))
+                          [[:max-steps 100000] [:max-states 4096] [:max-paths 256] [:max-summaries 512]
+                           [:max-loop-states 1024]]))
+    (fail! :ownership-budget-options))
+   (BeamLisp.CompilerData/check_first_order! entries {:max-nodes 262144 :max-depth 128 :max-bytes 16777216})
+   (when-not (and (or (vector? entries) (erlang/is_list entries)) (<= 1 (count entries) 128))
+    (fail! :ownership-entries))
+   (let [limits (merge {:max-steps 100000 :max-states 4096 :max-paths 256
+                        :max-summaries 512 :max-loop-states 1024} options)
+         protocol-key (crypto/hash :sha256 (erlang/term_to_binary protocol (list :deterministic)))
+         analysis-key (crypto/hash :sha256
+                       (erlang/term_to_binary ['ownership-flow-v2 entries protocol limits] (list :deterministic)))
+         engine (atom {:protocol protocol :states {} :index {} :edges {} :summaries {} :summary-hits 0
+                       :loop-states 0 :loop-back-edges 0 :max-loop-states (get options :max-loop-states 1024)
+                       :max-summaries (get options :max-summaries 512)
+                       :remaining (get options :max-steps 100000)
+                       :max-states (get options :max-states 4096) :max-paths (get options :max-paths 256)})
+         results
+         (mapv (fn [[index entry]]
+                 (let [node (:body entry)
+                       _ (when-not (and (= #{:id :body} (set (keys entry))) (some? (:id entry))
+                                         (ir/node? node)) (fail! :ownership-entry-body))
+                       ;; Use the compiler's validator, including exact node
+                       ;; fields and catch/pattern grammar, before interpreting.
+                       _ (anf/module :Elixir.BeamLisp.OwnershipInput
+                           [{:op :defn-clause :fname :entry :params [] :guard nil :body node :ann {}}]
+                           [] [])
+                       initial (point! engine {:env {} :resources {} :value (scalar) :exit :normal
+                                               :issues #{} :obligations #{} :opaque false
+                                               :loop nil :loop-tail false :protected-depth 0 :retained-refs #{}} [index :entry])
+                       terminals (visit node initial [index] engine 96)
+                       terminals (mapv #(edge! engine (:point %) (finish % node) [index :return]) terminals)]
+                  {:id (:id entry) :initial (:point initial) :terminals (mapv :point terminals)}))
+               (map-indexed (fn [index item] [index item]) entries))
+         states (:states @engine) edges (:edges @engine)
+         bad? (fn [id] (let [state (get states id)] (or (:opaque state) (seq (:issues state)))))
+         safe (gfp/safe-region (keys states) #(get edges % #{}) bad?)
+         issues (set (mapcat :issues (vals states))) obligations (set (mapcat :obligations (vals states)))
+         opaque? (some :opaque (vals states))
+         all-safe? (every? #(contains? safe (:initial %)) results)
+         progress (if (and all-safe? (not opaque?)) (cleanup-progress engine states edges)
+                    {:scope :finite-cleanup-inevitability :status :not-checked :native-admission false})]
+    {:version 2 :scope :finite-anf-entry-lifecycle :profile 'ownership-flow-v2
+     :protocol (:id protocol) :protocol-key protocol-key :analysis-key analysis-key :limits limits
+     :native-admission false
+     :status (cond opaque? :unknown (not all-safe?) :refused
+                   (not= :proved (:status progress)) :unknown (seq obligations) :conditional :else :proved)
+     :assumptions {:protocol-contracts true :future-native-custody :runtime :concrete-counterexample false}
+     :coverage {:immediate-control-flow true :latent-bodies :on-known-invocation
+                :local-calls :contextual-transitions :guarded-or-destructuring-calls :unknown
+                :tail-loops :finite-worklist :recur-across-handler-or-nontail :unknown
+                :recursive-and-unsupported-control :unknown :exception-contracts :explicit}
+     :cleanup progress
+     :loops {:states (:loop-states @engine) :back-edges (:loop-back-edges @engine)}
+     :summaries {:contexts (count (:summaries @engine)) :hits (:summary-hits @engine)
+                 :scope :entry-local :reuse-across-snapshots false :native-admission false}
+     :entries results :states (count states) :steps (- (get options :max-steps 100000) (:remaining @engine))
+     :issues (vec issues) :runtime-obligations (vec obligations)
+     :diagnostics (vec (Enum/filter
+                        (Enum/map issues #(errors/node->warning :ownership {:ann (:origin %)}
+                                            (str "Possible ownership violation: " (name (:kind %)))))
+                        some?))})
+   (catch-raw [error-kind error error-stack]
+    {:version 2 :scope :finite-anf-entry-lifecycle :status :unknown :native-admission false
+     :kind (or (:kind (ex-data error)) :ownership-analysis-error)
+     :exception (failure-evidence error-kind error error-stack)}))))
+
+(defn analyze
+ "Consume the same validated contextual program/facts as phase analysis.
+  No Source parsing, expansion, mutable Env lookup or native admission."
+ ([program] (analyze program (execution-protocol)))
+ ([program protocol]
+  (let [facts (code/facts program)]
+   (assoc (check [{:id [:program (:entry program)] :body (:node program)}] protocol)
+          :snapshot (:snapshot facts) :binding-snapshot (:binding-snapshot facts)))))

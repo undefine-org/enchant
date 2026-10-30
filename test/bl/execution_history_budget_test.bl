@@ -1,0 +1,52 @@
+(ns execution.history-budget-test)
+
+(defn- original-case [source namespace]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id)) previous (Process/get :test_ctx)
+       name "a-refused-completion-still-wakes-the-owner-and-every-waiter"
+       budget-site "(Application/put_env :beam_lisp :lazy_cache_budget_bytes bytes)"
+       instrumented (str "(do " budget-site
+                         " (let [cell (Process/get :history-budget-occupancy)"
+                         "       before (BeamLisp.LazyMemo/retained_bytes)]"
+                         "   (BeamLisp.LazyMemo/put cell :released)"
+                         "   (Process/put :history-budget-reclaimed (- before (BeamLisp.LazyMemo/retained_bytes)))))")]
+  (when-not (= 2 (count (String/split source budget-site))) (throw :history-budget-instrumentation-drift))
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     ;; This retained native cell stays rooted until AFTER the original fixture
+     ;; computes its ceiling. Its replacement models unrelated reclamation;
+     ;; no counter or native admission result is mocked.
+     (Process/put :history-budget-occupancy
+      (BeamLisp.LazyMemo/create_ref (erlang/make_tuple 262144 7)))
+     (BeamLisp.TestRT/clear_registry)
+     (BeamLisp.TestRT/declarations
+      #(BeamLisp.Compiler/eval_string
+        (-> source
+            (String/replace "(ns lazy.budget.test)" (str "(ns " namespace ")"))
+            (String/replace budget-site instrumented))))
+     (let [selected (Enum/filter (BeamLisp.TestRT/registered_tests namespace) #(= name (elem % 0)))]
+      (when-not (= 1 (count selected)) (throw :history-budget-selector-drift))
+      (BeamLisp.TestRT/clear_registry)
+      (BeamLisp.TestRT/register_test namespace name (elem (first selected) 1))
+      (assoc (select-keys (BeamLisp.TestRT/run_ns namespace) [:tests :pass :fail :error])
+       :reclaimed (Process/get :history-budget-reclaimed)))))
+   (finally
+    (Process/delete :history-budget-occupancy) (Process/delete :history-budget-reclaimed)
+    (if (nil? previous) (Process/delete :test_ctx) (Process/put :test_ctx previous))
+    (BeamLisp.Env/destroy scope)))))
+
+(deftest E05-absolute-publication-ceiling-survives-real-native-reclamation
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       source (File/read! (Path/join root "test/bl/lazy_budget_test.bl"))
+       absolute "(erlang/div (BeamLisp.LazyMemo/estimate_bytes (tuple :completed (payload-list 64))) 4)"
+       sampled "(erlang/+ (BeamLisp.LazyMemo/retained_bytes) 16)"
+       normal (original-case source "history.budget.absolute")
+       mutant (original-case (String/replace source absolute sampled) "history.budget.sampled")]
+  (println :history-E05 {:normal normal :mutant mutant
+                         :producer-sha256 (Base/encode16 (crypto/hash :sha256 source))})
+  (is (= 2 (count (String/split source absolute))) "the causal mutation changes exactly one ceiling")
+  (is (= {:tests 1 :pass 7 :fail 0 :error 0} (dissoc normal :reclaimed)))
+  (is (= 1 (:tests mutant)))
+  (is (> (+ (:fail mutant) (:error mutant)) 0) "the sampled fixture loses its expected refusal")
+  (is (> (:reclaimed normal) 1048576) "actual unrelated native bytes disappeared after the ceiling was computed")
+  (is (> (:reclaimed mutant) 1048576))))

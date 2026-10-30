@@ -176,7 +176,9 @@
 
 (defn- cons->args [node]
   (loop [n node acc []]
-    (if (= :cons (:op n)) (recur (:tail n) (conj acc (:head n))) acc)))
+    (cond (= :cons (:op n)) (recur (:tail n) (conj acc (:head n)))
+          (= :enil (:op n)) acc
+          :else :untranslatable)))
 
 ; primitives that arrive as RT/invoke (:global name) — the ops the compiler
 ; leaves as a var apply rather than a resolved remote. `not` is normally LINKED
@@ -273,15 +275,16 @@
                         (:body cl))))))
 
 (defn- t-invoke
-  "An (RT/invoke (:global f) argcons) call: payload accessor, nth, primitive
+  "A canonical callable invocation: payload accessor, nth, primitive
    desugar, or pure-helper inline. Otherwise :untranslatable (honest — an
    unknown or impure callee is not modellable)."
   [ctx node]
-  (let [args (:args node)
-        callee (first args)
+  (let [site (ir/call-site node)
+        callee (:callee site)
         f (global-name callee)
-        actuals (if (>= (count args) 2) (cons->args (second args)) [])]
+        actuals (if (nil? (:arity site)) :untranslatable (:args site))]
     (cond
+      (untranslatable? actuals) :untranslatable
       ; payload accessor (:tag arg): callee is a :lit keyword
       (and (= :lit (:op callee)) (keyword? (:val callee)))
         (let [k (name (:val callee))
@@ -330,16 +333,15 @@
 
 ; (some? (:tag x)) / (is? (:tag x)) → ((_ is Ctor) x): "the :tag arm is present".
 (defn- discriminant [ctx node]
-  (let [args (:args node) inner (first args)]
-    (if (and (= 1 (count args)) (ir/node? inner)
-             (= :remote (:op inner)) (= rt (:mod inner)) (= :invoke (:fun inner)))
-      (let [iargs (:args inner) kw (first iargs)]
+  (let [args (:args node) inner (first args) site (ir/call-site inner)]
+    (if (and (= 1 (count args)) (= :invoke (:mode site)))
+      (let [kw (:callee site)]
         (if (and (= :lit (:op kw)) (keyword? (:val kw)))
           (let [k (name (:val kw))
                 v (get (:variants ctx) k)
-                actuals (if (>= (count iargs) 2) (cons->args (second iargs)) [])
-                arg (first actuals)]
-            (if (and (map? v) (:ctor v) (= :global (:op arg)) (not= :exact (:lookup arg)))
+                actuals (if (= 1 (:arity site)) (:args site) :untranslatable)
+                arg (when-not (untranslatable? actuals) (first actuals))]
+            (if (and (not (untranslatable? actuals)) (map? v) (:ctor v) (= :global (:op arg)) (not= :exact (:lookup arg)))
               (list (list '_ 'is (symbol (:ctor v))) (symbol (:name arg)))
               :untranslatable))
           :untranslatable))
@@ -357,7 +359,14 @@
       (get (:funs ctx) (name fun))
         (let [ts (t-args ctx args)]
           (if (untranslatable? ts) :untranslatable (apply list (symbol (name fun)) ts)))
-      (and (= (:mod node) rt) (= fun :invoke)) (t-invoke ctx node)
+      ;; The compiler's fixed variadic string ABI carries one proper list.
+      ;; Decode the complete list; a dynamic tail is not an empty suffix.
+      (and (= key [rt :str_v]) (= 1 (count args)))
+        (let [actuals (cons->args (first args))
+              ts (if (untranslatable? actuals) :untranslatable (t-args ctx actuals))]
+          (if (untranslatable? ts) :untranslatable
+            (cond (empty? ts) "" (= 1 (count ts)) (list 'str.++ "" (first ts))
+                  :else (apply list 'str.++ ts))))
       ; Repeated analysis can leave a declared helper in the compiler's module
       ; environment, so its next call is resolved directly. Only the analysis
       ; module's own source-defined helpers share the dynamic inline boundary.
@@ -450,7 +459,7 @@
         (if (not (= 1 (count pairs))) :untranslatable
           (let [pair (first pairs)
                 khead (first pair)
-                kw (and (= :remote (:op khead)) (first (:args khead)))
+                kw (when (= :lit (:op khead)) khead)
                 vnode (second pair)]
             (if (and kw (= :lit (:op kw)) (keyword? (:val kw)))
               (let [k (name (:val kw)) v (get (:variants ctx) k)]
@@ -459,6 +468,7 @@
                     (if (untranslatable? a) :untranslatable (list (symbol (:ctor v)) a)))
                   :untranslatable))
               :untranslatable))))
+    (= :invoke (:mode (ir/call-site node))) (t-invoke ctx node)
     (= :remote (:op node)) (t-remote ctx node)
     ; the canonical numeric op: the BIF reading IS the translation target
     ; (the prover's invariants are integer-only; the tower dispatch exists
@@ -483,15 +493,15 @@
 (defn- ->anf-src
   "Compile a SOURCE string to bl-ANF (read, then compile the first form)."
   [src]
-  (c/compile-node (first (BeamLisp.Reader/read_string src)) (c/new-env "system.smt")))
+  (c/compile (first (BeamLisp.Reader/read_string src)) (c/new-env "system.smt")))
 
 (defn- ->anf-node
   "Compile a reader NODE to bl-ANF. A NODE argument may be a bare scalar (the
    reader stores a string/number/bool literal as the raw value, not a tagged
-   tuple) — compile-node handles those directly, so we must NOT re-read a bare
+   tuple) — compile handles those directly, so we must NOT re-read a bare
    string as source (that would parse \"evt:init\" as the symbol evt:init)."
   [node]
-  (c/compile-node node (c/new-env "system.smt")))
+  (c/compile node (c/new-env "system.smt")))
 
 ; ── PUBLIC API (unchanged surface; ANF underneath) ────────────────────────
 

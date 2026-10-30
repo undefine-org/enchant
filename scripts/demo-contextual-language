@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Compile contextual worlds, then execute only their emitted bytes in a fresh VM.
+
+Run under a process-tree cap: MemoryMax=6G, MemorySwapMax=0, RuntimeMaxSec=600.
+One serial VM per phase. Output must be absent; no installed files are changed.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--seed", type=Path, help="candidate compiler floor; defaults to the checkout floor")
+    parser.add_argument("--scenario", choices=("language", "query", "mailbox", "cleanup", "validation"), default="language")
+    parser.add_argument("--artifact-unit", action="store_true", help="also qualify paired runtime/phase artifact units")
+    parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / "priv/bootstrap/seed").resolve()
+    if os.path.lexists(output):
+        parser.error(f"output must be absent: {output}")
+    output.mkdir(parents=True)
+    fixtures = root / f"test/fixtures/contextual-{args.scenario}"
+    spec = json.loads((fixtures / "manifest.json").read_text())
+    drivers = root / "test/scripts"
+    watched = sorted({root / "env.bl", Path(__file__).resolve(), root / "scripts/demo-artifact-production",
+                      *fixtures.glob("*.bl"), fixtures / "manifest.json", *drivers.glob("contextual-language-*.bl"),
+                      *[p for p in (root / "priv").rglob("*.bl")],
+                      *[p for p in (root / "priv/bootstrap/seed").iterdir() if p.is_file()]})
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    seed_inputs = {p.name: sha(p) for p in sorted(seed.iterdir()) if p.is_file()}
+    (output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
+    boot = runpy.run_path(str(root / "scripts/demo-artifact-production"))["BOOT"]
+    deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / "deps").glob("*/ebin")),
+                                                    *sorted((root / "_build").glob("*/lib/*/ebin"))]))
+    report = {"version": 1, "scope": "contextual-language-source-free-execution", "scenario": args.scenario, "status": "running",
+              "native_execution_admission": False, "artifact_unit": args.artifact_unit, "seconds": {}, "seed_inputs": seed_inputs}
+    try:
+        for phase in ("producer", "recompiler", "consumer"):
+            with tempfile.TemporaryDirectory(prefix=f"bl-contextual-{phase}-") as temporary:
+                image = Path(temporary)
+                subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+                shutil.rmtree(image / "priv/bootstrap/seed")
+                shutil.copytree(seed, image / "priv/bootstrap/seed")
+                shutil.copy2(root / "env.bl", image / "env.bl")
+                app = image / ".bl/lib/beam_lisp-0.1.0"
+                app.mkdir(parents=True)
+                (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+                shutil.copytree(seed, app / "ebin")
+                driver = image / "driver.bl"
+                shutil.copy2(drivers / f"contextual-language-{phase}.bl", driver)
+                bootstrap = image / "boot.exs"
+                bootstrap.write_text(boot)
+                command = ["elixir"]
+                for dep in deps:
+                    command += ["-pa", str(dep)]
+                command += ["-pa", str(app / "ebin"), str(bootstrap)]
+                env = {**os.environ, "BL_ROOT": str(image), "BL_DAEMON": "off",
+                       "BL_ARTIFACT_DRIVER": str(driver), "BL_CONTEXTUAL_OUTPUT": str(output),
+                       "BL_CONTEXTUAL_SPEC": json.dumps(spec),
+                       "XDG_CACHE_HOME": str(image / "cache"),
+                       "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+                env["BL_CONTEXTUAL_ARTIFACT_UNIT"] = "yes" if args.artifact_unit else "no"
+                if phase == "producer":
+                    env["BL_CONTEXTUAL_SOURCES"] = str(fixtures)
+                else:
+                    env.pop("BL_CONTEXTUAL_SOURCES", None)
+                    assert not (image / "test").exists()
+                started = time.monotonic()
+                completed = subprocess.run(command, cwd=image, env=env, text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+                report["seconds"][phase] = round(time.monotonic() - started, 3)
+                (output / f"{phase}.log").write_text(completed.stdout)
+                print(completed.stdout[-12000:], end="", flush=True)
+                if completed.returncode:
+                    raise RuntimeError(f"{phase} failed with exit {completed.returncode}")
+                report[phase] = json.loads((output / f"{phase}.json").read_text())
+                if args.artifact_unit:
+                    unit_result = json.loads((output / f"unit-{phase}.json").read_text())
+                    if unit_result.get("status") != "passed":
+                        raise RuntimeError(f"{phase} did not qualify its artifact unit")
+                    report[phase]["artifact_unit"] = unit_result
+            for path, digest in inputs.items():
+                if sha(root / path) != digest:
+                    raise RuntimeError(f"input changed during demonstration: {path}")
+            if seed_inputs != {p.name: sha(p) for p in sorted(seed.iterdir()) if p.is_file()}:
+                raise RuntimeError("candidate floor changed during demonstration")
+        report["status"] = "passed"
+    except Exception as error:
+        report.update(status="error", error=str(error))
+        raise
+    finally:
+        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Passed. Artifacts and receipts: {output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

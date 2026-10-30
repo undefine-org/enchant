@@ -1,15 +1,140 @@
-(ns proc-callback-capacity-test (:require [proc.callback :as callback]))
+(ns proc-callback-capacity-test
+ (:require [proc.callback :as callback] [system.ownership :as ownership]))
+
+(defn- pressure-owner! []
+ ;; spawn returns before the owned-start handoff enters the body. Filling the
+ ;; ledger then can kill that pending holder with code_lease_capacity, freeing
+ ;; its pressure rows before the operation under test. Acknowledge actual entry.
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       owner (spawn (fn [] (erlang/send parent [:capacity-owner-ready ticket (erlang/self)])
+                          (receive :never nil)))]
+  (receive [:capacity-owner-ready seen child] :when (and (= seen ticket) (= child owner)) owner
+   (after 5000 (Process/exit owner :kill) (throw :capacity-owner-start-timeout)))))
+
+(defn- stop-pressure-owner! [owner]
+ (let [monitor (Process/monitor owner)]
+  (try
+   (Process/exit owner :kill)
+   (receive [:DOWN seen :process child _] :when (and (= seen monitor) (= child owner)) :ok
+    (after 5000 (throw :capacity-owner-stop-timeout)))
+   (finally (Process/demonitor monitor (list :flush))))))
 
 (defn- fill-ledger! [owner]
- (let [rows (mapv (fn [_] (tuple (tuple :Elixir.BeamLisp.Env owner (erlang/make_ref)) true))
-              (range (max 0 (- 65536 (ets/info :beam_lisp_code_leases :size)))))]
-  (ets/insert :beam_lisp_code_leases (to-list rows))
-  rows))
+ ;; Fixture insertion must share native admission's capacity fence. Otherwise
+ ;; background admissions between measurement and insertion make the fixture
+ ;; itself exceed the ceiling. Transfer's temporary duplicate rows also cannot
+ ;; be interpreted as a stable capacity observation outside this fence.
+ (BeamLisp.Env/with_local_lock :bl_code_lease_capacity_held :bl_code_lease_capacity_lock
+  (fn []
+   (doseq [row (ets/tab2list :beam_lisp_code_leases)]
+    (when-not (Process/alive? (elem (elem row 0) 1))
+     (ets/delete_object :beam_lisp_code_leases row)))
+   (let [rows (mapv (fn [_] (tuple (tuple :Elixir.BeamLisp.Env owner (erlang/make_ref)) true))
+                  (range (max 0 (- 65536 (ets/info :beam_lisp_code_leases :size)))))]
+    (ets/insert :beam_lisp_code_leases (to-list rows))
+    (is (= 65536 (ets/info :beam_lisp_code_leases :size)))
+    rows))))
 (defn- clear-ledger! [rows]
  (doseq [row rows] (ets/delete_object :beam_lisp_code_leases row)))
 
+(defn- follow-native-outcome [resources command observed]
+ (let [relation (ownership/handoff-outcomes resources command)
+       matches (Enum/filter (:outcomes relation) #(= observed (:return %)))]
+  (is (= false (:native-admission relation)))
+  (is (= 1 (count matches)) (pr-str [command observed relation]))
+  (when-not (= 1 (count matches)) (throw :capacity-trace-outside-native-model))
+  (:resources (first matches))))
+
+(defn- observed-accept [prepared]
+ (let [result (BeamLisp.Execution/accept-handoff! prepared)]
+  (case (:status result)
+   :busy
+    (do (is (= {:status :busy :kind :code-retention-capacity} result))
+        {:kind :status :status :busy :detail (:kind result)})
+   :accepted
+    (do (is (= {:status :accepted :registration (:accepted prepared)} result))
+        {:kind :status :status :accepted :registration 'target})
+   :cancelled
+    (do (is (= {:status :cancelled} result)) {:kind :status :status :cancelled})
+   (throw {:unrecognized-native-capacity-outcome result}))))
+
+(deftest actual-capacity-and-recovery-traces-conform-to-the-shared-ownership-relation
+ (doseq [cancel-after-busy [false true]]
+  (let [owner (pressure-owner!) calls (atom 0)
+        source (BeamLisp.Execution/register! (fn [] (swap! calls inc) 42))
+        prepared (BeamLisp.Execution/prepare-handoff! source owner)
+        target (:accepted prepared) rows (atom [])
+        accept {:operation :accept :source 'source :target 'target}
+        close-source {:operation :close :target 'source}
+        close-target {:operation :close :target 'target}]
+   (try
+    (is (= source (:source prepared)))
+    (is (= :pending (:status (BeamLisp.Execution/observe target))))
+    (let [initial (follow-native-outcome {'source {:phase :owned :borrows #{}}}
+                    {:operation :prepare :source 'source :target 'target}
+                    {:kind :prepared :source 'source :target 'target})]
+     ;; Fill only this disposable VM's ledger. Live-owner rows survive native
+     ;; dead-owner pruning; all injected rows are removed before leaving.
+     (reset! rows (fill-ledger! owner))
+     (let [busy (observed-accept prepared)
+           pending (follow-native-outcome initial accept busy)]
+      (is (= :busy (:status busy)))
+      (is (= initial pending))
+      (is (= :active (:status (BeamLisp.Execution/observe source))))
+      (is (= :pending (:status (BeamLisp.Execution/observe target))))
+      (is (= 0 @calls))
+      (let [ready (if cancel-after-busy
+                    (follow-native-outcome pending close-source
+                      {:kind :literal :value (BeamLisp.Execution/close! source)}) pending)]
+       (clear-ledger! @rows) (reset! rows [])
+       (let [returned (observed-accept prepared)
+             accepted (follow-native-outcome ready accept returned)
+             repeated (observed-accept prepared)
+             acknowledged (follow-native-outcome accepted accept repeated)]
+        (is (= (if cancel-after-busy :cancelled :accepted) (:status returned)))
+        (is (= returned repeated))
+        (is (= accepted acknowledged))
+        (is (= (if cancel-after-busy :released :moved) (get-in acknowledged ['source :phase])))
+        (is (= (if cancel-after-busy :prepared :owned) (get-in acknowledged ['target :phase])))
+        (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+        (is (= (if cancel-after-busy :cancelled :active) (:status (BeamLisp.Execution/observe target))))
+        (is (= 0 @calls))
+        (is (= (if cancel-after-busy {:status :cancelled} {:status :completed :value 42})
+               (BeamLisp.Execution/invoke! target [])))
+        (is (= (if cancel-after-busy 0 1) @calls))
+        (let [closed-source (follow-native-outcome acknowledged close-source
+                              {:kind :literal :value (BeamLisp.Execution/close! source)})
+              closed (follow-native-outcome closed-source close-target
+                       {:kind :literal :value (BeamLisp.Execution/close! target)})]
+         (is (every? #(= :released (:phase %)) (vals closed)))
+         (is (= :cancelled (:status (BeamLisp.Execution/observe source))))
+         (is (= :cancelled (:status (BeamLisp.Execution/observe target))))
+         (println :capacity-trace {:cancel-after-busy cancel-after-busy :busy (:status busy)
+                                  :recovered (:status returned) :callback-entries @calls
+                                  :cleanup :released}))))))
+    (finally
+     (clear-ledger! @rows)
+     (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target)
+     (stop-pressure-owner! owner))))))
+
+(deftest native-handoff-pressure-leaves-the-source-and-prepublished-target-recoverable
+ (let [owner (pressure-owner!)
+       source (BeamLisp.Execution/register! (fn [] 42))
+       prepared (BeamLisp.Execution/prepare-handoff! source owner) rows (atom [])]
+  (try
+   (reset! rows (fill-ledger! owner))
+   (is (= {:status :busy :kind :code-retention-capacity} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= :active (:status (BeamLisp.Execution/observe source))))
+   (is (= {:status :pending} (BeamLisp.Execution/handoff-status prepared)))
+   (clear-ledger! @rows)
+   (reset! rows [])
+   (is (= {:status :accepted :registration (:accepted prepared)} (BeamLisp.Execution/accept-handoff! prepared)))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! (:accepted prepared) [])))
+   (finally (clear-ledger! @rows) (BeamLisp.Execution/close! source)
+    (BeamLisp.Execution/close! (:accepted prepared)) (stop-pressure-owner! owner)))))
+
 (deftest retention-pressure-is-busy-only-before-entry-and-never-a-provider-retry
- (let [owner (spawn (fn [] (receive :never nil))) calls (atom 0)
+ (let [owner (pressure-owner!) calls (atom 0)
        registration (callback/register! (fn [] (swap! calls inc) :value))
        provider-error (callback/register! (fn [] (erlang/error :code_lease_capacity)))
        rows (atom [])]
@@ -29,10 +154,41 @@
    (is (= {:status :cancelled} (callback/try-invoke! registration [])))
    (is (= 1 @calls))
    (finally (clear-ledger! @rows) (callback/unregister! registration)
-    (callback/unregister! provider-error) (Process/exit owner :kill)))))
+    (callback/unregister! provider-error) (stop-pressure-owner! owner)))))
 
 (deftest a-provider-returning-cancelled-is-still-a-completed-invocation
  (let [registration (callback/register! (fn [] :cancelled))]
   (try
    (is (= {:status :completed :value :cancelled} (callback/try-invoke! registration [])))
+   (finally (callback/unregister! registration)))))
+
+(deftest registration-payload-is-private-and-another-ticket-cannot-borrow-it
+ (let [first-registration (callback/register! (fn [] :first))
+       second-registration (callback/register! (fn [] :second))]
+  (try
+   (is (= :bl-execution (elem first-registration 0)))
+   (is (erlang/is_reference (elem first-registration 2)))
+   (let [fake (tuple :bl-execution (erlang/self) (erlang/make_ref))]
+    (is (not (callback/active? fake)))
+    (is (= {:status :cancelled} (callback/try-invoke! fake []))))
+   (let [other-owner (spawn (fn [] (receive :stop nil (after 10000 nil))))]
+    (try
+     (is (= {:status :cancelled}
+            (callback/try-invoke! (tuple :bl-execution other-owner (elem first-registration 2)) [])))
+     (finally (erlang/send other-owner :stop))))
+   (is (= :first (callback/invoke! first-registration [])))
+   (is (= :second (callback/invoke! second-registration [])))
+   (finally (callback/unregister! first-registration)
+    (callback/unregister! second-registration)))))
+
+(deftest sdk-callback-adapter-cannot-force-a-lazy-argument-continuation
+ (let [forced (atom false) called (atom false)
+       registration (callback/register! (fn [_] (reset! called true)))
+       arguments (lazy-seq (do (reset! forced true) '(42)))]
+  (try
+   (is (thrown? (callback/invoke! registration arguments)))
+   (is (thrown? (callback/try-invoke! registration arguments)))
+   (is (= false @forced))
+   (is (= false @called))
+   (is (= true (callback/active? registration)))
    (finally (callback/unregister! registration)))))

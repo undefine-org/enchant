@@ -1,0 +1,48 @@
+;; Run serially under a process-tree cap. Real prepared graphs and native
+;; registrations; numbers describe this host, not a portable timing threshold.
+(ns graph.custody.cost (:require [reload.generation :as generation]))
+(defn- summary [values]
+ (let [sorted (Enum/sort values)] {:min (first sorted) :median (nth sorted (erlang/div (count sorted) 2)) :max (last sorted)}))
+(defn- time-call [action]
+ (let [start (erlang/monotonic_time :microsecond) value (action)]
+  [value (- (erlang/monotonic_time :microsecond) start)]))
+(doseq [n [1 4 16]]
+ (let [root (str "pin.probe.root" n)
+       sources (into {root (str "(ns " root ") (defn callback [] (fn [] 42))")}
+                 (map (fn [i] (let [name (str "pin.probe.leaf" n "_" i)]
+                                [name (str "(ns " name ") (defn value [] " i ")")])) (range n)))
+       started (erlang/monotonic_time :microsecond)
+       graph (generation/prepare! {:application-id (str "pin-probe-" n) :sources sources})
+       preparation (- (erlang/monotonic_time :microsecond) started)]
+  (try
+   (let [row (generation/with! graph
+               (fn []
+                (let [callback (generation/invoke! graph (str root "/callback") [])
+                      registrations (atom [])]
+                 (try
+                  (let [sample (BeamLisp.Execution/register! callback)
+                        shape (try
+                                {:rows (BeamLisp.Execution/observe sample 'code-rows)
+                                 :payload-bytes
+                                  (erlang/external_size
+                                   (BeamLisp.Env/code_callback_payload
+                                    (:lease (BeamLisp.Env/execution_registration_state sample))))}
+                                (finally (BeamLisp.Execution/close! sample)))
+                        registered (mapv
+                                     (fn [_]
+                                      (let [[registration elapsed] (time-call #(BeamLisp.Execution/register! callback))]
+                                       (swap! registrations conj registration) elapsed)) (range 24))
+                        invocation (mapv
+                                     (fn [registration]
+                                      (let [[value elapsed] (time-call #(BeamLisp.Execution/invoke! registration []))]
+                                       (assert (= {:status :completed :value 42} value)) elapsed)) @registrations)]
+                   {:leaf-sources n :graph-modules (count (:modules graph)) :lease-rows-per-registration (:rows shape)
+                    :native-callback-payload-bytes (:payload-bytes shape)
+                    :serialized-graph-bytes (erlang/external_size graph) :preparation-us preparation
+                    :registration-us (summary registered) :invocation-us (summary invocation)})
+                  (finally (doseq [registration @registrations] (BeamLisp.Execution/close! registration)))))))]
+    (println "GRAPH-CUSTODY" (Jason/encode! row)))
+   (finally
+    (let [retired (generation/retire! graph)]
+     (println "GRAPH-RETIRE" (pr-str retired))
+     (assert (= {:status :retired} retired)))))))

@@ -148,20 +148,19 @@
    LOOP-INVARIANT (see `loop-variant`), so `(> i x)` with `x` moving too — or
    `n` computed from a moving collection — proves nothing."
   [node truth loop-vars]
-  (let [node (ir/arith-bif node)]
-    (if (not (= :remote (:op node)))
-      #{}
-      (let [k (:fun node) m (:mod node) args (:args node)
+  (let [node (ir/arith-bif node) call (ir/call-site node)]
+    (cond
+      (and (= :invoke (:mode call)) (= "not" (ir/global-key (:callee call)))
+           (= 1 (:arity call)))
+        (cmp-facts (first (:args call)) (not truth) loop-vars)
+      (not (= :remote (:op node))) #{}
+      :else (let [k (:fun node) m (:mod node) args (:args node)
             nm (fn [x] (when (= :var (:op x)) (:name x)))
             fixed? (fn [x] (invariant-expr? x loop-vars))]
         (cond
           ; A resolved runtime not has exact primitive identity.
           (and (= m rt) (= k :not_) (= 1 (count args)))
             (cmp-facts (first args) (not truth) loop-vars)
-          ; `(not t)` is t with the branch's truth flipped
-          (and (= m rt) (= k :invoke) (= :global (:op (first args))) (= "not" (ir/global-key (first args)))
-               (= :cons (:op (second args))) (= :enil (:op (:tail (second args)))))
-            (cmp-facts (:head (second args)) (not truth) loop-vars)
           (and (= m :erlang) (contains? #{:andalso :and} k) truth)
             (reduce (fn [acc c] (into acc (cmp-facts c true loop-vars))) #{} args)
           (and (= m :erlang) (= 2 (count args)) (contains? #{:< :=< :> :>=} k))
@@ -317,7 +316,7 @@
    carrying the loop's source position, read from the IR the compiler produced."
   [src]
   (let [forms (BeamLisp.Reader/read_string src)
-        anfs (map (fn [f] (c/compile-node f compile-env)) forms)]
+        anfs (map (fn [f] (c/compile f compile-env)) forms)]
     (reduce (fn [acc anf] (concat acc (map check-loop (loop-nodes anf)))) (list) anfs)))
 
 ; ── growth: the cost class of a fn's own recursion ──────────────────────
@@ -346,10 +345,11 @@
    compiles to `Module/fn` (a :remote whose module is a beam-lisp namespace);
    an unresolved user call compiles to RT/invoke of a (:global name)."
   [n self]
-  (and (ir/node? n) (= :remote (:op n))
-       (let [callee (first (:args n))]
-         (or (and (= :global (:op callee)) (= self (ir/global-key callee)))
-             (and (user-module? (:mod n)) (= self (fn-name-str (:fun n))))))))
+  (when-let [site (ir/call-site n)]
+   (let [callee (:callee site)]
+    (or (and (= :global (:op callee)) (= self (ir/global-key callee)))
+        (and (= :remote (:mode site)) (user-module? (:mod site))
+             (= self (fn-name-str (:fun site))))))))
 
 (defn self-call-nodes
   "Every ANF node under `ir-node` that is a call to the fn named `self`, in
@@ -364,7 +364,7 @@
 
 (defn- invoke?
   "Is `n` a user-fn invocation (RT/invoke of a callee value)?"
-  [n] (and (= :remote (:op n)) (= rt (:mod n)) (= :invoke (:fun n))))
+  [n] (= :invoke (:mode (ir/call-site n))))
 
 (defn- cons-chain-nodes
   "The element nodes of a :cons list value, in order."
@@ -380,7 +380,7 @@
   "The ACTUAL argument nodes of call node `n`: a linked remote carries them in
    :args; RT/invoke wraps them in a cons-chain list value."
   [n]
-  (if (invoke? n) (cons-chain-nodes (second (:args n))) (:args n)))
+  (if (invoke? n) (:args (ir/call-site n)) (:args n)))
 
 (defn- arithmetic-image
   "The parameter name an ARITHMETIC descent node steps by a positive literal —
@@ -497,6 +497,19 @@
            :detail "work grows with the recursion depth — a single self-call, or a recognised loop whose ranking variable moves toward its floor"}
           nil)))))
 
+(defn growth-bodies
+  "Recursion growth over prepared function bodies, including every arity.
+   This projection never recompiles a defn or publishes analysis definitions."
+  [bodies]
+  (reduce (fn [out [name d]]
+            (reduce (fn [out clause]
+                      (let [g (growth-of-body name (:params clause) (:body clause))
+                            old (get out name)]
+                        (if (or (nil? g) (and old (> (class-rank (:class old)) (class-rank (:class g)))))
+                          out (assoc out name g))))
+                    out (or (:clauses d) [{:params (:params d) :body (:body d)}])))
+          {} bodies))
+
 (defn- fn-descriptors
   "Every [fn-name params body] a compiled form embeds, walking to any depth."
   [n]
@@ -531,8 +544,9 @@
    analysis cannot read is omitted, never guessed; `growth` never raises."
   [src]
   (try
-    (let [forms (BeamLisp.Reader/read_string src)
-          descriptors (mapcat (fn [f] (fn-descriptors (c/compile-node f compile-env))) forms)]
+    (BeamLisp.Env/isolated (fn []
+     (let [forms (BeamLisp.Reader/read_string src)
+          descriptors (mapcat (fn [f] (fn-descriptors (c/compile f compile-env))) forms)]
       (reduce (fn [acc d]
                 (let [nm (nth d 0) params (nth d 1) body (nth d 2)
                       g (growth-of-body nm params body)
@@ -541,5 +555,5 @@
                     (assoc acc nm (if (and (some? old)
                                            (> (class-rank (:class g)) (class-rank (:class old))))
                                     old g)))))
-              {} descriptors))
+              {} descriptors))))
     (catch _ {})))

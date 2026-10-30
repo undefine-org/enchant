@@ -1,0 +1,93 @@
+(ns execution.history-boundary-test (:require [reload.sdk-readiness :as readiness]))
+
+(defn- scratch [prefix]
+ (Path/join (System/tmp_dir!) (str prefix (erlang/unique_integer (list :positive)))))
+
+(deftest E55-failed-loader-attribution-never-replays-initializer-effects
+ (let [root (scratch "history-load-error-")
+       namespace (str "historyloaderror" (erlang/unique_integer (list :positive)))
+       path (Path/join root (str namespace ".bl")) marker (Path/join root "effects")]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path
+    (str "(ns " namespace ")\n"
+         "(File/write! " (pr-str marker) " \"tick\\n\" (list :append))\n"
+         "(throw (ex-info \"history initializer stopped\" {:kind :history-initializer}))\n"))
+   (let [error (try (BeamLisp.Loader/with_search_dir root
+                     #(BeamLisp.Loader/ensure_loaded namespace))
+                   nil (catch error error))]
+    (is (some? error))
+    (is (String/contains? (ex-message error) "history initializer stopped"))
+    (is (= "tick\n" (File/read! marker)))
+    (is (= false (BeamLisp.Env/loaded_ns? namespace))))
+   (finally (File/rm_rf! root)))))
+
+(deftest E39-temporary-library-lifetime-never-enters-the-sdk-inventory
+ (let [root (scratch "history-library-")
+       namespace (str "historylibrary" (erlang/unique_integer (list :positive)))
+       path (Path/join root (str namespace ".bl"))
+       before (BeamLisp.Env/sdk_receipt_rows)]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path (str "(ns " namespace ") (defn answer [] 42)"))
+   (is (= false (boolean (BeamLisp.AOT/sdk_library_source? namespace path))))
+   (BeamLisp.Loader/with_search_dir root #(BeamLisp.Loader/ensure_loaded namespace))
+   (is (= 42 ((BeamLisp.Env/fetch_exact! namespace "answer"))))
+   (is (= before (BeamLisp.Env/sdk_receipt_rows)))
+   (File/rm_rf! root)
+   (is (= :sdk-runtime-retained (BeamLisp.Env/ensure_sdk_runtime!)))
+   (is (= before (BeamLisp.Env/sdk_receipt_rows)))
+   (finally (File/rm_rf! root)))))
+
+(deftest E44-binding-and-direct-sdk-references-reuse-the-same-closure-key
+ (let [namespace "clojure.string" binding "upper-case"
+       cache (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "closures")]
+  (is (= true (readiness/prepare! [[:binding namespace binding]])))
+  ;; First use can publish namespace definitions. That traversal deliberately
+  ;; cannot cache evidence read across a publication revision. Bind the stable
+  ;; input before comparing equivalent lookup representations.
+  (is (= true (readiness/prepare! [[:binding namespace binding]])))
+  (let [definition (first (BeamLisp.Env/ns_definition namespace binding))
+        provider (elem definition 4) arity (count (:params (elem definition 3)))
+        keys-before (set (keys @cache))
+        canonical (filterv #(= [[:binding namespace binding]] (nth % 3)) keys-before)]
+   (is (= 1 (count canonical)))
+   ;; A warm compiler remote and its redundant namespace guard must address
+   ;; the binding closure already prepared, without retaining a second copy.
+   (is (= true (readiness/prepare!
+                 [[:remote provider :upper-case arity] [:namespace namespace]])))
+   (is (= keys-before (set (keys @cache)))))))
+
+(defn- sdk-load-count [action]
+ (let [pattern (tuple :Elixir.BeamLisp.Env :load_sdk_library! 1)]
+  (erlang/trace_pattern pattern true (list :local :call_count))
+  (try
+   (action)
+   (elem (erlang/trace_info pattern :call_count) 1)
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(deftest an-image-index-does-not-freeze-transitive-sdk-publication-generations
+ (let [roots [[:binding "datom" "db"]]
+       cache (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "closures")]
+  (is (some? (elem (BeamLisp.AOT/sdk_inventory_input) 1)) "this control needs a real SDK image")
+  (readiness/prepare! roots)
+  (readiness/prepare! roots)
+  (let [entries (filterv #(= roots (nth (first %) 3)) (vec @cache))]
+   (is (= 1 (count entries)))
+   (when-not (= 1 (count entries)) (throw :sdk-readiness-cache-control-missing))
+   (let [[key entry] (first entries)
+         transitive (first (remove #(= "datom" %) (:namespaces entry)))
+         warm (sdk-load-count #(readiness/prepare! roots))]
+    (is (string? transitive))
+    (when-not (string? transitive) (throw :sdk-readiness-transitive-control-missing))
+    ;; This real native publication fence changes the generation without
+    ;; replacing any SDK value, descriptor, module or initializer flag.
+    (BeamLisp.Env/with_env :global
+     #(BeamLisp.Env/with_publication transitive (fn [] :same-bindings)))
+    (let [after (sdk-load-count #(readiness/prepare! roots))
+          again (sdk-load-count #(readiness/prepare! roots))]
+     (println :sdk-readiness-publication-control
+      {:transitive transitive :warm-loads warm :after-publication-loads after :again-loads again})
+     (is (> after warm) "the transitive publication invalidates the actual readiness closure")
+     (is (= warm again) "the stable replacement closure is reusable")
+     (is (not= (:generations entry) (:generations (get @cache key)))))))))

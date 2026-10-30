@@ -16,29 +16,46 @@
                  (= :map (:op implementations)) (<= (count (:pairs implementations)) 256)) (refuse))
   (let [names (mapv (fn [[method implementation]]
                      (let [method (literal method)]
-                      (when-not (and (string? method) (= :fn (:op implementation))) (refuse))
+                      (when-not (and (string? method)
+                                     (or (= :fn (:op implementation))
+                                         (some? (BeamLisp.CompilerData/self_application_parts implementation)))) (refuse))
                       ;; Closure construction is inert; actual delayed bodies
                       ;; still pass the ordinary compiled dependency checker.
                       (check-body! implementation) method)) (:pairs implementations))]
    (when-not (= (count names) (count (distinct names))) (refuse)))
   node))
-(defn class!
- "Validate one whole compiler-produced named class scaffold before evaluation.
-  No broad Record/Env/Lower exemptions; only these exact calls execute."
- [compiled namespace name kind namespaces check-body!]
- (when-not (and (= :let (:op compiled)) (= "mod" (:name compiled))
-                (= :do (:op (:body compiled)))) (refuse))
- (let [publish (:init compiled) body (:stmts (:body compiled))
-       descriptor (when (remote? publish :Elixir.BeamLisp.Record :publish_declaration! 1)
+(defn- class-header! [publish namespace name kind]
+ (let [descriptor (when (remote? publish :Elixir.BeamLisp.Record :publish_declaration! 1)
                     (literal (first (:args publish))))
        metadata (when descriptor (BeamLisp.Record/declaration_metadata descriptor))
        _ (when-not (and (tuple? metadata) (= 5 (erlang/tuple_size metadata))
                          (= [1 namespace name kind] (vec (take 4 (erlang/tuple_to_list metadata))))) (refuse))
        fields (elem metadata 4)
-       canonical (BeamLisp.Record/declaration_descriptor namespace name kind fields)
-       module (:name canonical) base-count (if (= :record kind) 3 2)]
-  (when-not (and (= canonical descriptor)
-                 (>= (count body) (inc base-count)) (variable? (last body) "mod")) (refuse))
+       canonical (BeamLisp.Record/declaration_descriptor namespace name kind fields (:name descriptor))]
+  (when-not (= canonical descriptor) (refuse))
+  {:module (:name canonical) :kind kind :namespace namespace :name name :fields fields}))
+(defn- class-value? [node constructor]
+ (if constructor
+  (and (remote? node :Elixir.BeamLisp.Record constructor 1)
+       (variable? (first (:args node)) "mod"))
+  (variable? node "mod")))
+(defn- extensions! [extensions namespaces check-body!]
+ (doseq [extension extensions]
+  (protocol-extension! extension #(variable? % "mod") namespaces check-body!))
+ (mapv (fn [extension]
+         {:namespace (literal (first (:args extension)))
+          :protocol (literal (second (:args extension)))
+          :methods (mapv (fn [[method _]] (literal method)) (:pairs (nth (:args extension) 3)))})
+       extensions))
+(defn class!
+ "Validate the whole namespace class scaffold at its actual physical target.
+  Descriptor, binding values and delayed methods share lexical!'s checks."
+ [compiled namespace name kind namespaces check-body!]
+ (when-not (and (= :let (:op compiled)) (= "mod" (:name compiled))
+                (= :do (:op (:body compiled)))) (refuse))
+ (let [class (class-header! (:init compiled) namespace name kind)
+       body (:stmts (:body compiled)) base-count (if (= :record kind) 3 2)]
+  (when-not (and (>= (count body) (inc base-count)) (variable? (last body) "mod")) (refuse))
   (doseq [[node binding constructor] (map (fn [node binding constructor] [node binding constructor])
                               (take base-count body)
                               (if (= :record kind) [name (str "->" name) (str "map->" name)] [name (str "->" name)])
@@ -46,19 +63,24 @@
    (when-not (remote? node :Elixir.BeamLisp.Env :intern 3) (refuse))
    (let [[owner target value] (:args node)]
     (when-not (and (= namespace (literal owner)) (= binding (literal target))
-                   (if constructor
-                    (and (remote? value :Elixir.BeamLisp.Record constructor 1)
-                         (variable? (first (:args value)) "mod"))
-                    (variable? value "mod"))) (refuse))))
-  (doseq [extension (drop base-count (butlast body))]
-   (protocol-extension! extension #(variable? % "mod") namespaces check-body!))
-  {:module module :kind kind :namespace namespace :name name :fields fields
-   :extensions (mapv (fn [extension]
-                      {:namespace (literal (first (:args extension)))
-                       :protocol (literal (second (:args extension)))
-                       :methods (mapv (fn [[method _]] (literal method))
-                                      (:pairs (nth (:args extension) 3)))})
-                    (drop base-count (butlast body)))}))
+                   (class-value? value constructor)) (refuse))))
+  (assoc class :extensions (extensions! (drop base-count (butlast body)) namespaces check-body!))))
+(defn lexical!
+ "Validate the same publication/constructors/methods in the lexical projection.
+  The single tuple binds all class values once; there are no namespace interns."
+ [compiled namespace name kind namespaces check-body!]
+ (when-not (and (= :let (:op compiled)) (= "mod" (:name compiled))
+                (= :let (:op (:body compiled))) (= "__class_bindings__" (:name (:body compiled)))
+                (= :tuple (:op (:init (:body compiled)))) (= :do (:op (:body (:body compiled))))) (refuse))
+ (let [class (class-header! (:init compiled) namespace name kind)
+       values (:elems (:init (:body compiled))) body (:stmts (:body (:body compiled)))
+       constructors (if (= :record kind) [nil :positional_ctor :map_ctor] [nil :positional_ctor])]
+  (when-not (and (= (count constructors) (count values)) (seq body)
+                 (variable? (last body) "__class_bindings__")) (refuse))
+  (doseq [[value constructor] (map (fn [value constructor] [value constructor]) values constructors)]
+   (when-not (class-value? value constructor) (refuse)))
+  (assoc class :extensions (extensions! (butlast body) namespaces check-body!))))
+
 (defn method-values!
  "Read only the exact method rows this canonical scaffold just installed in
   its private preparation environment; callbacks themselves are never invoked."
@@ -80,8 +102,8 @@
 (defn capture-extension [compiled implementations]
  ;; Bind the actual closures once. Register those same closures and return them
  ;; to the compiler owner for physical module retention; no callback runs.
- {:op :let :name "__sealed_class_methods__" :init implementations
-  :body {:op :do :stmts
-         (list (assoc compiled :args (concat (take 3 (:args compiled))
-                                     (list {:op :var :name "__sealed_class_methods__"})))
-               {:op :var :name "__sealed_class_methods__"})}})
+ {:op :let :name "__sealed_class_methods__" :init implementations :ann {}
+  :body {:op :do :ann {} :stmts
+         (list (assoc compiled :args (to-list (concat (take 3 (:args compiled))
+                                     (list {:op :var :name "__sealed_class_methods__" :ann {}}))))
+               {:op :var :name "__sealed_class_methods__" :ann {}})}})

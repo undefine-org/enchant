@@ -133,6 +133,15 @@
            (if (some? (:line env)) (list (erlang/list_to_tuple (list :line (:line env)))) (list))
            (if (some? form) (list (erlang/list_to_tuple (list :form form))) (list))))))))
 
+(defn- checked-context-env [env]
+  ;; Presence selects contextual compilation, even when malformed data is
+  ;; falsey. No public entry may turn an invalid table into ambient lookup.
+  (when (maps/is_key :contextual-bindings env)
+    (let [references (:contextual-bindings env)]
+      (when-not (and (erlang/is_map references) (not (maps/is_key :__struct__ references)))
+        (compile-error env "Invalid contextual reference table"))))
+  env)
+
 (defn- compile-warning!
   "Report a survivable fact about the code being compiled: one line on stderr,
    prefixed with the user's file and line when the env knows them. The
@@ -224,6 +233,8 @@
 (defn- kernel-mod-env-literal [] (quote :"Elixir.BeamLisp.Env"))
 
 (def ^:private mod-env (kernel-mod-env-literal))
+; Fixed native entry; mutable Source Vars cannot redirect actor admission.
+(defn- kernel-mod-execution-literal [] (quote :"Elixir.BeamLisp.Execution"))
 ; Immutable compiler-owned datum; public compatibility Var below remains mutable.
 (defn- kernel-mod-vector-literal [] (quote :"Elixir.BeamLisp.Vector"))
 
@@ -282,7 +293,7 @@
   "The general beam-lisp call: BeamLisp.Ns.Rt.invoke(f, [args]) — handles plain
    fns, keywords, remote references, and the $blfn dispatch tuple."
   [f-node arg-nodes]
-  (a/remote (kernel-mod-rt-literal) :invoke (list f-node (anf-list arg-nodes))))
+  (a/invoke f-node (anf-list arg-nodes)))
 
 ; ── fresh names ──────────────────────────────────────────────────────────────
 ;
@@ -516,10 +527,13 @@
 
 (defn- java-manifest
   "Ask the interop manifest (`priv/lib/java/manifest.bl`) a question by name.
-   Loaded on first use, so a program that never touches Java pays nothing."
+   Artifact construction interprets its selected declarations as compiler
+   data. Ordinary runtime compilation loads the manifest on first use."
   [fname args]
-  (BeamLisp.Loader/ensure_loaded "java.manifest")
-  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "java.manifest" fname) args))
+  (if (= :inactive (BeamLisp.AOT/sdk_constructor_binding_reference "java.manifest" fname))
+    (do (BeamLisp.Loader/ensure_loaded "java.manifest")
+        (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "java.manifest" fname) args))
+    (BeamLisp.AOT/constructor_call! {} {} "java.manifest" fname args)))
 
 (defn- manifest-answer->node
   "A manifest answer — `[:fn ns name]` or `[:lit v]` — as the ANF node that
@@ -529,6 +543,17 @@
     (if (= kind :lit)
       (a/lit (nth answer 1))
       (a/global-exact (nth answer 1) (nth answer 2)))))
+
+(defn contextual-native-name?
+  "Closed contextual-profile escape grammar. Source expansion and native
+   target selection share it; ambient aliases/imports never extend this set."
+  [name]
+  (and (erlang/is_binary name)
+       (or (starts-with? name "erlang/")
+           ;; Fully qualified physical names carry no ambient alias lookup.
+           ;; Recognition grants no execution authority: the Source dispatcher
+           ;; still checks the exact SDK public MFA and current executable bytes.
+           (and (starts-with? name "Elixir.") (some? (index-of name "/"))))))
 
 (defn- slash-target
   "Decide what a qualified name `prefix/member` refers to.
@@ -540,10 +565,17 @@
    (so `core/not` is the var `not` in ns `core`, not a call to a `core`
    module), and finally a lowercase unknown prefix is an Erlang module."
   [env name]
-  (let [[prefix member] (split-slash name)
-        prefix (if (= "clojure.core" prefix) "core" prefix)
-        alias (BeamLisp.Env/alias_target (:ns env) prefix)]
+  (let [[written-prefix member] (split-slash name)
+        canonical-core? (= "clojure.core" written-prefix)
+        prefix (if canonical-core? "core" written-prefix)
+        alias (when-not (or canonical-core? (:contextual-bindings env))
+                (BeamLisp.Env/alias_target (:ns env) prefix))]
     (cond
+      (:contextual-bindings env)
+        (if (contextual-native-name? name)
+          (gate-remote! env (if (= "erlang" prefix) :erlang (erlang/binary_to_atom prefix))
+                            (erlang/binary_to_atom member))
+          (compile-error env "Unlinked qualifier in contextual compilation"))
       ; an alias or an existing beam-lisp namespace resolves to a VAR — not a
       ; host escape — so it is never capability-gated.
       (some? alias) (list :var alias member)
@@ -580,6 +612,11 @@
 ; Compiling a symbol
 ; ─────────────────────────────────────────────────────────────────────────────
 
+;; This guard runs while the previous compiler is publishing this namespace
+;; one declaration at a time. Its new data helper must already be available.
+(defn- metadata-visibility [metadata]
+  (if (= true (:private metadata)) :private :public))
+
 (defn- private-var?
   "Say whether the var `name` in namespace `ns` was defined private (`defn-`,
    `^:private`). A private var records `{:private true}` in its metadata; a
@@ -590,7 +627,7 @@
              (contains? #{:private :unavailable} (BeamLisp.AOT/sdk_declaration_kind ns name)))
         (and (erlang/is_tuple m)
              (= :ok (erlang/element 1 m))
-             (= true (maps/get :private (erlang/element 2 m) false))))))
+             (= :private (metadata-visibility (erlang/element 2 m)))))))
 
 (defn- reject-private!
   "Stop compiling with a clear error when `target-ns/var` is a PRIVATE var
@@ -615,11 +652,15 @@
    never evidence that a generated name is public."
   [env target sym]
   (when-not (= target (:ns env))
-    (let [checked (when (erlang/function_exported :Elixir.BeamLisp.AOT :sdk_declaration_kind 2)
-                    (BeamLisp.AOT/sdk_declaration_kind target sym))]
+    (let [constructor (when (erlang/function_exported :Elixir.BeamLisp.AOT :sdk_constructor_declaration_kind 2)
+                        (BeamLisp.AOT/sdk_constructor_declaration_kind target sym))
+          checked (or constructor
+                    (when (erlang/function_exported :Elixir.BeamLisp.AOT :sdk_declaration_kind 2)
+                      (BeamLisp.AOT/sdk_declaration_kind target sym)))]
       (cond
         (= :unavailable checked) (compile-error env (str "SDK declaration metadata is unavailable for " target "/" sym))
         (= :private checked) (compile-error env (str "var " target "/" sym " is not public"))
+        (and constructor (contains? #{:public :value :macro} checked)) :ok
         (or (BeamLisp.Env/loaded_ns? target)
             (not= :error (BeamLisp.Env/lookup (tuple target sym))))
           (reject-private! env target sym)
@@ -671,8 +712,18 @@
     ; a local (let binding or parameter): usually its fresh var name; a named
     ; fn's own name stores the self-application NODE directly
     (local? env name)
-      (let [lv (local-var env name)]
-        (if (erlang/is_binary lv) (a/var lv) lv))
+      (let [lv (local-var env name)
+            node (if (erlang/is_binary lv) (a/var lv) lv)
+            reference (get-in env [:contextual-bindings name :reference])]
+        (if reference (assoc-in node [:ann :binding-reference] reference) node))
+    (contains? (:contextual-bindings env) name)
+      (let [selected (get (:contextual-bindings env) name)]
+        (when-not (and (not= :local (get-in selected [:declaration :visibility]))
+                       (contains? #{:function :value} (get-in selected [:declaration :kind])))
+          (compile-error env "Contextual reference was not linked into lexical scope"))
+        (a/binding-value (:reference selected)))
+    (and (:contextual-bindings env) (not (has-slash? name)))
+      (compile-error env "Unlinked name in contextual compilation")
     (contains? #{"bl->js" "js->bl"} name)
       (assoc (js-node :helper (list) env) :helper name)
     (starts-with? name "js/")
@@ -687,6 +738,8 @@
           (manifest-answer->node answer)))
     (has-slash? name)
       (let [tgt (slash-target env name)]
+        (when (and (:contextual-bindings env) (not= :remote (first tgt)))
+          (compile-error env "Unlinked namespace value in contextual compilation"))
         (cond
           ; a Java static/constant through the manifest: the var or the literal
           (= :java (first tgt)) (manifest-answer->node (second tgt))
@@ -704,7 +757,13 @@
         (reject-private-static! env (first ref) (second ref))
         (a/global-exact (first ref) (second ref)))
     :else
-      (a/global (:ns env) name)))
+      (let [reference (when (erlang/function_exported :Elixir.BeamLisp.AOT :sdk_constructor_binding_reference 2)
+                        (BeamLisp.AOT/sdk_constructor_binding_reference (:ns env) name))]
+        ;; The producer already owns Source resolution. Preserve its answer in
+        ;; ANF instead of making a phase consumer repeat inherited-name lookup.
+        (if (vector? reference)
+          (a/global-exact (first reference) (second reference))
+          (a/global (:ns env) name)))))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Compiling collection literals
@@ -946,6 +1005,11 @@
 ; Immutable compiler-owned datum; public compatibility Var below remains mutable.
 (defn- kernel-ifn-arities-literal [] (quote {"kw" [1 2] "map" [1 2] "set" [1 2] "vector" [1]}))
 
+(defn invocation-arities
+  "Immutable callable-data arities owned by the compiler/runtime contract.
+   Consumers call this function; ifn-arities remains a compatibility Var."
+  [] (kernel-ifn-arities-literal))
+
 (def ifn-arities
   (kernel-ifn-arities-literal))
 
@@ -1085,6 +1149,15 @@
             path (js-path (if ctor (subs name 0 (dec (count name))) name) env)]
         (assoc (js-node (if ctor :new :call) (compile-each-notail args env) env) :path path))))
 
+(defn- server-return-call [shape arguments]
+ ;; Match the head-before-tail argument list used by anf-invoke. The last
+ ;; binding is built first so the first argument becomes the outermost let.
+ (if (empty? arguments) (a/lit (elem shape 0))
+  (let [names (Enum/map arguments (fn [_] (fresh-var "return_arg")))
+        result (a/tup (cons (a/lit (elem shape 0)) (Enum/map names (fn [name] (a/var name)))))]
+   (Enum/reduce (Enum/reverse (Enum/zip names arguments)) result
+     (fn [pair body] (a/lett (elem pair 0) (elem pair 1) body))))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -1161,6 +1234,8 @@
             ; use the linked direct call when it is a linked defn, else invoke
             ; its fetched value
             (let [tns (second tgt) tvar (nth tgt 2)]
+              (when (:contextual-bindings env)
+                (compile-error env "Unlinked namespace call in contextual compilation" (first items)))
               (reject-private-static! env tns tvar)
               ;; The link is asked for the QUALIFIED name (`alias/member`), not for the
               ;; bare member in the alias's namespace. `link/2` appends core and sugar
@@ -1212,36 +1287,28 @@
                   (list (first arg-nodes)
                         (a/lit (erlang/binary_to_atom (deftype-field-name (rn/node-name head))))))
 
-      ; (name args) with a plain name. A LOCAL (a parameter, a let binding)
-      ; in call position faces a linked global of the same name: the decided
-      ; dispatch is CALLABILITY — the local's value is invoked when it can
-      ; take this many arguments (RT.invocable?), otherwise the linked global
-      ; runs. `(comp a b)` with a fn parameter `comp` invokes the parameter
-      ; (jank's sort-by slice depends on it); `(max h max)` with an integer
-      ; binding `max` still reaches core/max (the async backpressure contract
-      ; depends on THAT). Clojure would always pick the local and fail the
-      ; second; always-global would fail the first. When no linked global
-      ; exists the local is invoked unconditionally, exactly as before.
+      ; Lexical binding decides call identity. A local is invoked regardless
+      ; of its value's type or arity; failure cannot select an ambient global.
+      ; This rule is shared by ordinary, bootstrap and contextual compilation.
       (= tag :symbol)
         (let [name (rn/node-name head)]
           (if (local? env name)
-            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
-                  local-node (compile-symbol name env)
-                  direct (if (erlang/== :error lo)
-                           nil
-                           (linked-call (erlang/element 3 lo) arg-nodes env))]
-              (if (some? direct)
-                (a/iff (a/remote (kernel-mod-rt-literal) :invocable? (list local-node (a/lit (count arg-nodes))))
-                       (anf-invoke local-node arg-nodes)
-                       (ready-guard (erlang/element 2 lo) direct env))
+            (let [local-node (compile-symbol name env)
+                  constructor (get-in local-node [:ann :server-return-constructor])]
+              (if (and constructor (some #(= (count arg-nodes) %) (elem constructor 1)))
+                (server-return-call constructor arg-nodes)
                 (anf-invoke local-node arg-nodes)))
-            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
+            (if (contains? (:contextual-bindings env) name)
+              (anf-invoke (compile-symbol name env) arg-nodes)
+            (let [_ (when (:contextual-bindings env)
+                      (compile-error env "Unlinked call in contextual compilation" (first items)))
+                  lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
                   direct (if (erlang/== :error lo)
                            nil
                            (linked-call (erlang/element 3 lo) arg-nodes env))]
               (if (some? direct)
                 (ready-guard (erlang/element 2 lo) direct env)
-                (anf-invoke (compile-symbol name env) arg-nodes)))))
+                (anf-invoke (compile-symbol name env) arg-nodes))))))
 
       ; (expr args) with a compound head — compile it, then call it
       :else
@@ -1271,7 +1338,7 @@
    `proc/defserver`) are real code, so this is a warning, not an error. Written
    to stderr once per definition. `kind` is the defining form (`defn`, …)."
   [kind name env]
-  (when (and (erlang/is_binary name) (contains? special-forms name)
+  (when (and (erlang/is_binary name) (contains? (kernel-special-forms-literal) name)
              ; the toolchain's own qualified-only definitions (`anf/var`,
              ; `multi/satisfies?`, `proc/defserver`) are known and intended
              (not (contains? #{"anf" "proc" "proc.server" "host.multi" "host.emit"} (:ns env))))
@@ -1915,6 +1982,47 @@
   [x y]
   (a/iff x y (a/lit false)))
 
+(defn- catch-implicit-locals []
+  {:stack (:frames (BeamLisp.CompilerData/catch_stack_bindings)) :kind "__EXCEPTION_KIND__"})
+
+(defn catch-layout
+  "Canonical normalized-catch roles. The optional type is a compiler literal;
+   the exception binder and the two implicit locals belong to its handler."
+  [form env]
+  (let [items (rn/node-items (rn/node-form form))
+        first-node (rn/node-form (second items))
+        _ (when-not (= :symbol (rn/node-tag first-node))
+            (compile-error env "catch requires a variable or Module.Name"))
+        name (rn/node-name first-node)
+        typed? (or (uppercase-first? name) (java-spelled? name))
+        binder-index (if typed? 2 1)]
+    (when-not (= :symbol (rn/node-tag (rn/node-form (nth items binder-index nil))))
+      (compile-error env "catch requires an exception binding symbol"))
+    {:binder-index binder-index :type-index (when typed? 1)
+     :body-offset (if typed? 3 2) :implicit-locals (catch-implicit-locals)}))
+
+(defn try-layout
+  "Canonical try grouping over original Reader indexes. Both compilation and
+   contextual expansion consume these roles; exception semantics stay here."
+  [forms env]
+  (let [parts (Enum/map (Enum/with_index forms)
+                (fn [pair]
+                  (let [form (elem pair 0)]
+                    {:index (elem pair 1)
+                     :kind (cond (catch-clause-form? form) :catch
+                                 (catch-raw-clause-form? form) :catch-raw
+                                 (finally-clause-form? form) :finally
+                                 :else :body)})))
+        indexes (fn [kind] (Enum/map (Enum/filter parts #(= kind (:kind %))) #(:index %)))
+        raw-indexes (indexes :catch-raw) catches (indexes :catch)
+        finallies (indexes :finally)]
+    (when (and (seq raw-indexes) (or (seq catches) (next raw-indexes)))
+      (compile-error env "try: a catch-raw clause is the ONLY catch of its try (no other catch, at most one catch-raw)"))
+    (when (> (count finallies) 1)
+      (compile-error env "try accepts at most one finally clause"))
+    {:body-indexes (indexes :body) :raw-indexes raw-indexes
+     :catch-indexes catches :finally-indexes finallies}))
+
 (defn- catch-handler-node
   "Build the body a catch clause runs once it matches: bind the handler's name
    to the normalized exception value AND bind `__STACKTRACE__` to the frame
@@ -1944,12 +2052,13 @@
   [e-name handler-forms e-var kind-var env]
   (let [handler-var (fresh-var e-name)
         stk-var (fresh-var "stacktrace")
+        implicit (catch-implicit-locals)
         handler-env (put-local (put-local (put-local env e-name handler-var)
-                                          "__STACKTRACE__" stk-var)
-                               "__EXCEPTION_KIND__" kind-var)
+                                          (:stack implicit) stk-var)
+                               (:kind implicit) kind-var)
         handler-body (compile-body handler-forms handler-env)]
     (a/lett handler-var (a/var e-var)
-            (a/lett stk-var (a/var "__STACKTRACE__")
+            (a/lett stk-var (a/var (:frames (BeamLisp.CompilerData/catch_stack_bindings)))
                     handler-body))))
 
 (defn- catch-cond-branch
@@ -1965,13 +2074,14 @@
    (e.g. `(catch :bad e …)`) is refused with the same message the genesis
    compiler raises, because a keyword/literal names no catchable shape."
   [catch-form e-var kind-var env]
-  (let [items (rn/node-items (rn/node-form catch-form))
+  (let [layout (catch-layout catch-form env)
+        items (rn/node-items (rn/node-form catch-form))
         first-node (rn/node-form (second items))
         first-tag (rn/node-tag first-node)]
     (if-not (= :symbol first-tag) (compile-error env (str "catch requires a variable or Module.Name, got a " (rn/node-tag first-node))) (let [name (rn/node-name first-node)]
         ; a typed catch: `Module.Name`, or a Java class spelled in full
         ; (`java.io.IOException`) which is lowercase-first but a class
-        (if (or (uppercase-first? name) (java-spelled? name))
+        (if (some? (:type-index layout))
           ; typed: (catch Module.Name e handler…)
           (let [rest-items (rest (rest items))
                 e-name (rn/node-name (rn/node-form (first rest-items)))
@@ -1984,7 +2094,8 @@
                 ; an Elixir module, as before. A name that LOOKS Java
                 ; (imported, or `java.`/`clojure.lang.`-qualified) but is not in
                 ; the table is refused with the table's list.
-                imported (let [t (BeamLisp.Env/import_target (:ns env) name)] (if (erlang/is_binary t) t nil))
+                imported (when-not (:contextual-bindings env)
+                           (let [t (BeamLisp.Env/import_target (:ns env) name)] (if (erlang/is_binary t) t nil)))
                 java-ish? (or (some? imported) (java-spelled? name)
                               (contains? #{"Exception" "Throwable" "RuntimeException" "ExceptionInfo"
                                            "NumberFormatException" "ArithmeticException"
@@ -2072,13 +2183,36 @@
       (reverse acc)
       (let [pattern (first fs)
             after-pat (rest fs)
-            gb (split-when after-pat env)      ; [guard-or-nil rest]
+            gb (split-when after-pat env)      ; [guard-or-nil rest guarded?]
             guard (first gb)
+            guarded? (nth gb 2)
             body-and-more (second gb)
             _ (when (and (some? guard) (empty? body-and-more)) (compile-error env "a receive clause needs a body after its `:when` guard"))
             body (first body-and-more)]
         (recur (rest body-and-more)
-               (cons {:pattern pattern :guard guard :body body} acc))))))
+               (cons {:pattern pattern :guard guard :guarded? guarded? :body body} acc))))))
+
+(defn receive-layout
+  "Project the canonical receive grammar onto original Reader item indexes.
+   Contextual expansion uses these roles to scope syntax without reparsing
+   clauses. Compilation consumes the same parsed pattern/guard/body records."
+  [forms env]
+  (let [indexed (Enum/map (Enum/with_index forms) (fn [pair] [(elem pair 1) (elem pair 0)]))
+        afters (Enum/filter indexed (fn [pair] (after-clause-form? (second pair))))
+        normal (Enum/filter indexed (fn [pair] (not (after-clause-form? (second pair)))))
+        parsed (receive-clause-forms (apply list (map second normal)) env)
+        clauses
+        (loop [remaining parsed positions normal output (list)]
+          (if (empty? remaining) (reverse output)
+            (let [clause (first remaining) guarded? (:guarded? clause)
+                  body-offset (if guarded? 3 1)]
+              (recur (rest remaining) (Enum/drop positions (inc body-offset))
+                (cons (assoc clause
+                        :pattern-index (first (first positions))
+                        :guard-index (when guarded? (first (nth positions 2)))
+                        :body-index (first (nth positions body-offset nil))) output)))))]
+    {:clauses clauses :after-forms (apply list (map second afters))
+     :after-indexes (apply list (map first afters))}))
 
 (defn- compile-receive
   "Compile (receive pattern body... (after ms body)) into an Elixir receive.
@@ -2088,16 +2222,16 @@
    sharing the clause's body. A `:when` guard rides on the clause head. An
    optional `(after ms body)` becomes the receive timeout."
   [forms env]
-  (let [after-forms (filter (fn [form] (after-clause-form? form)) forms)
-        normal (filter (fn [f] (not (after-clause-form? f))) forms)
-        clauses (receive-clause-forms normal env)
+  (let [layout (receive-layout forms env)
+        after-forms (:after-forms layout)
+        clauses (:clauses layout)
         ; each clause -> one ANF clause per pattern alternative
         do-clauses (apply list
                      (mapcat (fn [cl]
                                (let [pr (compile-pattern (:pattern cl) env)
                                      pats (first pr)
                                      pat-env (second pr)
-                                     guard-node (if (nil? (:guard cl)) nil
+                                     guard-node (when (:guarded? cl)
                                                   (compile-guard (:guard cl) pat-env))
                                      body-node (compile-node (:body cl) pat-env)]
                                  (map (fn [pat]
@@ -2118,15 +2252,11 @@
    `try` with a single catch-all clause (normalizing the caught value) and an
    optional `after` block."
   [forms env]
-  (let [raws (filter (fn [form] (catch-raw-clause-form? form)) forms)
-        catches (filter (fn [form] (catch-clause-form? form)) forms)
-        finallies (filter (fn [form] (finally-clause-form? form)) forms)
-        body (filter (fn [f] (not (or (catch-clause-form? f) (catch-raw-clause-form? f)
-                                      (finally-clause-form? f)))) forms)]
+  (let [forms (vec forms) layout (try-layout forms env)
+        selected (fn [key] (Enum/map (get layout key) #(nth forms %)))
+        raws (selected :raw-indexes) catches (selected :catch-indexes)
+        finallies (selected :finally-indexes) body (selected :body-indexes)]
     (cond
-      (and (seq raws) (or (seq catches) (next raws)))
-      (compile-error env "try: a catch-raw clause is the ONLY catch of its try (no other catch, at most one catch-raw)")
-
       (seq raws)
       (compile-try-raw (first raws) body finallies env)
 
@@ -2161,7 +2291,7 @@
                              (nth names 2) s-var)
             handler (a/lett k-var (a/var kind-var)
                       (a/lett r-var (a/var value-var)
-                        (a/lett s-var (a/var "__STACKTRACE__")
+                        (a/lett s-var (a/var (:frames (BeamLisp.CompilerData/catch_stack_bindings)))
                           (compile-body (rest (rest items)) h-env))))
             after-node (if (empty? finallies) nil
                          (compile-body (rest (rn/node-items (rn/node-form (first finallies))))
@@ -2191,8 +2321,9 @@
             ; from `from_core` — the stage AFTER v3_core — so that rewrite had to
             ; be made there; before it, every handler held the raw
             ; `{Tag, Value, Info}` triple and no error could name its own site.
-            raw-stack (a/var "__STACKTRACE_RAW__")
-            frame-list (a/var "__STACKTRACE__")
+            stack-bindings (BeamLisp.CompilerData/catch_stack_bindings)
+            raw-stack (a/var (:raw stack-bindings))
+            frame-list (a/var (:frames stack-bindings))
             ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
             normalize (a/casee (a/var kind-var)
                                (list (a/clause (list (a/plit :throw)) nil (a/var value-var))
@@ -2219,7 +2350,7 @@
                            (compile-body fin-items (notail env))))]
         (a/tryy body-node catch-clauses after-node)))))
 
-(defn- datum
+(defn datum
   "Turn a reader form into the plain DATA value it denotes.
 
    This is what `quote` hands back: the form as data, not as running code. A
@@ -2258,18 +2389,18 @@
             base))
       (= tag :symbol) form
       (= tag :keyword) (erlang/binary_to_atom (rn/node-name form))
-      (= tag :list) (apply list (map (fn [value] (datum value)) (rn/node-items form)))
-      (= tag :vector) (BeamLisp.Vector/new (apply list (map (fn [value] (datum value)) (rn/node-items form))))
-      (= tag :set) (BeamLisp.Set/new (apply list (map (fn [value] (datum value)) (rn/node-items form))))
+      (= tag :list) (Enum/map (rn/node-items form) (fn [value] (datum value)))
+      (= tag :vector) (BeamLisp.Vector/new (Enum/map (rn/node-items form) (fn [value] (datum value))))
+      (= tag :set) (BeamLisp.Set/new (Enum/map (rn/node-items form) (fn [value] (datum value))))
       (= tag :map)
         ; build a plain map value from the key/value data; :maps.from_list
         ; takes a list of {k, v} tuples, which is what each pair becomes
         (maps/from_list
-          (apply list (map (fn [pair]
-                             (let [kv (erlang/tuple_to_list pair)]
-                               (erlang/list_to_tuple
-                                 (list (datum (first kv)) (datum (second kv))))))
-                           (rn/node-items form))))
+          (Enum/map (rn/node-items form)
+            (fn [pair]
+              (let [kv (erlang/tuple_to_list pair)]
+                (erlang/list_to_tuple
+                  (list (datum (first kv)) (datum (second kv))))))))
       :else form)))
 
 (defn- compile-quote
@@ -2351,6 +2482,13 @@
    `[:expand tag arity]` entry expands to a guard-safe expression built by
    guard-special."
   (kernel-guard-bifs-literal))
+
+(defn guard-operator?
+  "The canonical restricted guard dialect; these are compiler operators,
+   not ordinary variable references or macro calls."
+  [name]
+  (or (contains? #{"and" "or" "not"} name)
+      (contains? (kernel-guard-bifs-literal) name)))
 
 (defn- g-and
   "Strict boolean AND of two guard nodes (the if-chain the normaliser uses
@@ -2505,7 +2643,7 @@
     (cond
       (= tag :symbol)
         (if (local? env (rn/node-name f))
-          (a/var (local-var env (rn/node-name f)))
+          (compile-symbol (rn/node-name f) env)
           (compile-error env (str "`" (rn/node-name f) "` is not bound by this clause's pattern")))
       (= tag :keyword) (a/lit (erlang/binary_to_atom (rn/node-name f)))
       (= tag :list) (compile-guard-list (rn/node-items f) env)
@@ -2674,7 +2812,8 @@
 (defn- split-when
   "Split a clause's forms into [guard body] at a leading `:when`.
 
-   `(:when g rest...)` -> [g (rest...)]; forms with no `:when` -> [nil forms].
+   `(:when g rest...)` -> [g (rest...) true]; otherwise [nil forms false].
+   The flag distinguishes a literal nil guard from the absence of a guard.
    The guard is the test that must hold before the body runs. A DANGLING
    `:when` — one with no guard expression after it — is refused here (rather
    than silently read as a body form) so `(defn f [x] :when)` is a clear
@@ -2686,8 +2825,8 @@
            (= "when" (rn/node-name (rn/node-form (first forms)))))
     (if (empty? (rest forms))
       (compile-error env "`:when` must be followed by a guard expression")
-      (list (server-clause/guard-node (second forms) (rn/node-pos (first forms))) (rest (rest forms))))
-    (list nil forms)))
+      (list (server-clause/guard-node (second forms) (rn/node-pos (first forms))) (rest (rest forms)) true))
+    (list nil forms false)))
 
 (defn- parse-fn-clauses
   "Pull the clauses out of a (fn ...) form's arguments.
@@ -2708,10 +2847,13 @@
       ; single inline clause
       (let [gb (split-when (rest args) env)]
         (check-body (first gb) (second gb))
-        (list {:params (rn/node-items first-arg) :guard (first gb) :body (second gb)}))
+        (list {:params (rn/node-items first-arg) :guard (first gb) :body (second gb)
+               :guard-index (when (nth gb 2) 2) :body-offset (if (nth gb 2) 3 1)
+               :clause-index nil}))
       ; several parenthesised clauses
-      (map (fn [clause]
-             (let [clause-form (rn/node-form clause)]
+      (Enum/map (Enum/with_index args)
+       (fn [indexed]
+             (let [clause (elem indexed 0) clause-form (rn/node-form clause)]
                ; A clause that is not a form means something UPSTREAM built this
                ; defn from values instead of nodes — a macro splicing names, or a
                ; form that was already evaluated. Without this guard the failure
@@ -2725,8 +2867,20 @@
                      gb (split-when (rest items) env)]
                  (check-body (first gb) (second gb))
                  {:params (rn/node-items (rn/node-form (first items)))
-                  :guard (first gb) :body (second gb)})))
-           args))))
+                  :guard (first gb) :body (second gb)
+                  :guard-index (when (nth gb 2) 2) :body-offset (if (nth gb 2) 3 1)
+                  :clause-index (elem indexed 1)})))))))
+
+(defn function-layout
+  "Canonical fn name/clause grammar with original Reader item roles.
+   Clause indexes address forms after the optional name. A nil clause index
+   means inline parameters; guard/body indexes address that clause's items."
+  [args env]
+  (let [first-arg (rn/node-form (first args))
+        name (when (= :symbol (rn/node-tag first-arg)) (rn/node-name first-arg))
+        forms (if (nil? name) args (rest args))]
+    {:name name :inline? (= :vector (rn/node-tag (rn/node-form (first forms))))
+     :clauses (parse-fn-clauses forms env)}))
 
 (defn- assemble-fn
   "Assemble compiled clauses into a function value.
@@ -2787,10 +2941,9 @@
    to nil (not `[]`) when there are no extra arguments. Ordinary fns keep the
    Clojure `()` empty rest."
   [args nil-rest? env]
-  (let [first-arg (rn/node-form (first args))
-        fn-name (when (= :symbol (rn/node-tag first-arg)) (rn/node-name first-arg))
-        clause-args (if (nil? fn-name) args (rest args))
-        clauses (parse-fn-clauses clause-args env)
+  (let [layout (function-layout args env)
+        fn-name (:name layout)
+        clauses (:clauses layout)
         ; one shared self variable per distinct shape (all clauses of a shape
         ; recur into the same dispatcher)
         shapes (distinct (map (fn [c] (clause-shape (:params c))) clauses))
@@ -2829,7 +2982,7 @@
   (and (> (count name) 1)
        (= "#" (subs name (dec (count name)) (count name)))))
 
-(defn- resolve-gensym
+(defn syntax-quote-name
   "Resolve an auto-gensym name x# to a stable generated name within a template.
    Returns [resolved-name new-gensym-map]. A non-gensym name is unchanged. The
    same x# twice yields the same name."
@@ -2853,6 +3006,14 @@
         (when (BeamLisp.Env/local_var? "sugar" name) "sugar")
         ns)))
 
+(defn syntax-quote-literal-name?
+ "Names whose original syntax-quote spelling is independent of namespace lookup."
+ [name]
+ (or (has-slash? name) (gensym-hash? name)
+     (and (> (count name) 6) (= "__auto" (subs name (- (count name) 6) (count name))))
+     (and (> (count name) 3) (= "__c" (subs name (- (count name) 3) (count name))))
+     (contains? (kernel-special-forms-literal) name)))
+
 (defn- qualify-synq
   "Resolve a plain template symbol to the name it should expand to. A name with
    a slash, an auto-gensym, a special form, a template local, or a macro stays
@@ -2860,13 +3021,12 @@
    namespace that OWNS it. Anything else stays bare."
   [name env]
   (cond
-    (has-slash? name) name
-    (and (> (count name) 6)
-         (= "__auto" (subs name (- (count name) 6) (count name)))) name
-    (and (> (count name) 3)
-         (= "__c" (subs name (- (count name) 3) (count name)))) name
-    (contains? (kernel-special-forms-literal) name) name
+    (syntax-quote-literal-name? name) name
     (local? env name) name
+    ;; Contextual elaboration owns template spellings and selected references.
+    ;; Even a data symbol must never discover authority through mutable Env,
+    ;; staged macro lookup, namespace loading, or per-env materialization.
+    (maps/is_key :contextual-bindings env) name
     (macro? env name) name
     :else
       (let [ns (:ns env)
@@ -2874,7 +3034,8 @@
             ; materialize a `^:per-env` value — only test whether it binds.
             r (BeamLisp.Env/peek ns name)]
         (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
-          (str (owner-ns ns name) "/" name)
+          (let [owner (owner-ns ns name)]
+            (str (if (= owner "core") "clojure.core" owner) "/" name))
           name))))
 
 (defn- unquote-form?
@@ -2926,19 +3087,28 @@
                 (= :symbol (rn/node-tag (rn/node-form (first items))))
                 (= "syntax-quote" (rn/node-name (rn/node-form (first items)))))))))
 
+(defn syntax-quote-role
+ "The original quotation grammar, shared with contextual Source projection.
+  This classifies data only; selected binding lookup stays with the expander."
+ [form]
+ (cond (unquote-form? form) :unquote
+       (splice-form? form) :splice
+       (nested-synq-form? form) :nested
+       :else (rn/node-tag (rn/node-form form))))
+
 (defn- synq
   "Build the bl-ANF node that constructs one templated form at run time.
    Returns [node new-gensym-map]."
   [form env g]
   (let [f (rn/node-form form)
-        tag (rn/node-tag f)]
+        tag (syntax-quote-role form)]
     (cond
-      (unquote-form? form)
+      (= :unquote tag)
         (list (compile-node (second (rn/node-items f)) (notail env)) g)
       ; a bare ~@x outside any list/vector template: refused (splicing makes
       ; sense only as a list item — synq-list's splice-form? branch). The
       ; genesis Elixir compiler raised this; the port dropped it.
-      (splice-form? form)
+      (= :splice tag)
         (erlang/error
           (RuntimeError/exception "~@ is only valid inside a syntax-quoted list or vector"))
       ; a NESTED syntax-quote gets its OWN fresh gensym map: its `x#` symbols
@@ -2946,7 +3116,7 @@
       ; backticks each holding `x#` produce DIFFERENT generated names. The
       ; enclosing map `g` is threaded on unchanged. Mirrors the genesis
       ; nested-`syntax-quote` clause in synq_data.
-      (nested-synq-form? form)
+      (= :nested tag)
         (let [inner (second (rn/node-items f))
               inner-r (synq inner env {})
               inner-node (first inner-r)
@@ -2969,7 +3139,7 @@
                             (rn/node-items f))]
           (list (a/mapp (apply list (reverse (first built)))) (second built)))
       (= tag :symbol)
-        (let [rg (resolve-gensym (rn/node-name f) g)
+        (let [rg (syntax-quote-name (rn/node-name f) g)
               resolved (first rg)
               g2 (second rg)]
           (list (a/lit (rn/->tuple (list :symbol (qualify-synq resolved env)))) g2))
@@ -3008,6 +3178,10 @@
    `(extend-type T Proto ...)` finds the protocol var even when it was referred
    in from another namespace."
   [env name]
+  (if (:contextual-bindings env)
+   (if (has-slash? name)
+    (let [[prefix var] (split-slash name)] (list (if (= "clojure.core" prefix) "core" prefix) var))
+    (list (:ns env) name))
   (if (has-slash? name)
     (let [[prefix var] (split-slash name)
           target (or (BeamLisp.Env/alias_target (:ns env) prefix)
@@ -3015,7 +3189,7 @@
       (list target var))
     (if (BeamLisp.Env/local_var? (:ns env) name)
       (list (:ns env) name)
-      (list (or (BeamLisp.Env/refer_source (:ns env) name) (:ns env)) name))))
+      (list (or (BeamLisp.Env/refer_source (:ns env) name) (:ns env)) name)))))
 
 (defn- type-tag
   "The dispatch tag for a type in an `extend-type`/`defrecord` protocol block.
@@ -3353,56 +3527,92 @@
                              (a/var mod-var) impls))))
          grouped)))
 
-(defn- compile-defrecord
-  "Compile (defrecord Name [fields...] & protocols) into the block that defines
-   a struct-backed type, interns its constructors, and installs any inline
-   protocol implementations.
+(defn- class-source
+ ([name-form fields-form proto-forms kind env]
+  (class-source name-form fields-form proto-forms kind env nil))
+ ([name-form fields-form proto-forms kind env module]
+ ;; Ordinary publication, compiler prelinking and inert Source discovery share
+ ;; this one class header and the original native descriptor producer.
+ (when-not (and (= :symbol (rn/node-tag (rn/node-form name-form)))
+                (= :vector (rn/node-tag (rn/node-form fields-form)))
+                (every? #(= :symbol (rn/node-tag (rn/node-form %)))
+                        (rn/node-items (rn/node-form fields-form))))
+  (compile-error env "Class declaration requires a symbol name and a vector of field symbols"))
+ (let [name (rn/node-name (rn/node-form name-form))
+       fields (record-field-names fields-form)
+       descriptor (if module
+                    (BeamLisp.Record/declaration_descriptor (:ns env) name kind fields module)
+                    (BeamLisp.Record/declaration_descriptor (:ns env) name kind fields))
+       metadata (var-meta-map nil false (name-author-meta name-form))
+       bindings (concat (list {:name (symbol name) :role :type}
+                              {:name (symbol (str "->" name)) :role :positional-constructor})
+                         (if (= :record kind)
+                          (list {:name (symbol (str "map->" name)) :role :map-constructor}) (list)))]
+  {:kind (if (= :record kind) "defrecord" "deftype")
+   :name (rn/node-form name-form) :fields fields :metadata metadata
+   :visibility (metadata-visibility metadata) :descriptor descriptor
+   :bindings (apply list bindings) :protocol-forms (or proto-forms (list))})))
 
-   Emits: a `mod = Record.define(ns, Name, fields)` binding, then interns of
-   `Name` (the module), `->Name` (positional constructor), and `map->Name`
-   (map constructor for a record). Any trailing protocol blocks
-   (`Shape (area [s] ...)`) become `Multi.extend_type` calls via
-   `record-protocol-extends`, so a record can implement protocols inline just
-   like a standalone `extend-type`."
-  [name-form fields-form proto-forms kind env]
-  (let [name (rn/node-name (rn/node-form name-form))
-        fields (record-field-names fields-form)
-        ; a FIXED variable named `mod` (not gensym'd), matching the existing
-        ; compiler — there is only one per record definition, so no collision
-        mod-var "mod"
-        descriptor (BeamLisp.Record/declaration_descriptor (:ns env) name kind fields)
-        define-node (a/remote (kernel-mod-record-literal) :publish_declaration! (list (a/lit descriptor)))
-        base (list
-               ; intern Name -> mod
-               (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) (a/var mod-var)))
-               ; intern ->Name -> positional constructor
-               (a/remote (kernel-mod-env-literal) :intern
-                         (list (a/lit (:ns env)) (a/lit (str "->" name))
-                               (a/remote (kernel-mod-record-literal) :positional_ctor (list (a/var mod-var))))))
-        ; the map-constructor slot: a record interns `map->Name`; a deftype has none
-        map-ctor-stmts (if (= kind :record)
-                         (list (a/remote (kernel-mod-env-literal) :intern
-                                 (list (a/lit (:ns env)) (a/lit (str "map->" name))
-                                       (a/remote (kernel-mod-record-literal) :map_ctor (list (a/var mod-var))))))
-                         (list))
-        ; the inline protocol extends, in source order, each a Multi.extend_type
-        extend-nodes (record-protocol-extends (or proto-forms (list)) mod-var env)
-        stmts (apply list (concat base map-ctor-stmts extend-nodes (list (a/var mod-var))))]
-    (a/lett mod-var define-node (a/doo stmts))))
+(defn- class-initialization-plan [source env]
+ ;; Class publication, constructor values and inline extensions have one owner.
+ ;; Namespace and lexical projections differ only in where those values bind.
+ (let [mod-var "mod"
+       bindings (map (fn [binding]
+                       (assoc binding :node
+                        (case (:role binding)
+                         :type (a/var mod-var)
+                         :positional-constructor (a/remote (kernel-mod-record-literal) :positional_ctor (list (a/var mod-var)))
+                         :map-constructor (a/remote (kernel-mod-record-literal) :map_ctor (list (a/var mod-var))))))
+                     (:bindings source))]
+  {:namespace (:ns env) :module-variable mod-var :bindings bindings
+   :publication (a/remote (kernel-mod-record-literal) :publish_declaration! (list (a/lit (:descriptor source))))
+   :extensions (record-protocol-extends (:protocol-forms source) mod-var env)}))
+
+(defn- class-namespace-node [plan]
+ (let [mod-var (:module-variable plan)
+       interns (map (fn [binding]
+                      (a/remote (kernel-mod-env-literal) :intern
+                       (list (a/lit (:namespace plan)) (a/lit (str (:name binding))) (:node binding))))
+                    (:bindings plan))]
+  (a/lett mod-var (:publication plan)
+   (a/doo (apply list (concat interns (:extensions plan) (list (a/var mod-var))))))))
+
+(defn- class-lexical-node [plan]
+ ;; Build every constructor once before inline protocol registration, preserving
+ ;; ordinary class order. The tuple is a lexical value, never a registry or Var.
+ (let [frame "__class_bindings__"]
+  (a/lett (:module-variable plan) (:publication plan)
+   (a/lett frame (a/tup (map :node (:bindings plan)))
+    (a/doo (apply list (concat (:extensions plan) (list (a/var frame)))))))))
+
+(defn- compile-class-source [source env]
+ (class-namespace-node (class-initialization-plan source env)))
+
+(defn- compile-defrecord [name-form fields-form proto-forms kind env]
+ (compile-class-source (class-source name-form fields-form proto-forms kind env) env))
 
 ; ---- defserver (real gen_server) ---------------------------------------------
 ;
 ; (defserver name (init [arg] body) (handle-call PAT [from state] body) ...)
+(defn- server-constructor-node [shape]
+ (let [tag (elem shape 0) arities (elem shape 1)
+       fixed (a/mapp (Enum/map arities
+               (fn [arity]
+                (let [names (Enum/map (lists/seq 1 arity) (fn [_] (fresh-var "return")))
+                      body (if (= 0 arity) (a/lit tag)
+                             (a/tup (cons (a/lit tag) (Enum/map names (fn [name] (a/var name))))))]
+                 (list (a/lit arity)
+                       (a/fnn (list (a/clause (Enum/map names (fn [name] (a/pvar name))) nil body))))))))]
+  (assoc (a/tup (list (a/lit :"$blfn") fixed (a/lit nil)))
+         :ann {:server-return-constructor shape})))
+
 (defn- server-body
-  "Compile a callback body with OTP return constructors bound as locals."
+  "Compile callbacks against the shared pure return-constructor model.
+   Ordinary calls emit tuples; first-class captures remain Source-owned lambdas."
   [forms env]
-  (let [ctors (BeamLisp.Server/return_constructors)
-        ret-env (reduce (fn [e cname]
-                          (put-local e cname
-                                     (a/remote (erlang/binary_to_atom "Elixir.Map") :fetch!
-                                               (list (a/remote (kernel-mod-server-literal) :return_constructors (list))
-                                                     (a/lit cname)))))
-                        env (maps/keys ctors))]
+  (let [shapes (BeamLisp.Server/return_constructor_shapes)
+        ret-env (Enum/reduce (Map/to_list shapes) env
+                  (fn [entry e] (put-local e (elem entry 0) (server-constructor-node (elem entry 1)))))]
     (compile-body forms ret-env)))
 
 (defn- server-defn-clause [fname params guard body]
@@ -3435,13 +3645,19 @@
                           (a/lit nil)))
            (a/lit :ok) check)))
 
+(defn server-execution-target?
+  "Canonical native actor-entry target emitted by this compiler. Recognition
+   is analysis data only; class, operands and body still require exact checks."
+  [module function]
+  (and (= (kernel-mod-execution-literal) module) (= :invoke-actor! function)))
+
 (defn- server-execution-body [module fname params guard body]
   ;; Observers remain observers. Init/terminate preserve their exact ownership
   ;; and cleanup ABI; input certificates cover declared dispatch bodies only.
   (let [body (if (contains? #{:handle_call :handle_cast :handle_info :handle_continue} fname)
                (a/doo (list (server-input-check module fname params guard) body)) body)]
     (if (contains? #{:init :handle_call :handle_cast :handle_info :handle_continue :terminate} fname)
-      (a/remote (kernel-mod-env-literal) :with_server_execution!
+      (a/remote (kernel-mod-execution-literal) :invoke-actor!
         (list (a/lit module) (a/lit fname) (a/fnn (list (a/clause (list) nil body)))))
       body)))
 
@@ -3509,25 +3725,40 @@
                   :origin :canonical-compiled-clauses :callbacks callbacks}]
     (concat checks (list (server-defn-clause :__bl_contract__ (list) nil (a/lit metadata))))))
 
-(defn- server-client-defs [mod]
+(defn- server-client-defs [mod env]
   (let [gs (erlang/binary_to_atom "Elixir.GenServer")
         remote (fn [m f xs] (a/remote m f (apply list (map (fn [name] (a/var name)) xs))))
         clause (fn [f ps body] (server-defn-clause f ps nil body))]
-    (list
+    (concat (list
       (clause :start (list "init_arg") (a/remote (kernel-mod-server-literal) :start (list (a/lit mod) (a/var "init_arg") (a/empty-list-node))))
       (clause :start (list "init_arg" "opts") (a/remote (kernel-mod-server-literal) :start (list (a/lit mod) (a/var "init_arg") (a/var "opts"))))
       (clause :start_link (list "init_arg") (a/remote (kernel-mod-server-literal) :start_link (list (a/lit mod) (a/var "init_arg") (a/empty-list-node))))
       (clause :start_link (list "init_arg" "opts") (a/remote (kernel-mod-server-literal) :start_link (list (a/lit mod) (a/var "init_arg") (a/var "opts"))))
+      )
+     ;; Managed Source uses SDK client boundaries. Its generated class must not
+     ;; carry unused raw OTP adapters: the exact IR audit rightly refuses them.
+     ;; The native/nonmanaged public client surface remains unchanged.
+     (if (:managed-source env) (list)
+      (list
       (clause :call (list "server" "request") (a/remote gs :call (list (a/var "server") (a/var "request") (a/lit 5000))))
       (clause :call (list "server" "request" "timeout") (remote gs :call (list "server" "request" "timeout")))
       (clause :cast (list "server" "request") (remote gs :cast (list "server" "request")))
       (clause :stop (list "server") (a/remote gs :stop (list (a/var "server") (a/lit :normal) (a/lit :infinity))))
       (clause :stop (list "server" "reason") (a/remote gs :stop (list (a/var "server") (a/var "reason") (a/lit :infinity))))
-      (clause :stop (list "server" "reason" "timeout") (remote gs :stop (list "server" "reason" "timeout"))))))
+      (clause :stop (list "server" "reason" "timeout") (remote gs :stop (list "server" "reason" "timeout"))))))))
 
-(defn- server-default-defs [cb]
+(defn- server-default-defs [cb module]
   (let [clause (fn [f ps body] (server-defn-clause f ps nil body))]
     (cond
+      (= cb :init)
+       (let [argument (fresh-var "bl_init_arg")
+             body (server-execution-body module :init (list) nil
+                    (a/tup (list (a/lit :ok) (a/lit {}))))]
+        ;; OTP still requires init/1 when the declaration has no user init.
+        ;; Claim the real start envelope before entering the same owned extent
+        ;; as an explicit initializer; an empty state grants no actor authority.
+        (list (clause :init (list argument)
+          (a/doo (list (a/remote (kernel-mod-server-literal) :bind_init (list (a/var argument))) body)))))
       (= cb :handle_call) (list (clause :handle_call (list "msg" "_from" "state") (a/tup (list (a/lit :stop) (a/tup (list (a/lit :bad_call) (a/var "msg"))) (a/var "state")))))
       (= cb :handle_cast) (list (clause :handle_cast (list "msg" "state") (a/tup (list (a/lit :stop) (a/tup (list (a/lit :bad_cast) (a/var "msg"))) (a/var "state")))))
       (= cb :handle_info) (list (clause :handle_info (list "_msg" "state") (a/tup (list (a/lit :noreply) (a/var "state")))))
@@ -3553,9 +3784,9 @@
                          (reverse (:cbs parts)))
         inv-defs (mapcat (fn [c] (server-clause-defs c :__invariant__ :vector (dissoc env :aot-normal-declaration-token) mod)) (reverse (:inv parts)))
         grouped (reduce (fn [m cd] (assoc m (first cd) (concat (get m (first cd) (list)) (second cd)))) {} clause-defs)
-        ordered (mapcat (fn [cb] (let [user (get grouped cb (list))] (if (empty? user) (server-default-defs cb) user)))
+        ordered (mapcat (fn [cb] (let [user (get grouped cb (list))] (if (empty? user) (server-default-defs cb mod) user)))
                         (BeamLisp.Server/callback_order))
-        module-defs (apply list (concat ordered inv-defs (server-client-defs mod) (server-contract-defs grouped)))
+        module-defs (apply list (concat ordered inv-defs (server-client-defs mod env) (server-contract-defs grouped)))
         exports (to-list (distinct (map (fn [d] [(:fname d) (count (:params d))]) module-defs)))
         descriptor (a/module mod module-defs exports (list [:behaviour (list :gen_server)]))
         create-node (a/remote (kernel-mod-body-lower-literal) :reload-descriptor! (list (a/lit descriptor)))]
@@ -3570,56 +3801,17 @@
 ; that declares the namespace, enters it, runs the requires, installs aliases
 ; and refers, and returns the namespace name as an atom.
 
-(defn- ns-clauses
-  "The `(ns …)` clause forms, with the namespace DOCSTRING dropped.
-
-   The reader hands a bare string back as a SCALAR node — not a tuple, no
-   `:keyword` head — so `(ns app \"…\" (:require [x]))` would otherwise reach the
-   clause walker as a string, and walking it as a list ends inside the host with
-   a raw argument error instead of a located diagnostic. Clojure keeps that
-   string as the namespace's `:doc` and does not treat it as a clause; dropping
-   it here is the same reading.
-
-   A FINITE list, built eagerly: a compiler collection must be finite data, and
-   `remove` returns a lazy seq no layer below the runtime can walk."
-  [clauses]
-  (reduce (fn [kept clause]
-            (if (= :scalar (rn/node-tag (rn/node-form clause)))
-              kept
-              (conj kept clause)))
-          (list)
-          clauses))
+(defn- ns-clauses [clauses env]
+ (try (BeamLisp.CompilerData/namespace_clauses clauses)
+      (catch _ (compile-error env "Invalid namespace declaration"))))
 
 (defn- parse-require-spec
-  "Parse one :require spec into [target as-alias refer]. A bare symbol is just a
-   target; a vector `[target :as a :refer [x y]]` carries an alias and/or refer
-   list (or :all)."
+  "The compiler and artifact producer share the bounded native Reader grammar."
   [spec env]
-  (let [f (rn/node-form spec)]
-    (if (= :symbol (rn/node-tag f))
-      (list (rn/node-name f) nil (list))
-      ; a vector [target flags...]
-      (let [items (rn/node-items f)
-            target (rn/node-name (rn/node-form (first items)))]
-        (loop [fs (rest items) as-alias nil refer (list) expect nil]
-          (if (empty? fs)
-            (list target as-alias refer)
-            (let [x (rn/node-form (first fs))
-                  tag (rn/node-tag x)]
-              (cond
-                (and (= tag :keyword) (= "as" (rn/node-name x)))
-                  (recur (rest fs) as-alias refer :as)
-                (and (= tag :keyword) (= "refer" (rn/node-name x)))
-                  (recur (rest fs) as-alias refer :refer)
-                (= expect :as)
-                  (recur (rest fs) (rn/node-name x) refer nil)
-                (and (= expect :refer) (= tag :keyword) (= "all" (rn/node-name x)))
-                  (recur (rest fs) as-alias :all nil)
-                (and (= expect :refer) (= tag :vector))
-                  (recur (rest fs) as-alias
-                         (apply list (map (fn [s] (rn/node-name (rn/node-form s))) (rn/node-items x)))
-                         nil)
-                :else (compile-error env (str "invalid :require spec for " target))))))))))
+  (try
+   (let [parsed (BeamLisp.CompilerData/namespace_require_spec spec)]
+    (list (elem parsed 0) (elem parsed 1) (elem parsed 2)))
+   (catch _ (compile-error env "Invalid :require specification"))))
 
 (defn- ns-clause-head
   "The keyword naming an `(ns …)` clause — `\"require\"`, `\"import\"`,
@@ -3663,27 +3855,9 @@
                    (rest items)))))
       :else (compile-error env "invalid :import spec"))))
 
-(defn- parse-refer-clojure
-  "The names an `(:refer-clojure :exclude [a b])` clause excludes. Only
-   `:exclude` is meaningful here — beam-lisp resolves a same-ns def before
-   core already — so `:only`/`:rename` are refused rather than silently
-   accepted with different semantics."
-  [specs env]
-  (loop [fs specs names (list) expect nil]
-    (if (empty? fs)
-      names
-      (let [x (rn/node-form (first fs))
-            tag (rn/node-tag x)]
-        (cond
-          (and (= tag :keyword) (= "exclude" (rn/node-name x)))
-            (recur (rest fs) names :exclude)
-          (= tag :keyword)
-            (compile-error env (str ":refer-clojure supports only :exclude, got :" (rn/node-name x)))
-          (and (= expect :exclude) (= tag :vector))
-            (recur (rest fs)
-                   (concat names (map (fn [s] (rn/node-name (rn/node-form s))) (rn/node-items x)))
-                   nil)
-          :else (compile-error env "invalid :refer-clojure clause"))))))
+(defn- parse-refer-clojure [specs env]
+ (try (BeamLisp.CompilerData/namespace_core_excludes specs)
+      (catch _ (compile-error env "Invalid :refer-clojure specification"))))
 
 (defn- compile-ns
   "Compile (ns name clauses...) into the block that declares and enters the
@@ -3704,14 +3878,7 @@
         js? (or (= true (:js metadata))
                 (= :javascript (:interop metadata))
                 (= "javascript" (when (= :keyword (rn/node-tag (:interop metadata))) (rn/node-name (:interop metadata)))))
-        clauses (ns-clauses clauses)
-        _ (reduce (fn [_ c]
-                    (let [h (ns-clause-head c)]
-                      (if (or (= h "require") (= h "import") (= h "refer-clojure"))
-                        nil
-                        (compile-error env (str "ns supports :require, :import and :refer-clojure clauses"
-                                                (if (nil? h) "" (str ", got :" h)))))))
-                  nil clauses)
+        clauses (ns-clauses clauses env)
         specs (clause-specs "require" clauses)
         imports (BeamLisp.CompilerData/eager_concat (map (fn [s] (parse-import-spec s env)) (clause-specs "import" clauses)))
         import-ops (apply list
@@ -3799,17 +3966,11 @@
    result so the metadata is written after interning:
    `value = intern(...); Env.put_meta(ns, name, %{doc: ...}); value`."
   [args env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        rest-args (rest args)
+  (let [header (value-header args)
+        name (:name header) doc (:doc header) init (:value-form header)
         _ (warn-special-name! "def" name env)
-        ; (def name "doc" value) has a string before the value
-        has-doc (and (= 2 (count rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        init (if has-doc (second rest-args) (first rest-args))
         init-node (compile-node init (notail env))
-        author (name-author-meta (first args))
+        author (:author header)
         meta (var-meta-map doc false author)]
     (if (per-env-attr? author)
       (compile-per-env-def name init-node env meta)
@@ -3852,6 +4013,15 @@
                              (list (a/lit (:ns env)) (a/lit name)
                                    (a/lit meta)))
                    (a/lit :ok))))))
+
+(defn- function-clause [fname params guard body env]
+ (with-ann {:op :defn-clause :fname fname :params params :guard guard :body body :ann {}}
+           (maps/with (list :line :file) env)))
+
+(defn- function-declaration [name entries metadata env]
+ {:version 1 :kind :function-declaration :namespace (:ns env) :name name :entries entries
+  :location (list (tuple :file (or (:file env) "nofile")) (tuple :line (or (:line env) 1)))
+  :metadata metadata})
 
 (defn- compile-defn-clause
   "Compile one defn clause into a def-clause entry {kind fixed-count fname def-ast}.
@@ -3926,9 +4096,8 @@
                      (compile-guard guard (guardable-env body-env params)))
         ; params are always fresh plain vars (patterns compile to prelude
         ; steps), so the head is a list of pvar pattern nodes
-        clause-node {:op :defn-clause :fname fname
-                     :params (apply list (map (fn [p] {:pop :pvar :name p}) params))
-                     :guard guard-node :body body-node :ann {}}
+        clause-node (function-clause fname (apply list (map (fn [p] {:pop :pvar :name p}) params))
+                                     guard-node body-node env)
         kind (if variadic? :variadic :fixed)]
     ; entry shape Link.defvar wants: {kind, fixed-count, fname, clause-node}
     (erlang/list_to_tuple (list kind fixed-count fname clause-node))))
@@ -3957,41 +4126,33 @@
                        (concat (list (rn/->tuple (list :keyword "when")) guard) (apply list body)))))))
        clauses))
 
-(defn- compile-defmacro
-  "Compile (defmacro name [params] body...) into the tree that records a macro.
+(defn- macro-header [args env]
+ ;; Publication and inert Source projection share the original datum-macro ABI.
+ (let [name-form (first args) name (rn/node-name (rn/node-form name-form))
+       more (rest args)
+       has-doc (and (seq more) (erlang/is_binary (rn/node-form (first more))) (seq (rest more)))
+       doc (when has-doc (rn/node-form (first more)))
+       author (name-author-meta name-form)]
+  (when (per-env-attr? author)
+   (compile-error env (str "defmacro " name ": ^:per-env is only valid on a `def` value, not a macro")))
+  {:name name :name-form name-form :metadata (var-meta-map doc false author)
+   :clauses (parse-fn-clauses (if has-doc (rest more) more) env)}))
 
-   A macro is a variable whose value is tagged `{:\"$macro\", fn}`. The function
-   is an ordinary compiled fn whose parameters are `&form`, `&env`, then the
-   declared parameters, so at expansion time it receives the call form, the
-   call-site environment, and the unevaluated arguments. It is interned like a
-   `def`."
-  [args env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        _ (warn-special-name! "defmacro" name env)
-        rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     (not (empty? (rest rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        ; A macro expands at COMPILE time; a per-env (runtime, per-consumer)
-        ; instance is meaningless for one. Reject explicitly. Mirrors genesis.
-        _ (when (per-env-attr? (name-author-meta (first args))) (compile-error env (str "defmacro " name ": ^:per-env is only valid on a `def` value, not a macro")))
-        clauses (parse-fn-clauses after-doc env)
-        fn-args (macro-fn-form clauses)
-        ; macro fns use nil-rest: a trailing `& body` is nil when empty
-        fn-node (compile-fn* (apply list fn-args) true env)
-        macro-val (a/tup (list (a/lit (erlang/binary_to_atom "$macro")) fn-node))
-        intern-node (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) macro-val))
-        meta (var-meta-map doc false (name-author-meta (first args)))]
-    (if (nil? meta)
-      intern-node
-      (a/lett "value" intern-node
-              (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
-                                     (list (a/lit (:ns env)) (a/lit name)
-                                           (a/lit meta)))
-                           (a/var "value")))))))
+(defn- compile-defmacro
+ "Publish a datum macro using the same header/clauses as canonical preparation."
+ [args env]
+ (let [name (rn/node-name (rn/node-form (first args)))
+       _ (warn-special-name! "defmacro" name env)
+       header (macro-header args env)
+       fn-node (compile-fn* (apply list (macro-fn-form (:clauses header))) true env)
+       macro-val (a/tup (list (a/lit (erlang/binary_to_atom "$macro")) fn-node))
+       intern-node (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) macro-val))
+       meta (:metadata header)]
+  (if (nil? meta) intern-node
+   (a/lett "value" intern-node
+    (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
+                   (list (a/lit (:ns env)) (a/lit name) (a/lit meta)))
+                 (a/var "value")))))))
 
 (defn- compile-defn
   "Compile (defn name [params] body...) — or its multi-clause form — into the
@@ -4114,18 +4275,43 @@
                        shapes)]
     (erlang/list_to_tuple (list mod fixed variadic))))
 
+(defn- value-header [args]
+  (let [more (rest args)
+        has-doc (and (= 2 (count more)) (erlang/is_binary (rn/node-form (first more))))]
+    {:name (rn/node-name (rn/node-form (first args))) :name-form (first args)
+     :doc (when has-doc (rn/node-form (first more)))
+     :value-form (if has-doc (second more) (first more))
+     :author (name-author-meta (first args))}))
+
+(defn- function-header [args]
+  (let [more (rest args)
+        has-doc (and (not (empty? more)) (erlang/is_binary (rn/node-form (first more))) (not (empty? (rest more))))
+        after-doc (if has-doc (rest more) more)
+        has-attr (and (seq after-doc) (= :map (rn/node-tag (rn/node-form (first after-doc)))))
+        attrs (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})]
+    {:name (rn/node-name (rn/node-form (first args))) :name-form (first args)
+     :has-doc has-doc :doc-form (when has-doc (first more))
+     :doc (when has-doc (rn/node-form (first more)))
+     :clauses (if has-attr (rest after-doc) after-doc)
+     :author (maps/merge (name-author-meta (first args)) attrs)}))
+
+(defn- checked-function-header [args private? env]
+  (let [header (function-header args) name (:name header)
+        kind (if private? "defn-" "defn") author (:author header) clauses (:clauses header)]
+    (when (per-env-attr? author)
+      (compile-error env (str kind " " name ": ^:per-env is only valid on a `def` value, not a function")))
+    (cond
+      (empty? clauses) (compile-error env (str kind " " name ": expected at least one parameter vector"))
+      (erlang/is_binary (rn/node-form (first clauses)))
+        (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
+      :else nil)
+    (assoc header :metadata (var-meta-map (:doc header) private? author))))
+
 (defn- defn-clauses-of
   "The parsed clauses of a `(defn name doc? attr? clauses…)` argument list —
    the same peeling `compile-defn*` does, factored so the two agree."
   [args env]
-  (let [rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     (not (empty? (rest rest-args))))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        has-attr (and (not (empty? after-doc))
-                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
-        after-attr (if has-attr (rest after-doc) after-doc)]
+  (let [after-attr (:clauses (function-header args))]
     (if (or (empty? after-attr) (erlang/is_binary (rn/node-form (first after-attr))))
       nil
       (parse-fn-clauses after-attr env))))
@@ -4141,7 +4327,8 @@
       (let [items (rn/node-items node) head (rn/node-name (rn/node-form (first items)))
             name (rn/node-name (rn/node-form (second items)))
             kind (if (= "defrecord" head) :record :deftype)
-            descriptor (BeamLisp.Record/declaration_descriptor ns name kind (record-field-names (nth items 2)))]
+            descriptor (:descriptor (class-source (second items) (nth items 2) (Enum/drop items 3)
+                                                  kind (new-env ns)))]
         (BeamLisp.Env/put_key (tuple :class-declaration ns name) descriptor)
         true))))
 
@@ -4179,46 +4366,17 @@
               true)))
       false)))
 
-(defn- compile-defn*
-  "The general defn compiler, with an explicit `private?` flag (for defn-).
-
-   Records a linked function variable via Link.defvar. When the definition has
-   a docstring or is private, the result is wrapped so the metadata is written
-   after interning: `value = defvar(...); Env.put_meta(ns, name, %{...}); value`."
-  [args private? env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        kind (if private? "defn-" "defn")
+(defn- prepare-defn*
+  "Prepare the compiler-owned declaration data before publication. Nested
+   closure definitions retain their expression semantics, not a linked unit."
+  ([args private? env]
+   (prepare-defn* args private? env (BeamLisp.Link/module_for (:ns env))))
+  ([args private? env mod]
+  (let [header (checked-function-header args private? env)
+        name (:name header) kind (if private? "defn-" "defn")
         _ (warn-special-name! kind name env)
-        rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     ; a lone string with nothing after is the body, not a doc
-                     (not (empty? (rest rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        ; a `{:map …}` literal after the docstring is Clojure's attr-map: peel
-        ; it and merge into the `^{…}` author metadata (attr keys win on a clash,
-        ; matching genesis `merge_attr`). What remains are the parameter clauses.
-        has-attr (and (not (empty? after-doc))
-                      (= :map (rn/node-tag (rn/node-form (first after-doc)))))
-        attr-map (if has-attr (attr-kvs->map (rn/node-form (first after-doc))) {})
-        after-attr (if has-attr (rest after-doc) after-doc)
-        author (maps/merge (name-author-meta (first args)) attr-map)
-        ; `^:per-env` is a stateful-VALUE-def marker; a function is already
-        ; re-entrant and interns one global fn value (the PLAN-047 invariant),
-        ; so the marker would do nothing on a defn. Reject rather than silently
-        ; ignore it. Mirrors genesis `compile_defn`.
-        _ (when (per-env-attr? author) (compile-error env (str kind " " name ": ^:per-env is only valid on a `def` value, not a function")))
-        ; Parity guards (genesis compile_def_special): a defn with no clauses,
-        ; or a docstring followed by another string instead of a parameter
-        ; vector, is a source error — caught here with the exact message.
-        _ (cond
-            (empty? after-attr)
-              (compile-error env (str kind " " name ": expected at least one parameter vector"))
-            (erlang/is_binary (rn/node-form (first after-attr)))
-              (compile-error env (str kind " " name ": expected a parameter vector, got a string literal (a docstring must be followed by clauses)"))
-            :else nil)
+        has-doc (:has-doc header) rest-args (rest args)
+        after-attr (:clauses header) author (:author header) doc (:doc header)
         ; A defn nested inside a scope that BINDS locals (a top-level
         ; `(let [x …] (defn f … x))`, as an unmodified Clojure source writes a
         ; closed-over helper) cannot become a top-level linked module fn: the
@@ -4230,12 +4388,11 @@
         ; the fast linked path unchanged.
         nested? (not (empty? (:locals env)))]
     (if nested?
-      (compile-def (cons (first args)
+      {:kind :expression :node (compile-def (cons (first args)
                          (concat (if has-doc (list (first rest-args)) (list))
                                  (list (rn/list-node (cons (rn/sym-node "fn") after-attr)))))
-                   env)
-  (let [mod (BeamLisp.Link/module_for (:ns env))
-        clauses (parse-fn-clauses after-attr env)
+                   env)}
+  (let [clauses (parse-fn-clauses after-attr env)
         ; PRE-LINK before compiling the clauses. A non-tail self-reference in
         ; a body — `(bind …)` inside `bind`, or `mplus` calling `bind` calling
         ; `mplus` — compiles to a direct `Module.fname(args)` iff the var is
@@ -4248,27 +4405,128 @@
         ; up front makes the emitted code a function of the source alone,
         ; and always the direct call. The link is exactly what defvar will
         ; put back (`Emit.fixed_variadic` over the same shapes).
-        _ (BeamLisp.Env/put_link (:ns env) name (prelink-info mod name clauses))
+        _ (when-not (:contextual-bindings env)
+            (BeamLisp.Env/put_link (:ns env) name (prelink-info mod name clauses)))
         entries (apply list
                   (map (fn [c]
                          (compile-defn-clause name (:params c) (:guard c) (:body c) mod env))
                        clauses))
-        location (list (erlang/list_to_tuple (list :file (or (:file env) "nofile")))
-                       (erlang/list_to_tuple (list :line (or (:line env) 1))))
-        ; the entries are DATA (def-clause tuples with quoted bodies) embedded
-        ; as one literal; Link.defvar interns them at run time
-        defvar-node (a/remote (kernel-mod-link-literal) :defvar
-                              (list (a/lit (:ns env)) (a/lit name)
-                                    (a/lit entries) (a/lit location)))
         meta (var-meta-map doc private? author)]
-    (if (nil? meta)
-      defvar-node
-      ; value = defvar(...); Env.put_meta(ns, name, meta); value
+    (function-declaration name entries meta env))))))
+
+(defn- compile-defn*
+  "Interactive publication adapts the same declaration consumed by AOT.
+   Clause compilation and metadata interpretation have one owner."
+  [args private? env]
+  (let [declaration (prepare-defn* args private? env)]
+   (if (= :expression (:kind declaration)) (:node declaration)
+    (let [defvar-node (a/remote (kernel-mod-link-literal) :defvar
+                        (list (a/lit (:namespace declaration)) (a/lit (:name declaration))
+                              (a/lit (:entries declaration)) (a/lit (:location declaration))))
+          meta (:metadata declaration)]
+     (if (nil? meta) defvar-node
       (a/lett "value" defvar-node
-              (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
-                                     (list (a/lit (:ns env)) (a/lit name)
-                                           (a/lit meta)))
-                           (a/var "value")))))))))
+       (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
+                      (list (a/lit (:namespace declaration)) (a/lit (:name declaration)) (a/lit meta)))
+                    (a/var "value")))))))))
+
+(defn- declaration-input [form env]
+  (loop [form form env (checked-context-env env)]
+   (if (= :meta (rn/node-tag form))
+    (let [metadata (rn/node-pos form)
+          author (if (erlang/is_map metadata) (maps/remove :tag (author-meta metadata)) {})]
+     (when (seq author)
+      (compile-error (pos-env env metadata) "Function declaration result metadata requires expression compilation"))
+     (recur (rn/node-form form) (pos-env env metadata)))
+    (let [items (when (= :list (rn/node-tag form)) (rn/node-items form))]
+     {:form form :env env :args (rest items)
+      :head (when (seq items) (rn/node-name (rn/node-form (first items))))}))))
+
+(defn class-declaration-source
+ "Project one class declaration without compilation, publication or registry
+  mutation. Its exact descriptor and generated binding names have the SAME
+  owner as ordinary class compilation and compiler prelink metadata. Protocol
+  bodies remain Reader data. Optional physical target uses that same producer;
+  logical names stay unchanged. Native/artifact custody is a separate obligation."
+ ([form env] (class-declaration-source form env nil))
+ ([form env module]
+ (when-not (or (nil? module) (and (erlang/is_atom module) (not (contains? #{true false} module))))
+  (compile-error env "Class Declaration Source requires an atom physical target"))
+ (let [source (declaration-input form env) head (:head source) args (:args source)
+       env (:env source)]
+  (when-not (and (contains? #{"defrecord" "deftype"} head) (empty? (:locals env))
+                 (>= (count args) 2))
+   (compile-error env "Class Declaration Source requires a top-level defrecord or deftype"))
+  (class-source (first args) (second args) (Enum/drop args 2)
+                (if (= "defrecord" head) :record :deftype) env module))))
+
+(defn prepare-class-declaration
+ "Compile one checked class header and its inline methods through the SAME
+  scaffold as ordinary defrecord/deftype. No class initializer is evaluated.
+  Explicit physical target does not change logical binding names or provenance."
+ ([form env] (prepare-class-declaration form env nil))
+ ([form env module]
+  (let [input (declaration-input form env) env (:env input)
+        source (class-declaration-source form env module)
+        plan (class-initialization-plan source env)]
+   {:version 1 :kind :class-declaration :namespace (:ns env)
+    :name (rn/node-name (:name source)) :module (get-in source [:descriptor :name])
+    :descriptor (:descriptor source) :metadata (:metadata source) :bindings (:bindings source)
+    :node (class-namespace-node plan) :lexical-node (class-lexical-node plan)
+    :binding-slots (elem (Enum/map_reduce (:bindings source) 1
+                      (fn [binding index] (tuple (assoc binding :index index) (+ 1 index)))) 0)})))
+
+(defn declaration-source
+  "Derive inert metadata and the value Reader form from a supported declaration.
+   Header parsing is shared with publication/prelink preparation. No body is
+   compiled, no Env link is installed and no initializer or metadata executes."
+  [form env]
+  (let [source (declaration-input form env) head (:head source) args (:args source)
+        env (:env source)]
+    (when-not (and (contains? #{"def" "defn" "defn-" "defsyntax" "defmacro"} head) (empty? (:locals env))
+                   (= :symbol (rn/node-tag (rn/node-form (first args)))))
+      (compile-error env "Declaration Source requires def, defn, defn-, defmacro or defsyntax"))
+    (if (= "defmacro" head)
+     (let [header (macro-header args env)]
+      {:kind head :name (rn/node-form (:name-form header)) :metadata (:metadata header)
+       :visibility (metadata-visibility (:metadata header))
+       :value-form (rn/list-node (cons (rn/sym-node "fn") (macro-fn-form (:clauses header))))})
+    (if (= "def" head)
+      (let [header (value-header args)
+            metadata (var-meta-map (:doc header) false (:author header))]
+        (when-not (or (= 2 (count args))
+                      (and (= 3 (count args)) (some? (:doc header))))
+          (compile-error env "Value declaration requires one initializer"))
+        {:kind head :name (rn/node-form (:name-form header))
+         :metadata metadata :visibility (metadata-visibility metadata)
+         :value-form (:value-form header)})
+      (let [header (checked-function-header args (= "defn-" head) env)
+            _ (parse-fn-clauses (:clauses header) env)
+            name (rn/node-form (:name-form header))
+            position (maps/with (list :line :col :file :offset :end-line :end-col :end-offset :tag)
+                                (or (rn/node-pos (:name-form header)) {}))
+            ;; Declaration metadata has been consumed above. A recursive fn's
+            ;; lexical name retains positions/hints, not var metadata effects.
+            local-name (if (empty? position) name (rn/meta-node name position))
+            forms (if (= "defsyntax" head) (:clauses header)
+                      (cons local-name (:clauses header)))]
+        {:kind head :name (rn/node-form (:name-form header)) :metadata (:metadata header)
+         :visibility (metadata-visibility (:metadata header))
+         :value-form (rn/list-node (cons (rn/sym-node "fn") forms))})))))
+
+(defn prepare-function-declaration
+  "Prepare canonical clause/metadata data for an explicit physical target.
+   The two-argument adapter selects the namespace module. This is target data,
+   never publication or native execution authority."
+  ([form env]
+   (prepare-function-declaration form env (BeamLisp.Link/module_for (:ns env))))
+  ([form env module]
+   (let [source (declaration-input form env) head (:head source) env (:env source)]
+    (when-not (and (erlang/is_atom module) (not (contains? #{nil true false} module)))
+      (compile-error env "Function declaration requires a physical module atom"))
+    (when-not (and (contains? #{"defn" "defn-"} head) (empty? (:locals env)))
+      (compile-error env "Function declaration requires a top-level defn or defn-"))
+    (prepare-defn* (:args source) (= "defn-" head) env module))))
 
 (defn- checked-declaration-kind [head args]
   ;; The actual special-form compiler has accepted these arguments already.
@@ -4384,8 +4642,8 @@
     (vector? d)
       (let [vform (rn/->tuple
                     (list :vector
-                          (apply list (map (fn [value] (data->form value)) (BeamLisp.Vector/to_list d)))))
-            m (erlang/map_get :meta d)]
+                          (Enum/map (BeamLisp.Vector/to_list d) (fn [value] (data->form value)))))
+            m (maps/get :meta d nil)]
         (if (and (erlang/is_map m) (pos? (erlang/map_size m)))
           (rn/meta-node vform (metadata-data->forms m))
           vform))
@@ -4397,10 +4655,10 @@
     (set? d)
       (rn/->tuple (list :set
                         (lists/sort
-                          (apply list (map (fn [value] (data->form value)) (BeamLisp.Set/to_list d))))))
+                          (Enum/map (BeamLisp.Set/to_list d) (fn [value] (data->form value))))))
 
     (erlang/is_list d)
-      (rn/list-node (apply list (map (fn [value] (data->form value)) d)))
+      (rn/list-node (Enum/map d (fn [value] (data->form value))))
 
     ; a plain map (not one of the struct-backed values vector?/set? caught).
     ; SORTED by the reader-form key: an Erlang map enumerates atom keys in
@@ -4413,12 +4671,11 @@
         (list :map
               (lists/sort
                 (fn [a b] (erlang/=< (erlang/element 1 a) (erlang/element 1 b)))
-                (apply list
-                  (map (fn [kv]
-                         (erlang/list_to_tuple
-                           (list (data->form (erlang/element 1 kv))
-                                 (data->form (erlang/element 2 kv)))))
-                       (maps/to_list d))))))
+                (Enum/map (maps/to_list d)
+                  (fn [kv]
+                    (erlang/list_to_tuple
+                      (list (data->form (erlang/element 1 kv))
+                            (data->form (erlang/element 2 kv)))))))))
 
     ; a keyword is an atom other than nil/true/false; its node carries the name
     (and (erlang/is_atom d) (some? d) (not= d true) (not= d false))
@@ -4564,20 +4821,18 @@
                     (= "quote" (rn/node-name (rn/node-form (first items)))))))
           (list node m)
         (or (= tag :list) (= tag :vector) (= tag :set))
-          (let [r (reduce (fn [acc item]
-                            (let [x (renumber item (second acc))]
-                              (list (cons (first x) (first acc)) (second x))))
-                          (list (list) m)
-                          (rn/node-items node))]
-            (list (rn/->tuple (list tag (apply list (reverse (first r))))) (second r)))
+          (let [r (Enum/reduce (rn/node-items node) (list (list) m)
+                    (fn [item acc]
+                      (let [x (renumber item (second acc))]
+                        (list (cons (first x) (first acc)) (second x)))))]
+            (list (rn/->tuple (list tag (lists/reverse (first r)))) (second r)))
         (= tag :map)
-          (let [r (reduce (fn [acc pair]
-                            (let [k (renumber (kv-key pair) (second acc))
-                                  v (renumber (kv-val pair) (second k))]
-                              (list (cons (erlang/list_to_tuple (list (first k) (first v))) (first acc)) (second v))))
-                          (list (list) m)
-                          (rn/node-items node))]
-            (list (rn/->tuple (list :map (apply list (reverse (first r))))) (second r)))
+          (let [r (Enum/reduce (rn/node-items node) (list (list) m)
+                    (fn [pair acc]
+                      (let [k (renumber (kv-key pair) (second acc))
+                            v (renumber (kv-val pair) (second k))]
+                        (list (cons (erlang/list_to_tuple (list (first k) (first v))) (first acc)) (second v)))))]
+            (list (rn/->tuple (list :map (lists/reverse (first r)))) (second r)))
         :else (list node m)))))
 
 (defn- canonical-gensyms
@@ -4596,6 +4851,14 @@
   [form]
   (first (renumber form {})))
 
+(defn datum-macro-result
+ "Bounded datum-v1 result conversion, sharing ordinary Reader conversion and
+  deterministic template-gensym canonicalization. No evaluation or authority."
+ [value]
+ (BeamLisp.CompilerData/check_first_order! value
+  {:max-nodes 65536 :max-bytes 1048576 :max-depth 128})
+ (canonical-gensyms (data->form value)))
+
 (defn- expand-macro
   "Run a macro once and turn its result back into a form.
 
@@ -4608,12 +4871,10 @@
    `macro-fn` is the function from `macro-lookup`; `form` is the whole call
    node; `args` are the argument nodes; `env` is a fresh compile environment."
   [macro-fn form args env]
-  (canonical-gensyms
-    (data->form
-      (BeamLisp.Ns.Rt/invoke macro-fn
-        (apply list
-          (concat (list (datum form) (macro-env env))
-                  (map (fn [value] (datum value)) args)))))))
+  (datum-macro-result
+    (BeamLisp.Ns.Rt/invoke macro-fn
+      (erlang/++ (list (datum form) (macro-env env))
+                 (Enum/map args (fn [value] (datum value)))))))
 
 
 
@@ -4668,10 +4929,10 @@
               form))))
       form))))
 
-(defn compile-node
-  "Turn one reader form into its bl-ANF node.
+(defn- compile-node
+  "Lower one reader form recursively after the public entry checked its context.
 
-   This is the compiler's front door. It looks at what KIND of form it was
+   This internal builder looks at what KIND of form it was
    handed and routes to the matching builder: a plain value is a literal, a
    collection literal builds its runtime value, a symbol resolves to a
    variable or remote reference, and a list is a call. Metadata wrappers are
@@ -4767,9 +5028,314 @@
       :else (a/lit form))))
 
 (defn compile
-  "Turn one reader form directly into its canonical bl-ANF node."
+  "Validate the selected compilation context before lowering a Reader form.
+   Evaluation and contextual adapters enter through this same boundary."
   [form env]
-  (compile-node form env))
+  (compile-node form (checked-context-env env)))
+
+(defn with-fresh-names
+  "Run one nested compilation with independent names and restore the caller's
+   counter on every exit. The callback executes outside metadata custody."
+  [action]
+  (let [key (kernel-fresh-key-literal) previous (erlang/get key)]
+    (try
+      (reset-fresh!)
+      (erlang/apply action (list))
+      (finally
+        (if (erlang/=:= :undefined previous) (erlang/erase key)
+          (erlang/put key previous))))))
+
+(defn- compile-contextual-entry [form env kind]
+ (if (= :expression kind) (compile form env)
+  (let [source (declaration-input form env)]
+   (when-not (and (= :datum-macro kind) (= "fn" (:head source)))
+    (compile-error (:env source) "Contextual datum macro requires its canonical function form" form))
+   ;; Reuse the SAME clause dispatcher and nil-rest normalization as defmacro.
+   ;; No flag leaks into nested ordinary functions.
+   (compile-fn* (:args source) true (:env source)))))
+
+(defn- prepare-contextual-unit
+  "Compile dependency-ordered selected definitions and an entry into one ANF
+   body. Links are [internal-name Reader-form] pairs, owned by expansion's
+   selected catalog. Each initializer sees only preceding links. No synthetic
+   Reader let, namespace lookup, evaluator or publication is involved."
+  ([form env references links] (prepare-contextual-unit form env references links :expression))
+  ([form env references links kind]
+  (with-fresh-names
+   (fn []
+    (let [env (checked-context-env (assoc env :contextual-bindings references))
+          _ (when-not (erlang/is_list links) (compile-error env "Invalid contextual unit links"))
+          ;; Validate the complete table before compiling any initializer.
+          _ (Enum/reduce links #{}
+              (fn [link seen]
+               (when-not (and (erlang/is_tuple link) (= 2 (erlang/tuple_size link))
+                              (erlang/is_binary (elem link 0)))
+                (compile-error env "Invalid contextual unit link"))
+               (let [name (elem link 0) selected (get references name)]
+                (when-not (and selected (not (contains? seen name)) (not (local? env name))
+                               (not= :local (get-in selected [:declaration :visibility]))
+                               (contains? #{:function :value} (get-in selected [:declaration :kind])))
+                 (compile-error env "Contextual unit link is not a unique selected global"))
+                (a/binding-value (:reference selected))
+                (conj seen name))))
+          compiled (Enum/map_reduce links {}
+                     (fn [link targets]
+                      (let [name (elem link 0)
+                            init (a/link-bindings (compile (elem link 1) (notail env)) targets)
+                            variable (fresh-var name)
+                            reference (get-in references [name :reference])]
+                       (tuple {:name name :reference reference :slot variable :node init}
+                              (assoc targets reference (a/var variable))))))
+          body (a/link-bindings (compile-contextual-entry form env kind) (elem compiled 1))]
+     {:version 2 :kind :compiled-contextual-unit :initializers (elem compiled 0)
+      :steps (Enum/map (elem compiled 0) (fn [row] {:op :initialize :reference (:reference row)}))
+      :entry body :exports (list)})))))
+
+(defn compile-contextual-unit
+ "Compile a complete selected unit to canonical ANF with no unresolved globals."
+ [form env references links]
+ (let [unit (prepare-contextual-unit form env references links)]
+  (a/contextual-unit-entry unit)))
+
+(defn compile-contextual-callable
+ "Compile an explicitly parameterized selected expression to a closed callable.
+  Constructor-session values are formal parameters, never free variables in a
+  compiled unit. Dependency slots stay inside their parameter scope."
+ ([form env references links parameters]
+  (compile-contextual-callable form env references links parameters :expression))
+ ([form env references links parameters kind]
+ (when-not (contains? #{:expression :datum-macro} kind)
+  (compile-error env "Invalid contextual callable kind"))
+ (when-not (and (erlang/is_list parameters) (<= (count parameters) 255)
+                (every? #(erlang/is_binary %) parameters) (= parameters (Enum/uniq parameters)))
+  (compile-error env "Invalid contextual callable parameters"))
+ (let [locals (Map/new (Enum/map parameters #(tuple % %)))
+       unit (prepare-contextual-unit form (assoc env :locals locals) references links kind)
+       body (a/contextual-unit-body unit (:entry unit))
+       callable (a/fnn (list (a/clause (Enum/map parameters #(a/pvar %)) nil body)))]
+  ;; Validate the actual closed callable before returning it. The constructor
+  ;; interpreter supplies session-owned values at invocation; no native grant.
+  (a/contextual-unit-entry {:version 2 :kind :compiled-contextual-unit
+                           :initializers (list) :steps (list) :entry callable :exports (list)}))))
+
+(defn compile-contextual
+  "Compile an expanded expression through the canonical compiler. This analysis
+   adapter preserves unresolved selected globals; complete unit preparation
+   resolves them through ANF linkage before executable emission."
+  [form env references]
+  (with-fresh-names (fn [] (compile form (assoc env :contextual-bindings references)))))
+
+(defn prepare-program-entry
+  "Compile the selected unit with its expression scope, then represent run/0
+   through the canonical declaration owner. No synthetic function grants recur
+   scope or ambient prelinking."
+  ([form env references] (prepare-program-entry form env references (list)))
+  ([form env references links]
+   (let [node (compile-contextual-unit form env references links)
+         env (pos-env env (rn/node-pos form))
+         clause (function-clause :run (list) nil node env)]
+    (function-declaration "run" (list (tuple :fixed 0 :run clause)) nil env))))
+
+(defn- unit-node-dependencies [node]
+ ;; Reuse the executable grammar owner, including latent bodies and pattern
+ ;; keys. Annotations and literal lookalikes cannot create dependencies.
+ (Enum/uniq (Enum/flat_map (:edges (a/execution-dependencies (list node)))
+  (fn [edge]
+   (let [evidence (:evidence edge)]
+    (if (and (= :captured-value (:kind edge)) (= :anf (get evidence 0)) (= :binding (get evidence 1)))
+     (list (get evidence 2)) (list)))))))
+
+(defn- unit-append-binding [row state]
+ (let [row (select-keys row [:name :reference :slot :node])
+       row (assoc row :node (a/link-bindings (:node row) (:targets state)))]
+  (-> state
+      (update :initializers #(conj % row))
+      (update :steps #(conj % {:op :initialize :reference (:reference row)}))
+      (assoc-in [:targets (:reference row)] (a/var (:slot row))))))
+
+(defn- unit-require-function [reference table env state]
+ (if (contains? (:targets state) reference) state
+  (let [row (get table reference)]
+   (when-not (and row (= :function (:kind row)))
+    (compile-error env "Runtime initialization reads a value before its Source initialization"))
+   (when (contains? (:active state) reference)
+    (compile-error env "Cyclic runtime function initialization"))
+   (let [state (reduce (fn [state dependency] (unit-require-function dependency table env state))
+                 (update state :active #(conj % reference)) (unit-node-dependencies (:node row)))]
+    (update (unit-append-binding row state) :active #(disj % reference))))))
+
+(defn- unit-require-node [node table env state]
+ (reduce (fn [state reference] (unit-require-function reference table env state))
+         state (unit-node-dependencies node)))
+
+(defn- class-binding-link? [value]
+ (and (erlang/is_map value) (= :class-binding (:kind value))))
+
+(defn- class-link-row [name selected data env]
+ (when-not (and (erlang/=:= 1 (:version data))
+                (= #{:version :kind :form :namespace :module :role} (set (keys data)))
+                (erlang/is_binary (:namespace data))
+                (erlang/is_atom (:module data)) (not (contains? #{nil true false} (:module data)))
+                (= (:namespace data) (str (get-in selected [:declaration :namespace]))))
+  (compile-error env "Invalid selected class binding link"))
+ (let [source (class-declaration-source (:form data) (assoc env :ns (:namespace data)) (:module data))
+       binding (first (filter #(= (:role data) (:role %)) (:bindings source)))
+       declaration (:declaration selected) path (:path declaration)
+       ordinal (first (filter #(= (:role data) (:role (elem % 0))) (Enum/with_index (:bindings source))))]
+  (when-not (and binding (erlang/is_list path) (<= 1 (count path) 128)
+                 (every? #(and (int? %) (<= 0 % 1073741823)) path)
+                 (= (last path) (elem ordinal 1))
+                 (= (:name binding) (:name declaration))
+                 (= (:visibility source) (:visibility declaration))
+                 (= (if (= :type (:role binding)) :value :function) (:kind declaration)))
+   (compile-error env "Class link does not match its selected generated binding"))
+  {:name name :reference (:reference selected) :kind :class-slot :slot (fresh-var name)
+   :class-module (:module data) :class-data (dissoc data :role) :class-path (to-list (butlast path))
+   :role (:role data) :source source}))
+
+(defn- class-link-groups [rows env]
+ (let [groups (Enum/group_by (Enum/filter rows #(= :class-slot (:kind %))) (fn [row] (:class-module row)))]
+  (when (> (erlang/map_size groups) 128) (compile-error env "Too many contextual classes"))
+  (Map/new (Enum/map (Enum/sort_by (Map/to_list groups) #(Atom/to_string (elem % 0)))
+   (fn [entry]
+    (let [module (elem entry 0) members (elem entry 1) first-row (first members)
+          source (:source first-row) data (:class-data first-row)
+          expected (:bindings source)
+          _ (when-not (and (= (count expected) (count members))
+                            (= (count members) (count (Enum/uniq (map :role members))))
+                            (every? #(and (= data (:class-data %)) (= (:class-path first-row) (:class-path %))
+                                          (= (get-in first-row [:reference :world]) (get-in % [:reference :world]))
+                                          (= (get-in first-row [:reference :phase]) (get-in % [:reference :phase]))) members))
+              (compile-error env "Incomplete or conflicting selected class binding group"))
+          ordered (map (fn [binding]
+                         (or (first (filter #(= (:role binding) (:role %)) members))
+                             (compile-error env "Missing selected class binding role"))) expected)
+          plan (class-initialization-plan source (assoc env :ns (:namespace data)))
+          self-targets (Map/new (map (fn [row binding] (tuple (:reference row) (:node binding))) ordered (:bindings plan)))
+          node (a/link-bindings (class-lexical-node plan) self-targets)]
+     (tuple module {:module module :descriptor (:descriptor source) :rows ordered
+                    :slot (fresh-var "class_frame") :node node})))))))
+
+(defn- unit-append-class [group table env state]
+ (when (contains? (:class-frames state) (:module group))
+  (compile-error env "Repeated class initialization"))
+ (let [state (unit-require-node (:node group) table env state)
+       state (-> state
+                 (update :class-frames #(conj % (:module group)))
+                 (update :steps #(conj % {:op :capture :slot (:slot group)
+                                          :node (a/link-bindings (:node group) (:targets state))})))]
+  (Enum/reduce (Enum/with_index (:rows group)) state
+   (fn [pair current]
+    (let [row (elem pair 0) index (+ 1 (elem pair 1))
+          row (assoc row :node (a/remote :erlang :element (list (a/lit index) (a/var (:slot group)))))]
+     (unit-append-binding row current))))))
+
+(defn- prepare-ordered-program-unit [env references links events]
+ (with-fresh-names
+  (fn []
+   (let [env (checked-context-env (assoc env :contextual-bindings references))
+         _ (when-not (and (erlang/is_list links) (erlang/is_list events))
+             (compile-error env "Runtime initialization requires finite eager lists"))
+         _ (BeamLisp.CompilerData/check_reader_data! (list links events))
+         rows (Enum/map links
+                (fn [link]
+                 (when-not (and (erlang/is_tuple link) (= 2 (erlang/tuple_size link))
+                                (erlang/is_binary (elem link 0)) (not= "" (elem link 0)))
+                  (compile-error env "Invalid runtime initialization link"))
+                 (let [name (elem link 0) descriptor (get references name)
+                       reader (rn/node-form (elem link 1))
+                       head (when (= :list (rn/node-tag reader)) (rn/node-form (first (rn/node-items reader))))]
+                  (when-not (and descriptor (not (local? env name))
+                                 (not= :local (get-in descriptor [:declaration :visibility]))
+                                 (contains? #{:function :value} (get-in descriptor [:declaration :kind])))
+                   (compile-error env "Runtime initialization is not a selected binding"))
+                  (a/binding-value (:reference descriptor))
+                  (if (class-binding-link? (elem link 1))
+                   (class-link-row name descriptor (elem link 1) env)
+                   (do
+                  (when (and (= :function (get-in descriptor [:declaration :kind]))
+                             (not (and (= :list (rn/node-tag reader))
+                                       (= :symbol (rn/node-tag head)) (= "fn" (rn/node-name head)))))
+                   (compile-error env "Runtime function initializer must be an actual function form"))
+                  {:name name :reference (:reference descriptor) :kind (get-in descriptor [:declaration :kind])
+                   :slot (fresh-var name) :node (compile (elem link 1) (notail env))})))))
+         classes (class-link-groups rows env)
+         table (Map/new (Enum/map rows #(tuple (:reference %) %)))
+         names (Map/new (Enum/map rows #(tuple (:name %) (:reference %))))
+         _ (when-not (and (erlang/is_list events) (= (count rows) (erlang/map_size table)) (= (count rows) (erlang/map_size names)))
+             (compile-error env "Invalid runtime initialization table"))
+         state (reduce
+                 (fn [state event]
+                  (case (:op event)
+                   :initialize
+                   (let [row (get table (get names (:name event)))]
+                    (when-not (and row (not (contains? (:targets state) (:reference row))))
+                     (compile-error env "Repeated or unknown runtime initializer"))
+                    (if (= :class-slot (:kind row))
+                     (unit-append-class (get classes (:class-module row)) table env state)
+                     (unit-append-binding row (unit-require-node (:node row) table env state))))
+                   :evaluate
+                   (let [node (compile (:reader event) (notail env))
+                         state (unit-require-node node table env state)]
+                    (update state :steps #(conj % {:op :evaluate :node (a/link-bindings node (:targets state))})))
+                   :capture
+                   (let [node (compile (:reader event) (notail env))
+                         state (unit-require-node node table env state)
+                         slot (fresh-var "unit_result")]
+                    (-> state
+                        (update :steps #(conj % {:op :capture :slot slot :node (a/link-bindings node (:targets state))}))
+                        (assoc :entry (a/var slot))))
+                   (compile-error env "Unknown runtime initialization operation")))
+                 {:initializers [] :steps [] :targets {} :active #{} :class-frames #{} :entry (a/lit nil)} events)
+         state (reduce (fn [state row] (unit-require-function (:reference row) table env state)) state rows)]
+    {:unit {:version 2 :kind :compiled-contextual-unit :initializers (to-list (:initializers state))
+            :steps (to-list (:steps state)) :entry (:entry state) :exports (list)}
+     :classes (map :descriptor (map second (Enum/sort_by (Map/to_list classes) #(Atom/to_string (elem % 0)))))}))))
+
+(defn prepare-program-unit
+ "Prepare one runtime unit graph and its canonical expression entry once.
+  Export names are compiler-internal selected names derived by the catalog;
+  values stay in the same lexical unit as their private dependencies."
+ [form env references links exports events]
+ (when-not (and (erlang/is_list exports) (= (count exports) (count (Enum/uniq exports))))
+  (compile-error env "Invalid contextual export table"))
+ (let [prepared (prepare-ordered-program-unit env references links events) unit (:unit prepared)
+       targets (Map/new (Enum/map (:initializers unit) (fn [link] (tuple (:name link) (:reference link)))))
+       exported (Enum/map exports
+                  (fn [name]
+                   (when-not (and (contains? targets name)
+                                  (= :public (get-in references [name :declaration :visibility])))
+                    (compile-error env "Contextual export is not a selected public runtime binding"))
+                   (get targets name)))
+       unit (assoc unit :exports exported)
+       body (a/contextual-unit-entry unit)
+       env (pos-env env (rn/node-pos form))
+       clause (function-clause :run (list) nil body env)]
+  {:unit unit :classes (:classes prepared) :declaration (function-declaration "run" (list (tuple :fixed 0 :run clause)) nil env)}))
+
+(defn contextual-unit-factory
+ "Project the same compiled graph as a first-class unit instance. Creating an
+  instance executes its ordered module initialization once; its entry reads
+  the captured result. These data grant no provenance, activation, admission
+  or retirement authority."
+ [unit]
+ (a/contextual-unit-factory unit))
+
+(defn contextual-unit-entry
+ "Canonical ANF recipe projection, shared with phase facts and the factory."
+ [unit] (a/contextual-unit-entry unit))
+
+(defn contextual-unit-clauses
+ "Physical factory/run ABI projected from the one compiled unit graph.
+  The runtime adapter calls the factory and invokes its entry; it never
+  recompiles Source, looks up a mutable var or initializes an export on call."
+ [unit module]
+ (when-not (and (erlang/is_atom module) (not (contains? #{nil true false} module)))
+  (throw (ex-info "Invalid contextual unit module" {:kind :invalid-contextual-unit})))
+ (let [instance (a/remote module :__bl_unit__ (list))
+       entry (a/remote :maps :get (list (a/lit :entry) instance))]
+  (list (function-clause :__bl_unit__ (list) nil (contextual-unit-factory unit) {})
+        (function-clause :run (list) nil (a/invoke entry (a/empty-list-node)) {}))))
 
 ; ============================================================================
 ; Elixir-facing driver entry points (underscore names)
@@ -4789,6 +5355,20 @@
   "Host name for `reset-fresh!`: restart this process's fresh-name counter."
   []
   (reset-fresh!))
+
+(defn with_fresh_names [action] (with-fresh-names action))
+
+(defn prepare_class_declaration
+ ([form env] (prepare-class-declaration form env))
+ ([form env module] (prepare-class-declaration form env module)))
+
+(defn prepare_function_declaration
+  ([form env] (prepare-function-declaration form env))
+  ([form env module] (prepare-function-declaration form env module)))
+
+(defn prepare_program_entry
+  ([form env references] (prepare-program-entry form env references))
+  ([form env references links] (prepare-program-entry form env references links)))
 
 (defn macroexpand_1
   "Host name for `macroexpand-1`: expand `form` once in namespace `ns`."
@@ -4817,7 +5397,7 @@
    returns (a macro fn, a defn's value) lives in it."
   [form env]
   (assert-native-evaluation!)
-  (let [node (compile-node form env)
+  (let [node (compile form env)
         n (System/unique_integer (list :positive))
         modname (erlang/binary_to_atom (str "Elixir.BeamLisp.Eval.M" n))]
     (lower/eval-anf modname node)))
@@ -4830,6 +5410,7 @@
    re-reads each form's namespace so mid-source `ns` switches take effect."
   [source env file]
   (assert-native-evaluation!)
+  (checked-context-env env)
   (BeamLisp.Env/in_ns (:ns env))
   (let [forms (BeamLisp.Ns.Reader/read_string source file)
         v (reduce (fn [_ form]

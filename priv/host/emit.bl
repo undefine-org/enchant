@@ -261,11 +261,54 @@
   ([name clauses exports] (descriptor name clauses exports (list) {}))
   ([name clauses exports attrs] (descriptor name clauses exports attrs {}))
   ([name clauses exports attrs ann]
-   (BeamLisp.Ns.Anf/module name
-     clauses
-     (Enum/map exports (fn [pair] (canonical-pair pair)))
-     (Enum/map attrs (fn [pair] (canonical-pair pair)))
-     ann)))
+   (let [attributes (Enum/map attrs (fn [pair] (canonical-pair pair)))
+         _ (when (Enum/any? attributes (fn [pair] (= :bl_execution_clauses (first pair))))
+             (erlang/error (RuntimeError/exception "Execution clause identities are compiler owned")))
+         ; During a previous-generation bootstrap this API may not exist yet.
+         ; Such artifacts remain usable bootstrap code but carry NO execution
+         ; receipt. Native admission must refuse the explicit missing evidence.
+         identities (when (erlang/function_exported :Elixir.BeamLisp.Ns.Anf :execution-clause-identities 1)
+                      (BeamLisp.Ns.Anf/execution-clause-identities clauses))
+         attributes (if identities
+                      (erlang/++ attributes (list [:bl_execution_clauses identities])) attributes)]
+    (BeamLisp.Ns.Anf/module name clauses
+      (Enum/map exports (fn [pair] (canonical-pair pair))) attributes ann))))
+
+(defn execution_entries
+  "Bind canonical entry data to the loaded body's compiler-owned clause hashes.
+   This collects Source descriptions, never authenticates SDK/control origin.
+   Old bootstrap artifacts explicitly report unavailable evidence."
+  [ns name entries hashes]
+  (try (collect_execution_entries ns name entries hashes)
+    (catch error
+      ;; An evidence budget may refuse trusted preparation, but must not turn
+      ;; an otherwise valid ordinary Source function into a compilation error.
+      (if (= :execution-dependency-limit (:kind (BeamLisp.ExInfo/ex_data error)))
+        {:version 1 :status :unavailable :reason :dependency-limit :entries (list)}
+        (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
+
+(defn- collect_execution_entries [ns name entries hashes]
+  (if (erlang/not (erlang/function_exported :Elixir.BeamLisp.Ns.Anf :execution-entries 4))
+    {:version 1 :status :unavailable :reason :previous-compiler :entries (list)}
+    (let [descriptors (BeamLisp.Ns.Anf/execution-entries ns name entries hashes)
+          missing (Enum/flat_map descriptors
+            (fn [descriptor]
+              (let [id (:id descriptor) body (elem id 1) key (tuple (elem id 2) (elem id 3))
+                    clauses (Enum/map
+                              (Enum/filter entries (fn [e]
+                                (and (= body (elem e 4)) (= (elem id 2) (elem e 2))
+                                     (= (elem id 3) (count (:params (elem e 3)))))))
+                              (fn [e] (elem e 3)))
+                    expected (BeamLisp.Ns.Anf/execution-clause-identities clauses)
+                    attrs (erlang/apply body :module_info (list :attributes))
+                    values (Keyword/get attrs :bl_execution_clauses)
+                    actual (if (and (erlang/is_list values) (= 1 (erlang/length values)))
+                             (erlang/hd values) values)]
+                (if (and (erlang/is_map actual) (= (Map/get expected key) (Map/get actual key)))
+                  (list) (list id)))))]
+      {:version 1 :status (if (= (list) missing) :bound :unavailable)
+       :reason (if (= (list) missing) nil :unbound-clause-identities)
+       :entries descriptors :missing missing})))
 
 (defn- canonical-pair
   "A `[left right]` export/attr pair. A Vector passes through; a 2-tuple and a

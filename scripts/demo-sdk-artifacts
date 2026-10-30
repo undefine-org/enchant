@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Exercise the real artifact SDK build profile and sealed inventory consumer.
+
+Run under one whole-process-tree memory/time cap. No caller-created SDK rows,
+compiler-key memo overrides, source overlays or hotloaded host replacements.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import time
+
+
+def main():
+    preparation_started = time.monotonic()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--all-sdk', action='store_true', help='build the actual self-build library selection')
+    parser.add_argument('--activation-smoke', action='store_true', help='build the actual activation dependency graph before the full inventory gate')
+    parser.add_argument('--source-free', action='store_true', help='remove SDK Source after full production and use an empty-cache receiver')
+    parser.add_argument('--boundary-tests', action='store_true', help='include real sealed loader consumers before removing Source')
+    parser.add_argument('--contextual-tests', action='store_true', help='qualify contextual build/cache behavior in a Source-absent image')
+    parser.add_argument('--boundaries', nargs='+', help='focused sealed profiles; omit for complete coverage')
+    args = parser.parse_args()
+    if args.all_sdk and args.activation_smoke:
+        parser.error('choose --all-sdk or --activation-smoke')
+    inventory_mode = args.all_sdk or args.activation_smoke
+    if args.contextual_tests and not (inventory_mode and args.source_free):
+        parser.error('--contextual-tests requires an inventory producer and --source-free')
+    if args.boundary_tests and not inventory_mode:
+        parser.error('--boundary-tests requires an inventory producer')
+    if args.boundaries is not None and not args.contextual_tests:
+        parser.error('--boundaries requires --contextual-tests')
+    if args.source_free and not inventory_mode:
+        parser.error('--source-free requires --all-sdk or --activation-smoke')
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    profiles = runpy.run_path(str(root / 'scripts/sdk_sealed_profiles.py'))
+    timings = runpy.run_path(str(root / 'scripts/test_timings.py'))['slowest']
+    try:
+        selected_plan = profiles['plan'](args.boundaries)
+    except ValueError as error:
+        parser.error(str(error))
+    if os.path.lexists(output):
+        parser.error('output must be absent')
+    capture_tools = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools']
+    tools = capture_tools(root)
+    solver = tools['z3']['selected']
+    if args.contextual_tests and selected_plan['solver'] and (not solver or not solver['sha256']):
+        parser.error('contextual Source-free qualification requires the pinned solver prerequisite')
+    output.mkdir(parents=True)
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    drivers = [root / 'test/scripts/sdk-artifact-build.bl', root / 'test/scripts/sdk-artifact-consumer.bl']
+    if inventory_mode:
+        drivers[0] = root / 'test/scripts/sdk-artifact-all.bl'
+    boundary_driver = root / 'test/scripts/sdk-boundary-sealed.bl'
+    if args.boundary_tests:
+        drivers.append(boundary_driver)
+    contextual_driver = root / 'test/scripts/sdk-selected-consumer.bl'
+    initialization_driver = root / 'test/fixtures/sdk_sealed_loading_context_control.bl'
+    if args.contextual_tests:
+        drivers.append(contextual_driver)
+        if selected_plan['sdk-initialization']:
+            drivers.append(initialization_driver)
+    fixtures = root / 'test/fixtures/sdk-artifacts'
+    trace = root / 'test/scripts/sdk-artifact-trace.exs'
+    watched = sorted({Path(__file__).resolve(), *drivers, trace, root / 'scripts/demo-artifact-production',
+                      root / 'scripts/check-execution-history', root / 'scripts/sdk_sealed_profiles.py',
+                      root / 'scripts/test_timings.py', root / 'env.bl',
+                      root / 'scripts/test-isolation.json', root / 'scripts/qualify-candidate.py',
+                      root / 'test/scripts/sdk-contextual-consumer.bl',
+                      root / 'test/support/source_fixtures.bl',
+                      root / 'test/fixtures/source_effect_observer.bl',
+                      root / 'test/fixtures/source_instance_guard.bl',
+                      root / 'test/fixtures/unit_instance_observer.bl',
+                      *[root / row['path'] for group in selected_plan['groups'] for row in group['tests']],
+                      *(p for p in (root / 'priv').rglob('*') if p.is_file()
+                        and p.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc'))
+                        and '.bl' not in p.relative_to(root).parts),
+                      # These application/macro examples remain explicit test
+                      # inputs even when the receiver's SDK Source is removed.
+                      *(p for name in ['contextual-sdk', 'contextual-cleanup', 'contextual-mailbox']
+                        for p in (root / 'test/fixtures' / name).rglob('*') if p.is_file()),
+                      *fixtures.glob('*.bl'), *(root / 'priv/native').glob('*.so')})
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    seed_inputs = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+    (output / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
+    report = {'version': 1, 'scope': 'artifact-sdk-build-and-sealed-image', 'status': 'running',
+              'selection': 'activation-smoke' if args.activation_smoke else 'all-sdk' if args.all_sdk else 'scenario',
+              'seconds': {}, 'full_sdk_qualified': False, 'source_free_sdk': False,
+              'native_execution_admission': False, 'tool_inputs': tools}
+    if args.contextual_tests:
+        report['sealed_plan'] = selected_plan
+        (output / 'sealed-plan.json').write_text(json.dumps(selected_plan, indent=2) + '\n')
+    image = output / 'image'
+    image.mkdir()
+    subprocess.run(['cp', '-a', '--reflink=auto', str(root / 'priv'), str(image / 'priv')], check=True)
+    shutil.rmtree(image / 'priv/bootstrap/seed')
+    shutil.copytree(seed, image / 'priv/bootstrap/seed')
+    shutil.copy2(root / 'env.bl', image / 'env.bl')
+    app = image / '.bl/lib/beam_lisp-0.1.0'
+    app.mkdir(parents=True)
+    (app / 'priv').symlink_to(image / 'priv', target_is_directory=True)
+    shutil.copytree(seed, image / 'ebin')
+    # Nix input modes are immutable. This producer installs into its OWN ebin;
+    # changing copied modes grants no authority over the original seed bytes.
+    for path in [image / 'ebin', *(image / 'ebin').rglob('*')]:
+        if not path.is_symlink():
+            path.chmod(path.stat().st_mode | 0o200)
+    (app / 'ebin').symlink_to(image / 'ebin', target_is_directory=True)
+    target = image / 'priv/std/sdk/artifact'
+    target.mkdir(parents=True)
+    for file in fixtures.glob('*.bl'):
+        shutil.copy2(file, target / file.name)
+    if 'test.support.source-fixtures' in selected_plan['roots']:
+        # Produce this test dependency through the real inventory writer too.
+        # Loading a loose helper cannot satisfy sealed import authentication.
+        helper = image / 'priv/std/test/support/source-fixtures.bl'
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / 'test/support/source_fixtures.bl', helper)
+    boot = runpy.run_path(str(root / 'scripts/demo-artifact-production'))['BOOT']
+    boot = boot.replace('BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))',
+                        'if file = System.get_env("BL_SDK_ARTIFACT_TRACE"), do: Code.require_file(file)\n'
+                        'BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))')
+    (image / 'boot.exs').write_text(boot)
+    deps = list(dict.fromkeys(p.resolve() for p in [*sorted((root / 'deps').glob('*/ebin')),
+                                                  *sorted((root / '_build').glob('*/lib/*/ebin'))]))
+    command = ['elixir']
+    for dep in deps:
+        command += ['-pa', str(dep)]
+    command += ['-pa', str(app / 'ebin'), str(image / 'boot.exs')]
+    env = dict(os.environ, BL_ROOT=str(image), BL_DAEMON='off', BL_SDK_ARTIFACT_OUT=str(output), BL_TEST_TIMES='1',
+               XDG_CACHE_HOME=str(image / 'cache'), ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+    if args.activation_smoke:
+        env['BL_SDK_ARTIFACT_SMOKE'] = 'yes'
+    if args.contextual_tests:
+        env['BL_SDK_CONTEXTUAL_TESTS'] = 'yes'
+        env['BL_SDK_CONTEXTUAL_ROOT'] = str(root)
+        env['BL_TEST_SOURCE_ROOT'] = str(root)
+        env['BL_SDK_SEALED_PLAN'] = str(output / 'sealed-plan.json')
+        if solver:
+            env['BL_SDK_EXPECT_Z3_SHA256'] = solver['sha256']
+    if args.boundary_tests:
+        env['BL_SDK_BOUNDARY_TESTS'] = 'yes'
+        env['BL_SDK_BOUNDARY_ROOT'] = str(root)
+    report['preparation_seconds'] = round(time.monotonic() - preparation_started, 3)
+
+    def run(stage, driver):
+        if tools != capture_tools(root):
+            raise RuntimeError('solver prerequisite changed before ' + stage)
+        started = time.monotonic()
+        done = subprocess.run(command, cwd=image, env=dict(env, BL_ARTIFACT_DRIVER=str(driver)),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              timeout=900 if inventory_mode else 240)
+        report['seconds'][stage] = round(time.monotonic() - started, 3)
+        (output / f'{stage}.log').write_text(done.stdout)
+        report.setdefault('slowest_tests', {})[stage] = timings(done.stdout)
+        print(done.stdout[-10000:], end='', flush=True)
+        if done.returncode:
+            raise RuntimeError(f'{stage} failed with exit {done.returncode}')
+        if inputs != {p: sha(root / p) for p in inputs}:
+            raise RuntimeError('source/driver/native inputs changed during qualification')
+        if seed_inputs != {p.name: sha(p) for p in seed.iterdir() if p.is_file()}:
+            raise RuntimeError('selected floor changed during qualification')
+        if tools != capture_tools(root):
+            raise RuntimeError('solver prerequisite changed during ' + stage)
+
+    try:
+        if not inventory_mode:
+            env['BL_SDK_ARTIFACT_TRACE'] = str(trace)
+        run('producer', drivers[0])
+        report['producer'] = json.loads((output / 'producer.json').read_text())
+        env.pop('BL_SDK_ARTIFACT_TRACE', None)
+        if args.boundary_tests:
+            env['XDG_CACHE_HOME'] = str(image / 'empty-source-consumer-cache')
+            run('sealed-source-consumers', boundary_driver)
+            report['sealed_source_consumers'] = json.loads((output / 'sealed-source-consumers.json').read_text())
+        if args.source_free:
+            removed = []
+            for file in sorted((image / 'priv').rglob('*')):
+                if file.is_file() and file.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.ex', '.exs', '.rs', '.org')):
+                    removed.append(str(file.relative_to(image)))
+                    file.unlink()
+            (image / 'env.bl').unlink()
+            report['removed_source_files'] = len(removed)
+            (output / 'removed-source.json').write_text(json.dumps(removed, indent=2) + '\n')
+            env['BL_SDK_ARTIFACT_SOURCE_FREE'] = 'yes'
+        if inventory_mode:
+            # The full producer uses the original 40-valued provider; the
+            # seven-unit scenario changes it to 50 before sealing its image.
+            env['BL_SDK_ARTIFACT_EXPECTED'] = '42'
+        env['XDG_CACHE_HOME'] = str(image / 'empty-consumer-cache')
+        if args.contextual_tests and selected_plan['sdk-initialization']:
+            env['XDG_CACHE_HOME'] = str(image / 'empty-sdk-initialization-cache')
+            env['BL_TEST_SDK_SEALED_LOADING_CONTROL'] = 'original'
+            run('sdk-initialization', initialization_driver)
+            if 'SDK_SEALED_LOADING_CONTEXT_READY' not in (output / 'sdk-initialization.log').read_text():
+                raise RuntimeError('SDK initialization fixture did not complete')
+            report['sdk_initialization'] = {'status': 'passed', 'fresh-receiver': True,
+                                           'source-free': True, 'sdk-source-compiles': 0}
+        if args.contextual_tests:
+            profiles['validate_initialization'](selected_plan, report.get('sdk_initialization'))
+        env['XDG_CACHE_HOME'] = str(image / 'empty-consumer-cache')
+        if args.contextual_tests:
+            files = [row['path'] for group in selected_plan['groups'] for row in group['tests']]
+            isolation = json.loads((root / 'scripts/test-isolation.json').read_text())
+            groups = runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['process_groups'](files, isolation)
+            # Even a pipeline-only selection needs its fresh receiver.
+            parts = []
+            for index, paths in enumerate(groups or [[]]):
+                part = dict(selected_plan, pipeline=selected_plan['pipeline'] and index == 0)
+                part['groups'] = [dict(group, tests=[row for row in group['tests'] if row['path'] in paths])
+                                  for group in selected_plan['groups']]
+                part['groups'] = [group for group in part['groups'] if group['tests']]
+                part['assertions'] = sum(row['assertions'] for group in part['groups'] for row in group['tests'])
+                plan_path = output / f'sealed-plan-part-{index}.json'
+                plan_path.write_text(json.dumps(part, indent=2) + '\n')
+                env['BL_SDK_SEALED_PLAN'] = str(plan_path)
+                run('contextual-consumer' if index == 0 else f'contextual-consumer-isolated-{index}', contextual_driver)
+                receipt_path = output / 'contextual-consumer.json'
+                receipt = json.loads(receipt_path.read_text())
+                profiles['validate'](part, receipt)
+                receipt_path.rename(output / f'contextual-consumer-part-{index}.json')
+                parts.append(receipt)
+            env['BL_SDK_SEALED_PLAN'] = str(output / 'sealed-plan.json')
+            by_path = {row['path']: row for part in parts for row in part['files']}
+            receipt = dict(parts[0], pipeline=selected_plan['pipeline'],
+                           files=[by_path[path] for path in files],
+                           assertions=sum(part['assertions'] for part in parts))
+            report['contextual_consumer'] = receipt
+            report['contextual_consumer_processes'] = parts
+            profiles['validate'](selected_plan, report['contextual_consumer'])
+            (output / 'contextual-consumer.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        run('consumer', drivers[1])
+        report['consumer'] = json.loads((output / 'consumer.json').read_text())
+        victim = app / 'ebin/Elixir.BeamLisp.Ns.Sdk.Artifact.Consumer.beam'
+        original = victim.read_bytes()
+        try:
+            victim.write_bytes(b'changed sealed artifact')
+            env['BL_SDK_ARTIFACT_TAMPER'] = 'yes'
+            run('tamper', drivers[1])
+        finally:
+            victim.write_bytes(original)
+        if args.source_free:
+            inventory = image / 'priv/sdk-code.term'
+            sealed = inventory.read_bytes()
+            try:
+                env.pop('BL_SDK_ARTIFACT_TAMPER', None)
+                env['BL_SDK_ARTIFACT_MISSING'] = 'yes'
+                run('missing-unit', drivers[1])
+            finally:
+                inventory.write_bytes(sealed)
+            report['missing_unit_refused_before_initialization'] = True
+        report.update(status='passed', tampering_refused_before_initialization=True,
+                      source_free_sdk=args.source_free)
+    except Exception as error:
+        report.update(status='error', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(f'Passed. Artifacts and receipts: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

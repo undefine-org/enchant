@@ -1,0 +1,61 @@
+(ns sdk-set-source-test (:require [anf :as anf] [compile.sdk :as sdk] [expand :as expand] [lower :as lower]))
+
+(defn- prepared-union [file action]
+ (let [workspace (BeamLisp.AOT/open_workspace
+                  {:version 2 :phase-imports (list 'core 'sugar)
+                   :sources (list {:namespace 'clojure.set :file file})} {})]
+  (try
+   (let [prepared (BeamLisp.AOT/prepare_unit workspace 'clojure.set)
+         plan (first (filter #(= "clojure.set" (:namespace %)) (:plans prepared)))
+         definitions (:definitions plan)
+         nodes (loop [todo (Enum/map (get definitions "union") #(:body (elem % 3))) out (list)]
+                (if (empty? todo) out
+                 (let [node (first todo)]
+                  (recur (erlang/++ (anf/executable-children node) (rest todo)) (cons node out)))))]
+    (action prepared definitions nodes))
+   (finally (BeamLisp.AOT/close_workspace! workspace)))))
+
+(deftest actual-set-source-removes-the-stale-refer-before-emitting-exact-core-bindings
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       file (Path/join root "priv/compat/clojure/set.bl")
+       source (File/read! file)
+       directory (Path/join (System/tmp_dir!) (str "set-source-owner-" (erlang/unique_integer (list :positive))))
+       baseline (Path/join directory "set.bl")
+       previous (BeamLisp.Env/capture)
+       generations (BeamLisp.Env/namespace_generations (list "clojure.set"))
+       initialized (BeamLisp.Env/loaded_ns? "clojure.set")]
+  (File/mkdir! directory)
+  (try
+   ;; Both variants are explicit project Source inputs. They have no SDK or
+   ;; application admission origin, and neither publishes or initializes code.
+   (File/write! baseline (String/replace source "[clojure.core-ext]" "[clojure.core-ext :refer [conj]]"))
+   (prepared-union baseline
+    (fn [prepared definitions nodes]
+     (is (= :explicit (get-in prepared [:inputs "clojure.set" :selection])))
+     (is (some #(and (= :global (:op %)) (= "clojure.set" (:ns %)) (= "conj" (:name %))
+                     (not= :exact (:lookup %))) nodes))
+     (is (try (BeamLisp.AOT/constructor_call! {"clojure.set" definitions} {} "clojure.set" "union" [#{1 2} #{2 3}])
+              false (catch _ true)))))
+   (prepared-union file
+    (fn [prepared definitions nodes]
+     (is (= :explicit (get-in prepared [:inputs "clojure.set" :selection])))
+     (is (some #(and (= :global (:op %)) (= "core" (:ns %)) (= "conj" (:name %)) (= :exact (:lookup %))) nodes))
+     (is (= #{1 2 3} (BeamLisp.AOT/constructor_call! {"clojure.set" definitions} {} "clojure.set" "union" [#{1 2} #{2 3}])))
+     (is (= #{} (BeamLisp.AOT/constructor_call! {"clojure.set" definitions} {} "clojure.set" "union" [])))
+     (is (= #{1} (BeamLisp.AOT/constructor_call! {"clojure.set" definitions} {} "clojure.set" "union" [#{1}])))))
+   (is (= previous (BeamLisp.Env/capture)))
+   (is (= generations (BeamLisp.Env/namespace_generations (list "clojure.set"))))
+   (is (= initialized (BeamLisp.Env/loaded_ns? "clojure.set")))
+   (finally (File/rm_rf! directory)))))
+
+(deftest actual-core-conj-phase-recipe-handles-the-corrected-owners-set-domain
+ (let [provider (:source (sdk/capture {:sdk 'core :revision 'selected :only ['conj]}))
+       source {:namespace 'core.set.client :revision 'current :file "core-set-client.bl"
+               :source (str "(ns core.set.client) "
+                            "(begin-for-syntax (import-world 'core 'selected :only [conj])) "
+                            "(defsyntax answer [form ctx] (syntax-literal (conj #{1 2} 3))) (answer)")}
+       program (expand/program [provider source] ['core.set.client 'current])]
+  (is (= #{1 2 3}
+         (lower/eval-anf
+          (erlang/binary_to_atom (str "Elixir.CoreSetPhase" (erlang/unique_integer (list :positive))))
+          (:node program))))))

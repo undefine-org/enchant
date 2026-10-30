@@ -1,0 +1,98 @@
+(ns contextual-sdk-macro-binding-test)
+
+(defn- detail [action]
+ (try (action) nil (catch error (:detail (ex-data error)))))
+(defn- carrier [name]
+ (let [binding (BeamLisp.AOT/sdk_binding! "core" name)
+       datum (BeamLisp.CompilerData/sdk_macro_declaration binding)
+       form (BeamLisp.Reader/read_one (pr-str datum))]
+  {:binding binding :datum datum :claim (:sdk-macro (nth datum 2))
+   :declaration {:namespace "core" :form form}}))
+(defn- invoke [session identity form arguments]
+ (BeamLisp.AOT/eval_constructor_session! session
+  {:op :apply :fn {:op :var :name "macro"}
+   :args (mapv (fn [value] {:op :lit :val value})
+          (concat [form {:ns "macro.client"}] arguments))}
+  {} {"macro" identity}))
+
+(deftest original-computed-sdk-macro-retains-only-an-interpreted-phase-closure
+ (let [captured (carrier "cond") session (BeamLisp.AOT/open_constructor_session!)
+       before (BeamLisp.Env/lookup (tuple "core" "cond"))]
+  (try
+   (is (= (:binding captured)
+          (BeamLisp.AOT/sdk_macro_declaration_binding! (:claim captured) (:declaration captured))))
+   (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! session (:claim captured) (:declaration captured))]
+    (is (erlang/is_reference identity))
+    (is (= 42 (invoke session identity '(cond :else 42) [:else 42])))
+    (is (= nil (invoke session identity '(cond) [])))
+    (is (= '(if true 42 (cond :else 0))
+           (invoke session identity '(cond true 42 :else 0) [true 42 :else 0])))
+    (is (= 1 (:values (BeamLisp.AOT/constructor_session_status session))))
+    (is (= false (:native-admission (BeamLisp.AOT/constructor_session_status session)))))
+   (is (= before (BeamLisp.Env/lookup (tuple "core" "cond"))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest exact-macro-carrier-cannot-be-replaced-by-a-forged-body-or-another-namespace
+ (let [captured (carrier "cond") changed (concat (take 4 (:datum captured)) [42])]
+  (is (= :sdk-phase-declaration-changed
+         (detail #(BeamLisp.AOT/sdk_macro_declaration_binding! (:claim captured)
+                    {:namespace "core" :form (BeamLisp.Reader/read_one (pr-str changed))}))))
+  (is (= :sdk-phase-declaration-changed
+         (detail #(BeamLisp.AOT/sdk_macro_declaration_binding! (:claim captured)
+                    (assoc (:declaration captured) :namespace "forged")))))
+  (is (= :sdk-phase-binding-changed
+         (detail #(BeamLisp.AOT/sdk_macro_declaration_binding!
+                    (assoc (:claim captured) :digest (binary/copy "0" 64)) (:declaration captured)))))
+  (is (thrown? (BeamLisp.CompilerData/sdk_macro_declaration
+                 (assoc (:binding captured) :value '(defmacro different [] nil)))))))
+
+(deftest macro-identities-remain-owned-by-the-original-session
+ (let [captured (carrier "cond") a (BeamLisp.AOT/open_constructor_session!) b (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! a (:claim captured) (:declaration captured))]
+    (is (= :constructor-session-value-not-owned (detail #(invoke b identity '(cond :else 42) [:else 42]))))
+    (is (= :failed (:status (BeamLisp.AOT/constructor_session_status b))))
+    (is (= 42 (invoke a identity '(cond :else 42) [:else 42]))))
+   (finally (BeamLisp.AOT/close_constructor_session! a) (BeamLisp.AOT/close_constructor_session! b)))))
+
+(deftest mutable-macro-vars-do-not-select-the-authenticated-recipe
+ (let [captured (carrier "cond") scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/intern "core" "cond" :mutable-shadow)
+     (let [session (BeamLisp.AOT/open_constructor_session!)]
+      (try
+       (is (= :macro (:kind (BeamLisp.AOT/sdk_binding! "core" "cond"))))
+       (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! session (:claim captured) (:declaration captured))]
+        (is (= 42 (invoke session identity '(cond :else 42) [:else 42]))))
+       (finally (BeamLisp.AOT/close_constructor_session! session))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+
+(deftest function-and-macro-carriers-share-the-original-phase-binding-owner
+ (let [binding (BeamLisp.AOT/sdk_function_binding! "core" "inc")
+       datum (BeamLisp.CompilerData/sdk_function_declaration binding)
+       claim (:sdk-phase (nth datum 2))
+       declaration {:namespace "core" :form (BeamLisp.Reader/read_one (pr-str datum))}
+       session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (is (= binding (BeamLisp.AOT/sdk_function_declaration_binding! claim declaration)))
+   (let [identity (BeamLisp.AOT/bind_sdk_constructor_session! session claim declaration)]
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session
+               {:op :apply :fn {:op :var :name "inc"} :args [{:op :lit :val 41}]} {} {"inc" identity}))))
+   (is (= :sdk-phase-kind-changed
+          (detail #(BeamLisp.AOT/sdk_macro_declaration_binding! claim declaration))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+
+(deftest fixed-macros-use-the-same-callable-ABI-and-arguments-stay-inert
+ (let [captured (carrier "ite") session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! session (:claim captured) (:declaration captured))
+         form '(ite true (erlang/put :sdk-macro-effect :bad) 0)]
+    (erlang/erase :sdk-macro-effect)
+    (is (= '(if true (erlang/put :sdk-macro-effect :bad) 0)
+           (invoke session identity form [true '(erlang/put :sdk-macro-effect :bad) 0])))
+    (is (= :undefined (erlang/get :sdk-macro-effect))))
+   (finally (erlang/erase :sdk-macro-effect) (BeamLisp.AOT/close_constructor_session! session)))))

@@ -1,0 +1,61 @@
+(ns class-graph-schema-test (:require [reload.generation :as generation]))
+(defn- reason [action] (try (action) nil (catch-raw [kind reason stack] reason)))
+(defn- graph []
+ (generation/prepare! {:application-id (str "class-schema-idle-" (erlang/unique_integer (list :positive)))
+   :native-modules #{"erlang"} :sources {"schema.idle" "(ns schema.idle) (deftype Handle [payload]) (defn module [] Handle) (defn make [x] (->Handle x))"}}))
+(defn- replacement [module]
+ (let [info (BeamLisp.Record/info module)]
+  (BeamLisp.Record/declaration_descriptor (elem info 1) (elem info 2) :deftype (list "changed") module)))
+
+(deftest an-idle-prepared-graph-holds-class-schema-without-an-active-call
+ (let [g (graph) module (generation/invoke! g "schema.idle/module" [])
+       descriptor (replacement module)]
+  (try
+   (is (not (BeamLisp.Env/live_code_leases? module)))
+   (is (BeamLisp.Env/class_schema_held? module))
+   (is (= (tuple :code_leased module) (reason #(BeamLisp.Record/publish_declaration! descriptor))))
+   (is (= (list :payload) (BeamLisp.Record/fields_of module)))
+   (is (= (tuple :bl_deftype module (tuple 42)) (generation/invoke! g "schema.idle/make" [42])))
+   (finally (generation/retire! g)))))
+
+(deftest unchanged-executable-bytes-cannot-bypass-the-open-graph-schema-fence
+ (let [g (graph) module (generation/invoke! g "schema.idle/module" [])
+       before (erlang/apply module :module_info (list :md5))
+       pair (BeamLisp.Emit/compile_descriptor (replacement module))]
+  (try
+   (is (= before (elem (elem (beam_lib/md5 (second pair)) 1) 1)))
+   (is (not (BeamLisp.Env/live_code_leases? module)))
+   (is (= (tuple :class_schema_leased module)
+          (reason #(BeamLisp.Env/publish_binaries! (list pair) "idle-schema-conflict"))))
+   (is (= before (erlang/apply module :module_info (list :md5))))
+   (is (= (list :payload) (BeamLisp.Record/fields_of module)))
+   (finally (generation/retire! g)))))
+
+(deftest full-native-retirement-releases-the-schema-hold
+ (let [g (graph) module (generation/invoke! g "schema.idle/module" [])]
+  (try
+   (is (BeamLisp.Env/class_schema_held? module))
+   (is (= :retired (:status (generation/retire! g))))
+   (is (not (BeamLisp.Env/class_schema_held? module)))
+   (finally (generation/retire! g)))))
+
+(deftest ordinary-unowned-schema-edits-keep-the-original-native-publication-path
+ (let [module :Elixir.UnownedGraphSchema
+       old (BeamLisp.Record/declaration_descriptor "schema.unowned" "Handle" :deftype (list "old") module)
+       new (BeamLisp.Record/declaration_descriptor "schema.unowned" "Handle" :deftype (list "new") module)]
+  (try
+   (BeamLisp.Record/publish_declaration! old)
+   (is (not (BeamLisp.Env/class_schema_held? module)))
+   (is (= module (BeamLisp.Record/publish_declaration! new)))
+   (is (= (list :new) (BeamLisp.Record/fields_of module)))
+   (finally (BeamLisp.Env/retire_module! module)))))
+
+(deftest caller-retired-flags-do-not-release-the-original-native-schema-hold
+ (let [g (graph) module (generation/invoke! g "schema.idle/module" []) previous @(:state g)]
+  (try
+   (swap! (:state g) assoc :retired true)
+   (is (BeamLisp.Env/class_schema_held? module))
+   (is (= (tuple :code_leased module)
+          (reason #(BeamLisp.Record/publish_declaration! (replacement module)))))
+   (is (= (list :payload) (BeamLisp.Record/fields_of module)))
+   (finally (reset! (:state g) previous) (generation/retire! g)))))

@@ -1,0 +1,143 @@
+;; Native execution commands. Env remains the single custody/fence owner.
+;; Opaque registrations contain neither callable nor nominated context data.
+(ns host.execution)
+
+(defn- own-module [] (elem (erlang/fun_info (fn [] nil) :module) 1))
+
+(defn- finite-arguments [arguments]
+ (when-not (or (erlang/is_list arguments) (vector? arguments))
+  (erlang/error :execution_arguments_must_be_eager))
+ (when (> (if (vector? arguments) (BeamLisp.Vector/count arguments) (erlang/length arguments)) 16384)
+  (erlang/error :execution_argument_capacity))
+ (BeamLisp.CompilerData/eager_to_list arguments))
+
+(defn register!
+ "Retain and privately bind an executable to its actual native context before
+  publishing the registration. Managed code is retained by its native graph
+  pin; outside captured dependencies must be listed explicitly. No supplied
+  evaluator/context callback or second registry is accepted."
+ ([function] (register! function (list)))
+ ([function dependencies]
+  (BeamLisp.Env/execution_registration_preflight! function)
+  (let [dependencies (finite-arguments dependencies)
+        _ (when-not (Enum/all? dependencies (fn [module] (erlang/is_atom module)))
+            (erlang/error :invalid_execution_dependencies))
+        modules (Enum/concat (BeamLisp.Env/callback_modules function)
+                  (cons (own-module) dependencies))
+        lease (BeamLisp.Env/retain_execution_code! modules)]
+   (try
+    (BeamLisp.Env/execution_registration! lease (BeamLisp.Env/register_code_callback! lease function))
+    (catch error (BeamLisp.Env/release_code! lease)
+     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))
+
+(defn invoke!
+ "Accept once under native custody, returning completed/cancelled/busy. An
+  accepted callback's own exception propagates and is never a retry signal.
+  Argument collection conversion cannot run a lazy caller continuation."
+ [registration arguments]
+ (let [arguments (finite-arguments arguments)
+       ticket (BeamLisp.Env/execution_registration_ticket registration)]
+  (if ticket (BeamLisp.Env/run_code_callback! (elem ticket 0) (elem ticket 1) arguments)
+      {:status :cancelled})))
+
+(defn register-bundle!
+ "Register a noncallable control bundle against an actual native transition
+  grant and a fixed schema. No context or evaluator callback is nominated."
+ [grant schema entries]
+ (BeamLisp.Env/register_execution_bundle! grant schema entries))
+
+(defn invoke-bundle!
+ "Borrow the bundle and invoke its fixed SDK receiver entry. Entry identifiers
+  are a closed schema vocabulary, never a caller-supplied function or MFA."
+ [registration grant entry arguments]
+ (BeamLisp.Env/invoke_execution_bundle! registration grant entry (finite-arguments arguments)))
+
+(defn close!
+ "Idempotently close future admission. Independently accepted work drains."
+ [registration]
+ (BeamLisp.Env/close_execution_registration! registration))
+
+(defn inspect!
+ "Borrow a registered callback for a fixed SDK metadata analysis. The quoted
+  analysis identifier selects a closed native schema, never a supplied action,
+  function, context or MFA. The application callback is not invoked."
+ [registration analysis]
+ (BeamLisp.Env/inspect_execution_callback! registration analysis))
+
+(defn prepare-handoff!
+ "Create an inactive native target. Index :accepted in its lifetime-owner
+  slot before acceptance. Source data cannot construct the pending authority."
+ [registration owner]
+ (BeamLisp.Env/prepare_execution_handoff! registration owner))
+
+(defn accept-handoff!
+ ([prepared] (BeamLisp.Env/accept_execution_handoff! prepared))
+ ([prepared admission] (BeamLisp.Env/accept_execution_handoff! prepared admission)))
+
+(defn handoff-status [prepared] (BeamLisp.Env/execution_handoff_status prepared))
+
+(defn prepare-start! [registration child ticket]
+ (BeamLisp.Env/prepare_execution_start! registration child ticket))
+
+(defn register-start! [function dependencies]
+ (BeamLisp.Env/assert_execution_start_constructor!)
+ (register! function (cons :Elixir.BeamLisp.Refs (finite-arguments dependencies))))
+
+(defn accept-start! [prepared ticket]
+ (BeamLisp.Env/accept_execution_start! prepared ticket))
+
+(defn invoke-start! [registration ticket]
+ (BeamLisp.Env/invoke_execution_start! registration ticket))
+
+(defn- registration-ticket! [registration]
+ (or (BeamLisp.Env/execution_registration_ticket registration)
+     (erlang/error :invalid_execution_registration)))
+
+(defn metadata!
+ "Read owner-only native control metadata without exposing a physical ticket.
+  Source callers reach this only through fixed SDK adapters."
+ [registration]
+ (let [ticket (registration-ticket! registration)]
+  (BeamLisp.Env/code_callback_metadata! (elem ticket 0) (elem ticket 1))))
+
+(defn put-metadata! [registration value]
+ (let [ticket (registration-ticket! registration)]
+  (BeamLisp.Env/put_code_callback_metadata! (elem ticket 0) (elem ticket 1) value)))
+
+(defn restrict!
+ "Stamp the actual selected Source restriction; this grants no new context."
+ [registration]
+ (let [ticket (registration-ticket! registration)]
+  (BeamLisp.Env/restrict_code_callback! (elem ticket 0) (elem ticket 1))))
+
+(defn observe
+ "Read-only registration state, without function, context or physical lease."
+ ([] (BeamLisp.Env/execution_frame_observation))
+ ([registration]
+ (let [state (BeamLisp.Env/execution_registration_state registration)
+       ticket (when (= :callback (:kind state)) (tuple (:lease state) (:token state)))]
+  {:version 1 :kind (if (= :execution-bundle (:kind state)) :execution-bundle :execution-registration)
+   :status (cond
+             (and ticket (BeamLisp.Env/code_callback_active? (elem ticket 0) (elem ticket 1))) :active
+             (and (= :execution-bundle (:kind state)) (BeamLisp.Env/execution_bundle_active? registration)) :active
+             (= :execution-handoff (:kind state))
+              (if (= :pending (:status (handoff-status {:source (:source state) :accepted registration})))
+               :pending :cancelled)
+             :else :cancelled)}))
+ ([registration field]
+  (let [state (BeamLisp.Env/execution_registration_state registration)]
+   (case field
+    'owner (when state (elem (:lease state) 1))
+    'code-rows (when state (erlang/length (elem (:lease state) 0)))
+    'source-scope (when (and (= :callback (:kind state))
+                            (BeamLisp.Env/code_callback_active? (:lease state) (:token state)))
+                    (BeamLisp.Env/source_lease_profile (:lease state)))
+    (erlang/error :invalid_execution_observation)))))
+
+(defn selected-graph-id [] (BeamLisp.Env/selected_execution_graph_id))
+(defn graph-field [field] (BeamLisp.Env/selected_execution_graph_field field))
+
+(defn install-actor! [module lease]
+ (BeamLisp.Env/install_server_execution! module lease))
+(defn invoke-actor! [module callback action]
+ (BeamLisp.Env/with_server_execution! module callback action))

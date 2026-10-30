@@ -1,0 +1,83 @@
+(ns native-execution-managed-context-test (:require [reload.generation :as generation]))
+
+(defn- snapshots []
+ (count (filter (fn [entry]
+                  (let [key (elem entry 0)]
+                   (and (tuple? key) (= 3 (tuple-size key))
+                        (= :bl_execution_graph_snapshot (elem key 0))
+                        (= (Process/whereis :Elixir.BeamLisp.Env) (elem key 1)))))
+                (persistent_term/get))))
+(defn- payload [registration]
+ (BeamLisp.Env/code_callback_payload (:lease (BeamLisp.Env/execution_registration_state registration))))
+(defn- prepared [tag size answer]
+ (let [namespace (str "context.graph." tag)
+       sources (into {namespace (str "(ns " namespace ") (defn callback [] (fn [] " answer "))")}
+                 (map (fn [i] (let [leaf (str namespace ".leaf" i)]
+                                [leaf (str "(ns " leaf ") (defn value [] " i ")")])) (range size)))]
+  [(generation/prepare! {:application-id (str "context-" tag) :sources sources}) namespace]))
+(defn- registered [graph namespace]
+ (generation/with! graph #(BeamLisp.Execution/register! (generation/invoke! graph (str namespace "/callback") []))))
+
+(deftest managed-contexts-share-a-graph-snapshot-without-copying-it-through-custody
+ (let [baseline (snapshots)]
+  (doseq [size [1 16]]
+   (let [[graph namespace] (prepared (str "size" size) size 42)
+         registration (registered graph namespace)
+         context-id (:context-id (payload registration))
+         marker (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))]
+    (try
+     (is (= (inc baseline) (snapshots)))
+     (is (not (contains? (payload registration) :context)))
+     (is (< (erlang/external_size (payload registration)) 2048))
+     (is (= graph (:generation (BeamLisp.Env/execution_context_value! context-id))))
+     ;; Actual VM pointer identity proves the lookup didn't return a copied
+     ;; graph via Agent or ETS, in addition to ordinary value equivalence.
+     (Code/ensure_loaded? :erts_debug)
+     (is (erts_debug/same (:generation (BeamLisp.Env/execution_context_value! context-id))
+                         (BeamLisp.Env/execution_graph_generation! marker)))
+     (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [])))
+     (is (= :waiting (:status (generation/retire! graph))))
+     (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [])))
+     (BeamLisp.Execution/close! registration)
+     (is (= :retired (:status (generation/retire! graph))))
+     (is (= baseline (snapshots)))
+     (finally (BeamLisp.Execution/close! registration) (generation/retire! graph)))))))
+
+(deftest distinct-prepared-graphs-cannot-alias-their-context-identities
+ (let [baseline (snapshots) [left ln] (prepared "left" 1 41) [right rn] (prepared "right" 1 42)
+       a (registered left ln) b (registered right rn)]
+  (try
+   (is (= (+ baseline 2) (snapshots)))
+   (is (not= (:context-id (payload a)) (:context-id (payload b))))
+   (is (= {:status :completed :value 41} (BeamLisp.Execution/invoke! a [])))
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! b [])))
+   (finally (BeamLisp.Execution/close! a) (BeamLisp.Execution/close! b)
+    (generation/retire! left) (generation/retire! right)))
+  (is (= baseline (snapshots)))))
+
+(deftest scope-destruction-closes-admission-and-last-pin-reclaims-the-snapshot
+ (let [baseline (snapshots) [graph namespace] (prepared "destroyed-scope" 1 42)
+       registration (registered graph namespace)]
+  (try
+   (BeamLisp.Env/destroy (:scope graph))
+   (is (= (inc baseline) (snapshots)))
+   (is (= :execution_graph_closed
+          (try (generation/with! graph (fn [] :unexpected)) :unexpected
+           (catch error (:original error)))))
+   (BeamLisp.Execution/close! registration)
+   (is (= baseline (snapshots)))
+   (finally (BeamLisp.Execution/close! registration) (generation/retire! graph)))))
+
+(deftest legacy-physical-custody-keeps-the-snapshot-until-the-last-release
+ (let [graph (generation/prepare!
+               {:application-id "legacy-context-snapshot"
+                :sources {"legacy.context.snapshot" "(ns legacy.context.snapshot) (defn answer [] 42)"}})
+       marker (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))
+       key (tuple :bl_execution_graph_snapshot (Process/whereis :Elixir.BeamLisp.Env) marker)
+       physical (BeamLisp.Env/retain_code! (:modules graph))]
+  (try
+   (BeamLisp.Env/destroy (:scope graph))
+   (is (some? (persistent_term/get key nil)))
+   (BeamLisp.Env/release_code! physical)
+   (is (= nil (persistent_term/get key nil)))
+   (finally (BeamLisp.Env/release_code! physical) (generation/retire! graph)))))

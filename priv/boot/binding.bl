@@ -1,0 +1,490 @@
+;; Immutable binding tables. These are Source data, not artifact admission.
+;; The controller must derive the declarations from its actual selected source.
+(ns binding (:require [syntax :as syn]))
+
+(defn- canonical-bytes [value]
+ (erlang/term_to_binary value (list :deterministic)))
+
+(defn- refuse! [kind data]
+ (throw (ex-info (str "Binding contract: " kind) (assoc data :kind kind))))
+
+(defn- fields! [value allowed required]
+ (when-not (and (erlang/is_map value) (not (contains? value :__struct__))
+                (every? #(contains? allowed %) (keys value))
+                (every? #(contains? value %) required))
+  (refuse! :binding-fields {:actual (when (erlang/is_map value) (keys value))
+                            :allowed allowed :required required}))
+ value)
+
+(defn check-name!
+ "Check an unqualified logical binding/namespace name and return its bytes.
+  Archive admission and binding construction share this identity grammar."
+ [value]
+ (when-not (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value))
+                (= :symbol (elem value 0)) (erlang/is_binary (elem value 1))
+                (<= 1 (erlang/byte_size (elem value 1)) 512)
+                (not (String/contains? (elem value 1) "/")))
+  (refuse! :binding-symbol {:value value}))
+ (elem value 1))
+
+(defn- digest! [value]
+ (when-not (and (erlang/is_binary value) (= 32 (erlang/byte_size value)))
+  (refuse! :binding-digest {}))
+ value)
+
+(defn- finite! [value maximum]
+ (when-not (or (vector? value) (erlang/is_list value)) (refuse! :binding-collection {}))
+ (let [items (try (BeamLisp.CompilerData/eager_to_list value)
+              (catch Elixir.ArgumentError _ (refuse! :binding-collection {})))]
+  (when (> (erlang/length items) maximum) (refuse! :binding-bound {:maximum maximum}))
+  items))
+
+(defn- phase! [value]
+ (when-not (and (erlang/is_integer value) (<= -4096 value 4096))
+  (refuse! :binding-phase {}))
+ value)
+
+(defn- path! [value]
+ (let [items (finite! value 64)]
+  (when-not (every? #(and (erlang/is_integer %) (<= 0 % 1073741823)) items)
+   (refuse! :binding-path {}))
+  items))
+
+(defn- selection! [selection]
+ (fields! selection #{:version :profile :target :sources} [:version :profile :target :sources])
+ (when-not (erlang/=:= 1 (:version selection)) (refuse! :binding-version {}))
+ (check-name! (:profile selection)) (check-name! (:target selection))
+ (let [sources (Enum/sort_by
+                (Enum/map (finite! (:sources selection) 4096)
+                 (fn [source]
+                  (fields! source #{:namespace :digest :revision} [:namespace :digest])
+                  (when (contains? source :revision)
+                   (let [r (:revision source)]
+                    (when-not (and (erlang/is_tuple r) (= 2 (erlang/tuple_size r))
+                                   (= :symbol (elem r 0)) (erlang/is_binary (elem r 1))
+                                   (<= 1 (erlang/byte_size (elem r 1)) 512))
+                     (refuse! :binding-revision {}))))
+                  (check-name! (:namespace source)) (digest! (:digest source)) source))
+                (fn [source] (check-name! (:namespace source))))
+       names (Enum/map sources (fn [source] (:namespace source)))]
+  (when (or (empty? sources) (not= names (Enum/uniq names)))
+   (refuse! :binding-sources {}))
+  (assoc selection :sources sources)))
+
+(defn world-key
+ "Canonical logical input key. The descriptor accepts source revisions,
+  profile and target names; physical artifacts/receipts are separate inputs."
+ [selection]
+ (let [s (selection! selection)]
+  (crypto/hash :sha256
+   (canonical-bytes
+    (tuple :binding-world-v1 (check-name! (:profile s)) (check-name! (:target s))
+     (Enum/map (:sources s)
+      (fn [source]
+       (if (contains? source :revision)
+        (tuple (check-name! (:namespace source)) (:revision source) (:digest source))
+        (tuple (check-name! (:namespace source)) (:digest source))))))))))
+
+(defn- owners [selection]
+ (Map/new (Enum/map (:sources selection) #(tuple (:namespace %) (:digest %)))))
+
+(defn- owner! [selected owner]
+ (check-name! owner)
+ (when-not (Map/has_key? selected owner)
+  (refuse! :binding-owner {:owner owner}))
+ owner)
+
+(defn- scope-record [key owner path role]
+ (when-not (contains? #{:module :lexical :introduction :use-site :import} role)
+  (refuse! :binding-scope-role {}))
+ {:version 1 :kind :binding-scope :world key :owner owner :path path :role role
+  :id (crypto/hash :sha256 (canonical-bytes (tuple :binding-scope-v1 key owner path role)))})
+
+(defn scope
+ "Stable scope coordinates, allocated by the expansion controller. Distinct
+  expansion paths/roles remain distinct; no process counter or artifact hash."
+ [selection owner path role]
+ (let [selection (selection! selection) key (world-key selection)
+       owner (owner! (owners selection) owner) path (path! path)]
+  (scope-record key owner path role)))
+
+(defn- scopes! [value registry]
+ (let [ids (Enum/sort (Enum/uniq (Enum/map (finite! value 128) (fn [id] (digest! id)))))]
+  (when-not (every? #(contains? registry %) ids) (refuse! :binding-foreign-scope {}))
+  ids))
+
+(defn- declaration! [selected key registry declaration]
+ (fields! declaration #{:namespace :name :phase :space :kind :path :scopes :visibility :available-from}
+                      [:namespace :name :phase :space :kind :path :scopes :visibility :available-from])
+ (owner! selected (:namespace declaration)) (check-name! (:name declaration))
+ (check-name! (:space declaration)) (phase! (:phase declaration))
+ (when-not (contains? #{:value :function :macro :syntax :core} (:kind declaration))
+  (refuse! :binding-declaration-kind {}))
+ (when-not (contains? #{:public :private :local} (:visibility declaration))
+  (refuse! :binding-visibility {}))
+ (when-not (and (erlang/is_integer (:available-from declaration))
+                (<= 0 (:available-from declaration) 1073741823))
+  (refuse! :binding-position {}))
+ (let [d (assoc declaration :path (path! (:path declaration))
+                            :scopes (scopes! (:scopes declaration) registry))
+       ;; This is the complete, finite declaration coordinate, without its ID.
+       coordinate (tuple :binding-declaration-v1 key (:namespace d) (:name d) (:phase d)
+                         (:space d) (:kind d) (:path d) (:scopes d) (:visibility d) (:available-from d))]
+  (assoc d :id (crypto/hash :sha256 (canonical-bytes coordinate)))))
+
+(defn- qualified-entry-key [entry]
+ (tuple (symbol (str (:namespace entry) "/" (:name entry)))
+        (if (:view entry) (get-in entry [:view :phase]) (:phase entry)) (:space entry)))
+
+(defn- insert-qualified [index entries]
+ ;; An index over existing rows, never new declarations or import permission.
+ (Enum/reduce entries index
+  (fn [entry out]
+   (if (= :local (:visibility entry)) out
+    (Map/update out (qualified-entry-key entry) (list entry)
+     #(Enum/sort_by (cons entry %) (fn [value] (canonical-bytes value))))))))
+
+(defn world
+ "Build a bounded, immutable indexed table. Scope and declaration rows are
+  explicit controller output, not evidence that arbitrary source was checked.
+  Validate serialized tables once before repeated lookup. No Env fallback."
+ [selection scope-records declarations]
+ (let [selection (selection! selection) key (world-key selection) selected (owners selection)
+       registry (Enum/reduce (finite! scope-records 16384) {}
+                 (fn [record out]
+                  (fields! record #{:version :kind :world :owner :path :role :id}
+                                  [:version :kind :world :owner :path :role :id])
+                  (let [expected (scope-record key (owner! selected (:owner record)) (path! (:path record)) (:role record))]
+                   (when (or (not (erlang/=:= record expected)) (contains? out (:id record)))
+                    (refuse! :binding-scope-record {}))
+                   (assoc out (:id record) record))))
+       rows (Enum/sort_by
+              (Enum/map (finite! declarations 16384) #(declaration! selected key registry %))
+              (fn [d] (:id d)))
+       coordinates (Enum/map rows #(tuple (:namespace %) (:phase %) (:space %) (:name %) (:scopes %)))
+       paths (Enum/map rows #(tuple (:namespace %) (:phase %) (:space %) (:path %)))
+       _ (when (or (not= coordinates (Enum/uniq coordinates)) (not= paths (Enum/uniq paths)))
+           (refuse! :binding-duplicate-declaration {}))
+       index (Enum/group_by rows #(tuple (:name %) (:phase %) (:space %)))]
+  {:version 1 :kind :binding-world :key key :selection selection :scopes registry
+   :declarations rows :index index :qualified-index (insert-qualified {} rows) :owners selected :imports (list)
+   :owner-index (Enum/group_by rows #(tuple (:namespace %) (:name %) (:space %))) :entry-count (count rows)
+   :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))}))
+
+(defn validate-world
+ "Rebuild and compare all serialized fields, including the index. A valid
+  table remains ordinary data; this check never authenticates a compiler."
+ [value]
+ (fields! value #{:version :kind :key :selection :scopes :declarations :index :qualified-index :by-id :owners :imports :owner-index :entry-count}
+                [:version :kind :key :selection :scopes :declarations :index :qualified-index :by-id :owners :imports :owner-index :entry-count])
+ (let [base (world (:selection value) (Map/values (:scopes value))
+                   (Enum/map (:declarations value) #(dissoc % :id)))
+       expected (Enum/reduce (finite! (:imports value) 256) base (fn [request w] (import-view w request)))]
+  (when-not (erlang/=:= expected value) (refuse! :binding-invalid-world {}))
+  value))
+
+(defn reference-id
+ ([world declaration]
+  (let [row (Map/get (:by-id world) declaration)]
+   (when-not row (refuse! :binding-unknown-declaration {}))
+   (reference-id world declaration (:phase row))))
+ ([world declaration phase]
+  (when-not (contains? (:by-id world) declaration) (refuse! :binding-unknown-declaration {}))
+  (phase! phase)
+  (let [row (Map/get (:by-id world) declaration)
+        origin (Map/get row :owner-world (:key world))]
+   (crypto/hash :sha256 (canonical-bytes (tuple :binding-reference-v1 origin declaration phase))))))
+
+(defn- project-import [provider world request]
+ (fields! request #{:from :into :scope :phase-shift :space :only :alias :rename}
+                  [:from :into :scope :phase-shift :space :only])
+ (owner! (:owners provider) (:from request)) (owner! (:owners world) (:into request))
+ (phase! (:phase-shift request)) (check-name! (:space request))
+ (when (some? (:alias request)) (check-name! (:alias request)))
+ (let [scope (Map/get (:scopes world) (digest! (:scope request)))
+       _ (when-not (and (= :import (:role scope)) (= (:into request) (:owner scope)))
+           (refuse! :binding-import-scope {}))
+       names (Enum/sort (finite! (:only request) 256))
+       _ (Enum/each names (fn [name] (check-name! name)))
+       _ (when (or (empty? names) (not= names (Enum/uniq names)))
+           (refuse! :binding-import-names {}))
+       renames (if (nil? (:rename request)) {} (:rename request))
+       _ (when-not (and (erlang/is_map renames) (not (contains? renames :__struct__)) (<= (erlang/map_size renames) 256))
+           (refuse! :binding-import-rename {}))
+       _ (Enum/each (Map/to_list renames)
+           (fn [pair]
+            (check-name! (elem pair 0)) (check-name! (elem pair 1))
+            (when-not (Enum/member? names (elem pair 0)) (refuse! :binding-import-rename {}))))
+       request (assoc request :only names :rename renames :alias (:alias request))
+       declarations (Enum/flat_map names
+                       #(Map/get (:owner-index provider) (tuple (:from request) % (:space request)) (list)))
+       _ (doseq [name names]
+           (let [named (Enum/filter declarations #(= name (:name %)))]
+            (when (empty? named) (refuse! :binding-import-missing {:name name}))
+            (when-not (some #(= :public (:visibility %)) named)
+             (refuse! :binding-import-private {:name name}))))
+       entries (Enum/map (Enum/filter declarations #(= :public (:visibility %)))
+                 (fn [d]
+                  (let [renamed (Map/get renames (:name d) (:name d))
+                        visible (if (:alias request)
+                                  (symbol (str (check-name! (:alias request)) "/" (check-name! renamed))) renamed)
+                        phase (phase! (+ (:phase d) (:phase-shift request)))]
+                   (assoc d :view {:name visible :phase phase :namespace (:into request)
+                                   :scopes (list (:scope request)) :available-from 0}))))
+       keys (Enum/map entries #(tuple (get-in % [:view :name]) (get-in % [:view :phase]) (:space %)))
+       _ (when-not (= keys (Enum/uniq keys)) (refuse! :binding-import-duplicate {}))]
+  {:request request :entries entries}))
+
+(defn- entry-key [entry]
+ (tuple (if (:view entry) (get-in entry [:view :name]) (:name entry))
+        (if (:view entry) (get-in entry [:view :phase]) (:phase entry)) (:space entry)))
+
+(defn- insert-entries [index entries]
+ (Enum/reduce entries index
+  (fn [d out]
+   (Map/update out (entry-key d) (list d)
+    #(Enum/sort_by (cons d %) (fn [entry] (canonical-bytes entry)))))))
+
+(defn import-view
+ "Project public declarations within one world. Renaming preserves origin;
+  phase shifts change reference phase. Cross-world edges use select."
+ [world request]
+ (let [projected (project-import world world request) request (:request projected)]
+  (when (or (>= (count (:imports world)) 256) (Enum/member? (:imports world) request))
+   (refuse! :binding-import-duplicate {}))
+  (when (> (+ (:entry-count world) (count (:entries projected))) 131072)
+   (refuse! :binding-bound {:maximum 131072}))
+  (assoc world :index (insert-entries (:index world) (:entries projected))
+               :qualified-index (insert-qualified (:qualified-index world) (:entries projected))
+               :entry-count (+ (:entry-count world) (count (:entries projected)))
+               :imports (Enum/sort_by (cons request (:imports world))
+                          (fn [value] (canonical-bytes value))))))
+
+(defn- selected-world! [worlds key]
+ (or (Map/get worlds (digest! key)) (refuse! :binding-world-not-selected {:world key})))
+
+(defn- origin-entry [entry key]
+ (cond-> (assoc entry :owner-world key)
+   (:view entry) (assoc :view (assoc (:view entry) :world key))))
+
+(defn- merge-unique [left right]
+ (Enum/reduce (Map/to_list right) left
+  (fn [pair out]
+   (let [key (elem pair 0) value (elem pair 1)]
+    (when (and (contains? out key) (not (erlang/=:= (Map/get out key) value)))
+     (refuse! :binding-identity-collision {}))
+    (Map/put out key value)))))
+
+(defn select
+ "Select immutable logical worlds and explicit cross-world import edges.
+  Each edge adds :from-world/:into-world to the import-view request. Namespace
+  revisions remain separate. The graph key contains logical tables and edges,
+  never physical artifact attestations; declaration/reference IDs retain origin."
+ [world-values import-edges]
+ (let [worlds (Enum/reduce (finite! world-values 256) {}
+                (fn [value out]
+                 (let [w (validate-world value)] (merge-unique out {(:key w) w}))))
+       _ (when (empty? worlds) (refuse! :binding-empty-selection {}))
+       ordered (Enum/sort_by (Map/values worlds) (fn [w] (:key w)))
+       total (Enum/reduce ordered 0 (fn [w n] (+ n (count (:declarations w)) (count (:scopes w)))))
+       _ (when (> total 131072) (refuse! :binding-bound {:maximum 131072}))
+       initial-count (Enum/reduce ordered 0 (fn [w n] (+ n (:entry-count w))))
+       _ (when (> initial-count 131072) (refuse! :binding-bound {:maximum 131072}))
+       registry (Enum/reduce ordered {} (fn [w out] (merge-unique out (:scopes w))))
+       rows (Enum/flat_map ordered
+              (fn [w] (Enum/map (:declarations w) #(origin-entry % (:key w)))))
+       index (Enum/reduce ordered {}
+               (fn [w out]
+                (insert-entries out
+                 (Enum/map (Enum/flat_map (Map/values (:index w)) (fn [bucket] bucket))
+                   #(origin-entry % (:key w))))))
+       projected-budget (Enum/map_reduce (finite! import-edges 4096) (- 131072 initial-count)
+                   (fn [edge remaining]
+                    (let [from (:from-world edge) into (:into-world edge)
+                          provider (selected-world! worlds from) consumer (selected-world! worlds into)
+                          p (project-import provider consumer (dissoc edge :from-world :into-world))]
+                     (when (> (count (:entries p)) remaining) (refuse! :binding-bound {:maximum 131072}))
+                     (tuple {:request (assoc (:request p) :from-world from :into-world into)
+                             :entries (Enum/map (:entries p)
+                                        #(assoc % :owner-world from :view (assoc (:view %) :world into)))}
+                            (- remaining (count (:entries p)))))))
+       projected (elem projected-budget 0)
+       requests (Enum/sort (Enum/map projected (fn [p] (:request p))))
+       _ (when-not (= requests (Enum/uniq requests)) (refuse! :binding-import-duplicate {}))
+       index (insert-entries index (Enum/flat_map projected (fn [p] (:entries p))))
+       ;; Scope/declaration coordinates do not refer back to this graph key.
+       ;; Hashing the finite canonical graph therefore has no recursive equation.
+       key (crypto/hash :sha256 (canonical-bytes (tuple :binding-selection-v1 ordered requests)))]
+  {:version 1 :kind :binding-selection :key key :state-key key :worlds worlds :imports requests :instances (list)
+   :instance-base (Enum/group_by (Enum/flat_map (Map/values index) (fn [bucket] bucket))
+                    #(if (:view %) (get-in % [:view :world]) (:owner-world %)))
+   :introduced-scopes (list) :introduced-declarations (list)
+   :scopes registry :index index
+   :qualified-index (insert-qualified {} (Enum/flat_map (Map/values index) (fn [bucket] bucket))) :by-id (Map/new (Enum/map rows #(tuple (:id %) %)))
+   :coordinates (Map/new (Enum/map rows
+                  #(tuple (tuple (:owner-world %) (:namespace %) (:phase %) (:space %) (:path %)) (:id %))))
+   :binding-coordinates (Map/new (Enum/map rows
+                  #(tuple (tuple (:owner-world %) (:namespace %) (:phase %) (:space %) (:name %) (:scopes %)) (:id %))))
+   :entry-count (- 131072 (elem projected-budget 1))}))
+
+(defn instantiate
+ "Select a module's phase instance, including its private declarations and
+  imported views. Visibility stays in its own lexical context. Locals never
+  shift, and original declaration identity remains unchanged."
+ [selection origin delta]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (selected-world! (:worlds selection) origin) (phase! delta)
+ (let [instance (tuple origin delta)]
+  (if (Enum/member? (:instances selection) instance) selection
+   (do
+    (when (>= (count (:instances selection)) 256) (refuse! :binding-bound {:maximum 256}))
+    (let [entries (if (= 0 delta) (list)
+                    (Enum/map (Enum/filter (Map/get (:instance-base selection) origin (list))
+                                #(not= :local (:visibility %)))
+                     (fn [entry]
+                      (let [view (:view entry)]
+                       (assoc entry :view
+                        {:name (if view (:name view) (:name entry))
+                         :phase (phase! (+ delta (if view (:phase view) (:phase entry))))
+                         :namespace (if view (:namespace view) (:namespace entry))
+                         :scopes (if view (:scopes view) (:scopes entry))
+                         :available-from 0 :world origin :phase-instance delta})))))]
+     (when (> (+ (:entry-count selection) (count entries)) 131072)
+      (refuse! :binding-bound {:maximum 131072}))
+     (assoc selection :instances (Enum/sort (cons instance (:instances selection)))
+                      :index (insert-entries (:index selection) entries)
+                      :qualified-index (insert-qualified (:qualified-index selection) entries)
+                      :entry-count (+ (:entry-count selection) (count entries)) :state-key nil))))))
+
+(defn register-scope
+ "Extend an expansion snapshot with a controller-allocated scope. Repeating
+  the exact registration is idempotent. Logical world keys remain unchanged."
+ [selection record]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [w (selected-world! (:worlds selection) (:world record))
+       expected (scope-record (:key w) (owner! (:owners w) (:owner record)) (path! (:path record)) (:role record))]
+  (when-not (erlang/=:= record expected) (refuse! :binding-scope-record {}))
+  (if-let [existing (Map/get (:scopes selection) (:id record))]
+   (if (erlang/=:= existing record) selection (refuse! :binding-identity-collision {}))
+   (do
+    (when (>= (erlang/map_size (:scopes selection)) 65536) (refuse! :binding-bound {:maximum 65536}))
+    (assoc selection :scopes (Map/put (:scopes selection) (:id record) record)
+                     :introduced-scopes (cons record (:introduced-scopes selection)) :state-key nil)))))
+
+(defn bind
+ "Add an actual expanded declaration to its origin world. Its lexical context
+  may contain selected scopes from other worlds, as introduced macro code does.
+  Persistent indexes make each addition independent of unrelated declarations."
+ [selection origin declaration]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [w (selected-world! (:worlds selection) origin)
+       d (declaration! (:owners w) origin (:scopes selection) declaration)
+       entry (origin-entry d origin)
+       coordinate (tuple origin (:namespace d) (:phase d) (:space d) (:path d))
+       binding-coordinate (tuple origin (:namespace d) (:phase d) (:space d) (:name d) (:scopes d))]
+  (if-let [existing (Map/get (:by-id selection) (:id d))]
+   (if (erlang/=:= existing entry) selection (refuse! :binding-identity-collision {}))
+   (do
+    (when (or (contains? (:coordinates selection) coordinate)
+              (contains? (:binding-coordinates selection) binding-coordinate))
+     (refuse! :binding-duplicate-declaration {}))
+    (when (or (>= (:entry-count selection) 131072) (>= (erlang/map_size (:by-id selection)) 65536))
+     (refuse! :binding-bound {:maximum 65536}))
+    (assoc selection :by-id (Map/put (:by-id selection) (:id d) entry)
+                     :index (insert-entries (:index selection) (list entry))
+                     :qualified-index (insert-qualified (:qualified-index selection) (list entry))
+                     :coordinates (Map/put (:coordinates selection) coordinate (:id d))
+                     :binding-coordinates (Map/put (:binding-coordinates selection) binding-coordinate (:id d))
+                     :introduced-declarations (cons entry (:introduced-declarations selection))
+                     :entry-count (+ 1 (:entry-count selection)) :state-key nil)))))
+
+(defn freeze
+ "Fingerprint a complete expansion snapshot once. Declaration/reference IDs
+  depend on logical origin coordinates, not this output fingerprint."
+ [selection]
+ (when-not (= :binding-selection (:kind selection)) (refuse! :binding-context {}))
+ (let [scopes (Enum/sort_by (:introduced-scopes selection) (fn [s] (:id s)))
+       declarations (Enum/sort_by (:introduced-declarations selection) (fn [d] (:id d)))
+       state-key (if (and (empty? scopes) (empty? declarations) (empty? (:instances selection))) (:key selection)
+                   (crypto/hash :sha256
+                    (canonical-bytes (tuple :binding-expansion-v1 (:key selection) (:instances selection) scopes declarations))))]
+  (assoc selection :introduced-scopes scopes :introduced-declarations declarations :state-key state-key)))
+
+(defn validate-selection [value]
+ (fields! value #{:version :kind :key :state-key :worlds :imports :scopes :index :qualified-index :by-id :entry-count
+                  :introduced-scopes :introduced-declarations :coordinates :binding-coordinates :instances :instance-base}
+                [:version :kind :key :state-key :worlds :imports :scopes :index :qualified-index :by-id :entry-count
+                 :introduced-scopes :introduced-declarations :coordinates :binding-coordinates :instances :instance-base])
+ (let [base (select (Map/values (:worlds value)) (:imports value))
+       instanced (Enum/reduce (finite! (:instances value) 256) base
+                    (fn [instance out]
+                     (when-not (and (erlang/is_tuple instance) (= 2 (erlang/tuple_size instance)))
+                      (refuse! :binding-instance {}))
+                     (instantiate out (elem instance 0) (elem instance 1))))
+       scoped (Enum/reduce (finite! (:introduced-scopes value) 65536) instanced
+                 (fn [record out] (register-scope out record)))
+       declared (Enum/reduce (finite! (:introduced-declarations value) 65536) scoped
+                   (fn [entry out] (bind out (:owner-world entry) (dissoc entry :owner-world :id))))
+       expected (if (:state-key value) (freeze declared)
+                    (assoc declared :introduced-scopes (:introduced-scopes value)
+                                    :introduced-declarations (:introduced-declarations value)))]
+  (when-not (erlang/=:= expected value) (refuse! :binding-invalid-selection {})) value))
+
+(defn- subset? [left right]
+ (every? #(Map/has_key? right %) left))
+
+(defn resolve
+ "Resolve a contextual identifier in a validated world at one phase and source
+  position. Bucketed lookup uses scope containment, never a spelling fallback.
+  Unavailable inner declarations do not silently select an outer binding."
+ [world identifier phase position]
+ (when-not (and (erlang/=:= 1 (:version world)) (contains? #{:binding-world :binding-selection} (:kind world))
+                (syn/identifier? identifier))
+  (refuse! :binding-context {}))
+ (phase! phase)
+ (when-not (and (erlang/is_integer position) (<= 0 position 1073741823))
+  (refuse! :binding-position {}))
+ (let [context (syn/context (:context identifier)) name (:value identifier) space (:space context)
+       selected? (= :binding-selection (:kind world))
+       origin (:world context)
+       local-world (if selected? (selected-world! (:worlds world) origin)
+                       (if (= (:key world) origin) world (refuse! :binding-context {})))
+       _ (check-name! space) _ (owner! (:owners local-world) (:namespace context))
+       ids (scopes! (syn/scopes identifier phase) (:scopes world))
+       scope-set (Map/new (Enum/map ids #(tuple % true)))
+       key (tuple name phase space)
+       applicable? #(and (if (:view %)
+                              (and (= (get-in % [:view :namespace]) (:namespace context))
+                                   (= (get-in % [:view :world] (:key world)) origin))
+                              (or (and (= :local (:visibility %))
+                                       (or (= (Map/get % :owner-world (:key world)) origin)
+                                           (some (fn [id]
+                                                   (= (get-in world [:scopes id :world])
+                                                      (Map/get % :owner-world (:key world)))) (:scopes %))))
+                                  (and (= (Map/get % :owner-world (:key world)) origin)
+                                       (= (:namespace %) (:namespace context)))))
+                           (subset? (if (:view %) (get-in % [:view :scopes]) (:scopes %)) scope-set))
+       lexical (Enum/filter (Map/get (:index world) key (list)) applicable?)
+       ;; A qualified spelling identifies its origin, not an import alias. If
+       ;; no lexical alias applies, all visible routes to ONE declaration are
+       ;; equivalent. Distinct selected revisions remain ambiguous.
+       candidates (if (seq lexical) lexical
+                    (Enum/uniq_by
+                     (Enum/filter (Map/get (:qualified-index world) key (list)) applicable?)
+                     #(tuple (Map/get % :owner-world (:key world)) (:id %))))
+       ;; A greatest candidate must contain every applicable candidate's scopes.
+       ;; Compare the union once instead of comparing all pairs of candidates.
+       union (Enum/uniq (Enum/flat_map candidates (fn [d] (if (:view d) (get-in d [:view :scopes]) (:scopes d)))))
+       union-count (erlang/length union)
+       greatest (Enum/filter candidates #(= (count (if (:view %) (get-in % [:view :scopes]) (:scopes %))) union-count))
+       selected (when (= 1 (count greatest)) (first greatest))
+       status (cond (empty? candidates) :unbound
+                    (nil? selected) :ambiguous
+                    (> (if (:view selected) (get-in selected [:view :available-from]) (:available-from selected)) position) :not-yet-available
+                    :else :resolved)]
+  {:version 1 :status status :phase phase :position position
+   :candidates (Enum/map candidates (fn [d] (:id d)))
+   :declaration (when (= :resolved status) (dissoc (Map/get (:by-id world) (:id selected)) :owner-world))
+   :reference (when (= :resolved status)
+                {:version 1 :kind :binding-reference :world (Map/get selected :owner-world (:key world)) :declaration (:id selected)
+                 :id (reference-id world (:id selected) phase) :phase phase :space space})}))

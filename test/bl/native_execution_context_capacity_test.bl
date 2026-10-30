@@ -1,0 +1,75 @@
+(ns native-execution-context-capacity-test)
+
+(defn- kind [action]
+ (try (action) :unexpected-entry (catch error (:original error))))
+(defn- wait-gone [reference pid]
+ (receive [:DOWN seen :process who _] :when (and (= seen reference) (= who pid)) true
+   (after 10000 false)))
+(defn- wait-private [limit attempts]
+ (cond (<= (ets/info :beam_lisp_source_lease_domains :size) limit) true
+       (<= attempts 0) false
+       :else (do (Process/sleep 5) (wait-private limit (dec attempts)))))
+
+(deftest real-context-pressure-cannot-admit-a-callback-past-the-custody-bound
+ ;; Run alone. Fill through real registrations, not injected custody rows.
+ ;; Kill the pure allocator in cleanup: owner-death reclamation avoids closing
+ ;; thousands of independent epochs by repeatedly scanning for their offers.
+ (let [warm (BeamLisp.Execution/register! (fn [] nil))
+       _ (BeamLisp.Execution/close! warm)
+       before-private (ets/info :beam_lisp_source_lease_domains :size)
+       before-code (ets/info :beam_lisp_code_leases :size)
+       parent (erlang/self) entered (atom false) workers (atom [])
+       callback (fn []
+                  (if (= parent (erlang/self))
+                   (do (reset! entered true) :unexpected-entry)
+                   (do (erlang/send parent (tuple :capacity-entered (erlang/self)))
+                    (receive :finish 42 (after 30000 :barrier-expired)))))
+       module (elem (erlang/fun_info callback :module) 1)
+       allocator (erlang/spawn
+                   (fn []
+                    (loop [n 0 first-registration nil]
+                     (if (>= n 30000) (erlang/send parent (tuple :capacity-missing n))
+                      (let [result (try
+                                    [:ok (BeamLisp.Env/with_ns (str "context.capacity." n)
+                                           #(BeamLisp.Execution/register! callback))]
+                                    (catch error [:refused (:original error)]))]
+                       (if (= :ok (first result))
+                        (recur (inc n) (or first-registration (second result)))
+                        (do (erlang/send parent (tuple :capacity-ready (second result) first-registration n))
+                         (receive :stop nil))))))))
+       monitor (Process/monitor allocator)]
+  (try
+   (let [[reason registration count]
+         (receive [:capacity-ready reason registration count] [reason registration count]
+           [:capacity-missing n] (throw (ex-info "native custody bound not reached" {:count n}))
+           (after 60000 (throw :capacity-allocator-timeout)))
+         free (- 65536 (ets/info :beam_lisp_source_lease_domains :size))]
+    (is (= :execution_context_capacity reason))
+    (is (> count 10000))
+    (is (and (>= free 0) (<= free 3)))
+    (when-not (and (>= free 0) (<= free 3))
+     (throw (ex-info "unexpected custody boundary" {:free free :reason reason})))
+    (doseq [_ (range free)]
+     (let [worker (erlang/spawn
+                    #(erlang/send parent (tuple :capacity-completed (erlang/self)
+                       (BeamLisp.Execution/invoke! registration []))))]
+      (swap! workers conj worker)
+      (is (receive [:capacity-entered who] :when (= who worker) true (after 10000 false)))))
+    (is (= 65536 (ets/info :beam_lisp_source_lease_domains :size)))
+    (let [code-rows (ets/info :beam_lisp_code_leases :size)]
+     (is (= :source_lease_capacity (kind #(BeamLisp.Execution/invoke! registration []))))
+     (is (= false @entered))
+     (is (= code-rows (ets/info :beam_lisp_code_leases :size))))
+    (doseq [worker @workers]
+     (erlang/send worker :finish)
+     (is (receive [:capacity-completed who result] :when (= who worker)
+           (= {:status :completed :value 42} result) (after 10000 false)))))
+   (finally
+    (doseq [worker @workers] (when (Process/alive? worker) (erlang/exit worker :kill)))
+    (when (Process/alive? allocator) (erlang/exit allocator :kill))
+    (is (wait-gone monitor allocator))
+    (is (wait-private before-private 2000))
+    ;; Prune actual dead lease rows without attempting to retire shared SDK code.
+    (BeamLisp.Env/live_physical_code_leases? module)
+    (BeamLisp.Env/live_physical_code_leases? :Elixir.BeamLisp.Execution)
+    (is (= before-code (ets/info :beam_lisp_code_leases :size)))))))

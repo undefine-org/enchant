@@ -1,0 +1,107 @@
+(ns exact-member-lease-test (:require [anf :as a] [lower :as lower]))
+(defn- descriptor [module value]
+ (a/module module (list {:op :defn-clause :fname :run :params (list) :guard nil :body (a/lit value) :ann {}})
+  (list [:run 0]) (list)))
+(defn- beam [module value] (lower/descriptor->beam (descriptor module value) {}))
+(defn- reason [action] (try (action) nil (catch-raw [kind reason frames] reason)))
+(defn- retire [modules] (doseq [module modules] (BeamLisp.Env/retire_module! module)))
+
+(deftest complete-member-borrow-retains-factory-and-class-with-one-owner
+ (let [factory :Elixir.ExactMembersFactory
+       class (BeamLisp.Record/declaration_descriptor "exact.members" "Opaque" :deftype (list "payload"))
+       module (:name class) beams (list (beam factory 42) (lower/descriptor->beam class {}))]
+  (try
+   (let [lease (BeamLisp.Env/retain_exact_binaries! beams "exact-members")]
+    (try
+     (is (BeamLisp.Env/code_lease_active? lease))
+     (is (= 42 (erlang/apply factory :run (list))))
+     (is (not (BeamLisp.Env/retire_module! factory)))
+     (is (not (BeamLisp.Env/retire_module! module)))
+     (is (nil? (BeamLisp.Record/info module)))
+     (finally (BeamLisp.Env/release_code! lease)))
+    (is (not (BeamLisp.Env/code_lease_active? lease))))
+   (is (BeamLisp.Env/retire_module! factory))
+   (is (BeamLisp.Env/retire_module! module))
+   (finally (retire [factory module])))))
+
+(deftest a-later-loaded-conflict-cannot-publish-earlier-fresh-members
+ (let [fresh :Elixir.ExactMembersFresh conflict :Elixir.ExactMembersConflict
+       before (beam conflict 9) changed (beam conflict 10)]
+  (try
+   (BeamLisp.Env/publish_binaries! (list before) "existing-member")
+   (is (= (tuple :compiled_module_identity_conflict conflict)
+          (reason #(BeamLisp.Env/retain_exact_binaries! (list (beam fresh 42) changed) "conflicting-members"))))
+   (is (not (erlang/module_loaded fresh)))
+   (is (= 9 (erlang/apply conflict :run (list))))
+   (finally (retire [fresh conflict])))))
+
+(deftest the-entire-input-shape-and-module-identities-are-checked-before-publication
+ (let [fresh :Elixir.ExactMembersMalformed actual :Elixir.ExactMembersActual
+       first (beam fresh 42) other (beam actual 9)]
+  (try
+   (is (= :invalid_compiled_member_set
+          (reason #(BeamLisp.Env/retain_exact_binaries! (list first (tuple :Elixir.ForgedMember (second other))) "bad-members"))))
+   (is (= :duplicate_code_publication_module
+          (reason #(BeamLisp.Env/retain_exact_binaries! (list first first) "duplicate-members"))))
+   (is (not (erlang/module_loaded fresh)))
+   (is (not (erlang/module_loaded actual)))
+   (finally (retire [fresh actual])))))
+
+(deftest identical-code-with-different-class-schema-refuses-even-after-borrow-release
+ (let [old (BeamLisp.Record/declaration_descriptor "exact.members.schema" "Opaque" :deftype (list "old"))
+       new (BeamLisp.Record/declaration_descriptor "exact.members.schema" "Opaque" :deftype (list "new"))
+       before (lower/descriptor->beam old {}) after (lower/descriptor->beam new {})
+       fresh :Elixir.ExactMembersSchemaFresh module (:name old)]
+  (try
+   (is (= (beam_lib/md5 (second before)) (beam_lib/md5 (second after))))
+   (let [lease (BeamLisp.Env/retain_exact_binary! before "old-class")]
+    (BeamLisp.Env/release_code! lease))
+   (is (= (tuple :compiled_module_identity_conflict module)
+          (reason #(BeamLisp.Env/retain_exact_binaries! (list (beam fresh 42) after) "new-class"))))
+   (is (not (erlang/module_loaded fresh)))
+   (is (nil? (BeamLisp.Record/info module)))
+   (finally (retire [fresh module])))))
+
+(deftest identical-reborrow-keeps-the-single-member-adapter-and-batch-on-one-boundary
+ (let [module :Elixir.ExactMembersReplay bytes (beam module 42)]
+  (try
+   (let [first (BeamLisp.Env/retain_exact_binary! bytes "single-adapter")]
+    (try
+     (let [second (BeamLisp.Env/retain_exact_binaries! (list bytes) "batch-adapter")]
+      (try
+       (is (BeamLisp.Env/code_lease_active? first))
+       (is (BeamLisp.Env/code_lease_active? second))
+       (is (not (erlang/check_old_code module)))
+       (finally (BeamLisp.Env/release_code! second))))
+     (finally (BeamLisp.Env/release_code! first))))
+   (is (BeamLisp.Env/retire_module! module))
+   (finally (retire [module])))))
+
+(deftest unchanged-class-schema-still-requires-identical-persisted-provenance
+ (let [base (BeamLisp.Record/declaration_descriptor "exact.members.provenance" "Opaque" :deftype (list "payload"))
+       stamp (fn [key] (lower/descriptor->beam (update base :attrs #(cons [:bl_compiler_key key] %)) {}))
+       before (stamp "compiler-a") after (stamp "compiler-b") module (:name base)
+       fresh :Elixir.ExactMembersProvenanceFresh]
+  (try
+   (is (= (beam_lib/md5 (second before)) (beam_lib/md5 (second after))))
+   (let [lease (BeamLisp.Env/retain_exact_binary! before "old-provenance")]
+    (try
+     (is (= (tuple :compiled_module_identity_conflict module)
+            (reason #(BeamLisp.Env/retain_exact_binaries! (list (beam fresh 42) after) "new-provenance"))))
+     (is (BeamLisp.Env/code_lease_active? lease))
+     (is (not (erlang/module_loaded fresh)))
+     (finally (BeamLisp.Env/release_code! lease))))
+   (is (= (tuple :compiled_module_identity_conflict module)
+          (reason #(BeamLisp.Env/retain_exact_binary! after "released-provenance"))))
+   (finally (retire [fresh module])))))
+
+(deftest finite-member-input-refuses-before-touching-native-code
+ (doseq [members [(list) [] (list (tuple nil "bad"))
+                  (list (tuple :Elixir.InvalidExactMember "not-beam"))
+                  (list (tuple :Elixir.InvalidExactMember ""))]]
+  (is (= :invalid_compiled_member_set
+         (reason #(BeamLisp.Env/retain_exact_binaries! members "invalid-input")))))
+ (is (= :invalid_compiled_member_set
+        (reason #(BeamLisp.Env/retain_exact_binaries! (list (beam :Elixir.InvalidExactFilename 42)) nil))))
+ (is (not (erlang/module_loaded :Elixir.InvalidExactMember)))
+ (is (not (erlang/module_loaded :Elixir.InvalidExactFilename))))

@@ -115,24 +115,23 @@
        "    \"(get-model)\") printf '(model\\n  (define-fun x () Int 0))\\n' ;;\n"
        "    \"(get-unsat-core)\") printf '(n1)\\n' ;;\n"
        "    \"(get-info :reason-unknown)\") printf '" reason "\\n' ;;\n"
-       "    *bl-ok*) printf '~~bl-ok~~\\n' ;;\n"
+       "    *bl-ok*) printf '%s\\n' \"$line\" | cut -d '\"' -f 2 ;;\n"
        "    *) : ;;\n"
        "  esac\n"
        "done\n"))
 
 (defn- error-script
-  "A solver that refuses every command with an `(error …)` line, then waits — so
-   the error line is read on its own, before any marker could arrive — and then
-   EXITS, so the double never outlives the test's scratch directory (a second
-   iteration would append to a path the test has already removed)."
+  "Reject a command, then acknowledge its actual host-owned marker. Fragment
+   boundaries are exhausted separately; this double implements the full wire."
   []
   (str "log=\"\"\n"
        "case \"$1\" in /*) log=\"$1\" ;; esac\n"
        "while IFS= read -r line; do\n"
        "  if [ -n \"$log\" ]; then printf '%s\\n' \"$line\" >> \"$log\"; fi\n"
-       "  printf '(error \"boom\")\\n'\n"
-       "  sleep 1\n"
-       "  exit 0\n"
+       "  case \"$line\" in\n"
+       "    *bl-ok*) printf '%s\\n' \"$line\" | cut -d '\"' -f 2; exit 0 ;;\n"
+       "    *) printf '(error \"boom\")\\n' ;;\n"
+       "  esac\n"
        "done\n"))
 
 (defn- silent-script
@@ -153,7 +152,9 @@
     (let [rp (run-fn probe-mod fake-p log-p)
           rl (run-fn live fake-l log-l)]
       {:probe rp :live rl
-       :log-probe (File/read! log-p) :log-live (File/read! log-l)})))
+       :wire-probe (File/read! log-p) :wire-live (File/read! log-l)
+       :log-probe (Regex/replace (Regex/compile! "~~bl-ok-[0-9a-f]{32}~~") (File/read! log-p) "~~bl-ok~~")
+       :log-live (Regex/replace (Regex/compile! "~~bl-ok-[0-9a-f]{32}~~") (File/read! log-l) "~~bl-ok~~")})))
 
 ; ── the callable surface ─────────────────────────────────────────────────
 
@@ -239,6 +240,11 @@
       (is (= expected (:probe r)) "the pinned answers are the source's answers")
       ; and the live module must agree, answer for answer
       (is (= (:probe r) (:live r)) "probe and live answer identically")
+      ;; The host owns a fresh marker on each call. Only that field is
+      ;; normalized for the remaining byte-exact wire comparison.
+      (is (= 1 (count (Regex/scan (Regex/compile! "~~bl-ok-[0-9a-f]{32}~~") (:wire-probe r)))))
+      (is (= 1 (count (Regex/scan (Regex/compile! "~~bl-ok-[0-9a-f]{32}~~") (:wire-live r)))))
+      (is (not= (:wire-probe r) (:wire-live r)))
       ; THE WIRE: every byte the driver wrote, sanitizer included
       (is (= (protocol-wire) (:log-probe r)) "the probe writes the pinned bytes")
       (is (= (:log-probe r) (:log-live r)) "probe and live write identical bytes")
@@ -333,11 +339,15 @@
 
 (defn- read-timeout-run
   [mod exe _log]
-  (let [p (open-port! exe (list))]
+  ;; Each timed-out exchange retires its port. Exercise both error surfaces on
+  ;; separate fresh conversations rather than reusing the failed query stream.
+  (let [query-port (open-port! exe (list)) command-port (open-port! exe (list))]
     (try
-      (list (outcome (fn [] (erlang/apply mod :raw_check (list p "(assert true)" false))))
-            (outcome (fn [] (erlang/apply mod :raw_command (list p "(reset)")))))
-      (finally (close! p)))))
+      (list (outcome (fn [] (erlang/apply mod :raw_check (list query-port "(assert true)" false))))
+            (outcome (fn [] (erlang/apply mod :raw_command (list command-port "(reset)"))))
+            (erlang/apply mod :alive? (list query-port))
+            (erlang/apply mod :alive? (list command-port)))
+      (finally (close! query-port) (close! command-port)))))
 
 (deftest a-silent-solver-hits-the-read-deadline
   (testing "an answer that never comes raises in read_answer; a stray byte is read for a max"
@@ -349,7 +359,7 @@
             (is (= (list (list :raise :Elixir.RuntimeError "z3 timeout (acc: \"\")")
                          (list :value {:ok false
                                        :error "timeout waiting for z3 to acknowledge"
-                                       :output ""}))
+                                       :output ""}) false false)
                    (:probe r)))
             (is (= (:probe r) (:live r))))))
       (File/rm_rf! dir))))

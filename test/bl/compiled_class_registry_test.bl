@@ -1,0 +1,65 @@
+(ns compiled-class-registry-test (:require [anf :as a] [lower :as lower]))
+(defn- reason [action] (try (action) nil (catch-raw [kind reason stack] reason)))
+(defn- fresh-beam [module]
+ (lower/descriptor->beam (a/module module
+  (list {:op :defn-clause :fname :run :params (list) :guard nil :body (a/lit 42) :ann {}})
+  (list [:run 0]) (list)) {}))
+(defn- fixture [action]
+ (let [namespace (str "compiled.registry.n" (erlang/unique_integer (list :positive)))
+       old (BeamLisp.Record/declaration_descriptor namespace "Handle" :deftype (list "old"))
+       changed (BeamLisp.Record/declaration_descriptor namespace "Handle" :deftype (list "changed"))
+       module (:name old) bytes (BeamLisp.Emit/compile_descriptor old)]
+  (try
+   (BeamLisp.Record/publish_declaration! old)
+   (BeamLisp.Record/publish_declaration! changed)
+   (action {:module module :bytes bytes :old old :changed changed})
+   (finally (BeamLisp.Env/retire_module! module)))))
+
+(deftest exact-code-and-loaded-schema-do-not-substitute-for-original-registry-truth
+ (fixture
+  (fn [{:keys [module bytes]}]
+   (let [fresh :Elixir.CompiledRegistryFresh]
+    (try
+     (is (= (elem (elem (beam_lib/md5 (second bytes)) 1) 1) (erlang/apply module :module_info (list :md5))))
+     (is (= (list :changed) (BeamLisp.Record/fields_of module)))
+     (is (= (tuple :compiled_class_registry_conflict module)
+            (reason #(BeamLisp.Env/retain_exact_binaries! (list (fresh-beam fresh) bytes) "registry-conflict"))))
+     (is (not (erlang/module_loaded fresh)))
+     (is (= (list :changed) (BeamLisp.Record/fields_of module)))
+     (finally (BeamLisp.Env/retire_module! fresh)))))))
+
+(deftest retired-code-does-not-erase-a-conflicting-registry-entry
+ (fixture
+  (fn [{:keys [module bytes]}]
+   (is (BeamLisp.Env/retire_module! module))
+   (is (not (erlang/module_loaded module)))
+   (is (= (tuple :compiled_class_registry_conflict module)
+          (reason #(BeamLisp.Env/retain_exact_binary! bytes "retired-registry-conflict"))))
+   (is (not (erlang/module_loaded module))))))
+
+(deftest consistent-registry-and-new-unregistered-class-both-borrow-without-initialization
+ (fixture
+  (fn [{:keys [module bytes old]}]
+   (BeamLisp.Record/publish_declaration! old)
+   (let [lease (BeamLisp.Env/retain_exact_binary! bytes "consistent-class")]
+    (try
+     (is (BeamLisp.Env/code_lease_active? lease))
+     (is (= (list :old) (BeamLisp.Record/fields_of module)))
+     (finally (BeamLisp.Env/release_code! lease))))))
+ (let [descriptor (BeamLisp.Record/declaration_descriptor "compiled.registry.new" "Fresh" :deftype (list "payload"))
+       module (:name descriptor) bytes (BeamLisp.Emit/compile_descriptor descriptor)]
+  (try
+   (let [lease (BeamLisp.Env/retain_exact_binary! bytes "unregistered-class")]
+    (try
+     (is (BeamLisp.Env/code_lease_active? lease))
+     (is (nil? (BeamLisp.Record/info module)))
+     (finally (BeamLisp.Env/release_code! lease))))
+   (finally (BeamLisp.Env/retire_module! module)))))
+
+(deftest missing-class-metadata-cannot-reuse-a-registered-class-name
+ (fixture
+  (fn [{:keys [module]}]
+   (BeamLisp.Env/retire_module! module)
+   (is (= (tuple :compiled_class_registry_conflict module)
+          (reason #(BeamLisp.Env/retain_exact_binary! (fresh-beam module) "missing-class-metadata"))))
+   (is (not (erlang/module_loaded module))))))

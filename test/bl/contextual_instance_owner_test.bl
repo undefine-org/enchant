@@ -1,0 +1,188 @@
+(ns contextual-instance-owner-test
+ (:require [expand :as expand] [anf :as a] [lower :as lower]
+           [reload.source-producer :as producer] [reload.generation :as generation]
+           [reload.execution :as execution] [test.support.source-fixtures :as fixtures]))
+(fixtures/unit-instance-observer!)
+(fixtures/instance-guard!)
+
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+(defn- program []
+ (expand/program [{:namespace 'owner.unit :revision 'current :file "owner-unit.bl"
+                   :source "(ns owner.unit) (def token (erlang/unique_integer)) (defn answer [x] (erlang/+ x 40)) token"}]
+                 ['owner.unit 'current]))
+(defn- reference [program name]
+ (:reference (first (filter #(and (= name (get-in % [:declaration :name]))
+                                  (not= :local (get-in % [:declaration :visibility])))
+                            (vals (:references program))))))
+(defn- factory! [module mode]
+ (let [p (program)
+       unit (update (:unit p) :steps #(cons {:op :evaluate :node (a/remote :Elixir.UnitInstanceObserverFixture :before! (list))} %))
+       expression (:expression (producer/specialize-unit unit {:native-modules #{"erlang" "UnitInstanceObserverFixture"}}))
+       expression (case mode
+                    :throw (a/lett "discarded" expression (a/remote :erlang :error (list (a/lit :factory-body-failed))))
+                    :malformed (a/lett "discarded" expression (a/lit {:version 1 :kind :contextual-unit-instance :entry nil :exports {}}))
+                    :privileged
+                    (let [value (a/remote :erlang :make_fun
+                                  (list (a/lit :Elixir.BeamLisp.Env) (a/lit :assert_native_framework_execution!) (a/lit 0)))]
+                     (a/lett "discarded" expression
+                      (a/mapp (list [(a/lit :version) (a/lit 1)] [(a/lit :kind) (a/lit :contextual-unit-instance)]
+                                    [(a/lit :entry) value]
+                                    [(a/lit :exports) (a/mapp (to-list (map (fn [ref] [(a/lit ref) value]) (get-in p [:unit :exports]))))]))))
+                    expression)
+       descriptor (a/module module
+                    (list {:op :defn-clause :fname :__bl_unit__ :params (list) :guard nil
+                           :body expression
+                           :ann {}})
+                    (list [:__bl_unit__ 0]) (list))
+       beam (lower/descriptor->beam descriptor {})]
+  (code/load_binary module '() (elem beam 1)) p))
+(defn- graph [tag module grant?]
+ (generation/prepare!
+  {:application-id (str "instance-owner-" tag)
+   :native-modules (into #{"erlang" "UnitInstanceObserverFixture" "SourceInstanceGuardFixture"}
+                     (if grant? [(String/replace (Atom/to_string module) "Elixir." "")] []))
+   :sources {"owner.shell" (if grant?
+                             (str "(ns owner.shell) (defn answer [] 999) (defn enter-source [action] (action)) (defn __bl_unit__ [] ("
+                                  (String/replace (Atom/to_string module) "Elixir." "") "/__bl_unit__))")
+                             "(ns owner.shell) (defn answer [] 999)")}}))
+(defn- owned-factory [g] (BeamLisp.Emit/module_for (get (:mapping g) "owner.shell")))
+(defn- reopen! [g]
+ ;; Native fixture state injection reopens readiness on an ALREADY genuine
+ ;; SDK preparation. G, the actual native profile and its grants stay exact.
+ ;; This tests the owner before the production input adapter has been joined.
+ (generation/attested-prepared! g)
+ (swap! (BeamLisp.Env/fetch_exact! "reload.execution" "prepared") assoc (:cache-key g)
+        {:phase :prepared :owner (erlang/self) :generation g}))
+(defn- cleanup! [g]
+ ;; Real retirement first. The Source SDK owner forgets its row after cleanup;
+ ;; a paired component may additionally hold the same G in its isolated owner.
+ (generation/retire! g)
+ (execution/forget-preparation! g))
+
+(deftest admitted-factory-initializes-once-and-keeps-exports-private
+ (let [module :Elixir.OwnerFactorySuccess p (factory! module :normal)
+       g (graph "success" module true) key (:cache-key g) answer (reference p 'answer)]
+  (UnitInstanceObserverFixture/reset! nil)
+  (try
+   (reopen! g)
+   (is (= :unready-prepared-generation (reason #(execution/with! g (fn [] :early)))))
+   (execution/prepare-instance! g (owned-factory g) (get-in p [:unit :exports]))
+   (is (= :preparation-owner-changed (reason #(execution/complete-preparation! key g))))
+   (is (= 0 (UnitInstanceObserverFixture/calls)))
+   (is (erlang/== g (execution/initialize-instance! g)))
+   (is (= 1 (UnitInstanceObserverFixture/calls)))
+   (is (erlang/== g (execution/initialize-instance! g)))
+   (is (= 1 (UnitInstanceObserverFixture/calls)))
+   (is (= :unready-prepared-generation (reason #(execution/invoke-instance-entry! g))))
+   (execution/complete-preparation! key g)
+   (let [token (execution/invoke-instance-entry! g)]
+    (is (erlang/is_integer token))
+    (is (= token (execution/invoke-instance-entry! g))))
+   (is (= 42 (execution/invoke-instance-binding! g answer [2])))
+   (is (= :unsealed-entrypoint (reason #(execution/invoke-instance-binding! g "owner.unit/answer" [2]))))
+   (is (= :unsealed-entrypoint (reason #(execution/invoke-instance-binding! g (assoc answer :world (crypto/hash :sha256 "foreign")) [2]))))
+   (is (= 1 (UnitInstanceObserverFixture/calls)))
+   (is (= :unit_factory_already_entered
+          (reason #(generation/with! g (fn [] (BeamLisp.Env/invoke_generation_factory! (owned-factory g)))))))
+   (is (= :unadmitted_unit_factory (reason #(erlang/apply module :__bl_unit__ (list)))))
+   (is (= :unsealed-entrypoint (reason #(generation/invoke! g "owner.shell/__bl_unit__" []))))
+   (is (= 1 (UnitInstanceObserverFixture/calls)))
+   (is (not (contains? g :instance)))
+   (is (not (contains? @(:state g) :instance)))
+   (finally (cleanup! g) (UnitInstanceObserverFixture/clear!)))))
+
+(deftest exported-sdk-functions-run-as-source-and-never-as-framework
+ (let [module :Elixir.OwnerFactoryPrivileged p (factory! module :privileged)
+       g (graph "privileged-export" module true)]
+  (UnitInstanceObserverFixture/reset! nil)
+  (try
+   (reopen! g)
+   (execution/prepare-instance! g (owned-factory g) (get-in p [:unit :exports]))
+   (execution/initialize-instance! g)
+   (execution/complete-preparation! (:cache-key g) g)
+   (is (= :source_native_target_refused (reason #(execution/invoke-instance-entry! g))))
+   (is (= :source_native_target_refused
+          (reason #(execution/invoke-instance-binding! g (reference p 'answer) []))))
+   (is (= 1 (UnitInstanceObserverFixture/calls)))
+   (finally (cleanup! g) (UnitInstanceObserverFixture/clear!)))))
+
+(deftest failed-or-malformed-initialization-cannot-be-retried-or-abandoned
+ (doseq [[tag module mode expected]
+         [["failed" :Elixir.OwnerFactoryFailed :throw :factory-body-failed]
+          ["malformed" :Elixir.OwnerFactoryMalformed :malformed :invalid-unit-instance]
+          ["exports" :Elixir.OwnerFactoryExports :normal :invalid-unit-instance]]]
+  (let [p (factory! module mode) g (graph tag module true) key (:cache-key g)]
+   (UnitInstanceObserverFixture/reset! nil)
+   (try
+    (reopen! g)
+    (execution/prepare-instance! g (owned-factory g) (if (= tag "exports") (list) (get-in p [:unit :exports])))
+    (is (= expected (reason #(execution/initialize-instance! g))))
+    (is (= 1 (UnitInstanceObserverFixture/calls)))
+    (is (= :instance-initialization-failed (reason #(execution/initialize-instance! g))))
+    (execution/abandon-preparation! key)
+    (is (erlang/== g (execution/attested-prepared! g true)))
+    (is (= :instance-initialization-failed (reason #(execution/cached-preparation key))))
+    (is (= :preparation-owner-changed (reason #(execution/complete-preparation! key g))))
+    (is (= :unready-prepared-generation (reason #(execution/with! g (fn [] :early)))))
+    (is (= 1 (UnitInstanceObserverFixture/calls)))
+    (finally (cleanup! g) (UnitInstanceObserverFixture/clear!))))))
+
+(deftest actual-native-grant-is-required-before-any-factory-body
+ (let [module :Elixir.OwnerFactoryUngranted p (factory! module :normal)
+       g (graph "ungranted" module false)]
+  (UnitInstanceObserverFixture/reset! nil)
+  (try
+   (reopen! g)
+   (execution/prepare-instance! g module (get-in p [:unit :exports]))
+   (is (= :unadmitted_unit_factory (reason #(execution/initialize-instance! g))))
+   (is (= 0 (UnitInstanceObserverFixture/calls)))
+   (is (= :instance-initialization-failed (reason #(execution/initialize-instance! g))))
+   (is (= 0 (UnitInstanceObserverFixture/calls)))
+   (finally (cleanup! g) (UnitInstanceObserverFixture/clear!)))))
+
+(deftest competing-initialization-refuses-before-entry-and-user-code-holds-no-module-lock
+ (doseq [[mode module] [[:normal :Elixir.OwnerFactoryConcurrent] [:closing :Elixir.OwnerFactoryClosing]]]
+ (let [p (factory! module :normal) parent (erlang/self)]
+  (UnitInstanceObserverFixture/reset! parent)
+  (let [worker (erlang/spawn
+                (fn []
+                 (let [g (graph (str "concurrent-" mode) module true)]
+                  (try
+                   (reopen! g) (execution/prepare-instance! g (owned-factory g) (get-in p [:unit :exports]))
+                   (erlang/send parent (tuple :preparing-graph g))
+                   (execution/initialize-instance! g)
+                   (let [completed (reason #(execution/complete-preparation! (:cache-key g) g))]
+                    (erlang/send parent (tuple :instance-ready
+                      (if (= mode :normal)
+                       (execution/invoke-instance-binding! g (reference p 'answer) [2]) completed))))
+                   (finally (cleanup! g))))))
+        watch (Process/monitor worker)]
+   (try
+    (let [g (receive [:preparing-graph g] g (after 15000 (throw :fixture-timeout)))
+          frame (receive [:factory-entered seen frame] :when (= seen worker) frame
+                  (after 15000 (throw :fixture-timeout)))]
+     (is (= :active (:status frame)))
+     (is (= :preparation-in-progress (reason #(execution/cached-preparation (:cache-key g)))))
+     (is (= :preparation-owner-changed (reason #(execution/initialize-instance! g))))
+     (is (= 1 (UnitInstanceObserverFixture/calls)))
+     (is (= :unlocked (BeamLisp.Env/with_module_locks (to-list (:modules g)) (fn [] :unlocked))))
+     (when (= mode :closing)
+      (is (= false (BeamLisp.Env/retire_module! (owned-factory g)))))
+     (erlang/send worker :finish-factory)
+     (is (= (if (= mode :normal) 42 :execution_graph_closed)
+            (receive [:instance-ready result] result (after 15000 :timeout))))
+     (is (= :normal (receive [:DOWN seen :process pid result] :when (and (= seen watch) (= pid worker)) result
+                     (after 15000 :timeout))))
+     (is (= 1 (UnitInstanceObserverFixture/calls))))
+    (finally
+     (when (Process/alive? worker)
+      (erlang/send worker :finish-factory)
+      (receive [:DOWN seen :process pid _] :when (and (= seen watch) (= pid worker)) :down
+       (after 15000
+        (erlang/exit worker :kill)
+        (receive [:DOWN seen :process pid _] :when (and (= seen watch) (= pid worker)) :down
+         (after 5000 (throw :fixture-worker-did-not-stop))))))
+     (Process/demonitor watch (list :flush))
+     (UnitInstanceObserverFixture/clear!)))))))

@@ -1,0 +1,64 @@
+(ns contextual-sdk-phase-value-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [lower :as lower]))
+
+(defn- selection [] {:sdk 'system.execution :revision 'selected :only ['VERSION]})
+(defn- client []
+ {:namespace 'value.client :revision 'current :file "value-client.bl"
+  :source (str "(ns value.client) (import-world 'system.execution 'selected :as schema :only [VERSION]) "
+               "(begin-for-syntax (import-world 'system.execution 'selected :only [VERSION])) "
+               "(defsyntax answer [form ctx] (syntax-literal (erlang/+ VERSION 41))) "
+               "[schema/VERSION (answer)]")})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.SDKPhaseValue" (erlang/unique_integer (list :positive))))
+                 (:node program)))
+(defn- refused? [action] (try (action) false (catch _ true)))
+
+(deftest literal-sdk-input-is-passive-artifact-data-with-canonical-phase-instances
+ (let [before (BeamLisp.Env/lookup (tuple "system.execution" "VERSION"))
+       captured (sdk/capture (selection)) binding (first (:bindings captured))
+       program (expand/program [(:source captured) (client)] ['value.client 'current])]
+  (is (= :value (:kind binding)))
+  (is (= 1 (:value binding)))
+  (is (= before (BeamLisp.Env/lookup (tuple "system.execution" "VERSION"))))
+  (is (= captured (sdk/check! captured)))
+  (is (= [1 42] (execute program)))
+  (is (= 1 (count (:expansions program))))
+  (is (refused? #(sdk/check! (assoc-in captured [:bindings 0 :value] 2))))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))
+        archived (expand/program [(client)] ['value.client 'current] [library])]
+   (is (= [1 42] (execute archived)))
+   (is (every? #(not (contains? % :source)) (:units library))))))
+
+(deftest literal-only-sdk-selection-needs-no-provider-initializer
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-phase-value-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") (:source (client)))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['value.client 'current] :sources [{:namespace 'value.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'system.execution :revision 'selected :only ['VERSION]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (BeamLisp.AOT/compile_unit (world/prepare-unit prepared :Elixir.SDKLiteralOnlyUnit))]
+    (is (= [] (BeamLisp.AOT/contextual_sdk_namespaces! unit)))
+    (is (= [1 42] (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest nonliteral-sdk-values-never-run-through-the-adapter
+ ;; The atom initializer is deliberately effectful; a public declaration does
+ ;; not turn its native resource into portable compiler data.
+ (is (= :sdk_value_binding_not_literal
+        (try (sdk/capture {:sdk 'reload.runtime :revision 'selected :only ['live-generations]}) :unexpected-success
+         (catch error (BeamLisp.ExInfo/ex_original error)))))
+ (is (refused? #(sdk/capture {:sdk 'reload.execution :revision 'selected :only ['prepared]})))
+ (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "when"))))
+
+(deftest literal-projection-ignores-mutable-child-var-values
+ (let [expected (BeamLisp.AOT/sdk_binding! "system.execution" "VERSION")
+       scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/intern "system.execution" "VERSION" 999)
+     (is (= (tuple :ok 999) (BeamLisp.Env/lookup (tuple "system.execution" "VERSION"))))
+     (is (= expected (BeamLisp.AOT/sdk_binding! "system.execution" "VERSION")))))
+   (finally (BeamLisp.Env/destroy scope)))))

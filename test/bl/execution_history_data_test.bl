@@ -1,0 +1,68 @@
+(ns execution.history-data-test
+ (:require [diagnostics :as diag] [proc.queue :as queue] [datom :as datom]))
+
+(deftest E27-expired-attempt-emits-the-public-lost-settlement
+ (let [seen (atom []) now (atom 1000) server :history-lost-settlement
+       decl (queue/normalise-decl {:of :history/work :lease 1 :retry {:max 1}})]
+  (queue/register-perform! server (fn [_] :completed))
+  (let [state (queue/init-state server decl (fn [] @now))
+        job (queue/enqueue! server {:history/value 42} {:at 1000})]
+   (diag/with-options {:min-level :info :sink #(swap! seen conj %)}
+    (let [running (queue/run-due state)]
+     (receive [:bl-queue/finished ref outcome]
+      (do
+       ;; Advance only the injected logical clock, after real worker completion.
+       ;; Settlement must refuse the expired claim without losing its event.
+       (reset! now (inc (get-in running [:queue :running ref :lease-until])))
+       (is (= {} (get-in (queue/settle running ref outcome) [:queue :running]))))
+      (after 5000 (throw :history-queue-worker-did-not-complete)))))
+   (let [settled (filterv #(= :proc.queue/settled (:diagnostics/event %)) @seen)]
+    (is (= 1 (count settled)))
+    (is (= :lost (:proc.queue/settlement (first settled))))
+    (is (= :returned (:proc.queue/outcome (first settled))))
+    (is (nil? (:job/result (datom/entity (datom/db (queue/conn server)) (:db/id job)))))))))
+
+(defn- install-settlement [source namespace]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "priv/std/proc/queue.bl")
+               #(and (= "defn" (BeamLisp.AOT/stage-head %))
+                     (= "settle" (BeamLisp.AOT/stage-symbol
+                                   (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 1 (count forms)) (throw :history-settlement-form-changed))
+  ;; Deterministic component boundaries supply the private storage outcome and
+  ;; forward the actual producer's event into the real diagnostics schema.
+  (BeamLisp.Compiler/eval_string
+   (str "(ns " namespace " (:require [diagnostics :as diag])) "
+        "(defn settle! [_ _ _] :expired-or-lost) "
+        "(defn emit-entry! [_ event fields] (diag/emit! event fields))"))
+  (BeamLisp.Compiler/eval_form (first forms) (BeamLisp.Compiler/new_env namespace))
+  (BeamLisp.Env/fetch_exact! namespace "settle")))
+
+(defn- observe-settlement [action]
+ (let [events (atom []) state {:queue {:running {:attempt {:attempts 1}}}}
+       observed (diag/with-options {:min-level :info :sink #(swap! events conj %)}
+                  (let [result (action state :attempt {:ok 42})]
+                   {:state result :losses (diag/loss-count) :health (diag/health)}))]
+  (assoc observed :events @events)))
+
+(deftest E27-real-event-producer-detects-unnormalized-settlement-mutation
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "std/proc/queue.bl"))
+       before "(if (= :expired-or-lost settlement) :lost settlement)"
+       after "settlement" scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-settlement-anchor-changed))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [mutated (String/replace source before after)
+           normal (observe-settlement (install-settlement source "history.settlement.good"))
+           mutant (observe-settlement (install-settlement mutated "history.settlement.mutant"))]
+      (println :history-E27 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                            :mutant-sha256 (Base/encode16 (crypto/hash :sha256 mutated))})
+      (is (= {:queue {:running {}}} (:state normal) (:state mutant)))
+      (is (= 1 (count (:events normal)) (count (:events mutant))))
+      (is (= :lost (:proc.queue/settlement (first (:events normal)))))
+      (is (= 0 (:losses normal)))
+      (is (nil? (:proc.queue/settlement (first (:events mutant)))))
+      (is (= 1 (get-in mutant [:health :invalid-field])))
+      (is (= 1 (get-in mutant [:health :invalid-fields :proc.queue/settlement]))))))
+   (finally (BeamLisp.Env/destroy scope)))))

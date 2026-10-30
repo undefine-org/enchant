@@ -27,7 +27,7 @@
 ;   clause {:pats [pat…] :guard n|nil :body n} · pattern {:pop …}
 ; Getting these wrong silently walks nothing, so they live in ONE place.
 
-(ns system.ir)
+(ns system.ir (:require [anf :as anf]))
 
 ; ── opaque top ────────────────────────────────────────────────────────────
 ;
@@ -40,14 +40,20 @@
 
 (defn node? [n] (and (map? n) (contains? n :op)))
 
+(defn program-clauses
+  "All clauses of a prepared program function, with the legacy single-body
+   entry accepted at this shared data boundary."
+  [d]
+  (if (seq (:clauses d)) (:clauses d) [{:params (:params d) :body (:body d)}]))
+
 (defn global-key
   "Semantic identity for a global analysis edge or resource. Exact members
    carry a tagged namespace/name pair; lexical program names retain their
    existing spelling. No qualified member can borrow a bare-name proof."
   [node]
-  (when (= :global (:op node))
-    (if (= :exact (:lookup node)) [:qualified-global (:ns node) (:name node)]
-      (:name node))))
+  (cond (= :binding (:op node)) [:phase-binding (:reference node)]
+        (= :global (:op node))
+          (if (= :exact (:lookup node)) [:qualified-global (:ns node) (:name node)] (:name node))))
 
 ; ── the canonical numeric op ─────────────────────────────────────────────
 ;
@@ -73,71 +79,27 @@
 (defn op [n] (:op n))
 
 (defn child-nodes
-  "The immediate executable child NODES of `n`, in evaluation order, flat.
-   Clause bodies/guards are included; patterns are NOT nodes (they bind, they
-   do not evaluate). nil children (an absent :else already defaults to a nil
-   literal in real ANF, but :try/:recv :after may be nil) are dropped. This is
-   the op-agnostic spine every generic traversal folds over."
-  [n]
-  (let [o (:op n)]
-    (cond
-      (contains? #{:lit :var :global :enil} o) (list)
-      (= o :js) (:args n)
-      (= o :arith)  (:args n)
-      (= o :remote) (:args n)
-      (= o :apply)  (cons (:fn n) (:args n))
-      (= o :let)    (list (:init n) (:body n))
-      (= o :if)     (list (:test n) (:then n) (:else n))
-      (= o :do)     (:stmts n)
-      (= o :case)   (cons (:subj n) (clause-children (:clauses n)))
-      (= o :fn)     (clause-children (:clauses n))
-      (= o :try)    (finite-concat (list (:body n)) (clause-children (:catch n))
-                                   (if (nil? (:after n)) (list) (list (:after n))))
-      (= o :recv)   (finite-concat (clause-children (:clauses n))
-                                   (if (nil? (:timeout n)) (list) (list (:timeout n)))
-                                   (if (nil? (:after n)) (list) (list (:after n))))
-      (= o :tuple)  (:elems n)
-      (= o :map)    (pair-children (:pairs n))
-      (= o :cons)   (list (:head n) (:tail n))
-      (= o :struct) (pair-children (:fields n))
-      :else (list))))
+  "Shared eager executable-child traversal. The ANF grammar owns operand
+   shapes; unknown operations refuse instead of silently hiding effects."
+  [node] (anf/executable-children node))
 
 (defn- finite-concat [& xs] (apply concat xs))
-
-(defn- clause-children
-  "The guard (when present) and body node of every clause, flat."
-  [clauses]
-  (reduce (fn [acc cl]
-            (finite-concat acc
-                           (if (nil? (:guard cl)) (list) (list (:guard cl)))
-                           (list (:body cl))))
-          (list) clauses))
-
-(defn- pair-children
-  "Both node halves of every [k v] pair, flat."
-  [pairs]
-  (reduce (fn [acc pair] (finite-concat acc (list (first pair) (second pair)))) (list) pairs))
 
 ; ── pattern variables (for scope shadowing) ───────────────────────────────
 
 (defn pattern-vars
   "Every :pvar name bound by pattern `p`, recursively. A clause binding these
    introduces COMPUTED locals: any alias of the same name must be shadowed."
-  [p]
-  (let [o (:pop p)]
-    (cond
-      (= o :pvar)    (list (:name p))
-      (= o :ptuple)  (mapcat pattern-vars (:elems p))
-      (= o :pcons)   (finite-concat (pattern-vars (:head p)) (pattern-vars (:tail p)))
-      (= o :palias)  (finite-concat (pattern-vars (:a p)) (pattern-vars (:b p)))
-      (= o :pmap)    (mapcat (fn [pair] (pattern-vars (second pair))) (:pairs p))
-      (= o :pstruct) (mapcat (fn [pair] (pattern-vars (second pair))) (:fields p))
-      :else (list))))
+  [p] (anf/pattern-vars p))
 
 (defn clause-pattern-vars
   "Every var bound across all of a clause's :pats."
   [cl]
   (mapcat pattern-vars (:pats cl)))
+
+(defn pattern-expressions
+  "Executable pattern operands from the canonical grammar, excluding binders."
+  [pattern] (anf/pattern-expressions pattern))
 
 ; ── alias environment ──────────────────────────────────────────────────────
 ;
@@ -154,7 +116,7 @@
   [aliases a0]
   (cond
     (nil? a0) opaque-world
-    (= :global (:op a0)) (global-key a0)
+    (contains? #{:global :binding} (:op a0)) (global-key a0)
     (= :var (:op a0)) (get aliases (:name a0) opaque-world)
     :else opaque-world))
 
@@ -164,7 +126,7 @@
    init is a COMPUTED value (the local is then not a nameable resource)."
   [aliases init]
   (cond
-    (= :global (:op init)) (global-key init)
+    (contains? #{:global :binding} (:op init)) (global-key init)
     (= :var (:op init))    (get aliases (:name init))
     :else nil))
 
@@ -205,9 +167,12 @@
    copy of INNER — the shape system.linear now forbids.)"
   [n]
   (and (map? n) (= :let (:op n)) (self-fn? (:init n))
-       (let [b (:body n)]
-         (and (map? b) (= :apply (:op b)) (map? (:fn b)) (= :var (:op (:fn b)))
-              (= (:name n) (:name (:fn b)))))))
+       (let [b (:body n) cl (first (:clauses (:init n))) p (first (:pats cl))]
+         (and (nil? (:guard cl)) (= :pvar (:pop p)) (= (:name n) (:name p))
+              (= :fn (:op (:body cl)))
+              (map? b) (= :apply (:op b)) (map? (:fn b)) (= :var (:op (:fn b)))
+              (= (:name n) (:name (:fn b))) (= 1 (count (:args b)))
+              (= :var (:op (first (:args b)))) (= (:name n) (:name (first (:args b))))))))
 
 (defn scaffold-inner
   "The INNER fn of a self scaffold (the compiled fn/loop body-fn)."
@@ -278,7 +243,7 @@
 
 (def inv-mod :Elixir.BeamLisp.Ns.Rt)
 
-(defn- knot?
+(defn knot?
   "(apply (var s) [(var s)]) — the self scaffold's own knot, `(self self)`:
    structurally the same local applied to itself, the fn/loop re-entry point.
    A genuine callable-ABI `(f f)` is an :invoke, never this; only a
@@ -286,7 +251,7 @@
    bare self-application — so this reading stays sound over compiler output."
   [n]
   (let [f (:fn n) args (:args n)]
-    (and (map? f) (= :var (:op f))
+    (and (= :apply (:op n)) (map? f) (= :var (:op f))
          (= 1 (count args))
          (let [a (first args)] (and (map? a) (= :var (:op a)) (= (:name f) (:name a)))))))
 
@@ -323,21 +288,21 @@
    nil when `n` is not a call — including the compiled loop scaffold, its recur
    back-edge and the self scaffold's knot, which are :apply terms but CONTROL."
   [n]
-  (cond
+  (let [invocation (anf/callable-invocation n)]
+   (cond
     (not (node? n)) nil
-    (and (= :remote (:op n)) (= (:mod n) inv-mod) (= (:fun n) :invoke))
-      (let [a (:args n)
-            as (cons-args (second a))
-            tail (cons-tail (second a))]
+    invocation
+      (let [as (cons-args (:arguments invocation))
+            tail (cons-tail (:arguments invocation))]
         ; When the chain does not end in `:enil` the argument LIST is computed
         ; (`(RT/invoke f (apply list xs))`, as macro expansion does). Then
         ; `:rest` is that tail node and `:args` carries it last too, so every
         ; walk that evaluates `(cons callee args)` still sees all of it; the
         ; arity is unknown (nil) — never the count of what happened to be literal.
         (if (nil? tail)
-          {:mode :invoke :callee (first a) :args as
+          {:mode :invoke :callee (:callee invocation) :args as
            :mod nil :fun nil :arity (count as)}
-          {:mode :invoke :callee (first a) :args (conj as tail) :heads as :rest tail
+          {:mode :invoke :callee (:callee invocation) :args (conj as tail) :heads as :rest tail
            :mod nil :fun nil :arity nil}))
     (= :remote (:op n))
       (let [as (vec (:args n))]
@@ -349,7 +314,7 @@
         (let [as (vec (:args n))]
           {:mode :apply :callee (:fn n) :args as
            :mod nil :fun nil :arity (count as)}))
-    :else nil))
+    :else nil)))
 
 ; ── annotate: write a proof onto the IR ────────────────────────────────────
 
@@ -378,8 +343,11 @@
 (defn- rewrite-child [f x]
   (cond
     (node? x) (rewrite f x)
+    (and (map? x) (contains? x :pop))
+      (anf/map-pattern-expressions (fn [key] (rewrite f key)) x)
     (and (map? x) (contains? x :body) (contains? x :pats))
-      (assoc x :guard (rewrite f (:guard x)) :body (rewrite f (:body x)))
+      (assoc x :pats (rewrite-child f (:pats x))
+               :guard (rewrite f (:guard x)) :body (rewrite f (:body x)))
     (list? x) (eager (map (fn [y] (rewrite-child f y)) x))
     (vector? x) (into [] (map (fn [y] (rewrite-child f y)) x))
     :else x))
@@ -389,34 +357,75 @@
   [f k n]
   (rewrite (fn [node] (ann-put node k (f node))) n))
 
+(defn- literal-count? [node]
+ (and (= :lit (:op node)) (erlang/is_integer (:val node)) (>= (:val node) 0)))
+
+(defn- dispatch-layout [node]
+ (when (and (= :tuple (:op node)) (= 3 (count (:elems node))))
+  (let [[head fixed variadic] (:elems node) pairs (:pairs fixed)]
+   (when (and (= :lit (:op head)) (erlang/=:= :"$blfn" (:val head))
+               (= :map (:op fixed)) (erlang/is_list pairs)
+               (every? (fn [pair] (and (or (erlang/is_list pair) (vector? pair))
+                                      (= 2 (count pair)) (literal-count? (first pair)))) pairs)
+               (or (and (= :lit (:op variadic)) (nil? (:val variadic)))
+                   (and (= :tuple (:op variadic)) (= 2 (count (:elems variadic)))
+                        (literal-count? (first (:elems variadic))))))
+    (let [keys (mapv (fn [pair] (:val (first pair))) pairs)]
+     (when (= keys (vec (distinct keys)))
+      {:fixed pairs :variadic (when (= :tuple (:op variadic))
+                               {:minimum (:val (first (:elems variadic)))
+                                :function (second (:elems variadic))})}))))))
+
 (defn blfn-value?
-  "The compiler's single multi-arity/variadic callable-value encoding."
-  [node]
-  (and (= :tuple (:op node))
-       (let [head (first (:elems node))]
-         (and (= :lit (:op head)) (= "$blfn" (str (:val head)))))))
+ "Recognize the exact tagged dispatch container, not a printed tag spelling.
+  function-shape separately checks that each slot has its required native arity."
+ [node] (some? (dispatch-layout node)))
+
+(defn- native-function-shape [node remaining]
+ (when (> remaining 0)
+  (cond
+   (= :fn (:op node))
+    (when (and (erlang/is_list (:clauses node))
+                (every? (fn [cl] (erlang/is_list (:pats cl))) (:clauses node)))
+     (let [arities (set (map (fn [cl] (count (:pats cl))) (:clauses node)))]
+      (when (= 1 (count arities)) {:arities arities})))
+   (self-scaffold? node) (native-function-shape (scaffold-inner node) (dec remaining))
+   (= :let (:op node)) (native-function-shape (:body node) (dec remaining))
+   (= :do (:op node)) (native-function-shape (last (:stmts node)) (dec remaining))
+   :else nil)))
+
+(defn- function-shape-bounded [node remaining]
+ (when (> remaining 0)
+   (cond
+    (= :fn (:op node)) (native-function-shape node remaining)
+    (self-scaffold? node) (native-function-shape (scaffold-inner node) (dec remaining))
+    (= :tuple (:op node))
+     (when-let [layout (dispatch-layout node)]
+      (let [fixed (:fixed layout) variadic (:variadic layout)
+           valid? (fn [value arity]
+                    (= {:arities #{arity}} (native-function-shape value (dec remaining))))]
+      (when (and (every? (fn [pair] (valid? (second pair) (:val (first pair)))) fixed)
+                  (or (nil? variadic) (valid? (:function variadic) (inc (:minimum variadic)))))
+       (cond-> {:arities (set (map (fn [pair] (:val (first pair))) fixed))}
+        (some? variadic) (assoc :variadic-min (:minimum variadic))))))
+    (= :let (:op node)) (function-shape-bounded (:body node) (dec remaining))
+    (= :do (:op node)) (function-shape-bounded (last (:stmts node)) (dec remaining))
+    :else nil)))
 
 (defn function-shape
   "Static callable arities over canonical ANF. Nil means unknown, never zero
    arities. Binding a closure does not execute its initialization. Both actor and
-   native linking use this contract instead of re-reading source signatures."
+   native linking use this contract instead of re-reading source signatures.
+   Malformed dispatch, inconsistent native clauses or more than 256 wrappers
+   return unknown. Counts prove arity only, not purity or successful matching."
   [node]
-  (cond
-    (= :fn (:op node)) {:arities (set (map (fn [cl] (count (:pats cl))) (:clauses node)))}
-    (self-scaffold? node) (function-shape (scaffold-inner node))
-    (blfn-value? node)
-      (let [[_ fixed variadic] (:elems node)]
-        (merge {:arities (set (map (fn [pair] (:val (first pair))) (:pairs fixed)))}
-               (when (= :tuple (:op variadic))
-                 {:variadic-min (:val (first (:elems variadic)))})))
-    (= :let (:op node)) (function-shape (:body node))
-    (= :do (:op node)) (function-shape (last (:stmts node)))
-    :else nil))
+  (function-shape-bounded node 256))
 
 (defn accepts-arity?
   "Whether a known callable contract accepts n arguments. Unknown shapes fail
    closed; fixed and variadic entrypoints share this decision at every linker."
   [shape n]
-  (and (some? shape)
+  (and (erlang/is_integer n) (>= n 0) (some? shape)
        (or (contains? (:arities shape) n)
-           (and (some? (:variadic-min shape)) (>= n (:variadic-min shape))))))
+           (and (erlang/is_integer (:variadic-min shape)) (>= (:variadic-min shape) 0)
+                (>= n (:variadic-min shape))))))

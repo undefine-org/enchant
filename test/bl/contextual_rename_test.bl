@@ -1,0 +1,94 @@
+(ns contextual-rename-test
+ (:require [expand :as x] [codebase.refactor :as r] [lower :as lower] [codebase.phase :as code]))
+
+(defn- unit [namespace revision source]
+ {:namespace namespace :revision revision :source source :file (str namespace ".bl")})
+(defn- id [program name visibility]
+ (:id (Enum/find (Map/values (get-in program [:selection :by-id]))
+         #(and (= name (:name %)) (= visibility (:visibility %))))))
+(defn- refused [f] (try (f) nil (catch e (:kind (ex-data e)))))
+
+(deftest local-rename-preserves-unicode-comments-quotes-and-shadowed-bindings
+ (let [sources [(unit 'client 'current
+                  "(ns client) ; λ stays\n(let [α 40] [α (let [α 2] α) 'α])")]
+       program (x/program sources ['client 'current])
+       target (get-in (first (:occurrences program)) [:reference :declaration])
+       result (r/rename-program sources ['client 'current] target 'answer)
+       text (:source (first (:sources result)))
+       value (lower/eval-anf :Elixir.ContextualRenamedLocal (get-in result [:program :node]))]
+  (is (= "(ns client) ; λ stays\n(let [answer 40] [answer (let [α 2] α) 'α])" text))
+  (is (= [40 2 'α] value))
+  (is (= 2 (count (:edits result))))
+  (is (= :verified (:status result)))
+  (is (= (:snapshot (code/facts (:program result))) (:after-snapshot result)))
+  (is (not= (:before-snapshot result) (:after-snapshot result)))))
+
+(deftest capture-is-rejected-by-recompiling-the-whole-entry
+ (let [sources [(unit 'client 'current "(ns client) (let [x 40 y 2] (erlang/+ x y))")]
+       program (x/program sources ['client 'current]) target (id program 'x :local)]
+  (is (= :rename-changed-bindings
+         (refused #(r/rename-program sources ['client 'current] target 'y))))
+  (is (= :rename-quoted-symbol
+         (refused #(r/rename-program sources ['client 'current] target "renamed"))))))
+
+(deftest global-function-rename-includes-imports-aliases-and-its-recursive-self
+ (let [sources [(unit 'library 'old
+                  "(ns library) (defn answer [n] (if (erlang/== n 0) 42 (answer (erlang/- n 1))))")
+                (unit 'client 'current
+                  "(ns client) (import-world 'library 'old :as a :only [answer]) (a/answer 2)")]
+       program (x/program sources ['client 'current]) target (id program 'answer :public)
+       result (r/rename-program sources ['client 'current] target 'result)
+       provider (:source (first (:sources result))) consumer (:source (second (:sources result)))]
+  (is (= "(ns library) (defn result [n] (if (erlang/== n 0) 42 (result (erlang/- n 1))))" provider))
+  (is (= "(ns client) (import-world 'library 'old :as a :only [result]) (a/result 2)" consumer))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualRenamedGlobal (get-in result [:program :node]))))
+  (is (= 4 (count (:edits result))))))
+
+(deftest archived-source-refuses-and-prepared-runtime-exports-remain-editable
+ (let [provider (unit 'library 'old "(ns library) (defn answer [] 42)")
+       client (unit 'client 'current "(ns client) (import-world 'library 'old :only [answer]) (answer)")
+       archive (x/phase-library [provider]) program (x/program [client] ['client 'current] [archive])
+       target (id program 'answer :public)]
+  (is (= :rename-source-unavailable
+         (refused #(r/rename-program [client] ['client 'current] [archive] target 'result)))))
+ (let [sources [(unit 'client 'current "(ns client) (defn used [] 42) (defn unused [] (used)) (used)")]
+       program (x/program sources ['client 'current]) target (id program 'used :public)]
+  ;; Unit preparation now includes unused runtime exports and their bodies.
+  ;; The old unexpanded-definition premise no longer holds for this source.
+  (is (= :verified (:status (r/rename-program sources ['client 'current] target 'result))))))
+
+(deftest hygienic-generated-bindings-cannot-be-edited-as-user-source
+ (let [sources [(unit 'client 'current
+                  (str "(ns client) (defsyntax generated [form ctx] "
+                    "(syntax-template (let [tmp 42] tmp) {})) (generated)"))]
+       program (x/program sources ['client 'current]) target (id program 'tmp :local)]
+  (is (= :rename-generated-binding
+         (refused #(r/rename-program sources ['client 'current] target 'result))))))
+
+(deftest two-revisions-sharing-a-file-label-retain-separate-imports-and-bindings
+ (let [sources [(unit 'library 'old "(ns library) (defn answer [] 40)")
+                (unit 'library 'new "(ns library) (defn answer [] 2)")
+                (unit 'client 'current
+                  (str "(ns client) (import-world 'library 'old :as old :only [answer]) "
+                       "(import-world 'library 'new :as new :only [answer]) (erlang/+ (old/answer) (new/answer))"))]
+       program (x/program sources ['client 'current])
+       target (get-in (first (Enum/filter (:occurrences program) #(= 'old/answer (:name %))))
+                     [:reference :declaration])
+       result (r/rename-program sources ['client 'current] target 'result)]
+  (is (= "(ns library) (defn result [] 40)" (:source (first (:sources result)))))
+  (is (= (:source (second sources)) (:source (second (:sources result)))))
+  (is (String/contains? (:source (nth (:sources result) 2)) "[answer]) (erlang/+ (old/result) (new/answer))"))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualRenamedRevisions (get-in result [:program :node]))))))
+
+(deftest user-binder-holes-remain-editable-through-a-hygienic-vector-dsl
+ (let [sources [(unit 'client 'current
+                  (str "(ns client) (defsyntax bind [form context] "
+                       "(syntax-template (let [tmp initial user tmp] body) "
+                       "{'initial (syntax-arg (syntax-arg form 1) 1) "
+                       "'user (syntax-arg (syntax-arg form 1) 0) 'body (syntax-arg form 2)})) "
+                       "(let [tmp 2] (bind [answer 40] (erlang/+ answer tmp)))"))]
+       program (x/program sources ['client 'current]) target (id program 'answer :local)
+       result (r/rename-program sources ['client 'current] target 'result)]
+  (is (= 2 (count (:edits result))))
+  (is (String/contains? (:source (first (:sources result))) "(bind [result 40] (erlang/+ result tmp))"))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualRenamedHole (get-in result [:program :node]))))))

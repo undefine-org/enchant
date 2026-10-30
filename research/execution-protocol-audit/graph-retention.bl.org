@@ -1,0 +1,142 @@
+#+TITLE: Managed graph custody: baseline and native graph pins
+
+* Existing behavior and measured cost
+
+Opaque registrations already keep the callable and captured context in native
+custody. Preparing a handoff creates an inactive target; acceptance consumes
+the source epoch and permits the exact target to execute. Closing a registration
+prevents future admission while independently accepted work drains.
+
+#+begin_src beam-lisp :id native-handoff-remains-owned
+(ns execution.graph.retention.walkthrough)
+(let [source (BeamLisp.Execution/register! (fn [] 42))
+      offer (BeamLisp.Execution/prepare-handoff! source (erlang/self))
+      target (:accepted offer)]
+ (try
+  (assert (= {:status :pending} (BeamLisp.Execution/handoff-status offer)))
+  (assert (= {:status :cancelled} (BeamLisp.Execution/invoke! target [])))
+  (assert (= :accepted (:status (BeamLisp.Execution/accept-handoff! offer))))
+  (assert (= {:status :cancelled} (BeamLisp.Execution/invoke! source [])))
+  (assert (= {:status :completed :value 42} (BeamLisp.Execution/invoke! target [])))
+  {:inactive-target :cancelled :source-after-accept :cancelled :accepted-value 42}
+  (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target))))
+#+end_src
+#+RESULTS: native-handoff-remains-owned
+: {:accepted-value 42, :inactive-target :cancelled, :source-after-accept :cancelled}
+
+
+The measured baseline preceded native graph pins. =Execution/register!=
+then concatenated the actual callback modules, explicit dependencies and
+managed graph module list. =Env/retain_code!= sorts that list, takes its module
+fences and inserts one physical row per module. Invocation borrowed another
+complete lease before entering the captured context.
+
+The native probe creates actual prepared graphs, then measures24 registrations
+and24 real invocations per graph. Every invocation returns42. Registrations close
+in cleanup, every graph must retire, and the command exits its VM. One serial
+capped VM produced this baseline on this host:
+
+| Graph modules | Rows per registration | Registration median/us | Invocation median/us | Graph ETF bytes |
+|---------------+-----------------------+------------------------+----------------------+-----------------|
+|             4 |                     5 |                     93 |                  230 |            6768 |
+|            10 |                    11 |                    153 |                  279 |            7541 |
+|            34 |                    35 |                    318 |                  453 |           10950 |
+
+Timings are observations, not portable thresholds or an asymptotic proof. The
+row counts directly expose the representation's module-count dependence. ETF
+size measures the public graph term; it is not measured message-copy traffic.
+The first graph preparation includes lazy SDK warmup. VM startup is outside the
+registration/invocation timers. No native pin optimization is claimed here.
+
+#+begin_example
+systemd-run --user --collect --wait --pipe --working-directory="$PWD" \
+ --property=MemoryMax=6G --property=MemorySwapMax=0 --property=RuntimeMaxSec=300 \
+ ./bin/bl --cold run test/scripts/execution-graph-cost.bl
+#+end_example
+
+* Native graph retention
+
+The existing Env custody owner now records each original SDK-prepared graph's
+immutable physical membership and module identities once, under module fences.
+A fresh reference identifies that graph; registrations retain its native marker
+plus actual callback/explicit dependency modules outside its membership. Public
+physical retention accepts atoms only, including legacy finite enumerables;
+no supplied marker or scope map establishes graph membership.
+
+=reload.execution/acquire!= calls =Env/retain_generation_code!= for fresh roots.
+=Execution/register!= calls =Env/retain_execution_code!= against the actual
+admitted extent. Existing accepted work borrows its original components and
+restriction. No second owner, supplied decision callback or keeper process is
+introduced. Transfer, handoff and cleanup retain their existing ticket schema.
+
+Publication/retirement take physical module fences, close affected graphs to
+fresh roots, and consult graph pins before replacement. Fresh root acquisition
+inserts its pin before a final serialized open check; a concurrent close either
+sees a pin and refuses replacement, or the final check refuses admission and
+releases the pin. The action cannot enter between these decisions. Existing
+accepted frames and their registered continuations can drain after closure.
+A surviving pin whose protected graph index disappeared conservatively blocks
+publication. Full isolated owner-loss qualification remains outstanding.
+
+#+begin_src beam-lisp :id managed-graph-pin-drains
+(ns execution.graph.pin.walkthrough (:require [reload.generation :as generation]))
+(let [graph (generation/prepare!
+              {:application-id "literate-graph-pin"
+               :sources {"graph.pin.literate" "(ns graph.pin.literate) (defn callback [] (fn [] 42))"}})
+      registration (generation/with! graph
+                     #(BeamLisp.Execution/register!
+                        (generation/invoke! graph "graph.pin.literate/callback" [])))]
+ (try
+  (assert (= 2 (BeamLisp.Execution/observe registration 'code-rows)))
+  (assert (= :waiting (:status (generation/retire! graph))))
+  (assert (= {:status :completed :value 42} (BeamLisp.Execution/invoke! registration [])))
+  (BeamLisp.Execution/close! registration)
+  (assert (= {:status :retired} (generation/retire! graph)))
+  {:registration-rows 2 :retirement :drained :value 42}
+  (finally (BeamLisp.Execution/close! registration) (generation/retire! graph))))
+#+end_src
+#+RESULTS: managed-graph-pin-drains
+: {:value 42, :retirement :drained, :registration-rows 2}
+
+
+* Measured pin representation
+
+The same durable probe ran against the private candidate floor, using actual
+Reader/compiler/SDK preparation and native registrations, in one capped VM:
+
+| Graph modules | Lease rows | Registration median/us | Invocation median/us |
+|---------------+------------+------------------------+----------------------|
+|             4 |          2 |                     51 |                  333 |
+|            10 |          2 |                     46 |                   99 |
+|            34 |          2 |                     50 |                  107 |
+
+All72 invocations returned42 and all3 graphs retired. The rows comprise one
+native graph marker and one outside SDK callback module. Adding an explicit
+outside dependency is separately tested to require its own third row.
+These timings are observations from this candidate/run. They do not establish
+a portable speedup ratio against a different baseline VM. The first graph's
+preparation took123.147 seconds, including lazy SDK/source setup; subsequent
+preparations took0.601/1.033 seconds. Public graph serialization sizes also
+differ between these private images and the historical checkout run, so those
+sizes are not evidence of the pin representation's memory savings. Captured
+context copying and original SDK validation still remain.
+
+The race fixture observes a real worker blocked on a native module fence after
+its open check, publishes a replacement, then releases the fence. All4 assertions
+verify refusal before action entry. Tests additionally cover first-replacement
+blocking, handoff, retirement drain, dead registration owners, external modules,
+forged eager/lazy markers, legacy lazy database callbacks and exact epoch cleanup.
+
+* Remaining work
+
+A constant number of pin rows does not eliminate captured-context copying,
+original SDK attestation checks or public-generation validation. Frame/context
+IDs require migration of actual capture/bind and Source entry consumers. Native
+actors still use legacy physical retention. Deadline/target grants, affine
+analysis, complete historical-family qualification and build/release consumer
+migration remain unfinished.
+
+See [[file:graph-retention-checks.json][historical baseline receipt]]. Current implementation qualification is recorded
+separately, so the earlier measurements remain attributable to their source.
+
+See [[file:graph-pin-checks.json][native graph-pin implementation receipt]] for the installed qualification.

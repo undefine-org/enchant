@@ -1,0 +1,81 @@
+(ns reload.supervisor-context-lifetime-test
+ (:require [reload.generation :as g]))
+
+(def SOURCE
+ "(ns supervisor.context.lifetime (:require [proc.super :as super]))
+  (defserver child (init [_] (ok nil)) (handle-call :read [_ state] (reply 42 state)))
+  (super/defsupervisor tree (child :owner child nil {}))
+  (super/defsupervisor pooled (child :workers (pool child 2)))
+  (defn start-tree [] (start-link tree))
+  (defn start-pool [] (start-link pooled))")
+
+(defn- context-inventory [graph]
+ (BeamLisp.Env/source_private
+  (fn []
+   (mapv (fn [entry]
+           (let [key (elem entry 0) identity (:context-id (elem entry 1))
+                 row (elem (first (ets/lookup :beam_lisp_source_lease_domains
+                                    (tuple :execution_context identity))) 1)]
+            {:token (tuple :bl_native_context (:scope graph) (elem key 2))
+             :identity identity :index (tuple :execution_context_index (:context row))}))
+         (ets/match_object :beam_lisp_source_lease_domains
+           (tuple (tuple (:scope graph) :native_context :_) :_))))))
+
+(defn- child [supervisor id]
+ (some (fn [row] (when (= id (elem row 0)) (elem row 1)))
+       (Supervisor/which_children supervisor)))
+(defn- replacement [supervisor id previous]
+ (loop [left 1000]
+  (let [pid (child supervisor id)]
+   (cond (and (erlang/is_pid pid) (not= previous pid)) pid
+         (zero? left) nil
+         :else (do (Process/sleep 5) (recur (dec left)))))))
+(defn- retirement [graph]
+ (loop [left 1000]
+  (let [result (g/retire! graph)]
+   (cond (= :retired (:status result)) result
+         (= :already-retired (:status result)) result
+         (zero? left) result
+         :else (do (Process/sleep 5) (recur (dec left)))))))
+(defn- reason [action]
+ (try (action) nil (catch error (BeamLisp.ExInfo/ex_original error))))
+
+(deftest actual-child-and-native-pool-metadata-live-through-restart-and-expire-after-retirement
+ (doseq [mode [:tree :pool]]
+  (let [graph (g/prepare! {:application-id (str "supervisor-context-index-" (name mode))
+                          :stable-namespaces #{"proc.super"}
+                          :sources {"supervisor.context.lifetime" SOURCE}})
+        root (atom nil)]
+   (try
+    (reset! root (g/invoke! graph (str "supervisor.context.lifetime/start-" (name mode)) []))
+    (let [supervisor (if (= :pool mode) (child @root :workers) @root)
+          id (if (= :pool mode) :w0 :owner)
+          first (child supervisor id)
+          before (context-inventory graph)]
+     (is (erlang/is_pid first))
+     (is (pos? (count before)))
+     (is (= 42 (call first :read)))
+     (is (= :waiting (:status (g/retire! graph))))
+     (doseq [entry before]
+      (is (= graph (:generation (BeamLisp.Env/resolve_native_context! (:token entry))))))
+     ;; Logical retirement cannot remove the stored restart contexts while the
+     ;; actual supervisor owns the old graph. Native startup reuses its custody.
+     (Process/exit first :kill)
+     (let [next (replacement supervisor id first)]
+      (is (erlang/is_pid next))
+      (is (= 42 (call next :read))))
+     (let [all (vec (distinct (concat before (context-inventory graph))))]
+      (Supervisor/stop @root :normal 5000) (reset! root nil)
+      (is (contains? #{:retired :already-retired} (:status (retirement graph))))
+      (doseq [entry all]
+       (is (= :retired_native_context (reason #(BeamLisp.Env/resolve_native_context! (:token entry)))))
+       (is (= :retired_execution_context (reason #(BeamLisp.Env/execution_context_value! (:identity entry)))))
+       (is (= (list) (BeamLisp.Env/source_private
+                      #(ets/lookup :beam_lisp_source_lease_domains (:index entry))))))
+      (doseq [key [(tuple (:scope graph) :native_context_index)
+                   (tuple (:scope graph) :native_context_bytes)]]
+       (is (= (list) (BeamLisp.Env/source_private
+                      #(ets/lookup :beam_lisp_source_lease_domains key)))))))
+    (finally
+     (when (and @root (Process/alive? @root)) (Supervisor/stop @root :normal 5000))
+     (retirement graph))))))

@@ -1,0 +1,58 @@
+(ns system.execution-test
+ (:require [system.execution :as execution] [system.publication :as publication]
+           [codebase :as codebase] [codebase.boundary :as boundary] [env]))
+
+(defn fixture [definition]
+ (let [ns (str "execution.checked.p" (erlang/unique_integer (list :positive)))
+       source (str "(ns " ns ") " definition)]
+  (env/eval source)
+  (let [snapshot (publication/snapshot ns "choose")
+        index (codebase/index-source {} ns source {:mode :calls})
+        facts (boundary/project index (get-in snapshot [:execution :entries]))]
+   {:namespace ns :snapshot snapshot :facts facts})))
+
+(deftest a-current-closed-publication-proves-only-its-declared-scope
+ (let [f (fixture "(defn choose [x] x)")
+       result (execution/check (:snapshot f) (:facts f))]
+  (is (= :proved (:status result)))
+  (is (= true (get-in result [:coverage :complete])))
+  (is (= :published-defn-dependencies (:scope result)))
+  (is (= false (:native-admission result)))
+  (is (empty? (:obligations result)))))
+
+(deftest declaration-tags-and-fact-edits-cannot-borrow-an-authenticated-body
+ (let [f (fixture "(defn choose [x] x)") facts (:facts f)
+       changed (assoc-in facts [:entries 0 :entry/kind] :sdk)]
+  (is (= :refused (:status (execution/check (:snapshot f) changed))))
+  (is (= :refused (:status (execution/check (:snapshot f) (assoc facts :entries [])))))))
+
+(deftest reload-refuses-the-old-publication-before-an-invocation
+ (let [f (fixture "(defn choose [x] x)")]
+  (env/eval (str "(ns " (:namespace f) ") (defn choose [x] 99)"))
+  (let [result (execution/check (:snapshot f) (:facts f))]
+   (is (= :refused (:status result)))
+   (is (seq (get-in result [:witnesses :invalid-publications]))))))
+
+(deftest runtime-selected-callables-remain-explicit-obligations
+ (let [f (fixture "(defn choose [f] (f))")
+       result (execution/check (:snapshot f) (:facts f))
+       kinds (set (map :kind (:obligations result)))]
+  (is (= :unknown (:status result)))
+  (is (= false (get-in result [:coverage :complete])))
+  (is (contains? kinds :incomplete-entry-dependencies))
+  (is (contains? kinds :unresolved-dependency))))
+
+(deftest empty-and-malformed-input-cannot-be-a-passed-check
+ (let [empty {:version 1 :entries [] :edges [] :coverage {:complete true}}]
+  (is (= :unknown (:status (execution/check [] empty))))
+  (is (= :error (:status (execution/check [] (assoc empty :version 99)))))
+  (is (= :execution-analysis-error
+         (:kind (first (:diagnostics (execution/check [] nil))))))))
+
+(deftest analysis-boundaries-do-not-realize-a-callers-continuation
+ (let [seen (atom 0) pending (lazy-seq (swap! seen inc) (list :unexpected))
+       facts {:version 1 :entries [] :edges [] :coverage {:complete true}}]
+  (is (= :error (:status (execution/check pending facts))))
+  (is (= :error (:status (execution/check [] (assoc facts :edges pending)))))
+  (is (thrown? (boundary/emitted pending)))
+  (is (= 0 @seen))))

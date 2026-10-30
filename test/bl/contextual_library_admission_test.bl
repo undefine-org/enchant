@@ -1,0 +1,99 @@
+(ns contextual-library-admission-test
+ (:require [expand :as x] [binding :as b] [lower :as lower]))
+(defn- source [namespace text] {:namespace namespace :revision 'v1 :source text :file (str namespace ".bl")})
+(defn- library []
+ (x/phase-library [(source 'base "(ns base) (defn answer [] 42)")
+                   (source 'library "(ns library) (import-world 'base 'v1 :only [answer]) (defn result [] (answer))")]))
+(defn- resign [value]
+ (let [data (dissoc value :digest)]
+  (assoc data :digest (crypto/hash :sha256 (erlang/term_to_binary data (list :deterministic))))))
+(defn- edit-unit [library action]
+ (update library :units #(Enum/map % (fn [unit] (if (= 'library (:namespace unit)) (action unit) unit)))))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- raw [value] (erlang/term_to_binary value (list :deterministic)))
+
+(deftest import-requests-refuse-before-encoding-and-before-decoded-data-escapes
+ (let [original (library)
+       mutations [(fn [r] (assoc r :target 'beam-v1))
+                  (fn [r] (dissoc r :provider))
+                  (fn [r] (dissoc r :only-origins))
+                  (fn [r] (assoc r :phase 1))
+                  (fn [r] (assoc r :shift "bad"))
+                  (fn [r] (assoc r :alias 42))
+                  (fn [r] (assoc r :only (list)))
+                  (fn [r] (assoc r :only (list 'answer 'answer)))
+                  (fn [r] (assoc r :only-origins {'not-imported nil}))
+                  (fn [r] (assoc r :path (list 999)))
+                  (fn [r] (assoc r :alias (tuple :symbol "")))
+                  (fn [r] (assoc r :provider 'other/base))
+                  (fn [r] (assoc r :only (list 'other/answer)))
+                  (fn [r] (assoc r :only-origins {'answer 42}))]]
+  (doseq [mutate mutations]
+   (let [changed (resign (edit-unit original #(update % :imports (fn [rows] (Enum/map rows mutate)))))]
+    (is (refused? #(x/encode-phase-library changed)))
+    (is (refused? #(x/decode-phase-library (raw changed))))))
+  (is (= original (x/decode-phase-library (x/encode-phase-library original))))))
+
+(deftest coherent-orphan-world-scopes-and-incoherent-import-scope-records-refuse
+ (let [original (library)
+       orphan (resign (edit-unit original
+                 (fn [unit]
+                  (let [scope (b/scope (get-in unit [:world :selection]) 'library [77] :import)]
+                   (update-in unit [:world :scopes] #(Enum/sort_by (cons scope %) (fn [item] (:id item))))))))
+       inconsistent (resign (edit-unit original
+                       #(update % :import-scopes (fn [scopes] (cons (assoc (first scopes) :path [99]) (rest scopes))))))]
+  (doseq [changed [orphan inconsistent]]
+   (is (refused? #(x/encode-phase-library changed)))
+   (is (refused? #(x/decode-phase-library (raw changed)))))))
+
+(deftest header-scope-coordinates-cannot-switch-to-the-explicit-import-domain
+ (let [original (x/phase-library [(source 'base "(ns base) (defn answer [] 42)")
+                                  (source 'library "(ns library (:require [base :as b])) (defn result [] (b/answer))")])
+       changed (resign (edit-unit original
+                  #(update % :imports (fn [rows] (Enum/map rows (fn [r] (assoc r :scope-path (cons 0 (:path r)))))))))]
+  (is (refused? #(x/decode-phase-library (raw changed))))
+  (is (= original (x/decode-phase-library (x/encode-phase-library original))))))
+
+(deftest legacy-data-is-converted-before-either-writing-or-compilation
+ (let [current (library)
+       previous (BeamLisp.CompilerData/decode_closed_etf!
+                  (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+                               "test/fixtures/phase-library-schemas/v1.etf")))
+       extra (resign (edit-unit previous
+                        #(update % :imports (fn [rows] (Enum/map rows (fn [r] (assoc r :target 'beam-v1)))))))
+       restored (x/decode-phase-library (raw previous))
+       written (BeamLisp.CompilerData/decode_closed_etf! (x/encode-phase-library previous))
+       client (source 'client "(ns client (:require [library :as l])) (l/result)")
+       direct (x/prepare-program [client] ['client 'v1] [previous])
+       converted (x/program [client] ['client 'v1] [restored])]
+  (is (= 3 (:version restored)))
+  (is (refused? #(x/decode-phase-library (raw extra))))
+  (is (refused? #(x/encode-phase-library extra)))
+  (is (= restored written))
+  (is (= 3 (:version (:phase-library direct))))
+  (is (= (:selection (:program direct)) (:selection converted)))
+  (is (= 42 (lower/eval-anf :Elixir.ConvertedLibrary (:node converted))))
+  (is (refused? #(x/decode-phase-library (raw (assoc previous :digest (crypto/hash :sha256 "corrupt"))))))))
+
+(deftest unit-world-profile-and-target-cannot-disagree-with-the-library
+ (doseq [change [(fn [selection] (assoc selection :profile 'other-v1))
+                  (fn [selection] (assoc selection :target 'other-v1))]]
+  (let [library (x/phase-library [(source 'library "(ns library)")])
+        unit (first (:units library)) selection (change (get-in unit [:world :selection]))
+        module (b/scope selection 'library [0] :module)
+        world (b/world selection [module] [])
+        updated (assoc unit :module module
+                  :world {:version 1 :selection selection :scopes (list module) :declarations (list)}
+                  :context {:world (:key world) :namespace 'library :space 'value
+                            :scopes {0 (list (:id module)) :all (list)}})
+        changed (resign (assoc library :units (list updated)))]
+   (is (refused? #(x/decode-phase-library (raw changed))))
+   (is (refused? #(x/encode-phase-library changed))))))
+
+(deftest revision-labels-retain-their-quoted-symbol-grammar
+ (let [library (x/phase-library [(assoc (source 'base "(ns base) (defn answer [] 42)") :revision 'feature/v1)
+                                 (source 'library "(ns library) (import-world 'base 'feature/v1 :only [answer]) (defn result [] (answer))")])
+       restored (x/decode-phase-library (x/encode-phase-library library))
+       program (x/program [(source 'client "(ns client (:require [library :as l])) (l/result)")] ['client 'v1] [restored])]
+  (is (= library restored))
+  (is (= 42 (lower/eval-anf :Elixir.QualifiedRevision (:node program))))))

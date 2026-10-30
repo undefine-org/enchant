@@ -1,0 +1,534 @@
+;; Source-derived catalog for the closed syntax-v1 profile. No evaluation.
+(ns expand-source (:require [syntax :as s] [binding :as b] [compiler :as compiler]))
+
+(defn- refuse! [kind node]
+ (throw (ex-info "Invalid contextual source unit" {:kind kind :origin (:origin node)})))
+(defn- spelling [node] (when (s/identifier? node) (elem (:value node) 1)))
+(defn- head [node] (when (= :list (:tag node)) (spelling (first (:children node)))))
+(defn- module-scope [selection namespace phase]
+ (b/scope selection namespace (if (= 0 phase) [0] [0 phase]) :module))
+(defn- quoted-symbol [node]
+ (when-not (and (= "quote" (head node)) (= 2 (count (:children node)))
+                 (s/identifier? (second (:children node))))
+  (refuse! :phase-quoted-symbol node))
+ (:value (second (:children node))))
+
+(defn- flatten-forms [forms phase prefix]
+ (Enum/flat_map (Enum/with_index forms)
+  (fn [pair]
+   (let [node (elem pair 0) path (Enum/concat prefix (list (elem pair 1)))]
+    (if (= "begin-for-syntax" (head node))
+     (do (when (>= phase 32) (refuse! :phase-depth node))
+         (flatten-forms (rest (:children node)) (+ phase 1) path))
+     (list {:node node :phase phase :path path}))))))
+
+(defn- import-row [entry]
+ (let [node (:node entry) args (rest (:children node)) options (Enum/drop args 2)]
+  (when-not (and (>= (count args) 2) (even? (count options))) (refuse! :phase-import node))
+  (let [pairs (Enum/chunk_every options 2)
+        names (Enum/map pairs #(when (= :keyword (:tag (first %))) (keyword (:value (first %)))))
+        _ (when-not (and (= names (Enum/uniq names))
+                         (every? #(contains? #{:as :only :shift} %) names))
+            (refuse! :phase-import node))
+        opts (Map/new (Enum/map pairs #(tuple (keyword (:value (first %))) (second %))))
+        only (:only opts) alias (:as opts) shift (:shift opts)]
+   (when-not (and (= :vector (:tag only)) (every? (fn [node] (s/identifier? node)) (:children only))
+                  (or (nil? alias) (s/identifier? alias))
+                  (or (nil? shift) (and (= :scalar (:tag shift)) (erlang/is_integer (:value shift)))))
+    (refuse! :phase-import node))
+   {:provider (quoted-symbol (first args)) :revision (quoted-symbol (second args))
+    :phase (:phase entry) :shift (+ (:phase entry) (if shift (:value shift) 0))
+    :only (Enum/map (:children only) #(:value %))
+    :only-origins (Map/new (Enum/map (:children only) #(tuple (:value %) (:origin %))))
+    :alias (when alias (:value alias)) :path (:path entry)})))
+
+(defn- declaration-source [node namespace file]
+ (let [source (compiler/declaration-source (s/to-reader node)
+                (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file))]
+  ;; Per-environment values require runtime lifetime semantics; the closed
+  ;; phase-value constructor cannot silently turn them into global constants.
+  (when (and (= "def" (:kind source)) (= true (get-in source [:metadata :per-env])))
+   (refuse! :phase-per-environment-value node))
+  source))
+
+(defn- class-form? [node] (contains? #{"defrecord" "deftype"} (head node)))
+(defn- definition-form? [node]
+ (contains? #{"def" "defn" "defn-" "defsyntax" "defmacro" "defrecord" "deftype"} (head node)))
+
+(defn- class-source [node namespace file]
+ (compiler/class-declaration-source (s/to-reader node)
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file)))
+
+(defn- definition-slots [entry namespace file]
+ (let [node (:node entry) kind (head node)]
+  (if (class-form? node)
+   (let [source (class-source node namespace file)]
+    (Enum/map (Enum/with_index (:bindings source))
+     (fn [pair]
+      (let [binding (elem pair 0)]
+       {:entry (update entry :path #(Enum/concat % (list (elem pair 1))))
+        :name (:name binding) :visibility (:visibility source)
+        :kind (if (= :type (:role binding)) :value :function)}))))
+   (let [source (declaration-source node namespace file)]
+    (list {:entry entry :name (:name source) :visibility (:visibility source)
+           :kind (case kind "def" :value "defsyntax" :syntax "defmacro" :macro :function)})))))
+
+(defn- visibility [node namespace file]
+ (:visibility (if (class-form? node) (class-source node namespace file)
+                 (declaration-source node namespace file))))
+
+(defn- read-source [descriptor]
+ (when-not (and (erlang/is_map descriptor)
+                (= #{:namespace :revision :source :file} (set (keys descriptor)))
+                (symbol? (:namespace descriptor)) (symbol? (:revision descriptor))
+                (erlang/is_binary (:source descriptor)) (erlang/is_binary (:file descriptor)))
+  (refuse! :phase-source-descriptor nil))
+ (let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace (:namespace descriptor)
+                             :revision (:revision descriptor)
+                             :digest (crypto/hash :sha256 (:source descriptor))}]}
+       module (b/scope selection (:namespace descriptor) [0] :module)
+       context {:world (b/world-key selection) :namespace (:namespace descriptor) :space 'value
+                :scopes {:all [(:id module)]}}
+       forms (s/read (:source descriptor) (:file descriptor) context)
+       ns (first forms)
+       _ (when-not (and (= "ns" (head ns)) (<= 2 (count (:children ns)))
+                        (= (:namespace descriptor) (:value (second (:children ns)))))
+           (refuse! :phase-namespace ns))
+       entries (Enum/map (Enum/with_index (flatten-forms (rest forms) 0 (list)))
+                  #(assoc (elem % 0) :position (+ 1 (elem % 1))))
+       prepared {:descriptor descriptor :selection selection :context context :ns ns :entries entries}]
+  prepared))
+
+(defn- source-summary [prepared]
+ (let [descriptor (:descriptor prepared) entries (:entries prepared)
+       slots (Enum/flat_map (Enum/filter entries #(definition-form? (:node %)))
+               #(definition-slots % (:namespace descriptor) (:file descriptor)))]
+  {:namespace (:namespace descriptor) :revision (:revision descriptor)
+   :public-names (Enum/sort (Enum/uniq (Enum/map (Enum/filter slots #(= :public (:visibility %))) #(:name %))))
+   :entry? (some #(not (or (= "import-world" (head (:node %))) (definition-form? (:node %)))) entries)}))
+
+(defn- namespace-imports [ns providers]
+ ;; Acceptance belongs to CompilerData. Syntax children project only exact
+ ;; refer-name locations after that grammar has checked the request.
+ (Enum/flat_map (Enum/with_index
+   (Enum/map (BeamLisp.CompilerData/namespace_clauses
+               (Enum/map (Enum/drop (:children ns) 2) #(s/to-reader %)))
+             #(s/from-node % (:context ns))))
+  (fn [clause-pair]
+   (let [clause (elem clause-pair 0) ci (elem clause-pair 1)]
+    (when-not (and (= :list (:tag clause)) (= :keyword (:tag (first (:children clause)))))
+      (refuse! :phase-namespace-clause clause))
+    (when-not (= "require" (:value (first (:children clause))))
+      (refuse! :phase-namespace-clause clause))
+    (Enum/flat_map (Enum/with_index (rest (:children clause)))
+     (fn [spec-pair]
+      (let [spec (elem spec-pair 0) si (elem spec-pair 1)
+            parsed (BeamLisp.CompilerData/namespace_require_spec (s/to-reader spec))
+            target (symbol (elem parsed 0)) alias (when (elem parsed 1) (symbol (elem parsed 1)))
+            refer (elem parsed 2)
+            candidates (Enum/filter providers #(= target (:namespace %)))]
+       (when (empty? candidates) (refuse! :phase-provider-missing spec))
+       (when-not (= 1 (count candidates)) (refuse! :phase-provider-ambiguous spec))
+       (let [provider (first candidates) names (:public-names provider)
+             _ (when (:entry? provider) (refuse! :phase-provider-entry spec))
+             _ (when (empty? names) (refuse! :phase-provider-empty spec))
+             refer-names (if (= :all refer) names (Enum/map refer #(symbol %)))
+             pairs (if (= :vector (:tag spec)) (Enum/chunk_every (rest (:children spec)) 2) (list))
+             refer-node (second (first (Enum/filter pairs #(= "refer" (:value (first %))))))
+             origins (if (= :vector (:tag refer-node))
+                       (Map/new (Enum/map (:children refer-node) #(tuple (:value %) (:origin %)))) {})
+             views (Enum/concat (Enum/concat (list {:only names :alias target :only-origins {}})
+                     (if (and alias (not= alias target)) (list {:only names :alias alias :only-origins {}}) (list)))
+                     (if (empty? refer-names) (list) (list {:only refer-names :alias nil :only-origins origins})))]
+        (Enum/map (Enum/with_index views)
+         (fn [view-pair]
+          (let [path (list ci si (elem view-pair 1))]
+           (assoc (elem view-pair 0) :provider target :revision (:revision provider)
+             :phase 0 :shift 0 :path path :scope-path (cons 1 path)))))))))))))
+
+(defn- import-scope [selection namespace request]
+ (b/scope selection namespace (or (:scope-path request) (cons 0 (:path request))) :import))
+
+(defn- describe [prepared providers]
+ (let [descriptor (:descriptor prepared) selection (:selection prepared)
+       context (:context prepared) ns (:ns prepared) entries (:entries prepared)
+       module (b/scope selection (:namespace descriptor) [0] :module)
+       phases (Enum/sort (Enum/uniq
+                 (cons 0 (Enum/flat_map entries
+                           #(if (contains? #{"defsyntax" "defmacro"} (head (:node %)))
+                              (list (:phase %) (+ 1 (:phase %))) (list (:phase %)))))))
+       modules (Enum/map phases #(module-scope selection (:namespace descriptor) %))
+       imports (Enum/concat
+                 (Enum/map (Enum/filter entries #(= "import-world" (head (:node %)))) (fn [entry] (import-row entry)))
+                 (namespace-imports ns providers))
+       import-scopes (Enum/map imports #(import-scope selection (:namespace descriptor) %))
+       scopes (Enum/concat modules import-scopes)
+       context (s/context (assoc context :scopes
+                 (Map/put (Map/new (Enum/map (Enum/zip phases modules)
+                                     #(tuple (elem % 0) (list (:id (elem % 1))))))
+                          :all (Enum/map import-scopes #(:id %)))))
+       entries (Enum/map entries
+                  #(update % :node (fn [node] (s/from-node (s/to-reader node) context))))
+       definitions (Enum/flat_map (Enum/filter entries #(definition-form? (:node %)))
+                     #(definition-slots % (:namespace descriptor) (:file descriptor)))
+       declarations (Enum/map definitions
+        (fn [slot]
+         (let [entry (:entry slot) node (:node entry) kind (head node)
+               name (second (:children node))]
+          (when-not (s/identifier? name) (refuse! :phase-declaration node))
+          {:namespace (:namespace descriptor) :name (:name slot) :phase (:phase entry) :space 'value
+           :kind (:kind slot) :visibility (:visibility slot)
+           :available-from (if (contains? #{"defsyntax" "defmacro"} kind) (+ 1 (:position entry)) 0)
+           :path (cons 0 (:path entry))
+           :scopes (s/scopes (s/identifier (:name slot) context) (:phase entry))})))
+       world (b/world selection scopes declarations)
+       by-path (Map/new (Enum/map (:declarations world) #(tuple (:path %) %)))
+       recipes (Map/new (Enum/map definitions
+                  (fn [slot]
+                   (let [entry (:entry slot) declaration (Map/fetch! by-path (cons 0 (:path entry)))]
+                    (tuple (:id declaration) (assoc entry :declaration declaration :world (:key world)))))))
+       expressions (Enum/filter entries
+                     #(not (or (= "import-world" (head (:node %))) (definition-form? (:node %))))) ]
+  (assoc descriptor :world world :module module :imports imports :import-scopes import-scopes
+                    :recipes recipes :expressions expressions :context context)))
+
+(defn- portable-world [world]
+ {:version 1 :selection (:selection world)
+  :scopes (Enum/sort_by (Map/values (:scopes world)) #(:id %)) :declarations (:declarations world)})
+
+(defn- restore-world [data]
+ (when-not (and (= #{:version :selection :scopes :declarations} (set (keys data))) (= 1 (:version data)))
+  (refuse! :phase-library-world nil))
+ (let [world (b/world (:selection data) (:scopes data) (Enum/map (:declarations data) #(dissoc % :id)))]
+  (when-not (= data (portable-world world)) (refuse! :phase-library-world nil)) world))
+
+(defn- unit-context [world unit]
+ (let [phases (Enum/filter (keys (get-in unit [:context :scopes])) #(not= :all %))]
+  {:world (:key world) :namespace (:namespace unit) :space 'value
+   :scopes (Map/put (Map/new (Enum/map phases
+                       #(tuple % (list (:id (module-scope (:selection world) (:namespace unit) %))))))
+                   :all (Enum/map (:import-scopes unit) #(:id %)))}))
+
+(defn- declaration-coordinate [d] (tuple (:namespace d) (:phase d) (:space d) (:path d)))
+
+(defn- qualify-library-unit [unit]
+ ;; This is a one-way data conversion. Validate every old identity/context
+ ;; before replacing it; resolution and compilation see only qualified worlds.
+ (let [old (restore-world (:world unit))
+       _ (when (some #(contains? % :revision) (get-in old [:selection :sources]))
+           (refuse! :phase-library-world nil))
+       _ (when-not (and (= (:module unit) (b/scope (:selection old) (:namespace unit) [0] :module))
+                         (= (s/context (:context unit)) (s/context (unit-context old unit))))
+           (refuse! :phase-library-context nil))
+       selection (update (:selection old) :sources
+                   #(Enum/map % (fn [source] (assoc source :revision (:revision unit)))))
+       scopes (Map/new (Enum/map (Map/values (:scopes old))
+                #(tuple (:id %) (b/scope selection (:owner %) (:path %) (:role %)))))
+       declarations (Enum/map (:declarations old)
+                      #(assoc (dissoc % :id) :scopes
+                         (Enum/map (:scopes %) (fn [id] (:id (Map/fetch! scopes id))))))
+       world (b/world selection (Map/values scopes) declarations)
+       by-coordinate (Map/new (Enum/map (:declarations world) #(tuple (declaration-coordinate %) %)))
+       imports (Enum/map (:import-scopes unit)
+                 (fn [scope]
+                  (when-not (= scope (get-in old [:scopes (:id scope)]))
+                   (refuse! :phase-library-import-scope nil))
+                  (Map/fetch! scopes (:id scope))))
+       context (unit-context world (assoc unit :import-scopes imports))
+       recipes (Map/new (Enum/map (Map/to_list (:recipes unit))
+                 (fn [pair]
+                  (let [recipe (elem pair 1) declaration (Map/fetch! (:by-id old) (elem pair 0))
+                        node (s/validate (:node recipe))
+                        _ (when-not (and (= (:declaration recipe) declaration) (= (:world recipe) (:key old))
+                                          (= node (s/from-node (s/to-reader node) (:context unit))))
+                            (refuse! :phase-library-recipe node))
+                        current (Map/fetch! by-coordinate (declaration-coordinate declaration))]
+                   (tuple (:id current) (assoc recipe :declaration current :world (:key world)
+                                          :node (s/from-node (s/to-reader node) context)))))))]
+  (assoc unit :world (portable-world world) :module (b/scope selection (:namespace unit) [0] :module)
+              :import-scopes imports :context context :recipes recipes)))
+
+(defn- canonical-library [library]
+ (BeamLisp.CompilerData/check_first_order! library
+  {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+ (when-not (and (erlang/is_map library) (not (contains? library :__struct__))
+                (= #{:version :kind :profile :units :digest} (set (keys library)))
+                (contains? #{1 2 3} (:version library)) (= :contextual-phase-library (:kind library))
+                (= 'syntax-v1 (:profile library)) (erlang/is_list (:units library))
+                (= (:digest library) (crypto/hash :sha256 (erlang/term_to_binary (dissoc library :digest) (list :deterministic)))))
+  (refuse! :phase-library-integrity nil))
+ (when (> (count (:units library)) 128) (refuse! :phase-source-bound nil))
+ (if (< (:version library) 3)
+  ;; Legacy bytes are input data, never a second execution schema. Check their
+  ;; original digest above, then normalize once with explicitly unknown origins.
+  (let [units (Enum/map (:units library)
+               (fn [unit]
+                (when-not (and (erlang/is_map unit) (erlang/is_list (:imports unit)))
+                 (refuse! :phase-library-unit nil))
+                (update unit :imports
+                 (fn [requests]
+                  (Enum/map requests
+                   (fn [request]
+                    (if (= 1 (:version library))
+                     (do
+                      (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
+                                     (= #{:provider :revision :phase :shift :only :alias :path}
+                                        (set (keys request))))
+                       (refuse! :phase-library-import nil))
+                      (assoc request :only-origins {}))
+                     request)))))))
+        current (assoc (dissoc library :digest) :version 3 :units (Enum/map units (fn [unit] (qualify-library-unit unit))))
+        _ (BeamLisp.CompilerData/check_first_order! current
+            {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
+   (assoc current :digest (crypto/hash :sha256 (erlang/term_to_binary current (list :deterministic)))))
+  library))
+
+(defn- check-library-import! [unit world request scope]
+ (let [required #{:provider :revision :phase :shift :only :only-origins :alias :path}
+       allowed (conj required :scope-path)]
+  (when-not (and (erlang/is_map request) (not (contains? request :__struct__))
+                 (every? #(contains? request %) required)
+                 (every? #(contains? allowed %) (keys request))
+                 (symbol? (:provider request)) (symbol? (:revision request))
+                 (erlang/is_integer (:phase request)) (<= 0 (:phase request) 32)
+                 (contains? (get-in unit [:context :scopes]) (:phase request))
+                 (erlang/is_integer (:shift request)) (<= -4096 (:shift request) 4096)
+                 (or (nil? (:alias request)) (symbol? (:alias request)))
+                 (erlang/is_list (:only request)) (<= 1 (count (:only request)) 256)
+                 (every? #(symbol? %) (:only request))
+                 (= (:only request) (Enum/uniq (:only request)))
+                 (erlang/is_list (:path request))
+                 (erlang/is_map (:only-origins request)) (not (contains? (:only-origins request) :__struct__))
+                 (every? #(Enum/member? (:only request) %) (keys (:only-origins request)))
+                 (every? #(or (nil? %) (and (erlang/is_map %) (not (contains? % :__struct__))))
+                          (Map/values (:only-origins request))))
+   (refuse! :phase-library-import nil))
+  (doseq [name (Enum/concat (cons (:provider request) (:only request))
+                 (if (:alias request) (list (:alias request)) (list)))]
+   (b/check-name! name))
+  ;; Revisions are quoted syntax symbols, and can include qualified spelling;
+  ;; they are not unqualified binding names.
+  (s/identifier (:revision request) (:context unit))
+  (when (contains? request :scope-path)
+   (when-not (and (= 3 (count (:path request)))
+                  (= (cons 1 (:path request)) (:scope-path request))
+                  (= 0 (:phase request)) (= 0 (:shift request)))
+    (refuse! :phase-library-import-scope nil)))
+  (let [expected (import-scope (:selection world) (:namespace unit) request)]
+   (when-not (and (= expected scope) (= scope (get-in world [:scopes (:id expected)])))
+    (refuse! :phase-library-import-scope nil)))))
+
+(defn- recipe-slot [recipe unit]
+ (let [node (:node recipe)
+       entry (if (class-form? node) (update recipe :path #(Enum/drop % -1)) recipe)
+       slots (definition-slots entry (:namespace unit) (:file unit))]
+  (if (class-form? node)
+   (let [index (last (:path recipe))]
+    (when-not (and (erlang/is_integer index) (<= 0 index) (< index (count slots)))
+     (refuse! :phase-library-recipe node))
+    (Enum/at slots index))
+   (first slots))))
+
+(defn- check-class-inventory! [unit]
+ (Enum/each (Map/values (Enum/group_by
+              (Enum/filter (Map/values (:recipes unit)) #(class-form? (:node %)))
+              #(Enum/drop (:path %) -1)))
+  (fn [recipes]
+   (let [first (first recipes) slots (definition-slots (update first :path #(Enum/drop % -1))
+                                     (:namespace unit) (:file unit))]
+    (when-not (and (= (count recipes) (count slots))
+                   (= (Enum/sort (Enum/map recipes #(last (:path %)))) (Enum/map (Enum/with_index slots) #(elem % 1)))
+                   (every? #(and (= (:node first) (:node %)) (= (:phase first) (:phase %))
+                                  (= (:position first) (:position %))) recipes))
+     (refuse! :phase-library-class-inventory (:node first)))))))
+
+(defn- restore-library-units [library]
+ (Enum/map (:units library)
+  (fn [unit]
+   (let [world (restore-world (:world unit))
+         module (b/scope (:selection world) (:namespace unit) [0] :module)
+         phases (Enum/filter (keys (get-in unit [:context :scopes])) #(not= :all %))
+         context (unit-context world unit)]
+    (when-not (and (= #{:namespace :revision :file :world :module :imports :import-scopes
+                       :recipes :expressions :context} (set (keys unit)))
+                   (symbol? (:revision unit)) (erlang/is_binary (:file unit))
+                   (= (:module unit) module) (= (s/context context) (s/context (:context unit)))
+                   (= (set (keys (:recipes unit))) (set (keys (:by-id world))))
+                   (= (count (:imports unit)) (count (:import-scopes unit)))
+                   (empty? (:expressions unit)))
+     (refuse! :phase-library-unit nil))
+    (s/identifier (:revision unit) context)
+    (when-not (and (erlang/is_list (:imports unit)) (erlang/is_list (:import-scopes unit))
+                   (contains? (get-in unit [:context :scopes]) 0)
+                   (= 'syntax-v1 (get-in world [:selection :profile]))
+                   (= 'beam-v1 (get-in world [:selection :target]))
+                   (= 1 (count (get-in world [:selection :sources])))
+                   (= (:namespace unit) (:namespace (first (get-in world [:selection :sources]))))
+                   (= (:revision unit) (:revision (first (get-in world [:selection :sources]))))
+                   (= (count (:import-scopes unit)) (count (Enum/uniq (:import-scopes unit))))
+                   (= (set (Map/values (:scopes world)))
+                      (set (Enum/concat (Enum/map phases #(module-scope (:selection world) (:namespace unit) %))
+                                         (:import-scopes unit)))))
+     (refuse! :phase-library-unit nil))
+    (Enum/each (Enum/zip (:imports unit) (:import-scopes unit))
+      (fn [pair] (check-library-import! unit world (elem pair 0) (elem pair 1))))
+    (Enum/each (Map/to_list (:recipes unit))
+     (fn [pair]
+      (let [id (elem pair 0) recipe (elem pair 1) d (Map/fetch! (:by-id world) id)
+            node (s/validate (:node recipe))
+            _ (when-not (and (definition-form? node) (erlang/is_list (:path recipe)))
+                (refuse! :phase-library-recipe node))
+            kind (head node) slot (recipe-slot (assoc recipe :node node) unit)]
+       (when-not (and (= (:world recipe) (:key world)) (= (:declaration recipe) d)
+                      (= (:phase recipe) (:phase d)) (= (cons 0 (:path recipe)) (:path d))
+                      (erlang/is_integer (:position recipe)) (<= 1 (:position recipe) 131072)
+                      (= (:name d) (:name slot)) (= (:path recipe) (get-in slot [:entry :path]))
+                      (= (:kind d) (:kind slot))
+                      (= (:visibility d) (visibility node (:namespace unit) (:file unit)))
+                      (= (:available-from d) (if (contains? #{"defsyntax" "defmacro"} kind) (+ 1 (:position recipe)) 0)))
+        (refuse! :phase-library-recipe node))
+       (when-not (= node (s/from-node (s/to-reader node) context))
+        (refuse! :phase-library-context node)))))
+    (check-class-inventory! unit) (assoc unit :world world)))))
+
+(defn- checked-library [input]
+ (let [library (canonical-library input)]
+  (tuple library (restore-library-units library))))
+
+(defn- library-units [input] (elem (checked-library input) 1))
+
+(defn catalog
+ "Read finite source revisions once. Multiple revisions of one namespace are
+  independent worlds. Imports and declarations come from actual Reader nodes;
+  no Env links, file search, executable callbacks or fabricated fixture rows."
+ ([sources] (catalog sources []))
+ ([sources libraries]
+ (when-not (or (vector? sources) (erlang/is_list sources)) (refuse! :phase-source-collection nil))
+ (when-not (or (vector? libraries) (erlang/is_list libraries)) (refuse! :phase-library-collection nil))
+ (BeamLisp.CompilerData/check_first_order! libraries
+  {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+ (let [sources (BeamLisp.CompilerData/eager_to_list sources)
+       _ (when (> (count sources) 128) (refuse! :phase-source-bound nil))
+       prepared (Enum/map sources (fn [descriptor] (read-source descriptor)))
+       archived (Enum/flat_map (BeamLisp.CompilerData/eager_to_list libraries) (fn [library] (library-units library)))
+       providers (Enum/concat (Enum/map prepared #(source-summary %))
+                   (Enum/map archived (fn [unit]
+                    {:namespace (:namespace unit) :revision (:revision unit) :entry? false
+                     :public-names (Enum/sort (Enum/uniq (Enum/map
+                       (Enum/filter (get-in unit [:world :declarations]) #(= :public (:visibility %))) #(:name %))))})))
+       units (Enum/concat (Enum/map prepared (fn [source] (describe source providers))) archived)
+       _ (when (> (count units) 128) (refuse! :phase-source-bound nil))
+       keys (Enum/map units #(tuple (:namespace %) (:revision %)))
+       _ (when-not (= keys (Enum/uniq keys)) (refuse! :phase-source-duplicate nil))
+       named (Map/new (Enum/zip keys units))
+       edges (Enum/flat_map units
+        (fn [unit]
+         (Enum/map (Enum/zip (:imports unit) (:import-scopes unit))
+          (fn [pair]
+           (let [request (elem pair 0) provider (get named (tuple (:provider request) (:revision request)))]
+            (when-not provider (refuse! :phase-provider-missing nil))
+            {:from-world (get-in provider [:world :key]) :into-world (get-in unit [:world :key])
+             :from (:provider request) :into (:namespace unit) :scope (:id (elem pair 1))
+             :only (:only request) :space 'value :phase-shift (:shift request) :alias (:alias request)})))))
+       worlds (Map/new (Enum/map units #(tuple (get-in % [:world :key]) %)))
+       recipes (Enum/reduce units {} #(Map/merge %2 (:recipes %1)))
+       selection (b/select (Enum/map units #(:world %)) edges)
+       by-world (Enum/group_by edges #(:into-world %))
+       cycles (BeamLisp.SourceGraph/cycles (Map/keys worlds)
+                (fn [world] (Enum/map (Map/get by-world world (list)) #(:from-world %))))]
+  (when-not (empty? cycles) (refuse! :phase-import-cycle nil))
+  {:version 1 :kind :phase-catalog :selection selection
+   :units named :worlds worlds :recipes recipes})))
+
+(defn unit [catalog namespace revision]
+ (or (get (:units catalog) (tuple namespace revision)) (refuse! :phase-entry-missing nil)))
+
+(defn- assemble-library [catalog definitions-only?]
+ (let [units (Enum/sort_by (Enum/map (Map/values (:units catalog))
+                          #(cond-> (assoc (dissoc % :source) :world (portable-world (:world %)))
+                             definitions-only? (assoc :expressions (list))))
+                          #(tuple (:namespace %) (:revision %)))
+       library {:version 3 :kind :contextual-phase-library :profile 'syntax-v1 :units units}
+       library (assoc library :digest (crypto/hash :sha256 (erlang/term_to_binary library (list :deterministic))))]
+  (library-units library) library))
+
+(defn library
+ "Portable contextual Reader recipes and original binding worlds. No source
+  text, live functions, Env snapshots or native admission. The digest checks
+  content integrity; it is not SDK authority or producer authentication.
+  Provider sources must contain declarations only."
+ [sources] (assemble-library (catalog sources) false))
+
+(defn definitions-library
+ "Export declarations from an already parsed catalog. Entry expressions stay
+  in the runtime program, never in an imported phase library. This explicit
+  projection shares the catalog's original binding worlds and private recipes."
+ [catalog]
+ (when-not (= :phase-catalog (:kind catalog)) (refuse! :phase-catalog nil))
+ (assemble-library catalog true))
+
+(defn- library-vocabulary []
+ ;; A cold decoder must own its atom vocabulary before :safe ETF decoding.
+ ;; Source keywords are strings in Reader syntax; no Source-chosen atom needs
+ ;; interning here. This value is also used to reject foreign wire vocabulary.
+ (MapSet/new
+  '(:version :kind :profile :units :digest :namespace :revision :file :world
+    :module :imports :import-scopes :recipes :expressions :context :selection
+    :scopes :declarations :sources :target :owner :path :role :id :provider
+    :phase :shift :only :only-origins :scope-path :alias :node :position :declaration :name :space
+    :visibility :available-from :value :function :syntax :macro :public :private :local :sdk-phase
+    :binding-scope :import :lexical :introduction :use-site :all :tag :origin
+    :children :symbol :keyword :scalar :list :vector :set :map :record
+    :line :col :offset :end-line :end-col :end-offset :contextual-phase-library)))
+
+(defn- library-atoms! [value vocabulary]
+ (cond
+  (erlang/is_atom value)
+   (when-not (or (nil? value) (boolean? value) (MapSet/member? vocabulary value))
+    (refuse! :phase-library-vocabulary nil))
+  (erlang/is_tuple value) (Enum/each (erlang/tuple_to_list value) #(library-atoms! % vocabulary))
+  (erlang/is_list value) (Enum/each value #(library-atoms! % vocabulary))
+  (erlang/is_map value)
+   (Enum/each (Map/to_list value)
+     (fn [pair] (library-atoms! (elem pair 0) vocabulary) (library-atoms! (elem pair 1) vocabulary)))
+  :else nil))
+
+(defn encode-library [input]
+ (let [library (elem (checked-library input) 0)]
+  (library-atoms! library (library-vocabulary))
+  (erlang/term_to_binary library (list :deterministic))))
+
+(defn decode-library [bytes]
+ (let [vocabulary (library-vocabulary)
+       library (BeamLisp.CompilerData/decode_closed_etf! bytes
+                 {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})]
+  (let [current (elem (checked-library library) 0)]
+   (library-atoms! current vocabulary) current)))
+
+(defn provenance
+ "Source coordinates from the catalog, separate from logical binding identity.
+  Archived units retain locations and explicitly lack editable Source text."
+ [catalog]
+ (let [units (Map/values (:units catalog))
+       unit-key (fn [unit] (list (:namespace unit) (:revision unit)))]
+  {:units (Map/new (Enum/map units
+                     #(tuple (get-in % [:world :key])
+                        {:unit (unit-key %) :file (:file %) :source-available (contains? % :source)})))
+   :declarations (Map/new (Enum/flat_map units
+                   (fn [unit]
+                    (Enum/map (Map/to_list (:recipes unit))
+                     (fn [entry]
+                      (let [recipe (elem entry 1) node (second (:children (:node recipe)))]
+                       (tuple (elem entry 0)
+                         {:unit (unit-key unit) :world (get-in unit [:world :key])
+                          :name (get-in recipe [:declaration :name]) :origin (:origin node)})))))))
+   :imports (Enum/flat_map units
+               (fn [unit]
+                (Enum/map (:imports unit)
+                 (fn [request]
+                  (let [provider (get (:units catalog) (tuple (:provider request) (:revision request)))]
+                   {:unit (unit-key unit) :into-world (get-in unit [:world :key])
+                    :from-world (get-in provider [:world :key]) :only (:only request)
+                    :only-origins (:only-origins request) :alias (:alias request)})))))}))
+

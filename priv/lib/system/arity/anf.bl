@@ -1,0 +1,143 @@
+;; Finite lexical call-shape analysis. Compiler ANF owns semantics; this pass
+;; neither reads Source nor resolves globals through the running VM.
+(ns system.arity.anf (:require [system.ir :as ir] [errors :as errors]))
+
+(defn- unknown [] #{:unknown})
+(defn- known [node]
+ (when-let [shape (ir/function-shape node)]
+  #{(assoc shape :kind (if (ir/blfn-value? node) :dispatch :native))}))
+(defn- join [values]
+ (let [all (reduce into #{} values)]
+  (if (or (contains? all :unknown) (> (count all) 8) (empty? all)) (unknown) all)))
+(defn- shadow [env clause]
+ (reduce (fn [env name] (assoc env name (unknown))) env (ir/clause-pattern-vars clause)))
+(defn- site [node]
+ ;; Native apply remains a call even when its spelling resembles a recur/knot.
+ ;; Exact constructors alone are handled by the lexical rule below.
+ (if (= :apply (:op node))
+  {:mode :apply :callee (:fn node) :args (:args node) :arity (count (:args node))}
+  (ir/call-site node)))
+(defn- answer [call values]
+ (cond
+  (nil? (:arity call)) {:status :unknown :reason :computed-argument-list}
+  (= :remote (:mode call)) {:status :unknown :reason :native-target}
+  (contains? values :unknown) {:status :unknown :reason :dynamic-callee}
+  :else
+   (let [accepts (mapv (fn [value]
+                       (and (or (= :invoke (:mode call)) (contains? #{:native :factory} (:kind value)))
+                            (ir/accepts-arity? value (:arity call)))) values)]
+    (cond (every? true? accepts) {:status :proved}
+          (every? false? accepts) {:status :refused :reason :incompatible-arity}
+          :else {:status :unknown :reason :branch-dependent-arity}))))
+(defn- obligation [state node call values]
+ (update state :obligations conj
+  (merge {:mode (:mode call) :arity (:arity call) :origin (select-keys (:ann node) [:file :line :col :end-line :end-col])}
+         (when (= :remote (:mode call)) {:target [(:mod call) (:fun call)]})
+         (when-not (contains? values :unknown) {:alternatives values})
+         (answer call values))))
+
+(declare visit)
+(defn- children [nodes env state depth]
+ (reduce (fn [[values state] node]
+           (let [[value state] (visit node env state depth)] [(conj values value) state]))
+         [[] state] nodes))
+(defn- clauses [clauses env state depth]
+ (reduce (fn [[values state] clause]
+           (let [[_ state] (children (mapcat ir/pattern-expressions (:pats clause)) env state depth)
+                 scope (shadow env clause)
+                 state (if (nil? (:guard clause)) state
+                         (second (visit (:guard clause) scope state depth)))
+                 [value state] (visit (:body clause) scope state depth)]
+            [(conj values value) state])) [[] state] clauses))
+(defn- visit [node env state depth]
+ (when (or (<= (:remaining state) 0) (<= depth 0))
+  (throw (ex-info "Call-shape analysis budget exhausted" {:kind :call-shape-budget})))
+ (let [state (-> state (update :remaining dec) (update :visited inc)) depth (dec depth)
+       op (:op node)]
+  (cond
+   (ir/self-scaffold? node)
+    (let [inner (ir/scaffold-inner node) value (or (known inner) (unknown))
+          factory #{ {:kind :factory :arities #{1} :result value} }
+          [_ state] (visit inner (assoc env (:name node) factory) state depth)]
+     [value (update state :constructors inc)])
+   (= :var op) [(get env (:name node) (unknown)) state]
+   (= :let op)
+    (let [[value state] (visit (:init node) env state depth)]
+     (visit (:body node) (assoc env (:name node) value) state depth))
+   (= :fn op)
+    (let [[_ state] (clauses (:clauses node) env state depth)]
+     [(or (known node) (unknown)) state])
+   (= :if op)
+    (let [[_ state] (visit (:test node) env state depth)
+          [values state] (children (list (:then node) (:else node)) env state depth)]
+     [(join values) state])
+   (= :do op)
+    (let [[values state] (children (:stmts node) env state depth)]
+     [(or (last values) (unknown)) state])
+   (= :case op)
+    (let [[_ state] (visit (:subj node) env state depth)
+          [values state] (clauses (:clauses node) env state depth)]
+     [(join values) state])
+   (= :try op)
+    (let [[body state] (visit (:body node) env state depth)
+          [caught state] (clauses (:catch node) env state depth)
+          state (if (nil? (:after node)) state (second (visit (:after node) env state depth)))]
+     [(join (cons body caught)) state])
+   (= :recv op)
+    (let [[values state] (clauses (:clauses node) env state depth)
+          state (if (nil? (:timeout node)) state (second (visit (:timeout node) env state depth)))
+          [after state] (if (nil? (:after node)) [(unknown) state]
+                         (visit (:after node) env state depth))]
+     [(join (conj values after)) state])
+   (contains? #{:apply :invoke :remote} op)
+    (let [call (site node)
+          [callee state] (if (:callee call) (visit (:callee call) env state depth) [(unknown) state])
+          operands (if (= :invoke op) (list (:arguments node)) (:args node))
+          [_ state] (children operands env state depth)
+          state (obligation state node call callee)
+          ;; Only the exact self argument under this lexical factory carries
+          ;; the inner closure result. Other applications return unknown.
+          result (when (and (= :apply op) (= :var (:op (:fn node)))
+                            (= 1 (count (:args node)))
+                            (= :var (:op (first (:args node))))
+                            (= (:name (:fn node)) (:name (first (:args node)))))
+                   (join (map (fn [v] (if (= :factory (:kind v)) (:result v) (unknown))) callee)))]
+     [(or result (unknown)) state])
+   :else
+    (let [[_ state] (children (ir/child-nodes node) env state depth)]
+     [(or (known node) (unknown)) state]))))
+
+(defn check
+ "Check call arities over immutable ANF. Native remotes, globals, parameters
+  and call results stay unknown. All function bodies and branches are visited;
+  findings are potential sites, not claims of reachability or escaping errors.
+  Options bound nodes (<=100000) and depth (<=256); alternatives widen after8.
+  Pattern matching, termination, effects and native admission are separate."
+ ([node] (check node {}))
+ ([node options]
+  (try
+   (let [nodes (get options :node-limit 100000) depth (get options :depth-limit 256)
+         _ (when-not (and (= #{} (set (remove #{:node-limit :depth-limit} (keys options))))
+                          (erlang/is_integer nodes) (<= 1 nodes 100000)
+                          (erlang/is_integer depth) (<= 1 depth 256))
+             (throw (ex-info "Invalid call-shape budget" {:kind :call-shape-options})))
+         [_ state] (visit node {} {:remaining nodes :visited 0 :constructors 0 :obligations []} depth)
+         obligations (:obligations state) counts (frequencies (map :status obligations))
+         unknown (get counts :unknown 0) refused (get counts :refused 0)]
+    {:version 1 :scope :lexical-anf-call-arity
+     :status (cond (> refused 0) :refused (> unknown 0) :unknown :else :proved)
+     :coverage {:complete (= 0 unknown) :sites (count obligations) :visited (:visited state)
+                :constructors (:constructors state) :proved (get counts :proved 0)
+                :unknown unknown :refused refused}
+     :obligations obligations :findings (filterv #(= :refused (:status %)) obligations)
+     :diagnostics (vec (keep
+                    (fn [finding]
+                     (errors/node->warning :call-arity {:ann (:origin finding)}
+                      (str "Call supplies " (:arity finding) " argument(s); no known callee alternative accepts this arity")))
+                    (filter #(= :refused (:status %)) obligations)))
+     :native-admission false})
+   (catch error
+    (let [budget (= :call-shape-budget (:kind (ex-data error)))]
+     {:version 1 :scope :lexical-anf-call-arity :status (if budget :unknown :error)
+      :coverage {:complete false :sites nil} :kind (:kind (ex-data error))
+      :obligations [] :findings [] :diagnostics [] :native-admission false})))))

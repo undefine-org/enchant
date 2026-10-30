@@ -17,12 +17,6 @@
  (and (some? value)
       (try (first-order/check! value {:max-nodes 256 :max-bytes 4096 :max-depth 8}) true
        (catch _ false))))
-(defn- lease? [value]
- (and (tuple? value) (= 3 (erlang/tuple_size value))
-      (erlang/is_list (elem value 0)) (<= 1 (erlang/length (elem value 0)) 4096)
-      (every? #(erlang/is_atom %) (elem value 0))
-      (erlang/is_pid (elem value 1)) (= (erlang/node (elem value 1)) (erlang/node))
-      (erlang/is_reference (elem value 2))))
 (defn- row [table id] (when-let [entry (first (ets/lookup table id))] (elem entry 1)))
 (defn- save! [table job] (ets/insert table (tuple (:id job) job)) job)
 (defn- same-slot? [job ticket] (and job (= ticket (:ticket job))))
@@ -258,16 +252,17 @@
 (defn prepare!
  [st id ticket prepared from]
  (let [job (row (:table st) id) source (field prepared :source) accepted (field prepared :accepted)]
-  (if-not (and (plain-map? prepared) (plain-map? source) (plain-map? accepted)
-               (lease? (:lease source)) (lease? (:lease accepted))
-               (fn? (:invoke source)) (= (:invoke source) (:invoke accepted))
-               (= (elem (:lease source) 0) (elem (:lease accepted) 0))
-               (<= (count (elem (:lease accepted) 0)) (:lease-rows job 0))
-               (same-slot? job ticket) (= :preparing (:status job))
+  (if-not (and (same-slot? job ticket) (= :preparing (:status job))
                (= (elem from 0) (get-in job [:request :owner]))
                (nil? (:registration job))
-               (= (get-in job [:request :owner]) (elem (:lease source) 1))
-               (= (:owner st) (elem (:lease accepted) 1)))
+               ;; Native custody validates source/target lineage. Shape is
+               ;; neither authority nor a copied physical dependency list.
+               (try
+                (and (= :pending (:status (BeamLisp.Execution/handoff-status prepared)))
+                     (= (get-in job [:request :owner]) (BeamLisp.Execution/observe source 'owner))
+                     (= (:owner st) (BeamLisp.Execution/observe accepted 'owner))
+                     (<= (BeamLisp.Execution/observe accepted 'code-rows) (:lease-rows job 0)))
+                (catch _ false)))
    [{:status :refused :kind :invalid-dispatch-handoff} st]
    (do
     (save! (:table st) (assoc job :registration accepted :source-registration source))
@@ -356,7 +351,8 @@
 (defn- transfer-and-commit! [server job reserved original request timeout-ms]
  (let [prepared (callback/prepare-transfer! original (:owner reserved))
        indexed (call server [:prepare (:id job) (:ticket reserved) prepared] timeout-ms)]
-  (if-not (= :prepared (:status indexed)) indexed
+  (if-not (= :prepared (:status indexed))
+   (do (when-not (= :cancelled prepared) (callback/unregister! (:accepted prepared))) indexed)
    (try
     (callback/commit-transfer! prepared request)
     (call server [:commit (:id job) (:ticket reserved)] timeout-ms)
@@ -385,8 +381,8 @@
                  (int? restarts) (<= 0 restarts 3)
                  (contains? #{nil true false} (:replay-safe? job)))
     (fail :invalid-dispatch-job))
-   (let [modules (mapcat BeamLisp.Env/callback_modules (map #(get job %) [:run :waiting :failed]))
-         ;; One event wrapper plus proc.callback's helper; reserve a safe
+   (let [modules (vec (mapcat BeamLisp.Env/callback_modules (map #(get job %) [:run :waiting :failed])))
+         ;; One event wrapper plus the native Execution helper; reserve a safe
          ;; upper bound before creating any extra native code registration.
          lease-rows (+ 2 (count (set (concat modules (:modules (generation/current))))))
          request (admission/token (erlang/self) timeout-ms)

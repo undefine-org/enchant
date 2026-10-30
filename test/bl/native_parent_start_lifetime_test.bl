@@ -1,0 +1,37 @@
+(ns native-parent-start-lifetime-test (:require [vm.manager :as manager]))
+
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+
+(deftest accepted-sdk-parent-keeps-own-custody-after-its-original-creator-exits
+ (let [caller (erlang/self) context (BeamLisp.Env/capture) before (Process/whereis :vm-owner-procs)
+       creator (erlang/spawn
+                 (fn []
+                  (BeamLisp.Env/bind context)
+                  (erlang/send caller [:parent (manager/start)])
+                  (receive :release nil)))
+       monitor (erlang/monitor :process creator)
+       parent (receive [:parent pid] pid (after 10000 (throw :parent-start-missing)))]
+  (try
+   (erlang/send creator :release)
+   (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :creator-not-down)))
+   (is (Process/alive? parent))
+   (is (not (Process/alive? creator)))
+   ;; This is the actual native parent snapshot used when that parent starts a
+   ;; later child. Its completed birth is history; its own live lease is custody.
+   (let [chain (try (BeamLisp.Env/server_start_turn #(BeamLisp.Env/owned_start_creator_chain parent))
+                (catch error {:refused (BeamLisp.ExInfo/ex_original error)}))]
+    (is (and (erlang/is_list chain) (seq chain) (= parent (:child (first chain)))))
+    (is (and (erlang/is_list chain) (seq chain) (= creator (:creator (first chain))))))
+   ;; Origin proofs still require the entire claimed path to a LIVE real root.
+   (is (= :native_original_start_evidence_required
+          (reason #(BeamLisp.Env/native_process_start_evidence! parent creator))))
+   (is (not= :unexpected-success
+             (reason #(BeamLisp.Env/native_process_start_evidence! parent caller))))
+   (finally
+    (erlang/demonitor monitor (list :flush))
+    (when (Process/alive? creator) (erlang/exit creator :kill))
+    (when (Process/alive? parent) (GenServer/stop parent))
+    (when (and (nil? before) (Process/whereis :vm-owner-procs))
+     (GenServer/stop (Process/whereis :vm-owner-procs)))))))

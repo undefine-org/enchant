@@ -1,0 +1,85 @@
+(ns contextual-library-test (:require [expand :as x] [lower :as lower]))
+
+(defn- source [namespace revision text]
+ {:namespace namespace :revision revision :source text :file (str namespace ".bl")})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualLibrary." (erlang/unique_integer (list :positive))))
+   (:node program)))
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest portable-private-helper-and-transformer-recipes-need-no-provider-source
+ (let [library (x/phase-library
+                 [(source 'library 'old
+                    (str "(ns library) (defn- helper [x] (erlang/+ x 40)) "
+                      "(defsyntax answer [form ctx] "
+                      " (syntax-template (helper input) {'input (syntax-arg form 1)}))"))])
+       restored (x/decode-phase-library (x/encode-phase-library library))
+       program (x/program [(source 'client 'current
+                             "(ns client) (import-world 'library 'old :only [answer]) (answer 2)")]
+                   ['client 'current] [restored])]
+  (is (= 42 (execute program)))
+  (is (every? #(not (contains? % :source)) (:units library)))
+  (is (= library restored))
+  (is (= :phase-library-integrity
+        (kind-of #(x/program [(source 'client 'current "(ns client) 42")]
+                    ['client 'current] [(assoc library :digest (crypto/hash :sha256 "altered"))]))))))
+
+(deftest anf-lookalike-macro-results-are-literal-data
+ (let [program (x/program [(source 'client 'current
+                            (str "(ns client) (defsyntax literal [form ctx] "
+                              " (syntax-literal {:op :invoke :callee :not-code})) (literal)"))]
+                          ['client 'current])]
+  (is (= {:op :invoke :callee :not-code} (execute program)))))
+
+(deftest definition-local-identities-are-independent-of-the-importing-client
+ (let [provider (source 'library 'old "(ns library) (defn answer [x] (erlang/+ x 40))")
+       a (x/program [provider (source 'a 'current
+                         "(ns a) (import-world 'library 'old :as p :only [answer]) (p/answer 2)")]
+                    ['a 'current])
+       z (x/program [provider (source 'z 'current
+                         (str "(ns z) (import-world 'library 'old :as p :only [answer]) "
+                           "(let [x 2 unused (fn [z] z)] (p/answer x))"))]
+                    ['z 'current])
+       local-ids (fn [program]
+                   (Enum/sort (Enum/map
+                     (Enum/filter (get-in program [:selection :introduced-declarations])
+                       #(= 'library (:namespace %))) #(:id %))))]
+  (is (= (local-ids a) (local-ids z)))
+  (is (= 2 (count (local-ids a))))
+  (is (= 42 (execute a)))
+  (is (= 42 (execute z)))))
+
+(deftest shifted-transformers-retain-private-runtime-helpers-and-introduced-locals
+ (let [library (x/phase-library
+                 [(source 'library 'old
+                    (str "(ns library) (defn- helper [x] (erlang/+ x 40)) "
+                      "(defsyntax calc [form ctx] "
+                      " (syntax-template (let [tmp input] (helper tmp)) {'input (syntax-arg form 1)}))"))])
+       program (x/program [(source 'client 'current
+                              (str "(ns client) (begin-for-syntax "
+                                " (import-world 'library 'old :only [calc])) "
+                                "(defsyntax literal [form ctx] (syntax-literal (calc 2))) (literal)"))]
+                          ['client 'current] [library])]
+  (is (= 42 (execute program)))
+  (is (= 2 (count (:expansions program))))
+  (is (some #(= 1 (elem % 1)) (get-in program [:selection :instances])))))
+
+(deftest transformer-name-does-not-capture-a-value-at-the-next-phase
+ (let [program (x/program [(source 'client 'current
+                             (str "(ns client) (begin-for-syntax (def value 2)) "
+                               "(defsyntax value [form ctx] (syntax-literal value)) (erlang/+ 40 (value))"))]
+                          ['client 'current])]
+  (is (= 42 (execute program)))))
+
+(deftest cyclic-imports-and-runtime-author-metadata-have-no-ambient-escape
+ (is (= :phase-import-cycle
+        (kind-of #(x/program
+          [(source 'client 'current
+              "(ns client) (import-world 'client 'current :only [answer]) (defn answer [] 42) (answer)")]
+          ['client 'current]))))
+ (is (= :syntax-profile-metadata
+        (kind-of #(x/program [(source 'client 'current
+                               "(ns client) ^{:effect (erlang/put :metadata-effect true)} 42")]
+                            ['client 'current]))))
+ (is (= :undefined (erlang/get :metadata-effect))))

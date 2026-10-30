@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Exercise immutable scoped composition with the actual compiler and receiver.
+
+Run under a process-tree cap. The base must be the artifact-production fixture
+with base=40; the SDK must be the exact SDK recorded by that base product.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--base', type=Path, required=True)
+parser.add_argument('--elixir', type=Path, required=True)
+parser.add_argument('--out', type=Path, required=True)
+args = parser.parse_args()
+root = Path(__file__).resolve().parents[1]
+base, output = args.base.resolve(), args.out.absolute()
+metadata = json.loads((base / 'artifact.json').read_text())
+sdk = metadata['sdk']
+output.mkdir(parents=True, exist_ok=False)
+source = output / 'source'
+shutil.copytree(metadata['source'], source, symlinks=True)
+for path in [source, *source.rglob('*')]:
+    if not path.is_symlink():
+        path.chmod(path.stat().st_mode | 0o200 | (0o100 if path.is_dir() else 0))
+provider = source / 'src/artifact/demo/values.bl'
+text = provider.read_text()
+assert text.count('(def base (+ 20 20))') == 1
+provider.write_text(text.replace('(def base (+ 20 20))', '(def base (+ 20 30))'))
+report = {'base': str(base), 'sdk': sdk, 'status': 'running', 'products': {}}
+
+def run(label, argv, env=None):
+    done = subprocess.run(argv, cwd=root, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, timeout=240)
+    (output / (label + '.log')).write_text(done.stdout)
+    if done.returncode:
+        raise RuntimeError(label + ' failed: ' + done.stdout[-3000:])
+    return done.stdout
+
+
+def produce(label, parent, sources, scope='scoped'):
+    request = {'version': 2, 'scope': scope, 'base': parent, 'source': snapshot,
+               'sources': sources, 'world': None, 'exclude': [], 'ex': None,
+               'native': False, 'jobs': 1}
+    path = output / (label + '.json')
+    path.write_text(json.dumps(request))
+    run(label, ['nix-build', '--max-jobs', '0', str(root / 'nix/application-artifact.nix'),
+                '--argstr', 'requestPath', str(path), '--argstr', 'sdk', sdk,
+                '--out-link', str(output / label), '--option', 'experimental-features', 'nix-command flakes'])
+    product = (output / label).resolve()
+    result = json.loads((product / 'result.json').read_text())
+    assert not result['errors']
+    report['products'][label] = str(product)
+    return product, result
+
+
+def receiver(label, product, answer):
+    env = dict(os.environ, BL_APPLICATION_SDK=sdk, BL_APPLICATION_PRODUCT=str(product),
+               BL_APPLICATION_EXPECT_ANSWER=str(answer), BL_APPLICATION_EXPECT_BASE='50',
+               ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+    run(label + '-receiver', [str(args.elixir), str(root / 'test/scripts/nix_application_receiver.exs')], env)
+
+try:
+    run('snapshot', ['nix-build', '--max-jobs', '0', str(root / 'nix/project-snapshot.nix'),
+                    '--argstr', 'source', str(source), '--argstr', 'rootsJson', '["env.bl","src"]',
+                    '--out-link', str(output / 'snapshot'), '--option', 'experimental-features', 'nix-command flakes'])
+    snapshot = str((output / 'snapshot').resolve())
+    changed, result = produce('provider', str(base), ['src/artifact/demo/values.bl'])
+    assert len(result['units']) == 2
+    for path in (base / 'units/artifact.demo.consumer').iterdir():
+        assert path.read_bytes() == (changed / 'units/artifact.demo.consumer' / path.name).read_bytes()
+    receiver('provider', changed, 42)
+    rebuilt, result = produce('consumer', str(changed), ['src/artifact/demo/consumer.bl'])
+    assert [row['namespace'] for row in result['units']] == ['artifact.demo.values', 'artifact.demo.consumer']
+    receiver('consumer', rebuilt, 52)
+    empty, result = produce('empty', str(rebuilt), [])
+    assert len(result['units']) == 2
+    receiver('empty', empty, 52)
+    pruned, result = produce('full', None, ['src/artifact/demo/values.bl'], 'full')
+    assert [row['namespace'] for row in result['units']] == ['artifact.demo.values']
+    assert not (pruned / 'units/artifact.demo.consumer').exists()
+    for path in (base / 'ebin').glob('*Consumer*.beam'):
+        assert not (pruned / 'ebin' / path.name).exists()
+    report['status'] = 'passed'
+    print('SCOPED-APPLICATION passed', flush=True)
+except Exception as error:
+    report.update(status='failed', error=str(error))
+    raise
+finally:
+    (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
