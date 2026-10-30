@@ -3910,7 +3910,7 @@
      (erlang/error :invalid_generated_server_scaffold))
     name))))
 
-(defn- generated_class_owner [node ns]
+(defn- generated_class_identity [node ns]
  (when (and (erlang/is_map node) (erlang/== :remote (Map/get node :op))
             (erlang/== :Elixir.BeamLisp.Record (Map/get node :mod))
             (erlang/== :publish_declaration! (Map/get node :fun)))
@@ -3921,22 +3921,31 @@
                      (Map/get (erlang/hd arguments) :val))
         metadata (when (erlang/is_map descriptor) (BeamLisp.Record/declaration_metadata descriptor))]
    (when-not (and (erlang/is_tuple metadata) (erlang/== 5 (erlang/tuple_size metadata))
-                  (erlang/== ns (elem metadata 1)) (erlang/is_binary (elem metadata 2))
-                  (generated_class_call? node ns (elem metadata 2)))
+                  (or (erlang/== nil ns) (erlang/== ns (elem metadata 1))) (erlang/is_binary (elem metadata 2))
+                  (generated_class_call? node (elem metadata 1) (elem metadata 2)))
     (erlang/error :invalid_generated_class_owner))
-   (elem metadata 2))))
+   metadata)))
 
-(defn- prepare_generated_modules [node ns name attrs generated]
-  (let [server-owner (generated_server_owner node ns)
-        name (or (generated_class_owner node ns) name)]
+(defn- prepare_generated_modules
+ ([node ns name attrs generated] (prepare_generated_modules node ns name attrs generated nil))
+ ([node ns name attrs generated inventory]
+  (let [class-identity (generated_class_identity node ns)
+        ns (or ns (when class-identity (elem class-identity 1)))
+        server-owner (generated_server_owner node ns)
+        name (or (when class-identity (elem class-identity 2)) name)]
   (cond
     server-owner
     (let [prepared (Enum/map_reduce (Map/get node :stmts) generated
-                     (fn [child out] (prepare_generated_modules child ns server-owner attrs out)))]
+                     (fn [child out] (prepare_generated_modules child ns server-owner attrs out inventory)))]
       (tuple (Map/put node :stmts (elem prepared 0)) (elem prepared 1)))
     (or (generated_module_call? node ns name) (generated_class_call? node ns name))
     (let [class? (generated_class_call? node ns name)
           descriptor (Map/get (erlang/hd (Map/get node :args)) :val)
+          _ (when (and inventory
+                   (or (not class?)
+                       (erlang/not (erlang/=:= descriptor (Map/get inventory (Map/get descriptor :name))))
+                       (Map/has_key? generated (Map/get descriptor :name))))
+              (erlang/error :contextual_class_publication_mismatch))
           descriptor (Map/update! descriptor :attrs
                        (fn [current]
                          (erlang/++ current
@@ -3961,22 +3970,55 @@
       (tuple node generated)
     (and (erlang/is_map node) (erlang/== :Elixir.BeamLisp.Vector (Map/get node :__struct__)))
       (let [prepared (Enum/map_reduce node generated
-                       (fn [child out] (prepare_generated_modules child ns name attrs out)))]
+                       (fn [child out] (prepare_generated_modules child ns name attrs out inventory)))]
         (tuple (BeamLisp.Vector/new (elem prepared 0)) (elem prepared 1)))
     (erlang/is_map node)
       (let [prepared (Enum/map_reduce node generated
                        (fn [entry out]
                          (let [child (if (erlang/== :ann (elem entry 0)) (tuple (elem entry 1) out)
-                                      (prepare_generated_modules (elem entry 1) ns name attrs out))]
+                                      (prepare_generated_modules (elem entry 1) ns name attrs out inventory))]
                            (tuple (tuple (elem entry 0) (elem child 0)) (elem child 1)))))]
         (tuple (Map/new (elem prepared 0)) (elem prepared 1)))
     (erlang/is_list node)
       (Enum/map_reduce node generated
-        (fn [child out] (prepare_generated_modules child ns name attrs out)))
+        (fn [child out] (prepare_generated_modules child ns name attrs out inventory)))
     (erlang/is_tuple node)
-      (let [prepared (prepare_generated_modules (Tuple/to_list node) ns name attrs generated)]
+      (let [prepared (prepare_generated_modules (Tuple/to_list node) ns name attrs generated inventory)]
         (tuple (List/to_tuple (elem prepared 0)) (elem prepared 1)))
-    :else (tuple node generated))))
+    :else (tuple node generated)))))
+
+(defn prepare_contextual_classes!
+ "Emit the exact declared class set through the original generated-module
+  pass, replacing actual producer sites with replay. No load/init/registry
+  mutation or native authority. Literal lookalikes do not become producers."
+ [unit descriptors compiler-key input-key]
+ (BeamLisp.CompilerData/check_contextual_unit! unit)
+ (when-not (and (erlang/is_list descriptors) (erlang/=< (erlang/length descriptors) 128)
+                (erlang/is_binary compiler-key) (erlang/== 64 (erlang/byte_size compiler-key))
+                (erlang/is_binary input-key) (erlang/== 64 (erlang/byte_size input-key)))
+  (erlang/error :invalid_contextual_class_inventory))
+ (BeamLisp.CompilerData/check_compiler_data! descriptors
+   {:max-nodes 262144 :max-bytes 16777216 :max-depth 128})
+ (let [inventory (Enum/reduce descriptors {}
+                   (fn [descriptor out]
+                    (let [metadata (BeamLisp.Record/declaration_metadata descriptor) mod (Map/get descriptor :name)]
+                     (when-not (and (erlang/is_tuple metadata) (erlang/== 5 (erlang/tuple_size metadata))
+                                    (erlang/=:= 1 (elem metadata 0))
+                                    (BeamLisp.Record/declaration_kind descriptor (elem metadata 1) (elem metadata 2))
+                                    (not (Map/has_key? out mod)))
+                      (erlang/error :invalid_contextual_class_inventory))
+                     (Map/put out mod descriptor))))
+       attrs (list (tuple :bl_compiler_key compiler-key) (tuple :bl_source_hash input-key)
+                   (tuple :bl_contextual_class_version 1))
+       prepared (prepare_generated_modules unit nil nil attrs {} inventory)
+       generated (elem prepared 1)]
+  (when-not (erlang/== (Enum/sort (Map/keys inventory)) (Enum/sort (Map/keys generated)))
+   (erlang/error :contextual_class_inventory_incomplete))
+  (let [beams (Enum/sort_by (Map/values generated) (fn [beam] (Atom/to_string (elem beam 0))))]
+   {:unit (elem prepared 0) :beams beams
+    :members (Enum/map beams (fn [beam]
+                {:module (Atom/to_string (elem beam 0)) :sha256 (crypto/hash :sha256 (elem beam 1))
+                 :class-metadata (BeamLisp.Record/declaration_metadata (Map/get inventory (elem beam 0)))}))})))
 
 (defn replay_generated_module!
   "Replay an emitted actor declaration without code generation when its exact

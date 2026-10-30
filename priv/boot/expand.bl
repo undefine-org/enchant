@@ -650,6 +650,69 @@
     (reduce (fn [tail name] (anf/cons-cell (anf/var name) tail))
             (anf/empty-list-node) (reverse parameters))))))
 
+(defn- class-recipe? [recipe]
+ (contains? #{"defrecord" "deftype"} (spelling (first (:children (:node recipe))))))
+
+(defn- link-class [recipe reference state]
+ (when (:evaluation-phase state) (refuse! :contextual-phase-class-required (:node recipe)))
+ (let [unit (get-in state [:catalog :worlds (:world recipe)])
+       declaration (:declaration recipe) path (to-list (butlast (:path declaration)))
+       siblings (Enum/sort_by (Enum/filter (Map/values (:recipes unit))
+                    #(and (class-recipe? %) (= (:phase declaration) (get-in % [:declaration :phase]))
+                          (= path (to-list (butlast (get-in % [:declaration :path]))))))
+                  #(get-in % [:declaration :path]))
+       _ (when (>= (count (:class-groups state)) 128) (refuse! :contextual-class-budget (:node recipe)))
+       module (Module/concat :Elixir.BeamLisp.Contextual.Class
+                (str "C" (Base/encode16 (crypto/hash :sha256
+                  (erlang/term_to_binary (tuple :contextual-class-v1 (:world recipe) path (:phase reference)
+                                               (BeamLisp.AOT/runtime_image_key)) (list :deterministic)))
+                                      (list (tuple :case :lower)))))
+       source (compiler/class-declaration-source (s/to-reader (:node recipe))
+                 (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+       _ (when-not (= (count siblings) (count (:bindings source))) (refuse! :contextual-class-inventory (:node recipe)))
+       members (Enum/map (Enum/zip siblings (:bindings source))
+                  (fn [pair]
+                   (let [sibling (elem pair 0) d (:declaration sibling)
+                         ref {:version 1 :kind :binding-reference :world (:world sibling) :declaration (:id d)
+                              :id (b/reference-id (:selection state) (:id d) (:phase reference))
+                              :phase (:phase reference) :space (:space d)}]
+                    {:name (internal-name ref) :reference ref :declaration d :role (:role (elem pair 1))})))
+       names (set (Enum/map members (fn [member] (:name member))))
+       current (Enum/reduce members state
+                  (fn [member current]
+                   (-> current (assoc-in [:references (:name member)] (select-keys member [:reference :declaration]))
+                               (assoc-in [:link-active (:name member)] true))))
+       current (assoc current :world (:world recipe) :namespace (:namespace declaration)
+                    :phase (:phase declaration) :position (:position recipe)
+                    :reference-shift (- (:phase reference) (:phase declaration))
+                    :coordinate-prefix (Enum/concat (list 4 (+ (:phase declaration) 4096)) path)
+                    :next-scope 0 :next-declaration 0 :dependencies {})
+       node (contextualize (:node recipe) unit)
+       expanded (Enum/map_reduce (Enum/drop (:children node) 3) current
+                  (fn [part current]
+                   (if (= :list (:tag part))
+                    (let [fn-form (assoc part :children (cons (s/identifier 'fn (:context part)) (rest (:children part))))
+                          r (fn-node fn-form current)
+                          items (rn/node-items (rn/node-form (elem r 0)))]
+                     (tuple (list-reader part (cons (as-reader (first (:children part))) (rest items))) (elem r 1)))
+                    (let [resolved (resolve-symbol part current)
+                          d (:declaration resolved)
+                          r (reference-reader part resolved current false)]
+                     (when-not (= :value (:kind d)) (refuse! :contextual-protocol-binding part))
+                     (tuple (tuple :symbol (str (:namespace d) "/" (:name d))) (elem r 1))))))
+       reader (list-reader node (Enum/concat (Enum/map (Enum/take (:children node) 3) as-reader) (elem expanded 0)))
+       fields [:world :namespace :phase :position :reference-shift :coordinate-prefix :next-scope :next-declaration]
+       restored (Enum/reduce fields (elem expanded 1) (fn [current-key out] (assoc out current-key (get state current-key))))
+       dependencies (Map/drop (:dependencies (elem expanded 1)) (to-list names))
+       linked (link-dependencies dependencies restored)]
+  (Enum/reduce members (update linked :class-groups (fn [groups] (conj (or groups #{}) module)))
+   (fn [member current]
+    (-> current
+        (assoc-in [:linked (:name member)] {:version 1 :kind :class-binding :form reader
+                 :namespace (str (:namespace unit)) :module module :role (:role member)})
+        (update :link-order #(cons (:name member) %))
+        (update :link-active #(dissoc % (:name member))))))))
+
 (defn- link-reference [name descriptor state]
  (if (contains? (:linked state) name) state
   (if-let [identity (when (:evaluation-phase state) (get-in state [:phase-values name]))]
@@ -660,12 +723,9 @@
    (let [reference (:reference descriptor)
          recipe (get-in state [:catalog :recipes (:declaration reference)])]
     (when-not recipe (refuse! :contextual-definition-missing nil))
-    ;; Class constructor slots are functions, but their Source is a class
-    ;; declaration, not a defn/SDK forwarding carrier. Refuse before either
-    ;; phase metadata dispatch or initializer preparation until exact class
-    ;; members have joined artifact membership and custody.
-    (when (contains? #{"defrecord" "deftype"} (spelling (first (:children (:node recipe)))))
-     (refuse! :contextual-class-artifact-membership-required (:node recipe)))
+    (if (class-recipe? recipe)
+     (link-class recipe reference state)
+     (do
     (when-not (contains? #{:function :value} (get-in recipe [:declaration :kind]))
      (refuse! :contextual-runtime-transformer nil))
     (let [unit (get-in state [:catalog :worlds (:world recipe)])
@@ -693,7 +753,7 @@
        (-> (if phase-value? (assoc-in state [:phase-values name] result) state)
                  (assoc-in [:linked name] reader)
                  (update :link-order #(cons name %))
-                 (update :link-active #(dissoc % name)))))))))))
+                 (update :link-active #(dissoc % name)))))))))))))
 
 (defn- runtime-roots [unit state]
  ;; A namespace exports its declarations, including ones the entry never calls.
@@ -812,7 +872,7 @@
    (let [state {:catalog catalog :constructor-session session :selection (:selection catalog) :world (get-in unit [:world :key])
               :namespace (:namespace unit) :phase 0 :position 0 :reference-shift 0
               :next-scope 0 :next-declaration 0 :remaining 1000000 :macro-budget 128 :macro-depth 0 :transformer false
-              :references {} :dependencies {} :occurrences (list) :expansions (list)
+              :class-groups #{} :references {} :dependencies {} :occurrences (list) :expansions (list)
               :native-obligations (list) :linked {} :link-order (list) :link-active {}
               :transformers {} :transformer-active {} :transformer-bindings {} :transformer-protocols {} :opaque-transformers #{} :phase-values {}
               :evaluation-phase false}
@@ -834,7 +894,7 @@
        prepared (prepare-entry reader (:namespace unit) (:file unit) (:references state) (unit-links state) (elem roots 0) events)
        declaration (:declaration prepared)
        node (:body (elem (first (:entries declaration)) 3))
-       result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node :unit (:unit prepared)
+       result {:version 1 :kind :expanded-program :profile 'syntax-v1 :entry entry :reader reader :node node :unit (:unit prepared) :classes (:classes prepared)
    :provenance (catalog/provenance catalog)
    :selection (b/freeze (:selection state)) :references (:references state)
    :occurrences (Enum/reverse (:occurrences state)) :expansions (Enum/reverse (:expansions state))
