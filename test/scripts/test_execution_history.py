@@ -57,6 +57,19 @@ class ReceiptControls(unittest.TestCase):
             with self.subTest(edit=edit), self.assertRaises(ValueError):
                 history.validate_identity(dict(image, **edit), ROOT, frozen)
 
+    def test_sdk_receiver_checks_its_own_root_and_floor_instead_of_the_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk_image = Path(temporary) / 'image'
+            frozen = {'floor': {'manifest.term': 'SDK floor'}}
+            image = {'priv-root': str(sdk_image / 'priv'),
+                     'manifest-sha256': 'SDK floor', 'compiler-key': 'a' * 64}
+            history.validate_identity(image, sdk_image, frozen)
+            with self.assertRaises(ValueError):
+                history.validate_identity(image, ROOT, frozen)
+            with self.assertRaises(ValueError):
+                history.validate_identity(dict(image, **{'manifest-sha256': 'checkout floor'}),
+                                          sdk_image, frozen)
+
 
 class CaptureControls(unittest.TestCase):
     def test_solver_override_bytes_path_and_disappearance_invalidate_inputs(self):
