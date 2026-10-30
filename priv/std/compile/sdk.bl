@@ -6,73 +6,6 @@
 (defn- refuse! [kind]
  (throw (ex-info "Invalid contextual SDK selection" {:kind kind})))
 
-(defn- macro-template-symbols [value]
- (cond
-  (symbol? value) [value]
-  (or (erlang/is_list value) (vector? value) (set? value))
-   (Enum/flat_map (to-list value) macro-template-symbols)
-  (erlang/is_map value)
-   (Enum/flat_map (Map/to_list value)
-    #(Enum/concat (macro-template-symbols (elem % 0)) (macro-template-symbols (elem % 1))))
-  :else []))
-
-(defn- macro-template [value replacements splices]
- (cond
-  (erlang/is_list value)
-   (cond
-    (= 'unquote (first value))
-     (if (and (= 2 (count value)) (contains? replacements (second value))
-              (not (contains? splices (second value))))
-      (get replacements (second value)) (refuse! :world-sdk-macro-recipe))
-    (= 'unquote-splicing (first value))
-     (if (and (= 2 (count value)) (contains? splices (second value)))
-      (get replacements (second value)) (refuse! :world-sdk-macro-recipe))
-    (= 'syntax-quote (first value)) (refuse! :world-sdk-macro-recipe)
-    :else (Enum/map value #(macro-template % replacements splices)))
-  (vector? value) (mapv #(macro-template % replacements splices) value)
-  (set? value) (set (Enum/map (to-list value) #(macro-template % replacements splices)))
-  (erlang/is_map value)
-   (Map/new (Enum/map (Map/to_list value)
-    #(tuple (macro-template (elem % 0) replacements splices) (macro-template (elem % 1) replacements splices))))
-  :else value))
-
-(defn- macro-definition [binding]
- ;; Convert authenticated declaration DATA, never a live macro function. The
- ;; resulting defsyntax has the same recipe/session/hygiene path as app syntax.
- (let [form (:value binding) tail (when (erlang/is_list form) (drop 2 form))
-       tail (if (string? (first tail)) (rest tail) tail)
-       params (first tail) body (second tail)]
-  (when-not (and (= 'defmacro (first form)) (= (symbol (:name binding)) (second form))
-                 (= 2 (count tail)) (vector? params) (<= (count params) 64)
-                 (every? symbol? params) (= (count params) (count (distinct params)))
-                 (erlang/is_list body) (= 2 (count body)) (= 'syntax-quote (first body)))
-   (refuse! :world-sdk-macro-recipe))
-  (let [amp (Enum/find_index params #(= '& %))
-        _ (when (and amp (not= amp (- (count params) 2))) (refuse! :world-sdk-macro-recipe))
-        fixed (if amp (vec (take amp params)) params)
-        rest-name (when amp (last params))
-        names (if amp (conj fixed rest-name) fixed)
-        template (second body) existing (set (macro-template-symbols template))
-        holes (mapv #(symbol (str "__sdk_template_hole_" %)) (range (count names)))
-        _ (when (some #(contains? existing %) holes) (refuse! :world-sdk-macro-recipe))
-        replacements (Map/new (Enum/zip (to-list names) (to-list holes)))
-        splices (if amp #{rest-name} #{})
-        form-name 'sdk_macro_form context-name 'sdk_macro_context
-        rest-expression (Enum/reduce (range (inc (count fixed))) (list :children form-name)
-                          (fn [_ value] (list 'erlang/tl value)))
-        arguments (Map/new (Enum/map (Enum/with_index holes)
-                   (fn [pair]
-                    (tuple (elem pair 0)
-                     (if (and amp (= (elem pair 1) (count fixed)))
-                      {:kind :contextual-splice :children rest-expression}
-                      (list 'syntax-arg form-name (inc (elem pair 1))))))))]
-   (list 'defsyntax (symbol (:name binding)) [form-name context-name]
-    (list 'if (list (if amp 'erlang/>= 'erlang/==)
-                    (list 'erlang/length (list :children form-name)) (inc (count fixed)))
-     (list 'syntax-template (macro-template template replacements splices)
-      (Map/new (Enum/map (Map/to_list arguments) #(tuple (list 'quote (elem % 0)) (elem % 1)))))
-     (list 'throw :sdk-macro-arity))))))
-
 (defn capture
  "Select SDK functions, declarative syntax and closed literals in one Source world.
   Revision is a quoted logical label; authenticated provider bytes participate
@@ -92,7 +25,7 @@
        (Enum/map bindings
         (fn [binding]
          (cond
-          (= :macro (:kind binding)) (macro-definition binding)
+          (= :macro (:kind binding)) (BeamLisp.CompilerData/sdk_macro_declaration binding)
           (= :value (:kind binding)) (list 'def (symbol (:name binding)) (list 'quote (:value binding)))
           :else (BeamLisp.CompilerData/sdk_function_declaration binding))))
        source (str "; generated SDK forwarding Source, provider digest " identity "\n"

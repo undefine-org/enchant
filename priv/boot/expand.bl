@@ -288,6 +288,19 @@
        output (Enum/map (Enum/with_index forms) #(get (elem after 0) (elem % 1)))]
   (tuple (list-reader node (cons (as-reader (first (:children node))) output)) (elem after 1))))
 
+(defn- datum-macro-environment [node state]
+ ;; Preserve the ordinary &env ABI: visible local symbol -> authored spelling.
+ ;; Resolve against the SAME phase/scopes instead of exposing runtime values,
+ ;; the private constructor session or a second lexical environment registry.
+ (let [context (:context (first (:children node)))]
+  (Enum/reduce (Map/values (get-in state [:selection :by-id])) {}
+   (fn [declaration out]
+    (if (not= :local (:visibility declaration)) out
+     (let [name (:name declaration)
+           result (b/resolve (:selection state) (s/identifier name context) (:phase state) (:position state))]
+      (if (and (= :resolved (:status result)) (= (:id declaration) (get-in result [:declaration :id])))
+       (assoc out name (str name)) out)))))))
+
 (defn- macro-node [node result state]
  (when (or (<= (Map/get state :macro-budget 0) 0) (>= (Map/get state :macro-depth 0) 64))
   (refuse! :contextual-macro-budget node))
@@ -314,21 +327,30 @@
    (refuse! :contextual-macro-controller-unavailable node))
   ;; Fixed compiler interface. No caller-supplied evaluator or runtime macro Fn.
   (let [demand (demand-transformer reference state)
+        protocol (get-in (elem demand 1) [:transformer-protocols (:id reference)] 'syntax-v1)
+        arguments (if (= 'datum-v1 protocol)
+                    (cons (s/to-datum node)
+                     (cons (datum-macro-environment node state)
+                           (Enum/map (rest (:children node)) (fn [child] (s/to-datum child)))))
+                    (list node context))
         expanded (BeamLisp.AOT/eval_constructor_session! (:constructor-session state)
                    {:op :apply :fn (elem demand 0)
-                    :args [{:op :lit :val node} {:op :lit :val context}]} {}
+                    :args (Enum/map arguments (fn [value] {:op :lit :val value}))} {}
                    (get-in (elem demand 1) [:transformer-bindings (:id reference)] {}))
         materialize (fn [value]
                       (if (= :contextual-literal (:kind value))
                         (s/from-datum (:value value) (:definition-context context)) value))
         syntax (s/validate
+                (if (= 'datum-v1 protocol)
+                 (assoc (s/from-node (compiler/datum-macro-result expanded) (:use-context context))
+                        :origin (:origin node))
                  (if (= :contextual-template (:kind expanded))
                    (s/template (s/shift-phase (:template expanded) delta)
                      (Map/new (Enum/map (Map/to_list (:holes expanded))
                                 #(tuple (elem % 0) (materialize (elem % 1))))) (:id scope))
-                   (materialize expanded)))
+                   (materialize expanded))))
         syntax (s/for-compiler syntax (get-in state [:catalog :worlds (:world state) :file]))
-        trace {:transformer reference :origin (:origin node) :protocol 'syntax-v1
+        trace {:transformer reference :origin (:origin node) :protocol protocol
                :instance-shift instance-shift :lookup-shift delta
                :lookup-phase (:phase state) :position (:position result)
                :reference-shift (Map/get state :reference-shift 0)
@@ -616,7 +638,19 @@
     (when-not (= :syntax (get-in recipe [:declaration :kind]))
      (refuse! :contextual-transformer-missing nil))
     (when (contains? (:transformer-active state) key) (refuse! :contextual-transformer-cycle nil))
-    (let [r (in-definition recipe reference
+    (let [unit (get-in state [:catalog :worlds (:world recipe)])
+          declaration (compiler/declaration-source (s/to-reader (:node recipe))
+                        (assoc (BeamLisp.Compiler/new_env (str (:namespace unit))) :file (:file unit)))
+          claim (get-in declaration [:metadata :sdk-macro])]
+     (if claim
+      (let [identity (BeamLisp.AOT/bind_sdk_macro_constructor_session! (:constructor-session state) claim
+                       {:namespace (str (:namespace unit)) :form (s/to-reader (:node recipe))})
+            name (internal-name reference)
+            node (assoc-in (anf/var name) [:ann :binding-reference] reference)]
+       (tuple node (-> state (assoc-in [:transformers key] node)
+                         (assoc-in [:transformer-protocols key] 'datum-v1)
+                         (assoc-in [:transformer-bindings key] {name identity}))))
+      (let [r (in-definition recipe reference
               (assoc state :linked {} :link-order (list) :link-active {}
                            :evaluation-phase true
                            :transformer-active (assoc (:transformer-active state) key true)) true)
@@ -629,7 +663,7 @@
                                      :evaluation-phase (:evaluation-phase state))
                               (assoc-in [:transformer-bindings key] (phase-bindings linked))
                               (assoc-in [:transformers key] node))]
-     (tuple node restored))))))
+     (tuple node restored))))))))
 
 (defn phase-library
  "Produce portable first-order contextual recipes for source-free imports."
@@ -660,7 +694,7 @@
               :next-scope 0 :next-declaration 0 :remaining 1000000 :macro-budget 128 :macro-depth 0 :transformer false
               :references {} :dependencies {} :occurrences (list) :expansions (list)
               :native-obligations (list) :linked {} :link-order (list) :link-active {}
-              :transformers {} :transformer-active {} :transformer-bindings {} :phase-values {}
+              :transformers {} :transformer-active {} :transformer-bindings {} :transformer-protocols {} :phase-values {}
               :evaluation-phase false}
        ;; Each root keeps its authored position and module scope. Expansion
        ;; fuel, references, transformer caches and the constructor session are
@@ -688,7 +722,8 @@
    :linked (Enum/reverse (:link-order state)) :transformers (:transformers state)
    :constructor (assoc (BeamLisp.AOT/constructor_session_status session) :status :closed)
    :coverage {:contextual-bindings true :closed-global-linking true :binding-annotations true
-              :native-effects-complete false :legacy-datum-macros false}}]
+              :native-effects-complete false
+              :legacy-datum-macros (boolean (some #(= 'datum-v1 (:protocol %)) (:expansions state)))}}]
     (if bundle? {:program result :declaration declaration :phase-library (catalog/definitions-library catalog)} result))
    (finally (BeamLisp.AOT/close_constructor_session! session)))))
 
@@ -697,7 +732,7 @@
  "Compile a closed syntax-v1 source catalog. Entry is [namespace revision],
   both quoted symbols. No Env fallback; transformers use bounded ANF semantics."
  ([sources entry] (program sources entry []))
- ([sources entry libraries] (prepare-program* sources entry libraries false)))
+ ([sources entry libraries] (compiler/with-fresh-names #(prepare-program* sources entry libraries false))))
 
 (defn prepare-program
  "Prepare the canonical entry declaration, its exact runtime ANF projection
@@ -705,4 +740,4 @@
   share that preparation; declaration-only entries return nil. No target code
   is loaded and no runtime initializer executes during preparation."
  ([sources entry] (prepare-program sources entry []))
- ([sources entry libraries] (prepare-program* sources entry libraries true)))
+ ([sources entry libraries] (compiler/with-fresh-names #(prepare-program* sources entry libraries true))))
