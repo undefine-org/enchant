@@ -11,10 +11,10 @@ in {
     [ "deps" "deps-compile" "store" "hex" "drop" "release" "claim"
       "app-resource" "substrate" "mix-shim" ]);
   compiler = source [
-    "priv/boot" "priv/host" "priv/bootstrap/seed" "priv/build"
+    "priv/boot" "priv/host" "priv/self" "priv/bootstrap/seed" "priv/build"
     "priv/std/multi.bl" "priv/std/bl/env.bl.md" "priv/std/bl/util.bl.md"
     "priv/std/bl/loading-policy.bl" "priv/std/bl/native-declarations.bl"
-    "priv/std/proc/owner-registry.bl"
+    "priv/std/proc/owner-registry.bl" "priv/std/vm/native.bl"
     "env.bl" "bl.lock" "bin/bl-producer" "bin/bl-stage-hosts"
     "scripts/qualify-artifact-generation" "scripts/check-source-floor"
     "scripts/demo-artifact-production" "scripts/check-execution-history"

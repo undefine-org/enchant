@@ -122,19 +122,6 @@
       (= :darwin (erlang/element 2 t)) 1
       :else 0)))
 
-(defn- stage-sources!
-  "Copy the running priv's tiers into `stage`, preserving the tier layout, and
-   answer the staged sources. Staging is what makes the compiled-in path stable:
-   the payload sits under a directory named for its own hash, so compiling
-   straight from it bakes a different path into every generation."
-  [stage]
-  (c/clear! stage)
-  (doseq [t (BeamLisp.Tiers/library_names)]
-    (let [src (Path/join (BeamLisp.Tiers/priv_root) (name t))]
-      (when (File/dir? src)
-        (File/cp_r! src (Path/join stage (name t))))))
-  (vec (BeamLisp.Tiers/sources stage)))
-
 (defn- failed? [acc] (not (:ok? acc)))
 
 (defn- with-error [acc msg]
@@ -149,28 +136,6 @@
       (if (:ok? a)
         (assoc acc :stages (assoc (:stages acc) :assemble (:apps a)))
         (reduce with-error acc (map (fn [e] (str "assemble: " e)) (:errors a)))))))
-
-(defn- do-compile
-  "Stage 2: the language half, from the staged sources."
-  [acc stage scratch ebin jobs]
-  (if (failed? acc)
-    acc
-    (let [srcs (stage-sources! stage)
-          r (b/run {:sources srcs
-                    :root stage
-                    :out ebin
-                    :manifest (Path/join scratch "manifest")
-                    :log-path (Path/join scratch "build.log")
-                    :force? true
-                    :jobs jobs
-                    :log nil})]
-      (if (pos? (count (:errors r)))
-        (reduce with-error acc (map (fn [e] (str "build: " e)) (:errors r)))
-        (let [inventory (BeamLisp.AOT/write_sdk_inventory! stage (:manifest r) ebin
-                        (Path/join (Path/dirname ebin) "priv/sdk-code.term"))]
-          (assoc acc :built (:built r) :compiled (:compiled r) :cached (:cached r)
-                     :stages (assoc (:stages acc) :sources (count srcs)
-                                    :sdk-code-modules inventory)))))))
 
 (defn- do-reuse-floor
   "Package the qualified compiler floor, then leave source tiers in place. The
@@ -472,10 +437,12 @@
 
    opts: `{:out path :scratch dir :bin path :os n :jobs n}` — `:bin` defaults to
    `BL_BIN`, `:os` to the source drop's own tag. A qualified compiler floor is
-   reused by default; `:reuse-floor? false` requests full source regeneration.
+   reused; compiler production is owned by the qualified compiler artifact.
 
    → `{:ok? bool :out :tree :built :len :sha :stages {…} :errors [msg …]}`"
   [opts]
+  (when (contains? opts :reuse-floor?)
+    (throw (ex-info "Compiler production belongs to the qualified compiler artifact" {})))
   (let [out (rel/text (:out opts))
         scratch (rel/text (or (:scratch opts) (Path/join (System/tmp_dir) "bl-selfbuild")))
         bin (some-> (:bin opts) rel/text)
@@ -515,11 +482,9 @@
                 (File/mkdir_p! tree)
                 (-> base
                     (do-assemble v tree)
-                    ((fn [acc] (if (not= false (:reuse-floor? opts))
-                                 (-> (do-reuse-floor acc tree v ebin)
-                                     (do-library-compile scratch ebin jobs)
-                                     (do-app v ebin))
-                                 (do-compile acc stage scratch ebin jobs))))
+                    (do-reuse-floor tree v ebin)
+                    (do-library-compile scratch ebin jobs)
+                    (do-app v ebin)
                     (do-prime tree v)
                     (do-stamp tree (or (:provenance opts) (source-provenance)))
                     (do-pack tree bin c out os scratch)
