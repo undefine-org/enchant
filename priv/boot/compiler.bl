@@ -5161,6 +5161,68 @@
  (reduce (fn [state reference] (unit-require-function reference table env state))
          state (unit-node-dependencies node)))
 
+(defn- class-binding-link? [value]
+ (and (erlang/is_map value) (= :class-binding (:kind value))))
+
+(defn- class-link-row [name selected data env]
+ (when-not (and (erlang/=:= 1 (:version data))
+                (= #{:version :kind :form :namespace :module :role} (set (keys data)))
+                (erlang/is_binary (:namespace data))
+                (erlang/is_atom (:module data)) (not (contains? #{nil true false} (:module data)))
+                (= (:namespace data) (str (get-in selected [:declaration :namespace]))))
+  (compile-error env "Invalid selected class binding link"))
+ (let [source (class-declaration-source (:form data) (assoc env :ns (:namespace data)) (:module data))
+       binding (first (filter #(= (:role data) (:role %)) (:bindings source)))
+       declaration (:declaration selected) path (:path declaration)
+       ordinal (first (filter #(= (:role data) (:role (elem % 0))) (Enum/with_index (:bindings source))))]
+  (when-not (and binding (erlang/is_list path) (<= 1 (count path) 128)
+                 (every? #(and (int? %) (<= 0 % 1073741823)) path)
+                 (= (last path) (elem ordinal 1))
+                 (= (:name binding) (:name declaration))
+                 (= (:visibility source) (:visibility declaration))
+                 (= (if (= :type (:role binding)) :value :function) (:kind declaration)))
+   (compile-error env "Class link does not match its selected generated binding"))
+  {:name name :reference (:reference selected) :kind :class-slot :slot (fresh-var name)
+   :class-module (:module data) :class-data (dissoc data :role) :class-path (to-list (butlast path))
+   :role (:role data) :source source}))
+
+(defn- class-link-groups [rows env]
+ (let [groups (Enum/group_by (Enum/filter rows #(= :class-slot (:kind %))) (fn [row] (:class-module row)))]
+  (when (> (erlang/map_size groups) 128) (compile-error env "Too many contextual classes"))
+  (Map/new (Enum/map (Enum/sort_by (Map/to_list groups) #(Atom/to_string (elem % 0)))
+   (fn [entry]
+    (let [module (elem entry 0) members (elem entry 1) first-row (first members)
+          source (:source first-row) data (:class-data first-row)
+          expected (:bindings source)
+          _ (when-not (and (= (count expected) (count members))
+                            (= (count members) (count (Enum/uniq (map :role members))))
+                            (every? #(and (= data (:class-data %)) (= (:class-path first-row) (:class-path %))
+                                          (= (get-in first-row [:reference :world]) (get-in % [:reference :world]))
+                                          (= (get-in first-row [:reference :phase]) (get-in % [:reference :phase]))) members))
+              (compile-error env "Incomplete or conflicting selected class binding group"))
+          ordered (map (fn [binding]
+                         (or (first (filter #(= (:role binding) (:role %)) members))
+                             (compile-error env "Missing selected class binding role"))) expected)
+          plan (class-initialization-plan source (assoc env :ns (:namespace data)))
+          self-targets (Map/new (map (fn [row binding] (tuple (:reference row) (:node binding))) ordered (:bindings plan)))
+          node (a/link-bindings (class-lexical-node plan) self-targets)]
+     (tuple module {:module module :descriptor (:descriptor source) :rows ordered
+                    :slot (fresh-var "class_frame") :node node})))))))
+
+(defn- unit-append-class [group table env state]
+ (when (contains? (:class-frames state) (:module group))
+  (compile-error env "Repeated class initialization"))
+ (let [state (unit-require-node (:node group) table env state)
+       state (-> state
+                 (update :class-frames #(conj % (:module group)))
+                 (update :steps #(conj % {:op :capture :slot (:slot group)
+                                          :node (a/link-bindings (:node group) (:targets state))})))]
+  (Enum/reduce (Enum/with_index (:rows group)) state
+   (fn [pair current]
+    (let [row (elem pair 0) index (+ 1 (elem pair 1))
+          row (assoc row :node (a/remote :erlang :element (list (a/lit index) (a/var (:slot group)))))]
+     (unit-append-binding row current))))))
+
 (defn- prepare-ordered-program-unit [env references links events]
  (with-fresh-names
   (fn []
@@ -5181,12 +5243,16 @@
                                  (contains? #{:function :value} (get-in descriptor [:declaration :kind])))
                    (compile-error env "Runtime initialization is not a selected binding"))
                   (a/binding-value (:reference descriptor))
+                  (if (class-binding-link? (elem link 1))
+                   (class-link-row name descriptor (elem link 1) env)
+                   (do
                   (when (and (= :function (get-in descriptor [:declaration :kind]))
                              (not (and (= :list (rn/node-tag reader))
                                        (= :symbol (rn/node-tag head)) (= "fn" (rn/node-name head)))))
                    (compile-error env "Runtime function initializer must be an actual function form"))
                   {:name name :reference (:reference descriptor) :kind (get-in descriptor [:declaration :kind])
-                   :slot (fresh-var name) :node (compile (elem link 1) (notail env))})))
+                   :slot (fresh-var name) :node (compile (elem link 1) (notail env))})))))
+         classes (class-link-groups rows env)
          table (Map/new (Enum/map rows #(tuple (:reference %) %)))
          names (Map/new (Enum/map rows #(tuple (:name %) (:reference %))))
          _ (when-not (and (erlang/is_list events) (= (count rows) (erlang/map_size table)) (= (count rows) (erlang/map_size names)))
@@ -5198,7 +5264,9 @@
                    (let [row (get table (get names (:name event)))]
                     (when-not (and row (not (contains? (:targets state) (:reference row))))
                      (compile-error env "Repeated or unknown runtime initializer"))
-                    (unit-append-binding row (unit-require-node (:node row) table env state)))
+                    (if (= :class-slot (:kind row))
+                     (unit-append-class (get classes (:class-module row)) table env state)
+                     (unit-append-binding row (unit-require-node (:node row) table env state))))
                    :evaluate
                    (let [node (compile (:reader event) (notail env))
                          state (unit-require-node node table env state)]
@@ -5211,10 +5279,11 @@
                         (update :steps #(conj % {:op :capture :slot slot :node (a/link-bindings node (:targets state))}))
                         (assoc :entry (a/var slot))))
                    (compile-error env "Unknown runtime initialization operation")))
-                 {:initializers [] :steps [] :targets {} :active #{} :entry (a/lit nil)} events)
+                 {:initializers [] :steps [] :targets {} :active #{} :class-frames #{} :entry (a/lit nil)} events)
          state (reduce (fn [state row] (unit-require-function (:reference row) table env state)) state rows)]
-    {:version 2 :kind :compiled-contextual-unit :initializers (to-list (:initializers state))
-     :steps (to-list (:steps state)) :entry (:entry state) :exports (list)}))))
+    {:unit {:version 2 :kind :compiled-contextual-unit :initializers (to-list (:initializers state))
+            :steps (to-list (:steps state)) :entry (:entry state) :exports (list)}
+     :classes (map :descriptor (map second (Enum/sort_by (Map/to_list classes) #(Atom/to_string (elem % 0)))))}))))
 
 (defn prepare-program-unit
  "Prepare one runtime unit graph and its canonical expression entry once.
@@ -5223,7 +5292,7 @@
  [form env references links exports events]
  (when-not (and (erlang/is_list exports) (= (count exports) (count (Enum/uniq exports))))
   (compile-error env "Invalid contextual export table"))
- (let [unit (prepare-ordered-program-unit env references links events)
+ (let [prepared (prepare-ordered-program-unit env references links events) unit (:unit prepared)
        targets (Map/new (Enum/map (:initializers unit) (fn [link] (tuple (:name link) (:reference link)))))
        exported (Enum/map exports
                   (fn [name]
@@ -5235,7 +5304,7 @@
        body (a/contextual-unit-entry unit)
        env (pos-env env (rn/node-pos form))
        clause (function-clause :run (list) nil body env)]
-  {:unit unit :declaration (function-declaration "run" (list (tuple :fixed 0 :run clause)) nil env)}))
+  {:unit unit :classes (:classes prepared) :declaration (function-declaration "run" (list (tuple :fixed 0 :run clause)) nil env)}))
 
 (defn contextual-unit-factory
  "Project the same compiled graph as a first-class unit instance. Creating an

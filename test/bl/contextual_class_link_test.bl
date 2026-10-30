@@ -1,0 +1,123 @@
+(ns contextual-class-link-test
+ (:require [compiler :as compiler] [anf :as a] [lower :as lower]))
+(defn- form [text] (first (BeamLisp.Reader/read_string text "class-link.bl")))
+(defn- refused? [action]
+ (try (action) false (catch error (= :Elixir.BeamLisp.CompileError (:__struct__ error)))))
+(defn- fixture [module head fields prefix]
+ (let [namespace "class.link.logical" source (form (str "(" head " Packet " fields ")"))
+       slots (if (= "defrecord" head) [[:type "type" 'Packet :value] [:positional-constructor "ctor" '->Packet :function]
+                                        [:map-constructor "map_ctor" 'map->Packet :function]]
+                  [[:type "type" 'Packet :value] [:positional-constructor "ctor" '->Packet :function]])
+       references (Map/new (Enum/map (Enum/with_index slots)
+                    (fn [pair]
+                     (let [[role name logical kind] (elem pair 0) ordinal (elem pair 1) internal (str prefix name)]
+                      (tuple internal {:reference {:version 1 :kind :binding-reference
+                                       :world (crypto/hash :sha256 (Atom/to_string module))
+                                       :declaration (crypto/hash :sha256 (str module internal "decl"))
+                                       :id (crypto/hash :sha256 (str module internal "ref")) :space 'value :phase 0}
+                                       :declaration {:namespace (symbol namespace) :name logical :kind kind
+                                                     :visibility :public :path (list 0 ordinal)}})))))
+       links (Enum/map slots (fn [[role name _ _]]
+                (tuple (str prefix name) {:version 1 :kind :class-binding :namespace namespace
+                                         :module module :form source :role role})))]
+  {:module module :namespace namespace :references references :links links :type (str prefix "type")}))
+(defn- prepare [fixture events expression]
+ (compiler/prepare-program-unit (form expression) (compiler/new-env (:namespace fixture))
+   (:references fixture) (:links fixture) (Enum/map (:links fixture) first) events))
+(defn- events [fixture expression]
+ (list {:op :initialize :name (:type fixture)} {:op :capture :reader (form expression)}))
+(defn- execute [prepared]
+ (lower/eval-anf :Elixir.ClassLinkUnitFactory (a/contextual-unit-factory (:unit prepared))))
+
+(deftest selected-class-bindings-share-one-private-capture-and-exact-public-exports
+ (let [f (fixture :Elixir.ClassLinkRecord "defrecord" "[payload]" "")
+       p (prepare f (events f "(ctor 42)") "(ctor 42)") unit (:unit p)]
+  (try
+   (is (= 1 (count (:classes p))))
+   (is (= (:module f) (:name (first (:classes p)))))
+   (is (= 3 (count (:initializers unit))))
+   (is (= [:capture :initialize :initialize :initialize :capture] (vec (map :op (:steps unit)))))
+   (is (= (set (map :reference (vals (:references f)))) (set (:exports unit))))
+   (let [instance (execute p) exports (:exports instance)
+         lookup #(get exports (get-in f [:references % :reference]))
+         value ((:entry instance))]
+    (is (= (Map/put {:payload 42} :__struct__ (:module f)) value))
+    (is (= (:module f) (lookup "type")))
+    (is (= value (BeamLisp.Ns.Rt/invoke (lookup "map_ctor") (list {:payload 42}))))
+    (is (= :error (BeamLisp.Env/lookup (tuple (:namespace f) "Packet")))))
+   (finally (BeamLisp.Env/retire_module! (:module f))))))
+
+(deftest malformed-class-groups-refuse-before-any-publication
+ (let [f (fixture :Elixir.ClassLinkInvalid "defrecord" "[payload]" "")
+       first-link (first (:links f)) second-link (second (:links f)) third-link (nth (:links f) 2)
+       change-link (fn [key value] (assoc f :links (list first-link (tuple (first second-link) (assoc (second second-link) key value)) third-link)))
+       variants [(assoc f :links (to-list (butlast (:links f))))
+                 (change-link :role :type) (change-link :version 1.0) (change-link :module nil)
+                 (change-link :namespace "foreign")
+                 (assoc-in f [:references "ctor" :declaration :visibility] :private)
+                 (assoc-in f [:references "ctor" :declaration :path] (list 1 1))
+                 (assoc-in f [:references "ctor" :reference :phase] 1)
+                 (assoc-in f [:references "ctor" :reference :world] (crypto/hash :sha256 "foreign"))]]
+  (doseq [changed variants]
+   (is (refused? #(prepare changed (events changed "(ctor 42)") "(ctor 42)"))))
+  (is (not (erlang/module_loaded (:module f))))
+  (is (nil? (BeamLisp.Record/info (:module f))))))
+
+(deftest class-construction-stays-at-its-source-event-and-cannot-run-early-or-twice
+ (let [f (fixture :Elixir.ClassLinkOrdering "deftype" "[payload]" "")]
+  (is (refused? #(prepare f (list {:op :capture :reader (form "(ctor 42)")}
+                                 {:op :initialize :name "type"}) "(ctor 42)")))
+  (is (refused? #(prepare f (list {:op :initialize :name "type"} {:op :initialize :name "ctor"}) "type")))
+  (is (refused? #(prepare f (list) "type")))
+  (is (not (erlang/module_loaded (:module f))))))
+
+(deftest separate-selected-worlds-with-one-logical-class-name-retain-both-targets
+ (let [a (fixture :Elixir.ClassLinkWorldA "defrecord" "[payload]" "a_")
+       b (fixture :Elixir.ClassLinkWorldB "defrecord" "[payload]" "b_")
+       f (assoc a :links (Enum/concat (:links a) (:links b)) :references (merge (:references a) (:references b)))
+       expression "(erlang/+ (:payload (a_ctor 40)) (:payload (b_ctor 2)))"
+       p (prepare f (list {:op :initialize :name "a_type"} {:op :initialize :name "b_type"}
+                          {:op :capture :reader (form expression)}) expression)]
+  (try
+   (is (= 2 (count (:classes p))))
+   (is (= 6 (count (get-in p [:unit :initializers]))))
+   (let [instance (execute p)]
+    (is (= 42 ((:entry instance))))
+    (is (= #{(:module a) (:module b)}
+           #{(get (:exports instance) (get-in a [:references "a_type" :reference]))
+             (get (:exports instance) (get-in b [:references "b_type" :reference]))})))
+   (finally (BeamLisp.Env/retire_module! (:module a)) (BeamLisp.Env/retire_module! (:module b))))))
+
+(deftest inline-methods-close-over-selected-class-self-bindings-without-a-frame-cycle
+ (let [scope (BeamLisp.Env/fork) f (fixture :Elixir.ClassLinkSelf "defrecord" "[payload]" "")
+       source (form "(defrecord Packet [payload] Proto (read [this] [type (erlang/map_get :__struct__ (ctor 42))]))")
+       f (update f :links #(Enum/map % (fn [link] (tuple (first link) (assoc (second link) :form source)))))
+       p (prepare f (events f "(ctor 42)") "(ctor 42)")]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Multi/define_protocol (:namespace f) "Proto" (list "read"))
+     (let [instance (execute p) value ((:entry instance))]
+      (is (= [(:module f) (:module f)] (BeamLisp.Multi/dispatch_protocol (:namespace f) "Proto" "read" (list value))))
+      (is (= :error (BeamLisp.Env/lookup (tuple (:namespace f) "Packet")))))))
+   (finally (BeamLisp.Env/destroy scope) (BeamLisp.Env/retire_module! (:module f))))))
+
+(deftest ordinary-functions-and-values-retain-the-same-ordered-compiler-path
+ (let [f (fixture :Elixir.ClassLinkOrdinary "deftype" "[payload]" "")
+       function (assoc f :references (select-keys (:references f) ["ctor"])
+                         :links (list (tuple "ctor" (form "(fn [value] (erlang/+ value 2))"))))
+       p (prepare function (list {:op :capture :reader (form "(ctor 40)")}) "(ctor 40)")]
+  (is (= (list) (:classes p)))
+  (is (= [:initialize :capture] (vec (map :op (get-in p [:unit :steps])))))
+  (is (= 42 ((:entry (execute p))))))
+ (erlang/erase :class-link-ordinary)
+ (try
+  (let [f (fixture :Elixir.ClassLinkOrdinaryValue "deftype" "[payload]" "")
+        f (assoc f :references (select-keys (:references f) ["type"])
+                   :links (list (tuple "type" (form "(erlang/put :class-link-ordinary :ran)"))))
+        p (prepare f (events f "type") "type")]
+   (is (= (list) (:classes p)))
+   (is (= :undefined (erlang/get :class-link-ordinary)))
+   (is (= :undefined ((:entry (execute p)))))
+   (is (= :ran (erlang/get :class-link-ordinary))))
+  (finally (erlang/erase :class-link-ordinary))))
