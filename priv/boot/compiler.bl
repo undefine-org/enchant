@@ -4076,41 +4076,33 @@
                        (concat (list (rn/->tuple (list :keyword "when")) guard) (apply list body)))))))
        clauses))
 
-(defn- compile-defmacro
-  "Compile (defmacro name [params] body...) into the tree that records a macro.
+(defn- macro-header [args env]
+ ;; Publication and inert Source projection share the original datum-macro ABI.
+ (let [name-form (first args) name (rn/node-name (rn/node-form name-form))
+       more (rest args)
+       has-doc (and (seq more) (erlang/is_binary (rn/node-form (first more))) (seq (rest more)))
+       doc (when has-doc (rn/node-form (first more)))
+       author (name-author-meta name-form)]
+  (when (per-env-attr? author)
+   (compile-error env (str "defmacro " name ": ^:per-env is only valid on a `def` value, not a macro")))
+  {:name name :name-form name-form :metadata (var-meta-map doc false author)
+   :clauses (parse-fn-clauses (if has-doc (rest more) more) env)}))
 
-   A macro is a variable whose value is tagged `{:\"$macro\", fn}`. The function
-   is an ordinary compiled fn whose parameters are `&form`, `&env`, then the
-   declared parameters, so at expansion time it receives the call form, the
-   call-site environment, and the unevaluated arguments. It is interned like a
-   `def`."
-  [args env]
-  (let [name-form (rn/node-form (first args))
-        name (rn/node-name name-form)
-        _ (warn-special-name! "defmacro" name env)
-        rest-args (rest args)
-        has-doc (and (not (empty? rest-args))
-                     (erlang/is_binary (rn/node-form (first rest-args)))
-                     (not (empty? (rest rest-args))))
-        doc (when has-doc (rn/node-form (first rest-args)))
-        after-doc (if has-doc (rest rest-args) rest-args)
-        ; A macro expands at COMPILE time; a per-env (runtime, per-consumer)
-        ; instance is meaningless for one. Reject explicitly. Mirrors genesis.
-        _ (when (per-env-attr? (name-author-meta (first args))) (compile-error env (str "defmacro " name ": ^:per-env is only valid on a `def` value, not a macro")))
-        clauses (parse-fn-clauses after-doc env)
-        fn-args (macro-fn-form clauses)
-        ; macro fns use nil-rest: a trailing `& body` is nil when empty
-        fn-node (compile-fn* (apply list fn-args) true env)
-        macro-val (a/tup (list (a/lit (erlang/binary_to_atom "$macro")) fn-node))
-        intern-node (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) macro-val))
-        meta (var-meta-map doc false (name-author-meta (first args)))]
-    (if (nil? meta)
-      intern-node
-      (a/lett "value" intern-node
-              (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
-                                     (list (a/lit (:ns env)) (a/lit name)
-                                           (a/lit meta)))
-                           (a/var "value")))))))
+(defn- compile-defmacro
+ "Publish a datum macro using the same header/clauses as canonical preparation."
+ [args env]
+ (let [name (rn/node-name (rn/node-form (first args)))
+       _ (warn-special-name! "defmacro" name env)
+       header (macro-header args env)
+       fn-node (compile-fn* (apply list (macro-fn-form (:clauses header))) true env)
+       macro-val (a/tup (list (a/lit (erlang/binary_to_atom "$macro")) fn-node))
+       intern-node (a/remote (kernel-mod-env-literal) :intern (list (a/lit (:ns env)) (a/lit name) macro-val))
+       meta (:metadata header)]
+  (if (nil? meta) intern-node
+   (a/lett "value" intern-node
+    (a/doo (list (a/remote (kernel-mod-env-literal) :put_meta
+                   (list (a/lit (:ns env)) (a/lit name) (a/lit meta)))
+                 (a/var "value")))))))
 
 (defn- compile-defn
   "Compile (defn name [params] body...) — or its multi-clause form — into the
@@ -4406,9 +4398,14 @@
   [form env]
   (let [source (declaration-input form env) head (:head source) args (:args source)
         env (:env source)]
-    (when-not (and (contains? #{"def" "defn" "defn-" "defsyntax"} head) (empty? (:locals env))
+    (when-not (and (contains? #{"def" "defn" "defn-" "defsyntax" "defmacro"} head) (empty? (:locals env))
                    (= :symbol (rn/node-tag (rn/node-form (first args)))))
-      (compile-error env "Declaration Source requires def, defn, defn- or defsyntax"))
+      (compile-error env "Declaration Source requires def, defn, defn-, defmacro or defsyntax"))
+    (if (= "defmacro" head)
+     (let [header (macro-header args env)]
+      {:kind head :name (rn/node-form (:name-form header)) :metadata (:metadata header)
+       :visibility (metadata-visibility (:metadata header))
+       :value-form (rn/list-node (cons (rn/sym-node "fn") (macro-fn-form (:clauses header))))})
     (if (= "def" head)
       (let [header (value-header args)
             metadata (var-meta-map (:doc header) false (:author header))]
@@ -4430,7 +4427,7 @@
                       (cons local-name (:clauses header)))]
         {:kind head :name (rn/node-form (:name-form header)) :metadata (:metadata header)
          :visibility (metadata-visibility (:metadata header))
-         :value-form (rn/list-node (cons (rn/sym-node "fn") forms))}))))
+         :value-form (rn/list-node (cons (rn/sym-node "fn") forms))})))))
 
 (defn prepare-function-declaration
   "Prepare canonical clause/metadata data for an explicit physical target.
@@ -4963,12 +4960,22 @@
         (if (erlang/=:= :undefined previous) (erlang/erase key)
           (erlang/put key previous))))))
 
+(defn- compile-contextual-entry [form env kind]
+ (if (= :expression kind) (compile form env)
+  (let [source (declaration-input form env)]
+   (when-not (and (= :datum-macro kind) (= "fn" (:head source)))
+    (compile-error (:env source) "Contextual datum macro requires its canonical function form" form))
+   ;; Reuse the SAME clause dispatcher and nil-rest normalization as defmacro.
+   ;; No flag leaks into nested ordinary functions.
+   (compile-fn* (:args source) true (:env source)))))
+
 (defn- prepare-contextual-unit
   "Compile dependency-ordered selected definitions and an entry into one ANF
    body. Links are [internal-name Reader-form] pairs, owned by expansion's
    selected catalog. Each initializer sees only preceding links. No synthetic
    Reader let, namespace lookup, evaluator or publication is involved."
-  [form env references links]
+  ([form env references links] (prepare-contextual-unit form env references links :expression))
+  ([form env references links kind]
   (with-fresh-names
    (fn []
     (let [env (checked-context-env (assoc env :contextual-bindings references))
@@ -4994,10 +5001,10 @@
                             reference (get-in references [name :reference])]
                        (tuple {:name name :reference reference :slot variable :node init}
                               (assoc targets reference (a/var variable))))))
-          body (a/link-bindings (compile form env) (elem compiled 1))]
+          body (a/link-bindings (compile-contextual-entry form env kind) (elem compiled 1))]
      {:version 2 :kind :compiled-contextual-unit :initializers (elem compiled 0)
       :steps (Enum/map (elem compiled 0) (fn [row] {:op :initialize :reference (:reference row)}))
-      :entry body :exports (list)}))))
+      :entry body :exports (list)})))))
 
 (defn compile-contextual-unit
  "Compile a complete selected unit to canonical ANF with no unresolved globals."
@@ -5009,18 +5016,22 @@
  "Compile an explicitly parameterized selected expression to a closed callable.
   Constructor-session values are formal parameters, never free variables in a
   compiled unit. Dependency slots stay inside their parameter scope."
- [form env references links parameters]
+ ([form env references links parameters]
+  (compile-contextual-callable form env references links parameters :expression))
+ ([form env references links parameters kind]
+ (when-not (contains? #{:expression :datum-macro} kind)
+  (compile-error env "Invalid contextual callable kind"))
  (when-not (and (erlang/is_list parameters) (<= (count parameters) 255)
                 (every? #(erlang/is_binary %) parameters) (= parameters (Enum/uniq parameters)))
   (compile-error env "Invalid contextual callable parameters"))
  (let [locals (Map/new (Enum/map parameters #(tuple % %)))
-       unit (prepare-contextual-unit form (assoc env :locals locals) references links)
+       unit (prepare-contextual-unit form (assoc env :locals locals) references links kind)
        body (a/contextual-unit-body unit (:entry unit))
        callable (a/fnn (list (a/clause (Enum/map parameters #(a/pvar %)) nil body)))]
   ;; Validate the actual closed callable before returning it. The constructor
   ;; interpreter supplies session-owned values at invocation; no native grant.
   (a/contextual-unit-entry {:version 2 :kind :compiled-contextual-unit
-                           :initializers (list) :steps (list) :entry callable :exports (list)})))
+                           :initializers (list) :steps (list) :entry callable :exports (list)}))))
 
 (defn compile-contextual
   "Compile an expanded expression through the canonical compiler. This analysis

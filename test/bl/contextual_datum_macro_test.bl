@@ -1,0 +1,111 @@
+(ns contextual-datum-macro-test
+ (:require [expand-source :as catalog] [expand :as expand] [codebase.phase :as code]
+           [system.phase :as phase] [compile.world :as world] [lower :as lower] [compiler :as compiler]))
+
+(defn- unit [namespace text]
+ {:namespace namespace :revision 'current :file (str namespace ".bl") :source (str "(ns " namespace ") " text)})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.DatumMacro" (erlang/unique_integer (list :positive)))) (:node program)))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest authored-datum-macros-use-the-original-function-abi-and-first-order-facts
+ (let [sources [(unit 'provider "(defmacro add-two [value] (Elixir.BeamLisp.Vector/to_list ['erlang/+ value 2]))")
+                (unit 'client "(import-world 'provider 'current :only [add-two]) (let [value 40] (add-two value))")]
+       program (expand/program sources ['client 'current])]
+  (is (= 42 (execute program)))
+  (is (= :proved (:status (phase/check program))))
+  (is (= 'datum-v1 (:protocol (first (:expansions program)))))
+  (is (= true (get-in program [:coverage :legacy-datum-macros])))
+  (is (= true (get-in (code/dependencies program) [:coverage :transformer-images])))
+  (is (empty? (:linked program)))
+  (is (= :error (BeamLisp.Env/lookup (tuple "provider" "add-two"))))))
+
+(deftest datum-form-and-visible-local-environment-are-data-without-runtime-values
+ (let [program (expand/program
+                [(unit 'client
+                   "(defmacro inspect-local [value] (Elixir.BeamLisp.Vector/to_list ['quote {:form &form :locals &env}]))
+                    (let [outer 99 value 0] (let [value 42] (inspect-local value)))")]
+                ['client 'current])]
+  (is (= {:form '(inspect-local value) :locals {'outer "outer" 'value "value"}} (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest macro-empty-rest-and-nested-ordinary-function-rest-keep-their-distinct-abis
+ (let [program (expand/program
+                [(unit 'client
+                   "(defmacro empty-rest [& values] (erlang/=:= values nil))
+                    (defmacro pick ([value] value) ([a b & more] (if (erlang/=:= more nil) b a)))
+                    (defmacro ordinary-rest [] ((fn [& values] (erlang/=:= values nil))))
+                    [(empty-rest) (empty-rest 1) (pick 42) (pick 40 42) (pick 40 42 99) (ordinary-rest)]")]
+                ['client 'current])]
+  (is (= [true false 42 42 40 false] (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest archived-datum-macros-retain-the-original-private-phase-helpers
+ (let [provider (unit 'provider
+                  "(begin-for-syntax (defn ^:private offset [value] (erlang/+ value 2)))
+                   (defmacro answer [value] (offset value))")
+       source (unit 'client "(import-world 'provider 'current :only [answer]) (answer 40)")
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [provider])))
+       direct (expand/program [provider source] ['client 'current])
+       archived (expand/program [source] ['client 'current] [library])]
+  (is (= 42 (execute direct)))
+  (is (= 42 (execute archived)))
+  (is (= :proved (:status (phase/check archived))))
+  (is (empty? (:linked archived)))
+  (is (every? #(not (contains? % :source)) (:units library)))))
+
+(deftest declaration-order-private-imports-and-effects-refuse-before-execution
+ (erlang/erase :datum-macro-effect)
+ (try
+  (let [source (unit 'provider "(defmacro unsafe [] (erlang/put :datum-macro-effect :bad))")]
+   (is (= :phase-catalog (:kind (catalog/catalog [source]))))
+   (is (= :undefined (erlang/get :datum-macro-effect)))
+   (is (= :constructor-machine-refused
+          (kind #(expand/program [source (unit 'client "(import-world 'provider 'current :only [unsafe]) (unsafe)")]
+                                  ['client 'current]))))
+   (is (= :undefined (erlang/get :datum-macro-effect))))
+  (is (= :binding-not-yet-available
+         (kind #(expand/program [(unit 'client "(answer) (defmacro answer [] 42)")] ['client 'current]))))
+  (is (= :binding-import-private
+         (kind #(catalog/catalog [(unit 'provider "(defmacro ^:private answer [] 42)")
+                                  (unit 'client "(import-world 'provider 'current :only [answer]) 0")]))))
+  (finally (erlang/erase :datum-macro-effect))))
+
+(deftest datum-macro-source-world-uses-the-original-runtime-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "datum-macro-world-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "provider.bl")
+    "(ns provider) (defmacro answer [] 42)")
+   (File/write! (Path/join dir "client.bl")
+    "(ns client) (import-world 'provider 'current :only [answer]) (answer)")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['client 'current] :sources [{:namespace 'provider :revision 'current :file \"provider.bl\"} {:namespace 'client :revision 'current :file \"client.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))]
+    (is (= 42 (world/execute prepared [])))
+    (is (= 'datum-v1 (:protocol (first (get-in prepared [:program :expansions]))))))
+   (finally (File/rm_rf! dir)))))
+
+
+(deftest macro-callable-kind-and-context-validation-precede-compilation
+ (let [env (BeamLisp.Compiler/new_env "macro.contract")
+       form (BeamLisp.Reader/read_one "(fn [] 42)")]
+  (is (thrown? (compiler/compile-contextual-callable form env {} (list) (list) :unknown)))
+  (is (thrown? (compiler/compile-contextual-callable (BeamLisp.Reader/read_one "42") env {} (list) (list) :datum-macro)))
+  (is (thrown? (compiler/compile-contextual-callable form env false (list) (list) :datum-macro)))))
+
+(deftest ordinary-publication-and-inert-projection-share-macro-headers
+ (let [scope (BeamLisp.Env/fork)
+       source "(ns macro.header.parity) (defmacro ^:private answer \"rest doc\" [& values] (erlang/=:= values nil)) [(answer) (answer 1)]"]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [env (BeamLisp.Compiler/new_env "macro.header.parity")
+           value (compiler/eval-string source env "macro-header-parity.bl")
+           form (second (BeamLisp.Reader/read_string source))
+           declaration (compiler/declaration-source form env)
+           stored (elem (BeamLisp.Env/meta "macro.header.parity" "answer") 1)]
+      (is (= [true false] value))
+      (is (= (:metadata declaration) stored))
+      (is (= {:doc "rest doc" :private true} (select-keys stored [:doc :private]))))))
+   (finally (BeamLisp.Env/destroy scope)))))
