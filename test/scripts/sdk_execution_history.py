@@ -19,6 +19,18 @@ ROOT = Path(__file__).resolve().parents[2]
 HISTORY = runpy.run_path(str(ROOT / 'scripts/check-execution-history'))
 
 
+def accept_partial(execution, pending):
+    """Only an exact progressing prefix may hand over to the next warm VM."""
+    files = execution.get('files')
+    remaining = execution.get('remaining')
+    if (not isinstance(files, list) or not files or len(files) > len(pending)
+            or [row.get('path') for row in files] != [row['path'] for row in pending[:len(files)]]
+            or remaining != pending[len(files):]
+            or (bool(remaining) != bool(execution.get('handover')))):
+        raise ValueError('missing, reordered or nonprogressing historical handover')
+    return files, remaining
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sdk', type=Path, required=True)
@@ -71,42 +83,63 @@ def main():
         return frozen
 
     out.mkdir(parents=True)
+    # Fixture libraries resolve through the pinned test tree; SDK libraries
+    # resolve through the selected image rather than checkout priv directories.
+    (out / 'env.bl').write_text('{:paths [' + json.dumps(str(ROOT)) + ']}\n')
     frozen = capture()
+    frozen['receiver_project'] = HISTORY['digest'](out / 'env.bl')
     (out / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
-    (out / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
     receipt = {'version': 1, 'status': 'running', 'sdk': str(sdk), 'engine': selected[1],
                'cases': ids, 'complete_goal': False, 'scope': 'exact-SDK historical selector replay'}
     start = time.monotonic()
     cleanup = runpy.run_path(str(ROOT / 'scripts/qualify-candidate.py'))['stop_children']
     try:
-        with tempfile.TemporaryDirectory(prefix='bl-history-', dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
-            env = dict(os.environ, BL_EXECUTION_HISTORY_ROOT=str(ROOT),
-                       BL_EXECUTION_HISTORY_RUNTIME_ROOT=str(image), BL_EXECUTION_HISTORY_OUT=str(out),
-                       BL_TEST_SOURCE_ROOT=str(ROOT), BL_QUALIFY_CANDIDATE=str(sdk / 'bin/bl'),
-                       BL_DAEMON='off', BL_TEST_TIMES='1', XDG_RUNTIME_DIR=runtime,
-                       ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
-            for key in ['BL_ROOT', 'BL_EBIN', 'BL_BIN', 'BL_USE', 'BL_CHECKOUT_ROOT',
-                        'BL_CHECKOUT_COLD', 'BL_CHECKOUT_GENERATION', 'BL_CHECKOUT_SOURCE_GENERATION',
-                        'BEAM_LISP_PATH', 'BL_SDK_PRODUCT']:
-                env.pop(key, None)
-            try:
-                with (out / 'run.log').open('w') as log:
-                    result = subprocess.run([str(sdk / 'bin/bl'), '--cold', 'run', str(ROOT / HISTORY['DRIVER'])],
-                                            cwd=out, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                            timeout=args.timeout)
-            finally:
-                cleanup(runtime)
-        receipt['child_exit'] = result.returncode
-        if result.returncode:
-            raise RuntimeError('historical receiver failed; see retained run.log/execution.json')
-        if capture() != frozen:
+        pending, results, segments = plan, [], []
+        while pending:
+            number = len(segments)
+            (out / 'plan.json').write_text(json.dumps(pending, indent=2) + '\n')
+            with tempfile.TemporaryDirectory(prefix='bl-history-', dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
+                env = dict(os.environ, BL_EXECUTION_HISTORY_ROOT=str(ROOT),
+                           BL_EXECUTION_HISTORY_RUNTIME_ROOT=str(image), BL_EXECUTION_HISTORY_OUT=str(out),
+                           BL_EXECUTION_HISTORY_HANDOVER='1',
+                           BL_TEST_SOURCE_ROOT=str(ROOT), BL_QUALIFY_CANDIDATE=str(sdk / 'bin/bl'),
+                           BL_DAEMON='off', BL_TEST_TIMES='1', XDG_RUNTIME_DIR=runtime,
+                           ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+                for key in ['BL_ROOT', 'BL_EBIN', 'BL_BIN', 'BL_USE', 'BL_CHECKOUT_ROOT',
+                            'BL_CHECKOUT_COLD', 'BL_CHECKOUT_GENERATION', 'BL_CHECKOUT_SOURCE_GENERATION',
+                            'BEAM_LISP_PATH', 'BL_SDK_PRODUCT']:
+                    env.pop(key, None)
+                try:
+                    with (out / f'run-{number:03d}.log').open('w') as log:
+                        result = subprocess.run([str(sdk / 'bin/bl'), '--cold', 'run', str(ROOT / HISTORY['DRIVER'])],
+                                                cwd=out, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                                timeout=max(1, args.timeout - (time.monotonic() - start)))
+                finally:
+                    cleanup(runtime)
+            receipt['child_exit'] = result.returncode
+            if result.returncode:
+                raise RuntimeError('historical receiver failed; see retained per-VM logs/execution.json')
+            execution = json.loads((out / 'execution.json').read_text())
+            (out / f'execution-{number:03d}.json').write_text(json.dumps(execution, indent=2) + '\n')
+            HISTORY['validate_identity'](execution.get('image'), image, frozen)
+            files, pending = accept_partial(execution, pending)
+            results.extend(files)
+            segments.append({'files': len(files), 'handover': execution.get('handover')})
+            current = capture()
+            current['receiver_project'] = HISTORY['digest'](out / 'env.bl')
+            if current != frozen:
+                raise RuntimeError('frozen source/test/tool/SDK/floor inputs changed')
+        receipt['segments'] = segments
+        current = capture()
+        current['receiver_project'] = HISTORY['digest'](out / 'env.bl')
+        if current != frozen:
             raise RuntimeError('frozen source/test/tool/SDK/floor inputs changed')
         if subprocess.check_output([str(ROOT / 'scripts/prepare-checkout-sdk'), '--fingerprint'],
                                    cwd=ROOT, text=True).strip() != selected[1]:
             raise RuntimeError('SDK engine inputs changed')
-        execution = json.loads((out / 'execution.json').read_text())
-        HISTORY['validate_identity'](execution.get('image'), image, frozen)
-        actual = HISTORY['validate_execution'](execution.get('files'), plan)
+        execution = {'image': execution['image'], 'files': results}
+        (out / 'execution.json').write_text(json.dumps(execution, indent=2) + '\n')
+        actual = HISTORY['validate_execution'](results, plan)
         receipt.update(status='regressions-passed', frozen_inputs_unchanged=True,
                        image=execution['image'], files=len(plan), tests=len(actual),
                        assertions=sum(test['pass'] for test in actual.values()),

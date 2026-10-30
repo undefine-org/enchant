@@ -2,7 +2,7 @@
 """Run the consumer matrix and genuine small sealed image on one frozen input set.
 
 Run under systemd-run --user --collect --wait --pipe --property=MemoryMax=4G
---property=MemorySwapMax=0 --property=RuntimeMaxSec=2700. No installed files change.
+--property=MemorySwapMax=0 --property=RuntimeMaxSec=4500. No installed files change.
 """
 import argparse
 import hashlib
@@ -11,8 +11,11 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 
 
@@ -29,6 +32,41 @@ def select_boundaries(boundaries, requested):
     if unknown:
         raise ValueError('unknown boundaries: ' + ', '.join(sorted(unknown)))
     return [boundary for boundary in boundaries if boundary['id'] in requested]
+
+
+def consumer_contexts(tests, packaged):
+    """A real cold producer may publish SDK code; a sealed receiver may not."""
+    producer_only = {'test/bl/aot_sdk_constructor_staging_test.bl'}
+    if not packaged:
+        return [], list(tests)
+    return ([path for path in tests if path in producer_only],
+            [path for path in tests if path not in producer_only])
+
+
+def consumer_receipts(path, tests):
+    """Retain the existing runner's handovers and fail-closed terminal record."""
+    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    batches = [row for row in events if row.get('type') == 'batch']
+    if len(batches) != 1 or batches[0].get('process_status') != 0:
+        raise RuntimeError('missing or failed consumer batch end')
+    identity = batches[0].get('identity')
+    if (not isinstance(identity, dict) or set(identity) != {'candidate', 'source'}
+            or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v)
+                   for v in identity.values())):
+        raise RuntimeError('missing consumer artifact/source identity')
+    if any(row.get('identity') != identity for row in events):
+        raise RuntimeError('mixed consumer identities')
+    processes = [row for row in events if row.get('type') == 'process']
+    if not processes or any(row.get('process_status') != 0 for row in processes):
+        raise RuntimeError('missing or failed consumer process')
+    rows = [row for row in events if 'file' in row]
+    if len(rows) != len(tests) or {row['file'] for row in rows} != set(tests):
+        raise RuntimeError('missing, duplicate or unexpected consumer file')
+    if any(row.get('status') != 'passed'
+           or any(type(row.get(key)) is not int for key in ['tests', 'pass', 'fail', 'error'])
+           or row['tests'] <= 0 or row['pass'] <= 0 or row['fail'] or row['error'] for row in rows):
+        raise RuntimeError('empty or failed consumer coverage')
+    return rows, [row for row in events if row.get('type') == 'handover']
 
 
 def main():
@@ -131,11 +169,7 @@ def main():
         runpy.run_path(str(root / 'scripts/test_prerequisites.py'))['require'](root, tests)
     except (OSError, ValueError, RuntimeError) as error:
         parser.error(str(error))
-    # Use the existing candidate runner's isolation policy. Env isolation does
-    # not isolate VM-wide native lease ledgers from earlier file lifetimes.
-    isolation = json.loads((root / 'scripts/test-isolation.json').read_text())
-    consumer_groups = (runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['process_groups'](tests, isolation)
-                       if sdk is not None else [tests])
+    producer_tests, receiver_tests = consumer_contexts(tests, sdk is not None)
     output.mkdir(parents=True)
     workspace = None
     receiver_files = {}
@@ -177,8 +211,7 @@ def main():
         for dependency in sorted((sdk / 'lib').glob('*/ebin')):
             if not dependency.parent.name.startswith('beam_lisp-'):
                 consumer_command += ['-pa', str(dependency)]
-        consumer_command += ['-pa', str(application_link / 'ebin'), '-pa', str(workspace / 'ebin'), str(boot), '--cold', 'test',
-                             *[str(root / path) for path in tests]]
+        consumer_command += ['-pa', str(application_link / 'ebin'), '-pa', str(workspace / 'ebin'), str(boot)]
         consumer_env = {'BL_ROOT': str(workspace), 'BL_EBIN': str(workspace / 'ebin'),
                         'BL_DAEMON': 'off', 'BL_BUILD_ID': 'actual-sdk-consumer-receiver',
                         'BL_SDK_PRODUCT': str(sdk), 'BL_TEST_SOURCE_ROOT': str(root),
@@ -190,6 +223,19 @@ def main():
                         'BL_PREPARED_NATIVES': str(Path(descriptor['platform']) / 'native-products'),
                         'XDG_CACHE_HOME': str(output / 'consumer-cache'),
                         'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
+        # The established runner owns file isolation, native lifetime budget
+        # handovers, private endpoints and per-file receipts. This launcher
+        # selects only the byte-identical writable receiver already checked
+        # above; it does not replace any SDK module or custody inventory.
+        receiver_cli = output / 'consumer-cli'
+        receiver_cli.write_text('#!/bin/sh\nset -eu\n'
+            + '\n'.join('export ' + key + '=' + shlex.quote(value)
+                        for key, value in consumer_env.items() if key != 'BL_QUALIFY_CANDIDATE')
+            + '\nexec ' + shlex.join(consumer_command) + ' "$@"\n')
+        receiver_cli.chmod(0o700)
+        consumer_command = [sys.executable, str(root / 'scripts/qualify-candidate.py'),
+                            '--candidate', str(receiver_cli), '--results', str(output / 'consumer-results.jsonl'),
+                            '--timeout', '900', *receiver_tests]
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     capture_tools = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools']
 
@@ -198,7 +244,7 @@ def main():
         # known before a run; new/removed files also invalidate the candidate.
         paths = [root / 'env.bl', root / 'flake.nix', root / 'flake.lock', matrix_path, writers_path, Path(__file__).resolve()]
         if sdk is not None:
-            paths += [sdk / 'artifact.json', workspace / 'env.bl', output / 'consumer-sdk.exs']
+            paths += [sdk / 'artifact.json', workspace / 'env.bl', output / 'consumer-sdk.exs', receiver_cli]
         for directory in ['priv', 'test', 'scripts', 'native', 'tooling/drop', 'nix']:
             paths += [p for p in (root / directory).rglob('*') if p.is_file()
                       and (p.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.py', '.exs', '.erl', '.rs', '.toml', '.lock', '.so', '.nix', '.etf'))
@@ -219,6 +265,7 @@ def main():
               'mapped_boundaries': [b['id'] for b in matrix['boundaries']], 'stages': {},
               'complete_goal': False, 'full_sdk_build': False,
               'consumer_scope': 'byte-identical-copy-of-actual-selected-SDK' if sdk else 'private-Source-compiler-floor',
+              'producer_tests': producer_tests, 'receiver_tests': receiver_tests,
               'sdk': str(sdk) if sdk else None, 'engine_fingerprint': sdk_fingerprint,
               'SDK_receiver_initial_files': receiver_files,
               'preparation_seconds': round(time.monotonic() - preparation_started, 3)}
@@ -227,24 +274,28 @@ def main():
         if capture() != frozen:
             raise RuntimeError('frozen inputs changed before ' + name)
         start = time.monotonic()
-        deadline = start + (1500 if name == 'consumers' else 1000)
-        batches = ([command[:-len(tests)] + [str(root / path) for path in group]
-                    for group in consumer_groups]
-                   if name == 'consumers' and sdk is not None else [command])
+        deadline = start + (2400 if name == 'consumers' else 1000)
+        batches = [command]
         executions, status = [], 0
         with (output / (name + '.log')).open('w') as log:
             for index, batch in enumerate(batches):
                 if capture() != frozen:
                     raise RuntimeError('frozen inputs changed before process ' + str(index))
                 began = time.monotonic()
-                done = subprocess.run(batch, cwd=cwd or root,
-                                      env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {})},
-                                      stdout=log, stderr=subprocess.STDOUT,
-                                      timeout=max(1, deadline - began))
+                with tempfile.TemporaryDirectory(prefix='bl-preflight-',
+                        dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
+                    try:
+                        done = subprocess.run(batch, cwd=cwd or root,
+                                              env={**os.environ, 'BL_TEST_TIMES': '1', **(extra_env or {}),
+                                                   'XDG_RUNTIME_DIR': runtime},
+                                              stdout=log, stderr=subprocess.STDOUT,
+                                              timeout=max(1, deadline - began))
+                    finally:
+                        runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['stop_children'](runtime)
                 status = status or done.returncode
                 executions.append({'exit': done.returncode,
                                    'seconds': round(time.monotonic() - began, 3),
-                                   'tests': consumer_groups[index] if name == 'consumers' and sdk else None})
+                                   'tests': receiver_tests if name == 'consumers' and sdk else None})
         report['stages'][name] = {'exit': status, 'seconds': round(time.monotonic()-start, 3),
                                  'processes': executions}
         report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
@@ -289,13 +340,30 @@ def main():
             stage('consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root), '--seed', str(seed), '--test-timeout', '900',
                                 '--test', *[str(root / p) for p in tests]])
         else:
+            if producer_tests:
+                stage('producer-consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root),
+                      '--seed', str(seed), '--test-timeout', '900', '--test',
+                      *[str(root / path) for path in producer_tests]])
             stage('consumers', consumer_command, cwd=workspace, extra_env=consumer_env)
         log = (output / 'consumers.log').read_text()
-        summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
-        counts = re.findall(r'✓ .*?\s+(\d+) passed', log)
-        if summaries != [(str(len(group)), '0', '0') for group in consumer_groups] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
-            raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
-        report['assertions'] = sum(map(int, counts))
+        if sdk is not None:
+            rows, handovers = consumer_receipts(output / 'consumer-results.jsonl', receiver_tests)
+            report['SDK_receiver_assertions'] = sum(row['pass'] for row in rows)
+            report['consumer_handovers'] = handovers
+            producer_log = (output / 'producer-consumers.log').read_text() if producer_tests else ''
+            summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', producer_log)
+            counts = re.findall(r'✓ .*?\s+(\d+) passed', producer_log)
+            if producer_tests and (summaries != [(str(len(producer_tests)), '0', '0')]
+                                   or len(counts) != len(producer_tests) or any(int(n) == 0 for n in counts)):
+                raise RuntimeError('missing or failed Source producer coverage')
+            report['Source_producer_assertions'] = sum(map(int, counts))
+            report['assertions'] = report['SDK_receiver_assertions'] + report['Source_producer_assertions']
+        else:
+            summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
+            counts = re.findall(r'✓ .*?\s+(\d+) passed', log)
+            if summaries != [(str(len(tests)), '0', '0')] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
+                raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
+            report['assertions'] = sum(map(int, counts))
         command = [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),
                    '--out', str(output / 'sealed'), '--activation-smoke', '--source-free', '--boundary-tests', '--contextual-tests']
         if args.boundaries is not None:
