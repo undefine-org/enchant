@@ -1,0 +1,110 @@
+(ns contextual-class-catalog-test
+ (:require [expand-source :as catalog] [compiler :as compiler] [binding :as b] [syntax :as s] [expand :as expand]))
+
+(defn- unit [namespace source]
+ {:namespace namespace :revision 'current :file (str namespace ".bl") :source (str "(ns " namespace ")\n" source)})
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- resolved [catalog unit name phase]
+ (b/resolve (:selection catalog) (s/identifier name (:context unit)) phase 1073741823))
+(defn- signed [library]
+ (assoc library :digest (crypto/hash :sha256 (erlang/term_to_binary (dissoc library :digest) (list :deterministic)))))
+(defn- portable [world]
+ {:version 1 :selection (:selection world) :scopes (Enum/sort_by (Map/values (:scopes world)) #(:id %))
+  :declarations (:declarations world)})
+(defn- rebuild [unit declarations]
+ (let [old (:world unit) world (b/world (:selection old) (:scopes old) declarations)
+       by-path (Map/new (Enum/map (:declarations world) #(tuple (:path %) %)))
+       recipes (Map/new (Enum/flat_map (Map/values (:recipes unit))
+                  (fn [recipe]
+                   (if-let [declaration (get by-path (get-in recipe [:declaration :path]))]
+                    (list (tuple (:id declaration) (assoc recipe :declaration declaration))) (list)))))]
+  (assoc unit :world (portable world) :recipes recipes)))
+
+(deftest class-catalog-derives-every-binding-from-the-original-compiler-owner
+ (doseq [[head names kinds] [["defrecord" #{'Packet '->Packet 'map->Packet} #{:value :function}]
+                             ["deftype" #{'Packet '->Packet} #{:value :function}]]]
+  (let [namespace (symbol (str "catalog.n" (erlang/unique_integer (list :positive))))
+        text (str "(" head " Packet [payload])")
+        source (unit namespace text) catalog (catalog/catalog [source])
+        prepared (catalog/unit catalog namespace 'current)
+        expected (compiler/class-declaration-source (BeamLisp.Reader/read_one text) (compiler/new-env (str namespace)))
+        declarations (get-in prepared [:world :declarations]) module (get-in expected [:descriptor :name])]
+   (is (= names (set (map :name declarations))))
+   (is (= kinds (set (map :kind declarations))))
+   (is (= (set (map :name (:bindings expected))) (set (map :name declarations))))
+   (is (empty? (:expressions prepared)))
+   (is (nil? (BeamLisp.Record/info module)))
+   (is (not (erlang/module_loaded module))))))
+
+(deftest class-public-names-support-import-only-and-namespace-require-views
+ (let [provider (unit 'provider "(defrecord Packet [payload])")
+       client (assoc (unit 'client "") :source "(ns client (:require [provider :as p :refer [->Packet]]))")
+       selected (catalog/catalog [provider client]) prepared (catalog/unit selected 'client 'current)]
+  (doseq [name ['p/Packet 'p/->Packet 'p/map->Packet '->Packet]]
+   (is (= :resolved (:status (resolved selected prepared name 0)))))
+  (is (= :unbound (:status (resolved selected prepared 'p/Packet 1)))))
+ (doseq [name ['Packet '->Packet 'map->Packet]]
+  (is (= :binding-import-private
+       (kind #(catalog/catalog [(unit 'provider "(defrecord ^:private Packet [payload])")
+                                (unit 'client (str "(import-world 'provider 'current :only [" name "] )"))]))))))
+
+(deftest class-inventory-roundtrips-source-free-and-provenance-retains-logical-names
+ (let [provider (unit 'provider "(defrecord Packet [payload])")
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [provider])))
+       selected (catalog/catalog [(unit 'client "(import-world 'provider 'current :only [->Packet])")] [library])
+       prepared (catalog/unit selected 'provider 'current)
+       facts (:declarations (catalog/provenance selected))]
+  (is (not (contains? (first (:units library)) :source)))
+  (is (= #{'Packet '->Packet 'map->Packet} (set (map :name (get-in prepared [:world :declarations])))))
+  (is (= (set (keys (:recipes prepared))) (set (keys facts))))
+  (is (= #{'Packet '->Packet 'map->Packet} (set (map :name (vals facts)))))
+  (is (every? #(= 2 (get-in % [:origin :line])) (vals facts)))))
+
+(deftest consistent-archive-indexes-cannot-omit-or-rename-generated-constructors
+ (let [library (expand/phase-library [(unit 'provider "(defrecord Packet [payload])")])
+       original (first (:units library)) declarations (get-in original [:world :declarations])
+       missing (rebuild original (Enum/map (Enum/reject declarations #(= '->Packet (:name %))) #(dissoc % :id)))
+       renamed (rebuild original (Enum/map declarations #(cond-> (dissoc % :id) (= '->Packet (:name %)) (assoc :name 'forged))))
+       incomplete (signed (assoc library :units (list missing)))
+       forged (signed (assoc library :units (list renamed)))]
+  (is (= :phase-library-class-inventory (kind #(expand/encode-phase-library incomplete))))
+  (is (= :phase-library-class-inventory (kind #(expand/decode-phase-library (erlang/term_to_binary incomplete (list :deterministic))))))
+  (is (= :phase-library-recipe (kind #(expand/encode-phase-library forged))))))
+
+(deftest archived-class-privacy-is-derived-from-the-original-header
+ (let [library (expand/phase-library [(unit 'provider "(defrecord ^:private Packet [payload])")])
+       original (first (:units library))
+       public (rebuild original (Enum/map (get-in original [:world :declarations]) #(assoc (dissoc % :id) :visibility :public)))
+       forged (signed (assoc library :units (list public)))]
+  (is (= :phase-library-recipe (kind #(expand/encode-phase-library forged))))))
+
+(deftest class-demand-refuses-before-unlisted-code-or-origin-registration
+ (let [namespace (symbol (str "catalog.pending.n" (erlang/unique_integer (list :positive))))
+       provider (unit namespace "(defrecord Packet [payload])")
+       descriptor (compiler/class-declaration-source (BeamLisp.Reader/read_one "(defrecord Packet [payload])")
+                    (compiler/new-env (str namespace)))
+       module (get-in descriptor [:descriptor :name])]
+  (doseq [source [(str "(import-world '" namespace " 'current :only [->Packet]) (->Packet 42)")
+                 (str "(begin-for-syntax (import-world '" namespace " 'current :only [->Packet]))
+                       (defsyntax answer [form context] (syntax-literal (->Packet 42))) (answer)")]]
+   (is (= :contextual-class-artifact-membership-required
+          (kind #(expand/program [provider (unit 'client source)] ['client 'current])))))
+  (is (nil? (BeamLisp.Record/info module)))
+  (is (not (erlang/module_loaded module)))))
+
+(deftest class-binding-identities-ignore-display-paths-and-track-source-revisions
+ (let [provider (unit 'provider "(defrecord Packet [payload])")
+       ids (fn [source] (set (keys (:recipes (catalog/unit (catalog/catalog [source]) 'provider 'current)))))
+       original (ids provider)]
+  (is (= original (ids (assoc provider :file "/different/display/provider.bl"))))
+  (is (not= original (ids (unit 'provider "(defrecord Packet [payload extra])"))))))
+
+(deftest class-catalog-capture-never-executes-inline-protocol-bodies
+ (erlang/erase :class-catalog-effect)
+ (try
+  (let [library (expand/phase-library
+                 [(unit 'provider "(defrecord Packet [payload] Shape (area [this] (erlang/put :class-catalog-effect :bad)))")])]
+   (is (= 3 (count (:recipes (first (:units library))))))
+   (is (= library (expand/decode-phase-library (expand/encode-phase-library library))))
+   (is (= :undefined (erlang/get :class-catalog-effect))))
+  (finally (erlang/erase :class-catalog-effect))))

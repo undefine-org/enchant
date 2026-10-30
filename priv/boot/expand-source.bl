@@ -51,8 +51,31 @@
    (refuse! :phase-per-environment-value node))
   source))
 
+(defn- class-form? [node] (contains? #{"defrecord" "deftype"} (head node)))
+(defn- definition-form? [node]
+ (contains? #{"def" "defn" "defn-" "defsyntax" "defmacro" "defrecord" "deftype"} (head node)))
+
+(defn- class-source [node namespace file]
+ (compiler/class-declaration-source (s/to-reader node)
+  (assoc (BeamLisp.Compiler/new_env (str namespace)) :file file)))
+
+(defn- definition-slots [entry namespace file]
+ (let [node (:node entry) kind (head node)]
+  (if (class-form? node)
+   (let [source (class-source node namespace file)]
+    (Enum/map (Enum/with_index (:bindings source))
+     (fn [pair]
+      (let [binding (elem pair 0)]
+       {:entry (update entry :path #(Enum/concat % (list (elem pair 1))))
+        :name (:name binding) :visibility (:visibility source)
+        :kind (if (= :type (:role binding)) :value :function)}))))
+   (let [source (declaration-source node namespace file)]
+    (list {:entry entry :name (:name source) :visibility (:visibility source)
+           :kind (case kind "def" :value "defsyntax" :syntax "defmacro" :macro :function)})))))
+
 (defn- visibility [node namespace file]
- (:visibility (declaration-source node namespace file)))
+ (:visibility (if (class-form? node) (class-source node namespace file)
+                 (declaration-source node namespace file))))
 
 (defn- read-source [descriptor]
  (when-not (and (erlang/is_map descriptor)
@@ -79,12 +102,11 @@
 
 (defn- source-summary [prepared]
  (let [descriptor (:descriptor prepared) entries (:entries prepared)
-       definitions (Enum/filter entries #(contains? #{"def" "defn" "defn-" "defsyntax" "defmacro"} (head (:node %))))]
+       slots (Enum/flat_map (Enum/filter entries #(definition-form? (:node %)))
+               #(definition-slots % (:namespace descriptor) (:file descriptor)))]
   {:namespace (:namespace descriptor) :revision (:revision descriptor)
-   :public-names (Enum/sort (Enum/uniq (Enum/map
-     (Enum/filter definitions #(= :public (visibility (:node %) (:namespace descriptor) (:file descriptor))))
-     #(:value (second (:children (:node %)))))))
-   :entry? (some #(not (contains? #{"import-world" "def" "defn" "defn-" "defsyntax" "defmacro"} (head (:node %)))) entries)}))
+   :public-names (Enum/sort (Enum/uniq (Enum/map (Enum/filter slots #(= :public (:visibility %))) #(:name %))))
+   :entry? (some #(not (or (= "import-world" (head (:node %))) (definition-form? (:node %)))) entries)}))
 
 (defn- namespace-imports [ns providers]
  ;; Acceptance belongs to CompilerData. Syntax children project only exact
@@ -148,25 +170,26 @@
                           :all (Enum/map import-scopes #(:id %)))))
        entries (Enum/map entries
                   #(update % :node (fn [node] (s/from-node (s/to-reader node) context))))
-       definitions (Enum/filter entries #(contains? #{"def" "defn" "defn-" "defsyntax" "defmacro"} (head (:node %))))
+       definitions (Enum/flat_map (Enum/filter entries #(definition-form? (:node %)))
+                     #(definition-slots % (:namespace descriptor) (:file descriptor)))
        declarations (Enum/map definitions
-        (fn [entry]
-         (let [node (:node entry) name (second (:children node)) kind (head node)]
+        (fn [slot]
+         (let [entry (:entry slot) node (:node entry) kind (head node)
+               name (second (:children node))]
           (when-not (s/identifier? name) (refuse! :phase-declaration node))
-          {:namespace (:namespace descriptor) :name (:value name) :phase (:phase entry) :space 'value
-           :kind (case kind "def" :value "defsyntax" :syntax "defmacro" :macro :function)
-           :visibility (visibility node (:namespace descriptor) (:file descriptor))
+          {:namespace (:namespace descriptor) :name (:name slot) :phase (:phase entry) :space 'value
+           :kind (:kind slot) :visibility (:visibility slot)
            :available-from (if (contains? #{"defsyntax" "defmacro"} kind) (+ 1 (:position entry)) 0)
            :path (cons 0 (:path entry))
-           :scopes (s/scopes (s/identifier (:value name) context) (:phase entry))})))
+           :scopes (s/scopes (s/identifier (:name slot) context) (:phase entry))})))
        world (b/world selection scopes declarations)
        by-path (Map/new (Enum/map (:declarations world) #(tuple (:path %) %)))
        recipes (Map/new (Enum/map definitions
-                  (fn [entry]
-                   (let [declaration (Map/fetch! by-path (cons 0 (:path entry)))]
+                  (fn [slot]
+                   (let [entry (:entry slot) declaration (Map/fetch! by-path (cons 0 (:path entry)))]
                     (tuple (:id declaration) (assoc entry :declaration declaration :world (:key world)))))))
        expressions (Enum/filter entries
-                     #(not (contains? #{"import-world" "def" "defn" "defn-" "defsyntax" "defmacro"} (head (:node %))))) ]
+                     #(not (or (= "import-world" (head (:node %))) (definition-form? (:node %))))) ]
   (assoc descriptor :world world :module module :imports imports :import-scopes import-scopes
                     :recipes recipes :expressions expressions :context context)))
 
@@ -296,6 +319,30 @@
    (when-not (and (= expected scope) (= scope (get-in world [:scopes (:id expected)])))
     (refuse! :phase-library-import-scope nil)))))
 
+(defn- recipe-slot [recipe unit]
+ (let [node (:node recipe)
+       entry (if (class-form? node) (update recipe :path #(Enum/drop % -1)) recipe)
+       slots (definition-slots entry (:namespace unit) (:file unit))]
+  (if (class-form? node)
+   (let [index (last (:path recipe))]
+    (when-not (and (erlang/is_integer index) (<= 0 index) (< index (count slots)))
+     (refuse! :phase-library-recipe node))
+    (Enum/at slots index))
+   (first slots))))
+
+(defn- check-class-inventory! [unit]
+ (Enum/each (Map/values (Enum/group_by
+              (Enum/filter (Map/values (:recipes unit)) #(class-form? (:node %)))
+              #(Enum/drop (:path %) -1)))
+  (fn [recipes]
+   (let [first (first recipes) slots (definition-slots (update first :path #(Enum/drop % -1))
+                                     (:namespace unit) (:file unit))]
+    (when-not (and (= (count recipes) (count slots))
+                   (= (Enum/sort (Enum/map recipes #(last (:path %)))) (Enum/map (Enum/with_index slots) #(elem % 1)))
+                   (every? #(and (= (:node first) (:node %)) (= (:phase first) (:phase %))
+                                  (= (:position first) (:position %))) recipes))
+     (refuse! :phase-library-class-inventory (:node first)))))))
+
 (defn- restore-library-units [library]
  (Enum/map (:units library)
   (fn [unit]
@@ -330,17 +377,20 @@
      (fn [pair]
       (let [id (elem pair 0) recipe (elem pair 1) d (Map/fetch! (:by-id world) id)
             node (s/validate (:node recipe))
-            kind (head node)]
+            _ (when-not (and (definition-form? node) (erlang/is_list (:path recipe)))
+                (refuse! :phase-library-recipe node))
+            kind (head node) slot (recipe-slot (assoc recipe :node node) unit)]
        (when-not (and (= (:world recipe) (:key world)) (= (:declaration recipe) d)
                       (= (:phase recipe) (:phase d)) (= (cons 0 (:path recipe)) (:path d))
                       (erlang/is_integer (:position recipe)) (<= 1 (:position recipe) 131072)
-                      (= (:name d) (:value (second (:children node))))
-                      (= (:kind d) (case kind "def" :value "defsyntax" :syntax "defn" :function "defn-" :function "defmacro" :macro nil))
+                      (= (:name d) (:name slot)) (= (:path recipe) (get-in slot [:entry :path]))
+                      (= (:kind d) (:kind slot))
                       (= (:visibility d) (visibility node (:namespace unit) (:file unit)))
                       (= (:available-from d) (if (contains? #{"defsyntax" "defmacro"} kind) (+ 1 (:position recipe)) 0)))
         (refuse! :phase-library-recipe node))
        (when-not (= node (s/from-node (s/to-reader node) context))
-        (refuse! :phase-library-context node))))) (assoc unit :world world)))))
+        (refuse! :phase-library-context node)))))
+    (check-class-inventory! unit) (assoc unit :world world)))))
 
 (defn- checked-library [input]
  (let [library (canonical-library input)]
@@ -472,7 +522,7 @@
                       (let [recipe (elem entry 1) node (second (:children (:node recipe)))]
                        (tuple (elem entry 0)
                          {:unit (unit-key unit) :world (get-in unit [:world :key])
-                          :name (:value node) :origin (:origin node)})))))))
+                          :name (get-in recipe [:declaration :name]) :origin (:origin node)})))))))
    :imports (Enum/flat_map units
                (fn [unit]
                 (Enum/map (:imports unit)
