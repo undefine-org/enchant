@@ -24,7 +24,7 @@ import * as J from "./interop.mjs";
 import * as A from "./abi.mjs";
 import * as C from "./actor/module.mjs";
 import { exactCandidates, ENV } from "./env.mjs";
-import { LAZY_LEAVES } from "./lazy.mjs";
+import { LAZY_LEAVES, cell } from "./lazy.mjs";
 import { HOST_LEAVES, bindTable, registerModule, resolveRemote, mangle } from "./host-leaves.mjs";
 import { LINKS, RETURN_CONSTRUCTOR_SHAPES } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
@@ -208,9 +208,66 @@ const PDICT = new Map();
 const nextGensym = (() => { let n = 0; return () => ++n; })();
 const UNDEFINED = R.kw("undefined");
 const pkey = (k) => R.printStr(k);
+
+// Enum predicates consume one Enumerable cell at a time: all?/empty? must
+// not realize a deferred tail just to answer about the prefix.
+function* enumerable(c) {
+  if (c === null || c === undefined || typeof c === "string") {
+    const error = new BLError("Enumerable protocol is not implemented for " + R.printStr(c));
+    error.blType = R.kw("Elixir.Protocol.UndefinedError");
+    throw error;
+  }
+  for (let p = cell(c); p !== null; p = cell(p.t)) {
+    if (!(p instanceof Cons)) return badarg("Enumerable", c);
+    yield p.h;
+  }
+}
+
+// These are passive CompilerData shape views (host/compiler_data.bl), over
+// this host's values. They grant no Source execution or native admission.
+const field = (m, k) => m instanceof HMap ? m.get(R.kw(k), null) : null;
+const integer = (x) => typeof x === "bigint" || Number.isSafeInteger(x);
+const byteSize = (s) => new TextEncoder().encode(s).length;
+function bindingReference(value) {
+  const digest = (x) => typeof x === "string" && x.length <= 32 && byteSize(x) === 32;
+  const phase = field(value, "phase"), space = field(value, "space");
+  return value instanceof HMap && value.cnt === 7 &&
+    R.keyEq(field(value, "version"), 1) && field(value, "kind") === R.kw("binding-reference") &&
+    ["world", "declaration", "id"].every(k => digest(field(value, k))) &&
+    integer(phase) && phase >= -4096 && phase <= 4096 &&
+    space instanceof Tup && space.items.length === 2 && space.items[0] === R.kw("symbol") &&
+    typeof space.items[1] === "string" && space.items[1].length >= 1 && space.items[1].length <= 512 && byteSize(space.items[1]) <= 512;
+}
+function simpleFunctionClause(node) {
+  if (field(node, "op") !== R.kw("fn")) return null;
+  const clauses = field(node, "clauses");
+  if (!(clauses instanceof Cons) || clauses.t !== EMPTY) return null;
+  const clause = clauses.h;
+  if (!(clause instanceof HMap) || field(clause, "guard") !== null || !clause.has(R.kw("body"))) return null;
+  let pats = field(clause, "pats"), remaining = 255;
+  while (pats !== EMPTY) {
+    if (--remaining < 0 || !(pats instanceof Cons) || field(pats.h, "pop") !== R.kw("pvar") ||
+        typeof field(pats.h, "name") !== "string") return null;
+    pats = pats.t;
+  }
+  return clause;
+}
 Object.assign(LEAVES, {
+  "Elixir.BeamLisp.CompilerData/binding_reference?/1": bindingReference,
+  "Elixir.BeamLisp.CompilerData/simple_function_clause/1": simpleFunctionClause,
+  "Elixir.BeamLisp.CompilerData/catch_stack_bindings/0": () => R.hashMap(R.kw("frames"), "__STACKTRACE__", R.kw("raw"), "__STACKTRACE_RAW__"),
   "Elixir.BeamLisp.CompilerData/eager_to_list/1": (c) => list(eagerList(c)),
   // Elixir Enumerable callback convention: element first, accumulator last.
+  "Elixir.Enum/all?/2": (c, f) => { for (const x of enumerable(c)) if (!R.truthy(A.invoke(f, x))) return false; return true; },
+  "Elixir.Enum/each/2": (c, f) => { for (const x of enumerable(c)) A.invoke(f, x); return OK; },
+  "Elixir.Enum/empty?/1": (c) => enumerable(c).next().done,
+  "Elixir.Enum/group_by/2": (c, f) => {
+    let groups = R.EMPTY_MAP;
+    for (const x of enumerable(c)) { const k = A.invoke(f, x); groups = groups.assoc(k, new Cons(x, groups.get(k, EMPTY))); }
+    let out = R.EMPTY_MAP;
+    for (const [k, xs] of groups) out = out.assoc(k, R.reverseI(xs));
+    return out;
+  },
   "Elixir.Enum/map/2": (c, f) => list(eagerList(c).map((x) => A.invoke(f, x))),
   "Elixir.Enum/flat_map/2": (c, f) => list(eagerList(c).flatMap((x) => eagerList(A.invoke(f, x)))),
   "Elixir.Enum/reduce/3": (c, acc, f) => eagerList(c).reduce((a, x) => A.invoke(f, x, a), acc),
@@ -255,6 +312,15 @@ Object.assign(LEAVES, {
   "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(A.invoke(f, a, b)) ? -1 : 1))),
   "maps/filter/2": (f, m) => { let o = R.EMPTY_MAP; for (const [k, v] of m.entries()) if (R.truthy(A.invoke(f, k, v))) o = o.assoc(k, v); return o; },
   "maps/without/2": (ks, m) => { let o = m; for (const k of arr(ks)) o = o.dissoc(k); return o; },
+  "maps/with/2": (ks, m) => {
+    if (!(m instanceof HMap)) return badarg("with map", m);
+    let out = R.EMPTY_MAP;
+    for (let p = ks; p !== EMPTY; p = p.t) {
+      if (!(p instanceof Cons)) return badarg("with keys", ks);
+      if (m.has(p.h)) out = out.assoc(p.h, m.get(p.h));
+    }
+    return out;
+  },
 
   "Elixir.BeamLisp.Link/module_for/1": moduleFor,
   // a JS compile never loads beams: there is nothing for settle to rebuild

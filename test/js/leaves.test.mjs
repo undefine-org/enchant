@@ -241,3 +241,95 @@ test("actor and synchronous reference primitives use the same runtime functions"
   assert.equal(ERLANG["erlang/is_reference/1"](H.erlangRef("make_ref")()),true);
   assert.equal(H.erlangRef("is_reference")(R.vec(R.kw("ref"),1,2)),false);
 });
+
+const leaf = (key) => L.LEAVES[key];
+const cd = (name, arity) => leaf(`Elixir.BeamLisp.CompilerData/${name}/${arity}`);
+const en = (name, arity) => leaf(`Elixir.Enum/${name}/${arity}`);
+
+test("compiler Enum adapters preserve order, truthiness, exact keys and callback exceptions", () => {
+  const visited = [];
+  assert.equal(en("all?", 2)(R.list(0, "", false, 9), x => { visited.push(x); return x; }), false);
+  assert.deepEqual(visited, [0, "", false]);
+  assert.equal(en("all?", 2)(R.EMPTY, () => { throw new Error("empty callback"); }), true);
+  assert.equal(en("empty?", 1)(R.EMPTY_MAP), true);
+  assert.equal(en("empty?", 1)(R.vec(1)), false);
+  assert.equal(en("each", 2)(R.list(3, 1, 2), x => visited.push(x)), R.kw("ok"));
+  assert.deepEqual(visited.slice(3), [3, 1, 2]);
+  const failure = new Error("callback");
+  assert.throws(() => en("each", 2)(R.list(1, 2), () => { throw failure; }), e => e === failure);
+  let calls = 0;
+  const groups = en("group_by", 2)(R.list(3, 1, 2, 4), x => { calls++; return x % 2; });
+  assert.equal(calls, 4);
+  assert.deepEqual(xs(groups.get(1)), [3, 1]);
+  assert.deepEqual(xs(groups.get(0)), [2, 4]);
+  const exact = en("group_by", 2)(R.list(1, R.flt(1)), x => x);
+  assert.equal(exact.cnt, 2);
+  for (const value of [null, "abc"]) assert.throws(() => en("empty?", 1)(value), /Enumerable protocol/);
+});
+
+test("Enum predicates inspect only the required lazy prefix and maps enumerate tuples", () => {
+  let forced = 0;
+  const tail = Z.newLazy(() => { forced++; throw new Error("tail"); });
+  const prefix = new R.Cons(1, tail);
+  assert.equal(en("empty?", 1)(prefix), false);
+  assert.equal(en("all?", 2)(prefix, () => false), false);
+  assert.equal(forced, 0);
+  const values = [];
+  en("each", 2)(R.hashMap(R.kw("key"), 42), x => values.push(x));
+  assert.deepEqual(values[0].items, [R.kw("key"), 42]);
+});
+
+test("maps/with uses exact key identity, ignores missing/duplicate keys, refuses malformed lists", () => {
+  const input = R.hashMap(1, "integer", R.flt(1), "float", "other", 3);
+  const select = leaf("maps/with/2");
+  const result = select(R.list(1, 1, "missing"), input);
+  assert.equal(result.cnt, 1);
+  assert.equal(result.get(1), "integer");
+  assert.equal(result.has(R.flt(1)), false);
+  assert.equal(input.cnt, 3);
+  assert.throws(() => select(new R.Cons(1, 2), input), /with keys/);
+  assert.throws(() => select(R.EMPTY, null), /with map/);
+});
+
+test("CompilerData binding references validate byte widths, phase bounds and the closed shape", () => {
+  const valid = R.hashMap(R.kw("version"), 1, R.kw("kind"), R.kw("binding-reference"),
+    R.kw("world"), "w".repeat(32), R.kw("declaration"), "d".repeat(32), R.kw("id"), "é".repeat(16),
+    R.kw("phase"), -4096, R.kw("space"), R.sym("value"));
+  const reference = cd("binding_reference?", 1);
+  assert.equal(reference(valid), true);
+  assert.equal(reference(valid.assoc(R.kw("phase"), 4096)), true);
+  for (const [key, value] of [["phase", 4097], ["phase", R.flt(1)], ["id", "é".repeat(32)],
+    ["space", R.sym("")], ["space", R.sym("é".repeat(257))], ["version", 2]]) {
+    assert.equal(reference(valid.assoc(R.kw(key), value)), false, key);
+  }
+  assert.equal(reference(valid.assoc(R.kw("extra"), true)), false);
+  assert.equal(reference(null), false);
+});
+
+test("CompilerData plain-clause shape view is bounded, passive, and distinguishes catch stacks", () => {
+  let executed = 0;
+  const body = () => { executed++; };
+  const pat = R.hashMap(R.kw("pop"), R.kw("pvar"), R.kw("name"), "x");
+  const clause = R.hashMap(R.kw("pats"), R.list(pat), R.kw("body"), body);
+  const node = (cl) => R.hashMap(R.kw("op"), R.kw("fn"), R.kw("clauses"), R.list(cl));
+  const simple = cd("simple_function_clause", 1);
+  assert.strictEqual(simple(node(clause)), clause);
+  assert.equal(executed, 0);
+  assert.equal(simple(node(clause.assoc(R.kw("guard"), true))), null);
+  assert.equal(simple(node(clause.dissoc(R.kw("body")))), null);
+  assert.equal(simple(node(clause.assoc(R.kw("pats"), new R.Cons(pat, null)))), null);
+  assert.notEqual(simple(node(clause.assoc(R.kw("pats"), R.listFromArray(Array(255).fill(pat))))), null);
+  assert.equal(simple(node(clause.assoc(R.kw("pats"), R.listFromArray(Array(256).fill(pat))))), null);
+  const stacks = cd("catch_stack_bindings", 0)();
+  assert.equal(stacks.get(R.kw("frames")), "__STACKTRACE__");
+  assert.equal(stacks.get(R.kw("raw")), "__STACKTRACE_RAW__");
+});
+
+test("native unit validation and fingerprint serialization refuse explicitly without granting custody", () => {
+  for (const key of ["Elixir.BeamLisp.CompilerData/check_contextual_unit!/1", "erlang/term_to_binary/2"]) {
+    assert.equal(typeof leaf(key), "function");
+    assert.throws(() => leaf(key)(R.EMPTY_MAP, R.list(R.kw("deterministic"))),
+      e => e instanceof R.BLError && e.message.includes(key) && /BEAM only/.test(e.message));
+  }
+  assert.equal(leaf("Elixir.BeamLisp.CompilerData/not_a_function/1"), undefined);
+});

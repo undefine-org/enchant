@@ -411,6 +411,13 @@ export const BEAM_ONLY = Object.fromEntries([
   "Elixir.BeamLisp.Env/assert_native_framework_execution!/0",
   "Elixir.BeamLisp.Record/declaration_descriptor/4",
   "Elixir.BeamLisp.Record/declaration_kind/3",
+  // Native contextual units use the BEAM's raw-term/class validator. Keep
+  // its shared ANF callers linkable, but never replace that guard with a
+  // permissive JS shape check. Ordinary ANF traversal stays portable.
+  "Elixir.BeamLisp.CompilerData/check_contextual_unit!/1",
+  // Execution-entry fingerprints use deterministic ETF and native hashing.
+  // JS has text binaries; it cannot supply an authentic ETF byte stream.
+  "erlang/term_to_binary/2",
   "erlang/monitor/2", "erlang/exit/2",
   "Elixir.Code/ensure_loaded?/1", "crypto/hash/2", "Elixir.Base/encode16/1",
   "Elixir.BeamLisp.Trace/trace/3", "Elixir.BeamLisp.Trace/trace/4", "Elixir.BeamLisp.Trace/untrace/2",
