@@ -451,7 +451,7 @@
    :artifact-membership :source-staged :execution-entry-inventory-complete
    :contextual-artifact-membership :phase-library :contextual-binding-resolution :proved
    :restored-from-cache :contextual-runtime-membership :phase-companion
-   :role :runtime :phase :profile :entry :snapshot :program-module :phase-module :phase-digest :runtime-image
+   :role :runtime :phase :generated-class :class-members :class-metadata :record :deftype :profile :entry :snapshot :program-module :phase-module :phase-digest :runtime-image
    :input-selection :manifest :pipeline :sources :libraries :revision :file :digest :bytes
    :build-key :ns :hash :iface :factory-abi :exports :kind :binding-reference :world :declaration :id :space :symbol
    :sdk-inputs :selection :bindings :sdk :only :clauses :function :minimum-arity :arity
@@ -573,42 +573,108 @@
    {:compiler-key compiler-key :identity (runtime_image_key_for manifest)
     :prepared (elem captured 0) :native-admission false})))
 
+(defn- contextual_class_members! [classes identity source-hash]
+ (let [expected (Map/get identity :class-members)
+       actual (Enum/map classes
+                (fn [row]
+                 {:module (Atom/to_string (elem (:beam row) 0))
+                  :sha256 (crypto/hash :sha256 (elem (:beam row) 1))
+                  :class-metadata (normalized_attribute (:attributes row) :bl_generated_class)}))]
+  (when-not (and (erlang/is_list expected) (erlang/=:= expected actual))
+   (artifact_refuse :world-artifact-membership))
+  (Enum/each (Enum/zip classes actual)
+   (fn [pair]
+    (let [row (elem pair 0) entry (elem pair 1) metadata (:class-metadata entry)
+          attrs (:attributes row)]
+     (when-not (and (erlang/is_tuple metadata) (erlang/=:= 5 (erlang/tuple_size metadata))
+                    (erlang/=:= 1 (elem metadata 0))
+                    (erlang/is_binary (elem metadata 1)) (erlang/=< 1 (erlang/byte_size (elem metadata 1))) (erlang/=< (erlang/byte_size (elem metadata 1)) 512)
+                    (erlang/is_binary (elem metadata 2)) (erlang/=< 1 (erlang/byte_size (elem metadata 2))) (erlang/=< (erlang/byte_size (elem metadata 2)) 128)
+                    (Enum/member? (list :record :deftype) (elem metadata 3))
+                    (erlang/is_list (elem metadata 4)) (erlang/=< (erlang/length (elem metadata 4)) 256)
+                    (not (and (erlang/=:= :record (elem metadata 3)) (Enum/member? (elem metadata 4) "__struct__")))
+                    (not (Enum/member? (list (:program-module identity) (:phase-module identity)) (:module entry)))
+                    (Enum/all? (elem metadata 4)
+                     (fn [field] (and (erlang/is_binary field) (erlang/=< 1 (erlang/byte_size field)) (erlang/=< (erlang/byte_size field) 128))))
+                    ;; Logical owner names are independent of physical targets.
+                    ;; Actual module identity and full bytes were checked above;
+                    ;; producer provenance/native admission remain separate.
+                    (erlang/=:= nil (normalized_attribute attrs :bl_contextual_unit))
+                    (erlang/=:= nil (normalized_attribute attrs :bl_contextual_unit_version))
+                    (erlang/=:= 1 (normalized_attribute attrs :bl_contextual_class_version))
+                    (erlang/=:= 1 (normalized_attribute attrs :bl_generated_class_version))
+                    (erlang/=:= :generated-class (normalized_attribute attrs :bl_aot_artifact_role))
+                    (erlang/=:= (tuple (elem metadata 1) (elem metadata 2))
+                               (normalized_attribute attrs :bl_declaration_owner))
+                    (erlang/=:= (:compiler-key identity) (normalized_attribute attrs :bl_compiler_key))
+                    (erlang/=:= source-hash (normalized_attribute attrs :bl_source_hash))
+                    (erlang/=:= (lists/sort (:exports row))
+                     (lists/sort (erlang/++ (list (tuple :module_info 0) (tuple :module_info 1))
+                      (if (erlang/=:= :record (elem metadata 3))
+                       (list (tuple :__struct__ 0) (tuple :__struct__ 1) (tuple :__info__ 1))
+                       (list (tuple :__bl_deftype__ 0)))))))
+      (artifact_refuse :world-artifact-membership)))))))
+
 (defn contextual_unit_members!
- "Validate v3 factory membership as passive bounded data, including before
+ "Validate v4 factory and generated-class membership as passive bounded data, including before
   language bootstrap. No namespace vars, parsing or runtime activation. The
   returned record never grants Source origin or native admission."
  [verified]
  (artifact_wire_vocabulary)
  (let [beams (Map/get verified :beams)
        _ (when-not (and (erlang/is_list beams) (erlang/=< 1 (erlang/length beams))
-                        (erlang/=< (erlang/length beams) 2))
+                        (erlang/=< (erlang/length beams) 130))
+           (artifact_refuse :world-artifact-membership))
+       _ (Enum/reduce beams 268435456
+           (fn [beam remaining]
+            (when-not (and (erlang/is_tuple beam) (erlang/=:= 2 (erlang/tuple_size beam))
+                           (erlang/is_atom (elem beam 0)) (erlang/is_binary (elem beam 1))
+                           (erlang/=< (erlang/byte_size (elem beam 1)) 33554432)
+                           (erlang/=< (erlang/byte_size (elem beam 1)) remaining))
+             (artifact_refuse :world-artifact-membership))
+            (erlang/- remaining (erlang/byte_size (elem beam 1)))))
+       _ (when-not (erlang/=:= (erlang/length beams)
+                      (erlang/length (Enum/uniq (Enum/map beams (fn [beam] (elem beam 0))))))
            (artifact_refuse :world-artifact-membership))
        rows (Enum/map beams
               (fn [beam]
                (let [parsed (beam_lib/chunks (elem beam 1) (list :attributes :exports))
+                     _ (when-not (and (erlang/is_tuple parsed) (erlang/=:= :ok (elem parsed 0))
+                                       (erlang/=:= (elem beam 0) (elem (elem parsed 1) 0)))
+                         (artifact_refuse :world-artifact-membership))
                      chunks (elem (elem parsed 1) 1) attrs (Keyword/get chunks :attributes)
-                     metadata (BeamLisp.CompilerData/decode_closed_etf!
-                                (normalized_attribute attrs :bl_contextual_unit)
-                                {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})]
-                (when-not (erlang/is_map metadata) (artifact_refuse :world-artifact-membership))
+                     wire (normalized_attribute attrs :bl_contextual_unit)
+                     metadata (when wire (BeamLisp.CompilerData/decode_closed_etf! wire
+                                            {:max-nodes 16384 :max-bytes 1048576 :max-depth 64}))]
+                (when-not (or (erlang/is_map metadata)
+                              (and (erlang/=:= nil metadata)
+                                   (erlang/=:= nil (normalized_attribute attrs :bl_contextual_unit))
+                    (erlang/=:= nil (normalized_attribute attrs :bl_contextual_unit_version))
+                    (erlang/=:= 1 (normalized_attribute attrs :bl_contextual_class_version))))
+                 (artifact_refuse :world-artifact-membership))
                 {:beam beam :attributes attrs :exports (Keyword/get chunks :exports) :metadata metadata})))
-       runtimes (Enum/filter rows (fn [row] (erlang/=:= :runtime (maps/get :role (maps/get :metadata row) nil))))
-       phases (Enum/filter rows (fn [row] (erlang/=:= :phase (maps/get :role (maps/get :metadata row) nil))))]
+       runtimes (Enum/filter rows (fn [row] (and (erlang/is_map (:metadata row)) (erlang/=:= :runtime (Map/get (:metadata row) :role)))))
+       phases (Enum/filter rows (fn [row] (and (erlang/is_map (:metadata row)) (erlang/=:= :phase (Map/get (:metadata row) :role)))))
+       classes (Enum/sort_by (Enum/filter rows (fn [row] (erlang/=:= nil (Map/get row :metadata))))
+                  (fn [row] (Atom/to_string (elem (:beam row) 0))))]
   (when-not (and (erlang/=:= 1 (erlang/length runtimes)) (erlang/=< (erlang/length phases) 1)
-                 (erlang/=:= (erlang/length rows) (erlang/+ (erlang/length runtimes) (erlang/length phases))))
+                 (erlang/=:= (erlang/length rows) (erlang/+ (erlang/+ (erlang/length runtimes) (erlang/length phases)) (erlang/length classes)))
+                 (erlang/=< (erlang/length classes) 128))
    (artifact_refuse :world-artifact-membership))
   (let [runtime (erlang/hd runtimes) phase (when (erlang/> (erlang/length phases) 0) (erlang/hd phases))
         identity (maps/get :metadata runtime)
         selection (maps/get :input-selection identity nil)
+        source-hash (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary selection (list :deterministic)))
+                       (list (tuple :case :lower)))
         entry (maps/get :entry identity nil) exports (maps/get :exports identity nil)
         runtime-image (maps/get :runtime-image identity nil) compiler-key (maps/get :compiler-key identity nil)
         snapshot (maps/get :snapshot identity nil) phase-digest (maps/get :phase-digest identity nil)
         archive (when phase (normalized_attribute (maps/get :attributes phase) :bl_contextual_phase_library))]
    (when-not (and
     (erlang/=:= (lists/sort (list :version :profile :compiler-key :runtime-image :entry :snapshot :factory-abi
-                                  :exports :program-module :phase-module :phase-digest :input-selection :role))
+                                  :exports :program-module :phase-module :phase-digest :input-selection :class-members :role))
                 (lists/sort (maps/keys identity)))
-    (erlang/=:= 3 (maps/get :version identity nil)) (erlang/=:= 'syntax-v1 (maps/get :profile identity nil))
+    (erlang/=:= 4 (maps/get :version identity nil)) (erlang/=:= 'syntax-v1 (maps/get :profile identity nil))
     (erlang/=:= 2 (maps/get :factory-abi identity nil))
     (erlang/is_binary compiler-key) (erlang/=:= 64 (erlang/byte_size compiler-key))
     (erlang/is_map entry) (erlang/=:= :Elixir.BeamLisp.Vector (maps/get :__struct__ entry nil))
@@ -637,9 +703,11 @@
     (erlang/=:= compiler-key (Map/get (Map/get verified :manifest) :compiler-key))
     (erlang/=/= (maps/get :program-module identity nil) (maps/get :phase-module identity nil))
     (erlang/=:= (maps/get :program-module identity nil) (Atom/to_string (elem (maps/get :beam runtime) 0)))
-    (Enum/all? rows
-      (fn [row] (and (erlang/=:= (maps/remove :role identity) (maps/remove :role (maps/get :metadata row)))
-                      (erlang/=:= 3 (normalized_attribute (maps/get :attributes row) :bl_contextual_unit_version))
+    (Enum/all? (erlang/++ runtimes phases)
+      (fn [row] (and (erlang/=:= nil (normalized_attribute (:attributes row) :bl_contextual_class_version))
+                      (erlang/=:= source-hash (normalized_attribute (:attributes row) :bl_source_hash))
+                      (erlang/=:= (maps/remove :role identity) (maps/remove :role (maps/get :metadata row)))
+                      (erlang/=:= 4 (normalized_attribute (maps/get :attributes row) :bl_contextual_unit_version))
                       (erlang/=:= compiler-key (normalized_attribute (maps/get :attributes row) :bl_compiler_key)))))
     (or (erlang/=:= nil phase)
         (and (erlang/=:= (maps/get :phase-module identity nil) (Atom/to_string (elem (maps/get :beam phase) 0)))
@@ -648,7 +716,10 @@
                                           (tuple :module_info 0) (tuple :module_info 1))))
              (erlang/is_binary archive) (erlang/=:= phase-digest (crypto/hash :sha256 archive)))))
     (artifact_refuse :world-artifact-membership))
-   {:runtime runtime :phase phase :phase-library-bytes archive :metadata identity :native-admission false})))
+   (contextual_class_members! classes identity source-hash)
+   {:runtime runtime :phase phase :classes classes
+    :runtime-beams (erlang/++ (list (:beam runtime)) (Enum/map classes (fn [row] (:beam row))))
+    :phase-library-bytes archive :metadata identity :native-admission false})))
 
 (defn- compile_source_unit [source opts]
   ;; Even an already initialized namespace cannot evaluate source while an
