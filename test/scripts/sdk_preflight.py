@@ -29,10 +29,9 @@ with tempfile.TemporaryDirectory(prefix='sdk-preflight-control-') as temporary:
     }
     for name, text in additions.items():
         (candidate / 'priv/std' / ('preflight-' + name + '.bl')).write_text(text)
-    # The driver remains the exact repository command; --root selects only
-    # candidate data. Copy its BL entry as required by the command's contract.
+    # --root selects candidate data. A candidate's analysis driver never runs.
     (candidate / 'scripts').mkdir()
-    shutil.copyfile(root / 'scripts/sdk-preflight.bl', candidate / 'scripts/sdk-preflight.bl')
+    (candidate / 'scripts/sdk-preflight.bl').write_text('(throw :candidate-driver-ran)')
     report_path = candidate / 'report.json'
     done = subprocess.run([root / 'scripts/sdk-preflight', '--sdk', args.sdk,
                            '--root', candidate, '--out', report_path], timeout=340)
