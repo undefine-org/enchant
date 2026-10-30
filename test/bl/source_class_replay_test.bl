@@ -1,0 +1,70 @@
+(ns source-class-replay-test (:require [anf :as a] [reload.source-producer :as producer]))
+(defn- reason [action] (try (action) nil (catch-raw [kind reason stack] reason)))
+(defn- calls [node]
+ (loop [todo (list node) found []]
+  (if (empty? todo) found
+   (let [node (first todo)]
+    (recur (Enum/concat (a/executable-children node) (rest todo))
+     (if (= :remote (:op node)) (conj found [(:mod node) (:fun node)]) found))))))
+(defn- unit [entry]
+ {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list) :entry entry :exports (list)})
+(defn- replay [descriptor digest]
+ (a/remote :Elixir.BeamLisp.Record :replay_declaration! (list (a/lit descriptor) (a/lit digest))))
+(defn- fixture [action]
+ (let [namespace (str "source.replay.n" (erlang/unique_integer (list :positive)))
+       descriptor (BeamLisp.Record/declaration_descriptor namespace "Handle" :deftype (list "payload"))
+       module (:name descriptor) beam (BeamLisp.Emit/compile_descriptor descriptor)
+       expected (elem (elem (beam_lib/md5 (second beam)) 1) 1)]
+  (try
+   (BeamLisp.Env/publish_binaries! (list beam) "source-class-replay")
+   (let [schemas (BeamLisp.Env/source_class_schemas! {module expected} (list module))]
+    (action descriptor expected (get schemas module)))
+   (finally (BeamLisp.Env/retire_module! module)))))
+
+(deftest contextual-factory-replay-selects-only-the-fixed-native-boundary
+ (fixture (fn [descriptor expected schema]
+  (let [call (replay descriptor expected)
+        output (:expression (producer/specialize-unit (unit call) {:native-modules #{}}))
+        targets (calls output)]
+   (is (some #(= [:Elixir.BeamLisp.Env :replay_source_class!] %) targets))
+   (is (not (some #(= [:Elixir.BeamLisp.Record :replay_declaration!] %) targets)))
+   (is (some #(= [:Elixir.BeamLisp.Env :consume_generation_factory!] %) targets))
+   (is (not (some #(= [:Elixir.BeamLisp.Env :replay_source_class!] %)
+           (calls (:expression (producer/specialize {:op :fn :clauses (list {:pats (list) :guard nil :body call}) :ann {}}
+                    {:source-ingress true :native-modules #{}}))))))))))
+
+(deftest literal-replay-shapes-stay-data-and-computed-operands-refuse
+ (let [literal (a/lit (replay {} "digest"))
+       output (:expression (producer/specialize-unit (unit literal) {:native-modules #{}}))]
+  (is (not (some #(= [:Elixir.BeamLisp.Env :replay_source_class!] %) (calls output)))))
+ (is (= :invalid-contextual-class-replay
+        (:kind (ex-data (reason #(producer/specialize-unit
+          (unit (a/lett "computed" (a/lit {}) (a/remote :Elixir.BeamLisp.Record :replay_declaration! (list (a/var "computed") (a/lit "digest")))))
+          {:native-modules #{}})))))))
+
+(deftest canonical-preloaded-replay-plan-does-not-initialize-or-grant-source-access
+ (fixture (fn [descriptor expected schema]
+  (let [module (:name descriptor)]
+   (is (= module (BeamLisp.Env/source_class_replay_identity! descriptor expected expected schema)))
+   (is (nil? (BeamLisp.Record/info module)))
+   (is (= :refuse (BeamLisp.Env/source_native_route :Elixir.BeamLisp.Env :replay_source_class!)))
+   (is (= :unadmitted_class_initializer (reason #(BeamLisp.Env/replay_source_class! descriptor expected))))))))
+
+(deftest replay-plan-refuses-wrong-schema-code-or-canonical-descriptor
+ (fixture (fn [descriptor expected schema]
+  (doseq [[d expected md5 schema] [[descriptor expected expected nil]
+                                  [descriptor "wrong" expected schema]
+                                  [descriptor expected nil schema]
+                                  [(assoc descriptor :foreign true) expected expected schema]
+                                  [descriptor expected expected (erlang/setelement 5 schema (list "different"))]]]
+   (is (= :source_class_initializer_mismatch
+          (reason #(BeamLisp.Env/source_class_replay_identity! d expected md5 schema)))))
+  (is (nil? (BeamLisp.Record/info (:name descriptor)))))))
+
+(deftest factory-completion-requires-the-whole-frozen-class-inventory
+ (is (BeamLisp.Env/source_factory_classes_complete? {} {}))
+ (is (BeamLisp.Env/source_factory_classes_complete? {:class :schema} {:class :completed}))
+ (is (not (BeamLisp.Env/source_factory_classes_complete? {:class :schema} {})))
+ (is (not (BeamLisp.Env/source_factory_classes_complete? {:class :schema} {:class :initializing})))
+ (is (not (BeamLisp.Env/source_factory_classes_complete? {:class :schema} {:foreign :completed})))
+ (is (not (BeamLisp.Env/source_factory_classes_complete? nil {}))))
