@@ -33,6 +33,7 @@ let
   # metadata must not compile the same Rust source/toolchain a second time.
   compiled = import ./native-compile.nix {
     inherit pkgs source manifest library desktop memoryMiB;
+    version = builtins.unsafeDiscardStringContext (if legacy then manifest.package.version else workspace.version);
     package = manifest.package.name;
     flags = { workspace = !legacy; member = request.member or "."; };
   };

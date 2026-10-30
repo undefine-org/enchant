@@ -2,7 +2,7 @@
 # The real crate is always built from the complete captured Source. Only the
 # preparatory dependency build sees stubs, and none of its selected-crate
 # artifacts can cross into the real build.
-{ pkgs, source, manifest, package, library, flags, desktop, memoryMiB }:
+{ pkgs, source, manifest, version, package, library, flags, desktop, memoryMiB }:
 let
   lib = pkgs.lib;
   member = flags.member;
@@ -59,7 +59,7 @@ let
     (builtins.unsafeDiscardStringContext (builtins.readFile (source + "/Cargo.lock")));
   common = {
     pname = "bl-native-code-${package}";
-    version = manifest.package.version;
+    inherit version;
     cargoLock.lockFile = lock;
     CARGO_TARGET_DIR = "target";
     doCheck = false;
@@ -75,6 +75,13 @@ let
       "--manifest-path" (if member == "." then "Cargo.toml" else member + "/Cargo.toml")
       "--package" package
     ];
+  } // lib.optionalAttrs flags.workspace {
+    # Local Cargo package identities include their physical workspace path.
+    # Give dependency and final builds the same root as well as the same bytes.
+    postUnpack = ''
+      mv "$sourceRoot" source
+      sourceRoot=source
+    '';
   };
   bounded = import ./bounded-build.nix {
     inherit pkgs memoryMiB;
