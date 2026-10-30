@@ -92,6 +92,8 @@ record the exact sources their constructors read, including macro providers.
 An unchanged unit is verified and copied into the new SDK. A changed input
 recompiles its affected units; removing a namespace removes its artifacts.
 Compiler identity and runtime image identity must match before reuse.
+Each unit also checks its tier key. SDK production shares dependency parsing
+within one source snapshot and rechecks captured inputs after the pass closes.
 
 Nix tracks dependency compilation, compiler qualification and SDK libraries
 through separate source selections. Editing an ordinary SDK library preserves
