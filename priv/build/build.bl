@@ -267,61 +267,8 @@
          (try (Process/sleep 150) (catch _e2 nil))
          (thunk))))
 
-(defn- sdk-artifact-profile [root]
-  ;; The profile selects compilation semantics, never SDK authority. Only the
-  ;; running SDK's actual source tree belongs in this producer. Its existing
-  ;; inventory writer still validates every emitted declaration and byte.
-  (let [root (when root (BeamLisp.AOT/physical_sdk_path root))
-        sdk (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))]
-    (when-not (and root (= root sdk))
-      (throw (ex-info "SDK artifact production requires the actual SDK source root"
-               {:kind :sdk-artifact-source-root})))
-    (let [files (Enum/sort (BeamLisp.Tiers/sources root))]
-      (when-not (<= 1 (count files) 4096)
-        (throw (ex-info "SDK artifact source inventory is too large" {:kind :sdk-artifact-source-bound})))
-      (let [[inputs _] (Enum/map_reduce files 16777216
-                         (fn [file remaining]
-                           (let [source (BeamLisp.Loader/read_source file) size (erlang/byte_size source)]
-                             (when-not (<= size (min remaining 1048576))
-                               (throw (ex-info "SDK artifact source input is too large" {:kind :sdk-artifact-source-bound})))
-                             (tuple (tuple file (crypto/hash :sha256 source)) (- remaining size)))))
-            inputs (Map/new inputs)
-            identity (Base/encode16
-                       (crypto/hash :sha256 (erlang/term_to_binary
-                         (tuple :sdk_artifact_profile_v1 root (BeamLisp.AOTCache/compiler_key)
-                           (BeamLisp.AOTCache/build_key) (BeamLisp.AOT/runtime_image_key)
-                           (Enum/sort (Map/to_list inputs))) (list :deterministic)))
-                       (list (tuple :case :lower)))]
-        {:root root :inputs inputs :id identity}))))
-
-(defn- artifact-cache-key [profile source-key]
-  (Base/encode16
-    (crypto/hash :sha256 (erlang/term_to_binary (tuple :sdk_artifact_unit_v1 (:id profile) source-key)))
-    (list (tuple :case :lower))))
-
-(defn- prepare-artifact-file! [path profile]
-  (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
-        selected (tuple :symbol namespace)
-        workspace (BeamLisp.AOT/open_workspace
-                    {:version 2 :phase-imports (list 'core 'sugar) :roots (list (:root profile))
-                     :sources (list {:namespace selected :file path})} {})]
-    (try
-      (let [prepared (BeamLisp.AOT/prepare_unit workspace selected)
-            stage (Path/join (System/tmp_dir!) (str "bl-sdk-artifact-" (erlang/unique_integer (list :positive))))]
-        (doseq [input (Map/values (:inputs prepared))]
-          (when-not (= (:digest input) (get (:inputs profile) (:file input)))
-            (throw (ex-info "SDK preparation read outside its frozen source inventory"
-                     {:kind :sdk-artifact-input-changed :source (:file input)}))))
-        (File/mkdir! stage)
-        (try
-          (BeamLisp.AOT/emit_unit prepared stage)
-          (let [verified (BeamLisp.AOT/verify_unit stage)]
-            {:modules (Enum/map (:beams verified) first) :beams (:beams verified)})
-          (finally (File/rm_rf! stage))))
-      (finally (BeamLisp.AOT/close_workspace! workspace)))))
-
 (defn- build-one-unfenced
-  [path key tkey closure-key out log prepared syntax? profile]
+  [path key tkey closure-key out log prepared syntax?]
   (when log (log (str "  " path)))
   (let [result (try
                  (if (:preparation-error prepared)
@@ -335,39 +282,24 @@
                  (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))]
     {:path path :key key :tkey tkey :closure-key closure-key
      :cached? (and (some? prepared) (not (:new-artifact? prepared))) :result result
-     :preparation-key (:id profile)
-     :replay? (or (some? profile) syntax? (and (= :ok (first result))
+     :replay? (or syntax? (and (= :ok (first result))
                          (BeamLisp.AOTCache/output_replay_complete? (to-list (second result)) out)))}))
 
-(defn- prepare-one [path key tkey cache-key closure-key out log profile]
-  ;; Capture immutable inputs before waiting. Bound preparation by the wave's
-  ;; job window, then publish serially instead of creating local lock contention.
+(defn- prepare-one [path key tkey cache-key closure-key out log]
   (let [syntax? (or (toolchain-source? path (BeamLisp.Tiers/priv_root))
                     (BeamLisp.Loader/replayable_source? (BeamLisp.Loader/read_source path)))
         candidate (when cache-key (BeamLisp.AOTCache/prepare_fetch cache-key closure-key key))
-        cached (when (and candidate (or profile syntax? (BeamLisp.AOTCache/prepared_replay_complete? candidate))) candidate)
-        prepared (or cached (when profile
-                              (try (assoc (prepare-artifact-file! path profile) :new-artifact? true)
-                                (catch error {:preparation-error (ex-message error) :new-artifact? true}))))]
+        cached (when (and candidate (or syntax? (BeamLisp.AOTCache/prepared_replay_complete? candidate))) candidate)]
     {:path path :key key :tkey tkey :closure-key closure-key :out out :log log
-     :prepared prepared :syntax? syntax? :profile (when profile {:id (:id profile)})}))
+     :prepared cached :syntax? syntax?}))
 
 (defn- publish-one [input]
-  ;; Serialize publication into this VM's code table. Kernel workspace custody
-  ;; in run protects output/log mutations against other OS processes.
   (let [run (fn [] (build-one-unfenced (:path input) (:key input) (:tkey input)
-                    (:closure-key input) (:out input) (:log input) (:prepared input) (:syntax? input) (:profile input)))
+                    (:closure-key input) (:out input) (:log input) (:prepared input) (:syntax? input)))
         waiting (erlang/monotonic_time :microsecond)]
-   (if (:profile input)
-    ;; No code publication occurs in this profile. The output's kernel claim
-    ;; owns filesystem materialization; it needs no VM code-publication lock.
-    (assoc (run) :lock-wait-us 0)
     (global/trans (tuple :bl_build_unit_publication (erlang/self))
-      (fn []
-        (let [wait-us (- (erlang/monotonic_time :microsecond) waiting)]
-          (assoc (run)
-                 :lock-wait-us wait-us)))
-      (list (erlang/node))))))
+      (fn [] (assoc (run) :lock-wait-us (- (erlang/monotonic_time :microsecond) waiting)))
+      (list (erlang/node)))))
 
 ; ── parallel wave ────────────────────────────────────────────────────────────
 
@@ -540,10 +472,7 @@
                                      (fn [path]
                                        (let [tkey (source-key root path)]
                                          (prepare-one path (get (:key p) path) tkey (when cache? tkey)
-                                           (when cache?
-                                             (if (:artifact-profile p)
-                                               (artifact-cache-key (:artifact-profile p) (get (:key p) path))
-                                               (get (:key p) path))) out log (:artifact-profile p)))) window)]
+                                           (when cache? (get (:key p) path)) out log))) window)]
                       (into acc (pmap-ordered 1 publish-one prepared))))
                   [] (chunks-of (max 1 jobs) paths))]
     (fold-results st results out log-path)))
@@ -939,15 +868,7 @@
         all-excluded? (and (not (empty? all-sources)) (not (empty? excl)) (empty? sources))
         out (:out opts)
         _ (File/mkdir_p! out)
-        _ (when-not (contains? #{nil true false} (:sdk-artifacts? opts))
-            (throw (ex-info "SDK artifact profile must be a boolean" {:kind :sdk-artifact-profile})))
-        profile (when (= true (:sdk-artifacts? opts)) (sdk-artifact-profile (:root opts)))
-        _ (when profile
-            (doseq [path sources]
-              (when-not (contains? (:inputs profile) (BeamLisp.AOT/physical_sdk_path path))
-                (throw (ex-info "SDK artifact selection is outside its source inventory"
-                         {:kind :sdk-artifact-source-root :source path})))))
-        _ (when-not profile (code/add_patha (String/to_charlist out)))
+        _ (code/add_patha (String/to_charlist out))
         force? (= true (:force? opts))
         ; WHAT THIS RUN OWNS. `:full` is the default because it is what every
         ; existing caller means; only an explicit `:scoped` — or a scope we
@@ -1027,14 +948,13 @@
                                     " — no load order satisfies it; break one edge"
                                     " (resolve that namespace by name at the point of use)"))
                              (:cycles p)))
-        p (assoc p :artifact-profile profile)
         part (partition-plan p (or root (BeamLisp.Tiers/priv_root))) hashes (into {} (map (fn [n] [(:path n) (:hash n)]) (:order p)))
         ; A refused source is never compiled, even under `:force?` — force
         ; rebuilds, it does not run entry programs the project excluded.
         nodes-by-path (into {} (map (fn [n] [(:path n) n]) (:order p)))
         todo? (fn [state path] (and (not (contains? refused path))
                                     (or force?
-                                        (not (blog/fresh? state path (get (:key p) path) (source-key root path) out (:id profile)))
+                                        (not (blog/fresh? state path (get (:key p) path) (source-key root path) out))
                                         (not (namespace-output-fresh? (get nodes-by-path path)
                                                (get (:key p) path) (source-key root path) out
                                                (:modules (get (:sources state) path)))))))
@@ -1092,8 +1012,6 @@
       ; ONE compacted log and its projection, written together at the END.
       ; Everything before this line was appended as it happened; this is the
       ; point where the log stops being history and becomes the current state.
-      (when (and profile (not= (:id profile) (:id (sdk-artifact-profile root))))
-        (throw (ex-info "SDK source inventory changed during artifact production" {:kind :sdk-artifact-input-changed})))
       (blog/write! lpath (blog/facts-of st))
       (write-manifest mpath projection)
       (let [nat (if (:native opts) (if (contains? opts :native-declarations)
@@ -1131,7 +1049,11 @@
           {:built 0 :compiled 0 :cached 0 :lock-wait-us 0 :manifest {} :ex-built 0
            :native {:built 0 :cached 0 :artifacts [] :errors []}
            :errors [(str "World build refused: " (ex-message error))]}))
-        (run_unclaimed opts))
+        (if (:sdk-artifacts? opts)
+          (do (BeamLisp.Loader/ensure_loaded "unit-store")
+              (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "unit-store" "produce!")
+                (list (assoc opts :sources (select-sources (:sources opts) (:exclude opts))))))
+          (run_unclaimed opts)))
        (finally (when-not ours (c/release! out)))))))
 
 (defn run

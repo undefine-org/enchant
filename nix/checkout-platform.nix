@@ -1,10 +1,11 @@
 # Pinned prerequisites selected before starting a checkout VM.
 { pkgs, erlang, elixir, executor ? import ./command-executor.nix { inherit pkgs; },
-  root ? ../., includeDesktop ? builtins.pathExists (root + "/native/wry_webview/Cargo.toml") }:
+  root ? ../., includeDesktop ? builtins.pathExists (root + "/native/wry_webview/Cargo.toml"),
+  nativeProducts ? null, includeRecipes ? true }:
 let
-  recipes = import ./artifact-platform.nix { inherit pkgs; commandExecutor = executor; };
+  recipes = import ./artifact-platform.nix { inherit pkgs includeRecipes; commandExecutor = executor; };
   server = import ./native-products.nix { inherit pkgs root; };
-  products = server.products // pkgs.lib.optionalAttrs includeDesktop {
+  products = if nativeProducts != null then nativeProducts else server.products // pkgs.lib.optionalAttrs includeDesktop {
     wry_webview = import ./native-artifact.nix {
     requestJson = builtins.toJSON {
       version = 1;

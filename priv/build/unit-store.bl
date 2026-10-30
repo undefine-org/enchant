@@ -1,0 +1,125 @@
+;; One artifact producer for SDK library units. Reuse is bound to the inputs
+;; the constructor read, not the inventory of the containing SDK/workspace.
+(ns unit-store (:require [build-log :as blog]))
+
+(defn- hex [bytes] (Base/encode16 bytes (list (tuple :case :lower))))
+(defn- digest [text] (hex (crypto/hash :sha256 text)))
+(defn- read-index [directory]
+  (when (and directory (File/regular? (Path/join directory "unit-index.json")))
+    (Jason/decode! (File/read! (Path/join directory "unit-index.json")))))
+
+(defn- relative-input [input root]
+  (let [sdk (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+        file (BeamLisp.AOT/physical_sdk_path (:file input))
+        scope (if (String/starts_with? file (str root "/")) "root" "sdk")
+        base (if (= scope "root") root sdk)]
+    (when-not (String/starts_with? file (str base "/"))
+      (throw (ex-info "Unit read outside its immutable source roots" {:file file})))
+    {"namespace" (:namespace input) "scope" scope
+     "file" (Path/relative_to file base) "sha256" (digest (:source input))}))
+
+(defn- inputs-current? [inputs root selected]
+  (and (seq inputs)
+    (every? (fn [input]
+      (let [namespace (get input "namespace")
+            path (or (get selected namespace) (BeamLisp.Loader/source_path namespace))
+            base (if (= "root" (get input "scope")) root
+                     (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root)))
+            current (when path (BeamLisp.AOT/physical_sdk_path path))]
+        (and current (File/regular? current)
+             (= (get input "file") (Path/relative_to current base))
+             (= (get input "sha256") (digest (BeamLisp.Loader/read_source current)))))) inputs)))
+
+(defn- verify-inputs! [verified inputs namespace]
+  (let [actual (into {} (map (fn [row] [(:namespace row) (hex (:sha256 row))])
+                            (get-in verified [:manifest :inputs])))
+        expected (into {} (map (fn [row] [(get row "namespace") (get row "sha256")]) inputs))]
+    (when-not (and (= namespace (get-in verified [:manifest :namespace]))
+                   (= actual expected) (contains? actual namespace))
+      (throw (ex-info "Unit reuse inputs disagree with verified artifact" {:namespace namespace})))))
+
+(defn produce!
+  "Produce complete units under the caller's output custody. Prior products
+   are data: verification and source re-resolution precede every restoration."
+  [opts]
+  (let [out (:out opts) root (BeamLisp.AOT/physical_sdk_path (:root opts))
+        sdk (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+        _ (when-not (and root (= root sdk))
+            (throw (ex-info "SDK unit production requires the actual SDK source root" {})))
+        paths (vec (:sources opts))
+        selected (into {} (map (fn [path]
+                     [(BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path)) path]) paths))
+        _ (when-not (and (= (count selected) (count paths))
+                         (every? (fn [namespace] (and (string? namespace)
+                                    (Regex/match? (Regex/compile! "^[A-Za-z_][A-Za-z0-9_.-]*$") namespace))) (keys selected)))
+            (throw (ex-info "SDK unit selection contains duplicate or invalid namespaces" {})))
+        key (BeamLisp.AOTCache/compiler_key)
+        runtime (hex (BeamLisp.AOT/runtime_image_key))
+        previous (or (:previous opts) (System/get_env "BL_PREVIOUS_UNIT_STORE") out)
+        candidate (read-index previous)
+        old (when (and (= 1 (get candidate "version")) (= key (get candidate "compiler"))
+                       (= runtime (get candidate "runtime"))) (get candidate "units"))
+        _ (File/mkdir_p! (Path/join out ".units"))
+        result
+        (reduce (fn [acc path]
+          (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
+                prior (get old namespace)
+                directory (Path/join (Path/join out ".units") namespace)
+                reusable (and (not (:force? opts)) prior
+                              (inputs-current? (get prior "inputs") root selected))
+                [verified inputs compiled?]
+                (if reusable
+                  (let [source (Path/join (Path/join previous ".units") namespace)
+                        verified (BeamLisp.AOT/verify_unit source)]
+                    (verify-inputs! verified (get prior "inputs") namespace)
+                    (when (not= source directory)
+                      (File/rm_rf! directory) (File/cp_r! source directory))
+                    [verified (get prior "inputs") false])
+                  (let [workspace (BeamLisp.AOT/open_workspace
+                          {:version 2 :phase-imports (list 'core 'sugar) :roots (list root)
+                           :sources (list {:namespace (symbol namespace) :file path})} {})]
+                    (try
+                      (let [prepared (BeamLisp.AOT/prepare_unit workspace (symbol namespace))
+                            _ (File/rm_rf! directory)
+                            _ (BeamLisp.AOT/emit_unit prepared directory)
+                            inputs (to-list (sort-by #(get % "namespace")
+                                      (map #(relative-input % root) (vals (:inputs prepared)))))
+                            verified (BeamLisp.AOT/verify_unit directory)]
+                        (verify-inputs! verified inputs namespace)
+                        [verified inputs true])
+                      (finally (BeamLisp.AOT/close_workspace! workspace)))))
+                same? (and (not compiled?) (= previous out)
+                       (every? (fn [[module bytes]]
+                         (= (tuple :ok bytes) (File/read (Path/join out (str (Atom/to_string module) ".beam")))))
+                         (:beams verified)))
+                modules (vec (map first (:beams verified)))
+                _ (doseq [[module bytes] (:beams verified)]
+                    (File/write! (Path/join out (str (Atom/to_string module) ".beam")) bytes))
+                entry {:hash (BeamLisp.AOT/ns_closure_hash namespace)
+                       :key (BeamLisp.AOTCache/key_for_source path) :modules modules
+                       :digests (blog/artifact-digests out modules)
+                       :preparation-key (digest (Jason/encode! inputs))}]
+            (when-let [log (:log opts)]
+              (when-not same? (log (str (if compiled? "compile " "restore ") namespace))))
+            (-> acc
+              (update (if compiled? :compiled :cached) + (if same? 0 1))
+              (update :built + (if same? 0 1))
+              (assoc-in [:manifest path] entry)
+              (assoc-in [:units namespace] {"file" (Path/relative_to path root) "inputs" inputs}))))
+          {:built 0 :compiled 0 :cached 0 :errors [] :manifest {} :units {} :ex-built 0
+           :lock-wait-us 0 :native {:built 0 :cached 0 :artifacts [] :errors []}} paths)]
+    ;; Full production owns removal. No old beam can survive outside the new
+    ;; manifest; partial/scoped production preserves its explicit predecessor.
+    (doseq [namespace (keys old)]
+      (when-not (contains? (:units result) namespace)
+        (let [directory (Path/join (Path/join out ".units") namespace)]
+          (when (File/dir? directory)
+            (doseq [[module _] (:beams (BeamLisp.AOT/verify_unit directory))]
+              (File/rm (Path/join out (str (Atom/to_string module) ".beam")))))
+          (File/rm_rf! directory))))
+    (File/write! (Path/join out "unit-index.json")
+      (Jason/encode! {"version" 1 "compiler" key "runtime" runtime "units" (:units result)}))
+    (when-let [manifest (:manifest opts)] (File/write! manifest (erlang/term_to_binary (:manifest result))))
+    (when-let [log (:log-path opts)]
+      (blog/write! log (blog/facts-of (blog/state-of-manifest (:manifest result)))))
+    (dissoc result :units)))

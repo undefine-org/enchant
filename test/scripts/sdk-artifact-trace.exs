@@ -9,6 +9,9 @@ tracer = spawn_link(fn ->
           Map.update(counts, module, 1, &(&1 + 1))
         end)
         loop.(loop, next)
+      {:trace, _, :call, {BeamLisp.AOT, :load_unit, [file, _options]}} ->
+        IO.puts("SDK-ARTIFACT-SOURCE-INIT " <> inspect(String.slice(file, 0, 100)))
+        loop.(loop, publications)
       {:finish, caller, ticket, targets} when caller == parent ->
         selected = Map.take(publications, targets)
         send(caller, {:sdk_artifact_publications, ticket,

@@ -11,9 +11,11 @@
 # with no RUNPATH, so the drop does not depend on /nix/store paths existing on
 # the target. On NixOS that loader is nix-ld's, which resolves libc from the HOST:
 # the host's glibc must therefore be >= the drop's symbol floor, which is the point.
-{ pkgs, rustPkgs, erlang, elixir, includeDesktop ? false }:
+{ pkgs, rustPkgs, erlang, elixir, includeDesktop ? false, previousSdk ? null }:
 let
   inherit (pkgs) lib;
+
+  sources = import ./producer-sources.nix { inherit lib; };
 
   # ── hex libraries, exactly the digests bl.lock names ─────────────────────────
   lockLines = lib.filter (l: lib.hasPrefix "[:dep " l) (lib.splitString "\n" (builtins.readFile ../bl.lock));
@@ -57,6 +59,16 @@ let
     inherit pkgs erlang elixir;
     executor = drop-tools;
     inherit includeDesktop;
+  };
+  compilerNatives = { names = [ "lazy_memo" ]; bundle = import ./native-bundle.nix {
+    inherit pkgs;
+    products = { inherit (nativeProducts.products) lazy_memo; };
+  }; };
+  compilerPlatform = import ./checkout-platform.nix {
+    inherit pkgs erlang elixir;
+    executor = drop-tools;
+    nativeProducts = { inherit (nativeProducts.products) lazy_memo; };
+    includeRecipes = false;
   };
 
   # ── pinned binary assets ─────────────────────────────────────────────────────
@@ -143,26 +155,32 @@ let
   };
   producerTools = [ erlang elixir pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
 
-  dependencies = worker (pkgs.stdenv.mkDerivation {
-    pname = "beam-lisp-dependencies";
-    version = "1";
-    inherit src;
+  dependencies = worker (pkgs.runCommand "beam-lisp-dependencies-1" {
     nativeBuildInputs = producerTools;
-    dontConfigure = true;
-    dontFixup = true;
-    buildPhase = setupTree + ''
-      ./bin/bl deps verify --cold
-      ./bin/bl deps compile --cold
-    '';
-    installPhase = ''
-      mkdir -p "$out"
-      cp -a --no-preserve=ownership "$XDG_CACHE_HOME/beam_lisp/ebin" "$out/ebin"
-    '';
-  });
+  } ''
+    export HOME=$TMPDIR/home XDG_CACHE_HOME=$TMPDIR/home/.cache BL_DAEMON=off
+    export LANG=C.UTF-8 ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1'
+    export BL_ROOT=/build/dependency-tool/lib/beam_lisp-0.1.0
+    export BL_DEPENDENCY_SOURCE=${sources.dependencies}
+    export BL_DEPENDENCY_NATIVE=${nativeProducts.products.lazy_memo}/lib/lazy_memo.so
+    export RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH=$TMPDIR/rp-cache
+    export EXPLORER_USE_LEGACY_ARTIFACTS=false
+    mkdir -p "$HOME" "$XDG_CACHE_HOME/beam_lisp" "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH"
+    cp ${explorerNif} "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/libexplorer-v0.12.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz"
+    cp ${ratatuiNif} "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/libex_ratatui-v0.13.0-nif-2.17-x86_64-unknown-linux-gnu.so.tar.gz"
+    cp -a ${hexStore} "$XDG_CACHE_HOME/beam_lisp/lib"
+    chmod -R u+w "$XDG_CACHE_HOME/beam_lisp/lib"
+    mkdir -p "$BL_ROOT"
+    cd "$BL_ROOT"
+    ${elixir}/bin/elixir ${../scripts/produce-dependencies.exs}
+    mkdir -p "$out"
+    cp -aL --no-preserve=ownership "$XDG_CACHE_HOME/beam_lisp/ebin" "$out/ebin"
+  '');
   compiler = import ./compiler-product.nix {
-    inherit pkgs erlang elixir src dependencies;
-    checkoutPlatform = buildCheckout;
-    nativeProducts = nativeProducts;
+    inherit pkgs erlang elixir dependencies;
+    src = sources.compiler;
+    checkoutPlatform = compilerPlatform;
+    nativeProducts = compilerNatives;
   };
 
   # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
@@ -202,6 +220,12 @@ let
 
       export BL_PRODUCTION_LAUNCHER=${drop-tools}/bin/drop-launcher
       export BL_PRODUCTION_DROP_OUTPUT=$TMPDIR/selfbuilt.drop
+      export BL_PRODUCTION_UNIT_STORE=$TMPDIR/unit-store
+      ${lib.optionalString (previousSdk != null) ''
+        if test -f ${previousSdk}/unit-store/unit-index.json; then
+          export BL_PREVIOUS_UNIT_STORE=${previousSdk}/unit-store
+        fi
+      ''}
       ./bin/bl --cold run scripts/produce-sdk.bl
 
       # unpack, retarget every ELF at the FHS loader, repack with the same launcher
@@ -210,6 +234,7 @@ let
       # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
       # checks the existing sealed metadata and actual bytes at load time.
       mkdir -p "$sdk"
+      cp -a --no-preserve=ownership "$TMPDIR/unit-store" "$sdk/unit-store"
       cp -a --no-preserve=ownership $TMPDIR/payload/lib "$sdk/lib"
       for application in "$sdk"/lib/beam_lisp-*; do
         ln -s "lib/$(basename "$application")" "$sdk/image"

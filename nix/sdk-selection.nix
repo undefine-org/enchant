@@ -8,6 +8,7 @@ pkgs.runCommand "beam-lisp-sdk-selection" {
   ln -s ${image}/lib "$out/lib"
   ln -s ${image}/image "$out/image"
   ln -s ${image}/bl "$out/bl"
+  ln -s ${image}/unit-store "$out/unit-store"
   ln -s ${coordinator} "$out/preparation-coordinator"
   cat > "$out/boot.exs" <<EOF
   for path <- Path.wildcard("$out/lib/*/ebin"), do: Code.prepend_path(path)

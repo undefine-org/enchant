@@ -1,7 +1,7 @@
 # SDK-family production from an already captured immutable full engine tree.
 # The coordinator recipe is fixed; requests supply the engine input and one
 # enumerated product, never an expression or a mutable Git checkout.
-{ source, product ? "sdk" }:
+{ source, product ? "sdk", previous ? null }:
 let
   storeObject = value: builtins.isString value
     && builtins.match "/nix/store/[0-9a-z]{32}-[^/]+" value != null;
@@ -14,6 +14,7 @@ let
     elixir-src = (builtins.fetchTree lock.nodes.elixir-src.locked).outPath;
   };
   products = import (engine + "/nix/bl-drop.nix") {
+    previousSdk = if previous == null then null else builtins.storePath previous;
     inherit pkgs;
     rustPkgs = pkgs;
     inherit (beam) erlang elixir;
@@ -21,5 +22,6 @@ let
   };
 in
 assert storeObject source;
+assert previous == null || storeObject previous;
 assert builtins.elem product [ "sdk" "compiler" "dependencies" "bl-drop" "coordinator" ];
 products.${product}

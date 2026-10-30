@@ -1,5 +1,5 @@
 # A small immutable provider platform, independent of the compiler/SDK payload.
-{ pkgs, commandExecutor ? import ./command-executor.nix { inherit pkgs; } }:
+{ pkgs, commandExecutor ? import ./command-executor.nix { inherit pkgs; }, includeRecipes ? true }:
 pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   mkdir -p "$out/nix" "$out/bin"
   ln -s ${commandExecutor}/bin/bl-command-executor "$out/bin/bl-command-executor"
@@ -12,6 +12,7 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   ln -s ${pkgs.util-linux}/bin/setsid "$out/bin/setsid"
   ln -s ${pkgs.procps}/bin/kill "$out/bin/kill"
   cp ${commandExecutor}/executor.json "$out/executor.json"
+  ${pkgs.lib.optionalString includeRecipes ''
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
   cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
   cp ${./native-workspace.nix} "$out/nix/native-workspace.nix"
@@ -27,4 +28,5 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   cp ${./project-snapshot.nix} "$out/nix/project-snapshot.nix"
   cp ${./native-bundle.nix} "$out/nix/native-bundle.nix"
   cp ${../flake.lock} "$out/flake.lock"
+  ''}
 ''
