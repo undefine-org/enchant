@@ -25,11 +25,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Require a supported Nix production target
+        run: |
+          set -eu
+          if [ "$(uname -s)/$(uname -m)" != Linux/x86_64 ]; then
+            echo "::error::The qualified Nix SDK producer currently supports x86_64-linux only"
+            exit 69
+          fi
+
+      - name: Enable the bounded Nix preparation worker
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$uid.service"
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+
+      - uses: cachix/install-nix-action@v31
+        if: runner.os == 'Linux'
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 1
+            cores = 2
+            extra-system-features = kvm
+            extra-sandbox-paths = /dev/kvm
+
+      - name: Verify bounded Nix workers can access KVM
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends acl
+          sudo setfacl -m g:nixbld:rw /dev/kvm
+          build_gid=$(getent group nixbld | cut -d: -f3)
+          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
+          test -n "$build_user"
+          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
+
       - name: Set up OTP 29 + Elixir 1.20
         uses: erlef/setup-beam@v1
         with:
-          otp-version: "29"
-          elixir-version: "1.20"
+          otp-version: "29.0.1"
+          elixir-version: "1.20.4"
 
       - name: Resolve version
         id: version
@@ -55,73 +96,13 @@ jobs:
           echo "value=$v" >> "$GITHUB_OUTPUT"
           echo "building beam-lisp $v for ${{ inputs.artifact }} (ref ${{ github.ref_name }})"
 
-      # The one artefact the language cannot build for itself. `priv/native` is a
-      # build output (`.gitignore` says so; the native stage installs it), and the
-      # boot needs `priv/native/lazy_memo` before any step that could build it has
-      # run: `BeamLisp.LazyMemo.load_nif!/0` loads from ONE path with no fallback
-      # and the prelude interns LazySeq, so a runner without it dies at the first
-      # `bl` call with "BeamLisp LazySeq requires the lazy_memo native runtime".
-      #
-      # No `bl` command can produce it — `bl` is what needs it. Cargo can: the
-      # crate is an ordinary cdylib.
-      #
-      # `priv/native` is DELIBERATELY not in the cache below. Its cache key is
-      # `hashFiles('bl.lock','**/Cargo.lock')`, which does not change when a
-      # crate's `src/lib.rs` changes its NIF surface without touching Cargo.lock
-      # — so a cached `.so` can export a function the current `.ex` no longer
-      # declares (or lack one it now requires), and the first `bl` call boots
-      # against it and dies `{:bad_lib, Function not found …}`. This exact class
-      # broke every v2026.4 macOS release build: a cached `lazy_memo.so` still
-      # exported `nif_lane/1` after PLAN-132 Phase 1 removed it. `native/*/target`
-      # stays cached, so this cargo build is still incremental; only the installed
-      # artefact is rebuilt from THIS tree's source, every run.
-      - name: Bootstrap the native crates the boot needs
-        run: |
-          set -eu
-          mkdir -p priv/native
-          case "$(uname -s)" in Darwin) ext=dylib ;; *) ext=so ;; esac
-          cargo build --release --manifest-path native/lazy_memo/Cargo.toml
-          install -m 755 "native/lazy_memo/target/release/liblazy_memo.$ext" \
-                          priv/native/lazy_memo.so
-          ls -l priv/native
-
-      # `build/` (the boot+std AOT tier) is DELIBERATELY not cached, for the same
-      # reason as `priv/native` above: the cache key is
-      # `hashFiles('bl.lock','**/Cargo.lock')`, which does not move when a
-      # `priv/boot/` or `priv/std/` SOURCE changes. `restore-keys` prefix-fallback
-      # then restores an old `build/` on every run, and the launcher's generation
-      # check serves that stale tier while the committed floor is current — the
-      # exact "two generations in one VM" the launcher warns about, which dies
-      # `undefined var: compiler/special-forms` compiling anf.bl against a floor
-      # whose compiler no longer matches. `bl build --force` rebuilds the whole
-      # tier from THIS tree every run; `~/.cache/beam_lisp` (the content-addressed
-      # AOT cache, keyed per-namespace by source closure) stays cached, so a
-      # rebuild is still incremental where the sources did not move.
-      - name: Cache deps, builds, and cargo registry
+      - name: Restore addressed test assets
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/beam_lisp
-            ~/.cargo/registry
-            ~/.cargo/git
-            native/*/target
-            tooling/drop/target
-            priv/embed
-          key: ${{ inputs.artifact }}-${{ hashFiles('bl.lock', '**/Cargo.lock') }}
+          path: ~/.cache/beam_lisp
+          key: ${{ inputs.artifact }}-test-assets-${{ hashFiles('bl.lock') }}
           restore-keys: |
-            ${{ inputs.artifact }}-
-
-      # wry_webview is a Linux-only capability (gtk + webkit2gtk +
-      # wlr-layer-shell). Its Cargo.toml target-gates those deps and lib.rs is
-      # crate-level `cfg(target_os = "linux")`, so the macOS legs compile it to
-      # an empty cdylib and `wry/*` reads as ABSENT — the doctrine for a native
-      # capability that cannot be built here. On Linux the headers must exist.
-      - name: Install WebKitGTK toolchain (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
+            ${{ inputs.artifact }}-test-assets-
 
       # The version lives in the DECLARATION (env.bl `:app :vsn`) — that is what
       # the app resource is written from, and the app resource is what the
@@ -134,62 +115,41 @@ jobs:
           perl -pi -e "s/:vsn \"0\.1\.0\"/:vsn \"$BL_VERSION\"/" env.bl
           grep -n ':vsn' env.bl
 
-      # Dependencies, with no Mix: `bl deps fetch` obtains every locked tarball
-      # into the content-addressed store (verifying the digest the lock names),
-      # and `bl deps compile` builds each one for THIS runtime.
-      - name: Dependencies
+      - name: Install runtime fixture prerequisites
         run: |
-          ./bin/bl deps fetch --cold
-          ./bin/bl deps compile --cold
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr inotify-tools
 
-      # The checked compiler floor is reused. Native libraries and release
-      # metadata are prepared independently; library tiers ship as source.
-      - name: Prepare native libraries and application metadata
-        run: ./bin/bl --cold run scripts/prepare-release.bl
-
-      # Release builds consume the qualified, committed compiler floor. A source
-      # mismatch must fail qualification rather than silently replace that floor.
-      - name: Verify committed native bootstrap floor
-        run: ./bin/bl --cold seed --check
-
-      - name: Fetch the pinned z3 solver
-        run: ./bin/bl --cold install z3
-
-      # The embedding weights travel INSIDE the drop, so they are fetched into
-      # the BUNDLED copy here (`bl install embed DIR` writes into DIR) — and for
-      # the cache: a miss costs one 33 MB download per leg, and a stale entry is
-      # re-verified against the pinned sha256 and refetched.
-      - name: Fetch the code-embedding weights (bundled into the drop)
-        run: ./bin/bl --cold install embed priv/embed/potion-code-16M-v2
-
-      # Apple Silicon refuses to exec unsigned Mach-O pages. Cargo/ld ad-hoc
-      # sign what they produce, but the z3 release archive is not necessarily
-      # signed — sign it (and its dylib) before the release copies priv/ into
-      # the payload. The signature rides in the file, so extraction preserves it.
-      - name: Ad-hoc sign native binaries (macOS)
-        if: runner.os == 'macOS'
+      # Public self-build publishes the selected Nix release. Its normal recipe
+      # already produces dependencies, natives, floor, solver and stock launcher.
+      - name: Build the drop through the normal Nix SDK path
+        run: ./bin/bl --cold self-build --out "bl-${{ inputs.artifact }}"
+      - name: Materialize the exact portable candidate for native fixtures
         run: |
-          set -eu
-          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --force --sign - {} \;
-          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --verify --verbose=1 {} \;
-
-      # cargo builds the STOCK launcher — the one non-beam-lisp piece a drop
-      # needs, and cargo is not Mix. `bl self-build` then assembles the release
-      # tree from THIS checkout, compiles the staged tier sources, seals the tree
-      # with that launcher, and verifies the compound against its own trailer.
-      - name: Build the drop
-        run: |
-          set -eu
-          cargo build --release --manifest-path tooling/drop/Cargo.toml
-          ./bin/bl --cold self-build \
-            --bin tooling/drop/target/release/drop-launcher \
-            --out "bl-${{ inputs.artifact }}"
-
+          python3 scripts/ci-materialize-candidate.py \
+            --sdk .bl/sdks/current-sdk --candidate "bl-${{ inputs.artifact }}"
       - name: Verify persistent SDK builds restore without initialization
         run: |
-          image=$(python3 -c 'import glob,tempfile; print(glob.glob(tempfile.gettempdir()+"/bl-selfbuild/tree/lib/beam_lisp-*")[0])')
-          python3 test/scripts/sdk_build_persistence.py --image "$image"
-          python3 test/scripts/file_locks.py --image "$image"
+          python3 test/scripts/sdk_build_persistence.py --image .bl/ci-image
+          python3 test/scripts/file_locks.py --image .bl/ci-image
+          python3 test/scripts/owned_monitor.py --image .bl/ci-image
+      - name: Fetch pinned embeddings for the complete Linux inventory
+        if: inputs.artifact == 'linux-x86_64'
+        run: ./bl-${{ inputs.artifact }} --cold install embed
+      - name: Package the already-built Linux runtime for inventory consumers
+        if: inputs.artifact == 'linux-x86_64'
+        run: python3 scripts/package-ci-runtime.py --out "$RUNNER_TEMP" --candidate "bl-${{ inputs.artifact }}"
+      - name: Retain the exact Linux runtime projection
+        if: inputs.artifact == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-runtime
+          path: |
+            ${{ runner.temp }}/ci-runtime.tar.gz
+            ${{ runner.temp }}/ci-store.tar.gz
+          compression-level: 0
+          retention-days: 1
 
       - name: Verify fresh SDK startup uses compiled units
         run: python3 test/scripts/drop_startup.py "bl-${{ inputs.artifact }}" --samples 1 --runtime-regressions
