@@ -37,14 +37,6 @@
 (def hello-mod :Elixir.BeamLisp.Ns.Hello)
 (def greeter-mod :Elixir.BeamLisp.Ns.Greeter)
 
-(def code-dir
-  "Where THIS VM loaded `BeamLisp` from — the ebin the child VM needs for
-   `BeamLisp.Env`/`AOT`. (The ExUnit passed `AOT.default_output_dir/0`, which a
-   plain `elixir` VM cannot answer without a Mix project.)"
-  (Path/dirname
-    (erlang/list_to_binary
-      (code/which (erlang/binary_to_atom "Elixir.BeamLisp" :utf8)))))
-
 (defn- discover
   "Every source `BuildTask.discover` would have found: plain `.bl` and the
    literate `.bl.md`/`.bl.org` documents, sorted."
@@ -63,7 +55,7 @@
   "Compile the fixture set through the production driver; return `build/produce!`'s
    map (`:built`, `:errors`)."
   []
-  (b/run {:sources (discover fixture-dir)
+  (b/produce! {:sources (discover fixture-dir)
           :out compile-path
           :manifest (b/manifest-path compile-path)
           :jobs 2}))
@@ -85,14 +77,19 @@
     ; Intern the fixture namespaces exactly as a fresh VM's boot would. The
     ; ExUnit suite relied on a sibling module having already interned them in
     ; its long-lived VM; ward runs this file in its own fork off a warm base,
-    ; so the prerequisite is STATED here instead of inherited. `:loaded` (not
-    ; `:no_module`) is required: the point of this file is the AOT BEAM, and a
+    ; so the prerequisite is STATED here instead of inherited. Successful load
+    ; and the exact emitted path are required: the point is the AOT BEAM, and a
     ; source fallback would let every assertion below pass without testing it.
-    (doseq [ns (list "math" "hello" "greeter")]
-      (let [loaded (BeamLisp.AOT/ensure_loaded ns)]
-        (when (not= :loaded loaded)
+    (BeamLisp.Loader/with_search_dir fixture-dir
+     (fn []
+      (doseq [ns (list "math" "hello" "greeter")]
+       (let [loaded (BeamLisp.Loader/ensure_loaded ns)
+             mod (BeamLisp.Emit/module_for ns)]
+        (when (or (not= :ok loaded)
+                  (not= (Path/expand (beam-path mod))
+                        (Path/expand (erlang/list_to_binary (code/which mod)))))
           (erlang/error (str "fixture ns " ns " did not load from its AOT beam: "
-                             (pr-str loaded))))))
+                             (pr-str loaded))))))))
     r))
 
 ; Build once at load: the deftests below observe the built state, mirroring the
@@ -136,26 +133,32 @@
 
 (defn- fresh-vm-script []
   (str
-    "Application.load(:beam_lisp)\n"
-    "{:ok, _} = BeamLisp.Env.start_link([])\n"
-    "BeamLisp.init()\n"
-    "for ns <- [\"math\", \"hello\", \"greeter\"], do: BeamLisp.AOT.ensure_loaded(ns)\n"
-    "IO.puts(\"loaded_from=\" <> to_string(:code.which(BeamLisp.Ns.Math)))\n"
-    "IO.puts(\"has_bl_init=\" <> to_string(function_exported?(BeamLisp.Ns.Math, :__bl_init__, 0)))\n"
-    "IO.puts(\"square=\" <> to_string(BeamLisp.Ns.Math.square(9)))\n"
-    "IO.puts(\"answer_mul=\" <> to_string(BeamLisp.Ns.Math.\"answer-mul\"(3)))\n"
-    "IO.puts(\"double=\" <> to_string(BeamLisp.Ns.Math.double(21)))\n"
-    "IO.puts(\"greet=\" <> BeamLisp.Ns.Hello.greet(\"world\"))\n"
-    "IO.puts(\"report=\" <> BeamLisp.Ns.Greeter.report(3))\n"))
+    "(ns fixture.wave9-cold)\n"
+    "(Code/prepend_path " (pr-str compile-path) ")\n"
+    "(BeamLisp.Loader/with_search_dir " (pr-str fixture-dir) " (fn [] "
+    "(doseq [n [\"math\" \"hello\" \"greeter\"]] "
+    "(assert (= :ok (BeamLisp.Loader/ensure_loaded n))) "
+    "(assert (= (str " (pr-str compile-path) " \"/\" (BeamLisp.Emit/module_for n) \".beam\") "
+    "(erlang/list_to_binary (code/which (BeamLisp.Emit/module_for n))))))))\n"
+    "(println (str \"loaded_from=\" (erlang/list_to_binary (code/which :Elixir.BeamLisp.Ns.Math))))\n"
+    "(println (str \"has_bl_init=\" (erlang/function_exported :Elixir.BeamLisp.Ns.Math :__bl_init__ 0)))\n"
+    "(println (str \"square=\" (BeamLisp.Ns.Math/square 9)))\n"
+    "(println (str \"answer_mul=\" (BeamLisp.Ns.Math/answer-mul 3)))\n"
+    "(println (str \"double=\" (BeamLisp.Ns.Math/double 21)))\n"
+    "(println (str \"greet=\" (BeamLisp.Ns.Hello/greet \"world\")))\n"
+    "(println (str \"report=\" (BeamLisp.Ns.Greeter/report 3)))\n"))
 
 (deftest fresh-vm-loads-the-beams-with-no-runtime-compilation
-  ; Two code paths: the app's real ebin supplies `BeamLisp.Env`/`AOT`, the
-  ; isolated fixture dir supplies the AOT-emitted `Ns.Math` etc. The
-  ; `loaded_from` assertion still pins `Ns.Math` to `compile-path`.
-  (let [r (System/cmd "elixir"
-                      (to-list ["-pa" code-dir "-pa" compile-path "-e" (fresh-vm-script)])
-                      (to-list [(tuple :stderr_to_stdout true)]))
-        text (elem r 0)]
+  ; Boot the exact selected SDK normally; add only the ordinary fixture beams.
+  (let [file (str compile-path ".cold.bl")
+        cli (or (System/get_env "BL_QUALIFY_CANDIDATE")
+                (when-let [sdk (System/get_env "BL_SDK_PRODUCT")] (Path/join sdk "bin/bl"))
+                (Path/join (BeamLisp/cwd) "bin/bl"))
+        _ (File/write! file (fresh-vm-script))]
+   (try
+    (let [r (System/cmd cli (list "--cold" "run" file)
+                           (list (tuple :stderr_to_stdout true)))
+          text (elem r 0)]
     (is (= 0 (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
     (is (includes? text (str "loaded_from=" compile-path)))
     (is (includes? text "has_bl_init=true"))
@@ -163,7 +166,8 @@
     (is (includes? text "answer_mul=126"))
     (is (includes? text "double=42"))
     (is (includes? text "greet=hi, world!"))
-    (is (includes? text "report=hi, aot! | 9 | LOUD"))))
+    (is (includes? text "report=hi, aot! | 9 | LOUD")))
+    (finally (File/rm! file)))))
 
 ; ── incremental: nothing to rebuild ─────────────────────────────────────────
 
@@ -206,7 +210,7 @@
 ; using both a fn and a macro from it.
 
 (deftest an-aot-loaded-namespace-survives-runtime-def-churn-of-its-module
-  (BeamLisp.AOT/ensure_loaded "math")
+  (BeamLisp.Loader/with_search_dir fixture-dir #(BeamLisp.Loader/ensure_loaded "math"))
 
   ; Sanity: the fn and the macro work before any churn.
   (is (= 25 (BeamLisp/eval "(math/square 5)")))
