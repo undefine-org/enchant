@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   public-evidence:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -80,40 +80,18 @@ jobs:
   prepare-linux:
     if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !inputs.runtime_run
     needs: public-evidence
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-8vcpu-ubuntu-2604
     timeout-minutes: 45
+    outputs:
+      cache-key: ${{ steps.sdk-cache.outputs.key }}
+      sdk: ${{ steps.save-sdk.outputs.sdk }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable the bounded Nix preparation worker
-        run: |
-          set -eu
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          sudo systemctl start "user@$uid.service"
-          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
-
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            max-jobs = 1
-            cores = 2
-            extra-system-features = kvm
-            extra-sandbox-paths = /dev/kvm
-
-      - name: Verify bounded Nix workers can access KVM
-        run: |
-          set -eu
-          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends acl
-          sudo setfacl -m g:nixbld:rw /dev/kvm
-          build_gid=$(getent group nixbld | cut -d: -f3)
-          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
-          test -n "$build_user"
-          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
+      - uses: ./.github/actions/nix-worker
+      - name: Restore the previous immutable SDK and completed AOT units
+        id: sdk-cache
+        uses: ./.github/actions/nix-sdk-cache
 
       - uses: erlef/setup-beam@v1
         with:
@@ -137,21 +115,6 @@ jobs:
       - name: the launcher is executable
         run: test -x bin/bl
 
-      # Cache addressed producer artifacts, never the loose priv/native
-      # projection. Prefix restores must not overwrite produced native bytes
-      # with another source revision's NIF ABI.
-      - name: Restore the content-addressed native and library store
-        id: addressed-store
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/beam_lisp
-          key: ci-${{ runner.os }}-${{ runner.arch }}-otp29-elixir1.20-${{ hashFiles('bl.lock', 'native/**/Cargo.*', 'native/**/src/**', 'native/**/build.rs', 'tooling/drop/Cargo.*', 'tooling/drop/src/**') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          # Each attempt can publish newly completed addressed products, even
-          # after an earlier attempt of this revision failed later in the job.
-          restore-keys: |
-            ci-${{ runner.os }}-${{ runner.arch }}-otp29-elixir1.20-
-
       - name: Install runtime fixture prerequisites
         run: |
           sudo apt-get update
@@ -165,9 +128,14 @@ jobs:
         run: |
           python3 scripts/ci-materialize-candidate.py \
             --sdk .bl/sdks/current-sdk --candidate "$RUNNER_TEMP/bl-ci-producer"
+      - name: Prepare the pinned adapter for the unchanged portable release
+        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
       - name: Fetch pinned embeddings used by index integration tests
         run: |
-          "$RUNNER_TEMP/bl-ci-producer" --cold install embed
+          scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- \
+            "$RUNNER_TEMP/bl-ci-producer" --cold install embed
+      - name: Capture the verified pinned model for bounded inventory workers
+        run: python3 scripts/ci-model-input.py capture --models "$HOME/.cache/beam_lisp/models"
       # Compiler production and seed reproducibility are separate gates. Start
       # from the already-materialized runtime, recompile every host in a bare
       # VM, and compare the result with the committed floor byte for byte.
@@ -175,7 +143,8 @@ jobs:
         run: |
           set -eu
           out="$RUNNER_TEMP/regen"
-          BL_REGEN_FROM_SCRATCH=1 BL_REGEN_MEMORY_MAX=6G scripts/regenerate-seed "$out"
+          BL_REGEN_FROM_SCRATCH=1 BL_REGEN_MEMORY_MAX=6G scripts/with-release-runtime \
+            --sdk .bl/sdks/current-sdk -- scripts/regenerate-seed "$out"
           scripts/floor-diff priv/bootstrap/seed "$out/seed" --quiet || {
             echo "::error::priv/bootstrap/seed differs from this tree's regenerated floor. Run scripts/regenerate-seed and commit the floor."
             exit 1
@@ -184,39 +153,39 @@ jobs:
           diff -r priv/bootstrap/seed "$out/seed"
       - name: Kernel file custody and owned monitors use the produced image
         run: |
-          python3 test/scripts/file_locks.py --image .bl/ci-image
-          python3 test/scripts/owned_monitor.py --image .bl/ci-image
+          scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/file_locks.py --image .bl/ci-image
+          scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/owned_monitor.py --image .bl/ci-image
       - name: Verify persistent builds use the genuine produced SDK lifecycle
-        run: python3 test/scripts/sdk_build_persistence.py --image .bl/ci-image
+        run: scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/sdk_build_persistence.py --image .bl/ci-image
 
-      # Completed addressed products remain individually verified on reuse.
-      # A later native/solver failure must not discard all dependency work.
-      # Keep failed/cancelled runtime images out of the same-run artifact below.
-      - name: Save completed addressed products after provisioning
-        if: ${{ always() && !cancelled() && steps.dependencies.outcome == 'success' }}
-        uses: actions/cache/save@v4
+      - name: Retain the qualified SDK and Nix closure for the next checkout
+        id: save-sdk
+        uses: ./.github/actions/nix-sdk-cache
         with:
-          path: ~/.cache/beam_lisp
-          key: ${{ steps.addressed-store.outputs.cache-primary-key }}
-
-      # One producer for this run and revision. Tar preserves native executable
-      # modes; consumers restore the addressed cache to the same HOME layout.
-      - name: Package the prepared Linux runtime
-        run: python3 scripts/package-ci-runtime.py --out "$RUNNER_TEMP" --candidate "$RUNNER_TEMP/bl-ci-producer"
+          operation: save
+          key: ${{ steps.sdk-cache.outputs.key }}
+          sdk: .bl/sdks/current-sdk
+      - name: Record the immutable producer selection for explicit reuse
+        env:
+          CACHE_KEY: ${{ steps.sdk-cache.outputs.key }}
+        run: |
+          python3 scripts/ci-sdk-cache.py write-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection.json" --key "$CACHE_KEY" \
+            --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID"
       - uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-runtime
-          path: |
-            ${{ runner.temp }}/ci-runtime.tar.gz
-            ${{ runner.temp }}/ci-store.tar.gz
-          compression-level: 0
-          retention-days: 1
+          name: ci-sdk-selection
+          path: ${{ runner.temp }}/ci-sdk-selection.json
+          retention-days: 7
 
   reuse-linux:
     if: inputs.runtime_run
     needs: public-evidence
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: blacksmith-4vcpu-ubuntu-2604
+    timeout-minutes: 15
+    outputs:
+      cache-key: ${{ steps.selection.outputs.key }}
+      sdk: ${{ steps.selection.outputs.sdk }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -233,17 +202,42 @@ jobs:
           printf '%s\n' "$producer" > "$RUNNER_TEMP/runtime-producer-sha"
       - uses: actions/download-artifact@v4
         with:
-          name: ci-linux-runtime
-          path: ${{ runner.temp }}/ci-linux-runtime
+          name: ci-sdk-selection
+          path: ${{ runner.temp }}/ci-sdk-selection
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run }}
-      - run: mv "$RUNNER_TEMP/runtime-producer-sha" "$RUNNER_TEMP/ci-linux-runtime/"
+      - name: Read the original producer's immutable SDK selection
+        id: selection
+        env:
+          PRODUCER_RUN: ${{ inputs.runtime_run }}
+        run: |
+          python3 scripts/ci-sdk-cache.py read-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
+            --revision "$(cat "$RUNNER_TEMP/runtime-producer-sha")" \
+            --run-id "$PRODUCER_RUN" --github-output
+      - uses: ./.github/actions/nix-worker
+      - name: Validate and retain the original qualified SDK
+        uses: ./.github/actions/nix-sdk-cache
+        with:
+          key: ${{ steps.selection.outputs.key }}
+          sdk: ${{ steps.selection.outputs.sdk }}
+          required: 'true'
+      - name: Bind the same engine and candidate to this qualification revision
+        env:
+          CACHE_KEY: ${{ steps.selection.outputs.key }}
+          PRODUCER_RUN: ${{ inputs.runtime_run }}
+        run: |
+          python3 scripts/ci-sdk-cache.py verify-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
+            --revision "$(cat "$RUNNER_TEMP/runtime-producer-sha")" --run-id "$PRODUCER_RUN"
+          python3 scripts/ci-sdk-cache.py write-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection.json" --key "$CACHE_KEY" \
+            --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID"
       - uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-runtime
-          path: ${{ runner.temp }}/ci-linux-runtime/
-          compression-level: 0
-          retention-days: 1
+          name: ci-sdk-selection
+          path: ${{ runner.temp }}/ci-sdk-selection.json
+          retention-days: 7
 
   test:
     if: ${{ !cancelled() && (needs.prepare-linux.result == 'success' || needs.reuse-linux.result == 'success') }}
@@ -253,178 +247,94 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3]
     needs: [prepare-linux, reuse-linux]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
-      - name: Enable the bounded Nix preparation worker
-        run: |
-          set -eu
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          sudo systemctl start "user@$uid.service"
-          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
-
-      - uses: cachix/install-nix-action@v31
+      - uses: ./.github/actions/nix-worker
+      - name: Restore this run's exact SDK and retained provider context
+        id: sdk-cache
+        uses: ./.github/actions/nix-sdk-cache
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            max-jobs = 1
-            cores = 2
-            extra-system-features = kvm
-            extra-sandbox-paths = /dev/kvm
-
-      - name: Verify bounded Nix workers can access KVM
-        run: |
-          set -eu
-          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends acl
-          sudo setfacl -m g:nixbld:rw /dev/kvm
-          build_gid=$(getent group nixbld | cut -d: -f3)
-          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
-          test -n "$build_user"
-          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
-
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: "29.0.1"
-          elixir-version: "1.20.4"
-
-      - name: Select the shared native toolchain
-        run: |
-          set -eu
-          rustup toolchain install "$CI_RUST_VERSION" --profile minimal
-          rustup override set "$CI_RUST_VERSION"
-          echo "RUSTUP_TOOLCHAIN=$CI_RUST_VERSION" >> "$GITHUB_ENV"
-          cargo --version
-          rustc --version
-      - name: Install native runtime libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr inotify-tools
-      - uses: actions/download-artifact@v4
-        with:
-          name: ci-linux-runtime
-          path: ${{ runner.temp }}/ci-linux-runtime
-      - name: Restore this revision's prepared runtime
-        run: |
-          set -eu
-          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-runtime.tar.gz"
-          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-store.tar.gz" -C "$HOME"
-      # The complete corpus uses one serial capped VM per runner and the same
-      # portable candidate. Native-provider fixtures also require their retained
-      # immutable producer context; the portable archive does not supply it.
+          key: ${{ needs.prepare-linux.outputs.cache-key || needs.reuse-linux.outputs.cache-key }}
+          sdk: ${{ needs.prepare-linux.outputs.sdk || needs.reuse-linux.outputs.sdk }}
+          required: 'true'
+      # The bounded worker materializes the exact candidate from the SDK. All
+      # provider fixtures receive its genuine immutable compiler context.
       - name: test partition
-        run: python3 scripts/ci-test-shard.py --index ${{ matrix.shard }} --count 4
+        run: |
+          scripts/ci-check --local --sdk '${{ steps.sdk-cache.outputs.sdk }}' \
+            --models "$HOME/.cache/enchant-ci/models-root" \
+            --shard ${{ matrix.shard }} --shards 4 --out "$RUNNER_TEMP/check-${{ matrix.shard }}"
       - name: Keep per-file qualification receipts even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.shard }}
-          path: ${{ runner.temp }}/bl-test-results-${{ matrix.shard }}.jsonl
+          path: ${{ runner.temp }}/check-${{ matrix.shard }}/
           if-no-files-found: warn
           retention-days: 7
 
   qualify-linux:
     if: ${{ !inputs.runtime_run }}
     needs: prepare-linux
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Enable the bounded Nix preparation worker
-        run: |
-          set -eu
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          sudo systemctl start "user@$uid.service"
-          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
-
-      - uses: erlef/setup-beam@v1
+      - uses: ./.github/actions/nix-worker
+      - name: Restore this run's exact SDK
+        id: sdk-cache
+        uses: ./.github/actions/nix-sdk-cache
         with:
-          otp-version: "29.0.1"
-          elixir-version: "1.20.4"
-
-      - name: Select the shared native toolchain
-        run: |
-          set -eu
-          rustup toolchain install "$CI_RUST_VERSION" --profile minimal
-          rustup override set "$CI_RUST_VERSION"
-          echo "RUSTUP_TOOLCHAIN=$CI_RUST_VERSION" >> "$GITHUB_ENV"
-          cargo --version
-          rustc --version
-      - name: Install native runtime libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr inotify-tools
-      - uses: actions/download-artifact@v4
-        with:
-          name: ci-linux-runtime
-          path: ${{ runner.temp }}/ci-linux-runtime
-      - name: Restore this revision's prepared runtime
-        run: |
-          set -eu
-          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-runtime.tar.gz"
-          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-store.tar.gz" -C "$HOME"
+          key: ${{ needs.prepare-linux.outputs.cache-key }}
+          sdk: ${{ needs.prepare-linux.outputs.sdk }}
+          required: 'true'
+      - name: Prepare the pinned adapter for the unchanged portable release
+        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
       - name: the exact produced drop reuses its default VM
         run: |
           systemd-run --user --collect --wait --pipe --quiet \
             --working-directory="$PWD" --property=MemoryMax=6G --property=MemorySwapMax=0 \
-            --property=RuntimeMaxSec=1800 --setenv=PATH="$PATH" python3 scripts/qualify-self-build.py --candidate .bl/ci-candidate
+            --property=RuntimeMaxSec=1800 --setenv=PATH="$PATH" \
+            scripts/with-release-runtime --sdk '${{ steps.sdk-cache.outputs.sdk }}' -- \
+            python3 scripts/qualify-self-build.py --sdk '${{ steps.sdk-cache.outputs.sdk }}'
 
-  # The nix-built server drop (docs/native-bundler.md §16): `nix flake check` is the
-  # gate — the drop evaluates, its glibc floor is <= the servers' 2.40 — and the pin
-  # check keeps this flake's nixpkgs equal to Foundry's.
+  # Evaluate the complete flake, then execute the runtime and measured ABI
+  # checks against the exact selected release. No second SDK/drop production.
   nix-drop:
     if: ${{ !inputs.runtime_run && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
-    # Independent artifact/backend gate: discover Nix failures while Linux
-    # tests run. The complete workflow must still pass before release.
-    needs: public-evidence
-    runs-on: ubuntu-24.04
+    needs: prepare-linux
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - uses: cachix/install-nix-action@v31
+      - uses: ./.github/actions/nix-worker
+      - name: Restore the already qualified SDK
+        id: sdk-cache
+        uses: ./.github/actions/nix-sdk-cache
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            max-jobs = 1
-            cores = 2
-            extra-system-features = kvm
-            extra-sandbox-paths = /dev/kvm
-
-      - name: Verify bounded Nix workers can access KVM
-        run: |
-          set -eu
-          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends acl
-          sudo setfacl -m g:nixbld:rw /dev/kvm
-          build_gid=$(getent group nixbld | cut -d: -f3)
-          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
-          test -n "$build_user"
-          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
+          key: ${{ needs.prepare-linux.outputs.cache-key }}
+          sdk: ${{ needs.prepare-linux.outputs.sdk }}
+          required: 'true'
 
       - name: Pins agree with the servers
         # apps/foundry is a separate repo; only checked where it is checked out
         run: if [ -f apps/foundry/infra/flake.lock ]; then tooling/drop/check-pins.sh; else echo 'foundry not checked out; pin check skipped'; fi
 
-      - name: nix flake check
-        run: nix flake check -L
+      - name: Evaluate the flake outputs and checks
+        run: nix flake check --no-build -L
 
-      - name: nix build .#bl-drop
-        run: nix build .#bl-drop -L
+      - name: Check the already produced drop and its measured libc floor
+        run: |
+          nix-build nix/ci-sdk-gates.nix --argstr sdk '${{ steps.sdk-cache.outputs.sdk }}' \
+            --out-link .bl/ci-sdk-gates
 
   producer-gates:
     if: inputs.runtime_run
     needs: [reuse-linux, test]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
