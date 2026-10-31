@@ -24,7 +24,7 @@ let
     let entry = prerequisites.${name} or {}; in (entry.all or []) ++ (entry.linux or [])
   ) selectedFiles);
   toolPackages = { cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools;
-    ssh = pkgs.openssh; ssh-keygen = pkgs.openssh; };
+    ssh = pkgs.openssh; ssh-keygen = pkgs.openssh; tesseract = pkgs.tesseract; };
   nativeFixture = builtins.elem "test/bl/execution_qualification_test.bl" selectedFiles;
   # E50 compiles two private Rustler variants with --offline. Retain the same
   # lock-addressed vendor input used by native-compile.nix, without compiling
@@ -36,8 +36,7 @@ let
   # The SDK platform supplies the exact Erlang/Elixir, Nix and user-manager
   # tools. Add only the remaining declared external test tools here.
   fixtureTools = map (name: toolPackages.${name}) (builtins.filter (name: builtins.hasAttr name toolPackages) tools)
-    ++ pkgs.lib.optionals nativeFixture [ pkgs.stdenv.cc ]
-    ++ pkgs.lib.optionals (requestData.kind == "shard") [ pkgs.tesseract ];
+    ++ pkgs.lib.optionals nativeFixture [ pkgs.stdenv.cc ];
   selection = if sdk == null then import (input + "/nix/sdk-artifact.nix") {
     source = toString input;
     inherit previous;
