@@ -22,6 +22,12 @@ for pattern <- ["**/*.bl", "**/*.bl.md", "**/*.phase"] do
  unless Path.wildcard(Path.join(support_root, pattern)) == [],
    do: raise("compiled runtime contains Source or phase inputs")
 end
+if System.get_env("BL_RUNTIME_CHANGED_FLOOR") == "yes" do
+  # Exercise the native runtime admission boundary in this fresh receiver.
+  # The positive consumer below separately checks packaged compiler identity.
+  BeamLisp.run_runtime_artifact(program, [])
+  raise "changed runtime floor was admitted"
+end
 unless BeamLisp.AOTCache.current_compiler_key()==producer,
   do: raise("packaged compiler identity does not match its verified floor")
 observed=[BeamLisp.Reader,BeamLisp.Compiler,BeamLisp.Ns.Reader,BeamLisp.Ns.Body.Reader,
