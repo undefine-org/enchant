@@ -1,6 +1,7 @@
-; A cached artifact must retain the runtime edges discovered during compilation.
-; The consumer source is removed before the cold replay, so fallback is impossible.
-(ns aot.implicit-dependencies-test)
+; Compiled application artifacts retain the runtime edges discovered during
+; compilation. Live consumer Source is removed; the verified package retains
+; its immutable ownership witness and the receiver must use the compiled beam.
+(ns aot.implicit-dependencies-test (:require [application.package :as package]))
 
 (defn- launch [file]
  (System/cmd "timeout"
@@ -12,13 +13,15 @@
   (list (tuple :stderr_to_stdout true)
         (tuple :env (list (tuple "BL_DAEMON" "off") (tuple "BEAM_LISP_AOT_REPAIR" "off"))))))
 
-(deftest compiled-runtime-edges-replay-lazily-without-consumer-source
+(deftest compiled-runtime-edges-replay-lazily-without-live-consumer-source
  (let [root (str (System/get_env "HOME") "/tmp/bl-aot-implicit-" (System/unique_integer (list :positive)))
        source (str root "/src") out (str root "/ebin") probe-out (str root "/probe")
        provider (str source "/implicit/provider.bl") consumer (str source "/implicit/consumer.bl")
        macro (str source "/implicit/macros.bl") cycle-a (str source "/implicit/cycle-a.bl")
        cycle-b (str source "/implicit/cycle-b.bl") marker (str root "/initialized")
-       child (str root "/replay.bl") environment (BeamLisp.Env/fork)
+       child (str root "/replay.bl") entry (str root "/entry.bl") release (str root "/package")
+       program "(ns implicit.package-entry (:require [implicit.consumer]))"
+       environment (BeamLisp.Env/fork)
        probe :Elixir.BeamLisp.AOTImplicitDependencyProbe]
   (try
    (File/mkdir_p! (Path/dirname provider)) (File/mkdir_p! out) (File/mkdir_p! probe-out)
@@ -44,14 +47,34 @@
          attrs (Keyword/get (elem (elem chunks 1) 1) :attributes)
          witness (Keyword/get attrs :bl_aot_replay_version)]
     (is (or (= 1 witness) (= (list 1) witness)) "the actual emitter proves its initializer format"))
+   (File/write! entry program)
+   (BeamLisp.Env/with_env environment
+    (fn []
+     (BeamLisp.Loader/with_ambient_dirs (list source)
+      (fn []
+       ;; The producer already compiled these phase/runtime providers. Admit
+       ;; them through their real Source before the packager forks its view.
+       (BeamLisp.Loader/ensure_loaded "implicit.provider")
+       (BeamLisp.Loader/ensure_loaded "implicit.macros")
+       (package/build! entry release [])))))
+   (is (File/regular? (str release "/source/implicit/consumer.bl"))
+       "the real package retains its authenticated Source ownership witness")
+   (is (empty? (Path/wildcard (str release "/ebin/*Implicit.Macros*.beam")))
+       "a compile-time-only macro has no runtime package artifact")
    (File/rm! consumer) (File/rm! macro) (File/rm! marker)
    ;; Remove the macro artifacts as well. A compile-time-only invocation must
    ;; not become an accidental runtime requirement of the consumer artifact.
    (doseq [path (Path/wildcard (str out "/*Implicit.Macros*.beam"))] (File/rm! path))
    (File/write! child
-    (str "(ns implicit.replay) (Code/prepend_path " (pr-str out) ") "
-     "(BeamLisp.Loader/with_ambient_dirs (list " (pr-str source) ") (fn [] "
+    (str "(ns implicit.replay (:require [application.package :as package])) "
+     "(package/install! " (pr-str release) " " (pr-str program) " []) "
+     "(Code/append_path " (pr-str out) ") "
+     "(erlang/trace_pattern (tuple :Elixir.BeamLisp.AOT :compile_source 2) true (list :local :call_count)) "
+     "(BeamLisp.Loader/with_ambient_dirs (list " (pr-str (str release "/source")) " " (pr-str source) ") (fn [] "
      "(BeamLisp.Loader/ensure_loaded \"implicit.consumer\") "
+     "(assert (= " (pr-str (str release "/ebin/Elixir.BeamLisp.Ns.Implicit.Consumer.beam"))
+       " (List/to_string (code/which :Elixir.BeamLisp.Ns.Implicit.Consumer)))) "
+     "(assert (= :non_existing (code/which :Elixir.BeamLisp.Ns.Implicit.Macros))) "
      "(assert (not (File/exists? " (pr-str marker) "))) "
      "(assert (= 17 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! \"implicit.consumer\" \"expanded\") (list)))) "
      "(assert (= 42 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! \"implicit.consumer\" \"answer\") (list)))) "
@@ -61,7 +84,21 @@
      ;; Dormant cycle dependencies must be declarations, never eager loads.
      "(BeamLisp.Loader/ensure_loaded \"implicit.cycle-a\") "
      "(assert (= 5 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! \"implicit.cycle-a\" \"next\") (list)))) "
+     "(assert (= (tuple :call_count 0) (erlang/trace_info (tuple :Elixir.BeamLisp.AOT :compile_source 2) :call_count))) "
      "(println \"IMPLICIT_COLD_REPLAY_OK\")))"))
+   ;; Missing or tampered ownership must fail before application effects.
+   (let [manifest (str release "/manifest.term") original (File/read! manifest)]
+    (try
+     (File/rm! manifest)
+     (let [[text status] (launch child)] (is (not= 0 status) text))
+     (is (not (File/exists? marker)))
+     (finally (File/write! manifest original))))
+   (let [beam (str release "/ebin/Elixir.BeamLisp.Ns.Implicit.Consumer.beam") original (File/read! beam)]
+    (try
+     (File/write! beam (str original "changed"))
+     (let [[text status] (launch child)] (is (not= 0 status) text))
+     (is (not (File/exists? marker)))
+     (finally (File/write! beam original))))
    (let [[text status] (launch child)]
     (is (= 0 status) text)
     (is (String/contains? text "IMPLICIT_COLD_REPLAY_OK") text))
