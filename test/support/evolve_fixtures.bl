@@ -1,0 +1,67 @@
+(ns test.support.evolve-fixtures
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+
+;; These tests measure owner admission/conversion after its SDK dependencies
+;; are ready. Dependency loading is not a migration or a deadline extension.
+(BeamLisp.Loader/ensure_loaded "proc.message-domain")
+
+(defn source [mode]
+ (let [old? (= :old mode)
+       migrate (case mode :old "value" :invalid "-1" :ninety-nine "{:count 99}"
+                   :effectful "(do (Process/sleep 10000) {:count value})" "{:count value}")]
+  (str "(ns evolution.fixture)
+        (defn accepts [message] "
+        (if old? "(and (erlang/is_atom message) (contains? #{:inc :read} message))"
+                 "(and (erlang/is_map message) (erlang/is_integer (maps/get :amount message nil)))") ")
+        (defn state-valid [value] "
+        (if old? "(and (erlang/is_integer value) (erlang/>= value 0))" "(erlang/is_map value)") ")
+        (defn migrate [value] " migrate ")
+        (defn upcast [message] "
+        (if old? "message"
+         (if (= :wrong-upcast mode) ":wrong"
+          "(case message :inc {:amount 1} :read {:amount 0} message)")) ")
+        (defn handler [message value]
+          (let [next (+ " (if old? "value (if (= :inc message) 1 0)" "(:count value) (:amount message)") ")]
+           {:reply next :state " (if old? "next" "{:count next}") "}))
+        (defn spec [version digest]
+          {:version version :digest digest :accept? accepts :check-state state-valid
+           :handler handler :migrate-state migrate :upcast upcast})")))
+
+(defn with-generations [application sources action]
+ (let [graphs (mapv (fn [[revision source]]
+                (g/prepare! {:application-id application :fixed-runtime true
+                  :native-modules #{"erlang" "maps" "Process"}
+                  :stable-namespaces #{"proc.server" "proc.evolve" "proc.callback"}
+                  :resources {:fixture-revision revision}
+                  :sources {"evolution.fixture" source}}))
+              (map-indexed (fn [revision source] [revision source]) sources))
+       old (first graphs)]
+  (try
+   (g/with! old #(state/bind! {}))
+   (doseq [fresh (rest graphs)] (g/inherit-runtime! fresh old))
+   (action graphs)
+   (finally (doseq [graph (reverse graphs)] (g/retire! graph))))))
+
+(defn spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "evolution.fixture/spec" [version (:digest graph)]))))
+(defn in! [graph action] (g/with! graph action))
+(defn with-owner [application sources initial options action]
+ (with-generations application sources
+  (fn [graphs]
+   (let [old (first graphs) pid (atom nil)]
+    (try
+     (reset! pid (g/with! old #(ev/start! (spec old 1) initial options)))
+     (action graphs @pid)
+     (finally (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))))))))
+
+(defn with-counter [callback action]
+ (when-not (= :external (elem (erlang/fun_info callback :type) 1))
+  (throw (ex-info "Named admitted Source callback required" {})))
+ (let [mfa (tuple (elem (erlang/fun_info callback :module) 1)
+                  (elem (erlang/fun_info callback :name) 1)
+                  (elem (erlang/fun_info callback :arity) 1))]
+  (try
+   (when-not (= 1 (erlang/trace_pattern mfa true (list :call_count)))
+    (throw (ex-info "Native call counter unavailable" {:mfa mfa})))
+   (action (fn [] (elem (erlang/trace_info mfa :call_count) 1)))
+   (finally (erlang/trace_pattern mfa false (list :call_count))))))

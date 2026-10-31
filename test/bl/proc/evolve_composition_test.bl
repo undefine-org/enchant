@@ -1,5 +1,5 @@
 (ns proc.evolve-composition-test
- (:require [proc.server :as ps] [proc.evolve :as ev] [proc.callback :as cb] [reload.generation :as generation] [reload.state :as state] [core]))
+ (:require [proc.server :as ps] [proc.evolve :as ev] [proc.callback :as cb] [reload.generation :as generation] [reload.state :as state] [test.support.evolve-fixtures :as f] [test.support.workflow :as workflow] [core]))
 
 (defn spec [version]
  {:version version :digest (str "composed-" version)
@@ -19,30 +19,64 @@
   (when (:throw? st) (throw (ex-info "custom cleanup failure" {:kind :custom-cleanup-failed})))
   :ok))
 
+(def COMPOSED-SOURCE
+ "(ns evolution.fixture (:require [proc.server :as ps] [proc.evolve :as ev] [proc.callback :as cb]))
+  (defn accepts [message] (erlang/is_atom message))
+  (defn valid [value] (erlang/is_map value))
+  (defn unchanged [value] value)
+  (defn handler [message state]
+   (let [next (if (= :inc message) (inc (:count state)) (:count state))]
+    {:reply next :state (assoc state :count next)}))
+  (defn spec [version digest]
+   {:version version :digest digest :accept? accepts :check-state valid :handler handler
+    :migrate-state unchanged :upcast unchanged})
+  (ps/defserver owner
+   (evolve {:spec (:spec start-opts) :state (:borrowed start-opts) :managed true})
+   (init [opts] (ok {:custom 10 :cleaned (:cleaned opts)}))
+   (handle-call [:custom-inc] [_ st] (reply (:custom st) (update st :custom inc)))
+   (handle-call [:custom-read] [_ st] (reply (:custom st) st))
+   (handle-call :private-current-handler [_ st]
+    (reply (try (cb/invoke! (get-in st [:evolve :current :handler]) [:read (get-in st [:evolve :value])])
+                (catch _ :foreign-handler-refused)) st))
+   (terminate [_ st]
+    (reset! (:cleaned st) (get-in st [:evolve :value]))
+    :ok))")
+(def COMPOSED-CANDIDATE (first (String/split COMPOSED-SOURCE "  (ps/defserver owner")))
+
 (deftest explicit-evolution-composes-with-custom-owner-state-and-cleanup
- (let [cleaned (atom nil) borrowed {:count 0 :resource :borrowed}
-       p (core/start composed {:spec (spec 1) :borrowed borrowed :cleaned cleaned})
-       lease (:token (ev/acquire-client! p 1))]
-  (try
-   (is (ev/owner? p))
-   (is (:managed (ev/owner-evidence p)))
-   (is (nil? (ev/owner-evidence (erlang/self))))
-   (is (= 10 (GenServer/call p [:custom-inc])))
-   (is (= 1 (ev/call-client! p lease :inc)))
-   (is (= :managed-client-required (:kind (ev/call! p 1 :inc))))
-   (is (= :applied (:status (ev/upgrade! p 1 (spec 2)))))
-   (is (= p (:pid (ev/status p))))
-   (is (= 11 (GenServer/call p [:custom-read])))
-   (is (= 2 (ev/call-client! p lease :inc)))
-   (is (= :waiting (:status (ev/retire! p 2 1))))
-   (ev/release-client! p lease)
-   (is (= :retired (:status (ev/retire! p 2 1))))
-   (let [held (get-in (erlang/apply :sys :get_state (list p)) [:evolve :current :handler])]
-    (GenServer/stop p)
-    (is (= {:reply 2 :state {:count 2 :resource :borrowed}} @cleaned))
-    (is (= :cancelled (cb/invoke! held [:read borrowed])))
-    (is (not (ev/owner? p))))
-   (finally (when (Process/alive? p) (GenServer/stop p))))))
+ (f/with-generations "composed-owner-cleanup" [COMPOSED-SOURCE COMPOSED-CANDIDATE]
+  (fn [[old fresh]]
+   (let [cleaned (atom nil) borrowed {:count 0 :resource :borrowed}
+         p (f/in! old #(core/start (BeamLisp.Env/fetch_exact! (get (:mapping old) "evolution.fixture") "owner")
+                                   {:spec (f/spec old 1) :borrowed borrowed :cleaned cleaned}))
+         lease (:token (ev/acquire-client! p 1))]
+    (try
+     (is (ev/owner? p))
+     (is (:managed (ev/owner-evidence p)))
+     (is (nil? (ev/owner-evidence (erlang/self))))
+     (is (= 10 (GenServer/call p [:custom-inc])))
+     (is (= 1 (ev/call-client! p lease :inc)))
+     (is (= {:reply 1 :state {:count 1 :resource :borrowed}} (GenServer/call p :private-current-handler)))
+     (is (= :managed-client-required (:kind (ev/call! p 1 :inc))))
+     (workflow/status! :applied (f/in! fresh #(ev/upgrade! p 1 (f/spec fresh 2))))
+     (is (= p (:pid (ev/status p))))
+     (is (= 11 (GenServer/call p [:custom-read])))
+     (is (= 2 (ev/call-client! p lease :inc)))
+     ;; The old Source class may observe installed state. Its private access to
+     ;; a fresh implementation is not native transition execution authority.
+     (f/with-counter (:handler (f/spec fresh 2))
+      (fn [calls]
+       (is (= :foreign-handler-refused (GenServer/call p :private-current-handler)))
+       (is (= 0 (calls)))))
+     (is (= :waiting (:status (ev/retire! p 2 1))))
+     (ev/release-client! p lease)
+     (is (= :retired (:status (ev/retire! p 2 1))))
+     (let [held (get-in (erlang/apply :sys :get_state (list p)) [:evolve :current :handler])]
+      (GenServer/stop p)
+      (is (= {:count 2 :resource :borrowed} @cleaned))
+      (is (= :cancelled (cb/invoke! held [:read borrowed])))
+      (is (not (ev/owner? p))))
+     (finally (when (Process/alive? p) (GenServer/stop p))))))))
 
 (deftest framework-termination-runs-after-throwing-custom-cleanup
  (let [before (Process/flag :trap_exit true) cleaned (atom nil)
