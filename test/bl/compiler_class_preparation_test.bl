@@ -1,0 +1,95 @@
+(ns compiler-class-preparation-test
+ (:require [compiler :as compiler] [lower :as lower] [reload.generated-class :as boundary]))
+(defn- form [source] (first (BeamLisp.Reader/read_string source "class-preparation.bl")))
+(defn- refused? [f] (try (f) false (catch _ true)))
+(defn- namespace! [] (str "class.prepared.n" (erlang/unique_integer (list :positive))))
+(defn- execute [prepared] (lower/eval-anf :Elixir.ClassPreparedInitializer (:node prepared)))
+
+(deftest prepared-class-and-ordinary-compilation-share-one-canonical-scaffold
+ (doseq [head ["defrecord" "deftype"]]
+  (let [namespace (namespace!) env (compiler/new-env namespace) reader (form (str "(" head " ^:private Packet [payload])"))
+        prepared (compiler/prepare-class-declaration reader env)
+        native (BeamLisp.Compiler/prepare_class_declaration reader env)
+        kind (if (= head "defrecord") :record :deftype)]
+   (is (= 1 (:version prepared)))
+   (is (= :class-declaration (:kind prepared)))
+   (is (= namespace (:namespace prepared)))
+   (is (= "Packet" (:name prepared)))
+   (is (= true (get-in prepared [:metadata :private])))
+   (is (= prepared native))
+   (is (= (dissoc (:node prepared) :ann) (dissoc (BeamLisp.Compiler/compile reader env) :ann)))
+   (is (= kind (BeamLisp.Record/declaration_kind (:descriptor prepared) namespace "Packet")))
+   (is (not (erlang/module_loaded (:module prepared))))
+   (is (nil? (BeamLisp.Record/info (:module prepared)))))
+ ))
+
+(deftest explicit-target-class-preparation-does-not-initialize-or-intern
+ (let [namespace (namespace!) env (compiler/new-env namespace) module :Elixir.PreparedClassPassive
+       reader (form "(defrecord Packet [payload])")
+       prepared (compiler/prepare-class-declaration reader env module)]
+  (is (= prepared (BeamLisp.Compiler/prepare_class_declaration reader env module)))
+  (is (= module (:module prepared)))
+  (is (= (:descriptor prepared) (:val (first (:args (:init (:node prepared)))))))
+  (is (= ['Packet '->Packet 'map->Packet] (vec (map :name (:bindings prepared)))))
+  (is (= module (:module (boundary/class! (:node prepared) namespace "Packet" :record #{} (fn [_] nil)))))
+  (is (= :error (BeamLisp.Env/lookup (tuple namespace "Packet"))))
+  (is (nil? (BeamLisp.Record/info module)))
+  (is (not (erlang/module_loaded module)))))
+
+(deftest validated-physical-scaffold-publishes-constructors-through-original-runtime
+ (let [scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (doseq [[head kind module] [["defrecord" :record :Elixir.PreparedRecordRuntime]
+                                 ["deftype" :deftype :Elixir.PreparedTypeRuntime]]]
+      (let [namespace (namespace!) prepared (compiler/prepare-class-declaration
+                          (form (str "(" head " Packet [payload])")) (compiler/new-env namespace) module)]
+       (try
+        (is (= module (:module (boundary/class! (:node prepared) namespace "Packet" kind #{} (fn [_] nil)))))
+        (is (= module (execute prepared)))
+        (is (= module (elem (BeamLisp.Env/lookup (tuple namespace "Packet")) 1)))
+        (let [ctor (elem (BeamLisp.Env/lookup (tuple namespace "->Packet")) 1)
+              value (BeamLisp.Ns.Rt/invoke ctor (list 42))]
+         (is (= (if (= :record kind) (Map/put {:payload 42} :__struct__ module)
+                    (tuple :bl_deftype module (tuple 42))) value))
+         (if (= :record kind)
+          (is (= value (BeamLisp.Ns.Rt/invoke (elem (BeamLisp.Env/lookup (tuple namespace "map->Packet")) 1) (list {:payload 42}))))
+          (is (= :error (BeamLisp.Env/lookup (tuple namespace "map->Packet"))))))
+        (finally (BeamLisp.Env/retire_module! module)))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest physical-scaffold-validation-does-not-exempt-corrupt-bodies-or-foreign-interns
+ (let [namespace (namespace!) module :Elixir.PreparedCorruption
+       prepared (compiler/prepare-class-declaration (form "(defrecord Packet [payload])") (compiler/new-env namespace) module)
+       node (:node prepared) descriptor (:descriptor prepared)
+       check (fn [node] (boundary/class! node namespace "Packet" :record #{} (fn [_] nil)))
+       stmts (get-in node [:body :stmts])]
+  (is (refused? #(check (assoc-in node [:init :args] (list {:op :lit :val (assoc descriptor :clauses (list))})))))
+  (is (refused? #(check (assoc-in node [:init :args] (list {:op :lit :val (assoc descriptor :name :Elixir.PreparedOther)})))))
+  (is (refused? #(check (assoc-in node [:body :stmts]
+                      (cons (assoc-in (first stmts) [:args] (list {:op :lit :val "foreign"} {:op :lit :val "Packet"} {:op :var :name "mod"}))
+                            (rest stmts))))))
+  (is (refused? #(check {:op :lit :val descriptor})))
+  (is (not (erlang/module_loaded module)))
+  (is (nil? (BeamLisp.Record/info module)))))
+
+(deftest inline-methods-retain-the-original-delayed-body-check
+ (erlang/erase :class-prepared-method)
+ (let [namespace (namespace!) module :Elixir.PreparedMethods
+       prepared (compiler/prepare-class-declaration
+                  (form "(deftype Packet [payload] Proto (read [this] (erlang/put :class-prepared-method true)))")
+                  (compiler/new-env namespace) module)
+       checked (atom [])
+       class (boundary/class! (:node prepared) namespace "Packet" :deftype #{namespace}
+                              #(swap! checked conj %))]
+  (is (= module (:module class)))
+  (is (= 1 (count @checked)))
+  (is (or (= :fn (:op (first @checked)))
+          (some? (BeamLisp.CompilerData/self_application_parts (first @checked)))))
+  (is (= ["read"] (get-in class [:extensions 0 :methods])))
+  (is (refused? #(boundary/class! (:node prepared) namespace "Packet" :deftype #{namespace}
+                                 (fn [_] (throw :delayed-body-refused)))))
+  (is (= :undefined (erlang/get :class-prepared-method)))
+  (is (not (erlang/module_loaded module)))
+  (is (nil? (BeamLisp.Record/info module)))))

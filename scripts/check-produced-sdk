@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Check a produced SDK without rebuilding it. Run under a process-tree cap."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--sdk', type=Path, required=True)
+parser.add_argument('--elixir', type=Path, required=True)
+parser.add_argument('--out', type=Path, required=True)
+args = parser.parse_args()
+sdk, output = args.sdk.resolve(), args.out.absolute()
+metadata = json.loads((sdk / 'artifact.json').read_text())
+assert metadata['kind'] == 'sdk' and metadata['version'] == 1
+output.mkdir(parents=True, exist_ok=False)
+image = output / 'image'
+shutil.copytree(sdk / 'image', image, symlinks=True)
+removed = []
+for path in image.rglob('*'):
+    if path.is_symlink():
+        continue
+    path.chmod(path.stat().st_mode | 0o200 | (0o100 if path.is_dir() else 0))
+    if path.is_file() and path.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.ex', '.exs', '.rs')):
+        removed.append(str(path.relative_to(image)))
+        path.unlink()
+(output / 'removed-source.json').write_text(json.dumps(removed, indent=2) + '\n')
+victim = image / 'ebin/Elixir.BeamLisp.Ns.Bl.Json.beam'
+inventory = image / 'priv/sdk-code.term'
+original, sealed = victim.read_bytes(), inventory.read_bytes()
+driver = Path(__file__).resolve().parents[1] / 'test/scripts/nix_sdk_receiver.exs'
+report = {'scope': 'produced-sdk-source-free-json-class-and-integrity', 'sdk': str(sdk), 'metadata': metadata, 'driver_sha256': hashlib.sha256(driver.read_bytes()).hexdigest(),
+          'source_files_removed': len(removed), 'stages': {}, 'status': 'running'}
+try:
+    for mode in ('positive', 'tamper', 'missing'):
+        victim.write_bytes(b'changed sealed artifact' if mode == 'tamper' else original)
+        inventory.write_bytes(sealed)
+        env = dict(os.environ, BL_APPLICATION_SDK=str(sdk), BL_APPLICATION_IMAGE=str(image),
+                   BL_ROOT=str(image), BL_SDK_RECEIVER_MODE=mode, BL_DAEMON='off',
+                   XDG_CACHE_HOME=str(output / ('cache-' + mode)),
+                   ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
+        started = time.monotonic()
+        result = subprocess.run([str(args.elixir), str(driver)], env=env, cwd=image,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+        (output / (mode + '.log')).write_text(result.stdout)
+        report['stages'][mode] = {'exit': result.returncode, 'seconds': round(time.monotonic() - started, 3)}
+        print(mode + ': ' + result.stdout[-3000:], flush=True)
+        if result.returncode or 'SDK-RECEIVER passed' not in result.stdout:
+            raise RuntimeError(mode + ' receiver failed')
+    report['status'] = 'passed'
+except Exception as error:
+    report.update(status='failed', error=str(error))
+    raise
+finally:
+    victim.write_bytes(original)
+    inventory.write_bytes(sealed)
+    (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

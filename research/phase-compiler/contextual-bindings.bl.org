@@ -1,0 +1,2034 @@
+#+TITLE: Same spelling, different bindings
+
+* A name needs a context
+
+A quoted symbol such as ='temporary= is name data. An identifier combines that
+symbol with lexical context. Two identifiers can print the same name and refer
+to different declarations. That is how a macro introduces its own temporary
+without capturing a temporary supplied by its caller.
+
+The boot-owned =syntax= and =binding= namespaces implement a bounded, pure model
+over the actual Reader. =expand/program= consumes them in the =syntax-v1=
+compiler path, including =defsyntax= and source-derived imports. The fixtures
+below isolate lookup from compilation; the [[file:language.bl.org][compiled walkthrough]] exercises the
+whole path. These tables grant no native execution authority.
+
+The scope rule follows [[https://docs.racket-lang.org/reference/syntax-model.html#%28part._.Identifiers__Binding__and_.Scopes%29][Racket's syntax model]]: a declaration applies when its
+scopes are a subset of the identifier's scopes. Its binding must have a scope
+set containing every other applicable candidate's scopes. Otherwise lookup is
+ambiguous. This model also makes binding space explicit in the lookup key.
+
+| Owner | Responsibility |
+|-------+----------------|
+| =syntax= | Reader-backed trees, contexts, source spans, explicit datum conversion and template substitution |
+| =binding= | Canonical input/scope/declaration keys, immutable indexes, phase/space lookup and availability |
+| =expand-source= / =expand= | Derive actual declarations, allocate scope coordinates and drive existing bounded macro evaluation |
+
+* Watch a template avoid capture
+
+Run from the repository root:
+
+#+begin_example
+./bin/bl --cold doc run research/phase-compiler/contextual-bindings.bl.org
+#+end_example
+
+This fixture gives one =temporary= a caller scope and the other an introduction
+scope. Template substitution preserves the supplied syntax exactly. The table
+is explicit fixture data; this cell tests name resolution, rather than claiming
+that the production compiler already consumes contextual bindings.
+
+#+begin_src beam-lisp :id avoid-capture
+(ns phase.contextual.walkthrough (:require [binding :as b] [syntax :as s]))
+
+(let [source "[temporary supplied]"
+      selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                 :sources [{:namespace 'example :digest (crypto/hash :sha256 source)}]}
+      module (b/scope selection 'example [0] :module)
+      caller (b/scope selection 'example [1] :lexical)
+      intro (b/scope selection 'example [2] :introduction)
+      context {:world (b/world-key selection) :namespace 'example :space 'value
+               :scopes {:all [(:id module)]}}
+      supplied (s/identifier 'temporary
+                 (assoc context :scopes {:all [(:id module)] 0 [(:id caller)]}))
+      template (first (s/read source "template.bl" context))
+      expanded (s/template template {'supplied supplied} (:id intro))
+      declaration (fn [path scopes]
+                    {:namespace 'example :name 'temporary :phase 0 :space 'value
+                     :kind :value :visibility :local :available-from 0
+                     :path [path] :scopes scopes})
+      world (b/world selection [module caller intro]
+              [(declaration 1 [(:id module) (:id caller)])
+               (declaration 2 [(:id module) (:id intro)])])
+      introduced (b/resolve world (first (:children expanded)) 0 0)
+      substituted (b/resolve world (second (:children expanded)) 0 0)]
+  (assert (= ['temporary 'temporary] (s/to-datum expanded)))
+  (assert (= supplied (second (:children expanded))))
+  (assert (= :resolved (:status introduced)))
+  (assert (= :resolved (:status substituted)))
+  (assert (= '(2) (get-in introduced [:declaration :path])))
+  (assert (= '(1) (get-in substituted [:declaration :path])))
+  (assert (not= (get-in introduced [:reference :id]) (get-in substituted [:reference :id])))
+  {:same-spelling true :same-binding false :caller-context :preserved})
+#+end_src
+#+RESULTS: avoid-capture
+: {:same-spelling true, :same-binding false, :caller-context :preserved}
+
+
+* Phase, space and position answer different questions
+
+=binding/resolve(world, identifier, phase, position)= first looks in the
+=name/phase/space= bucket, then checks scopes and declaration availability.
+A runtime value at phase 0 and a helper at phase 1 are distinct bindings.
+A type and a value can also use the same symbol in separate spaces.
+
+Syntax contexts carry separate scope sets for each phase, plus =:all= scopes
+that apply at every phase. An introduction scope therefore survives a phase
+shift, while each module phase can retain its own context.
+
+Lookup returns =:resolved=, =:unbound=, =:ambiguous= or =:not-yet-available=.
+Selecting an inner declaration before its authored availability point returns
+=:not-yet-available=. It does not silently choose a less-specific outer binding.
+No lookup consults Env, reads a file or executes a transformer.
+
+* Import a provider into another phase
+
+The =binding/import-view= API connects modules in one selected logical world;
+=binding/select= connects distinct worlds, including revisions of one namespace.
+An import view preserves the original declaration. =:alias= and =:rename=
+change its visible spelling; =:phase-shift= changes the reference's phase.
+The consumer must carry the explicit import scope. Only public declarations
+can enter this view. Two aliases at the same phase refer to the same binding;
+a reference at a different phase has a different reference key.
+
+#+begin_src beam-lisp :id phase-import
+(let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                 :sources [{:namespace 'provider :digest (crypto/hash :sha256 "provider")}
+                           {:namespace 'client :digest (crypto/hash :sha256 "client")}]}
+      provider (b/scope selection 'provider [0] :module)
+      import (b/scope selection 'client [0] :import)
+      declarations [{:namespace 'provider :name 'answer :phase 0 :space 'value
+                     :kind :function :visibility :public :available-from 0
+                     :path [0] :scopes [(:id provider)]}
+                    {:namespace 'provider :name 'helper :phase 0 :space 'value
+                     :kind :function :visibility :private :available-from 0
+                     :path [1] :scopes [(:id provider)]}]
+      world (b/world selection [provider import] declarations)
+      request {:from 'provider :into 'client :scope (:id import) :phase-shift 1
+               :space 'value :only ['answer] :alias 'p}
+      imported (b/import-view world request)
+      identifier (s/identifier 'p/answer
+                   {:world (:key world) :namespace 'client :space 'value
+                    :scopes {1 [(:id import)]}})
+      result (b/resolve imported identifier 1 0)]
+  (assert (= :resolved (:status result)))
+  (assert (= 'provider (get-in result [:declaration :namespace])))
+  (assert (= 0 (get-in result [:declaration :phase])))
+  (assert (= 1 (get-in result [:reference :phase])))
+  (assert (= :unbound (:status (b/resolve imported identifier 0 0))))
+  (assert (= imported (b/validate-world imported)))
+  (assert (= :binding-import-private
+             (try (b/import-view world (assoc request :only ['helper])) nil
+               (catch error (:kind (ex-data error))))))
+  {:visible-name 'p/answer :provider 'provider :definition-phase 0 :reference-phase 1})
+#+end_src
+#+RESULTS: phase-import
+: {:provider provider, :visible-name p/answer, :definition-phase 0, :reference-phase 1}
+
+
+Declarations and import views in these fixtures are explicit model inputs.
+The compiled path derives them from actual Reader units. Serialization
+validation checks their structure and indexes; it does not claim that a
+caller's hand-built table matches arbitrary source text.
+Cross-world views between a preceding compiler phase and candidate source
+remain a separate integration gate; they must retain both namespace revisions.
+
+* Keys describe logical inputs; attestations bind physical bytes
+
+=binding/world-key= accepts source namespace/revision pairs, profile and target.
+It normalizes finite collections and ordering. Physical artifact hashes and
+receipts belong to the separate production attestation, so repackaging does not
+alter a binding key. Changed source revisions do alter the logical world.
+
+Scope keys use owner, structural expansion path and role. Declaration keys also
+include phase, space, kind and authored coordinates. Process counters, native
+references and absolute file locations have no place in these keys. Source
+spans remain on syntax nodes for diagnostics and Reader roundtripping.
+
+=binding/validate-world= rebuilds every serialized index before repeated lookup.
+Lookup uses the matching bucket and a scope union, avoiding a scan of all
+declarations or all pairs of candidates. Inputs are eager and finite. Syntax
+work accounts for tree depth, metadata and repeated scope references; template
+holes and total substituted output have aggregate bounds.
+
+=syntax/to-datum= explicitly forgets context. Reconstructing syntax with
+=syntax/from-datum= requires a chosen context. A map resembling ANF stays
+ordinary map data. Record Reader nodes roundtrip through =syntax/to-reader=;
+materializing record values belongs to the expander/compiler and is refused
+by the pure datum conversion.
+
+
+* Ordered entry units share the compilation session
+The same =expand/prepare-program= entry now accepts an ordered sequence of
+phase-zero forms, or a declaration-only entry. It expands every form before any
+runtime entry executes. Each form retains its authored position and module
+context; siblings do not inherit one another's lexical scopes. Transformer
+images, phase values, reference tables, expansion fuel and the bounded constructor
+session belong to the complete unit. They are not recreated per form.
+
+#+begin_example
+(ns initialization)
+(defsyntax answer [form context] (syntax-literal 42))
+0
+(answer)
+(answer)
+#+end_example
+
+This entry returns42, records two macro expansions/calls and caches one
+transformer image. Putting =(answer)= before its declaration refuses before
+runtime effects. A declaration-only entry returnsnil and exports the same
+portable phase recipes. Compilation builds one canonical entry declaration;
+World analysis and raw artifact emission consume its exact body. A runtime
+initializer failure prevents later effects.
+
+This is entry-body integration, not a complete ordinary namespace compiler or
+once-per-activation initializer owner. Provider expressions remain unsupported,
+and closed-profile values retain their existing restrictions. Physical module
+exports, ordinary Source/bootstrap/AOT/reload/JS adapters and verified activation
+still require migration. Commitfea2125e and contextual-initialization-checks.json
+record202 passing private-component assertions; actual new immutable B/C/SDK
+qualification remains required. No alternate language engine or entry mode is
+introduced.
+
+
+* Declaration headers have one compiler owner
+=compiler/declaration-source(form, env)= projects a supported declaration into
+inert =:kind=, =:name=, =:metadata=, =:visibility= and =:value-form= data. The
+normal compiler's value/function publication and prelinking share its header
+parsers. The contextual catalog and phase-library validator rederive visibility
+from that same owner rather than reading only the defn- spelling. Metadata has
+its established precedence: attribute maps override name metadata; defn- privacy
+and explicit docstrings apply last. Only a true private flag means private.
+
+#+begin_example
+(ns forms)
+(begin-for-syntax (def ^:private offset "phase constant" 40))
+(defsyntax answer "Documented transformer" {:audit :stored}
+  [form context] (syntax-literal (erlang/+ offset 2)))
+#+end_example
+
+A Source-free phase archive of this provider supplies42 to a client importing
+answer. Its private phase helper remains available to the transformer. Direct
+imports of metadata-private functions, values or transformers refuse. Rebuilding
+a library's declaration IDs, indexes and digest cannot override private metadata
+in its stored recipe; recipe validation rejects the contradiction before use.
+
+Header projection executes neither declaration bodies nor metadata expressions.
+Consumption of declaration-name metadata does not permit runtime expression
+metadata effects. Per-environment values need runtime lifetime semantics and
+refuse in the closed constant profile. These checks provide no SDK provenance or
+execution grant. Commita67b1449 passes306 private-component assertions; actual
+new immutable bootstrap/SDK qualification and physical namespace export
+integration remain separate requirements. See declaration-header-checks.json.
+
+
+* Logical namespace and physical recursion target are distinct
+The canonical declaration owner now accepts an explicit physical module:
+=BeamLisp.Compiler/prepare_function_declaration(form, env, module)=. The existing
+two-argument adapter selects the namespace module and calls the same owner.
+AOT supplies one chosen module to both preparation and body attachment, so
+recur does not reconstruct a physical target from the logical namespace.
+
+Two selected revisions may share a logical namespace while their actual code
+lives in different modules. The native component demonstrates16/106/16 across
+two such modules, variadic tail recursion, and first-class values using the
+existing fixed/variadic ABI. Target metadata grants no code origin, publication
+permission or Execution admission. With contextual references present,
+preparation leaves Env links/definitions untouched.
+
+Commit987b3aa4 passes371 focused component assertions, including the private
+retargeted facade ABI differential. It changes the compiler interface to include
+arity3; the AOT consumer requires a matching new immutable compiler/facade/SDK.
+No old-floor fallback is provided. Complete selected-global lowering, physical
+namespace exports and adapter/activation integration remain required. See
+physical-declaration-checks.json for exact scopes and retained failures.
+
+
+* A selected global is a logical reference before it is a physical address
+Canonical ANF now distinguishes a global selected by the phase binder from an
+ambient namespace lookup:
+
+#+begin_example
+{:op :binding
+ :reference {:version 1 :kind :binding-reference :world ...
+             :declaration ... :id ... :phase 0 :space 'value}
+ :ann {...}}
+#+end_example
+
+The field carries executable identity; display annotations cannot change it.
+The same :invoke operation calls the value. Compiler and compile-expression
+retain it without Env fallback. ANF validates finite shape and reports an
+unresolved captured dependency; shape does not authenticate a declaration or
+prove native entry. Shared analysis keeps different worlds/phases distinct and
+leaves unknown arities/dependency coverage explicit.
+
+Both native and JS emission refuse unlinked values, before loading code or using
+an ambient resolver. Constructor evaluation refuses them too. Commit5e46fe8f
+passes414 private-component assertions, including the descriptor emission path.
+This is the representation/refusal boundary. The owned unit linker, actual
+physical namespace exports, producer/consumer migration and new immutable
+qualification remain required. Existing lexical program linking is unfinished
+cutover work, not an additional engine to preserve.
+
+* Selected definitions enter the canonical unit compiler
+The Reader no longer invents a let around the entry. Expansion supplies one
+ordered table of selected definitions to the same compiler owner used by
+runtime entries, constructor values and transformers:
+
+#+begin_example
+(compiler/compile-contextual-unit entry env references
+  (list (tuple internal-selected-name expanded-definition)))
+#+end_example
+
+Only preceding definitions are visible to an initializer. The compiler validates
+selected global identity shape and table uniqueness before compiling definitions,
+then uses its normal lexical names and ANF constructors. This is compilation
+input, not Source authentication or native admission. The expression adapter
+supplies an empty table; it does not choose another compiler. The native entry
+facade forwards its new fourth argument to the same owner.
+
+Commit1343673d passes431 private-component assertions. The selected-binding file
+checks actual invocation, identity retention, deterministic output, malformed
+link refusal, unwrapped authored input and declaration/analysis body equality.
+This prepares one lexical unit body. Physical exported function/value layout,
+complete namespace adapters and new immutable qualification are still required;
+unresolved symbolic ANF values continue to refuse execution.
+
+* Binding linkage operates on explicit ANF identity
+The compiler now emits selected global references before resolving the unit:
+
+#+begin_example
+(anf/link-bindings
+  (anf/binding-value selected-reference)
+  {selected-reference (anf/var compiler-owned-slot)})
+#+end_example
+
+The entire reference is the key. A reference from another world or phase cannot
+borrow this target. Targets are already-linked data; recursive binding nodes and
+ambient global targets refuse. The linker never calls a resolver. It traverses
+only executable grammar positions, including latent function bodies and cleanup;
+literals, patterns and display metadata remain inert. The output retains selected
+identity in annotations and contains no unresolved executable binding.
+
+Complete unit compilation uses this owner for definitions in dependency order and
+then for the entry. Partial expression analysis uses the same canonical compiler
+but deliberately preserves unresolved identities. An empty table cannot make an
+executable unit accept a missing target. This supersedes the earlier empty-table
+expression delegation; there is still one compiler and one emission route.
+
+Commit28868a1e passes478 private-component assertions. Current physical namespace
+exports, complete adapters, activation lifetime and immutable qualification remain
+open; no data-shape check authenticates code or grants execution.
+
+* Namespace exports are values from one compiled instance
+The namespace compiler now prepares unused public declarations as well as the
+entry's dependencies. It retains the same compiled initializer/entry graph for
+both ordinary evaluation and physical artifact projection:
+
+#+begin_example
+(compiler/prepare-program-unit entry env references ordered-links public-names)
+(compiler/contextual-unit-factory compiled-unit)
+(compiler/contextual-unit-clauses compiled-unit physical-module)
+
+;; Physical module.__bl_unit__/0 returns ordinary data:
+{:version 1 :kind :contextual-unit-instance
+ :entry <zero-argument entry thunk>
+ :exports {<full selected reference> <constant or callable>}}
+#+end_example
+
+The instance closes over private dependencies. Callers reuse the returned
+callables; they do not look up namespace strings or rebuild a definition on each
+function call. Creating the factory instance leaves top-level entry expressions
+latent. Physical run/0 invokes the factory then that entry. The compiler compiles
+Source bodies once and owns both projections. The unit recipe participates in
+the codebase snapshot; phase checking validates actual public runtime identities,
+and World refuses a changed export recipe with stale analysis before emission.
+
+Commit28c50cec passes519 private-component assertions, including genuine physical
+BEAM factories and independent revisions. This is still the closed constant
+profile. The data are not admission handles. Artifact ABI admission, remaining
+producer/consumer migration, effectful definitions, once-per-activation ownership,
+real consumer retirement and new immutable qualification remain required.
+
+* A factory artifact is admitted before language bootstrap
+The one contextual artifact format now has metadata version3 and factory ABI1.
+It binds a shared public phase0 reference inventory and requires the actual
+runtime factory/run exports. Older run-only artifacts and extra initializer
+exports refuse; there is no compatibility selector. The passive verifier checks
+bytes/roles/finite shape and never grants native admission from metadata.
+
+Binding-reference shape lives in native CompilerData; ANF and artifact admission
+reuse it. Cold replay exposed variadic comparisons that fetched uninitialized
+language vars, first in admission and then in the ETF decoder. Both boundaries
+now use native primitives. The new private native Source candidate accepts v3
+and refuses v2 without initializing the var table or loading program code.
+
+f3392518 records557 main component assertions, a separately passing unchanged-
+candidate fresh receiver/recompiler,296 focused Data assertions and10 old-floor
+installation mechanics assertions. Failed aggregates remain failed. Producer and
+recompiler delegate to World, so metadata/factory projection has one owner.
+Actual immutable SDK production and complete consumer/activation qualification
+remain required; these Source components are not relabeled as a qualified SDK.
+
+* Bootstrap evaluates availability during publication too
+The actual Nix bootstrap caught an order dependency hidden by atomic private
+component compilation: private-var? became callable before its new shared
+metadata-visibility helper. 1ccb9f98 places the helper before that early guard.
+The focused regression invokes the actual guard as soon as it is published and
+reverses the declarations to reproduce the missing-helper failure. It passes
+four assertions without replacing any SDK compiler module. Full immutable
+bootstrap is being retried; this focused repair is not an SDK qualification.
+
+* Patterns bind names; their map keys read the enclosing environment
+A map pattern contains two different roles:
+
+#+begin_example
+(anf/pmap (list [(anf/var "selected-key") (anf/pvar "value")]))
+                 enclosing read           clause binding
+#+end_example
+
+Treating the complete pattern as inert lost the key's selected references, free
+captures and analysis obligations. Lower already emitted those keys as ANF.
+The canonical grammar now owns pattern-expressions/map-pattern-expressions;
+linkage and system.ir traversal/rewriting share those roles. Literal pattern
+payloads and struct field names remain data. Clause parameters become available
+for guards/body, after key reads use the enclosing lexical scope.
+
+Closed function checks and reconciliation retain key-only captures; the actual
+residual callback's key substitution executes correctly. Arity, suspension and
+footprint checks see the operands too. Ownership handler-key interpretation is
+explicitly unknown, rather than silently proved. This does not complete lexical
+free-variable validation or original runtime admission obligations.
+
+The paired private component passes81 tests/558 assertions and six actual older
+SDK API controls reproduce the omitted operands. Exact scopes and failed earlier
+attempts are in pattern-expression-consumer-checks.json. Actual new immutable
+production and full cutover/final replay remain required; no parallel compiler,
+admission flag, registry or effectful initializer permission is added.
+
+* A compiled unit's variables must close over actual lexical bindings
+The unit validator now checks lexical closure after its bounded data, executable
+grammar and selected-linkage checks. Initializers see only preceding slots;
+entry sees all completed slots. A delayed function cannot capture a slot that
+will be declared later: the native lexical environment does not contain it yet.
+Let initializers read their enclosing scope. Clause keys read the outer scope;
+guards and bodies read the clause's parameter bindings. Sibling scopes do not
+leak. One iterative walk shares the unit's262144-step budget; nothing is evaluated.
+
+CompilerData supplies the bootstrap-ready direct-function shape and fixed catch
+stack names. The compiler, lowerer and validator consume those same roles,
+including the existing direct Core parameter behavior and separate frame/raw
+stack identities. system.ir's pattern binder enumeration delegates to ANF.
+Invalid scope reaches entry/factory/fresh facts as invalid-contextual-unit before
+emission, rather than being discovered by the Core compiler later.
+
+The focused paired component passes545 assertions and real catch/optimizer/Core
+emission controls. Five unchanged SDK observations reproduce the missing lexical
+check. Fresh native-leaf preboot passes11 controls with compiler unloaded and no
+namespace table. These are scoped Source/native-leaf results, not an installed
+new SDK. Type/effect/Core validity and native execution authority are separate.
+Remaining ordinary/bootstrap/world/JS adapters and actual activation/retirement
+still feed the one next architecture. See contextual-unit-lexical-checks.json.
+
+* Namespace require grammar has one bootstrap owner
+CompilerData.namespace_require_spec now owns the bounded Reader grammar used by
+the ordinary compiler and inert AOT header capture. Both reject missing values,
+invalid names, duplicate options/refer names and unknown flags. AOT parses each
+request once, preserving bare/alias/refer-all intent in its existing metadata.
+Raw Reader tuples use check_reader_data!, never runtime vector storage checks.
+
+Paired private components pass16 tests/103 assertions; fresh current native-leaf
+preboot passes21 controls with compiler unloaded and namespace table absent. Four
+actual unchanged SDK observations reproduce old malformed-request acceptance.
+Preparation41.623s, execution1.558s;430.4MiB/zero swap. The slowest247ms existing
+header child uses installed old AOT; the separate0.388s/69.6MiB preboot explicitly
+checks current private AOT/Data. Earlier failed aggregates remain failed.
+
+Python7/4/23 and16-boundary/seven-writer discovery pass. Configured next gate:
+145 ordinary files;56 selected sealed files/2463 assertions; full2816/universal6;
+preboot21 separate. Historical ledger stays16 scoped/70 open, all86 final replays.
+No actual new SDK or sealed qualification. Compiler/AOT/Data require paired new
+immutable production; no old-floor fallback. Backend/executor contracts unchanged.
+
+This removes duplicate grammar, not the remaining ordinary import architecture.
+Next: captured Source headers become existing canonical binding import edges,
+with precise origins and explicit revision ambiguity/privacy/phase refusals; no
+ambient Env/Loader resolution. Ordinary compiler privacy lookup still loads
+unloaded providers. Full bootstrap/JS/native adapters, old-route deletion and
+existing-owner activation/real consumer retirement remain required. Conservative
+roots stay retained. Receipt: namespace-require-grammar-checks.json.
+
+* Captured namespace headers converge on canonical imports; phase captures close
+The Source catalog reads each descriptor once, summarizes captured public
+providers and projects ns/:require through the shared native grammar into
+existing binding/select edges. Bare/full-qualified, alias, explicit refer and
+refer-all views preserve provider identities, visibility and phases. Missing or
+ambiguous revisions, runtime provider entry expressions, empty public providers
+and unsupported namespace clauses refuse explicitly. No ambient Env/Loader
+provider lookup or new evaluator is added. This is the closed syntax-v1 adapter,
+not completion of the ordinary compiler/bootstrap/JS/native cutover.
+
+Header scopes use prefix1; explicit revision import-world scopes retain prefix0.
+Library versions1/2 remain readable; :scope-path is new wire vocabulary requiring
+a paired new receiver. Exact explicit refer-name origins survive archival.
+Qualified/refer-all views carry no invented tokens; refactor edits only explicit
+import tokens and real occurrences, then recompiles and checks binding/ANF shape.
+
+The wider replay exposed an actual phase-value bug: externally supplied session
+values were free variables in a supposedly closed compiled unit. New compiler/
+compile-contextual-callable uses shared unit preparation, then binds explicit
+formal parameters around initializer slots and entry. Strict unit closure checks
+the actual returned callable; no external-variable exception is added. The sole
+phase-reader consumer invokes it using canonical ANF list operands and actual
+constructor-session bindings. Effects/native admission stay closed. The older
+rename fixture's unexpanded export premise was stale: unit preparation now
+prepares unused runtime exports too. Its checked rename now succeeds; archived
+Source refusal remains asserted.
+
+Final paired private batch:43 tests/244 assertions, zero failures/errors. Includes
+new header33/capture9, library16/compat3, rename22, lexical103, phase-value15,
+import25 and query18. Preparation12.455s, execution10.610s; service24.396s,233MiB
+and zero swap. Native Data/AOT/compiler bytes were reused from preparation8; its
+46.101s failed run is separately retained, not charged as zero-cost preparation.
+All ten failed earlier attempts remain failed with precise causes in the receipt.
+Actual installed Compiler/Loader/AOT/Data MD5 remains unchanged; these private
+components are not SDK-origin graph authority or a qualified immutable SDK.
+
+Python7/4/23 and16-boundary/seven-writer discovery pass. Next configured gate:
+151 ordinary files;62 selected sealed files/2564 assertions; full2917/universal6;
+preboot21 separate. Historical ledger remains16 scoped/70 open; all86 final
+replays required. No new immutable production or sealed execution, backend or
+command-executor change. Continue remaining single-cutover adapters and old-route
+deletion, existing-owner activation/comparison/real consumer retirement, then
+paired immutable production and actual final qualification. Conservative roots
+remain retained. Receipt: namespace-header-import-checks.json.
+
+* One namespace clause interpretation across compiler/AOT/Source/JS
+CompilerData.namespace_clauses now owns the bounded Reader header tail. One
+optional leading docstring is data; other forms must be supported keyword-headed
+clauses. Compiler scalar-dropping and duplicate clause-name validation are gone.
+AOT and Source consume this same normalization. Arbitrary scalars, duplicate
+docstrings and malformed/unknown clauses refuse before provider or namespace
+effects. AOT unwraps clause-head metadata before capture: a wrapper cannot erase
+a dependency. Returned Reader nodes retain exact token origins.
+
+JS ns-head now delegates to AOT header metadata. Its independent require parser
+and index helper are deleted. Bare and refer-only requests now appear in the
+JS dependency graph, alongside aliases. This is a shared-header migration, not
+completion of canonical JS expansion/staging or ordinary/bootstrap/native routes.
+No new fallback, input mode, native authority registry or effect permission.
+
+Private paired consumer batch passes30 tests/179 assertions. Preparation37.609s,
+execution2.839s; service41.789s,417.6MiB/zero swap. Data/Compiler bytes reuse the
+paired preparation1 (45.920s preparation;176 assertions passed before the added
+metadata control). Native installed Compiler/Loader/AOT/Data remain unchanged.
+Slowest bodies: JS exports305ms; existing old-SDK header child244ms; rename219ms.
+Fresh current private native-leaf preboot passes25 controls in0.465s, compiler
+unloaded and namespace table absent. Tracked actual next-SDK gate now requires25.
+
+Production intake inventory covers598 plain/literate Source files under priv
+through actual Loader extraction:592 leading namespace headers, six headerless
+files,1542 require requests,412 require clauses and one refer-clojure clause.
+All pass current private AOT capture. Preparation0.022s, execution7.736s; service
+9.145s,199.8MiB/zero swap; all raw inputs unchanged. This checks leading forms,
+not every nested/later/dynamic namespace declaration or actual immutable boot.
+The sole refer-clojure row is an intentional preinit refusal fixture; keep that
+refusal. Initial probe12 errors were its own nil/docstring walk; its failed
+aggregate is retained. Plain-only563-file scope is kept separately.
+
+Python7/4/23 and16-boundary/seven-writer discovery pass. Configured ordinary152
+files;63 selected sealed files/2611 assertions; full2964/universal6; preboot25.
+No actual new immutable SDK or sealed qualification. Historical ledger remains
+16 scoped/70 open, all86 final replays. Remaining whole-language producer and
+consumer cutover, owner activation/comparison/live-consumer retirement and exact
+final qualification remain required. Native compiler/AOT/Data need paired Nix
+production; backend/executor unchanged and roots remain conservative. Receipt:
+research/phase-compiler/namespace-clause-checks.json.
+
+* Canonical archive admission and one-way legacy data conversion
+Archive envelope integrity did not check every imported request against its
+recorded scope/world. checked-library now owns bounded envelope/digest checking,
+legacy conversion and canonical restoration for catalog input, encoding and
+decoding. Exact request fields, unique names, phase/shift, aliases, origin-map
+shape and scope domains are checked. Expected scopes must equal both imported
+records and world registry entries. Orphan/repeated scopes, missing phase0 and
+world profile/target mismatches refuse. Provider closure still resolves at full
+catalog selection, since separately supplied libraries are valid dependencies.
+
+Binding.check-name! exposes the existing unqualified identity grammar; internal
+world/reference hash inputs stay the same. Archive admission shares that owner.
+Revision labels use quoted Syntax symbols and retain qualified spelling. This
+does not prove different revision labels produce distinct logical worlds.
+
+Supported v1 bytes are checked against their original digest and exact legacy
+row schema, then converted once to current v2 with explicitly unknown token
+origins represented by empty maps. Encoding always emits v2; decoding returns
+v2. No old compiler/runtime branch remains for those inputs. Converted digest
+is data integrity, not Source/SDK authentication; original file byte digests
+remain compile.world capture inputs. Archived Source remains unavailable for
+editing. Unknown legacy fields refuse before conversion instead of disappearing.
+
+Final private paired component:38 tests/177 assertions, zero failures/errors.
+Archive49, format conversion5, libraries16, header imports33, phase captures9,
+rename22, queries18, binding imports25. Preparation16.553s, execution9.727s;
+service27.658s,254.5MiB/zero swap. Exact slowest bodies are in the receipt. Four
+actual unchanged SDK decoder calls reproduce malformed row acceptance; caller
+Env capture stays unchanged after fixture creation. Native installed Compiler/
+Loader/AOT/Data MD5 stays unchanged. No private clone becomes native SDK-origin
+authority. Prior failed driver/fixture/Reader aggregates remain failed; the175
+assertion predecessor is not relabeled final. Early Reader preflight now rejects
+malformed inputs before component preparation. Native leaf did not change; the
+prior25-control native preboot scope was not redundantly rerun or promoted.
+
+Python7/4/23 and16-boundary/seven-writer discovery pass. Configured next gate:
+153 ordinary files;64 selected sealed files/2662 assertions; full3015/universal6;
+preboot25. No actual new SDK or sealed execution. Historical ledger remains16
+scoped/70 open and all86 need final replay. Backend/executor unchanged; effects
+remain restricted and roots conservative. Receipt: library-import-admission-checks.json.
+
+Next concrete identity obligation: reproduce same-content revision behavior.
+Source selection currently hashes namespace/content while catalog indexes
+revision separately. Verify actual world-key/recipe/provenance behavior and close
+independent-world isolation before changing its schema or claiming it proved.
+Continue whole producer cutover/old-route deletion and existing-owner verified
+activation/comparison/real consumer retirement, then exact immutable final
+qualification. Archive shape validation does not close those obligations.
+
+* Revision-qualified worlds and archive identity conversion
+Actual SDK reproduction confirmed the suspected collision: two same-content
+revision units retained one world and one recipe, and reversing input changed
+the representative file z.bl to a.bl. Declaration provenance retained one unit.
+The initial probes' native-Enum and over-specific ordering assertions are kept
+as failures; the final direct catalog reproduction proves the actual collapse.
+
+Binding source records now accept an explicit revision coordinate in world-key
+identity, separately from the unchanged raw Source digest. Catalog descriptors
+always supply it. Scope/declaration/reference IDs therefore distinguish two
+revisions even when bytes match, while order-independent selection and exact
+file/token provenance remain. Anonymous expression/table worlds have no Source
+revision label; they use the same binding/resolution owner, not a second compiler.
+Revisions are bounded quoted symbols and retain qualified spelling.
+
+Current contextual phase libraries are v3 and require qualified Source identity.
+V1/v2 data are validated and converted once before canonical restoration. Check
+old module/scope/declaration/context claims before replacement, rebuild all IDs
+and recipe contexts using the explicit unit revision, preserve digests/origins,
+then run current unit/import/recipe and aggregate data limits. No identity field
+is silently overwritten to launder malformed input, and no SDK/Execution grant
+comes from conversion. Encoding emits v3 only. Actual old SDK fixture bytes
+prove both legacy layouts and same-content twins; they are tracked, documented
+and frozen as .etf inputs. The separate authenticated AOT kernel-phase-library
+DTO remains v2; do not conflate its ownership/ABI with this Source archive.
+
+Final private paired replay:50 tests/351 assertions, zero failures/errors. This
+covers independent worlds/recipes/provenance, private macro helpers and actual
+84 execution from both revisions, both old archive formats, tampering refusal,
+query/rename/phase reports and141 binding assertions. Preparation16.482s,
+execution11.048s; service28.964s,254.8MiB/zero swap. Slowest archived-query rename
+1.941s, malformed query1.367s, hygienic query1.061s. First mixed-component run
+remains FAILED312pass/2fail/8errors: private codebase/system readers used the old
+installed binding decoder. Correct pairing fixes that harness mismatch; no
+production check was weakened. Actual installed Compiler/Loader/AOT/Data MD5
+remains unchanged, and private clones confer no native SDK-origin authority.
+
+Python7/4/23 and16-boundary/seven-writer discovery pass. Configured ordinary155
+files;66 selected sealed files/2836 assertions; full3189/universal6; preboot25.
+Native leaf unchanged, so prior preboot scope is not rerun or relabeled. No new
+immutable SDK or sealed qualification. Historical ledger remains16 scoped/70
+open and all86 final replays. Next: finish whole producer cutover and superseded
+route deletion, then existing-owner activation/comparison/real consumer
+retirement and exact immutable final qualification. Native instance lifetimes
+are not proved by Source world identity. Backend/executor unchanged and roots
+remain conservative. Receipt: revision-qualified-world-checks.json.
+
+* Actual bootstrap dependency-order failure and verified floor provisioning
+The frozen03ebe86f integration attempt failed after119.846s before coordinator/
+SDK production. Nix dependency provisioning entered a current Source boot-tier
+rebuild while its pinned CompilerData lacked simple_function_clause/1. This is
+an actual stage-order failure, not a component qualification or usable SDK.
+
+Internal bin/bl-producer now delegates dependency classification to the existing
+Source Launcher, installs the whole SHA-verified committed floor and uses the
+existing application/CLI provisioning dispatch. External dependency compilation
+precedes production of current host/compiler ABI; other commands retain current
+Source rebuild. Public checkout bin/bl still selects Nix products. No new provider
+flag, routine local production path, seed overwrite, authority assertion or
+backend recipe change. A bootstrap input floor is not labeled current compiler.
+
+Actual enumerated Nix dependency product passes46 locked/46 usable packages in
+four passes. Total151.026s (build phase115s); service151.076s,2.2G/zero swap. This
+qualifies dependency provisioning only. Existing launcher owner controls pass18
+tests/148 assertions, including cold/opaque argv, language-less preboot decisions,
+installation refusal and full-evidence rebuild/dispatch order. Execution3.293s;
+service4.512s,212.2MiB/zero swap. No installed Compiler/Loader/AOT/Data replacement.
+Shell syntax, Python7/4/23 and16-boundary/seven-writer discovery pass. Entry/callers
+are mapped explicitly: internal producer, dependency/release and compiler Nix
+recipes; ordinary/coordinator SDK entries continue their prior native owners.
+
+New SDK integration must restart from a new frozen fingerprint because producer
+Source changed. No SDK was produced by the failed attempt. Keep its failed
+packet and all prior Source/metadata/historical obligations. Dependency success
+does not promote a compiler floor or close activation/retirement or any E01–E86
+case. Receipt: bootstrap-dependency-order-checks.json.
+
+* ANF bootstrap traversal uses module-owned grammar
+
+The frozen984d7239 SDK retry passed dependency provisioning, then failed after
+246.029s in compiler generation P fresh boot. ANF executable-clause traversal
+passed an unpublished runtime var as eager_mapcat's callback. No compiler/SDK
+was produced; the qualification handoff stopped without running preflight.
+
+Canonical ANF now wraps five pattern helper callbacks in explicit functions
+that directly call their module-owned definitions. Structural grammar therefore
+does not depend on __bl_init__ populating namespace values first. This changes
+neither schema nor admission, and introduces no alternative bootstrap grammar.
+The new existing-file regression shadows both vars with nil and poison data:
+nested binders/keys, dependency edges and lexical accept/refuse remain intact.
+
+A private native defn projection passes with both vars nil (preparation2.031s,
+execution0.005s). Paired current Source consumer tests pass21 tests/225 assertions
+(preparation16.014s, execution3.585s,241.2MiB/zero swap). Slowest tests are the
+existing dependency-budget refusal1109ms, divergent phase facts501ms and actual
+catch lowering62ms. Exact prior ANF Source reproduces three cannot-call-nil errors
+in the new control. That causal runner also fails its mistaken final predicted
+count; its real33-pass/three-error result and earlier probe refusals are retained.
+
+Discovery verifies16 boundaries/seven external writers; Python controls7/4/23
+pass. Historical arithmetic remains16 scoped/70 open with all86 final replays.
+This is component evidence only. The next actual frozen SDK must pass P/B/C,
+fresh boots, installed seed equality and affected ordinary/sealed checks before
+any floor claim. Activation, actual consumer retirement and the rest of the one
+cutover remain required. No build-claim or command-executor contract changes.
+Receipt: [[file:anf-bootstrap-callback-checks.json][ANF bootstrap callback checks]].
+
+* Actual revision-integrated SDK; receiver fixture failures retained
+
+Runtime84357c14 produces actual immutable SDK
+=/nix/store/47fvvpm4ql0ka1slhk54x8cl99a7ip22-beam-lisp-sdk-selection=,
+engine50303eac49aecd6ac6aebd33543e43fed2409103bcd46bc10ba052b12e31114b.
+Normal Nix/managed production succeeds in2135.062s. P/B/C fresh boots pass;
+B/C reproduce141 files exactly and both compiler/SDK installed seeds match C.
+Compiler product02zk9wj9vi8fbdpqsgnkm1yb96lzq0py, coordinator
+=dvq05gsamib266x2g4as1m3wab15bbn9= and all exact product addresses are retained
+in [[file:revision-integration-sdk-checks.json][the integration receipt]]. No constructed SDK is relabeled as this product.
+
+The first nine-boundary consumer gate remains FAILED:25 preboot checks pass;
+153/155 ordinary files pass, two fail, none are incoherent. All6923 frozen files
+remain unchanged; sealed qualification does not run. Preparation4.318s,
+preboot1.562s, consumers1234.113s; service1243.379s,3.2G/zero swap. Slowest tests
+are retirement release cycles100148ms, ordinary env-world build52693ms,
+historical guard controls48464ms and dedicated durable stores45988ms.
+
+Independent original-file replay reproduces the namespace fixture's unavailable
+JS API and the JS cache fixture's assumed authority decline. It additionally
+exposes four JS API errors that prior aggregate loads masked. Receivers must
+initialize their own dependencies. They now load js.build inside each isolated
+native-compiler scope. Malformed headers must produce the exact shared grammar
+reason, not any exception. The portable-authority negative explicitly supplies
+a reference-capturing Core override in an owned fork; it refuses certificate and
+memo without invocation and preserves original global authority. No production
+policy or guard is changed, and engine50303eac... remains identical.
+
+Focused exact-candidate replay passes13 tests/68 assertions, no failures/errors;
+file execution totals are recorded separately from service14.083s,432.7MiB/zero
+swap. These corrections require a new frozen consumer/sealed qualification on
+the SAME immutable SDK, not another engine build. Until it passes, no semantic
+floor promotion is asserted. Original activation/lifetime, compiler/bootstrap/
+JS cutover,16 scoped/70 open historical arithmetic and all86 final replays remain.
+No build-claim or command-executor contract changed.
+
+* Prepublication control included in actual affected and sealed selection
+
+The callback regression file belonged only to execution-clause-identity and was
+not selected by the current nine-boundary ordinary/sealed gate. Actual P/B/C
+fresh boots already cover bootstrap, but that does not substitute for selecting
+the explicit nil/poison control. The existing execution-entry producer file now
+belongs to ordinary unit-metadata/preboot-identity and the existing sealed
+clauses group. No new runner, runtime route or integrity exemption is added.
+
+The control passes on actual SDK47fvv... through the existing exact-candidate
+runner:8 tests/47 assertions; file execution3.683s, service13.140s,381.9MiB/zero
+swap. Slowest dependency-budget control1106ms; nil/poison callback test2ms.
+Python sealed/selector checks7/4 and16-boundary/seven-writer discovery pass.
+Engine50303eac... is unchanged; no SDK rebuild is needed for this test selection.
+
+The frozen retry now selects156 ordinary files and67 sealed files/2883 assertions;
+complete sealed selection is75 files/3236 assertions. All six universal integrity
+controls and25 native preboot controls remain. Full final qualification remains
+required; adding this control closes no E01–E86 case and does not establish that
+arbitrary SDK vars were never previously mutated in a running VM.
+Receipt: [[file:anf-prepublication-selection-checks.json][selection coverage checks]].
+
+* Ordinary integration passes; sealed query receiver cwd corrected
+
+Frozen aee4ab4c integration passes25 preboot checks and all156 ordinary files /
+7898 assertions on actual SDK47fvv... (engine50303eac...). Preparation3.592s,
+preboot1.552s, ordinary execution1233.463s. Slowest release-cycle control100756ms,
+historical guards48375ms, ordinary env-world build47596ms, dedicated durable
+stores45998ms and allocation-before-ack/creator-death custody34052ms.
+
+The WHOLE gate remains FAILED. Constructed sealed producer passes224 Source
+units/877 code modules; Source-present consumers, genuine Source-free lazy SDK
+initialization and contextual build/cache pipeline pass. The contextual receiver
+then hits four query errors: its cwd is deliberately the Source-free image, but
+the query fixture used a checkout-relative path. The generic malformed-query
+negative also accepted that IO error. Later selected tests and final consumer /
+tamper/missing-unit universal controls were not reached. Sealed300.693s;
+total service1544.886s,3G/zero swap. All6925 frozen files remained unchanged.
+
+The fixture now uses explicit BL_TEST_SOURCE_ROOT and reads its provider before
+entering malformed-syntax refusal assertions. Receiver cwd and SDK Source absence
+remain intact. Actual-SDK focused replay passes5 tests/18 assertions (file8.906s,
+service17.960s,445.9MiB). The existing selected-consumer driver also passes5/18 in
+the retained constructed Source-free image (execution7.828s, service7.874s,
+195.5MiB). Both use zero swap. All75 complete sealed files were mechanically
+scanned: no direct quoted relative fixture IO remains;20 root-related matches
+were reviewed. This is not a dynamic-path absence proof.
+
+Run the fresh nine-boundary sealed stage on frozen corrected inputs next, with
+67 files/2883 assertions and all six universal integrity controls. Reuse the
+unchanged immutable SDK. Preserve the ordinary aee4ab4c result in its original
+scope plus the focused current query replay; do not relabel failed preflight2
+as green or repeat the20-minute ordinary suite for this test-only cwd change.
+Full final exact-candidate qualification remains required after runtime changes.
+No historical case, build claim or command-executor contract is closed/changed.
+Receipt: [[file:query-receiver-fixture-checks.json][query receiver checks]].
+
+** Dependency-ordered required batches after this gate
+1. Complete fresh sealed selected qualification; retain all failed receipts and
+   reconcile actual scopes before changing runtime inputs.
+2. Complete canonical runtime unit instantiation: defer phase-zero values,
+   preserve authored initialization order, retain phase-owned compile-time
+   values and close private/imported captures. Use focused initializer/world/
+   phase tests and original causal controls during development.
+3. Join verified candidate comparison/activation to existing generation and
+   Execution owners; initialize once per activation and retain real actors,
+   callbacks, closures, data, contexts and resources through actual retirement.
+   Close mapped historical/protocol cases alongside their owning changes before
+   rebuilding. No extra activation registry or GC without live-consumer proof.
+4. Migrate remaining ordinary Source/AOT/bootstrap/JS/native consumers to that
+   same binding/unit/descriptor route, then delete superseded resolution and
+   staging. Map changed boundaries before any new immutable SDK build.
+5. Freeze the final implementation, produce/qualify its actual immutable SDK,
+   require P/B/C fresh reproduction, all86 historical final replays, protocol
+   obligations, full required SDK/platform/integration gates and executable
+   macro/compile-time-value/bracket-syntax demonstrations.
+
+These retain the original one-cutover plan; they do not replace its requirements
+with the checks already passing. Optional features, new caches, additional DSLs
+and backend optimization are deferred. Backend acceptance still closes no
+original semantic case;16 scoped/70 open arithmetic is unchanged.
+
+* Closed selected consumer dependencies and complete failure diagnostics
+
+Fresh sealed3 preserves all frozen inputs and passes the corrected query tests,
+then fails at the classic catch control: compiler's lazy java.manifest lookup
+was absent from the manually selected roots. Producer224 units succeeds; the
+whole run remains failed (316.669s; service317.128s,908.6MiB/zero swap). The
+subsequent retained-image diagnostic reaches evidence_test.bl and discovers a
+second missing dependency, system.prove, directly required by that test header.
+It is not a production SDK or compiler semantic regression.
+
+Existing lexical-scope selection now declares java.manifest. Ordinary selected
+test dependencies are derived by the EXISTING producer through canonical Reader
+and AOT.namespace_header before its existing BuildPlan closure. No test body,
+initializer, new parser or alternate compiler executes. The producer receipt
+records these dependencies. A read-only actual-SDK helper probe returns the
+selected header dependencies, including system.prove/native.eligible, with Env
+snapshot unchanged (316ms execution; service1.561s,142.5MiB/zero swap).
+
+The selected-consumer driver now collects failed test counts and bounded load
+errors, continues later files, writes a failed receipt, then exits unsuccessfully.
+Exact counts/nonempty tests/zero failures and errors are still required for green.
+A real negative control on the image lacking java.manifest records its catch
+failure, executes the following47-assertion producer file, and exits1 as required.
+Service6.524s,186.8MiB/zero swap. The tail diagnostic records missing system.prove
+and passes its eight other files, including capacity isolated in a separate
+process (22.170s,386.3MiB/zero swap). Earlier failed diagnostics and a Reader-caught
+parenthesis edit error are preserved; no manufactured successful receipt.
+
+Python sealed8/selector4 controls pass. The nine-boundary selection remains67
+files/2883 assertions; complete selection75/3236, all six universal controls and25
+preboot controls remain. Engine50303eac... is unchanged. Fresh selected sealed
+qualification is required next; no full SDK rebuild or ordinary156-file repeat
+is needed for this qualification-only dependency correction. No floor or case
+promotion is asserted; all original runtime/cutover/final obligations remain.
+Receipt: [[file:sealed-consumer-dependency-checks.json][sealed dependency checks]].
+
+* Dependency receipt uses native JSON data
+
+Frozen f434d536 sealed4 reaches compiled closure assembly/inventory but fails
+while writing the new header-dependency receipt: native Jason does not encode
+language vectors. Producer248.198s, total249.007s; no receivers run and no
+qualification success is asserted. Frozen inputs remain unchanged.
+
+Convert the list only at that existing native serialization boundary. Actual
+SDK canonical header collection plus native Jason round trip now preserves all
+54 dependencies exactly, with Env snapshot unchanged: collection312ms,
+service1.553s,146.3MiB/zero swap. No runtime, SDK, ABI, encoder protocol or admission
+change. The local copied probe result has a broad inherited scope label; the
+receipt explicitly limits this to header data collection/JSON, with no compiler
+or native module replacement.
+
+Fresh sealed selection67 files/2883 assertions and all six universal integrity
+controls remains required. The failed producer is retained. Engine50303eac...
+is unchanged; no immutable production SDK rebuild is needed.
+Receipt: [[file:sealed-dependency-json-checks.json][dependency JSON checks]].
+
+* Scoped revision integration checkpoint passed; runtime work resumes
+
+Final selected sealed5 passes on frozen7e2fc920 inputs with all6928 files
+unchanged:67 files/2883 assertions, split66 shared files/2782 assertions and
+one isolated capacity file/101 assertions. All six universal controls pass:
+fresh Source-free load, packaged macro in a new project, class image proof,
+Source-present loader, tamper-before-initialization and missing-unit-before-
+initialization. Source-free SDK lazy initialization compiles zero Source,
+restores its caller and leaves native modules unchanged. Producer227 Source
+units/888 code modules includes54 canonical test-header dependencies.
+
+Preparation0.291s; producer244.428s; Source-present consumers11.123s; lazy SDK
+initialization7.032s; contextual consumers142.788s plus isolated capacity3.598s;
+final receiver3.431s, tamper1.883s and missing unit1.903s. Total419.035s;
+service419.487s,989.1MiB/zero swap. Slowest contextual tests: path-specific native
+cleanup25175ms, independent helper lifetime boundaries9431ms and retained
+callback metadata analysis7694ms. Exact stage/file timings remain in the receipt.
+
+This is a CONSTRUCTED selected Source-free image from actual immutable C floor,
+not the actual full SDK and not native application admission. Actual SDK47fvv...
+(engine50303eac...) separately passed Nix production/P/B/C and ordinary156 files /
+7898 assertions plus25 preboot controls on aee4ab4c inputs. The corrected query
+file separately passes actual-SDK5/18 after that ordinary observation. Earlier
+failed combined gates keep their FAILED status and original scopes. Do not
+claim a single combined final-candidate replay or promote a full semantic floor.
+
+The integration milestone is sufficient to resume runtime implementation.
+Canonical runtime value/initialization semantics, verified generation activation
+and comparison, actual actor/callback/closure/data/context/resource retirement,
+remaining Source/AOT/bootstrap/JS/native migration and superseded route deletion
+remain required. Preserve16 scoped/70 open historical arithmetic and all86 final
+replays, full final SDK/platform/protocol checks and executable language demos.
+No automatic GC or arbitrary prior SDK var immutability proof is asserted.
+Receipt: [[file:revision-integration-checkpoint.json][scoped integration checkpoint]].
+
+
+* Ordered runtime unit Source checkpoint (2026-10-28)
+Phase-zero values now remain runtime Reader initializers, including closures.
+Only actual expansion-phase values enter the owned constructor session. The old
+constant-reader execution branch is deleted. Preparation performs no runtime
+initialization. This is work toward the same cutover, not an alternate compiler.
+
+Native CompilerData accepts compiled-contextual-unit version2 only, with exact
+keys version/kind/initializers/steps/entry/exports. Binding references remain v1;
+phase archives remain v3; the separate AOT kernel-phase DTO remains v2. Each
+initializer reference occurs exactly once in the schedule. Evaluate steps carry
+canonical ANF; capture steps introduce unique private lexical result slots.
+Unknown/duplicate/omitted initializations and slot collisions refuse before
+projection. ANF checks executable grammar and lexical scope in schedule order;
+one body projection supplies entry, factory and parameterized constructor forms.
+
+The compiler API is now:
+#+begin_example
+(compiler/prepare-program-unit reader env references links public-names events)
+;; reader supplies declaration Source position; events own execution order.
+;; events are finite eager lists, as are selected links:
+{:op :initialize :name internal-binding-name}
+{:op :evaluate :reader expanded-expression}
+{:op :capture :reader final-authored-expression}
+#+end_example
+expand is its sole production caller. It merges entry-world value initializers
+and expressions by authored position, placing selected provider dependencies
+before the entry world. Function construction uses canonical ANF dependency
+edges, including latent captures and pattern keys; it waits for captured values.
+Actual fn shape is required before a declaration is treated as pure function
+construction. Reads of uninitialized values and cyclic function initialization
+refuse in the current finite/acyclic profile. Provider top-level expressions are
+still refused; arbitrary recursive module locations remain unfinished.
+
+Creating a factory instance executes its schedule once. The entry thunk reads
+its captured result; it never repeats module initialization. Physical run/0 makes
+one fresh instance. Merely emitting/loading artifact bytes remains passive. This
+supersedes the earlier checkpoint's latent-entry factory behavior above. Instance
+data are not activation, Source, SDK or native-admission authority. Existing
+Loader passive-byte checks/exact-code leases and reload.generation's private
+prepared identity, publication and retirement owners must converge before this
+runtime profile is qualified for the cutover. No new activation registry or GC.
+
+Paired current Source CompilerData/ANF/compiler/expand/codebase.phase/system.phase/
+compile.world component passes53 tests/376 assertions, using unchanged actual
+SDK Loader/AOT/Lower. Preparation12.758s; execution7.046s; service21.046s,
+337.9MiB/zero swap. Slowest tests: producer malformed inventory1113ms, divergent
+recipe facts951ms, whole-sequence constructor budget/cleanup205ms. New controls
+cover runtime/private archived closures, interleaved effects, failure ordering,
+forward function captures, per-instance results and passive world artifacts.
+Fresh native preboot passes31 controls in0.465s with compiler unloaded and no
+namespace table. Python sealed8, selector4 and historical23 controls pass.
+The attempted removal of the Reader argument failed29 tests because it still
+supplies declaration position; it was reverted to the exact passed API, and its
+failed component packet is retained. Earlier failed causal controls remain too.
+
+All16 boundary inventories and seven external writer inventories match. The
+existing nine-boundary selection now covers157 ordinary files and68 sealed
+files/2935 assertions; complete sealed coverage76 files/3288 assertions. All six
+universal integrity controls remain mandatory. These are planned coverage counts,
+not newly executed integration evidence. No new immutable SDK/build was run.
+Batch activation/custody and remaining adapters before immutable production;
+then qualify produced bytes, full reproduction and exact final E01-E86 replay.
+No historical case closure, build-claim change or command-executor change.
+Receipt: [[file:ordered-runtime-unit-checks.json][ordered runtime unit checks]].
+
+* Admission adapters consume canonical executable pattern operands
+
+During the required activation join inspection, three current consumers still
+classified every pattern as inert: reload.native-call, reload.source-producer
+and reload.registration. ANF map-pattern keys are executable operands; nested
+binders, literal pattern payloads and annotations are data. These adapters now
+use the existing anf/map-pattern-expressions owner and traverse actual clause
+parameters/patterns. Their public APIs and authorization/declaration callbacks
+are unchanged. No parallel validator, parser, compiler mode or registry is added.
+
+Native apply operands in keys now reach the same exact-target authorization as
+body calls. HTTP keys reach the existing native declaration check and fixed
+Source adapter. Registration keys reach the existing declaration owner before
+runtime initialization. Binding names and literal lookalikes remain inert.
+Reconciliation capture substitution already treats pattern keys canonically;
+its explicit clause handling remains. Initializer eager pattern operands and
+clause shadowing still require migration before joining broader activation.
+
+The unchanged actual SDK causal fixture has5 tests/16 assertions,7 passing and
+nine failing, with no errors. The paired current Source adapters pass17 tests/
+68 assertions, including the existing generated actor entry/input-proof and
+registration controls and actual native lowering/matching of lexical map keys.
+Preparation1.714s includes the causal observation and private adapter compilation;
+execution1.303s. Service4.265s,187.9MiB/zero swap. Slowest current body is generated
+actor entry/input-proof specialization85ms. No HTTP request, candidate activation
+or real managed actor is run by these structural controls. Native compiler/Env/
+Loader/AOT modules remain unchanged. The initial Reader-rejected fixture and the
+old implementation's failures are retained as failed scopes, never promoted.
+
+Consumer map audit matches all16 boundaries and seven external writers. Existing
+selected affected coverage is160 ordinary files and70 sealed files/2980 assertions;
+complete sealed coverage78 files/3333 assertions. All six universal integrity
+controls remain required. These are future integration counts, not executed
+broad-suite claims. Python sealed8/selector4/historical23 controls pass. No new
+SDK build or historical case closure; build claims/executor contracts unchanged.
+
+Next remains the SAME generation admission, publication and retirement owner:
+finish canonical artifact instrumentation and initializer scope semantics before
+verified activation/comparison and actual retained actor/callback/value lifetimes.
+Keep conservative roots; do not introduce an artifact registry alongside it or
+infer SDK/Source authority from the factory map. Receipt:
+[[file:pattern-admission-checks.json][pattern admission controls]].
+
+* Initializer clauses keep lexical scope and eager keys
+
+reload.initializer/inline now handles case, receive and catch clauses explicitly.
+Pattern keys expand against enclosing factory bindings. Canonical pattern-vars
+then removes clause-bound names before rewriting guards/bodies; catch clauses
+also remove the native owner's implicit stack bindings. Subject, timeout, after
+and try-body operands retain their original positions. Delayed function bodies
+remain guarded. The same ANF grammar owns pattern keys and binders; no new
+interpreter, name resolver or admission route is added.
+
+The old inliner demonstrably selects the OUTER cached factory after a case,
+catch or receive binder selects an INNER function. The new tests compare actual
+native evaluation before/after inlining and require the inner result. A separate
+eager key control expands a proved enclosing constructor to its literal map key;
+actual native matching returns42. This stays inside existing construction-proof
+use by reload.generation/evaluate-definitions!, not arbitrary runtime evaluation.
+
+On the unchanged actual SDK the12-test/28-assertion file has22 passes, five
+failures and one native Lower error (the unexpanded eager key). Current Source
+at a private initializer alias passes all28, using unchanged SDK ANF/compiler/
+producer/native-call/Env/Loader/AOT. Preparation2.834s includes baseline execution
+and private compilation; execution1.012s; service5.115s,184.6MiB/zero swap.
+Slowest current test: catch/receive shadowing12ms; guarded local inlining11ms;
+40-argument depth-budget control10ms. Failed component harness/implementation
+attempts are retained; only the final component is passing evidence.
+
+All16 boundary/seven external writer maps match. Python sealed8, selector4 and
+historical23 controls pass. The existing selected gate now specifies160 ordinary
+files and70 sealed files/2989 assertions, complete sealed78/3342, with all six
+universal integrity controls. No broad gate or immutable production was run.
+This does not qualify actual new generation preparation, artifact activation or
+consumer retirement. The next required join is canonical artifact instrumentation
+and the existing private generation admission/publication/retirement lifecycle;
+Source/AOT/bootstrap/JS/native migration, old-route deletion and final complete
+candidate replay remain. No case closure, automatic GC or backend/executor change.
+Receipt: [[file:initializer-clause-scope-checks.json][initializer lexical scope checks]].
+
+* One private preparation lifecycle, before instance activation
+
+reload.generation's existing private cache now owns rows with preparing,
+prepared and ready phases, rather than exposing a graph as immediately reusable.
+Reservation is atomic and bounded by the existing256-preparation budget. Reentry
+refuses; foreign processes cannot complete or abandon the owner's reservation.
+A dead owner's row remains held and requests runtime handover: death does not
+prove partial resources/code have retired. A retired graph awaiting cleanup
+cannot be returned as a reusable preparation.
+
+The original native attested-prepared! hook projects the exact graph from the
+private prepared/ready row, so code can be authenticated before initialization.
+Only completion permits cache reuse or publication; publish! checks private ready
+state before any no-op/pointer path. All original retirement readers/deletion
+checks use the same graph projection and exact row identity. Nothing in a public
+graph map supplies readiness or native admission. This changes no public API,
+adds no registry/production mode, and grants no authority from factory metadata.
+The remaining factory must store its values privately in this same owner.
+
+Current Source at a private generation alias passes4 tests/25 assertions: state
+and identity transitions, premature publication refusal, reentry/foreign/dead
+owner controls, retired-cache refusal and TWO actual malformed-Source prepare!
+failures with reservation cleanup. Preparation5.020s; execution7.881s, including
+7.295s for the repeated real compile-failure check. Service14.181s,459.2MiB/zero
+swap. Native compiler/Env/Loader/AOT remain unchanged. The private alias cannot
+qualify successful native graph enrollment: that hook requires the actual SDK's
+private owner. New immutable qualification remains mandatory.
+
+Failed controls/diagnostics are retained. The first failure fixture's bare
+missing value did not demonstrate the intended compile refusal and reached the
+correct rejection of the private alias by the actual SDK owner. A real CompileError
+fixture exposed incorrect finally nesting in the NEW wrapper; corrected nesting
+now cleans both attempts. One diagnostic's alias was unresolved when its driver
+compiled; the corrected diagnostic observed the pending-row leak before the fix.
+No failed scope is promoted.
+
+** Instance identity is distinct from code and binding identity
+A new actual factory control instantiates the SAME physical program twice, with
+42 and99 captured respectively. Its functions share the physical module,
+new_uniq/code MD5 and selected binding reference, yet remain unequal and return
+42/99/42. This extends the export file to8 tests/48 assertions, all passing on
+paired current Source CompilerData/ANF/compiler/expand/phase/world. Preparation
+12.650s; execution2.159s; service16.133s,336.7MiB/zero swap. The new body takes24ms.
+This is an instance/code observation, NOT a demonstrated native admission bypass.
+
+Therefore actual runtime closure ownership cannot be inferred from code hashes
+or selected declaration identity. The current native Source local-target check
+checks module MD5/new_uniq and capture validity; Source generations currently use
+fresh physical namespaces. Reusing stable artifact code requires explicit native
+instance identity, not another artifact registry or public mutable callable cell.
+
+** Required activation join, continuing the approved cutover
+1. Reuse the existing native graph marker/frame as the instance identity. Runtime
+   closures capture the owner's actual marker during initialization. Their native
+   ingress compares it with the admitted current frame before effects, including
+   the already-active Source fast path. A copied marker creates no frame, context,
+   grant or lease. Named physical entry and instance-bound closure are distinct
+   entry roles within ONE protocol, not selectable old/new execution modes.
+2. Run canonical factory initialization only after the existing owner recorded
+   prepared code and native original-grant admission succeeded. All runtime
+   function arms/self recursion capture that instance identity. Compile-time and
+   SDK/bootstrap constructor adapters keep their explicit existing stage owners;
+   no runtime token is serialized into phase data or supplied by Source flags.
+3. Keep the actual instance/export values in the private owner row. Complete ready
+   state only after factory result validation. Entry selection consumes canonical
+   bindings; no mutable Env/name fallback or caller-mutable callable cell becomes
+   an alternate resolver. Route Source/artifact/replay adapters to that owner.
+4. Reuse actual actor/callback/context/resource retention and native graph drain.
+   Stale closures must refuse in an unmanaged or different instance even if
+   identical code is loaded again. Avoid a registration/lease per transient local
+   closure: instance checks are constant-size; retained consumer boundaries own
+   actual leases. Release private instance/product custody only on real retirement.
+5. Qualify the produced immutable SDK, complete Source/AOT/bootstrap/JS/native
+   migration and old-route deletion, then run the original full exact-candidate
+   historical/protocol/reproduction/platform/demonstration gates. Conservative
+   roots remain; no automatic GC or prior mutable SDK-var attestation is inferred.
+
+All16 boundary/seven writer inventories and Python sealed8/selector4/historical23
+controls pass. Planned selected integration is161 ordinary files and71 sealed/
+3021 assertions, complete sealed79/3374, retaining all six universal controls.
+These broader gates were not run. No immutable SDK or historical case promotion;
+build claims/command-executor contracts unchanged. Receipt:
+[[file:preparation-owner-checks.json][preparation owner and instance identity checks]].
+
+* Native instance ingress checks the actual frame before the Source shortcut
+
+BeamLisp.Env/with_source_execution! now has two entry roles in the same protocol:
+#+begin_example
+(with_source_execution! action)                 ; named entry, existing custody
+(with_source_execution! expected-graph action)  ; instance-bound runtime closure
+#+end_example
+The new role requires the existing authenticated execution_frame_current's graph
+marker to equal the closure's captured marker. This check precedes the existing
+active-Source tail path. It then calls the original ingress, preserving Source
+restriction, original graph/context and code checks. Nil, forged or foreign
+markers cannot create a frame, context, grant or lease. This closure role has no
+compatibility-ticket fallback. Source still cannot call privileged Env targets
+through ordinary native grants.
+
+The new comparison reads the compact native frame directly, rather than invoking
+a whole-generation observation. It adds no registry, snapshot copy, module hash,
+retention ticket or lease per transient closure. Existing admission/Source context
+checks still run. No throughput claim is inferred from the component wall times.
+
+The exact new native arm/helper is Reader-extracted into an explicit EXTERNAL
+fixture for bounded feedback. Its private current-frame read is projected through
+the actual SDK's public execution_frame_observation reader of that same frame;
+actual Env/compiler/AOT bytes remain unchanged. Genuine immutable-SDK managed
+graphs supply admission, frame selection and actual retirement. The control covers
+matching/foreign/forged markers, an already-active Source callback, a retired
+marker against a fresh preparation, copied public generation data without a frame,
+and a matching marker with forged caller context. New comparison passes3 tests/
+23 assertions; the isolated comparison-deleted fixture passes13/fails10, no errors.
+
+Preparation0.724s; causal baseline16.185s (includes first SDK preparation);
+current execution5.987s. Service24.195s,464.8MiB/zero swap. Slowest current test is
+marker/frame refusal1533ms, retired-marker1165ms, active-Source1151ms. The earlier
+Reader-rejected fixtures and out-of-scope callback lookup remain failed packets.
+The lookup is now performed inside genuine owned graph execution. An earlier
+baseline effect assertion was isolated from preceding causal effects before the
+final packet. None of these receipts qualifies the newly produced Env ABI.
+
+Fresh bare-VM component preboot refuses all three marker inputs, runs no action,
+leaves the compiler unloaded and creates no namespace table:0.364s execution,
+0.408s service,72.5MiB/zero swap. The cheap existing preflight now requires this
+native-Env preboot control on affected metadata/identity/custody selections before
+ordinary consumers. It will fail on an older SDK, not select a fallback.
+
+Construction adapters deliberately retain the TWO-argument runtime restriction.
+Current Source initializer plus existing Source/syntax construction normalizers
+pass13 tests/31 assertions, including three controls that it is not stripped as
+pure eager construction. Preparation1.495s; execution1.526s; service4.269s,
+185.3MiB/zero swap. Analyses must keep an unresolved instance obligation explicit;
+unwrapping the runtime guard as a preparation permission would be unsound.
+
+All16 boundary/seven writer maps and Python sealed8/selector4/historical23
+controls pass. Planned selected qualification162 ordinary files/72 sealed files/
+3047 assertions; complete sealed80/3400, all six universal integrity controls.
+These broad scopes have NOT run. No immutable SDK was built or case closed;
+backend/build-claim/executor contracts and conservative roots remain unchanged.
+
+The guard primitive is implemented; compiler birth capture and the existing
+owner's actual factory/instance integration remain required. Capture one actual
+graph marker per owned factory activation and retain it lexically through every
+runtime function arm/self-recursion; do not synthesize Source bindings, serialize
+runtime tokens into phase archives or add caller-selectable compatibility modes.
+The private owner must admit prepared code before factory execution, retain the
+instance privately, and complete ready state only after initialization succeeds.
+Then finish comparison, actual consumer retirement, remaining input/stage adapters
+and old-route deletion, followed by the full produced-candidate qualification.
+Receipt: [[file:source-instance-ingress-checks.json][native instance ingress checks]].
+
+* Canonical factory compiler captures one instance marker
+
+reload.source-producer/specialize-unit now projects a validated compiled-unit v2
+through the EXISTING ANF factory and shared Source specialization pass. It returns
+ANF/data, not a runtime instance or admission. Named Source declaration ingress
+keeps its existing adapter; the closed runtime factory's actual function arms
+use the instance-bound native role. There is no caller-selectable execution mode.
+
+#+begin_example
+(producer/specialize-unit unit compiler-context)
+;; :expression is structurally:
+(let [<private-slot> (Env/selected_execution_graph_id)]
+  (Env/with_source_execution! <private-slot>
+    (fn [] <ordered initialization and instance map>)))
+;; Each runtime closure body, including nested/multi-arity/self-recursive arms:
+(Env/with_source_execution! <same-private-slot> (fn [] <actual-body>))
+#+end_example
+
+The factory captures ONCE, before initialization; native ingress requires a real
+matching frame before any initializer runs. Every runtime closure retains the
+same lexical marker. A bounded worklist over canonical executable children and
+pattern-vars chooses a deterministic internal slot disjoint from real variables
+and binders. It is not a synthetic Source declaration or serialized runtime
+capability. The final enclosing image is checked by the shared ANF lexical/data
+validator before emission. No second evaluator, registry, per-closure query or
+lease is introduced.
+
+Closed units refuse named declaration/class carriers such as Link.defvar and
+reload-descriptor! rather than reuse a namespace-publication adapter or capture a
+factory local into a separate class module. Literal lookalikes stay inert. Actor
+producer migration remains required. The current contextual native escape grammar
+remains erlang-only; this slice does not widen native imports or grant permissions
+from compiler-context data. Actual native effects still require the genuine
+admitted graph's frozen grants.
+
+** Actual emitted-code component
+Paired current CompilerData/ANF/compiler/expand/phase/world/Source pass emits one
+physical factory at an explicitly granted EXTERNAL native fixture. Genuine SDK
+managed graphs supply actual original-grant admission/frames; the new primitive
+logic is at the previously qualified external fixture. Actual Env/Compiler/Loader/
+AOT remain unchanged. This does NOT grant produced application Source/SDK authority
+or qualify the new immutable SDK/native ABI.
+
+Same factory code produces unequal closures under two graphs. Module/new_uniq
+match; matching calls work, foreign calls fail before a terminal body, recursion
+and fixed/variadic dispatch work, and returned nested closures retain their birth
+graph. No-frame factory execution refuses. Structural controls verify one marker
+query, every function arm, deterministic slot hygiene and carrier/literal handling.
+Existing named Source/actor specialization controls remain passing.
+
+Final9 tests/54 assertions pass. Removing the generated marker operand from local
+closure ingress while retaining the factory guard causes six failures out of25
+assertions, no errors. Preparation14.427s; causal baseline14.990s; current execution
+3.269s. Service34.023s,509MiB/zero swap. Slowest final body is real same-code closure
+isolation1666ms, actor specialization53ms and structural arm inventory18ms.
+
+Earlier failed scopes remain: unsupported capitalized native escape in the first
+fixture (replaced by supported erlang operations, without changing grammar), then
+an incorrect test lookup selecting a local self binding rather than the actual
+public export. Actual emitted export identities were correct; the lookup now
+excludes local visibility. Diagnostic and failed packets are not passing evidence.
+
+All16 boundary/seven writer maps and Python sealed8/selector4/historical23 controls
+pass. Planned affected qualification163 ordinary files,73 sealed/3072 assertions;
+complete sealed81/3425, all six universal integrity controls. No broad gate or
+immutable build ran and no case closed; backend/executor contracts unchanged.
+
+** Required production join remains
+The pass is implemented and exercised by the generated-code component. Production
+world emission/loader and the existing private generation owner must still consume
+it together: authenticate prepared code, enter native custody, run the factory,
+validate/store its instance privately, then mark ready and publish/compare.
+Do not wire guarded output to an unowned Loader run/0 path or add a raw fallback.
+Retained actors/callbacks/data/context/resources and actual product/instance
+retirement, remaining Source/AOT/bootstrap/JS/native adapters and old-route deletion
+remain required before the full exact-candidate/reproduction/protocol/demo gates.
+Receipt: [[file:instance-factory-capture-checks.json][factory capture checks]].
+
+* Generation-scoped admission closure before physical retirement
+Immutable factory code can belong to multiple instances. The former generation
+retirement call used Env.retire_modules!, which closes EVERY native graph indexed
+by each physical module. An idle sharing graph could lose admissions and code
+without holding an active callback pin. Module identity is not instance identity.
+
+The existing generation owner now calls Env.retire_generation_modules!(G) after
+its exact original-preparation check and private MD5 reservation. The new native
+entry also requires native framework origin and the unchanged fixed SDK original
+preparation attestation. Under sorted owned-module fences, one private native turn
+closes only G's graph and checks all indexed sharing graphs. An open sharing graph
+or missing evidence retains code. Registration takes these same fences, preventing
+a new sharing profile from appearing between check and physical deletion.
+
+Only after other admissions close does the operation delegate to existing physical
+retirement. Accepted graph pins, outside physical tickets and live code still block
+purge. The existing physical invalidation operation retains its role for deliberate
+module replacement; it is no longer the generation retirement admission selector.
+false issues no resource proof. Only the unchanged private SDK native-success edge
+issues that proof after actual complete physical retirement. This deliberately
+retains resources while shared code remains; separating logical instance cleanup
+from last physical code collection remains required, with distinct exact evidence.
+There is no automatic collector or alternate production activation mode.
+
+The genuine-SDK component uses a second original prepared graph that explicitly
+grants the first graph's real owned module. No SDK grant or preparation is forged.
+Exact current native operation/helpers execute at a native fixture through actual
+Env protected tables/fences, original SDK identity MFA/MD5 and physical retirement.
+Initialized table recovery is skipped in the extracted fixture; actual Env bytes
+remain unchanged. Tests cover idle sharing admissions, repeated attempts, accepted
+callbacks after both admissions close, forged G refusal and Source-framework
+refusal despite an explicit native fixture grant. Four tests/32 assertions pass;
+replacing only scoped closure with physical retirement gives5 failures/0 errors.
+Preparation1.181s, comparison22.006s, current8.594s; service33.373s/488.5MiB/zero swap.
+Slowest current sharing test2178ms, accepted callback1817ms.
+
+Existing immutable-SDK graph-pin/native-outcome regressions pass12 tests/67
+assertions: execution33.386s, service35.129s/546.2MiB/zero swap. Slowest first native
+outcome test15874ms includes its first SDK preparation; graph registration2763ms.
+These are existing SDK regressions, not the changed SDK generation caller or new
+native ABI qualification. Actual new immutable qualification remains mandatory.
+
+Mechanical boundary/writer audit and sealed8/selector4/history23 controls pass.
+Planned complete coverage212 ordinary files and82 sealed/3457 assertions; affected
+nine-boundary coverage164 ordinary and74 sealed/3104 assertions. All six universal
+integrity checks remain. No broad suite/build ran, no historical case closed,
+and backend/build-claim/command-executor contracts are unchanged.
+Receipt: [[file:scoped-generation-retirement-checks.json][scoped retirement checks]].
+
+* One preparation owner on the runtime side of the compiler boundary
+The prepared-state Atom and original preparation lifecycle now live in existing
+reload.execution, which requires only env. reload.generation retains planning,
+Source compilation, publication/resource coordination, and calls this same owner.
+There is no second cache. The old generation attested-prepared! API delegates to
+execution's exact private identity check so existing consumers keep one authority.
+AOT's native SDK inventory now freezes ONLY reload.execution/attested-prepared!/2;
+it does not fall back to the former generation provider. Env's actual SDK MFA/MD5
+and original identity requirements remain unchanged. A new immutable SDK/fresh VM
+is required to qualify that provider transition.
+
+Cross-namespace cached/ready/original projections and lifecycle mutations require
+actual native framework origin before private reads or writes. The read-only
+original attestation remains usable by the fixed native hook and grants no lease.
+The same256 reservation limit is reported by generation capacity. Exact-G cleanup
+cannot erase a newer instance reusing the same plan key. Failed preparation still
+abandons only its own unfinished reservation; dead-owner reservations remain
+conservative until real custody recovery exists.
+
+Six component tests/46 assertions pass. Original state tests exercise paired
+current Source execution/generation aliases, including real compilation failures
+before native profile enrollment. Additional Source-origin/stale-cleanup controls
+use exact canonical-Reader-extracted lifecycle bodies at explicit native fixtures,
+with an isolated test Atom accessor, against real immutable-SDK Source frames.
+Erasing framework guards causes12 assertion failures and no errors. These fixtures
+do not receive SDK identity or enroll test rows as managed generations. Actual
+Env/Compiler/AOT bytes and actual SDK fixed provider remain unchanged in this test.
+No actual new fixed-hook or compiler-free fresh receiver qualification is claimed.
+
+Preparation7.893s, comparison13.556s, current execution2.550s; service25.459s,
+514.3MiB/zero swap. Slowest current Source-origin test1044ms, failed preparation
+305ms. Earlier rejected Source-alias fixture scopes and a module-literal mistake
+remain in the receipt; their refusals are not promoted as passing origin controls.
+
+All16 maps/seven writers and sealed8/selector4/history23 controls pass. Complete
+planned coverage213 ordinary/83 sealed/3478 assertions; previous nine boundaries
+165 ordinary/75 sealed/3125. Include source-and-class-proof as well for this fixed
+provider change; the exact ten-boundary plan is recorded in the receipt. All six
+universal integrity controls remain. No full build/broad gate or case closure.
+Receipt: [[file:execution-preparation-owner-checks.json][runtime-side owner checks]].
+
+* Admitted once-only factories and private instances
+The same reload.execution prepared row now owns factory selection, initializer
+reservation, validated instance and readiness. prepare-instance!(G,module,exports)
+freezes finite canonical export identities in an original prepared row. The owner
+runs initialize-instance!(G) under the original native graph lease and stores the
+raw-validated four-field instance privately before releasing that lease. G and its
+mutable state expose no instance cell. Invalid body/envelope/export results retain
+an instance-failed row for actual retirement; abandon and retry cannot rerun it.
+
+Two distinct boundaries emerged in the actual runtime checks. An SDK callback is
+not an application-owned Source body: wrapping the SDK initializer closure in
+with_source_execution! was correctly rejected. Source ingress belongs in the
+owned emitted factory. Separately, an exported SDK function value may have no
+application guard of its own; invoking it as framework would grant privilege.
+The native protocol now represents both boundaries explicitly:
+
+- Env.invoke_generation_factory!(module): actual retained native frame, native
+  framework origin, exact owned module/MD5 and __bl_unit__/0. In the EXISTING
+  protected graph record, reserve one claim for this graph/frame/pid. A fresh
+  frame or caller state cannot issue another claim. No lock spans user code.
+- Env.consume_generation_factory!(): generated first operation, before marker
+  capture or unit initialization. Consume only this actual frame's issued claim.
+  Success/failure leaves a compact terminal fact, not a retained closure/frame.
+- Env.invoke_generation_value!(value,proper-args): enter the existing Source
+  domain under actual retained custody, then let Rt.invoke perform its canonical
+  callable/argument validation once. A public/private SDK function cannot inherit
+  framework privileges by becoming an exported value. No second callable walker.
+
+Specialize-unit now emits the claim-consumption prefix before its existing
+lexical graph capture and every closure's two-argument Source guard. A raw public
+factory call from Source and a native fresh-frame replay fail before body effects.
+This adds a constant-sized native fact at initialization, not a per-closure ticket,
+SDK hash, whole-generation scan or alternate instance registry.
+
+Instance initialization and readiness are distinct. Complete-preparation! probes
+fresh native admission under the generation retirement lock before declaring a
+factory instance ready. A previously accepted initializer may finish while a
+retirement closes admissions, but cannot become ready afterward. Error recording
+cannot restore a preparation already retired/replaced during unwind. Canonical
+entry/export invocation reads the private instance/reference table; no string or
+mutable namespace resolver can supply another binding. Existing pure Source
+construction still uses its prior completion adapter until the mandatory input
+migration; this is not a completed dual-mode cutover.
+
+** Actual focused evidence
+The final bounded paired component passes15 tests/149 assertions: owner68,
+canonical factory/closure regression27, original preparation state25, and expanded
+Source-origin/stale cleanup29. It uses real original immutable-SDK preparation,
+profiles, owned facade, frames, leases, protected graph storage and module fences.
+Current code is extracted at explicit native fixture modules; the private owner
+uses its isolated test Atom. Value-domain entry is projected through a genuinely
+owned Source adapter because the original SDK lacks the new Native API. Test
+readiness is reopened only for an already genuine G, without editing G/profile/
+MD5/grants. The generated unit remains an explicitly granted native fixture;
+none of this grants fabricated Source/SDK product authority. Actual native Env/
+Compiler/Loader/AOT bytes remain unchanged in the component.
+
+Replay guard deletion causes2 failures/0 errors in20 assertions: body executes a
+second time in a fresh native frame. Source-domain deletion causes2 failures/0
+errors in3 assertions: the exported privileged SDK function runs as framework.
+Current covers normal/failing/malformed/mismatched exports, early completion,
+concurrent entry, available module fences during blocked initialization, admission
+closure before readiness, canonical-reference isolation and Source refusal for all
+four new public owner entry points. Existing closure/arity/recursion/hygiene and
+preparation/death/failure controls remain. No historical case is promoted closed.
+
+Preparation22.487s; causal execution17.305s; current execution11.166s. Total native
+service52.502s,537MiB/zero swap. Current slowest failure/malformed test2037ms,
+same-code closure test1273ms and competing/closing admission1258ms. Causal first
+SDK preparation12846ms is separately recorded, not current execution latency.
+Fresh preboot component refuses3 operations with no Lisp compiler/namespace table:
+execution0.415s, service0.455s,75.3MiB/zero swap. The actual candidate gate now
+requires these three checks too; no absent-API compatibility fallback.
+
+Earlier failed scopes are retained: namespace/alias leak in unscoped test fixture
+compilation, genuine rejection of SDK closure as Source, incorrect native grant
+spelling, missing Source domain, malformed Reader/ANF test scaffolding and a
+fixture-retargeted structural expectation. Changed fixtures scope their native
+compilation context like existing test.support.source-fixtures. Rejected fixture
+scopes are not passing runtime evidence.
+
+** Mandatory production join, still open
+1. Make verified Source/artifact inputs create the actual original owned graph and
+   freeze the canonical factory in THIS owner. Use specialized guarded emission
+   and one final factory ABI; do not feed new guarded output to raw Loader run/0.
+2. Join production Loader/emitter/native receipt and the fresh compiled-only
+   receiver, including the lean runtime owner/support packaging. Preserve immutable
+   producer/runtime identity and actual SDK original-grant rules. No SDK aliases,
+   modified original preparation cache or metadata-only admission workaround.
+3. Integrate real comparison/publication and actor/callback/closure/data/context/
+   resource retirement, including logical instance vs last physical code cleanup.
+   Instance envelope validation is not a proof of those whole-runtime obligations.
+4. Migrate remaining Source/AOT/bootstrap/JS/native inputs, delete superseded
+   execution/resolution routes, then freeze and qualify the actual immutable SDK:
+   reproduction, all86 final historical replays, complete gates and demonstrations.
+
+The actual new native ABI/provider/fresh receiver remain UNQUALIFIED. No full SDK
+build or expanding broad suite ran. Historical ledger16 scoped/70 open remains;
+all86 final exact-candidate replays are required. Complete planned coverage214
+ordinary/84 sealed/3556 assertions; affected ten boundaries166 ordinary/76 sealed/
+3203 assertions, all six universal integrity controls. Mechanical16-boundary/seven
+writer audit and Python sealed8/selector4/history23 controls pass. Build claims,
+command-executor contract and conservative roots are unchanged; no automatic GC.
+Receipt: [[file:admitted-unit-instance-checks.json][admitted instance checks]].
+
+* Production join: frozen candidate, qualification pending (2026-10-28)
+World's production descriptor now exports only =__bl_unit__/0= with factory ABI2.
+It specializes the canonical unit with the existing Source producer. ABI1 and raw
+run/0 artifact entry points refuse in passive native membership validation.
+Analysis recipe projections remain data; they provide no production admission.
+
+The Source-evaluation and file-artifact adapters converge as follows:
+#+begin_src text
+World.execute -> AOT.compile_unit ----------------------+
+World.run-unit -> AOT.verify_unit ----------------------|-> captured unit
+compiled-only receiver -> AOT.capture_runtime_unit -----+
+  -> Execution.prepare-captured-unit! (original private preparation)
+  -> Execution.initialize-instance! (native once-only factory claim)
+  -> Execution.complete-preparation! (fresh native admission probe)
+  -> Execution.invoke-instance-entry! (retained Source-domain invocation)
+#+end_src
+
+AOT.compile_unit factors the existing emission producer. It compiles captured
+inputs and returns verified bytes without writing or publishing an application
+product. Nix remains the sole production artifact authority. AOT.emit_unit uses
+that same producer, writes member bytes and publishes its manifest last.
+
+Preparation freezes the actual selected SDK before publishing application code,
+validates the captured members/runtime image and creates a fresh environment
+scope. Each activation receives an original private preparation and an independent
+instance, even when immutable module bytes are shared. The public generation map
+never carries the entry/export closure table. There is no copied SDK receipt,
+private-alias grant, raw context admission or caller-selected legacy execution.
+
+The execution owner no longer imports the unused env namespace. Compiled-only
+packages nevertheless need the actual SDK identity for the native original
+preparation hook. They conservatively retain all compiled selected SDK members
+and its unchanged original inventory. This adds disk bytes, not Source compilation
+or another authority path. Every copied member is checked against its inventory
+SHA256; conflicting floor bytes refuse. Future minimization must retain those
+truths, and is separate from closing runtime ownership obligations.
+
+The paired component passes5 tests/41 assertions and exact-copy/conflict controls
+for1907 SDK members. Preparation17.867s; execution2.759s; service22.140s/563.3MiB/
+zero swap. It is not actual constructor, Loader or fresh-receiver qualification.
+See [[file:production-instance-boundary-checks.json][the scoped evidence]]. The normal immutable preparation is running
+for engine ea607f640019f6f632af48726c5f73f9a09ab442d83109f4e1411149edc55c1d.
+
+Required next: actual19-assertion Loader-instance tests, focused affected consumers,
+compiled-only receiver/effect adapters, then real activation failure cleanup and
+actor/callback/closure/data/context/resource retirement. Conservative roots remain.
+No automatic GC or complete-cutover claim follows from this join. All86 final
+historical replays and final exact-candidate reproduction remain required.
+
+** Actual SDK activation checkpoint
+The frozen engine now produced immutable SDK
+=/nix/store/qgpk9pky8j470vl7vidfcxkqq1hb5sm4-beam-lisp-sdk-selection=.
+Its141 seed files equal the freshly booted, exactly reproduced compilerC.
+Actual original-receipt/native Loader activation passes60 assertions (Loader19,
+ABI41); corrected artifact/namespace consumers pass78 assertions and the existing
+runtime-value file passes32 within a preserved failed aggregate. These are scoped
+results, not complete final-candidate qualification. See
+[[file:production-instance-sdk-production-checks.json][SDK identities]], [[file:production-instance-loader-checks.json][actual Loader checks]] and [[file:production-instance-consumer-checks.json][consumer and failed receiver scopes]].
+
+The query macro now emits a hygienic recursive function instead of reflective
+=erlang.make_fun=. Admitted execution returns =(4 6)=. A measured fresh execution
+splits into41.024s World preparation,926ms unit preparation,48ms compilation,
+103ms activation preparation,3ms initialization and0ms entry. A separate probe
+attributes35.735s to ownership analysis; expansion1032ms, facts40ms, arity16ms.
+Ownership and arity report unknown for unsupported recursion/native obligations.
+No static proof or efficient preparation is claimed. Improving this analysis cost
+must not displace required protocol cases.
+
+Compiled-only qualification remains FAILED. The real producer passed, then the
+preboot adoption control exposed =host.aot/<=: a native metadata parser uses a
+variadic Lisp comparator before the namespace environment exists. Do not seed
+Lisp, invent SDK authority or add a Source fallback to bypass it. Map and repair
+the native preboot metadata dependency boundary and extend the focused positive
+preboot gate before the next immutable build. Earlier harness failures involved a
+generated directory in the Source glob and a wrong copied SDK ebin root; neither
+is receiver evidence. Mailbox/cleanup effect integration, failed activation cleanup,
+real escaped consumers and all final cutover/historical obligations remain open.
+
+** Native metadata must not depend on the Lisp phase
+The failed adoption is now a focused boundary: native three-argument comparisons
+were late Lisp calls even though binary comparisons lower natively. Eleven host
+bounds validators now use explicit native binary operations, evaluating computed
+operands once. The lambda decoder additionally checks atom-table membership;
+accepting nil's atom type did not prove the referenced index existed.
+
+The positive preboot gate reads real native lambda tables and malformed variants
+with compiler unloaded and namespace table absent. Exact changed helper component
+passes10 checks, and the existing postboot origin regression passes2 assertions.
+Old immutable code fails on the Lisp lookup; deleting only membership validation
+accepts the missing index. Preparation2.067s, three controls0.415s each, whole
+service3.356s/191.4MiB/zero swap. The actual SDK remains unchanged in this component;
+full publication/source-free receiver qualification needs the next immutable
+candidate. See [[file:native-preboot-metadata-checks.json][native preboot metadata evidence]]. No SDK admission is inferred from a
+fixture, passive metadata or these planned gate counts.
+
+** The native owner restricts the factory's first instruction
+Generated guards remain necessary, but they cannot be the sole SDK privilege
+boundary. The unchanged SDK fails a new regression: a factory prologue calls a
+framework-only SDK function before its generated Source ingress. Native invocation
+now enters the existing Source domain before calling any application instruction.
+Claim consumption, immutable module ownership and lexical marker checks remain.
+No extra registry, per-closure token or selectable mode is introduced.
+
+Actual old SDK Loader regression is19 pass/1 fail/0 error across20 assertions.
+The exact changed native helper fixture passes prologue refusal, normal factory/
+Source entry, missing claim consumption, replay and context restoration using
+actual original preparations/profiles/frames. SDK code and original rows stay
+unchanged. The new actual SDK still needs the full initializer/receiver replay.
+See [[file:factory-entry-domain-checks.json][factory entry domain evidence]]. This protects the SDK framework boundary;
+it does not assert sandboxing arbitrary native BEAM instructions.
+
+** Failed activation cleanup uses the existing retirement owner
+The native Loader now treats initialization, readiness commit and entry invocation
+as one failure boundary. It obtains =reload.generation/retire!= through the fixed
+SDK callable owner, then asks that owner to retire the actual preparation before
+reraising the original exception kind/value/stack. Preparation failure already
+owns its effect-free rollback. Successful results keep their current conservative
+lifetime pending real consumer integration.
+
+Retirement is an attempt, not an unconditional destructor. If another admitted
+activation shares the code, its values remain callable and the failed instance
+keeps its exact private row for retry. Native pins and managed registrations still
+decide cleanup. Neither an exception nor the absence of a returned value proves
+escaped callbacks or resources are gone. A failed/uncertain cleanup cannot replace
+the original error or erase custody. Realm drain, caller death and automatic retry
+remain explicit unfinished integration; no parallel lifecycle registry is added.
+
+Exact Loader-helper component:4 tests/29 assertions pass using the unchanged SDK's
+original private preparation, native profile, factory, graph and retirement owner.
+The same regression against the unchanged SDK Loader has19 passes/10 failures,
+showing its retained failed rows/code and shared-admission cleanup difference.
+Preparation69ms; tests8025ms; service9.424s/378.8MiB/zero swap. Earlier fixture
+construction errors were corrected before this final component input was frozen.
+Boundary discovery16/9 and Python profile9/selector4 pass; the selected sealed
+profile now plans11 files/585 assertions plus all six universal integrity controls.
+These are planned coverage, not another passing sealed run. See
+[[file:loader-failure-cleanup-checks.json][scoped failure cleanup evidence]].
+
+Current engine840bc939... differs from the previously qualified c722653a... SDK.
+This component does not qualify a new immutable product. Batch the next Source
+changes before rebuilding, then run =BL_TEST_TIMES=1 ./bin/bl --cold test
+test/bl/contextual_loader_failure_test.bl= against the actual produced candidate,
+followed by its affected boundary qualification and required integration replay.
+No command-executor or Nix backend contract changes in this slice.
+
+** Parent closure fences preparation publication
+=reload.execution/prepare-captured-unit!= now uses a private reservation helper.
+It allocates a child, then records the original =:preparing= row while holding
+=Env.with_scope_commit= on the parent. Parent destruction shares that fence.
+A publisher admitted before closure is visible in the existing owner; a publisher
+that reaches the fence afterward refuses and destroys its unused child. No module
+publication or application initializer executes inside the parent fence.
+
+Scope ordering matters: a parent scope lock cannot enclose child creation or
+physical module locks. The first component version nested child creation under
+the parent; inspection of the existing native lock contract caught this before
+commit. Child allocation now precedes the parent fence. A trace-based regression
+holds that actual fence, observes a worker reaching it after child allocation,
+destroys the parent, releases the fence and observes refusal without a leftover
+preparation. Sequential lookup alone would not establish that race ordering.
+
+Frozen final helper component3 tests/16 assertions pass. Only real SDK begin/
+abandon APIs are called; no fixture G/profile/readiness or SDK authority is added.
+Deleting the parent fence produces5 failures, including a late reservation and
+the missing expected native fence call. Preparation50ms; tests901ms; whole service
+2.263s/186.1MiB/zero swap. Boundary16/external-writer9 and profile9/selector4 checks
+pass. Selected sealed coverage now plans12 files/601 assertions plus the same six
+universal controls; no new SDK/sealed qualification is inferred. See
+[[file:contextual-parent-admission-checks.json][parent admission evidence]].
+
+This is an admission ordering repair, not completed realm teardown or crash
+recovery. In particular, a caller killed BETWEEN child allocation and reservation
+publication can still leave an unrecorded scope: the previous implementation had
+that window too. Required follow-up must preserve native scope/module lock order
+and record allocation custody before it can be orphaned; caller death is not an
+instruction to forget initialized resources. Actual realm drain must consume the
+original owner rows after parent closure, retain pending retirement in the manager
+and refuse new service/open admission until cleanup finishes. Audit shutdown and
+close/reload callers as part of that integration. Conservative roots remain.
+
+** Realm retirement consumes original contextual preparations
+The existing private Execution owner exposes a framework-only snapshot of a
+parent's contextual rows, including reservations without a graph. Generation's
+=retire-contextual-children!= requires the actual parent admission to be closed
+and invokes its existing =retire!= owner. Two bounded passes close sibling graphs
+then allow shared physical code to retire. Pending work, failed cleanup or a
+preparing row retains custody. The returned status is not a GC/product receipt.
+
+=vm.core/drain= halts owned processes, closes the parent, then retires those child
+activations. Realm-name physical purge waits while children remain. The manager
+keeps a waiting realm as =:draining=, rejects ensure/open/serve/service admission,
+and removes it only after a successful retry. Shutdown similarly retains pending
+entries and returns both drained/pending counts. No second activation registry or
+caller-supplied graph/proof is introduced.
+
+The real handoff control transfers an admitted contextual callback to a process
+OWNED by another live realm. Source-realm drain keeps its manager entry and fails
+new admission; the receiver survives, invokes42, then releases. Retirement retry
+finishes afterward, and the unrelated realm still runs. A separate control covers
+manager shutdown with a live registration. Preparing rows and same-code sibling
+activation/physical retention are independently covered.
+
+Final component uses actual SDK preparations/profiles/instances, Native Execution
+handoff/registration and original Generation retirement. Exact new snapshot/drain
+helpers are an external Native fixture, current core/manager are Source aliases
+with a private test manager. No alias is enrolled as SDK or granted to application
+Source. Two files/six tests/64 assertions pass, including existing busy-code and
+concurrent-drain controls. Preparation889ms; execution9154ms; service11.335s/
+411.8MiB/zero swap. Prior core/manager Source22 pass/10 fail/0 error across the same
+new32-assertion regression. See [[file:contextual-realm-retirement-checks.json][realm retirement evidence]].
+
+The new manager-shutdown test requires its own VM via existing isolation policy;
+ordinary and sealed selectors both use that policy. Profile9/selector4 and all16
+boundary/9 external-writer discovery checks pass. Selected sealed plan now14 files/
+665 assertions plus unchanged six universal controls; it has NOT been executed.
+Current engine9143e05f... still needs its actual immutable SDK after batched fixes.
+
+Required next consumers are explicit: session control currently prints closed/
+restarted/stopping before observing pending retirement; session.stop and foreground
+client teardown must retain the listener/owner and report pending without terminal
+success. This component does not qualify them. Caller death/partial preparation
+and the allocation-before-row window remain open. Manager rejection also does not
+prove every raw core/run/serve call using an old VM datum is fenced: finish their
+canonical execution migration. Preserve those obligations, managed SDK/effect
+binding selection, verified product activation/comparison and final replay.
+
+** Session control consumes pending retirement without terminating its owner
+Session stop now closes request admission before reading the existing in-flight
+counter. A request checks admission, increments that counter, rechecks, then runs;
+its finally releases the counter BEFORE its terminal frame. If stop raced before
+the increment, the second check refuses before dispatch. If the request was
+accepted first, stop observes in-flight work. No additional execution registry or
+compiler/runtime mode is introduced.
+
+Accepted work drains before realms. Pending realm custody preserves listener,
+registry record, idle watcher and foreground owner. Close/restart/stop controls
+return nonzero while pending; restart cannot open a replacement realm. Ordinary
+requests remain refused during session drain, while controls support observation
+and retry. The foreground loop reenters its existing wait after a pending stop.
+A successful stop commits its notification before acknowledging the terminal frame.
+
+The client previously discarded the exit frame's code and treated any terminal
+receipt as success. Its internal receipt now includes =:code=; outcome preserves
+that explicit code and refuses an incomplete receipt. The stdout collector also
+rejects nonzero exits, so restart cannot report success on an empty failed reply.
+The historical distinction remains: stop EOF is accepted, close EOF is failure.
+The existing shared-VM pure test now supplies the explicit successful code. Wire
+version1 tuples and the Native/Rust command-executor ABI remain unchanged.
+
+Final component5 tests/43 assertions pass on real AF_UNIX frames and actual SDK
+callback custody, with current lifecycle Source aliases/private manager and exact
+child helpers at Native fixture. No alias receives SDK/native grant authority.
+Preparation2445ms; execution10729ms; service14.553s/443.6MiB/zero swap. Terminal-code
+mutation39 pass/4 fail; deleting only the post-increment admission check41 pass/
+2 fail: the forced race reaches dispatch and returns0. Actual counter lock and a
+trace-delivery barrier establish ordering, not a quiet timing window. Trace MFAs
+come from actual namespace declarations, preserving private SDK bridge distinction.
+See [[file:contextual-session-retirement-checks.json][session retirement evidence]].
+
+This file owns mutable session/counter state and uses existing VM isolation. The
+race temporarily replaces the inactive counter cell and restores it; no claim
+about arbitrary prior SDK var values is inferred. Private short temporary runtime
+paths avoid Unix socket limits and are removed after the component VM exits.
+Profile9/selector4 and map16/external-writer9 pass. Planned selected sealed coverage
+is15 files/708 assertions with the same six universal controls, not a completed
+SDK gate. Existing full session/shared-VM suites are selected for ordinary affected
+integration; fresh actual SDK/transport/foreground qualification remains required.
+
+Current enginebac5aef6... needs a new immutable SDK after the runtime Source batch.
+Next required work includes caller-death/partial-preparation/allocation custody,
+raw core/run/serve canonical admission, managed SDK/effect binding selection and
+verified product activation/comparison. This does not close any historical case
+or the remaining compiler/bootstrap/JS migration and final exact-candidate replay.
+
+** Allocation custody exists before an actor message can outlive its caller
+Contextual preparation now chooses a fresh scope reference and records its private
+reservation BEFORE asking Env to allocate. Parent admission/caps/heap capture stay
+under the existing parent commit fence; child allocation stays outside it. This
+closes the earlier allocation-before-row interval without nesting scope locks.
+
+The new native =fork_prepared_scope!= resolves one fixed original SDK claim hook
+before taking the child lock. That hook consumes only its own caller's private
+reserved allocation. A generic key or supplied scope/permission map is not a
+reservation. One Env actor =get_and_update= checks creator liveness and publishes
+fresh environment state; the caller publishes lifetime while holding the same
+child lock as destruction. No user-supplied callback or new execution registry.
+
+Actor messages survive caller death. A scope address in a private row alone is
+insufficient: a late actor callback could recreate the scope after recovery.
+Checking actual creator liveness inside the actor prevents that. If the callback
+observed the creator alive before death, actor serialization orders a later
+recovery deletion after its state update. If recovery's message arrives first,
+that creator is already dead and the later allocation callback refuses.
+
+Recovery uses the existing preparation owner/key lock and requires a genuinely
+dead owner, =:preparing= phase and NO generation. It destroys the scope before
+forgetting the matching row. Abandonment of pre-G contextual rows also destroys
+first. Child retirement invokes this recovery; uncertainty remains pending. Rows
+with a G, factory effects, callbacks or resources are not erased by this path.
+Their existing Native/Generation retirement proof remains required.
+
+Final allocation/parent component2 files/8 tests/41 assertions pass. Preparation
+806ms; execution934ms; service3.121s/231.4MiB/zero swap. The test suspends ONLY its
+private Env actor, observes an actual queued native allocation, kills the creator,
+then checks both delivery and replay after destruction. Removing only creator
+liveness gives38 pass/3 fail, reproducing scope recreation. Ordinary/private
+preparation state, native locks, fresh-state constructor and scope destruction
+are exact helpers at an external Native fixture; its isolated reservation Atom
+creates NO G/profile/readiness/SDK grant. The original SDK hook does not enroll
+that fixture. See [[file:contextual-allocation-custody-checks.json][allocation custody evidence]].
+
+This is not actual new-SDK acceptance. Production Native Env plus fixed original
+SDK claim still need immutable qualification. General persistent Env.fork is
+unchanged; this slice does not assert all general environment ownership transfers.
+Map16/external-writer9 and profile9/selector4 pass. New actor-suspension file is
+isolated by existing policy; selected sealed plan16 files/733 assertions plus
+all six universal controls is unexecuted. Engine3e31b38c... is a new Native/SDK
+candidate, not the historical c722653a... SDK. Batch remaining partial-G recovery
+before actual SDK preparation; preserve complete final exact-candidate replay.
+
+** Recorded generation retirement can close before profile publication
+G must be recorded in the original SDK owner before native profile enrollment can
+authenticate it. Caller death between those steps leaves a genuine G without a
+native marker. Native retirement previously refused that state as unclassified.
+It now publishes a CLOSED-only custody barrier under the same owned module fences
+and Env private actor. It creates neither a Source profile nor an executable
+snapshot. Existing native physical retirement and fixed SDK cleanup still issue
+the only retirement proof and remove the original preparation.
+
+A queued profile publisher must not reopen that barrier. Inside the actual Env
+actor, profile publication now checks creator liveness, actual scope lifetime and
+existing graph closure before changing admission state. A destroyed scope refuses.
+A caller phase flag or missing code is still not retirement authority.
+
+The test obtains a G from actual immutable SDK preparation, observes the real
+profile entry behind the explicit erlang grant fence, then kills its owner before
+publication. Intrinsic ExInfo was the wrong fence: it also blocked SDK inventory/
+initialization, as captured stacks show. The worker binds framework context and
+warms SDK before the final controlled entry. No G/cache/profile is fabricated.
+New native close/profile helpers run at an external fixture; preclosing is followed
+by original SDK native retirement/Generation proof, not a fixture-issued outcome.
+
+Component3 tests/11 assertions pass: preparation268ms, execution7804ms, service
+9.736s/394.2MiB/zero swap. Removing only the reopen guard gives10 pass/1 fail: the
+late publisher succeeds. Destroyed scope refusal and original physical retirement/
+private-row cleanup pass independently. See [[file:contextual-profile-recovery-checks.json][profile recovery evidence]].
+
+Map16/external-writer9 and profile9/selector4 checks pass. Selected sealed plan17
+files/744 assertions plus all six universal controls is unexecuted. Engineba3f4724...
+requires actual immutable Native/SDK acceptance; the current SDK v08 remains c722
+historical evidence. Already-missing physical code, arbitrary partial-publication
+faults, initializing/failed/ready resource lifetimes and all original final cases
+remain conservative wherever native proof is unavailable. No broad recovery or
+historical closure is inferred. The next integration milestone must qualify this
+batched native/SDK candidate rather than extend component-only claims indefinitely.
+
+* Batched custody compiler reproduction
+The allocator/profile/session/realm/Loader changes now have an actual immutable
+compiler: =/nix/store/j1md9cqi1xyy6bcm4a2x0dz2hybqlwyk-beam-lisp-compiler-1=.
+Its P/B/C stages boot freshly; B and C reproduce all141 installed files exactly.
+The verifier checks716 current inputs and709 captured Source inputs, retaining
+separate accounting for seven generated native inputs. The receipt is
+[[file:contextual-custody-compiler-bootstrap-checks.json][the actual compiler result]].
+
+This is compiler evidence, not the new SDK or runtime acceptance. Normal managed
+SDK job =job_c4c8e3108bc6723a= continues on frozen =ba3f4724...= inputs. The actual
+SDK must exercise the fixed allocator hook, native profile barrier, Source-free
+initialization and affected ordinary/sealed/session/transport consumers. Original
+next-cutover and final historical obligations are unchanged.
+
+* Actual allocator race qualification needs the operation boundary
+The real fixed SDK lookup may queue an Env metadata READ before the scope claim.
+The earlier component skipped that lookup, so selecting any creator Agent message
+was insufficient. Replaying a read as an update replaced the fixture actor's state
+with returned metadata; that failure is retained, not a runtime admission result.
+
+The regression now resolves its original SDK entry first, observes the actual
+private reservation, and holds its fresh child fence while metadata reads and the
+original claim finish. It suspends the actor before releasing that fence, then
+captures only the queued =:get_and_update= allocator. Creator DOWN and late replay
+therefore exercise the actual native allocation callback. All25 assertions pass
+through the actual selected SDK; no reservation, G, profile or authority is forged.
+The [[file:contextual-custody-integration-checks.json][integration receipt]] preserves the failed broad gate, repaired focused
+scope and separate shared-realm/checkout failures. SDK production is a verified
+prerequisite, not final runtime acceptance or a closed historical case.
+
+* Accepted parent's custody is distinct from its birth history
+A real long-lived SDK manager can start after its birth caller has exited. Native
+parent snapshots previously required that old caller alive, even though the parent
+still held its own exact code lease. This incorrectly rejected later scheduler
+keeper births. The row validator now checks the live child's accepted state, code
+and current custody. Complete original-origin verification separately checks its
+live requested root and every exact ancestor while traversing the immutable chain;
+removing the redundant row-level creator test cannot skip a dead intermediate.
+
+Actual prior SDK control4 pass/2 fail reproduces the manager boundary. Exact new
+Native helpers plus the unchanged full origin verifier at an external fixture
+pass14 assertions on genuine original private SDK receipts and code leases. The
+mutation restoring only birth-caller liveness gives12 pass/2 fail. No SDK code was
+replaced or alias granted authority. Preparation213ms/execution1378ms; service
+5.631s/342.1MiB/zero swap. See [[file:native-parent-start-lifetime-checks.json][the scoped receipt]].
+
+A new immutable SDK must still qualify this Native change and real aggregate
+scheduler/session consumers. The ordinary/sealed selection includes the new
+six-assertion regression through the existing isolation policy. Source discovery
+16 boundaries/9 external writers and Python profile9/selector4 controls pass;
+planned affected gate84 ordinary/42 sealed files/1631 assertions retains all six
+universal controls. No historical case or final candidate is promoted here.
+
+* One runtime owner for SDK libraries in this repository
+The repository listed =priv/lib= as a project source root while also consuming
+those libraries from its immutable SDK. A cold scheduler lookup could rediscover
+=datom.query.analytic= as a project definition and attempt to replace its guarded
+SDK forwarder. The verification refusal was correct; duplicate selection was not.
+Default =:paths= now contains only =examples=. Build input declarations still
+include the SDK Source roots; runtime loading uses the selected SDK library owner.
+
+The SAME retained SDK binary passes shared-realm111 with corrected project paths
+(service34.190s/785.7MiB/zero swap); an isolated owned project adding the original
+=priv/lib= root fails at =sdk_forwarder_route_changed= (25.371s/709.5MiB/zero swap).
+See [[file:sdk-project-source-selection-checks.json][selection evidence]]. This verifies project selection on SDKpnp9..., not
+installation of the new Native parent validator. Combined immutable qualification
+and ordinary checkout transport remain required. No runtime fallback or SDK grant.
+
+* Nonempty coverage is an integrity control
+Combined SDKiwk3lbk2... has exact P/B/C/SDK byte evidence for engine7b9c06b8... .
+Its ordinary processes all returned0, including the previously failing aggregate
+schedule and real parent lifetime. The gate still rejected the run: native scoped
+retirement registered no tests because its fixture compiler changed the namespace.
+The existing strict nonempty-file check exposed that omission before sealed work.
+
+Restoring the captured caller context around that TEST fixture gives32 actual
+assertions through ./bin/bl (18.049s/591.7MiB/zero swap). The runtime SDK is unchanged.
+See [[file:retirement-fixture-coverage-checks.json][coverage evidence]]. The same affected gate must run with repaired frozen
+test inputs; no zero-count acceptance, skip, new SDK label or Source rebuild is used.
+
+* Optional cache readiness versus runtime-owner lifetime
+The ordinary84/3290 milestone now passes. A sealed consumer required a cache owner
+to exist after one optional25ms touch. The first aggregate returned a permitted
+cache miss; fresh and complete-prefix controls subsequently pass. The original
+failure cause remains unconfirmed. Its failed packet is retained.
+
+The lifetime control now observes readiness within5s through the existing named
+cache API and still checks real global/no-generation context, survival after the
+starter scope closes, data access and rejection of adoption outside actual init.
+Ordinary and Source-free focused controls both pass7. SDK policies and Native
+admission are unchanged. See [[file:sealed-cache-owner-readiness-checks.json][scope and evidence]]. The selected sealed stage
+still needs a complete passing receipt; no failed aggregate is promoted.
+
+* Qualified custody milestone, with stage scopes preserved
+The [[file:custody-completion-qualification.json][final custody packet]] independently checks the normal immutable SDK,
+its reproduced compiler, ordinary84/3290, repaired-file7, sealed42/1631, six
+universal controls, Source-free initialization and actual checkout transport.
+All runtime/floor/ordinary receiver bytes match. Only the recorded cache test
+changed between the passing ordinary run and latest sealed run; original failed
+aggregates retain their failed status. This composition is explicit, not a forged
+single passing preflight or final cutover receipt.
+
+Preparation38m46.108s; ordinary862.330s; selected sealed482.246s/895MiB/zero swap.
+Normal checkout shared-realm111 passes33.426s; transport31.922s with one owner,
+per-request cwd/argv/env, concurrency, failure recovery and project edit refresh.
+Warm requests about0.49s. Reproduction commands and exact scopes are in the packet.
+
+The next work is canonical compiler/SDK binding and class integration, verified
+activation/core admission, remaining real consumer/historical obligations, then
+superseded-route deletion and one final exact candidate replay. The canonical
+checklist now records those four finite dependency-ordered batches. Same one next
+architecture; no public compatibility execution path or additional authority owner.
+
+* Archived SDK dependency repair: reproduced compiler prerequisite
+The immutable compiler mypvip49... reproduces all141 B/C files from frozen
+Source8fc795f3 / engine2b356e44... . Its installed seed equals C; all718 current
+inputs and711 captured Source inputs agree. Fresh P/B/C boot controls pass.
+This includes the shared exact forwarding-declaration validator and dependency
+projection through existing SDK input metadata, cache and Loader admission.
+
+See [[file:sdk-archive-dependency-compiler-checks.json][compiler receipt]] for immutable addresses, hashes, timing and scope.
+Actual SDK production/ordinary/sealed qualification remains pending in the same
+managed job. Compiler reproduction alone does not prove cold runtime archive
+admission, close a historical case or promote a final candidate. The original
+four required cutover batches and exact final replay remain authoritative.
+
+* Archived SDK dependencies qualify across cold runtime consumers
+The [[file:sdk-archive-dependency-sdk-checks.json][scoped immutable qualification packet]] verifies produced SDKy0nkyniw...,
+frozen engine2b356e44..., focused12/474, ordinary188/8789 and selected sealed96/3760
+with all six universal integrity controls. Cold archive-only first admission,
+shared-cache restoration and runtime-only packaging retain the same checked SDK
+selection and use the original Loader; provider initialization still belongs to
+that owner. Passive build/capture never warms the optional provider body.
+
+All2340 input hashes,141 floor files and3382 actual receiver files agree; the
+Source-free receiver compiles0 SDK Source files. Original SDK5 failure and local
+receipt-read handoff failure remain preserved. Preparation37m23s is separate from
+focused112s and preflight2403.464s. The packet carries exact commands and timings.
+
+This verifies the dependency repair, not the complete language cutover. Canonical
+default front doors, computed SDK macros, class carriers, verified product
+activation, actual retained consumers, route removal and exact final all86 replay
+remain required. No alternate evaluator/registry, Source-to-SDK authority transfer,
+automatic collection or final floor promotion is introduced.
+
+* Computed SDK macro recipes share the existing phase owner
+CompilerData/sdk_macro_declaration returns a bounded phase-only declaration
+carrier. Native descriptor/declaration checking and retained interpreted closures
+share the function binder's original private session and budgets. Actual SDK
+macros already compile to the same callable ABI as functions: fixed self-application
+or $blfn variadic dispatch. No second macro evaluator or native permission is needed.
+
+The [[file:sdk-computed-macro-binding-checks.json][native component receipt]] records18 tests/72 assertions with unchanged original
+owners, including computed cond, fixed ite, inert operands, mutable Var isolation
+and exact carrier/session refusals. This is a component on immutable SDK6, not a
+new qualified SDK. The compile.sdk/contextual expansion consumer still needs the
+explicit datum-v1 argument/result adapter; template-only forwarding is not retired
+yet. That integration and remaining class/default compiler front doors stay required.
+
+* One macro evaluator, explicit conversion protocols
+SDK macro selection now emits the canonical authenticated carrier for every
+macro, replacing the separate template grammar. Native demand retains the original
+compiled datum-macro closure in the existing session. The normal macro ABI is
+&form, a map of visible local symbol names, then unevaluated datum arguments.
+Compiler/datum-macro-result shares bounded Reader conversion and existing gensym
+normalization with ordinary macro expansion. Contextual preparation owns freshness.
+
+Datum-v1 output re-enters callsite elaboration. It is not advertised as hygienic:
+syntax-v1 transformers keep definition/use scopes and template holes in the same
+pipeline. Output maps resembling syntax protocol values or ANF remain data. The
+compiler chooses the protocol from the checked declaration, never the returned
+map. Missing metadata interpretation executes an unconditional refusal body, so
+an older consumer cannot silently expand the new carrier to nil.
+
+Public analysis retains canonical phase-qualified transformer references, while
+private interpreter IDs never enter first-order program facts. Native datum-macro
+implementation images are explicitly opaque in dependency coverage. Binding and
+phase proofs remain available; no native-effect/admission claim follows from them.
+
+The [[file:sdk-computed-macro-integration-checks.json][component packet]] records exact same-runtime composition7 files/62 tests/228
+assertions. It preserves the original214-pass/1-fail aggregate and the corrected
+changed-file/ordinary-compiler replay62; it does not forge one passing aggregate.
+Computed recursion, variadic/overloaded calls, short-circuiting, deterministic
+gensyms, direct/archive/higher-phase and real runtime-unit admission are covered.
+Class/default compiler and authored Source datum-macro integration, actual new
+immutable bootstrap/SDK qualification and all original execution obligations remain.

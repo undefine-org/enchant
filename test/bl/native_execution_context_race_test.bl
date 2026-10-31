@@ -1,0 +1,94 @@
+(ns native-execution-context-race-test)
+
+(defn- parked? [pid attempts]
+ (let [info (Process/info pid :current_stacktrace)
+       names (set (map (fn [frame] [(elem frame 0) (elem frame 1)]) (when info (elem info 1))))]
+  (cond
+   (and (contains? names [:Elixir.BeamLisp.Env :accept_code_borrow!])
+        (contains? names [:Elixir.BeamLisp.Env :with_local_lock])) true
+   (<= attempts 0) false
+   :else (do (Process/sleep 5) (parked? pid (dec attempts))))))
+(defn- context-gone? [identity attempts]
+ (let [gone (try (BeamLisp.Env/execution_context_value! identity) false
+              (catch error (= :retired_execution_context (:original error))))]
+  (cond gone true (<= attempts 0) false
+        :else (do (Process/sleep 5) (context-gone? identity (dec attempts))))))
+
+(deftest source-owner-death-between-payload-read-and-borrow-commit-cancels-before-entry
+ (let [parent (erlang/self) touched (atom false) worker (atom nil)
+       owner (erlang/spawn
+               (fn []
+                (let [registration (BeamLisp.Env/with_ns "context.race.dead-owner"
+                                     #(BeamLisp.Execution/register! (fn [] (reset! touched true))))
+                      state (BeamLisp.Env/execution_registration_state registration)
+                      identity (:context-id (BeamLisp.Env/code_callback_payload (:lease state)))]
+                 (erlang/send parent (tuple :context-race-ready registration identity))
+                 (receive :stop nil))))
+       monitor (Process/monitor owner)]
+  (try
+   (let [[registration identity]
+         (receive [:context-race-ready registration identity] [registration identity]
+           (after 10000 (throw :context-race-owner-unavailable)))]
+    (BeamLisp.Env/with_local_lock :bl_code_lease_capacity_held :bl_code_lease_capacity_lock
+     (fn []
+      (reset! worker (erlang/spawn
+                      #(erlang/send parent (tuple :context-race-result (erlang/self)
+                         (try (BeamLisp.Execution/invoke! registration [])
+                          (catch error [:raised (:original error)]))))))
+      (is (parked? @worker 1000))
+      (erlang/exit owner :kill)
+      (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid owner)) true
+            (after 5000 false)))
+      (is (context-gone? identity 1000))))
+    (let [expected @worker]
+     (is (= {:status :cancelled}
+          (receive [:context-race-result pid result] :when (= pid expected) result
+            (after 10000 :context-race-no-result)))))
+    (is (= false @touched)))
+   (finally
+    (Process/demonitor monitor (list :flush))
+    (when (Process/alive? owner) (erlang/exit owner :kill))
+    (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))))))
+
+(defn- registration-gone? [registration attempts]
+ (cond (nil? (BeamLisp.Env/execution_registration_state registration)) true
+       (<= attempts 0) false
+       :else (do (Process/sleep 5) (registration-gone? registration (dec attempts)))))
+
+(deftest an-accepted-borrow-keeps-its-context-after-the-registration-owner-dies
+ (let [parent (erlang/self) worker (atom nil)
+       owner (erlang/spawn
+               (fn []
+                (let [registration (BeamLisp.Env/with_ns "context.race.accepted-owner"
+                                     #(BeamLisp.Execution/register!
+                                       (fn []
+                                        (erlang/send parent (tuple :context-accepted (erlang/self)))
+                                        (receive :finish 42 (after 30000 :context-barrier-expired)))))
+                      state (BeamLisp.Env/execution_registration_state registration)
+                      identity (:context-id (BeamLisp.Env/code_callback_payload (:lease state)))]
+                 (erlang/send parent (tuple :context-owner-ready registration identity))
+                 (receive :stop nil))))
+       monitor (Process/monitor owner)]
+  (try
+   (let [[registration identity]
+         (receive [:context-owner-ready registration identity] [registration identity]
+           (after 10000 (throw :context-owner-unavailable)))]
+    (reset! worker (erlang/spawn
+                    #(erlang/send parent (tuple :context-completed (erlang/self)
+                       (BeamLisp.Execution/invoke! registration [])))))
+    (let [expected @worker]
+     (is (receive [:context-accepted pid] :when (= pid expected) true (after 10000 false)))
+     (erlang/exit owner :kill)
+     (is (receive [:DOWN seen :process pid _] :when (and (= seen monitor) (= pid owner)) true
+           (after 5000 false)))
+     (is (registration-gone? registration 1000))
+     (is (map? (BeamLisp.Env/execution_context_value! identity)))
+     (erlang/send expected :finish)
+     (is (= {:status :completed :value 42}
+          (receive [:context-completed pid result] :when (= pid expected) result
+            (after 10000 :context-no-completion))))
+     (is (context-gone? identity 1000))))
+   (finally
+    (Process/demonitor monitor (list :flush))
+    (when (Process/alive? owner) (erlang/exit owner :kill))
+    (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))))))

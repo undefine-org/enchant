@@ -1,0 +1,83 @@
+;; Publication-time obligations. No solver, compiler or fact projection runs
+;; in an invocation; no result from this namespace is a native admission grant.
+(ns system.execution
+ (:require [system.publication :as publication] [codebase.boundary :as boundary]
+           [diag :as diag]))
+
+(def VERSION 1)
+(defn- finite-sequence? [value]
+ (or (erlang/is_list value) (BeamLisp.Ns.Rt/vector? value)))
+
+(defn- obligation [kind witness]
+ {:kind kind :status :unknown :witness witness})
+
+(defn- report [status coverage obligations witnesses]
+ {:version VERSION :status status :scope :published-defn-dependencies
+  :native-admission false :coverage coverage :obligations obligations
+  :witnesses witnesses :diagnostics []})
+
+(defn- check-once [publications facts]
+ (let [epoch (BeamLisp.Env/publication_epoch)
+       _ (when-not (and (finite-sequence? publications) (<= (count publications) 256)
+                         (= 1 (:version facts)) (finite-sequence? (:entries facts))
+                         (finite-sequence? (:edges facts)) (<= (count (:edges facts)) 32768)
+                         (map? (:coverage facts)))
+           (throw (ex-info "Invalid execution check input" {:kind :invalid-execution-check})))
+       invalid (vec (keep (fn [saved]
+                           (when-not (and (map? saved) (publication/valid? saved))
+                            [(:namespace saved) (:name saved)])) publications))
+       missing (vec (keep (fn [saved]
+                           (when-not (and (= 1 (get-in saved [:execution :version]))
+                                          (= :bound (get-in saved [:execution :status]))
+                                          (seq (get-in saved [:execution :entries])))
+                            [(:namespace saved) (:name saved)])) publications))
+       descriptors (vec (mapcat #(get-in % [:execution :entries] []) publications))
+       emitted (boundary/emitted descriptors)
+       entries-match (= (frequencies (:entries emitted)) (frequencies (:entries facts)))
+       edges-match (= (frequencies (:edges emitted))
+                      (frequencies (filter #(= :emitted (:edge/origin %)) (:edges facts))))
+       origins-valid (every? #(contains? #{:source :emitted} (:edge/origin %)) (:edges facts))
+       mismatch (and (empty? missing) (not (and entries-match edges-match origins-valid)))
+       obligations
+       (vec (concat
+             (when (empty? publications) [(obligation :missing-publication-inventory {})])
+             (map #(obligation :missing-artifact-descriptors {:definition %}) missing)
+             (when-not (= true (get-in facts [:coverage :complete]))
+              [(obligation :incomplete-source-projection (:coverage facts))])
+             (keep (fn [entry]
+                     (when-not (:dependencies-complete entry)
+                      (obligation :incomplete-entry-dependencies {:entry (:id entry)}))) descriptors)
+             (keep (fn [edge]
+                     (when-not (= :indexed (:edge/status edge))
+                      (obligation :unresolved-dependency edge))) (:edges emitted))))
+       coverage {:scope :published-defn-dependencies
+                 :publications (count publications) :entries (count descriptors)
+                 :edges (count (:edges emitted)) :complete
+                 (and (seq publications) (seq descriptors) (empty? invalid)
+                      (empty? missing) (not mismatch) (empty? obligations))}
+       coverage (update coverage :complete boolean)
+       result (report (cond (or (seq invalid) mismatch) :refused
+                            (:complete coverage) :proved :else :unknown)
+                       coverage obligations
+                       {:invalid-publications invalid :projection-mismatch (boolean mismatch)})]
+  ;; All revalidation and descriptor/fact comparison precede the final fence.
+  (if (= epoch (BeamLisp.Env/publication_epoch)) result :retry)))
+
+(defn check
+ "Authenticate current publication snapshots and compare their exact emitted
+  facts with a codebase.boundary projection. A single snapshot or a finite
+  collection is accepted. Missing/unknown coverage stays an obligation; stale
+  publications or altered projections refuse. Proved covers published defn
+  dependencies only, not initializers, effects, frames or lifetime ownership."
+ [publications facts]
+ (try
+  (let [publications (if (map? publications) [publications] publications)
+        first (check-once publications facts)]
+   (if (= :retry first)
+    (let [second (check-once publications facts)]
+     (if (= :retry second)
+      (report :unknown {:scope :published-defn-dependencies :complete false}
+              [(obligation :unstable-publication {})] {}) second)) first))
+  (catch _
+   (assoc (report :error {:scope :published-defn-dependencies :complete false} [] {})
+          :diagnostics [(diag/error :execution-analysis-error "Execution publication analysis failed" {} {})]))))

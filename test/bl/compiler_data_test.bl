@@ -4,12 +4,9 @@
 ; Ported from the ExUnit `test/beam_lisp/compiler_data_test.exs`. That suite
 ; called `BeamLisp.CompilerData` — the Elixir module — because the leaf was
 ; authored in `lib/`. The leaf is now a pinned HOST BEAM: `priv/host/compiler_data.bl`
-; compiled to `Elixir.BeamLisp.CompilerData.beam`, committed in the bootstrap
-; seed and installed into the build's ebin by `Bootstrap.install!/1`. So the
-; suite still calls the same atom, and what it calls is the SEED beam — not a
-; source compile. The last two tests pin that: the live module's beam IS the
-; committed seed's bytes, it carries the pinned attributes, and a FRESH `bin/bl`
-; loads the same bytes. There is no `lib/*.ex` fallback left.
+; compiled into the immutable SDK floor. The last two tests compare the live
+; module with that floor and invoke the exact same SDK tool in a fresh receiver.
+; They never use checkout production as an implicit test prerequisite.
 ;
 ; Behaviour is asserted as concrete expected values, never by diffing against a
 ; second implementation: after the `.ex` is deleted there is no second
@@ -129,6 +126,12 @@
 (deftest every-eager-entry-point-has-the-arity-the-compiler-calls
   (let [m :Elixir.BeamLisp.CompilerData
         exported? (fn [f a] (erlang/apply :erlang :function_exported (list m f a)))]
+    (is (exported? :binding_reference? 1))
+    (is (exported? :simple_function_clause 1))
+    (is (exported? :catch_stack_bindings 0))
+    (is (exported? :check_reader_data! 1))
+    (is (exported? :namespace_require_spec 1))
+    (is (exported? :namespace_clauses 1))
     (is (exported? :eager_to_list 1))
     (is (exported? :eager_map 2))
     (is (exported? :eager_map 3))
@@ -142,35 +145,28 @@
     (is (exported? :eager_range 1))
     (is (exported? :eager_range 2))))
 
-; ── the installed module IS the committed seed ──────────────────────────────
-;
-; With the `.ex` gone there is no `lib` source to fall back to, but the proof
-; that the RUNNING module came from the seed (and not, say, a stale beam an old
-; elixirc pass left in the ebin) is the beam itself: it must be the committed
-; floor's bytes, and it must carry the pinned attributes. `bl_compiler_key` is
-; the generation claim `Bootstrap.fresh_generation?/2` reads; the presence of
-; `bl_source_hash` is what separates a pinned host beam from an elixirc build.
-; Whether the SEED is current for its source is `bl seed --check`'s question,
-; not this suite's.
+; The selected immutable SDK owns its running compiler floor. The checkout's
+; bootstrap predecessor need not equal a newly reproduced SDK. These checks
+; use the actual SDK image and its exact tool, never start production implicitly.
 
-(deftest the-installed-module-is-the-committed-seed-beam
-  (let [root (BeamLisp/cwd)
-        seed (Path/join root "priv/bootstrap/seed/Elixir.BeamLisp.CompilerData.beam")
+(deftest the-installed-module-matches-the-running-sdk-floor
+  (let [floor (Path/join (BeamLisp.Tiers/priv_root) "bootstrap/seed")
+        seed (Path/join floor "Elixir.BeamLisp.CompilerData.beam")
         installed (unicode/characters_to_binary (code/which :Elixir.BeamLisp.CompilerData))
         hash (attr :Elixir.BeamLisp.CompilerData :bl_source_hash)]
-    (is (File/exists? seed) "the committed floor carries the host leaf")
+    (is (File/exists? seed) "the running SDK floor carries the host leaf")
     (is (some? installed) "the module is loaded from a beam")
     (is (= (File/read! seed) (File/read! installed))
-        "the live module's bytes ARE the committed seed's bytes — no lib source fallback")
+        "the live module matches its immutable SDK floor")
     (is (= 64 (erlang/byte_size hash))
         "the beam carries a pinned source digest (an elixirc build has none)")
     (is (nil? (attr :Elixir.BeamLisp.CompilerData :bl_compiler_key))
         "a floor beam carries no generation key: the seed manifest claims it")
-    (is (BeamLisp.Bootstrap/claimed? (Path/join root "priv/bootstrap/seed")
+    (is (BeamLisp.Bootstrap/claimed? floor
           "Elixir.BeamLisp.CompilerData.beam" (BeamLisp.AOTCache/compiler_key))
-        "and the committed manifest claims these bytes under this toolchain's key")))
+        "the SDK floor manifest claims these bytes under this toolchain key")))
 
-(deftest a-fresh-bin-bl-loads-the-same-seed-beam
+(deftest a-fresh-exact-sdk-tool-loads-the-same-floor-beam
   (let [root (BeamLisp/cwd)
         probe (Path/join (System/tmp_dir!)
                 (str "bl_seed_probe_" (erlang/unique_integer (list :positive)) ".bl"))
@@ -183,8 +179,14 @@
            "      attr (fn [k] (some (fn [a] (when (= k (erlang/element 1 a)) (erlang/element 2 a))) attrs))]\n"
            "  (println (str \"BLSEED path=\" (unicode/characters_to_binary (code/which m))\n"
            "                \" source=\" (attr :bl_source_hash)\n"
-           "                \" key=\" (attr :bl_compiler_key))))\n"))
-    (let [r (System/cmd (Path/join root "bin/bl") (to-list (list "run" probe))
+           "                \" key=\" (attr :bl_compiler_key)\n"
+           "                \" bytes=\" (Base/encode16 (crypto/hash :sha256 (File/read! (unicode/characters_to_binary (code/which m))))))))\n"))
+    (let [tool (or (System/get_env "BL_QUALIFY_CANDIDATE")
+                   (let [sdk (System/fetch_env! "BL_SDK_PRODUCT")]
+                    (assert (= (Path/expand (Path/join sdk "image/priv")) (Path/expand (BeamLisp.Tiers/priv_root))))
+                    (Path/join sdk "bin/bl")))
+          r (System/cmd tool
+              (to-list (list "--cold" "run" probe))
               (to-list (list (erlang/list_to_tuple (list :cd root))
                              (erlang/list_to_tuple (list :stderr_to_stdout true)))))
           out (elem r 0)
@@ -194,6 +196,6 @@
           "a process that compiled nothing carries the seed beam's source digest")
       (is (includes? out "key=")
           "and reports its (absent) key attribute")
-      (is (includes? out (str "path=" installed))
-          "loaded from the same beam path this VM resolved"))
+      (is (includes? out (str "bytes=" (Base/encode16 (crypto/hash :sha256 (File/read! installed)))))
+          "the fresh receiver loads the same immutable bytes through its own package path"))
     (File/rm! probe)))

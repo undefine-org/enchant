@@ -1,0 +1,127 @@
+(ns contextual-realm-retirement-test
+ (:require [compile.world :as world] [reload.execution :as execution]
+           [reload.generation :as generation] [vm.core :as vmc] [vm.manager :as manager]))
+
+(defn- children [parent] (execution/contextual-preparations parent))
+(defn- retire-children [parent] (generation/retire-contextual-children! parent))
+(defn- refused [action]
+ (try (action) :unexpected-success (catch e (or (:reason (ex-data e)) (:kind (ex-data e))))))
+(defn- fixture [module action]
+ (let [root (Path/join (System/tmp_dir!) (str "realm-unit-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! root)
+  (try
+   (File/write! (Path/join root "main.bl") "(ns realm.unit) (defn callback [] (fn [] 42)) 42")
+   (File/write! (Path/join root "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['realm.unit 'current] :sources [{:namespace 'realm.unit :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join root "world.bl"))
+         reference (:reference (first (filter #(and (= 'callback (get-in % [:declaration :name]))
+                                                    (not= :local (get-in % [:declaration :visibility])))
+                                      (vals (get-in prepared [:program :references])))))]
+    (try (action (BeamLisp.AOT/compile_unit (world/prepare-unit prepared module)) reference)
+     (catch error
+      (println :REALM-RETIREMENT-ERROR (ex-data error) __STACKTRACE__)
+      (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))
+   (finally (File/rm_rf! root)))))
+(defn- activate [parent captured]
+ (BeamLisp.Env/with_env parent
+  (fn []
+   (let [g (execution/prepare-captured-unit! captured)]
+    (execution/initialize-instance! g)
+    (execution/complete-preparation! (:cache-key g) g) g))))
+(defn- registration [g reference]
+ (execution/with! g #(BeamLisp.Execution/register! (execution/invoke-instance-binding! g reference []))))
+(defn- spec [] {:id (str "contextual-drain-" (erlang/unique_integer (list :positive)))})
+(defn- consume [caller]
+ (loop [target nil]
+  (receive
+   [:accept transfer]
+    (do (erlang/send caller [:accepted (BeamLisp.Execution/accept-handoff! transfer)])
+        (recur (:accepted transfer)))
+   :invoke
+    (do (erlang/send caller [:invoked (BeamLisp.Execution/invoke! target [])]) (recur target))
+   :release
+    (do (BeamLisp.Execution/close! target) (erlang/send caller :released) (recur nil)))))
+
+(deftest closed-parent-drain-closes-all-same-code-siblings-without-touching-another-parent
+ (fixture :Elixir.RealmSameCodeChildren
+  (fn [captured reference]
+   (let [a (BeamLisp.Env/fork) b (BeamLisp.Env/fork)
+         first (activate a captured) second (activate a captured) other (activate b captured)]
+    (try
+     (is (= :preparation-parent-open (refused #(retire-children a))))
+     (is (= 2 (count (children a))))
+     (BeamLisp.Env/destroy a)
+     ;; The other parent's admitted graph still owns these physical bytes.
+     (is (= :waiting (:status (retire-children a))))
+     (is (= 2 (count (children a))))
+     (is (= 42 (execution/invoke-instance-entry! other)))
+     (BeamLisp.Env/destroy b)
+     (is (= :retired (:status (retire-children b))))
+     (is (= {:status :retired :pending 0 :retired 2} (retire-children a)))
+     (is (empty? (children a)))
+     (is (= {:status :retired :pending 0 :retired 0} (retire-children a)))
+     (finally
+      (BeamLisp.Env/destroy a) (BeamLisp.Env/destroy b)
+      (doseq [g [first second other]] (generation/retire! g))))))))
+
+(deftest drain-keeps-a-preparing-reservation-until-its-owner-abandons-it
+ (let [parent (BeamLisp.Env/fork) child (BeamLisp.Env/fork parent)
+       key [parent :contextual-unit "preparing-only" child]]
+  (try
+   (execution/begin-preparation! key)
+   (BeamLisp.Env/destroy parent)
+   (is (= {:status :waiting :pending 1 :retired 0} (retire-children parent)))
+   (is (= :preparing (:phase (first (children parent)))))
+   (is (nil? (:generation (first (children parent)))))
+   (execution/abandon-preparation! key)
+   (BeamLisp.Env/destroy child)
+   (is (= :retired (:status (retire-children parent))))
+   (finally (execution/abandon-preparation! key) (BeamLisp.Env/destroy child)
+            (BeamLisp.Env/destroy parent)))))
+
+(deftest realm-drain-retains-transferred-callback-and-rejects-new-work-until-retry
+ (fixture :Elixir.RealmTransferredCallback
+  (fn [captured reference]
+   (let [source (spec) consumer (spec) _ (manager/start)
+         source-vm (manager/ensure source) consumer-vm (manager/ensure consumer)
+         caller (erlang/self) consumer-pid (vmc/serve consumer-vm :callback-consumer #(consume caller))
+         g (activate (:env source-vm) captured) held (registration g reference)
+         transfer (BeamLisp.Execution/prepare-handoff! held consumer-pid)]
+    (try
+     (erlang/send consumer-pid [:accept transfer])
+     (is (= :accepted (:status (receive [:accepted result] result (after 5000 {:status :missing})))))
+     (is (= :waiting (:status (manager/drain (:id source)))))
+     (is (= :draining (:status (manager/get-vm (:id source)))))
+     (is (= :realm-draining (refused #(manager/ensure source))))
+     (is (= :realm-draining (refused #(manager/open source))))
+     (is (= :realm-draining (refused #(manager/serve (:id source) :late (fn [] :unexpected)))))
+     (is (= :realm-draining
+            (:error (call manager/MANAGER [:service (:id source) :late {} (fn [_] :unexpected) (list)] :infinity))))
+     (erlang/send consumer-pid :invoke)
+     (is (= {:status :completed :value 42}
+            (receive [:invoked result] result (after 5000 :missing))))
+     (is (Process/alive? consumer-pid))
+     (is (= :ready (:status (manager/get-vm (:id consumer)))))
+     (erlang/send consumer-pid :release)
+     (is (= :released (receive :released :released (after 5000 :missing))))
+     (BeamLisp.Execution/close! held)
+     (is (= :retired (:status (manager/drain (:id source)))))
+     (is (nil? (manager/get-vm (:id source))))
+     (is (= 99 (vmc/run consumer-vm (fn [] 99))))
+     (finally
+      (BeamLisp.Execution/close! held)
+      (manager/drain (:id consumer)) (manager/drain (:id source)) (generation/retire! g)))))))
+
+(deftest shutdown-retains-pending-real-consumers-in-the-manager
+ (fixture :Elixir.RealmShutdownCallback
+  (fn [captured reference]
+   (let [spec (spec) _ (manager/start) vm (manager/ensure spec)
+         g (activate (:env vm) captured) held (registration g reference)]
+    (try
+     (is (= {:drained 0 :pending 1} (manager/shutdown)))
+     (is (= :draining (:status (manager/get-vm (:id spec)))))
+     (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! held [])))
+     (BeamLisp.Execution/close! held)
+     (is (= {:drained 1 :pending 0} (manager/shutdown)))
+     (is (nil? (manager/get-vm (:id spec))))
+     (finally (BeamLisp.Execution/close! held) (manager/drain (:id spec)) (generation/retire! g)))))))

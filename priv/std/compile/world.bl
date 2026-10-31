@@ -1,0 +1,494 @@
+;; File/build adapter for the existing contextual compiler. No resolver or evaluator
+;; lives here: Loader reads, Compiler prepares, AOT bounds, expand links, Lower emits.
+(ns compile.world
+ (:require [binding :as binding] [expand :as expand] [anf :as anf]
+           [lower :as lower] [system.phase :as phase] [system.arity.anf :as arity]
+           [claim :as claim] [build-plan :as plan] [compiler :as compiler] [codebase.phase :as codebase]
+           [reload.source-producer :as source-producer] [compile.sdk :as sdk]))
+
+(defn- refuse! [kind detail]
+ (throw (ex-info "Invalid compilation world" {:kind kind :detail detail})))
+
+(defn- rows! [value]
+ (when-not (or (vector? value) (erlang/is_list value)) (refuse! :world-file-table nil))
+ (let [rows (BeamLisp.CompilerData/eager_to_list value)]
+  (when (> (count rows) 128) (refuse! :world-file-budget nil)) rows))
+
+(defn- bytes! [path limit]
+ (let [stat (File/stat! path)]
+  (when-not (and (= :regular (:type stat)) (<= (:size stat) limit))
+   (refuse! :world-file-size path))
+  (let [file (File/open! path (list :read :binary))
+        bytes (try (IO/binread file (+ limit 1)) (finally (File/close file)))
+        bytes (if (= :eof bytes) "" bytes)]
+   (when-not (and (erlang/is_binary bytes) (<= (erlang/byte_size bytes) limit))
+    (refuse! :world-file-size path)) bytes)))
+
+(defn- digest [bytes] (crypto/hash :sha256 bytes))
+
+(defn read-manifest
+ "Read one bounded, effect-denying Source expression. Quoted symbols are values;
+  ambient vars, reader results and a manifest's own policy grant no capabilities."
+ [path]
+ (let [path (Path/expand path (BeamLisp/cwd)) source (bytes! path 65536)
+       _ (BeamLisp.AtomGuard/check! source)
+       selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace 'world-manifest :digest (digest source)}]}
+       world (binding/world selection [] [])
+       node (:node (expand/compile-expression source path
+                    {:selection (binding/select [world] []) :world (:key world) :namespace 'world-manifest}))
+       value (BeamLisp.AOT/interpret_constructor! node {} {})]
+  (when-not (and (erlang/is_map value) (not (contains? value :__struct__))
+                 (= #{:version :profile :entry :sources :libraries} (set (keys value)))
+                 (= 1 (:version value)) (= 'syntax-v1 (:profile value))
+                 (vector? (:entry value)) (= 2 (count (:entry value)))
+                 (every? (fn [value] (symbol? value)) (:entry value)))
+   (refuse! :world-manifest nil))
+  {:manifest value :input {:path path :digest (digest source) :bytes (erlang/byte_size source)}}))
+
+(defn- entry-declaration! [prepared]
+ (let [declaration (:declaration prepared) entries (when (erlang/is_map declaration) (:entries declaration))
+       entry (when (and (erlang/is_list entries) (= 1 (erlang/length entries))) (first entries))
+       clause (when (and (erlang/is_tuple entry) (= 4 (erlang/tuple_size entry))) (elem entry 3))]
+  (when-not (and (erlang/is_map declaration) (= 1 (:version declaration)) (= :function-declaration (:kind declaration))
+                 (= (str (first (get-in prepared [:manifest :entry]))) (:namespace declaration))
+                 (= "run" (:name declaration)) (nil? (:metadata declaration))
+                 (erlang/is_map clause) entry (= :fixed (elem entry 0)) (= 0 (elem entry 1)) (= :run (elem entry 2))
+                 (= :defn-clause (:op clause)) (= :run (:fname clause))
+                 (= (list) (:params clause)) (nil? (:guard clause))
+                 (= (get-in prepared [:program :node]) (:body clause))
+                 (= (:body clause) (compiler/contextual-unit-entry (get-in prepared [:program :unit]))))
+   (refuse! :world-entry-declaration nil))
+  clause))
+
+(defn check-inputs!
+ "Recheck captured file bytes; analysis and execution always use the prepared
+  immutable program, never reload providers through ambient namespace lookup."
+ [prepared]
+ (when (contains? prepared :program)
+  (entry-declaration! prepared)
+  (let [snapshot (:snapshot (codebase/facts (:program prepared)))]
+   (when-not (and (= snapshot (get-in prepared [:facts :snapshot]))
+                  (= :proved (get-in prepared [:phase :status]))
+                  (every? (fn [report] (= snapshot (:snapshot report)))
+                           (list (:phase prepared) (:arity prepared) (:ownership prepared))))
+    (refuse! :world-analysis-changed nil))))
+ (doseq [input (:sdk-inputs prepared)] (sdk/check! input))
+ (doseq [input (:inputs prepared)]
+  (when-not (= (:digest input) (digest (bytes! (:path input) 16777216)))
+   (refuse! :world-input-changed (:path input))))
+ prepared)
+
+(defn capture
+ "Capture exact bounded source/archive bytes without expanding providers or
+  projecting facts. Manifests remain effect-denying constructor data; unchanged
+  builds may validate this selection before deciding whether expansion is needed."
+ [path]
+ (let [read (read-manifest path) manifest (:manifest read)
+       base (Path/dirname (get-in read [:input :path]))
+       sources (rows! (:sources manifest)) libraries (rows! (:libraries manifest))
+       _ (when (> (+ (count sources) (count libraries)) 128) (refuse! :world-file-budget nil))
+       sdk-inputs (Enum/map (Enum/filter libraries #(erlang/is_map %)) sdk/capture)
+       archives (Enum/reject libraries #(erlang/is_map %))
+       sdk-bytes (Enum/reduce sdk-inputs 0
+                   (fn [input total] (+ total (erlang/byte_size (get-in input [:source :source])))))
+       remaining (- 16777216 (+ (get-in read [:input :bytes]) sdk-bytes))
+       _ (when (< remaining 0) (refuse! :world-file-size :sdk-forwarding-source))
+       source-capture
+       (Enum/map_reduce sources remaining
+        (fn [row remaining]
+         (when-not (and (erlang/is_map row) (not (contains? row :__struct__))
+                        (= #{:namespace :revision :file} (set (keys row)))
+                        (symbol? (:namespace row)) (symbol? (:revision row))
+                        (erlang/is_binary (:file row)) (not= "" (:file row)))
+          (refuse! :world-source-row nil))
+         (let [path (Path/expand (:file row) base) bytes (bytes! path remaining)]
+          (tuple {:input {:path path :digest (digest bytes) :bytes (erlang/byte_size bytes)}
+                  :source (assoc row :source (BeamLisp.Loader/doc_content path bytes))}
+                 (- remaining (erlang/byte_size bytes))))))
+       source-inputs (elem source-capture 0)
+       archive-capture
+       (Enum/map_reduce archives (elem source-capture 1)
+        (fn [file remaining]
+         (when-not (and (erlang/is_binary file) (not= "" file)) (refuse! :world-library-row nil))
+         (let [path (Path/expand file base) bytes (bytes! path remaining)]
+          (tuple {:input {:path path :digest (digest bytes) :bytes (erlang/byte_size bytes)}
+                  :library-bytes bytes}
+                 (- remaining (erlang/byte_size bytes))))))
+       archive-inputs (elem archive-capture 0)
+       inputs (cons (:input read) (Enum/map (Enum/concat source-inputs archive-inputs) #(:input %)))
+       captured-sources (Enum/concat (Enum/map source-inputs #(:source %)) (Enum/map sdk-inputs #(:source %)))
+       library-bytes (Enum/map archive-inputs #(:library-bytes %))
+       dependencies (sdk/capture-dependencies sdk-inputs captured-sources
+                      (Enum/map library-bytes expand/decode-phase-library))
+       capture {:manifest manifest :inputs inputs :sdk-inputs dependencies
+                :sources captured-sources :library-bytes library-bytes}]
+  (check-inputs! capture)))
+
+(defn prepare-captured
+ "Expand one validated capture once, then project codebase/phase/arity reports
+  from that same program. No ambient provider search or target initialization."
+ [captured]
+ (check-inputs! captured)
+ (let [manifest (:manifest captured)
+       expansion (expand/prepare-program (:sources captured) (:entry manifest)
+                   (Enum/map (:library-bytes captured) expand/decode-phase-library))
+       program (:program expansion)
+       analysis (phase/analyze program) report (:report analysis)
+       _ (when-not (= :proved (:status report)) (refuse! :world-phase-check (:status report)))
+       facts (:facts analysis)]
+  (check-inputs! {:manifest manifest :inputs (:inputs captured) :sdk-inputs (:sdk-inputs captured) :program program :declaration (:declaration expansion)
+                  :phase-library (:phase-library expansion) :phase report :facts facts
+                  :ownership (:ownership analysis)
+                  :arity (assoc (arity/check (:node program)) :snapshot (:snapshot facts))})))
+
+(defn prepare
+ "Capture and expand one exact manifest selection. Build callers may split
+  capture from preparation to validate a cached complete artifact first."
+ [path] (prepare-captured (capture path)))
+
+(defn describe [prepared]
+ {:profile "syntax-v1" :entry (mapv (fn [value] (str value)) (get-in prepared [:manifest :entry]))
+  :worlds (count (get-in prepared [:program :selection :worlds]))
+  :references (get-in prepared [:phase :references])
+  :expansions (count (get-in prepared [:program :expansions]))
+  :phase-check (name (get-in prepared [:phase :status]))
+  :arity-check (name (get-in prepared [:arity :status]))
+  :arity-scope (name (get-in prepared [:arity :scope]))
+  :arity-coverage (get-in prepared [:arity :coverage])
+  :arity-diagnostics (get-in prepared [:arity :diagnostics])
+  :ownership-check (name (get-in prepared [:ownership :status]))
+  :ownership-scope (name (get-in prepared [:ownership :scope]))
+  :ownership-obligations (count (get-in prepared [:ownership :runtime-obligations]))
+  :ownership-contexts (get-in prepared [:ownership :summaries :contexts])
+  :ownership-summary-hits (get-in prepared [:ownership :summaries :hits])
+  :ownership-cleanup-check (name (get-in prepared [:ownership :cleanup :status] :unknown))
+  :ownership-loop-states (get-in prepared [:ownership :loops :states])
+  :ownership-loop-back-edges (get-in prepared [:ownership :loops :back-edges])
+  :phase-scope (name (get-in prepared [:phase :scope]))
+  :native-effects (name (get-in prepared [:phase :native-effects :status]))
+  :native-obligations (count (get-in prepared [:phase :native-effects :obligations]))
+  :snapshot (Base/encode16 (get-in prepared [:facts :snapshot]) (list (tuple :case :lower)))
+  :constructor-closed (= :closed (get-in prepared [:program :constructor :status]))
+  :native-admission false})
+
+(defn- program-descriptor [prepared module attrs]
+ (let [program (:program prepared)
+       bindings {:version 2 :profile 'syntax-v1 :snapshot (get-in prepared [:facts :snapshot])
+                 :references (:references program) :expansions (:expansions program)
+                 :exports (get-in program [:unit :exports])}]
+  (anf/module module
+   (list {:op :defn-clause :fname :__bl_unit__ :params (list) :guard nil
+          :body (:expression (source-producer/specialize-unit (:unit program) {:native-modules #{"erlang"}})) :ann {}})
+   (list [:__bl_unit__ 0])
+   (cons [:bl_contextual_bindings (erlang/term_to_binary bindings (list :deterministic))] attrs))))
+
+(defn artifact
+ "Emit the admitted factory and contextual metadata without loading the target."
+ [prepared module]
+ (check-inputs! prepared)
+ (when-not (erlang/is_atom module) (refuse! :world-target-module nil))
+ (when (seq (get-in prepared [:program :classes])) (refuse! :contextual-class-unit-required nil))
+ (lower/descriptor->beam (program-descriptor prepared module (list)) {}))
+
+(defn- pipeline-identity []
+ ;; Reuse the existing content-keyed planner parts. Full body identities of
+ ;; the discovered pipeline closure participate, not just interface keys.
+ (if (BeamLisp.AOTCache/packaged_compiler?)
+  (BeamLisp.AOT/sdk_pipeline_identity! "compile.world")
+  (BeamLisp.Loader/with_declaration_snapshot
+   (fn []
+    (let [nodes (BeamLisp.BuildPlan/nodes_from_resolver "compile.world"
+                 (fn [namespace]
+                  (when-let [content (BeamLisp.Loader/source_content namespace)]
+                   (plan/memo-node namespace content))))]
+    (when-not (seq nodes) (refuse! :world-pipeline-unavailable nil))
+    (mapv #(select-keys % [:ns :hash :iface]) (sort-by :ns nodes)))))))
+
+(defn- selection-identity [captured module]
+ {:version 1 :profile 'syntax-v1 :manifest (:manifest captured)
+  :inputs (mapv #(select-keys % [:digest :bytes]) (:inputs captured))
+  :sdk-inputs (mapv #(select-keys % [:selection :bindings]) (:sdk-inputs captured))
+  :compiler-key (BeamLisp.AOTCache/current_compiler_key)
+  :build-key (BeamLisp.AOTCache/current_build_key)
+  :runtime-image (BeamLisp.AOT/runtime_image_key)
+  :module (Atom/to_string module) :pipeline (pipeline-identity)})
+
+(defn- selection-key [selection]
+ (Base/encode16 (digest (erlang/term_to_binary selection (list :deterministic)))
+                 (list (tuple :case :lower))))
+
+(defn- selection-module [selection]
+ (Module/concat :Elixir.BeamLisp.World.Revision (str "R" (selection-key selection))))
+
+(defn runtime-module
+ "Select an immutable physical program name from the complete captured input
+  and compiler pipeline identity. The logical target is a fixed domain tag;
+  the resulting physical name is then part of the ordinary artifact selection."
+ [captured]
+ (selection-module (selection-identity captured :Elixir.BeamLisp.World.Program)))
+
+(defn- artifact-inputs [captured key]
+ (Map/new (map-indexed
+  (fn [index input]
+   (let [source (bytes! (:path input) 16777216) name (str "world-input-" index)]
+    (tuple name {:namespace name :file (:path input) :source source :selection :explicit
+                 :content-kind :bytes :digest (digest source) :compiler-key key})))
+  (:inputs captured))))
+
+(defn prepare-unit
+ "Adapt one prepared world to the existing AOT artifact-unit protocol. Runtime
+  code and a phase-only companion are complete members of the same unit. No
+  expansion is repeated and neither module is loaded or initialized."
+ [prepared module]
+ (check-inputs! prepared)
+ (when-not (erlang/is_atom module) (refuse! :world-target-module nil))
+ (let [key (BeamLisp.AOTCache/current_compiler_key)
+       _ (when-not (= key (BeamLisp.AOTCache/compiler_key)) (refuse! :world-compiler-changed nil))
+       phase-module (Module/concat module :PhaseLibrary)
+       snapshot (get-in prepared [:facts :snapshot])
+       archive (expand/encode-phase-library (:phase-library prepared))
+       input-selection (selection-identity prepared module)
+       input-key (selection-key input-selection)
+       classes (BeamLisp.AOT/prepare_contextual_classes! (get-in prepared [:program :unit])
+                  (or (get-in prepared [:program :classes]) (list)) key input-key)
+       emitted (assoc-in prepared [:program :unit] (:unit classes))
+       identity {:version 4 :class-members (:members classes) :profile 'syntax-v1 :compiler-key key
+                 :runtime-image (:runtime-image input-selection)
+                 :entry (get-in prepared [:manifest :entry]) :snapshot snapshot
+                 :factory-abi 2 :exports (get-in prepared [:program :unit :exports])
+                 :program-module (Atom/to_string module) :phase-module (Atom/to_string phase-module)
+                 :phase-digest (crypto/hash :sha256 archive)
+                 :input-selection input-selection}
+       _ (BeamLisp.CompilerData/check_compiler_data! identity
+           {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+       metadata (fn [role]
+                  (list [:bl_contextual_unit_version 4] [:bl_compiler_key key] [:bl_source_hash input-key]
+                        [:bl_contextual_unit (erlang/term_to_binary (assoc identity :role role) (list :deterministic))]))
+       runtime (program-descriptor emitted module (metadata :runtime))
+       phase (anf/module phase-module
+               (list {:op :defn-clause :fname :__bl_phase_identity__ :params (list) :guard nil
+                      :body (anf/lit snapshot) :ann {}})
+               (list [:__bl_phase_identity__ 0])
+               (erlang/++ (metadata :phase) (list [:bl_contextual_phase_library archive])))
+       inputs (artifact-inputs prepared key)
+       unit {:version 1 :kind :prepared-artifact-unit :namespace (str (first (:entry identity)))
+             :compiler-key key :inputs inputs :host-spec nil
+             :world (:selection (:program prepared))
+             :plans (list {:generated-beams (:beams classes) :descriptors (list runtime phase)})
+             :coverage {:scope :contextual-artifact-membership :phase-library true
+                        :contextual-binding-resolution :proved :execution-entry-inventory-complete false}}]
+  (check-inputs! prepared) unit))
+
+(defn- decode-unit [verified]
+ (let [members (BeamLisp.AOT/contextual_unit_members! verified)]
+  (when-not (:phase members) (refuse! :world-artifact-membership nil))
+  {:version 1 :kind :contextual-artifact-unit :manifest (:manifest verified)
+   :metadata (:metadata members) :exports (get-in members [:metadata :exports])
+   :factory-abi (get-in members [:metadata :factory-abi]) :phase-library (expand/decode-phase-library (:phase-library-bytes members))
+   :runtime-beams (:runtime-beams members) :beams (:beams verified) :native-admission false}))
+
+(defn read-unit
+ "Verify complete AOT artifact membership and decode phase data without loading
+  code. Runtime packaging selects :runtime-beams; artifacts grant no admission."
+ [directory] (decode-unit (BeamLisp.AOT/verify_unit directory)))
+
+(defn execute
+ "Evaluate through the same canonical producer/admitted instance as captured
+  artifacts. Runtime compilation does not publish an application product."
+ [prepared argv]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (check-inputs! prepared)
+ (let [module (erlang/binary_to_atom (str "Elixir.BeamLisp.World.Eval" (erlang/unique_integer (list :positive))))
+       unit (prepare-unit prepared module)]
+  (BeamLisp.Loader/run_prepared_artifact_unit unit (BeamLisp.CompilerData/eager_to_list argv))))
+
+
+(defn- expected-selection! [verified selection]
+ (when-not (= selection (get-in verified [:metadata :input-selection]))
+  (refuse! :world-cached-selection nil)) verified)
+
+(defn- captured-cache-unit [captured module cached]
+ (let [key (BeamLisp.AOTCache/current_compiler_key)]
+  {:version 1 :kind :prepared-artifact-unit :namespace (str (first (get-in captured [:manifest :entry])))
+   :compiler-key key :inputs (artifact-inputs captured key)
+   :plans (list {:generated-beams (:beams cached) :descriptors (list)})
+   :coverage {:scope :contextual-artifact-membership :phase-library true
+              :execution-entry-inventory-complete false :restored-from-cache true}}))
+
+(defn- temporary-suffix []
+ (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower))))
+
+(defn- atomic-bytes! [path bytes]
+ (File/mkdir_p! (Path/dirname path))
+ (let [temporary (str path ".writing-" (temporary-suffix))
+       file (File/open! temporary (list :write :binary :exclusive))]
+  (try
+   (try (when-not (= :ok (IO/binwrite file bytes)) (refuse! :world-output-write path))
+    (finally (File/close file)))
+   (File/rename! temporary path)
+   (finally (File/rm temporary)))))
+
+(defn- unit-file-names [verified]
+ (cons "artifact-unit.term" (map #(str (Atom/to_string (elem % 0)) ".beam") (:beams verified))))
+
+(defn- publish-unit! [staged directory verified previous]
+ ;; The workspace's existing kernel claim serializes writers. Refuse foreign
+ ;; files; replace only this complete unit's known members, manifest last.
+ (when (File/exists? directory)
+  (when-not (and (= :directory (:type (File/lstat! directory)))
+                 (every? (set (concat (unit-file-names verified)
+                                      (when previous (unit-file-names previous)))) (File/ls! directory)))
+   (refuse! :world-output-membership directory)))
+ (doseq [beam (:beams verified)]
+  (atomic-bytes! (Path/join directory (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
+ (atomic-bytes! (Path/join directory "artifact-unit.term")
+                (File/read! (Path/join staged "artifact-unit.term")))
+ ;; Only a captured, byte-verified previous unit proves cleanup ownership.
+ ;; Loaded code is independent of these disk files and keeps its own Env lease.
+ (when previous
+  (doseq [name (remove (set (unit-file-names verified)) (unit-file-names previous))]
+   (File/rm! (Path/join directory name)))))
+
+(defn- runtime-current? [verified directory]
+ (every? (fn [beam]
+           (let [path (Path/join directory (str (Atom/to_string (elem beam 0)) ".beam"))]
+            (and (File/regular? path) (= (elem beam 1) (File/read! path)))))
+         (:runtime-beams verified)))
+
+(defn- obsolete-runtime-beams [previous verified]
+ (let [current (set (map first (:runtime-beams verified)))]
+  (filter #(not (contains? current (first %))) (:runtime-beams previous))))
+
+(defn- check-obsolete-runtime! [previous verified directory]
+ (doseq [beam (obsolete-runtime-beams previous verified)]
+  (let [path (Path/join directory (str (Atom/to_string (first beam)) ".beam"))
+        stat (File/lstat path)]
+   (when-not (= stat (tuple :error :enoent))
+    (when-not (and (= :ok (elem stat 0)) (= :regular (:type (elem stat 1)))
+                   (= (second beam) (File/read! path)))
+     (refuse! :world-runtime-membership path))))))
+
+(defn- build-result [path directory runtime verified built compiled cached]
+ (let [modules (mapv #(elem % 0) (:beams verified))
+       record (fn [beams]
+                {:hash (selection-key (get-in verified [:metadata :input-selection]))
+                 :key (get-in verified [:manifest :compiler-key])
+                 :modules (mapv #(elem % 0) beams)
+                 :digests (mapv (fn [beam] [(Atom/to_string (elem beam 0))
+                                           (Base/encode16 (digest (elem beam 1)) (list (tuple :case :lower)))]) beams)})]
+  {:built built :compiled compiled :cached cached :errors [] :lock-wait-us 0 :ex-built 0
+   :native {:built 0 :cached 0 :artifacts [] :errors []}
+   :profile 'syntax-v1 :out directory :runtime-out runtime
+   :manifest {path (record (:beams verified))}
+   :runtime-manifest {path (record (:runtime-beams verified))}
+   :native-admission false}))
+
+(defn- build-unclaimed [path out force?]
+ (let [captured (capture path)
+       logical-selection (selection-identity captured :Elixir.BeamLisp.World.Program)
+       module (selection-module logical-selection)
+       selection (assoc logical-selection :module (Atom/to_string module))
+       compiler-key (:compiler-key selection)
+       _ (when-not (= compiler-key (BeamLisp.AOTCache/compiler_key))
+           (refuse! :world-compiler-changed nil))
+       cache-key (selection-key selection)
+       directory (Path/join out "artifact-unit") runtime (Path/join out "ebin")
+       _ (when (and (File/exists? runtime) (not= :directory (:type (File/lstat! runtime))))
+           (refuse! :world-runtime-membership runtime))
+       previous (try (read-unit directory) (catch _ nil))
+       _ (when (and previous
+                    (File/exists? (Path/join runtime (str (get-in previous [:metadata :phase-module]) ".beam"))))
+           (refuse! :world-runtime-membership runtime))
+       local (when-not force? (when previous (try (expected-selection! previous selection) (catch _ nil))))
+       reusable (or local
+                    (when-not force?
+                     (when-let [cached (BeamLisp.AOTCache/prepare_fetch compiler-key cache-key)]
+                      (try
+                       (expected-selection!
+                        (decode-unit {:beams (:beams cached) :manifest {:compiler-key compiler-key}}) selection)
+                       (catch _ nil)))))]
+  (if (and local (runtime-current? local runtime))
+   (do (check-inputs! captured)
+       (when-not (= selection (selection-identity captured module))
+        (refuse! :world-pipeline-changed nil))
+       (build-result path directory runtime local 0 0 0))
+   (let [unit (if reusable (captured-cache-unit captured module reusable)
+                (prepare-unit (prepare-captured captured) module))
+         staged (Path/join out (str ".world-stage-" (temporary-suffix)))]
+    ;; Atomic creation precedes cleanup ownership. A name left by an earlier
+    ;; VM must never be adopted or removed just because our counter repeats.
+    (File/mkdir! staged)
+    (try
+     (BeamLisp.AOT/emit_unit unit staged)
+     (let [verified (expected-selection! (read-unit staged) selection)]
+      (check-inputs! captured)
+      (when-not (= selection (selection-identity captured module))
+       (refuse! :world-pipeline-changed nil))
+      (check-obsolete-runtime! previous verified runtime)
+      (BeamLisp.AOTCache/store compiler-key cache-key staged (to-list (map first (:beams verified))))
+      (publish-unit! staged directory verified previous)
+      (doseq [beam (:runtime-beams verified)]
+       (atomic-bytes! (Path/join runtime (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
+      (when previous
+       (check-obsolete-runtime! previous verified runtime)
+       (doseq [beam (obsolete-runtime-beams previous verified)]
+        (File/rm (Path/join runtime (str (Atom/to_string (first beam)) ".beam")))))
+      (build-result path directory runtime verified 1 (if reusable 0 1) (if reusable 1 0)))
+     (finally (File/rm_rf! staged)))))))
+
+(defn build!
+ "Build an explicit syntax-v1 manifest through existing workspace claims,
+  AOT artifact units and AOTCache. Unchanged selected units reuse data/bytes:
+  they do not rerun macros, publish modules or initialize target code."
+ [path out force?]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (BeamLisp.Env/ensure_sdk_runtime!)
+ (let [path (Path/expand path (BeamLisp/cwd)) out (Path/expand out (BeamLisp/cwd))
+       ours (claim/owned? out) acquired (if ours {:ok? true} (claim/acquire! out "contextual build"))]
+  (when-not (:ok? acquired) (refuse! :build-workspace-held (:held acquired)))
+  (try (build-unclaimed path out force?)
+   (finally (when-not ours (claim/release! out))))))
+
+
+(defn run-unit
+ "Run a complete paired or runtime-only contextual unit through the ordinary
+  native Loader. No Source capture, expansion or phase initialization occurs."
+ [directory argv]
+ (BeamLisp.Loader/run_artifact_unit (Path/expand directory (BeamLisp/cwd))
+                                  (BeamLisp.CompilerData/eager_to_list argv)))
+
+(defn package-runtime!
+ "Project a paired or runtime-only unit into an absent runtime directory using
+  the existing AOT manifest, emitter/verifier and workspace claim. Phase data
+  stays out; projection does not decode a phase library."
+ [directory output]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [captured (BeamLisp.AOT/verify_unit directory)
+       members (BeamLisp.AOT/contextual_unit_members! captured)
+       verified {:manifest (:manifest captured) :runtime-beams (:runtime-beams members)}
+       output (Path/expand output (BeamLisp/cwd))]
+  (when (File/exists? output) (refuse! :world-runtime-output-exists output))
+  (let [acquired (claim/acquire! output "contextual runtime package")]
+   (when-not (:ok? acquired) (refuse! :build-workspace-held (:held acquired)))
+   (try
+    (when-not (= (list ".claim") (File/ls! output))
+     (refuse! :world-runtime-output-exists output))
+    (let [staged (Path/join output (str ".runtime-stage-" (temporary-suffix)))
+          unit {:version 1 :kind :prepared-artifact-unit
+                :namespace (get-in verified [:manifest :namespace])
+                :compiler-key (get-in verified [:manifest :compiler-key]) :inputs {}
+                :plans (list {:generated-beams (:runtime-beams verified) :descriptors (list)})
+                :coverage {:scope :contextual-runtime-membership :phase-companion false
+                           :execution-entry-inventory-complete false}}]
+     (File/mkdir! staged)
+     (try
+      (BeamLisp.AOT/emit_unit unit staged)
+      (let [captured (BeamLisp.AOT/verify_unit staged)]
+       (doseq [beam (:beams captured)]
+        (atomic-bytes! (Path/join output (str (Atom/to_string (elem beam 0)) ".beam")) (elem beam 1)))
+       (atomic-bytes! (Path/join output "artifact-unit.term") (File/read! (Path/join staged "artifact-unit.term")))
+       {:version 1 :kind :contextual-runtime-package :output output :modules (mapv first (:beams captured))
+        :phase-companion false :native-admission false})
+      (finally (File/rm_rf! staged))))
+    (finally (claim/release! output))))))

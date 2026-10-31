@@ -1,0 +1,128 @@
+(ns contextual-class-membership-test
+ (:require [compile.world :as world] [anf :as a] [lower :as lower]))
+
+(defn- kind [action] (try (action) nil (catch error (or (:kind (ex-data error)) (:__struct__ error)))))
+(defn- attr [descriptor key] (second (first (filter #(= key (first %)) (:attrs descriptor)))))
+(defn- attribute [descriptor key value]
+ (update descriptor :attrs
+  #(cons [key value] (Enum/reject % (fn [pair] (= key (first pair)))))))
+(defn- identity [descriptor] (erlang/binary_to_term (attr descriptor :bl_contextual_unit) (list :safe)))
+(defn- fixture [module action]
+ (let [dir (Path/join (System/tmp_dir!) (str "class-members-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") "(ns membership) 42")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['membership 'current] :sources [{:namespace 'membership :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl")) unit (world/prepare-unit prepared module)
+         descriptors (:descriptors (first (:plans unit))) runtime (first descriptors)
+         stamp (fn [name type]
+                 (-> (BeamLisp.Record/declaration_descriptor "contextual.membership" name type (list "payload"))
+                     (attribute :bl_contextual_class_version 1)
+                     (attribute :bl_generated_class_version 1)
+                     (attribute :bl_aot_artifact_role :generated-class)
+                     (attribute :bl_declaration_owner (tuple "contextual.membership" name))
+                     (attribute :bl_compiler_key (attr runtime :bl_compiler_key))
+                     (attribute :bl_source_hash (attr runtime :bl_source_hash))))]
+    (action {:directory dir :unit unit :descriptors descriptors
+             :classes [(stamp "Packet" :record) (stamp "Opaque" :deftype)]}))
+   (finally (File/rm_rf! dir)))))
+(defn- bundle [fixture classes]
+ (let [beams (Enum/sort_by (Enum/map classes #(lower/descriptor->beam % {})) #(Atom/to_string (elem % 0)))
+       rows (Enum/map beams (fn [beam]
+              (let [descriptor (first (filter #(= (:name %) (elem beam 0)) classes))]
+               {:module (Atom/to_string (elem beam 0)) :sha256 (crypto/hash :sha256 (elem beam 1))
+                :class-metadata (BeamLisp.Record/declaration_metadata descriptor)})))
+       descriptors (Enum/map (:descriptors fixture)
+                     #(attribute % :bl_contextual_unit
+                        (erlang/term_to_binary (assoc (identity %) :class-members rows) (list :deterministic))))
+       prepared (assoc (:unit fixture) :plans (list {:generated-beams beams :descriptors descriptors}))]
+  {:prepared prepared :manifest {:compiler-key (:compiler-key prepared)}
+   :beams (Enum/concat (Enum/map descriptors #(lower/descriptor->beam % {})) beams)}))
+(defn- members [bundle] (BeamLisp.AOT/contextual_unit_members! bundle))
+
+(deftest exact-record-and-deftype-members-are-passive-and-included-in-runtime-closure
+ (fixture :Elixir.ClassMembershipPositive
+  (fn [f]
+   (let [captured (bundle f (:classes f)) checked (members captured)]
+    (is (= 4 (get-in checked [:metadata :version])))
+    (is (= 2 (count (:classes checked))))
+    (is (= 3 (count (:runtime-beams checked))))
+    (is (= false (:native-admission checked)))
+    (is (= :record (BeamLisp.Record/declaration_kind (first (:classes f)) "contextual.membership" "Packet")))
+    (doseq [descriptor (:classes f)]
+     (is (not (erlang/module_loaded (:name descriptor)))))
+    (when-let [out (System/get_env "BL_COMPILER_COMPONENT_OUT")]
+     (File/write! (Path/join out "preboot-classes.term") (erlang/term_to_binary captured)))))))
+
+(deftest missing-duplicate-and-mislabeled-class-bytes-refuse-before-loading
+ (fixture :Elixir.ClassMembershipMissing
+  (fn [f]
+   (let [captured (bundle f (:classes f)) class-beam (last (:beams captured))]
+    (is (= :world-artifact-membership (kind #(members (update captured :beams (fn [beams] (Enum/drop beams -1)))))))
+    (is (= :world-artifact-membership (kind #(members (update captured :beams (fn [beams] (Enum/concat beams (list class-beam))))))))
+    (is (= :world-artifact-membership
+           (kind #(members (assoc captured :beams (cons (tuple :Elixir.ForgedClassName (elem class-beam 1))
+                                                  (Enum/drop (:beams captured) -1)))))))
+    (is (not (erlang/module_loaded (elem class-beam 0))))))))
+
+(deftest class-owner-compiler-source-stamps-and-exports-are-part-of-the-membership-check
+ (fixture :Elixir.ClassMembershipStamps
+  (fn [f]
+   (let [record (first (:classes f)) other (second (:classes f))
+         extra (-> record
+                   (update :clauses #(Enum/concat % (list {:op :defn-clause :fname :__bl_init__ :params (list) :guard nil
+                                                  :body (a/lit :forbidden) :ann {}})))
+                   (update :exports #(Enum/concat % (list [:__bl_init__ 0]))))]
+    (doseq [changed [(attribute record :bl_declaration_owner (tuple "foreign" "Packet"))
+                     (attribute record :bl_compiler_key (String/duplicate "0" 64))
+                     (attribute record :bl_source_hash (String/duplicate "0" 64))
+                     (attribute record :bl_contextual_class_version 1.0)
+                     (attribute record :bl_generated_class (tuple 1 "contextual.membership" "Packet" :deftype (list "payload")))
+                     extra]]
+     (is (= :world-artifact-membership (kind #(members (bundle f [changed other]))))))))))
+
+(deftest a-class-cannot-be-spliced-between-different-factory-input-identities
+ (fixture :Elixir.ClassMembershipFirst
+  (fn [first]
+   (fixture :Elixir.ClassMembershipSecond
+    (fn [second]
+     ;; Hashes/declared schemas are recomputed by bundle. Only the class's own
+     ;; Source/input stamp still belongs to the first producer identity.
+     (is (= :world-artifact-membership (kind #(members (bundle second (:classes first)))))))))))
+
+(deftest runtime-packaging-retains-every-exact-class-and-drops-only-phase-code
+ (fixture :Elixir.ClassMembershipPackage
+  (fn [f]
+   (let [captured (bundle f (:classes f)) directory (Path/join (:directory f) "unit")
+         output (Path/join (:directory f) "runtime")]
+    (BeamLisp.AOT/emit_unit (:prepared captured) directory)
+    (let [before (world/read-unit directory) result (world/package-runtime! directory output)
+          packaged (BeamLisp.AOT/capture_runtime_unit output) checked (members packaged)]
+     (is (= 3 (count (:runtime-beams before))))
+     (is (= 3 (count (:beams packaged))))
+     (is (= nil (:phase checked)))
+     (is (= (set (map first (:runtime-beams before))) (set (map first (:runtime-beams checked)))))
+     (is (= false (:native-admission result) (:native-admission checked))))))))
+
+(deftest class-cache-keys-require-exact-protocol-and-compiler-stamps
+ (fixture :Elixir.ClassMembershipCache
+  (fn [f]
+   (doseq [descriptor (:classes f)]
+    (let [module (:name descriptor) key (attr descriptor :bl_compiler_key) source (attr descriptor :bl_source_hash)
+          bytes (fn [descriptor] (second (lower/descriptor->beam descriptor {})))
+          cached? (fn [descriptor] (BeamLisp.AOTCache/cached_bytes_match? module (bytes descriptor) key source))]
+     (is (= true (cached? descriptor)))
+     (is (= false (cached? (attribute descriptor :bl_source_hash (String/duplicate "0" 64)))))
+     (is (= false (cached? (attribute descriptor :bl_contextual_class_version 1.0))))
+     (is (= false (cached? (-> descriptor (attribute :bl_compiler_key nil) (attribute :bl_unit_namespace "core"))))))))))
+
+(deftest physical-class-targets-do-not-rewrite-logical-declaration-identities
+ (fixture :Elixir.ClassMembershipPhysical
+  (fn [f]
+   (let [descriptor (assoc (second (:classes f)) :name :Elixir.SelectedPhysicalClassTarget)
+         checked (members (bundle f [descriptor])) row (first (get-in checked [:metadata :class-members]))]
+    (is (= "Elixir.SelectedPhysicalClassTarget" (:module row)))
+    (is (= (tuple 1 "contextual.membership" "Opaque" :deftype (list "payload"))
+           (:class-metadata row)))
+    (is (= false (:native-admission checked)))))))

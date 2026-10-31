@@ -65,31 +65,91 @@
                              (map lock-entry deps)))]
     {:ok? (empty? missing) :checked (count deps) :missing missing}))
 
+(defn- entry-custody [dir]
+  ;; Metadata lives outside the published immutable package. Installer and
+  ;; sweeper derive exactly the same per-entry admission resource.
+  (Path/join (Path/join (Path/join (Path/dirname dir) ".bl") "store-custody") (Path/basename dir)))
+
+(defn- checked-entry! [dir]
+  (let [info (File/lstat dir)]
+    (when (and (= :ok (elem info 0)) (= :symlink (:type (elem info 1))))
+      (throw (ex-info "Store entry cannot redirect publication" {:kind :store-entry-scope :path dir}))))
+  dir)
+
+(defn- complete-entry? [dir sha]
+  (let [read (File/read (sha-file dir))]
+    (and (File/dir? dir) (= :ok (elem read 0)) (= sha (String/trim (elem read 1))))))
+
 (defn install-dir!
-  "Install a DIRECTORY of files as the library `(name, vsn, sha)`:\n\n   copy to a temp dir beside the destination, record the digest, then RENAME.\n\n   The rename is the whole point: a library becomes visible under its content\n   address only when it is complete, so a build that dies mid-install leaves a\n   temp dir to sweep, never a half-library that looks locked."
+  "Publish one complete content-addressed package under per-entry kernel custody.
+   A valid existing entry is immutable. A unique sibling temporary is invisible
+   until copy and digest recording finish; concurrent sweep uses the same claim."
   [name vsn sha from]
-  (let [dir (dir-for name vsn sha)
-        tmp (str dir ".tmp-" (c/owner-pid))]
-    (File/rm_rf! tmp)
-    (File/mkdir_p! (Path/dirname dir))
-    (File/mkdir_p! tmp)
-    (File/cp_r! from tmp)
-    (File/write! (sha-file tmp) sha)
-    (File/rm_rf! dir)
-    (File/rename tmp dir)
-    dir))
+  (let [root (root) basename (str name "-" vsn "-" (subs sha 0 8))]
+    (when (or (not= basename (Path/basename basename)) (= :absolute (Path/type basename)))
+      (throw (ex-info "Store entry must be one directory name" {:kind :store-entry-scope})))
+    (let [dir (checked-entry! (Path/join root basename))]
+      (if (complete-entry? dir sha) dir
+        (c/with-writer! (entry-custody dir) "store install"
+          (fn []
+            (checked-entry! dir)
+            (if (complete-entry? dir sha) dir
+              (let [tmp (str dir ".tmp-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
+                (try
+                  (File/mkdir_p! tmp)
+                  (File/cp_r! from tmp)
+                  (File/write! (sha-file tmp) sha)
+                  (File/rm_rf! dir)
+                  (File/rename! tmp dir)
+                  dir
+                  (finally (File/rm_rf! tmp)))))))))))
+
+(defn- temporary-entry [path]
+  (let [parts (String/split (Path/basename path) ".tmp-")]
+    (when (and (> (count parts) 1) (not= "" (first parts))
+               (Regex/match? (Regex/compile! "^[0-9]+(-[0-9]+)?$") (last parts)))
+      (Path/join (Path/dirname path) (Enum/join (Enum/drop (to-list parts) -1) ".tmp-")))))
+
+(defn- published-entry? [path]
+  ;; A published version can itself contain .tmp-<digits>. Its content address,
+  ;; not that substring, identifies a complete immutable entry. Ambiguous legacy
+  ;; temporaries with an identical address/marker are conservatively retained.
+  (let [read (File/read (sha-file path))]
+    (and (= :ok (elem read 0)) (File/dir? path)
+         (let [sha (String/trim (elem read 1))]
+           (and (Regex/match? (Regex/compile! "^[0-9a-fA-F]{64}$") sha)
+                (String/ends_with? (Path/basename path) (str "-" (subs sha 0 8))))))))
+
+(defn- sweep-candidate! [path entry]
+  (let [candidate (entry-custody path) installer (entry-custody entry)]
+    ;; One spelling can be either a legacy temporary or a published address.
+    ;; Own both possible writers before checking its marker or removing bytes.
+    ;; Never sweep this process's own in-progress operation.
+    (if (or (c/owned? candidate) (c/owned? installer)) false
+      (try
+        (c/with-writer! candidate "store sweep candidate"
+          (fn []
+            (c/with-writer! installer "store sweep installer"
+              (fn []
+                (if (or (published-entry? path) (= (tuple :error :enoent) (File/lstat path)))
+                  false
+                  (do (File/rm_rf! path) true))))))
+        (catch error
+          (if (= :build-workspace-held (:kind (ex-data error))) false (throw error)))))))
 
 (defn sweep-temp!
-  "Remove leftover `.tmp-*` directories in the store. A killed install leaves one;
-   nothing else ever does, so this needs no bookkeeping to be safe."
+  "Sweep inactive legacy temporary installs under both candidate and installer
+   custody. Complete content-addressed publication is never inferred as scratch
+   from its name; marker validation happens after acquiring the actual scopes."
   []
-  (let [r (root)]
-    (if (File/dir? r)
-      (let [tmps (filter (fn [p] (some? (index-of (Path/basename p) ".tmp-")))
-                         (Path/wildcard (Path/join r "*")))]
-        (doseq [t tmps] (File/rm_rf! t))
-        (count tmps))
-      0)))
+  (let [directory (root)]
+    (if-not (File/dir? directory) 0
+      (reduce
+        (fn [removed path]
+          (if-let [entry (temporary-entry path)]
+            (if (sweep-candidate! path entry) (inc removed) removed)
+            removed))
+        0 (Path/wildcard (Path/join directory "*"))))))
 
 (defn entries
   "What the store actually holds, sorted: `[{:name :vsn :sha8 :dir} …]` read from
@@ -103,7 +163,7 @@
                             (let [base (Path/basename p)
                                   parts (String/split base "-")
                                   n (count parts)]
-                              (when (and (File/dir? p) (>= n 3))
+                              (when (and (File/dir? p) (or (not (temporary-entry p)) (published-entry? p)) (>= n 3))
                                 {:name (join "-" (take (- n 2) parts))
                                  :vsn (nth parts (- n 2))
                                  :sha8 (nth parts (dec n))

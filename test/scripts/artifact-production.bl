@@ -1,0 +1,126 @@
+;; Real producer/consumer used by scripts/demo-artifact-production. Source
+;; selection and compilation stay in AOT; this driver only exercises the API.
+(ns artifact.production.demo)
+
+(defn- invoke [namespace name arguments]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace name) arguments))
+
+(defn- producer []
+ (let [source-root (System/get_env "BL_ARTIFACT_SOURCES")
+       output (System/get_env "BL_ARTIFACT_OUTPUT")
+       manifest {:version 1 :roots (list source-root)
+                 :sources (list
+                   {:namespace 'artifact.demo.values :file (str source-root "/artifact/demo/values.bl")}
+                   {:namespace 'artifact.demo.consumer :file (str source-root "/artifact/demo/consumer.bl")})}
+       workspace (BeamLisp.AOT/open_workspace manifest {})]
+  (try
+   (BeamLisp/eval "(ns artifact.demo.consumer) (defn answer [] 7)")
+   (let [namespace "artifact.demo.consumer" module (BeamLisp.Emit/module_for namespace)
+         binding (BeamLisp.Env/lookup (tuple namespace "answer"))
+         generation (BeamLisp.Env/namespace_generations (list namespace))
+         identity (erlang/apply module :module_info (list :md5))
+         provider (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.values)
+         consumer (BeamLisp.AOT/prepare_unit workspace 'artifact.demo.consumer)
+         _ (BeamLisp.AOT/emit_unit provider (str output "/values"))
+         artifact (BeamLisp.AOT/emit_unit consumer (str output "/consumer"))
+         repeated (BeamLisp.AOT/emit_unit consumer (str output "/repeat"))]
+    (assert (= binding (BeamLisp.Env/lookup (tuple namespace "answer"))))
+    (assert (= generation (BeamLisp.Env/namespace_generations (list namespace))))
+    (assert (= identity (erlang/apply module :module_info (list :md5))))
+    (assert (= 7 (invoke namespace "answer" (list))))
+    (assert (nil? (Process/get :artifact-demo-initialized)))
+    (assert (= artifact repeated))
+    (println "PRODUCER: running answer=7; imported macro + computed value staged; publication unchanged")
+    (println "EMISSION: complete artifacts written twice with identical digests; initializer deferred")
+    (File/write! (str output "/producer.json")
+      (Jason/encode! {:running-answer 7 :publication-unchanged true :deterministic-emission true
+                     :candidate-modules (count (:modules artifact))
+                     :input-namespaces (Enum/map (:inputs artifact) (fn [input] (:namespace input)))})))
+   (finally (BeamLisp.AOT/close_workspace! workspace)))))
+
+(defn- consumer []
+ (let [output (System/get_env "BL_ARTIFACT_OUTPUT")
+       directories (list (str output "/values") (str output "/consumer"))
+       verified (Enum/map directories (fn [directory] (BeamLisp.AOT/verify_unit directory)))]
+  (assert (nil? (BeamLisp.Loader/source_path "artifact.demo.consumer")))
+  (let [directory (str output "/consumer")
+        name (:module (first (get-in (second verified) [:manifest :modules])))
+        file (str directory "/" name ".beam") bytes (File/read! file)]
+   (try
+    (File/write! file (str bytes "changed"))
+    (assert (= :artifact-bytes-changed
+              (try (BeamLisp.AOT/verify_unit directory) nil
+                   (catch error (:kind (ex-data error))))))
+    (assert (= false (erlang/module_loaded (BeamLisp.Emit/module_for "artifact.demo.consumer"))))
+    (println "TAMPER CHECK: altered bytes refused before target code was loaded")
+    (finally (File/write! file bytes))))
+  ;; Validate every unit before the first publication. The fresh consumer owns
+  ;; this ordinary Source activation; these bytes receive no SDK authority.
+  (doseq [directory directories] (Code/prepend_path directory))
+  (doseq [unit verified]
+   (BeamLisp.Env/publish_binaries! (:beams unit) "artifact-production-demo"))
+  (doseq [namespace ["artifact.demo.values" "artifact.demo.consumer"]]
+   (let [module (BeamLisp.Emit/module_for namespace)]
+    (BeamLisp.AOT/init_loaded_module namespace module)
+    (BeamLisp.Env/mark_emitted namespace module)))
+  (let [namespace "artifact.demo.consumer"
+        answer (invoke namespace "answer" (list))
+        value (invoke namespace "value" (list))
+        closure (invoke namespace "adder" (list 10))
+        closed-answer (BeamLisp.Ns.Rt/invoke closure (list 32))
+        initialized (BeamLisp.Loader.Server/run (fn [] (Process/get :artifact-demo-initialized)))]
+   (assert (= 42 answer))
+   (assert (= 3 value))
+   (assert (= 42 closed-answer))
+   (assert (= 1 initialized))
+   (BeamLisp.AOT/init_loaded_module namespace (BeamLisp.Emit/module_for namespace))
+   (assert (= 1 (BeamLisp.Loader.Server/run (fn [] (Process/get :artifact-demo-initialized)))))
+   (let [row (second (BeamLisp.Env/lookup (tuple :emitted_definition namespace "answer")))]
+    (assert (= :bound (get-in row [:execution :status]))))
+   (println "FRESH VM: answer=42; runtime value=3; captured closure=42; initializer ran exactly once")
+   (println "EVIDENCE: published function descriptor binds actual loaded artifact bytes")
+   (File/write! (str output "/consumer.json")
+     (Jason/encode! {:answer answer :runtime-value value :closure-answer closed-answer
+                    :initializer-count initialized :descriptor-bound true :fixture-source-present false
+                    :tampered-bytes-refused true})))))
+
+(defn- bootstrap-probe []
+ (let [namespace "rt" module (BeamLisp.Emit/module_for namespace)
+       before (erlang/apply module :module_info (list :md5))
+       generations (BeamLisp.Env/namespace_generations (list namespace))
+       file (Path/join (BeamLisp.Tiers/priv_root) "boot/rt.bl")
+       workspace (BeamLisp.AOT/open_workspace
+                   {:version 2 :phase-imports (list 'core 'sugar)
+                    :sources (list {:namespace 'rt :file file})} {})
+       started (erlang/monotonic_time :millisecond)]
+  (try
+   (let [prepared (BeamLisp.AOT/prepare_unit workspace 'rt)
+         manifest (BeamLisp.AOT/emit_unit prepared (str (System/get_env "BL_ARTIFACT_OUTPUT") "/rt"))
+         elapsed (- (erlang/monotonic_time :millisecond) started)]
+    (assert (= before (erlang/apply module :module_info (list :md5))))
+    (assert (= generations (BeamLisp.Env/namespace_generations (list namespace))))
+    (assert (= :kernel-phase-world (get-in prepared [:phase-world :kind])))
+    (println (str "BOOTSTRAP PROBE: preceding-phase macros prepare/emit actual rt.bl in " elapsed
+                  "ms; protected running runtime unchanged"))
+    (File/write! (str (System/get_env "BL_ARTIFACT_OUTPUT") "/bootstrap.json")
+      (Jason/encode! {:namespace namespace :running-runtime-unchanged true
+                     :artifact-modules (count (:modules manifest)) :milliseconds elapsed
+                     :phase-world (Base/encode16 (get-in prepared [:phase-world :id]))
+                     :source-world (Base/encode16 (get-in prepared [:world :id]))
+                     :full-self-reproduction false})))
+   (finally
+    (try
+     (assert (= before (erlang/apply module :module_info (list :md5))))
+     (assert (= generations (BeamLisp.Env/namespace_generations (list namespace))))
+     (File/write! (str (System/get_env "BL_ARTIFACT_OUTPUT") "/bootstrap-state.json")
+       (Jason/encode! {:running-runtime-unchanged true}))
+     (finally (BeamLisp.AOT/close_workspace! workspace)))))))
+
+(try
+ (case (System/get_env "BL_ARTIFACT_PHASE")
+  "producer" (producer)
+  "consumer" (consumer)
+  "bootstrap" (bootstrap-probe))
+ (catch error
+  (println "DEMO REFUSAL:" (pr-str (ex-data error)))
+  (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))

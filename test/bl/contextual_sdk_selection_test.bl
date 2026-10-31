@@ -1,0 +1,243 @@
+(ns contextual-sdk-selection-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [compiler :as compiler]
+           [reload.execution :as execution] [reload.generation :as generation]))
+
+(defn- fixture-path [path]
+ (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) path))
+
+(defn- refused? [action]
+ (try (action) false (catch _ true)))
+
+(defn- forge-sdk-claim [unit]
+ ;; Re-emit coherent runtime/phase metadata with an incorrect binding claim.
+ ;; The artifact's ordinary byte membership is valid; SDK admission must still
+ ;; compare the claim to original image evidence before invoking the factory.
+ (update unit :plans
+  #(BeamLisp.CompilerData/eager_map (fn [plan]
+    (update plan :descriptors
+     (fn [descriptors]
+      (BeamLisp.CompilerData/eager_map (fn [descriptor]
+       (let [attrs (:attrs descriptor)
+             attribute (first (filter (fn [attribute] (= :bl_contextual_unit (first attribute))) attrs))
+             metadata (assoc-in (erlang/binary_to_term (second attribute) (list :safe))
+                        [:input-selection :sdk-inputs 0 :bindings 0 :provider-sha256] "forged")
+             source-hash (Base/encode16
+                           (crypto/hash :sha256 (erlang/term_to_binary (:input-selection metadata) (list :deterministic)))
+                           (list (tuple :case :lower)))]
+        (assoc descriptor :attrs
+         (BeamLisp.CompilerData/eager_map (fn [attribute]
+          (case (first attribute)
+           :bl_contextual_unit [:bl_contextual_unit (erlang/term_to_binary metadata (list :deterministic))]
+           :bl_source_hash [:bl_source_hash source-hash]
+           attribute)) attrs)))) descriptors)))) %)))
+
+(deftest sdk-projection-is-passive-exact-and-public
+ (let [before (BeamLisp.Env/lookup (tuple "clojure.string" "upper-case"))
+       binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")
+       clause (first (:clauses binding))]
+  (is (= before (BeamLisp.Env/lookup (tuple "clojure.string" "upper-case"))))
+  (is (= :function (:kind binding)))
+  (is (string? (:module clause)))
+  (is (string? (:function clause)))
+  (is (= 1 (:arity clause)))
+  (is (= :fixed (:kind clause)))
+  (is (= #{1 2} (set (map :arity (:clauses (BeamLisp.AOT/sdk_function_binding! "clojure.string" "join"))))))
+  (is (= (BeamLisp.AOT/runtime_image_key) (:runtime-image binding)))
+  (is (= binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "clojure.string" "ch->str")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "clojure.string" "no-such-binding")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "missing.provider" "answer")))))
+
+(deftest selected-sdk-forwarding-source-has-one-canonical-binding-identity
+ (let [selection {:sdk 'clojure.string :revision 'selected :only ['upper-case]}
+       captured (sdk/capture selection)
+       provider (:source captured)
+       client {:namespace 'sdk.client :revision 'current :file "sdk-client.bl"
+               :source "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")"}
+       program (expand/program [provider client] ['sdk.client 'current])]
+  (is (= captured (sdk/check! captured)))
+  (is (= 'clojure.string (:namespace provider)))
+  (is (String/starts_with? (:file provider) "sdk-forwarding:"))
+  (is (= 2 (count (get-in program [:selection :worlds]))))
+  (is (seq (:references program)))
+  (is (refused? #(sdk/check! (assoc-in captured [:bindings 0 :provider-sha256] "forged"))))
+  (is (refused? #(sdk/capture (assoc selection :only ['ch->str]))))
+  (is (refused? #(sdk/capture (assoc selection :only ['upper-case 'upper-case]))))))
+
+(deftest physical-target-syntax-does-not-use-ambient-aliases
+ (is (= true (compiler/contextual-native-name? "Elixir.BeamLisp.Ns.Body.Clojure.String/upper-case")))
+ (is (= true (compiler/contextual-native-name? "erlang/+")))
+ (is (= false (compiler/contextual-native-name? "String/upcase")))
+ (is (= false (compiler/contextual-native-name? "alias/upper-case")))
+ (is (refused? #(expand/program
+                 [{:namespace 'sdk.client :revision 'current :file "unselected-sdk.bl"
+                   :source "(ns sdk.client) (upper-case \"hello\")"}]
+                 ['sdk.client 'current]))))
+
+(deftest world-file-sdk-selection-executes-through-original-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-world-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")")
+   (File/write! (Path/join dir "world.bl")
+    "'{:version 1 :profile syntax-v1 :entry [sdk.client current] :sources [{:namespace sdk.client :revision current :file \"main.bl\"}] :libraries [{:sdk clojure.string :revision selected :only [upper-case]}]}")
+   (let [captured (world/capture (Path/join dir "world.bl"))
+         prepared (world/prepare-captured captured)]
+    (is (= 1 (count (:sdk-inputs captured))))
+    (is (= 2 (count (:sources captured))))
+    (is (= :proved (get-in prepared [:phase :status])))
+    (let [unit (world/prepare-unit prepared :Elixir.ContextualSDKClaimFixture)
+          verified (BeamLisp.AOT/compile_unit unit)
+          forged (BeamLisp.AOT/compile_unit (forge-sdk-claim unit))]
+     (is (some? (:runtime (BeamLisp.AOT/contextual_unit_members! forged))))
+     (is (= ["clojure.string"] (BeamLisp.AOT/contextual_sdk_namespaces! verified)))
+     (is (refused? #(BeamLisp.AOT/contextual_sdk_namespaces! forged)))
+     ;; Direct activation shares the Loader's original SDK-selection guard.
+     ;; Even coherent artifact membership cannot publish a false SDK claim.
+     (is (refused? #(let [g (execution/prepare-captured-unit! forged)]
+                     (generation/retire! g))))
+     (is (not (erlang/module_loaded :Elixir.ContextualSDKClaimFixture)))
+     (is (refused? #(BeamLisp.Loader/run_prepared_artifact_unit (forge-sdk-claim unit) (list)))))
+    (is (= "HELLO" (world/execute prepared [])))
+    (let [pair (world/artifact prepared :Elixir.ContextualSDKPassiveFixture)]
+     (is (= false (erlang/module_loaded (first pair)))))
+    (is (refused? #(world/check-inputs! (assoc-in prepared [:sdk-inputs 0 :bindings] [])))))
+   ;; A public SDK selection grants neither private SDK entries nor host effects.
+   (let [binding (BeamLisp.AOT/sdk_function_binding! "clojure.string" "upper-case")
+         module (:module (first (:clauses binding)))]
+    (File/write! (Path/join dir "main.bl")
+     (str "(ns sdk.client) (" module "/ch->str 65)"))
+    (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) []))))
+   (File/write! (Path/join dir "main.bl")
+    "(ns sdk.client) (Elixir.Process/put :contextual-sdk-host-effect true)")
+   (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) [])))
+   (is (= :undefined (erlang/get :contextual-sdk-host-effect)))
+   ;; Archive-only imports retain the executable identity pin independently
+   ;; of the manifest SDK adapter. A mismatched pin must refuse at runtime.
+   (let [captured (sdk/capture {:sdk 'clojure.string :revision 'selected :only ['upper-case]})
+         provider (:source captured)
+         expected (pr-str (list 'quote (erlang/binary_to_list
+                                        (:md5 (first (:clauses (first (:bindings captured))))))))
+         changed (String/replace (:source provider) expected "(quote (0))")]
+    (File/write! (Path/join dir "main.bl")
+     "(ns sdk.client) (import-world 'clojure.string 'selected :only [upper-case]) (upper-case \"hello\")")
+    (File/write! (Path/join dir "world.bl")
+     "'{:version 1 :profile syntax-v1 :entry [sdk.client current] :sources [{:namespace sdk.client :revision current :file \"main.bl\"}] :libraries [\"selected.phase\"]}")
+    (File/write! (Path/join dir "selected.phase")
+     (expand/encode-phase-library (expand/phase-library [provider])))
+    (is (= "HELLO" (world/execute (world/prepare (Path/join dir "world.bl")) [])))
+    (is (not= changed (:source provider)))
+    (File/write! (Path/join dir "selected.phase")
+     (expand/encode-phase-library (expand/phase-library [(assoc provider :source changed)])))
+    (is (refused? #(world/execute (world/prepare (Path/join dir "world.bl")) []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest selected-sdk-showcase-retains-first-class-calls-and-fixed-overloads
+ (let [prepared (world/prepare (fixture-path "test/fixtures/contextual-sdk/world.bl"))]
+  (is (= :proved (get-in prepared [:phase :status])))
+  (is (= ["HELLO BEAM" "a:b"] (world/execute prepared [])))))
+
+
+(deftest sdk-variadic-clauses-preserve-fixed-dispatch-and-rest-list-abi
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-rest-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "world.bl")
+    "'{:version 1 :profile syntax-v1 :entry [sets current] :sources [{:namespace sets :revision current :file \"main.bl\"}] :libraries [{:sdk clojure.set :revision selected :only [union]}]}")
+   (File/write! (Path/join dir "main.bl")
+    "(ns sets) (import-world 'clojure.set 'selected :only [union]) (let [combine union] [(combine) (combine #{1}) (combine #{1} #{2}) (combine #{1} #{2} #{3} #{4})])")
+   (let [binding (BeamLisp.AOT/sdk_function_binding! "clojure.set" "union")
+         clause (first (filter #(= :variadic (:kind %)) (:clauses binding)))
+         prepared (world/prepare (Path/join dir "world.bl"))]
+    (is (= 2 (:minimum-arity clause)))
+    (is (= 3 (:arity clause)))
+    (is (= [#{} #{1} #{1 2} #{1 2 3 4}] (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest bootstrap-primitives-project-without-source-or-var-authority
+ (let [atom-binding (BeamLisp.AOT/sdk_function_binding! "core" "atom")
+       arithmetic (BeamLisp.AOT/sdk_function_binding! "core" "+")]
+  (is (= "core" (:namespace atom-binding)))
+  (is (= "Elixir.BeamLisp.Refs" (:module (first (:clauses atom-binding)))))
+  (is (= nil (:source atom-binding)))
+  (is (= nil (:source-digest atom-binding)))
+  (is (= 32 (erlang/byte_size (:declaration-sha256 atom-binding))))
+  (is (= [2] (mapv :arity (:clauses arithmetic))))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "eval")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "not-a-primitive")))))
+
+(deftest contextual-cleanup-uses-managed-primitive-reference-effects
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-primitive-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "world.bl")
+    "'{:version 1 :profile syntax-v1 :entry [cleanup current] :sources [{:namespace cleanup :revision current :file \"main.bl\"}] :libraries [{:sdk core :revision selected :only [atom deref reset! + count conj]}]}")
+   (File/write! (Path/join dir "main.bl")
+    "(ns cleanup) (import-world 'core 'selected :only [atom deref reset! + count conj]) (let [cell (atom 0)] [(try (+ 40 2) (finally (reset! cell 100))) (deref cell) (try (try (erlang/throw 40) (finally (reset! cell 200))) (catch error error)) (deref cell) (count [1 2]) (conj [1] 2 3 4)])")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))]
+    (is (= :proved (get-in prepared [:phase :status])))
+    (is (= [42 100 40 200 2 [1 2 3 4]] (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+
+(deftest existing-cleanup-macro-example-runs-with-managed-state
+ (is (= [42 100 40 200]
+        (world/execute (world/prepare (fixture-path "test/fixtures/contextual-cleanup/world.bl")) []))))
+
+
+(deftest primitive-selection-ignores-ambient-core-var-shadows
+ (let [expected (BeamLisp.AOT/sdk_function_binding! "core" "atom")
+       scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/intern "core" "atom" :ambient-shadow)
+     (is (= (tuple :ok :ambient-shadow) (BeamLisp.Env/lookup (tuple "core" "atom"))))
+     (is (= expected (BeamLisp.AOT/sdk_function_binding! "core" "atom")))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest bootstrap-source-functions-use-original-stable-bodies
+ (let [before (BeamLisp.Env/lookup (tuple "core" "identity"))
+       binding (BeamLisp.AOT/sdk_function_binding! "core" "identity")
+       clause (first (:clauses binding))]
+  (is (= before (BeamLisp.Env/lookup (tuple "core" "identity"))))
+  (is (= :function (:kind binding)))
+  (is (= nil (:source binding)))
+  (is (= nil (:source-digest binding)))
+  (is (= "Elixir.BeamLisp.Ns.Body.Core" (:module clause)))
+  (is (= 1 (:arity clause)))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "eval")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "when")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "qualified-parts")))
+  (is (refused? #(BeamLisp.AOT/sdk_function_binding! "core" "no-such-binding"))))
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-core-functions-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns core.client) (import-world 'core 'selected :only [identity inc dec]) (let [f identity] [(f 42) (inc 41) (dec 43)])")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['core.client 'current] :sources [{:namespace 'core.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['identity 'inc 'dec]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))]
+    (is (= :proved (get-in prepared [:phase :status])))
+    (is (= [42 42 42] (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest kernel-imports-project-the-value-abi-before-direct-link-optimizations
+ (let [map-binding (BeamLisp.AOT/sdk_function_binding! "core" "map")
+       assoc-binding (BeamLisp.AOT/sdk_function_binding! "core" "assoc")
+       rem-binding (BeamLisp.AOT/sdk_function_binding! "core" "rem")]
+  (is (= #{[:fixed 1] [:fixed 2] [:variadic 2]}
+         (set (map (fn [clause] [(:kind clause) (:minimum-arity clause)]) (:clauses map-binding)))))
+  (is (= #{[:fixed 3] [:variadic 3]}
+         (set (map (fn [clause] [(:kind clause) (:minimum-arity clause)]) (:clauses assoc-binding)))))
+  (is (= "Elixir.BeamLisp.Ns.Body.Rt" (:module (first (:clauses rem-binding))))))
+ (let [dir (Path/join (System/tmp_dir!) (str "bl-sdk-value-abi-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns value.abi.client) (import-world 'core 'selected :only [map vec assoc rem]) [(vec (map (fn [x] (erlang/+ x 1)) [1 2])) (assoc {:a 1} :b 2 :c 3) (rem 7 3)]")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['value.abi.client 'current] :sources [{:namespace 'value.abi.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['map 'vec 'assoc 'rem]}]}")
+   (is (= [[2 3] {:a 1 :b 2 :c 3} 1] (world/execute (world/prepare (Path/join dir "world.bl")) [])))
+   (finally (File/rm_rf! dir)))))

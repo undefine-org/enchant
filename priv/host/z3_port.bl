@@ -62,7 +62,7 @@
           default)))))
 
 (defn read_timeout
-  "How long a single read from z3 may take, in ms.
+  "How long one complete solver conversation may take, in ms.
 
    `BL_Z3_READ_TIMEOUT` moves it; a missing, non-numeric or non-positive value
    falls back to the default rather than disarming the read."
@@ -79,8 +79,73 @@
 
 (defn close
   [port]
-  (when (alive? port) (Port/close port))
+  (when (alive? port) (assert_port_owner! port) (Port/close port))
   :ok)
+
+(defn- assert_port_owner! [port]
+ (let [owner (erlang/port_info port :connected)]
+  (when (= :undefined owner) (erlang/error :badarg))
+  (when-not (= (erlang/self) (elem owner 1)) (erlang/error :z3_port_owner_required)))
+ :ok)
+
+(defn- retire_port! [port]
+ ;; A failed exchange cannot be reused. Never close a foreign owner's port.
+ (when (erlang/is_port port)
+  (try
+   (when (= (tuple :connected (erlang/self)) (erlang/port_info port :connected))
+    (Port/close port))
+   (catch _ nil))
+  (loop []
+   (receive
+    [seen [:data _]] :when (= seen port) (recur)
+    [:EXIT seen _] :when (= seen port) (recur)
+    (after 0 :ok))))
+ :ok)
+
+(defn- with_conversation! [port action]
+ ;; This scope changes no Env, origin or execution grant. The real connected
+ ;; PID is checked before any effect. Nested phases share one absolute budget.
+ (assert_port_owner! port)
+ (let [previous (Process/get :bl_z3_conversation)
+       shared (and (erlang/is_map previous) (= port (Map/get previous :port)))
+       frame (if shared previous
+               {:port port :deadline (+ (erlang/monotonic_time :millisecond) (read_timeout))
+                :monitor (erlang/monitor :port port)})]
+  (Process/put :bl_z3_conversation frame)
+  (try (action)
+   (catch error
+    (retire_port! port)
+    (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+   (finally
+    (if (nil? previous) (Process/delete :bl_z3_conversation)
+     (Process/put :bl_z3_conversation previous))
+    (when-not shared (Process/demonitor (:monitor frame) (list :flush)))))))
+
+(defn- conversation_deadline [port]
+ (let [frame (Process/get :bl_z3_conversation)]
+  (if (and (erlang/is_map frame) (= port (Map/get frame :port))) (:deadline frame)
+   (+ (erlang/monotonic_time :millisecond) (read_timeout)))))
+
+(defn- conversation_monitor [port]
+ (let [frame (Process/get :bl_z3_conversation)]
+  (when (and (erlang/is_map frame) (= port (Map/get frame :port))) (:monitor frame))))
+
+(defn- read_remaining [deadline]
+ (max 0 (- deadline (erlang/monotonic_time :millisecond))))
+
+(defn- reply_capacity! [port bytes]
+ ;; Keep malformed/unterminated replies finite even before the time budget.
+ (when (> (erlang/byte_size bytes) 16777216)
+  (retire_port! port) (erlang/error :z3_reply_capacity))
+ :ok)
+
+(defn- port_write! [port bytes]
+ (assert_port_owner! port)
+ (when (zero? (read_remaining (conversation_deadline port)))
+  (erlang/error (RuntimeError/exception "z3 timeout before command")))
+ ;; A busy driver must not suspend this process beyond its conversation budget.
+ (when-not (Port/command port bytes (list :nosuspend)) (erlang/error :z3_port_busy))
+ :ok)
 
 (defn open_port
   "Start a z3 process. Called ONLY by the owner (`BeamLisp.Z3.Solver`), which
@@ -162,10 +227,11 @@
    One extra round trip, on the undecided path only. The reply is the RAW z3
    string here; naming it is the language's job (`oracle/verdict`)."
   [port status rest]
+   (with_conversation! port (fn []
   (if (erlang/== status "unknown")
-    (do (Port/command port "(get-info :reason-unknown)\n")
+    (do (port_write! port "(get-info :reason-unknown)\n")
         (extract_reason (read_sexp port rest)))
-    nil))
+    nil))))
 
 (defn- extract_reason
   "`(:reason-unknown \"timeout\")` → \"timeout\"; `(:reason-unknown \"\")` → nil;
@@ -185,32 +251,38 @@
   "The protocol itself. Runs in the OWNER process only."
   ([port smt] (raw_check port smt false))
   ([port smt model?]
+   (with_conversation! port (fn []
    ;; A caller-supplied (check-sat) would make z3 answer TWICE and desync the
    ;; reader by one answer for every later query on this port — a silent,
    ;; alternating sat/unsat that looks like a solver bug. Strip it: this
    ;; function owns the check.
    (let [smt (Regex/replace (Regex/compile! "^\\s*\\(check-sat\\)\\s*$" "m") smt "")
-         _ (Port/command port (str "(reset)\n" smt "(check-sat)\n"))
+         _ (port_write! port (str "(reset)\n" smt "(check-sat)\n"))
          ans (read_answer port "")]
      (if (erlang/== "sat" (erlang/element 1 ans))
        (if model?
-         (do (Port/command port "(get-model)\n")
+         (do (port_write! port "(get-model)\n")
              {:status "sat" :model (read_sexp port (erlang/element 2 ans))})
          {:status "sat" :model nil})
        {:status (erlang/element 1 ans)
         :model nil
-        :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))}))))
+        :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))}))))))
 
 (defn raw_command
   "Send SMT-LIB and wait for z3 to ACKNOWLEDGE it. Anything z3 prints before the
    marker is returned as `:output`; an `(error …)` line comes back as
    `%{ok: false}` rather than desynchronizing the reader."
   [port smt]
-  (Port/command port (str smt "\n(echo \"~~bl-ok~~\")\n"))
-  (let [r (read_until_marker port "" "")]
+   (with_conversation! port (fn []
+  ;; The command owns its delimiter. A literal echo in supplied SMT cannot
+  ;; acknowledge this later frame. Consume the full frame before reporting any
+  ;; error, whether the transport coalesces or splits the error/marker lines.
+  (let [marker (str "~~bl-ok-" (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower))) "~~")
+        _ (port_write! port (str smt "\n(echo \"" marker "\")\n"))
+        r (read_command_frame port marker "")]
     (if (erlang/== :marker (erlang/element 1 r))
       {:ok true :output (erlang/element 2 r)}
-      {:ok false :error (erlang/element 2 r) :output (erlang/element 3 r)})))
+      {:ok false :error (erlang/element 2 r) :output (erlang/element 3 r)})))))
 
 (defn raw_check_here3
   "The same check, positional — beam-lisp callers pass `(assume core? model?)`
@@ -225,29 +297,30 @@
    named and the script must set `:produce-unsat-cores`), `:model?` (return the
    model on sat)."
   [port opts]
+   (with_conversation! port (fn []
   (let [assume (or (:assume opts) (list))
         check (if (erlang/== assume (list))
                 "(check-sat)\n"
                 (str "(check-sat-assuming (" (Enum/join assume " ") "))\n"))
-        _ (Port/command port check)
+        _ (port_write! port check)
         ans (read_answer port "")]
     (cond
       (erlang/== "unsat" (erlang/element 1 ans))
       (if (:core? opts)
-        (do (Port/command port "(get-unsat-core)\n")
+        (do (port_write! port "(get-unsat-core)\n")
             {:status "unsat" :core (read_sexp port (erlang/element 2 ans))})
         {:status "unsat" :core nil})
 
       (erlang/== "sat" (erlang/element 1 ans))
       (if (:model? opts)
-        (do (Port/command port "(get-model)\n")
+        (do (port_write! port "(get-model)\n")
             {:status "sat" :core nil :model (read_sexp port (erlang/element 2 ans))})
         {:status "sat" :core nil})
 
       :else
       {:status (erlang/element 1 ans)
        :core nil
-       :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))})))
+       :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))})))))
 
 (defn raw_scoped
   "One SCOPED question: push, assert the script, check-sat, [get-model], pop —
@@ -259,81 +332,109 @@
    `pop` prints nothing, so the reply stream stays exactly one status (+ model)."
   ([port smt] (raw_scoped port smt false))
   ([port smt model?]
-   (Port/command port (str "(push 1)\n" smt "\n(check-sat)\n"))
+   (with_conversation! port (fn []
+   (port_write! port (str "(push 1)\n" smt "\n(check-sat)\n"))
    (let [ans (read_answer port "")]
      (cond
        (erlang/== "unsat" (erlang/element 1 ans))
-       (do (Port/command port "(pop 1)\n")
+       (do (port_write! port "(pop 1)\n")
            {:status "unsat" :core nil :model nil})
 
        (erlang/== "sat" (erlang/element 1 ans))
        (let [model (if model?
-                     (do (Port/command port "(get-model)\n")
+                     (do (port_write! port "(get-model)\n")
                          (read_sexp port (erlang/element 2 ans)))
                      nil)]
-         (Port/command port "(pop 1)\n")
+         (port_write! port "(pop 1)\n")
          {:status "sat" :core nil :model model})
 
        :else
        (let [why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))]
-         (Port/command port "(pop 1)\n")
-         {:status (erlang/element 1 ans) :core nil :model nil :why why})))))
+         (port_write! port "(pop 1)\n")
+         {:status (erlang/element 1 ans) :core nil :model nil :why why})))))))
 
 (defn- read_until_marker
   [port acc out]
-  (let [lines (String/split acc "\n")]
-    (cond
-      (Enum/member? lines "~~bl-ok~~")
-      (tuple :marker out)
+  ;; Retain the pinned helper ABI; all command parsing has one implementation.
+  (read_command_frame port "~~bl-ok~~" acc))
 
-      (Enum/any? lines (fn [l] (String/starts_with? l "(error")))
-      (tuple :error (Enum/find lines (fn [l] (String/starts_with? l "(error"))) out)
+(defn- read_command_frame [port marker acc]
+ (read_command_frame_until port marker acc (conversation_deadline port)))
 
-      :else
-      (receive
-        [p [:data data]] :when (== p port)
-        (let [acc2 (str acc data)
-              keep (Enum/join
-                     (Enum/reject (String/split acc2 "\n")
-                                  (fn [l] (or (erlang/== l "") (erlang/== l "~~bl-ok~~"))))
-                     "\n")]
-          (read_until_marker port acc2 keep))
-        (after (read_timeout)
-          (tuple :error "timeout waiting for z3 to acknowledge" out))))))
+(defn- command_frame_failure [port message output]
+ (retire_port! port)
+ (tuple :error message output))
+
+(defn- read_command_frame_until [port marker acc deadline]
+ (reply_capacity! port acc)
+ (let [pieces (String/split acc "\n") lines (Enum/drop pieces -1)
+       end (Enum/find_index lines (fn [line] (= marker line)))
+       complete (if (nil? end) lines (Enum/take lines end))
+       output (Enum/join (Enum/reject complete (fn [line] (= "" line))) "\n")
+       error (Enum/find complete (fn [line] (String/starts_with? (String/trim_leading line) "(error")))
+       remaining (read_remaining deadline) monitor (conversation_monitor port)]
+  (cond
+   (zero? remaining) (command_frame_failure port "timeout waiting for z3 to acknowledge" output)
+   (some? end) (if error (tuple :error error output) (tuple :marker output))
+   :else
+   (receive
+    [p [:data data]] :when (and (== p port) (string? data))
+     (read_command_frame_until port marker (str acc data) deadline)
+    [:DOWN seen :port p _] :when (and (= seen monitor) (= p port))
+     (command_frame_failure port "z3 exited before acknowledgement" output)
+    (after remaining
+     (command_frame_failure port "timeout waiting for z3 to acknowledge" output))))))
 
 (defn- read_answer
-  "Read until a status LINE appears, returning `{status, rest}`.
+ "One complete status line. Nested status/model/reason phases share the
+  conversation's original deadline; chunks cannot renew it."
+ [port acc]
+ (read_answer_until port acc (conversation_deadline port)))
 
-   DEVIATION FROM THE ELIXIR SOURCE, recorded here: `receive {^port, {:data, …}}`
-   pins the port in the message pattern; a beam-lisp pattern cannot pin a bound
-   value, so the clause matches the SHAPE and names the port with a `:when`
-   guard — `(== p port)`, where `port` is this function's own parameter and so is
-   visible to the guard. The BEAM therefore still takes only THIS port's data
-   and leaves every other message (a `$gen_call`, an `{:EXIT, …}`) queued, which
-   is exactly what the pinned pattern did."
-  [port acc]
+(defn- answer_timeout! [port acc]
+ (retire_port! port)
+ (erlang/error (RuntimeError/exception (str "z3 timeout (acc: " (Kernel/inspect acc) ")"))))
+
+(defn- read_answer_until [port acc deadline]
+ (reply_capacity! port acc)
+ (let [remaining (read_remaining deadline) monitor (conversation_monitor port)]
+  (when (zero? remaining) (answer_timeout! port acc))
   (receive
-    [p [:data data]] :when (== p port)
+    [p [:data data]] :when (and (== p port) (string? data))
     (let [acc2 (str acc data)
-          lines (String/split acc2 "\n")
+          _ (reply_capacity! port acc2)
+          pieces (String/split acc2 "\n") lines (Enum/drop pieces -1)
           idx (Enum/find_index lines
                 (fn [l] (Enum/member? (list "sat" "unsat" "unknown" "error") l)))]
       (if (nil? idx)
-        (read_answer port acc2)
-        (tuple (Enum/at lines idx)
-               (Enum/join (Enum/drop lines (erlang/+ idx 1)) "\n"))))
-    (after (read_timeout)
-      (erlang/error (Elixir.RuntimeError/exception
-                      (str "z3 timeout (acc: " (Kernel/inspect acc) ")"))))))
+        (read_answer_until port acc2 deadline)
+        (do
+         (when (zero? (read_remaining deadline)) (answer_timeout! port acc2))
+         ;; Consume the actual status even after an error. Preserve any model
+         ;; prefix already delivered in this chunk for the next read phase.
+         (tuple (if (Enum/any? (Enum/take lines idx)
+                     (fn [line] (String/starts_with? (String/trim_leading line) "(error")))
+                 "error" (Enum/at lines idx))
+               (Enum/join (Enum/drop pieces (erlang/+ idx 1)) "\n")))))
+    [:DOWN seen :port p _] :when (and (= seen monitor) (= p port))
+     (do (retire_port! port) (erlang/error (RuntimeError/exception "z3 exited before reply")))
+    (after remaining (answer_timeout! port acc)))))
 
-(defn- read_sexp
-  [port acc]
+(defn- read_sexp [port acc]
+ (read_sexp_until port acc (conversation_deadline port)))
+
+(defn- read_sexp_until [port acc deadline]
+ (reply_capacity! port acc)
+ (let [remaining (read_remaining deadline) monitor (conversation_monitor port)]
+  (when (zero? remaining) (answer_timeout! port acc))
   (if (and (erlang/> (String/length acc) 3) (balanced? acc))
     acc
     (receive
-      [p [:data data]] :when (== p port)
-      (read_sexp port (str acc data))
-      (after (read_timeout) acc))))
+      [p [:data data]] :when (and (== p port) (string? data))
+       (read_sexp_until port (str acc data) deadline)
+      [:DOWN seen :port p _] :when (and (= seen monitor) (= p port))
+       (do (retire_port! port) (erlang/error (RuntimeError/exception "z3 exited before complete value")))
+      (after remaining (answer_timeout! port acc))))))
 
 (defn- balanced?
   [s]

@@ -1,0 +1,47 @@
+(ns native-execution-graph-race-test
+ (:require [reload.generation :as generation] [anf :as a] [lower :as lower]))
+
+(defn- waiting-in-native-retention? [pid attempts]
+ (let [info (Process/info pid :current_stacktrace) stack (when info (elem info 1))
+       names (set (map (fn [frame] [(elem frame 0) (elem frame 1)]) stack))]
+  (cond
+   (and (contains? names [:Elixir.BeamLisp.Env :retain_generation_code!])
+        (contains? names [:Elixir.BeamLisp.Env :with_local_lock])) true
+   (<= attempts 0) false
+   :else (do (Process/sleep 5) (waiting-in-native-retention? pid (dec attempts))))))
+
+(deftest publication-between-open-check-and-row-insert-cannot-admit-stale-code
+ (let [namespace "graph.pin.race"
+       graph (generation/prepare!
+               {:application-id "graph-pin-admission-race"
+                :sources {namespace "(ns graph.pin.race) (defn answer [] 42)"}})
+       module (BeamLisp.Emit/module_for (get (:mapping graph) namespace))
+       pair (lower/descriptor->beam
+              (a/module module
+               (list {:op :defn-clause :fname :replacement :params (list) :guard nil :body (a/lit 99) :ann {}})
+               (list [:replacement 0]) (list)) {})
+       parent (erlang/self) context (BeamLisp.Env/capture) worker (atom nil) entered (atom false)]
+  (try
+   (BeamLisp.Env/with_module_locks (list :Elixir.BeamLisp.Env)
+    (fn []
+     (reset! worker
+      (erlang/spawn
+       (fn []
+        (BeamLisp.Env/bind context)
+        (let [result (try
+                       (generation/with! graph (fn [] (reset! entered true)))
+                       :unexpected-admission
+                      (catch error (:original error)))]
+         (erlang/send parent (tuple :graph-admission-race (erlang/self) result))))))
+     ;; The worker has observed open admission and is parked before inserting
+     ;; its graph row. Publication can close admission without this SDK fence.
+     (is (waiting-in-native-retention? @worker 1000))
+     (is (= :ok (BeamLisp.Env/publish_binaries! (list pair) "graph-pin-race.bl")))))
+   (let [expected-worker @worker]
+    (is (= :execution_graph_closed
+         (receive [:graph-admission-race pid result] :when (= pid expected-worker) result
+           (after 10000 :missing-result)))))
+   (is (= false @entered))
+   (finally
+    (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))
+    (generation/retire! graph)))))

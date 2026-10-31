@@ -27,6 +27,7 @@
 (ns js.build
   (:require [js.emit :as e]
             [reader-node :as rn]
+            [compiler :as compiler]
             [system.ir :as ir]
             [system.js :as native] [js.evidence :as evidence]
             [bl.json :as json]
@@ -37,7 +38,6 @@
 (defn- rn-tag [n] (rn/node-tag (rn/node-form n)))
 (defn- rn-items [n] (rn/node-items n))
 (defn- rn-name [n] (rn/node-name (rn/node-form n)))
-(defn- unwrap [n] (rn/node-form n))
 (defn- sym? [n s] (and (= :symbol (rn-tag n)) (or (nil? s) (= s (rn-name n)))))
 (defn- kw-node? [n s] (and (= :keyword (rn-tag n)) (= s (rn-name n))))
 
@@ -51,29 +51,14 @@
     (first (for [r roots rel rels :let [p (str r "/" rel)] :when (File/regular? p)] p))))
 
 (defn- ns-head
-  "{:ns name :requires [[ns alias]…]} from a file's `(ns …)` form."
-  [forms]
-  (let [h (first forms)]
-    (if (and (= :list (rn-tag h)) (sym? (first (rn-items h)) "ns"))
-      (let [items (rn-items h)
-            name (rn-name (second items))
-            clauses (filter (fn [c] (= :list (rn-tag c))) (rest (rest items)))
-            reqs (mapcat (fn [c]
-                           (let [its (rn-items c)]
-                             (if (kw-node? (first its) "require")
-                               (map (fn [spec]
-                                      (let [s (rn-items spec)
-                                            target (rn-name (first s))
-                                            as-i (index-where s (fn [x] (kw-node? x "as")))]
-                                        [target (if (nil? as-i) target (rn-name (nth s (inc as-i))))]))
-                                    (filter (fn [s] (= :vector (rn-tag s))) (rest its)))
-                               [])))
-                         clauses)]
-        {:ns name :requires (vec reqs)})
-      (throw (ex-info "js.build: a namespace file must start with (ns …)" {:form h})))))
-
-(defn- index-where [xs pred]
-  (loop [i 0 s (seq xs)] (cond (empty? s) nil (pred (first s)) i :else (recur (inc i) (rest s)))))
+ "Project the compiler/AOT namespace header into the JS dependency table."
+ [forms]
+ (let [header (BeamLisp.AOT/namespace_header (first forms))]
+  (when-not (= 1 (count header))
+   (throw (ex-info "js.build: a namespace file must start with (ns …)" {:form (first forms)})))
+  (let [name (first (Map/keys header)) requests (:require_specs (get header name))]
+   {:ns name :requires (mapv (fn [request]
+                             [(elem request 0) (or (elem request 1) (elem request 0))]) requests)})))
 
 ; ─── top-level forms → definitions ──────────────────────────────────────────
 
@@ -83,13 +68,10 @@
 (defn- comment-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "comment")))
 (defn- declare-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "declare")))
 
-(defn- strip-doc+attrs
-  "The clause part of `(defn name doc? attrs? clauses…)`."
-  [items]
-  (let [b0 (rest (rest items))
-        b1 (if (and (> (count b0) 1) (erlang/is_binary (unwrap (first b0)))) (rest b0) b0)
-        b2 (if (and (> (count b1) 1) (= :map (rn-tag (first b1)))) (rest b1) b1)]
-    b2))
+(defn- declaration-source [form]
+  ;; JavaScript staging consumes the same inert declaration interpretation as
+  ;; publication and contextual catalogs. No metadata or initializer runs here.
+  (compiler/declaration-source form (BeamLisp.Compiler/new_env "js-declaration")))
 
 (defn- wrap-pos [form like]
   (let [m (rn/node-pos like)]
@@ -109,9 +91,15 @@
   "A definition's function value with its original name/span and clauses.
    Docstrings and attribute maps are declaration data, not runtime arguments."
   [form]
-  (let [items (rn-items form)]
-    (wrap-pos (rn/list-node (cons (rn/sym-node "fn")
-                              (cons (second items) (strip-doc+attrs items)))) form)))
+  (wrap-pos (:value-form (declaration-source form)) form))
+
+(defn- helper-value-form
+  "A private staged defn keeps namespace dispatch for calls across its arities.
+   A named fn's local self denotes one clause shape on BEAM; using that self
+   for a defn helper would bypass the complete fixed/variadic dispatcher."
+  [form]
+  (let [value (:value-form (declaration-source form))]
+    (wrap-pos (rn/list-node (cons (rn/sym-node "fn") (rest (rest (rn-items value))))) form)))
 
 (defn definition-values
   "Definitions a file contributes, in order: {:name :private? :form :kind}.
@@ -121,17 +109,12 @@
   (last-wins
     (keep (fn [f]
             (cond
-              (defn-like? f)
-                (let [its (rn-items f)
-                      nm (rn-name (second its))]
-                  {:name nm :kind :fn :private? (or (sym? (first its) "defn-") (= true (:private (rn/node-pos (second its)))))
-                   :form (defn-value-form f)})
-              (def-like? f)
-                (let [its (rn-items f)
-                      nm (rn-name (second its))
-                      body (rest (rest its))
-                      init (if (and (> (count body) 1) (erlang/is_binary (unwrap (first body)))) (second body) (first body))]
-                  {:name nm :kind :val :private? (= true (:private (rn/node-pos (second its)))) :form init})
+              (or (defn-like? f) (def-like? f))
+                (let [declaration (declaration-source f)]
+                  {:name (rn-name (:name declaration)) :kind (if (= "def" (:kind declaration)) :val :fn)
+                   :private? (= :private (:visibility declaration))
+                   :form (if (= "def" (:kind declaration)) (:value-form declaration)
+                             (wrap-pos (:value-form declaration) f))})
               (or (defmacro? f) (comment-form? f) (declare-form? f)) nil
               (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "ns")) nil
               :else {:name nil :kind :expr :form f}))
@@ -231,9 +214,21 @@
         ; no other top-level form (def, side-effect expr) is ever run.
         mforms (filter defmacro? body)
         needed (macro-helper-forms body mforms)
+        ; Helpers are private build-time values, not namespace publications.
+        ; Mask inherited links before compiling forward helper references, but
+        ; keep existing Core values usable by the compiler during staging.
+        _ (doseq [f needed]
+            (let [name (rn-name (second (rn-items f)))
+                  value (when (BeamLisp.Env/bound? ns name) (BeamLisp.Env/fetch_exact! ns name))]
+              (BeamLisp.Env/intern ns name value)))
         _ (doseq [[f text] (if has-head? (rest texts) texts)
                   :when (or (defmacro? f) (some (fn [n] (identical? n f)) needed))]
-            (try (BeamLisp.Compiler/eval_string text (BeamLisp.Compiler/new_env ns) path)
+            (try
+              (if (defmacro? f)
+                (BeamLisp.Compiler/eval_string text (BeamLisp.Compiler/new_env ns) path)
+                (BeamLisp.Env/intern ns (rn-name (second (rn-items f)))
+                  (BeamLisp.Compiler/eval_form (helper-value-form f)
+                    (assoc (BeamLisp.Compiler/new_env ns) :file path :target :beam))))
                  (catch ex
                    (throw (ex-info (str path ": staging " (rn-name (second (rn-items f))) ": " (ex-message ex))
                                    {:path path :ns ns :form f})))))
@@ -359,6 +354,9 @@
          "export const LINKS = [\n"
          (join ",\n" (map (fn [[nm info]] (str "  [" (e/js-str nm) ", " (triple info) "]")) rows))
          "\n];\n"
+         "export const RETURN_CONSTRUCTOR_SHAPES = "
+         (e/lit-js (BeamLisp.Server/return_constructor_shapes)
+          {:runtime "R" :keyword (fn [k] (str "R.kw(" (e/js-str (e/atom-text k)) ")"))}) ";\n"
          "export const REST_FNS = [\n"
          (join ",\n" (map (fn [[m f a]] (str "  [" (e/js-str m) ", " (e/js-str f) ", " a "]")) (sort-by str (rest-fns core))))
          "\n];\n")))
@@ -498,8 +496,8 @@
                              (concat (:lines r) (list (str "export const d_" (e/mangle (:name d)) " = " (:val r) ";")))
                            :else (concat (:lines r) (if (nil? (:val r)) (list) (list (str (:val r) ";")))))))
                      (:defs cns))
-        ; `function` declarations hoist; consts do not. A def that refers to a
-        ; LATER def must not run before it: emit fn defs as hoisted functions.
+        ; Function values retain the common actor ABI. Their const bindings
+        ; initialize in module order, so the dependency graph must be acyclic.
         kws (e/kw-decls)
         ; exactly the built namespaces this one REFERENCES — by :require or by
         ; MODULE name (`BeamLisp.Ns.Rt/x`: core calls rt without requiring
@@ -562,7 +560,13 @@
               (recur (rest todo) (conj seen ns) order compiled)   ; not ours: core or BEAM-only
               (let [head (ns-head (read-forms path))
                     deps (vec (filter (fn [d] (and (not (contains? seen d)) (not (contains? stubs d)) (some? (ns-path roots d))))
-                                      (map first (:requires head))))]
+                                      ; core's seed boundary imports rt even
+                                      ; though its source has no :require. This
+                                      ; edge must participate in load order too:
+                                      ; otherwise rt imports core statically and
+                                      ; seeded.mjs reads rt's uninitialized const.
+                                      (concat (when (= ns "core") ["rt"])
+                                              (map first (:requires head)))))]
                 (if (empty? (filter (fn [d] (not (contains? (set order) d))) deps))
                   (let [c (compile-ns path)]
                     (recur (rest todo) (conj seen ns) (conj order ns) (assoc compiled ns c)))

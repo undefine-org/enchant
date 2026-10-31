@@ -1,0 +1,87 @@
+(ns contextual-profile-recovery-test
+ (:require [compile.world :as world] [reload.execution :as execution] [reload.generation :as generation]))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch e (or (BeamLisp.ExInfo/ex_original e) (:kind (ex-data e))))))
+(defn- fixture [module action]
+ (let [dir (Path/join (System/tmp_dir!) (str "profile-recovery-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") "(ns profile.unit) 42")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['profile.unit 'current] :sources [{:namespace 'profile.unit :revision 'current :file \"main.bl\"}] :libraries []}")
+   (action (BeamLisp.AOT/compile_unit (world/prepare-unit (world/prepare (Path/join dir "world.bl")) module)))
+   (finally (File/rm_rf! dir)))))
+(defn- at-profile-boundary [captured action]
+ (let [worker (atom nil) graph (atom nil) context (BeamLisp.Env/capture) caller (erlang/self)
+       target (tuple :Elixir.BeamLisp.Env :register_source_profile! 1)]
+  (BeamLisp.Env/ensure_sdk_runtime!)
+  (try
+   (reset! worker (erlang/spawn (fn []
+                     (BeamLisp.Env/bind context)
+                     (BeamLisp.Env/ensure_sdk_runtime!)
+                     (BeamLisp.Loader/ensure_loaded "reload.execution")
+                     (erlang/send caller :profile-worker-ready)
+                     (receive :begin nil)
+                     (execution/prepare-captured-unit! captured))))
+   (receive :profile-worker-ready nil (after 10000 (throw :profile-worker-not-ready)))
+   (BeamLisp.Env/with_module_locks (list :erlang)
+    (fn []
+     ;; The explicit erlang grant fence is needed by profile publication, not passive
+     ;; unit publication. Trace proves SDK G exists before this blocked entry.
+     (erlang/trace_pattern target true (list :local))
+     (erlang/trace @worker true (list :call (tuple :tracer (erlang/self))))
+     (erlang/send @worker :begin)
+     (let [pid @worker
+           g (receive [:trace seen :call [_ _ arguments]] :when (= seen pid) (first arguments)
+                       (after 10000
+                        (do (println :PROFILE-BLOCKED (Process/info pid :current_stacktrace))
+                            (throw :profile-entry-missing))))
+           monitor (erlang/monitor :process pid)]
+      (reset! graph g)
+      (erlang/exit pid :kill)
+      (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 5000 (throw :owner-not-dead)))
+      (erlang/demonitor monitor (list :flush))
+      (action g))))
+   (finally
+    (erlang/trace_pattern target false (list :local))
+    (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))
+    ;; Real generation retirement, never fixture row deletion or mutable flags.
+    (when @graph (generation/retire! @graph))))))
+
+(deftest interrupted-profile-preparation-retires-through-original-native-proof
+ (fixture :Elixir.ProfileUnpublishedRetirement
+  (fn [captured]
+   (at-profile-boundary captured
+    (fn [g]
+     (is (erlang/== g (generation/attested-prepared! g)))
+     (is (nil? (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope g)))))
+     ;; Native retirement must close the unpublished generation without
+     ;; manufacturing an executable profile or skipping physical deletion.
+     (is (= :retired (:status (generation/retire! g))))
+     (is (nil? (execution/prepared-generation (:cache-key g))))
+     (is (= :native-retired (:status (generation/native-retirement-outcome g))))
+     (is (not (erlang/module_loaded :Elixir.ProfileUnpublishedRetirement))))))))
+
+(deftest a-retirement-barrier-never-reopens-for-a-late-profile-publisher
+ (fixture :Elixir.ProfileLatePublisher
+  (fn [captured]
+   (at-profile-boundary captured
+    (fn [g]
+     ;; Exercise logical close separately from physical collection. The genuine
+     ;; original preparation and code still exist when publication is retried.
+     (BeamLisp.Env/with_module_locks (to-list (:modules g))
+      #(BeamLisp.Env/close_generation_graph_for_retirement! g (to-list (:modules g))))
+     (is (= :execution_graph_closed (reason #(BeamLisp.Env/register_source_profile! g))))
+     (is (= :retired (:status (generation/retire! g))))
+     (is (nil? (execution/prepared-generation (:cache-key g)))))))))
+
+(deftest destroyed-scope-refuses-profile-publication-before-any-native-admission
+ (fixture :Elixir.ProfileDestroyedScope
+  (fn [captured]
+   (let [g (execution/prepare-captured-unit! captured)]
+    (try
+     (BeamLisp.Env/destroy (:scope g))
+     (is (= :source_profile_preparation_closed (reason #(BeamLisp.Env/register_source_profile! g))))
+     (is (= :retired (:status (generation/retire! g))))
+     (finally (generation/retire! g)))))))

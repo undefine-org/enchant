@@ -34,6 +34,14 @@ or declared application functions. Unresolved calls are build errors. Static
 and eval-time remotes use the same compiled-module/leaf rule. A variadic clause
 receives its rest arguments as one BL list.
 
+The `--with system.ir,system.js,js.pattern` bundle includes the shared ANF
+inspection and dependency-description APIs. CompilerData's binding-reference,
+plain-clause and catch-scope views operate on JS values. Native contextual-unit
+validation and deterministic ETF serialization raise named BEAM-only errors;
+they require the native raw-term validator and binary representation. JS does
+not manufacture native compilation or execution evidence. Unknown host names
+and unsupported arities remain build errors.
+
 First-class seeded values remain raw. Direct-call adapters are cached by the
 captured value, not by namespace/name; rebinding changes future captures while
 existing captures retain their identity. General callable and sequence rules

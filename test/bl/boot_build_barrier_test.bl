@@ -13,7 +13,7 @@
 ; toolchain source requiring an ordinary source is a structural error, rejected
 ; before any scheduling. The tier law adds the require-direction rule: a
 ; `std`/`lib`/`compat` source may require the source graph/planner/interface KERNEL,
-; never the DRIVER.
+; never the DRIVER, except the two explicit shared-custody consumers below.
 ;
 ; Run: bl test test/bl/boot_build_barrier_test.bl
 
@@ -88,43 +88,58 @@
 
 ; ── the tier law ─────────────────────────────────────────────────────────────
 
-(deftest the-tier-law-std-lib-compat-may-require-the-graph-kernel-never-the-driver
-  ; The law of tiers.ex, enforced over SOURCE with the kernel itself: every
-  ; `.bl` under the program tiers is read by `source-graph/header` (the one
-  ; parser), and no `:require` may name a driver namespace. `source-graph` is
-  ; the kernel — std dev tooling (codebase, reload) requires it by design
-  ; (PLAN-125).
+(deftest the-tier-law-keeps-only-the-two-audited-runtime-custody-edges
+  ;; Contextual compiler publication and native refresh use the same actual
+  ;; claim owner as the build driver. Keep these exact pre-existing edges;
+  ;; ordinary code cannot acquire a general dependency on other drivers.
   (let [drivers (remove (fn [ns] (has? (BeamLisp.Tiers/build_kernel_namespaces) ns))
                         (BeamLisp.Tiers/build_namespaces))
-        offenders (for [tier ["std" "lib" "compat"]
-                        path (Path/wildcard (Path/join (BeamLisp.Tiers/priv_root)
-                                                       (str tier "/**/*.bl")))
-                        [ns requires] [(sg/header (File/read! path))]
-                        bad (vec (sort (filter (fn [r] (has? drivers r)) requires)))
+        headers (for [tier ["std" "lib" "compat"]
+                      path (Path/wildcard (Path/join (BeamLisp.Tiers/priv_root)
+                                                     (str tier "/**/*.bl")))
+                      [ns requires] [(sg/header (File/read! path))]]
+                  [path ns requires])
+        custody #{"compile.world" "vm.native"}
+        observed (set (for [[_ ns requires] headers :when (has? requires "claim")] ns))
+        offenders (for [[path ns requires] headers
+                        bad [(vec (sort (filter (fn [r]
+                                      (and (has? drivers r)
+                                           (not (and (= "claim" r) (contains? custody ns))))) requires)))]
                         :when (not (empty? bad))]
                     [path ns bad])]
+    (is (= custody observed))
+    (is (= [] (vec offenders)))))
+
+(deftest actual-driver-requires-stay-inside-the-toolchain
+  (let [allowed (set (concat (BeamLisp.Tiers/build_namespaces) (BeamLisp.Tiers/boot_namespaces)))
+        offenders (for [path (Path/wildcard (Path/join (BeamLisp.Tiers/build_dir) "*.bl"))
+                        [ns requires] [(sg/header (File/read! path))]
+                        dependency requires :when (not (contains? allowed dependency))]
+                    [ns dependency])]
     (is (= [] (vec offenders)))))
 
 (deftest each-tiers-sources-are-recognised-relative-or-absolute
-  (is (BeamLisp.Tiers/boot_source? "priv/boot/core.bl"))
-  (is (BeamLisp.Tiers/boot_source? (Path/join (BeamLisp.Tiers/boot_dir) "core.bl")))
-  (is (not (BeamLisp.Tiers/boot_source? "priv/build/build.bl")))
-
-  (is (BeamLisp.Tiers/build_source? "priv/build/build.bl"))
-  (is (not (BeamLisp.Tiers/build_source? "priv/boot/core.bl")))
-
-  (is (not (BeamLisp.Tiers/boot_source? "priv/std/errors.bl")))
-  (is (not (BeamLisp.Tiers/build_source? "priv/std/errors.bl")))
-
-  ; `toolchain_source?` is the union — what the barrier schedules serially.
-  (is (BeamLisp.Tiers/toolchain_source? "priv/boot/compiler.bl"))
-  (is (BeamLisp.Tiers/toolchain_source? "priv/build/build-plan.bl"))
-  (is (not (BeamLisp.Tiers/toolchain_source? "priv/std/errors.bl"))))
+ ;; Relative paths resolve from the selected runtime image, as they do for
+ ;; a checkout. A sealed drop must not claim another tree's same-named files.
+ (let [before (File/cwd!) root (Path/dirname (BeamLisp.Tiers/priv_root))]
+  (try
+   (File/cd! root)
+   (is (BeamLisp.Tiers/boot_source? "priv/boot/core.bl"))
+   (is (BeamLisp.Tiers/boot_source? (Path/join (BeamLisp.Tiers/boot_dir) "core.bl")))
+   (is (not (BeamLisp.Tiers/boot_source? "priv/build/build.bl")))
+   (is (BeamLisp.Tiers/build_source? "priv/build/build.bl"))
+   (is (not (BeamLisp.Tiers/build_source? "priv/boot/core.bl")))
+   (is (not (BeamLisp.Tiers/boot_source? "priv/std/errors.bl")))
+   (is (not (BeamLisp.Tiers/build_source? "priv/std/errors.bl")))
+   (is (BeamLisp.Tiers/toolchain_source? "priv/boot/compiler.bl"))
+   (is (BeamLisp.Tiers/toolchain_source? "priv/build/build-plan.bl"))
+   (is (not (BeamLisp.Tiers/toolchain_source? "priv/std/errors.bl")))
+   (finally (File/cd! before)))))
 
 (deftest the-tiers-are-disjoint-and-the-gates-own-namespaces-are-tier-keyed
   (let [boot (BeamLisp.Tiers/boot_namespaces)
         build (BeamLisp.Tiers/build_namespaces)]
-    (is (= ["app-resource" "build" "build-log" "build-plan" "claim" "deps"
+    (is (= ["app-resource" "artifact" "artifact-process" "build" "build-log" "build-plan" "claim" "deps"
             "deps-compile" "drop" "embed-asset" "hex" "mix-shim" "ns-interface"
             "pristine" "provenance" "release" "seed" "selfbuild" "source-graph"
             "store" "substrate" "z3-asset"]
@@ -141,6 +156,8 @@
     (is (= :build (BeamLisp.Tiers/tier_of_ns "source-graph")))
     (is (= :build (BeamLisp.Tiers/tier_of_ns "ns-interface")))
     (is (= :build (BeamLisp.Tiers/tier_of_ns "build-log")))
+    (is (= :build (BeamLisp.Tiers/tier_of_ns "artifact")))
+    (is (= :build (BeamLisp.Tiers/tier_of_ns "artifact-process")))
     (is (= :build (BeamLisp.Tiers/tier_of_ns "substrate")))
     (is (= :build (BeamLisp.Tiers/tier_of_ns "release")))
     (is (= :build (BeamLisp.Tiers/tier_of_ns "drop")))

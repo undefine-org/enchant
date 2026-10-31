@@ -1,0 +1,104 @@
+(ns contextual-receive-test
+ (:require [expand :as x] [binding :as b] [compiler :as compiler] [lower :as lower]
+           [anf :as anf] [typed :as typed] [system.phase :as phase]
+           [codebase.refactor :as refactor]))
+
+(defn- fixture-path [path]
+ (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) path))
+
+(defn- unit [source]
+ {:namespace 'client :revision 'current :file "client.bl" :source (str "(ns client) " source)})
+(defn- program [source] (x/program [(unit source)] ['client 'current]))
+(defn- execute [p]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ContextualReceive." (erlang/unique_integer (list :positive))))
+  (:node p)))
+(defn- refused [action] (try (action) nil (catch e (:kind (ex-data e)))))
+(defn- nodes [node] (cons node (Enum/flat_map (anf/executable-children node) nodes)))
+(defn- provider []
+ {:namespace 'mailbox :revision 'current :file "mailbox.bl"
+  :source (File/read! (fixture-path "test/fixtures/contextual-mailbox/mailbox.bl"))})
+
+(defn- compiler-transport []
+ {:namespace 'proc.mailbox :revision 'selected :file "compiler-transport.bl"
+  :source (File/read! (fixture-path "test/fixtures/contextual-mailbox/compiler-transport.bl"))})
+
+(deftest compiler-layout-keeps-the-original-reader-item-coordinates
+ (let [forms (rest (elem (BeamLisp.Reader/read_one
+                         "(receive [:a x] :when (> x 0) x (after 0 nil) :done true)") 1))
+       layout (compiler/receive-layout forms (compiler/new-env "client"))]
+  (is (= [[0 2 3] [5 nil 6]]
+         (mapv (fn [clause] [(:pattern-index clause) (:guard-index clause) (:body-index clause)]) (:clauses layout))))
+  (is (= '(4) (:after-indexes layout)))))
+
+(deftest literal-nil-guard-keeps-its-grammar-width-and-declines-the-message
+ (let [forms (rest (elem (BeamLisp.Reader/read_one "(receive x :when nil x :done true)") 1))
+       layout (compiler/receive-layout forms (compiler/new-env "client"))]
+  (is (= [[0 2 3] [4 nil 5]]
+         (mapv (fn [clause] [(:pattern-index clause) (:guard-index clause) (:body-index clause)]) (:clauses layout)))))
+ (is (= [:declined :queued]
+        (execute (program (str "(do (erlang/send (erlang/self) :nil-guard-message) "
+                               "(let [result (receive :nil-guard-message :when nil :incorrect (after 0 :declined))] "
+                               "[result (receive :nil-guard-message :queued (after 0 :gone))]))"))))))
+
+(deftest selective-receive-preserves-local-pattern-guard-and-outer-identities
+ (let [p (program (str "(let [x 100] (do "
+                  "(erlang/send (erlang/self) [:other 9]) "
+                  "(erlang/send (erlang/self) [:sum 40 2]) "
+                  "[(receive [:sum x y] :when (> x 0) (erlang/+ x y) (after 0 :missing)) "
+                  "(receive [:other x] x (after 0 :missing)) x]))"))]
+  (is (= [42 9 100] (execute p)))
+  (is (= :proved (:status (phase/check p))))
+  (is (= (:selection p) (b/validate-selection (:selection p))))
+  ;; Guard compilation retains the same selected reference as its body use.
+  (let [receive-node (first (Enum/filter (nodes (:node p)) #(= :recv (:op %))))
+        guard (:guard (first (:clauses receive-node)))]
+   (is (some #(typed/binding-key %) (when guard (nodes guard)))))))
+
+(deftest map-literal-and-tuple-message-patterns-use-the-existing-lowerer
+ (is (= 42 (execute (program (str "(do (erlang/send (erlang/self) {:kind :answer :value 42}) "
+                                 "(receive {:kind :answer :value answer} answer (after 0 :missing)))")))))
+ (is (= 42 (execute (program (str "(do (erlang/send (erlang/self) (erlang/append_element "
+                                 "(erlang/make_tuple 1 :answer) 42)) "
+                                 "(receive [:answer answer] answer (after 0 :missing)))")))))
+ (is (= :matched (execute (program "(do (erlang/send (erlang/self) 42) (receive 42 :matched (after 0 :missing)))")))))
+
+(deftest clause-and-timeout-bodies-cannot-borrow-another-patterns-bindings
+ (is (= :unbound-identifier (refused #(program "(receive [:a x] x [:b y] x (after 0 nil))"))))
+ (is (= :unbound-identifier (refused #(program "(receive [:a x] x (after 0 x))"))))
+ (is (= :contextual-receive-timeout-count
+        (refused #(program "(receive (after 0 nil) (after 1 nil))"))))
+ (is (= :contextual-receive-body (refused #(program "(receive [:a x])"))))
+ (is (= :unsupported-contextual-match-key
+        (refused #(program "(receive {dynamic x} x (after 0 nil))")))))
+
+(deftest guards-use-the-canonical-intrinsics-and-never-run-user-callbacks
+ (is (= :unsupported-contextual-guard
+        (refused #(program "(let [predicate (fn [x] true)] (receive x :when (predicate x) x (after 0 nil)))"))))
+ (is (= 42 (execute (program (str "(let [> (fn [x y] false)] "
+                                 "(do (erlang/send (erlang/self) 42) "
+                                 "(receive x :when (> x 0) x (after 0 :missing))))")))))
+ (is (compiler/guard-operator? ">"))
+ (is (not (compiler/guard-operator? "erlang/send"))))
+
+(deftest semantic-rename-includes-a-message-pattern-its-guard-and-its-body
+ (let [sources [(unit (str "(do (erlang/send (erlang/self) [:answer 42]) "
+                          "(receive [:answer value] :when (> value 0) value (after 0 :missing)))"))]
+       p (x/program sources ['client 'current])
+       target (Enum/find (Map/values (get-in p [:selection :by-id]))
+                #(and (= 'value (:name %)) (= :local (:visibility %))))
+       result (refactor/rename-program sources ['client 'current] (:id target) 'answer)]
+  (is (= :verified (:status result)))
+  (is (= 3 (count (:edits result))))
+  (is (= 42 (execute (:program result))))))
+
+(deftest archived-bracket-macro-keeps-user-binders-and-private-timeout-hygienic
+ (let [archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [(provider) (compiler-transport)])))
+       client {:namespace 'showcase :revision 'current :file "main.bl"
+               :source (File/read! (fixture-path "test/fixtures/contextual-mailbox/main.bl"))}
+       p (x/program [client] ['showcase 'current] [archive])]
+  (is (= [42 107 99] (execute p)))
+  (is (= 3 (count (:expansions p))))
+  (is (= :proved (:status (phase/check p))))
+  (is (= 2 (count (:linked p)))))
+ (is (thrown? (x/program [(provider) (compiler-transport) (unit (str "(import-world 'mailbox 'current :only [await-reply]) "
+                                            "(await-reply [:answer _] 42 0 nil)"))] ['client 'current]))))

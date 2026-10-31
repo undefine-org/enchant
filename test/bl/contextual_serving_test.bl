@@ -1,0 +1,117 @@
+(ns contextual-serving-test
+ (:require [compile.world :as world] [reload.execution :as execution]
+           [reload.generation :as generation] [reload.runtime :as runtime]
+           [proc.callback :as callback]))
+
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+
+(defn- fixture [module offset action]
+ (let [dir (Path/join (System/tmp_dir!) (str "canonical-serving-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    (str "(ns serving.unit) (def token (erlang/unique_integer)) "
+         "(defn identity [] token) (defn answer [x] (erlang/+ x " offset ")) "
+         "(defn make [n] (fn [x] (erlang/+ n x))) token"))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['serving.unit 'current] :sources [{:namespace 'serving.unit :revision 'current :file \"main.bl\"}] :libraries []}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         references (into {} (map (fn [row] [(get-in row [:declaration :name]) (:reference row)])
+                              (filter #(not= :local (get-in % [:declaration :visibility]))
+                                      (vals (get-in prepared [:program :references])))))
+         captured (BeamLisp.AOT/compile_unit (world/prepare-unit prepared module))]
+    (action captured references))
+   (finally (File/rm_rf! dir)))))
+
+(defn- initialize! [captured]
+ (let [g (execution/prepare-captured-unit! captured)]
+  (execution/initialize-instance! g)
+  (execution/complete-preparation! (:cache-key g) g) g))
+
+(deftest serving-and-retained-entries-use-the-original-canonical-instance
+ (fixture :Elixir.CanonicalServingOld 40
+  (fn [captured refs]
+   (fixture :Elixir.CanonicalServingNew 50
+    (fn [new-captured new-refs]
+     (let [old (initialize! captured) fresh (initialize! new-captured)
+           slot (generation/slot) prior @runtime/policy-override held (atom nil)]
+      (try
+       (runtime/set-enabled! true)
+       (is (= :applied (:status (generation/publish! slot nil old))))
+       (is (= 42 (generation/call! slot (get refs 'answer) [2])))
+       (is (= (execution/invoke-instance-entry! old)
+              (generation/call! slot (get refs 'identity) [])))
+       (is (= :unsealed-entrypoint (reason #(generation/call! slot "serving.unit/answer" [2]))))
+       (is (= :unsealed-entrypoint
+              (reason #(generation/call! slot (assoc (get refs 'answer) :world (crypto/hash :sha256 "foreign")) [2]))))
+       (reset! held (generation/with-selected! slot generation/capture!))
+       (is (= :stale (:status (generation/publish! slot "wrong" fresh))))
+       (is (= 42 (generation/call! slot (get refs 'answer) [2])))
+       (is (= :applied (:status (generation/publish! slot (:digest old) fresh))))
+       (is (= 52 (generation/call! slot (get new-refs 'answer) [2])))
+       (is (= :waiting (:status (generation/retire! old))))
+       (is (= 42 (generation/run! @held (get refs 'answer) [2])))
+       (generation/release! @held)
+       (is (= :cancelled (generation/run! @held (get refs 'answer) [2])))
+       (is (= :retired (:status (generation/retire! old))))
+       (is (not= :unexpected-success (reason #(generation/invoke! old (get refs 'answer) [2]))))
+       (finally
+        (when @held (generation/release! @held))
+        (generation/close! slot (generation/selected slot))
+        (generation/retire! old) (generation/retire! fresh)
+        (runtime/set-enabled! prior)))))))))
+
+(deftest nested-closures-retain-their-actual-instance-until-registration-release
+ (fixture :Elixir.CanonicalServingClosure 40
+  (fn [captured refs]
+   (let [g (initialize! captured) held (atom nil)]
+    (try
+     (let [closure (generation/invoke! g (get refs 'make) [40])]
+      (reset! held (generation/with! g #(callback/register! closure)))
+      (is (= 42 (callback/invoke! @held [2])))
+      (is (= :waiting (:status (generation/retire! g))))
+      (is (= 43 (callback/invoke! @held [3])))
+      (callback/unregister! @held)
+      (is (= :cancelled (callback/invoke! @held [2])))
+      (is (= :retired (:status (generation/retire! g))))
+      (is (not= :unexpected-success (reason #(closure 2)))))
+     (finally (when @held (callback/unregister! @held)) (generation/retire! g)))))))
+
+(deftest uninitialized-canonical-instances-cannot-enter-serving-slots
+ (fixture :Elixir.CanonicalServingUnready 40
+  (fn [captured refs]
+   (let [g (execution/prepare-captured-unit! captured) slot (generation/slot)]
+    (try
+     (is (= :unready-prepared-generation (reason #(generation/publish! slot nil g))))
+     (is (nil? (generation/selected slot)))
+     (is (= :unready-prepared-generation (reason #(generation/invoke! g (get refs 'answer) [2]))))
+     (finally (generation/retire! g)))))))
+
+(deftest dead-callback-owner-releases-the-real-canonical-graph
+ (fixture :Elixir.CanonicalServingOwnerDeath 40
+  (fn [captured refs]
+   (let [g (initialize! captured) parent (erlang/self)
+         worker (erlang/spawn
+                  (fn []
+                   (let [closure (generation/invoke! g (get refs 'make) [40])
+                         held (generation/with! g #(callback/register! closure))]
+                    (erlang/send parent [:owned-callback held])
+                    (receive :stop nil))))
+         watch (Process/monitor worker)]
+    (try
+     (let [held (receive [:owned-callback held] held (after 15000 (throw :callback-owner-timeout)))]
+      (is (= 42 (callback/invoke! held [2])))
+      (is (= :waiting (:status (generation/retire! g))))
+      (erlang/send worker :stop)
+      (is (= :normal (receive [:DOWN seen :process pid result] :when (and (= seen watch) (= pid worker)) result
+                      (after 15000 :timeout))))
+      (is (= :cancelled (callback/invoke! held [2])))
+      (is (= :retired (:status (generation/retire! g)))))
+     (finally
+      (when (Process/alive? worker)
+       (erlang/exit worker :kill)
+       (receive [:DOWN seen :process _ _] :when (= seen watch) nil (after 5000 nil)))
+      (Process/demonitor watch (list :flush))
+      (generation/retire! g)))))))

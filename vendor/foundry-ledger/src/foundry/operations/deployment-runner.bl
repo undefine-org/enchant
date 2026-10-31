@@ -1,0 +1,1047 @@
+; src/foundry/operations/deployment-runner.bl — durable generic job ledger and process supervisor.
+;
+; Port of deployment-runner.py. Policy lives in src/foundry/operations/deployment-jobs.bl; this file
+; owns only mechanism:
+;   * a private DIRECTORY ledger (no SQLite) under the state root:
+;       ledger/jobs/<id>.json      one record per job (job fields + step rows),
+;                                  replaced atomically (temp file + rename)
+;       ledger/events/<id>.jsonl   append-only, one event per line; seq = line no.
+;       ledger/keys/<sha256(key)>  idempotency index → job id
+;       ledger/locks/<target>      one target lock (created exclusively) → job id
+;       ledger/.lock               ledger mutex: exclusive-create file holding
+;                                  the owner's os pid; stale when that pid is dead
+;     files 0600, dirs 0700. Readers never lock (renames are atomic); every
+;     writer of a job/key/lock file holds the mutex.
+;   * idempotent submission keyed by a digest of the normalized request
+;   * detached workers (`setsid`, stdio to /dev/null, stderr → logs/<job>.worker.log)
+;   * worker identity = pid + /proc start ticks + nonce in cmdline, never pid alone
+;   * bounded, redacted event capture with a numeric cursor
+;   * process-group timeout / cancellation, deferred across noncancellable steps
+;   * truthful interrupted / reconciling states when a worker dies mid-flight
+; No cloud/domain knowledge, no shell strings with interpolated values, and
+; credentials only from owner-only envFiles loaded just in time, held in memory.
+;
+; CLI contract (identical to the Python runner), one JSON line on stdout:
+;   src/foundry/operations/deployment-runner.bl -- [--state DIR] [--env sandbox|production] CMD …
+;   CMD: state-root | submit (--request J|--request-file F) | run-once (same)
+;        | list-jobs | status --id | events --id [--cursor N] [--limit N]
+;        | cancel --id | recover | worker --id --nonce (internal)
+;   success {"ok":true,"value":…}  (state-root: {"ok":true,"root":…|null})
+;   failure {"ok":false,"error":"…"}, exit 1; usage errors exit 2.
+;
+; Deviations from the Python runner (see result notes): stdout and stderr of a
+; step share one stream ("stdout"), because deployment-exec merges them; a
+; SIGTERM to a worker is not trapped (status/recover report the job
+; interrupted); a cancelled step's exitCode is its raw exit (or null).
+
+(ns deployment-runner
+  (:require [deployment-exec :as x]
+            [deployment-keyring :as kr]
+            [deployment-runtime :as rt]
+            [deployment-tar :as t]
+            [cli-kit :as cli]))
+
+;; ── Bounds ──────────────────────────────────────────────────────────────────
+
+(def name-re "^[A-Za-z0-9._-]{1,64}\\z")
+(def target-re "^[A-Za-z0-9._-]{1,200}\\z")
+(def key-re "^[A-Za-z0-9._:-]{1,200}\\z")
+(def plan-id-re "^[A-Za-z0-9._-]{1,128}\\z")
+(def env-name-re "^[A-Za-z_][A-Za-z0-9_]*\\z")
+(def max-steps 32)
+(def run-once-max-steps 4)
+(def run-once-max-timeout 120)
+(def max-argv 128)
+(def max-arg-len 4096)
+(def max-path-len 4096)
+(def max-env-entries 128)
+(def max-env-value 8192)
+(def max-label 300)
+(def min-timeout 1)
+(def max-timeout 86400)
+(def min-output-limit 64)
+(def max-output-limit (* 64 1024 1024))
+(def max-job-event-bytes (* 4 1024 1024))
+(def max-event-text 8192)
+(def max-cursor-limit 2000)
+(def default-cursor-limit 500)
+(def terminal-statuses ["succeeded" "failed" "cancelled" "interrupted"])
+(def non-terminal-statuses ["queued" "running" "cancelling" "reconciling"])
+(def min-redact-len 4)
+(def environments ["sandbox" "production"])
+(def mutex-wait-ms 30000)
+
+;; ── Small helpers ───────────────────────────────────────────────────────────
+
+(defn- tuple [& xs] (erlang/list_to_tuple (to-list xs)))
+(defn- chars [s] (erlang/binary_to_list (str s)))
+(defn- hex [b] (str (erlang/apply :binary :encode_hex (list b :lowercase))))
+(defn- rand-hex [n] (hex (erlang/apply :crypto :strong_rand_bytes (list n))))
+(defn- now-ms [] (System/monotonic_time :millisecond))
+(defn- member? [v coll] (some (fn [c] (= c v)) coll))
+(defn- terminal? [s] (member? s terminal-statuses))
+(defn- pyrepr [s] (str "'" s "'"))
+
+(defn- refuse
+  "A request-level refusal (exit 1, message verbatim)."
+  [msg]
+  (throw (ex-info msg {"request" true})))
+
+(defn- rx? [pat s] (and (string? s) (Regex/match? (Regex/compile! pat) s)))
+
+(defn iso-now []
+  (str (erlang/list_to_binary
+         (erlang/apply :calendar :system_time_to_rfc3339
+                       (list (System/system_time :millisecond)
+                             (list (tuple :unit :millisecond)
+                                   (tuple :offset (chars "Z"))))))))
+
+(defn- os-pid []
+  (erlang/binary_to_integer (erlang/list_to_binary (erlang/apply :os :getpid (list)))))
+
+(defn plain
+  "Make a value JSON-encodable: vectors/seqs → lists, keywords → names."
+  [v]
+  (cond
+    (map? v) (reduce (fn [o k] (assoc o (if (keyword? k) (name k) k) (plain (get v k)))) {} (keys v))
+    (keyword? v) (name v)
+    (or (vector? v) (list? v) (seq? v) (set? v)) (to-list (map plain v))
+    :else v))
+
+(defn- json [v] (Jason/encode! (plain v)))
+
+(defn- canonical
+  "Compact JSON with sorted keys at every level (the request digest input)."
+  [v]
+  (cond
+    (map? v) (str "{" (join "," (map (fn [k] (str (Jason/encode! k) ":" (canonical (get v k))))
+                                      (sort (keys v)))) "}")
+    (or (vector? v) (list? v) (seq? v)) (str "[" (join "," (map canonical v)) "]")
+    :else (Jason/encode! v)))
+
+(defn- write-private!
+  "Atomic owner-only write: temp file, chmod 600, rename over `path`."
+  [path data]
+  (let [tmp (str path "." (rand-hex 6) ".tmp")]
+    (File/write! tmp data)
+    (File/chmod! tmp 384)
+    (File/rename! tmp path)))
+
+(defn- private-dir! [path]
+  (File/mkdir_p! path)
+  (try (File/chmod! path 448)
+       (catch e (refuse (str "state directory " path " is not private: " (ex-message e))))))
+
+;; ── State root ──────────────────────────────────────────────────────────────
+
+(defn- env-var [k]
+  (let [v (System/get_env k)] (if (and (string? v) (> (count v) 0)) v nil)))
+
+(defn default-state-root
+  "The state root for `env`, or nil when no home can be found.
+   FOUNDRY_DEPLOY_STATE wins verbatim; else ${XDG_STATE_HOME:-$HOME/.local/state}
+   /foundry/<env>. Production keeps the legacy …/foundry/deployments when it
+   exists. Refuses an unknown env."
+  [env]
+  (when-not (member? env environments)
+    (refuse (str "env must be one of " (join ", " environments) ", got " (pyrepr env))))
+  (let [override (env-var "FOUNDRY_DEPLOY_STATE")
+        xdg (env-var "XDG_STATE_HOME")
+        home (env-var "HOME")
+        base (cond xdg xdg home (str home "/.local/state") :else nil)]
+    (cond
+      override override
+      (nil? base) nil
+      :else
+      (let [legacy (str base "/foundry/deployments")]
+        (if (and (= env "production") (File/exists? legacy))
+          legacy
+          (str base "/foundry/" env))))))
+
+(defn- absolute [p]
+  (if (String/starts_with? p "/") p (str (File/cwd!) "/" p)))
+
+(defn state-dir
+  "Create (private) and return the absolute state root for `explicit`/`env`."
+  [explicit env]
+  (let [directory (if (and (string? explicit) (not= "" explicit)) explicit (default-state-root env))]
+    (when (nil? directory)
+      (refuse "deployment state root is unresolved (set FOUNDRY_DEPLOY_STATE or HOME)"))
+    (private-dir! directory)
+    (doseq [s ["logs" "tmp" "ledger" "ledger/jobs" "ledger/events" "ledger/keys" "ledger/locks"]]
+      (private-dir! (str directory "/" s)))
+    (absolute directory)))
+
+;; ── Ledger mutex ────────────────────────────────────────────────────────────
+
+(defn- mutex-path [d] (str d "/ledger/.lock"))
+
+(defn- pid-alive? [pid]
+  (and (int? pid) (> pid 0) (File/dir? (str "/proc/" pid))))
+
+(defn- stale-lock?
+  "The lock file names an os pid that no longer exists."
+  [path]
+  (let [txt (try (String/trim (File/read! path)) (catch e ""))
+        pid (try (erlang/binary_to_integer txt) (catch e nil))]
+    (and (int? pid) (not (pid-alive? pid)) pid)))
+
+(defn- acquire! [d]
+  (let [path (mutex-path d)
+        deadline (+ (now-ms) mutex-wait-ms)]
+    (loop []
+      (let [r (erlang/apply :file :open (list path (to-list [:write :exclusive :raw :binary])))]
+        (cond
+          (= :ok (erlang/element 1 r))
+          (let [fh (erlang/element 2 r)]
+            (erlang/apply :file :write (list fh (str (os-pid))))
+            (erlang/apply :file :close (list fh))
+            (try (File/chmod! path 384) (catch e nil))
+            nil)
+          (> (now-ms) deadline) (throw (ex-info "ledger is busy (mutex wait timed out)" {}))
+          :else
+          (do (when-let [stale (stale-lock? path)]
+                ;; only remove the lock if it still names the same dead pid
+                (when (= stale (stale-lock? path)) (File/rm_rf path)))
+              (Process/sleep 5)
+              (recur)))))))
+
+(defn- with-mutex
+  "Run (f) holding the ledger mutex. Never nest."
+  [d f]
+  (acquire! d)
+  (try (f) (finally (File/rm_rf (mutex-path d)))))
+
+;; ── Identity ────────────────────────────────────────────────────────────────
+
+(defn- words [s] (filter (fn [w] (not= "" w)) (String/split s " ")))
+
+(defn proc-start-ticks
+  "Field 22 (starttime) of /proc/<pid>/stat, or nil."
+  [pid]
+  (try
+    (let [raw (File/read! (str "/proc/" pid "/stat"))
+          tail (last (String/split raw ")"))
+          fs (vec (words (String/trim tail)))]
+      (when (>= (count fs) 20) (erlang/binary_to_integer (nth fs 19))))
+    (catch e nil)))
+
+(defn proc-cmdline [pid]
+  (try (String/trim (String/replace (File/read! (str "/proc/" pid "/cmdline"))
+                                    (erlang/list_to_binary (list 0)) " "))
+       (catch e nil)))
+
+(defn worker-alive?
+  "Ours only when the pid is live AND start ticks AND nonce all agree."
+  [job]
+  (let [pid (get job "worker_pid") ticks (get job "worker_ticks") nonce (get job "worker_nonce")]
+    (cond
+      (or (not (int? pid)) (not (string? nonce))) false
+      (not (pid-alive? pid)) false
+      :else
+      (let [actual (proc-start-ticks pid)]
+        (cond
+          (nil? actual) false
+          (and (some? ticks) (not= actual ticks)) false
+          :else (let [c (proc-cmdline pid)]
+                  (and (string? c) (String/contains? c nonce))))))))
+
+;; ── Validation ──────────────────────────────────────────────────────────────
+
+(defn- abs-path [value field]
+  (cond
+    (or (not (string? value)) (= "" value)) (refuse (str field " must be a non-empty string"))
+    (> (count value) max-path-len) (refuse (str field " exceeds " max-path-len " characters"))
+    (Regex/match? (Regex/compile! "[\\x00-\\x1f]") value) (refuse (str field " contains control characters"))
+    (not (String/starts_with? value "/")) (refuse (str field " must be an absolute path"))
+    (some (fn [p] (= p "..")) (String/split value "/")) (refuse (str field " must not contain '..' segments"))
+    :else value))
+
+(defn- bounded-int [value field low high]
+  (when-not (int? value) (refuse (str field " must be an integer")))
+  (when-not (and (<= low value) (<= value high))
+    (refuse (str field " must be between " low " and " high)))
+  value)
+
+(defn- boolean! [value field]
+  (when-not (or (= value true) (= value false)) (refuse (str field " must be a boolean")))
+  value)
+
+(defn- exact-keys [m required optional field]
+  (let [ks (keys m)
+        missing (sort (filter (fn [k] (not (contains? m k))) required))
+        unknown (sort (filter (fn [k] (not (or (member? k required) (member? k optional)))) ks))]
+    (when (seq missing) (refuse (str field " is missing keys: " (join ", " missing))))
+    (when (seq unknown) (refuse (str field " has unknown keys: " (join ", " unknown))))))
+
+(defn- normalize-step [step index once]
+  (let [where (str "steps[" index "]")]
+    (when-not (map? step) (refuse (str where " must be an object")))
+    (exact-keys step ["id" "argv" "cwd" "timeoutSeconds" "outputLimit" "cancellable"]
+                ["label" "env" "envFile"] where)
+    (let [step-id (get step "id")]
+      (when-not (rx? name-re step-id)
+        (refuse (str where ".id must match [A-Za-z0-9._-]{1,64}")))
+      (let [label (get step "label" "")]
+        (when (or (not (string? label)) (> (count label) max-label))
+          (refuse (str where ".label must be a string of at most " max-label " characters")))
+        (let [argv (get step "argv")]
+          (when (or (not (or (vector? argv) (list? argv))) (empty? argv))
+            (refuse (str where ".argv must be a non-empty array")))
+          (when (> (count argv) max-argv) (refuse (str where ".argv exceeds " max-argv " entries")))
+          (doseq [item argv]
+            (when (or (not (string? item)) (> (count item) max-arg-len))
+              (refuse (str where ".argv entries must be strings of at most " max-arg-len " characters")))
+            (when (String/contains? item (erlang/list_to_binary (list 0)))
+              (refuse (str where ".argv contains a NUL byte"))))
+          (abs-path (first argv) (str where ".argv[0]"))
+          (when (> (erlang/byte_size (Jason/encode! (to-list argv))) (* 32 1024))
+            (refuse (str where ".argv exceeds 32 KiB")))
+          (let [cwd (abs-path (get step "cwd") (str where ".cwd"))
+                env (get step "env" {})]
+            (when-not (map? env) (refuse (str where ".env must be an object")))
+            (when (> (count env) max-env-entries)
+              (refuse (str where ".env exceeds " max-env-entries " entries")))
+            (doseq [name (sort (keys env))]
+              (let [value (get env name)]
+                (when-not (rx? env-name-re name)
+                  (refuse (str where ".env has an invalid variable name: " (pyrepr name))))
+                (when (or (not (string? value)) (> (count value) max-env-value))
+                  (refuse (str where ".env[" name "] must be a string of at most " max-env-value " characters")))
+                (when (String/contains? value (erlang/list_to_binary (list 0)))
+                  (refuse (str where ".env[" name "] contains a NUL byte")))))
+            (let [env-file (get step "envFile")]
+              (when (some? env-file) (abs-path env-file (str where ".envFile")))
+              (when (and once (number? (get step "timeoutSeconds"))
+                         (> (get step "timeoutSeconds") run-once-max-timeout))
+                (refuse (str where ".timeoutSeconds exceeds the " run-once-max-timeout " s run-once limit")))
+              {"id" step-id
+               "label" label
+               "argv" (to-list argv)
+               "cwd" cwd
+               "env" env
+               "envFile" env-file
+               "timeoutSeconds" (bounded-int (get step "timeoutSeconds") (str where ".timeoutSeconds") min-timeout max-timeout)
+               "outputLimit" (bounded-int (get step "outputLimit") (str where ".outputLimit") min-output-limit max-output-limit)
+               "cancellable" (boolean! (get step "cancellable") (str where ".cancellable"))})))))))
+
+(defn validate-request
+  "Normalize a submit request, or (once) a run-once request."
+  ([request] (validate-request request false))
+  ([request once]
+   (when-not (map? request) (refuse "request must be a JSON object"))
+   (exact-keys request (if once ["target" "kind" "steps"] ["idempotencyKey" "target" "kind" "steps"])
+               (if once [] ["planId"]) "request")
+   (let [key (when-not once (get request "idempotencyKey"))
+         plan-id (when-not once (get request "planId"))]
+     (when-not once
+       (when-not (rx? key-re key)
+         (refuse "idempotencyKey must match [A-Za-z0-9._:-]{1,200}"))
+       (when (and (some? plan-id) (not (rx? plan-id-re plan-id)))
+         (refuse "planId must match [A-Za-z0-9._-]{1,128}")))
+     (let [target (get request "target")]
+       (when (or (not (rx? target-re target)) (= target ".") (= target ".."))
+         (refuse "target must match [A-Za-z0-9._-]{1,200} and not be a path"))
+       (let [kind (get request "kind")]
+         (when-not (rx? name-re kind) (refuse "kind must match [A-Za-z0-9._-]{1,64}"))
+         (let [steps (get request "steps")
+               limit (if once run-once-max-steps max-steps)]
+           (when (or (not (or (vector? steps) (list? steps))) (empty? steps))
+             (refuse "steps must be a non-empty array"))
+           (when (> (count steps) limit) (refuse (str "steps exceeds " limit " entries")))
+           (let [normalized
+                 (loop [xs (seq steps) i 0 seen #{} acc []]
+                   (if (nil? xs)
+                     acc
+                     (let [s (normalize-step (first xs) i once)
+                           sid (get s "id")]
+                       (when (contains? seen sid)
+                         (refuse (str "steps[" i "].id duplicates step id " (pyrepr sid))))
+                       (recur (next xs) (inc i) (conj seen sid) (conj acc s)))))
+                 steps-l (to-list normalized)]
+             (if once
+               {"target" target "kind" kind "steps" steps-l}
+               {"idempotencyKey" key "planId" plan-id "target" target "kind" kind "steps" steps-l}))))))))
+
+(defn request-digest [normalized]
+  (t/sha256-hex (canonical {"target" (get normalized "target")
+                            "kind" (get normalized "kind")
+                            "steps" (get normalized "steps")})))
+
+;; ── Ledger records ──────────────────────────────────────────────────────────
+
+(defn- job-path [d id] (str d "/ledger/jobs/" id ".json"))
+(defn- events-path [d id] (str d "/ledger/events/" id ".jsonl"))
+(defn- key-path [d key] (str d "/ledger/keys/" (t/sha256-hex key)))
+(defn- lock-path [d target] (str d "/ledger/locks/" target))
+
+(defn read-job [d id]
+  (let [p (job-path d id)]
+    (when (File/exists? p) (Jason/decode! (File/read! p)))))
+
+(defn- write-job! [d job] (write-private! (job-path d (get job "id")) (json job)))
+
+(defn- job-ids [d]
+  (let [names (try (to-list (File/ls! (str d "/ledger/jobs"))) (catch e []))]
+    (vec (map (fn [n] (subs n 0 (- (count n) 5)))
+              (filter (fn [n] (String/ends_with? n ".json")) names)))))
+
+(defn update-job!
+  "Read-modify-write one job under the mutex; returns the new record."
+  [d id f]
+  (with-mutex d (fn []
+                  (let [j (read-job d id)
+                        n (f j)]
+                    (when (and j n) (write-job! d n))
+                    n))))
+
+(defn- update-step [job seq f]
+  (assoc job "steps"
+         (to-list (map-indexed (fn [i s] (if (= i seq) (f s) s)) (get job "steps")))))
+
+(defn fresh-step [] {"status" "pending" "started_at" nil "finished_at" nil "exit_code" nil
+                      "error" nil "output_bytes" 0 "truncated" false "pid" nil "pgid" nil})
+
+(defn- release-lock! [d job]
+  (let [p (lock-path d (get job "target"))]
+    (when (and (File/exists? p)
+               (= (get job "id") (try (String/trim (File/read! p)) (catch e nil))))
+      (File/rm_rf p))))
+
+(defn- step-record [spec s]
+  {:id (get spec "id") :label (get spec "label") :argv (get spec "argv") :cwd (get spec "cwd")
+   :env (get spec "env") :envFile (get spec "envFile")
+   :timeoutSeconds (get spec "timeoutSeconds") :outputLimit (get spec "outputLimit")
+   :cancellable (get spec "cancellable")
+   :status (get s "status") :startedAt (get s "started_at") :finishedAt (get s "finished_at")
+   :exitCode (get s "exit_code") :error (get s "error")
+   :outputBytes (get s "output_bytes") :truncated (boolean (get s "truncated"))})
+
+(defn- alive-flag [job]
+  (and (not (terminal? (get job "status"))) (worker-alive? job)))
+
+(defn- job-record-of [job]
+  {:id (get job "id") :planId (get job "plan_id") :target (get job "target") :kind (get job "kind")
+   :status (get job "status") :createdAt (get job "created_at") :startedAt (get job "started_at")
+   :finishedAt (get job "finished_at") :exitCode (get job "exit_code") :error (get job "error")
+   :steps (to-list (map (fn [pair] (step-record (first pair) (second pair)))
+                        (map (fn [a b] [a b]) (get job "steps_spec") (get job "steps"))))
+   :cancelRequested (boolean (get job "cancel_requested"))
+   :truncated (boolean (get job "truncated"))
+   :workerAlive (boolean (alive-flag job))})
+
+(defn- job-record [d id]
+  (let [j (read-job d id)]
+    (when (nil? j) (refuse (str "unknown job: " id)))
+    (job-record-of j)))
+
+(defn- job-summary [job]
+  {:id (get job "id") :planId (get job "plan_id") :target (get job "target") :kind (get job "kind")
+   :status (get job "status") :createdAt (get job "created_at") :startedAt (get job "started_at")
+   :finishedAt (get job "finished_at") :exitCode (get job "exit_code") :error (get job "error")
+   :workerAlive (boolean (alive-flag job))})
+
+(defn settle!
+  "Terminal transition: running steps → interrupted (when interrupted), pending
+   → skipped, target lock released. A job already terminal is left alone."
+  ([d id status error exit-code] (settle! d id status error exit-code false))
+  ([d id status error exit-code extra-truncated]
+   (with-mutex d
+     (fn []
+       (let [j (read-job d id)]
+         (when (and j (not (terminal? (get j "status"))))
+           (let [now (iso-now)
+                 steps (to-list
+                         (map (fn [s]
+                                (cond
+                                  (and (= status "interrupted") (= "running" (get s "status")))
+                                  (assoc s "status" "interrupted" "finished_at" now
+                                         "error" (or error "worker exited while the step was running"))
+                                  (= "pending" (get s "status")) (assoc s "status" "skipped")
+                                  :else s))
+                              (get j "steps")))
+                 j2 (assoc j "status" status "error" error "exit_code" exit-code
+                           "finished_at" now "updated_at" now
+                           "truncated" (boolean (or (get j "truncated") extra-truncated))
+                           "steps" steps)]
+             (write-job! d j2)
+             (release-lock! d j2))))))))
+
+;; ── Redaction and event capture ─────────────────────────────────────────────
+
+(defn redact [text secrets]
+  (reduce (fn [out secret]
+            (if (and (>= (count secret) min-redact-len) (String/contains? out secret))
+              (String/replace out secret "[redacted]")
+              out))
+          text
+          (reverse (sort-by count (vec secrets)))))
+
+(defn- clean-line [raw]
+  (let [s (let [r (erlang/apply :unicode :characters_to_binary (list raw :utf8 :utf8))]
+            (if (erlang/is_binary r) r (String/replace_invalid raw)))]
+    (if (String/ends_with? s "\r") (String/slice s 0 (dec (count s))) s)))
+
+(defn- make-capture
+  "Bounds and redaction applied before anything reaches the sink.
+   sink: (fn [row]) with row {:time :step :stream :text}."
+  [sink secrets & [line-limit]]
+  {:sink sink :secrets secrets :line-limit (or line-limit max-event-text)
+   :st (atom {:job-bytes 0 :job-trunc false :step-bytes {} :step-trunc {} :marker #{}})})
+
+(defn- cap-guard! [cap seq step-id limit]
+  (let [st (:st cap) s @st]
+    (swap! st assoc :step-trunc (assoc (:step-trunc s) seq true))
+    (when-not (contains? (:marker s) seq)
+      (let [s2 @st used (get (:step-bytes s2) seq 0)]
+        (swap! st assoc
+               :marker (conj (:marker s2) seq)
+               :job-bytes (+ (:job-bytes s2) 40)
+               :step-bytes (assoc (:step-bytes s2) seq (+ used 40)))
+        ((:sink cap) {:time (iso-now) :step step-id :stream "guard"
+                      :text (str "[output truncated at " limit " bytes]")})))))
+
+(defn- cap-line! [cap seq step-id limit raw]
+  (let [st (:st cap) s @st used (get (:step-bytes s) seq 0)]
+    (cond
+      (>= (:job-bytes s) max-job-event-bytes) (swap! st assoc :job-trunc true)
+      (>= used limit) (cap-guard! cap seq step-id limit)
+      :else
+      (let [c (redact (clean-line raw) @(:secrets cap))
+            c (if (> (count c) (:line-limit cap))
+                (str (String/slice c 0 (:line-limit cap)) "…[line truncated]")
+                c)
+            size (erlang/byte_size c)]
+        ((:sink cap) {:time (iso-now) :step step-id :stream "stdout" :text c})
+        (swap! st assoc
+               :job-bytes (+ (:job-bytes s) size)
+               :step-bytes (assoc (:step-bytes s) seq (+ used size)))))))
+
+(defn- cap-step-bytes [cap seq] (get (:step-bytes @(:st cap)) seq 0))
+(defn- cap-step-trunc? [cap seq] (boolean (get (:step-trunc @(:st cap)) seq)))
+(defn- cap-any-trunc? [cap]
+  (let [s @(:st cap)] (or (:job-trunc s) (some (fn [v] v) (vals (:step-trunc s))))))
+
+;; ── Process execution ───────────────────────────────────────────────────────
+
+(defn- executable-file? [p]
+  (and (File/regular? p)
+       (let [st (erlang/apply :file :read_file_info (list p))]
+         (and (= :ok (erlang/element 1 st))
+              (not= 0 (erlang/band (erlang/element 8 (erlang/element 2 st)) 73))))))
+
+(defn- step-env [d job-id spec secrets]
+  "→ {:ok env} | {:error msg}. Nothing is inherited from this process."
+  (let [base (merge {"PATH" "/usr/bin:/bin" "LANG" "C.UTF-8"}
+                    {"TMPDIR" (str d "/tmp/" job-id)}
+                    (get spec "env"))]
+    (if-let [ef (get spec "envFile")]
+      (let [r (kr/read-env-file ef)]
+        (if (contains? r :error)
+          {:error (:error r)}
+          (do (reset! secrets (into @secrets
+                                    (filter (fn [v] (>= (count v) min-redact-len)) (vals (:ok r)))))
+              {:ok (merge base (:ok r))})))
+      {:ok base})))
+
+(defn- exec-step
+  "The ONE process-execution path (job worker and run-once share it).
+   → {:status :exit-code :error}."
+  [spec env on-line on-truncate on-spawn cancel?]
+  (let [cwd (get spec "cwd") argv (get spec "argv") exe (first argv)]
+    (cond
+      (not (File/dir? cwd))
+      {:status "failed" :exit-code nil :error (str "working directory not found: " cwd)}
+      (not (executable-file? exe))
+      {:status "failed" :exit-code nil :error (str "executable not found or not executable: " exe)}
+      :else
+      (let [r (x/run exe (rest argv)
+                     (merge {:env env :cwd cwd
+                             :timeout-ms (* 1000 (get spec "timeoutSeconds"))
+                             :limit (get spec "outputLimit")
+                             :poll-ms 100
+                             :on-line on-line :on-truncate on-truncate :on-spawn on-spawn}
+                            (if (get spec "cancellable") {:cancel? cancel?} {})))
+            exit (:exit r)
+            cancelled? (and (get spec "cancellable") (fn? cancel?) (cancel?))]
+        (cond
+          (= :spawn-failed (:status r)) {:status "failed" :exit-code nil :error (str "exec failed: " (:error r))}
+          (= :timed-out (:status r))
+          {:status "timed_out" :exit-code nil :error (str "timeout after " (get spec "timeoutSeconds") " s")}
+          (= :cancelled (:status r)) {:status "cancelled" :exit-code exit :error "cancelled"}
+          (= 0 exit) {:status "succeeded" :exit-code 0 :error nil}
+          (and cancelled? (int? exit) (member? exit [9 15 137 143])) {:status "cancelled" :exit-code exit :error "cancelled"}
+          :else {:status "failed" :exit-code exit :error (str "exited with code " exit)})))))
+
+(defn- cancel-requested? [d id]
+  (boolean (get (or (read-job d id) {}) "cancel_requested")))
+
+(defn- run-step [d id seq spec cap secrets]
+  (let [er (step-env d id spec secrets)]
+    (if (contains? er :error)
+      {:status "failed" :exit-code nil :error (:error er)}
+      (exec-step spec (:ok er)
+                 (fn [line] (cap-line! cap seq (get spec "id") (get spec "outputLimit") line))
+                 (fn [n] (cap-guard! cap seq (get spec "id") n))
+                 (fn [pgid] (update-job! d id (fn [j] (update-step j seq (fn [s] (assoc s "pid" pgid "pgid" pgid))))))
+                 (fn [] (cancel-requested? d id))))))
+
+(defn- open-events [d id]
+  (let [p (events-path d id)
+        r (erlang/apply :file :open (list p (to-list [:append :raw :binary])))]
+    (when-not (= :ok (erlang/element 1 r)) (throw (ex-info (str "cannot open events: " p) {})))
+    (File/chmod! p 384)
+    (erlang/element 2 r)))
+
+(defn run-job [d id]
+  (let [job (read-job d id)]
+    (when job
+      (let [specs (get job "steps_spec")
+            secrets (atom #{})
+            fh (open-events d id)
+            counter (atom 0)
+            sink (fn [row]
+                   (let [n (swap! counter inc)]
+                     (erlang/apply :file :write
+                                   (list fh (str (json {:seq n :time (:time row) :step (:step row)
+                                                        :stream (:stream row) :text (:text row)})
+                                                 "\n")))))
+            cap (make-capture sink secrets)]
+        (File/mkdir_p! (str d "/tmp/" id))
+        (File/chmod! (str d "/tmp/" id) 448)
+        (let [[status error exit-code]
+              (loop [i 0 specs (seq specs)]
+                (if (nil? specs)
+                  ["succeeded" nil 0]
+                  (if (cancel-requested? d id)
+                    ["cancelled" "cancelled before step started" nil]
+                    (let [spec (first specs)]
+                      (update-job! d id (fn [j] (update-step j i (fn [s] (assoc s "status" "running" "started_at" (iso-now))))))
+                      (let [result (try (run-step d id i spec cap secrets)
+                                        (catch e {:status "failed" :exit-code nil
+                                                  :error (str "runner error: " (ex-message e))}))]
+                        (update-job! d id
+                                     (fn [j] (update-step j i
+                                                          (fn [s] (assoc s "status" (:status result)
+                                                                         "finished_at" (iso-now)
+                                                                         "exit_code" (:exit-code result)
+                                                                         "error" (:error result)
+                                                                         "output_bytes" (cap-step-bytes cap i)
+                                                                         "truncated" (cap-step-trunc? cap i))))))
+                        (cond
+                          (= "succeeded" (:status result)) (recur (inc i) (next specs))
+                          (= "cancelled" (:status result)) ["cancelled" (:error result) (:exit-code result)]
+                          :else ["failed" (:error result) (:exit-code result)]))))))
+              [status error exit-code]
+              (if (and (= status "succeeded") (cancel-requested? d id))
+                ["cancelled" "cancelled at completion boundary" nil]
+                [status error exit-code])]
+          (try (erlang/apply :file :close (list fh)) (catch e nil))
+          (settle! d id status error exit-code (boolean (cap-any-trunc? cap))))))))
+
+;; ── Worker spawn / entry ────────────────────────────────────────────────────
+
+;; Fixed shell literals; every value is a positional parameter, never
+;; interpolated. Outer: $0=LOG $1=setsid $2…=argv. The inner shell is the
+;; session leader; it prints its pid, then becomes the worker (exec).
+(def spawn-script
+  (str "S=\"$1\"; shift; \"$S\" /bin/sh -c "
+       "'echo $$; exec \"$@\" </dev/null >/dev/null 2>>\"$0\"' \"$0\" \"$@\" &"))
+
+(defn- read-spawned-pid [port]
+  (loop [acc ""]
+    (let [i (index-of acc "\n")]
+      (if (and (some? i) (>= i 0))
+        (try (erlang/binary_to_integer (String/trim (subs acc 0 i)))
+             (catch e (throw (ex-info "worker pid unreadable" {}))))
+        (receive
+          [p [:data dd]] :when (== p port) (recur (str acc dd))
+          [p [:exit_status c]] :when (== p port)
+          (throw (ex-info "worker launcher exited before reporting a pid" {}))
+          (after 10000 (throw (ex-info "worker launcher timed out" {}))))))))
+
+(defn worker-env
+  "A detached pinned runtime must not inherit its parent's checkout/boot
+   paths or ambient credentials. Steps load their scoped envFile separately."
+  []
+  (let [env (reduce (fn [acc key]
+                      (let [value (System/get_env key)]
+                        (if value (assoc acc key value) acc)))
+                    (assoc (rt/step-env) "BL_DAEMON" "off")
+                    ; The worker late-binds credentials through the desktop
+                    ; keyring. These locate that session; they are not tokens.
+                    ["DBUS_SESSION_BUS_ADDRESS" "XDG_RUNTIME_DIR"])
+        bl (rt/bl-bin)]
+    (if bl (assoc env "FOUNDRY_BL" bl) env)))
+
+(defn spawn-worker!
+  "Start a detached worker for `job-id`; → its pid. Throws when it cannot."
+  [d job-id nonce]
+  (let [setsid (x/tool "setsid")
+        log (str d "/logs/" job-id ".worker.log")
+        env (worker-env)
+        argv (concat [x/env-bin "-i"]
+                     (map (fn [k] (str k "=" (get env k))) (sort (keys env)))
+                     (rt/script-argv (rt/script-path "bin/jobs.bl")
+                       ["--state" d "worker" "--id" job-id "--nonce" nonce]))]
+    (when (nil? setsid) (throw (ex-info "setsid (util-linux) is not installed" {})))
+    (File/mkdir_p! (str d "/logs"))
+    (when-not (File/exists? log) (File/write! log "") (File/chmod! log 384))
+    (let [port (erlang/open_port
+                 (tuple :spawn_executable (chars "/bin/sh"))
+                 (to-list [:binary :exit_status :use_stdio
+                           (tuple :args (to-list (map chars (concat ["-c" spawn-script log setsid] argv))))]))]
+      (try (read-spawned-pid port)
+           (finally (try (erlang/port_close port) (catch e nil)))))))
+
+(defn- record-spawn! [d id pid]
+  (update-job! d id
+    (fn [j]
+      ;; The detached launcher may return after the worker claims the job.
+      ;; Only a queued row can name the launcher; preserve a claimed worker's
+      ;; actual process identity and a terminal row's final observation.
+      (if (= "queued" (get j "status"))
+        (assoc j "worker_pid" pid "worker_ticks" (proc-start-ticks pid)
+                 "spawn_count" (inc (get j "spawn_count" 0))
+                 "updated_at" (iso-now))
+        j))))
+
+(defn cmd-worker [d args]
+  (let [id (get args "id") nonce (get args "nonce")
+        now (iso-now)
+        pid (os-pid)
+        claimed (with-mutex d
+                  (fn []
+                    (let [j (read-job d id)]
+                      (when (and j (= "queued" (get j "status")) (= nonce (get j "worker_nonce")))
+                        (write-job! d (assoc j "status" "running"
+                                             "started_at" (or (get j "started_at") now)
+                                             "updated_at" now "worker_pid" pid
+                                             "worker_ticks" (proc-start-ticks pid)))
+                        true))))]
+    (if-not claimed
+      {:ok true :value {:skipped true :reason "job is not queued for this worker"}}
+      (do (run-job d id)
+          {:ok true :value {:job id :status "settled"}}))))
+
+;; ── Commands ────────────────────────────────────────────────────────────────
+
+(defn- load-request [args]
+  (let [payload (if (get args "request-file")
+                  (try (File/read! (get args "request-file"))
+                       (catch e (refuse (str "request file cannot be read: " (get args "request-file")))))
+                  (get args "request"))]
+    (try (Jason/decode! payload)
+         (catch e (refuse (str "request is not valid JSON: " (ex-message e)))))))
+
+(defn cmd-submit [d args]
+  (let [normalized (validate-request (load-request args))
+        digest (request-digest normalized)
+        key (get normalized "idempotencyKey")
+        target (get normalized "target")
+        now (iso-now)
+        job-id (str "job_" (rand-hex 8))
+        nonce (rand-hex 16)
+        existing
+        (with-mutex d
+          (fn []
+            (let [kp (key-path d key)
+                  prior (when (File/exists? kp) (String/trim (File/read! kp)))
+                  prior-job (when prior (read-job d prior))]
+              (if prior-job
+                (do (when-not (= digest (get prior-job "request_digest"))
+                      (refuse (str "idempotency key " (pyrepr key) " was reused with a different request")))
+                    (get prior-job "id"))
+                (let [lp (lock-path d target)
+                      holder (when (File/exists? lp) (String/trim (File/read! lp)))
+                      holder-job (when holder (read-job d holder))]
+                  (when (and holder-job (not (terminal? (get holder-job "status"))))
+                    (refuse (str "target " (pyrepr target) " is locked by job " holder)))
+                  (when (File/exists? lp) (File/rm_rf lp))
+                  (write-job! d {"id" job-id "idempotency_key" key "request_digest" digest
+                                 "plan_id" (get normalized "planId") "target" target
+                                 "kind" (get normalized "kind") "status" "queued"
+                                 "created_at" now "started_at" nil "finished_at" nil
+                                 "exit_code" nil "error" nil
+                                 "steps_spec" (get normalized "steps")
+                                 "steps" (to-list (map (fn [_] (fresh-step)) (get normalized "steps")))
+                                 "cancel_requested" false "truncated" false
+                                 "worker_pid" nil "worker_ticks" nil "worker_nonce" nonce
+                                 "spawn_count" 0 "updated_at" now})
+                  (write-private! kp job-id)
+                  (write-private! lp job-id)
+                  nil)))))]
+    (if existing
+      {:ok true :value (job-record d existing)}
+      (let [spawned (try {:pid (spawn-worker! d job-id nonce)}
+                         (catch e {:error (ex-message e)}))]
+        (if (contains? spawned :error)
+          (do (settle! d job-id "failed" (str "worker spawn failed: " (:error spawned)) nil)
+              (refuse (str "worker spawn failed: " (:error spawned))))
+          (do (record-spawn! d job-id (:pid spawned))
+              {:ok true :value (job-record d job-id)}))))))
+
+(defn cmd-run-once [d args]
+  "Foreground diagnostic run: no ledger rows, no target lock."
+  (let [normalized (validate-request (load-request args) true)
+        tmp-root (str d "/tmp")
+        tmpdir (str tmp-root "/once_" (rand-hex 6))
+        secrets (atom #{})]
+    (File/mkdir_p! tmpdir)
+    (File/chmod! tmpdir 448)
+    (try
+      (loop [i 0 specs (seq (get normalized "steps")) status "succeeded" out []]
+        (if (nil? specs)
+          {:ok true :value {:target (get normalized "target") :kind (get normalized "kind")
+                            :status status :steps (to-list out)}}
+          (let [spec (first specs)
+                events (atom [])
+                cap (make-capture (fn [row] (swap! events conj {:stream (:stream row) :text (:text row)}))
+                                  secrets (min max-job-event-bytes (get spec "outputLimit")))
+                er (step-env d "" (assoc-in spec ["env"] (get spec "env")) secrets)
+                result (if (contains? er :error)
+                         {:status "failed" :exit-code nil :error (:error er)}
+                         (exec-step spec (assoc (:ok er) "TMPDIR" tmpdir)
+                                    (fn [line] (cap-line! cap i (get spec "id") (get spec "outputLimit") line))
+                                    (fn [n] (cap-guard! cap i (get spec "id") n))
+                                    (fn [pgid] nil)
+                                    (fn [] false)))
+                row {:id (get spec "id") :label (get spec "label") :status (:status result)
+                     :exitCode (:exit-code result) :error (:error result)
+                     :events (to-list @events) :truncated (cap-step-trunc? cap i)}
+                out (conj out row)]
+            (if (= "succeeded" (:status result))
+              (recur (inc i) (next specs) status out)
+              {:ok true :value {:target (get normalized "target") :kind (get normalized "kind")
+                                :status (if (= "timed_out" (:status result)) "timed_out" "failed")
+                                :steps (to-list out)}}))))
+      (finally (File/rm_rf tmpdir)))))
+
+(defn cmd-list [d args]
+  (let [jobs (vec (filter some? (map (fn [id] (read-job d id)) (job-ids d))))
+        ordered (reverse (sort-by (fn [j] (str (get j "created_at") "\u0000" (get j "id"))) jobs))]
+    {:ok true :value {:jobs (to-list (map job-summary ordered))}}))
+
+(defn cmd-lookup [d args]
+  (let [key (get args "key")]
+    (when-not (rx? key-re key) (refuse "invalid operation key"))
+    (let [p (key-path d key)
+          id (when (File/exists? p) (String/trim (File/read! p)))]
+      {:ok true :value (when id (job-record d id))})))
+
+(defn kill-orphan-step!
+  "A dead worker leaves its step's session alive; only kill a verified match."
+  [d id]
+  (let [j (read-job d id)]
+    (doseq [pair (map (fn [a b] [a b]) (get j "steps_spec") (get j "steps"))]
+      (let [spec (first pair) s (second pair) pgid (get s "pgid")]
+        (when (and (= "running" (get s "status")) (int? pgid))
+          (let [c (proc-cmdline pgid)]
+            (when (and (string? c) (String/contains? c (first (get spec "argv"))))
+              (x/kill-group! pgid))))))))
+
+(defn reconcile-job
+  "Verify one non-terminal job against its worker's real identity."
+  [d id resume]
+  (let [row (read-job d id)]
+    (if (or (nil? row) (terminal? (get row "status")))
+      {:id id :previousStatus (get row "status") :status (get row "status") :action "none"}
+      (let [previous (get row "status")]
+        (cond
+          (= previous "queued")
+          (cond
+            (worker-alive? row) {:id id :previousStatus previous :status "queued" :action "starting"}
+            (>= (get row "spawn_count" 0) 3)
+            (do (settle! d id "failed" "worker could not be started after repeated attempts" nil)
+                {:id id :previousStatus previous :status "failed" :action "failed"})
+            resume
+            (let [r (try {:pid (spawn-worker! d id (get row "worker_nonce"))}
+                         (catch e {:error (ex-message e)}))]
+              (if (contains? r :error)
+                (do (settle! d id "failed" (str "worker spawn failed: " (:error r)) nil)
+                    {:id id :previousStatus previous :status "failed" :action "failed"})
+                (do (record-spawn! d id (:pid r))
+                    {:id id :previousStatus previous :status "queued" :action "resumed"})))
+            :else {:id id :previousStatus previous :status "queued" :action "awaiting-runner"})
+
+          (worker-alive? row)
+          (if (= previous "reconciling")
+            (do (update-job! d id (fn [j] (assoc j "status" "running" "updated_at" (iso-now))))
+                {:id id :previousStatus "reconciling" :status "running" :action "reattached"})
+            {:id id :previousStatus previous :status previous :action "reattached"})
+
+          :else
+          (do (update-job! d id (fn [j] (assoc j "status" "reconciling" "updated_at" (iso-now))))
+              (kill-orphan-step! d id)
+              (settle! d id "interrupted"
+                       (if (get row "cancel_requested")
+                         "worker exited while cancellation was pending; step outcome unknown"
+                         "worker exited before the job completed; step outcome unknown")
+                       nil)
+              {:id id :previousStatus previous :status "interrupted" :action "interrupted"}))))))
+
+(defn cmd-status [d args]
+  (let [id (get args "id") row (read-job d id)]
+    (when (nil? row) (refuse (str "unknown job: " id)))
+    (when (and (not (terminal? (get row "status"))) (not (worker-alive? row)))
+      (reconcile-job d id false))
+    {:ok true :value (job-record d id)}))
+
+(defn cmd-events [d args]
+  (let [cursor (bounded-int (get args "cursor" 0) "cursor" 0 9007199254740992)
+        limit (bounded-int (get args "limit" default-cursor-limit) "limit" 1 max-cursor-limit)
+        id (get args "id")
+        row (read-job d id)]
+    (when (nil? row) (refuse (str "unknown job: " id)))
+    (let [p (events-path d id)
+          lines (if (File/exists? p) (vec (butlast (String/split (File/read! p) "\n"))) [])
+          picked (take limit (drop cursor lines))
+          events (to-list (map (fn [l] (Jason/decode! l)) picked))]
+      {:ok true :value {:events events
+                        :nextCursor (if (seq events) (get (last events) "seq") cursor)
+                        :truncated (boolean (get row "truncated"))}})))
+
+(defn cmd-cancel [d args]
+  (let [id (get args "id") row (read-job d id)]
+    (when (nil? row) (refuse (str "unknown job: " id)))
+    (if (terminal? (get row "status"))
+      {:ok true :value (job-record d id)}
+      (do
+        (update-job! d id (fn [j] (assoc j "cancel_requested" true "updated_at" (iso-now))))
+        (if-not (worker-alive? row)
+          (do (if (= "queued" (get row "status"))
+                (settle! d id "cancelled" "cancelled before start" nil)
+                (do (kill-orphan-step! d id)
+                    (settle! d id "interrupted"
+                             "worker exited while cancellation was pending; step outcome unknown" nil)))
+              {:ok true :value (job-record d id)})
+          (let [cur (read-job d id)
+                pair (first (filter (fn [p] (= "running" (get (second p) "status")))
+                                    (map (fn [a b] [a b]) (get cur "steps_spec") (get cur "steps"))))
+                deferred (atom true)]
+            (when pair
+              (let [spec (first pair) pgid (get (second pair) "pgid")]
+                (when (and (get spec "cancellable") (int? pgid))
+                  (reset! deferred false)
+                  (x/term-group! pgid)
+                  (Process/sleep 500)
+                  (x/kill-group! pgid))))
+            (update-job! d id (fn [j] (if (not= "running" (get j "status"))
+                                        j
+                                        (assoc j "status" "cancelling" "updated_at" (iso-now)))))
+            {:ok true :value (assoc (job-record d id) :cancelDeferred @deferred)}))))))
+
+(defn cmd-recover [d args]
+  (let [jobs (filter (fn [j] (member? (get j "status") non-terminal-statuses))
+                     (filter some? (map (fn [id] (read-job d id)) (job-ids d))))
+        ordered (sort-by (fn [j] (str (get j "created_at") "\u0000" (get j "id"))) jobs)]
+    {:ok true :value {:reconciled (to-list (map (fn [j] (reconcile-job d (get j "id") true)) ordered))}}))
+
+;; ── Entry point ─────────────────────────────────────────────────────────────
+
+(def global-flags {"--state" "state" "--env" "env"})
+
+(def command-flags
+  {"state-root" {}
+   "submit" {"--request" ["request" :s] "--request-file" ["request-file" :s]}
+   "run-once" {"--request" ["request" :s] "--request-file" ["request-file" :s]}
+   "list-jobs" {}
+   "lookup" {"--key" ["key" :s]}
+   "recover" {}
+   "status" {"--id" ["id" :s]}
+   "events" {"--id" ["id" :s] "--cursor" ["cursor" :i] "--limit" ["limit" :i]}
+   "cancel" {"--id" ["id" :s]}
+   "worker" {"--id" ["id" :s] "--nonce" ["nonce" :s]}})
+
+(defn- usage [msg] (throw (ex-info msg {"usage" true})))
+
+(defn parse-argv
+  "→ {:global {state env} :command c :args {…}}; throws a usage error."
+  [argv]
+  (let [xs (vec (filter (fn [a] (not= a "--")) (to-list argv)))]
+    (loop [i 0 g {}]
+      (let [a (get xs i)]
+        (cond
+          (nil? a) (usage "a command is required")
+          (contains? global-flags a)
+          (if (< (inc i) (count xs))
+            (recur (+ i 2) (assoc g (get global-flags a) (nth xs (inc i))))
+            (usage (str a " needs a value")))
+          (contains? command-flags a)
+          (let [flags (get command-flags a)]
+            (loop [j (inc i) args {}]
+              (let [f (get xs j)]
+                (cond
+                  (nil? f)
+                  (do (doseq [req (cond (member? a ["status" "cancel"]) ["id"]
+                                        (= a "events") ["id"]
+                                        (= a "worker") ["id" "nonce"]
+                                        :else [])]
+                        (when-not (contains? args req) (usage (str "--" req " is required"))))
+                      {:global g :command a :args args})
+                  (not (contains? flags f)) (usage (str "unrecognized argument " f))
+                  (nil? (get xs (inc j))) (usage (str f " needs a value"))
+                  :else
+                  (let [[k ty] (get flags f)
+                        raw (nth xs (inc j))]
+                    (when (contains? args k) (usage (str f " given twice")))
+                    (when (and (= ty :i) (not (rx? "^-?[0-9]+\\z" raw)))
+                      (usage (str f ": invalid int value: " (pyrepr raw))))
+                    (recur (+ j 2) (assoc args k (if (= ty :i) (erlang/binary_to_integer raw) raw))))))))
+          :else (usage (str "unrecognized argument " a)))))))
+
+(defn- fail-line [msg code]
+  (cli/emit! {:ok false :error msg})
+  (System/halt code))
+
+(defn- msg-of [e]
+  (let [m (try (ex-message e) (catch e2 nil))]
+    (if (and (string? m) (not= "" m)) m (str e))))
+
+(defn- flag-of [e k] (try (boolean (get (ex-data e) k)) (catch e2 false)))
+
+(defn- dispatch [command d args]
+  (cond
+    (= command "submit") (cmd-submit d args)
+    (= command "run-once") (cmd-run-once d args)
+    (= command "list-jobs") (cmd-list d args)
+    (= command "lookup") (cmd-lookup d args)
+    (= command "status") (cmd-status d args)
+    (= command "events") (cmd-events d args)
+    (= command "cancel") (cmd-cancel d args)
+    (= command "recover") (cmd-recover d args)
+    (= command "worker") (cmd-worker d args)))
+
+(defn run-main! [argv]
+  (try
+    (let [p (parse-argv argv)
+          g (:global p) command (:command p) args (:args p)
+          env (or (get g "env") (env-var "FOUNDRY_ENV") "production")]
+      (cond
+        (= command "state-root")
+        (do (cli/emit! {:ok true :root (default-state-root env)}) (System/halt 0))
+        (and (member? command ["submit" "run-once"])
+             (not (get args "request")) (not (get args "request-file")))
+        (fail-line (str command " requires --request or --request-file") 1)
+        :else
+        (let [d (state-dir (get g "state") env)
+              result (dispatch command d args)]
+          (when-not (= command "worker")
+            (cli/emit! {:ok true :value (:value result)}))
+          (System/halt 0))))
+    (catch e
+      (cond
+        (flag-of e "usage") (fail-line (msg-of e) 2)
+        (flag-of e "request") (fail-line (msg-of e) 1)
+        :else (fail-line (str "runner failure: " (msg-of e)) 1)))))
+
+; Library calls share exactly the CLI parser, ledger mutex and reconciliation.
+; Requiring this namespace never starts work or interprets the caller's argv.
+(defn invoke! [argv]
+  (try
+    (let [p (parse-argv argv) g (:global p) command (:command p)
+          env (or (get g "env") (env-var "FOUNDRY_ENV") "production")]
+      (if (= command "state-root")
+        {:ok true :value {:root (default-state-root env)}}
+        (dispatch command (state-dir (get g "state") env) (:args p))))
+    (catch e {:ok false :error (msg-of e)})))

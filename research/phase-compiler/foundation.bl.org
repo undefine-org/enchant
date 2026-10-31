@@ -1,0 +1,200 @@
+#+TITLE: Build tomorrow's compiler without replacing today's
+
+* Two worlds, one compiler
+
+A compiler must use macros to compile the next version of those same macros.
+Give each binding an owner: the authenticated preceding generation supplies
+the selected Core/Sugar transformers; selected source supplies candidate
+definitions and their helpers. A name such as =core/cond= can occur in both
+worlds. Its spelling alone does not identify its binding.
+
+The producer uses the real Reader, Compiler and AOT backend. Macro bodies and
+compile-time values run through a bounded ANF constructor. The preceding
+generation contributes authenticated recipes, rather than calls through a
+mutable public macro binding. Each expansion gets a temporary frame; the
+workspace retains the aggregate execution and allocation budget.
+
+The API separates selection, preparation, emission and verification:
+
+| Operation | Result |
+|-----------+--------|
+| =AOT/open_workspace= | Frozen source selection and a process-local handle |
+| =AOT/prepare_unit= | Complete plans, source-world identity and phase-world identity |
+| =AOT/prepare_host_unit= | Plans for an exact native module and its declared ABI |
+| =AOT/emit_unit= | BEAM bytes and a manifest, written last |
+| =AOT/verify_unit= | Bounded, hash-checked complete unit bytes |
+| =AOT/close_workspace!= | Release the workspace |
+
+Use quoted namespace symbols, such as ='core=. Files are explicit selections.
+Preparation reads their frozen bytes and checks them again before emission.
+World identities describe compiler inputs and phase providers. A prepared
+world identity is data; the emitted unit manifest currently records source
+digests and module membership, rather than the complete world descriptor.
+
+* A macro can compute tomorrow's function today
+
+Run these cells from the repository root:
+
+#+begin_example
+./bin/bl --cold doc run research/phase-compiler/foundation.bl.org
+#+end_example
+
+The temporary source computes a value, uses it inside a macro, and emits a
+function returning 42. Its initializer stays deferred. The cell owns and
+removes its temporary directory and closes its workspace on every exit.
+
+#+begin_src beam-lisp :id computed-function
+(ns phase.foundation.walkthrough)
+
+(let [directory (Path/join (System/tmp_dir!)
+                  (str "phase-foundation-" (System/unique_integer (list :positive))))
+      file (Path/join directory "example.bl")
+      _ (File/mkdir_p! directory)
+      _ (File/write! file
+          "(ns phase.foundation.example)\n(def half (+ 20 1))\n(defmacro make-answer [] (list 'defn 'answer [] (+ half half)))\n(make-answer)\n(Process/put :phase-foundation-initialized true)\n")
+      workspace (BeamLisp.AOT/open_workspace
+                  {:version 2 :phase-imports (list 'core 'sugar)
+                   :sources (list {:namespace 'phase.foundation.example :file file})} {})]
+  (try
+    (let [prepared (BeamLisp.AOT/prepare_unit workspace 'phase.foundation.example)
+          clause (elem (first (get (:definitions (first (:plans prepared))) "answer")) 3)
+          output (Path/join directory "unit")
+          emitted (BeamLisp.AOT/emit_unit prepared output)
+          verified (BeamLisp.AOT/verify_unit output)]
+      (assert (= 42 (get-in clause [:body :val])))
+      (assert (= emitted (:manifest verified)))
+      (assert (= false (:native-admission verified)))
+      (assert (nil? (Process/get :phase-foundation-initialized)))
+      (assert (= false (erlang/module_loaded :Elixir.BeamLisp.Ns.Phase.Foundation.Example)))
+      {:answer 42 :complete-unit true :initializer :deferred :target-loaded false})
+    (finally
+      (BeamLisp.AOT/close_workspace! workspace)
+      (File/rm_rf! directory))))
+#+end_src
+#+RESULTS: computed-function
+: {:initializer :deferred, :answer 42, :complete-unit true, :target-loaded false}
+
+
+* Bootstrap is the same operation on real compiler source
+
+Here =rt.bl= is the candidate runtime. Core/Sugar transformers belong to the
+preceding phase, so they do not need a partially replaced runtime to expand.
+The running runtime's module identity and namespace generation stay fixed.
+
+#+begin_src beam-lisp :id bootstrap-runtime
+(let [directory (Path/join (System/tmp_dir!)
+                  (str "phase-runtime-" (System/unique_integer (list :positive))))
+      module :Elixir.BeamLisp.Ns.Rt
+      before (erlang/apply module :module_info (list :md5))
+      generations (BeamLisp.Env/namespace_generations (list "rt"))
+      workspace (BeamLisp.AOT/open_workspace
+                  {:version 2 :phase-imports (list 'core 'sugar)
+                   :sources (list {:namespace 'rt
+                                   :file (Path/join (BeamLisp.Tiers/priv_root) "boot/rt.bl")})} {})]
+  (try
+    (let [prepared (BeamLisp.AOT/prepare_unit workspace 'rt)
+          emitted (BeamLisp.AOT/emit_unit prepared directory)
+          verified (BeamLisp.AOT/verify_unit directory)]
+      (assert (= :kernel-phase-world (get-in prepared [:phase-world :kind])))
+      (assert (= :source-compilation-world (get-in prepared [:world :kind])))
+      (assert (= before (erlang/apply module :module_info (list :md5))))
+      (assert (= generations (BeamLisp.Env/namespace_generations (list "rt"))))
+      (assert (= emitted (:manifest verified)))
+      {:namespace 'rt :running-runtime :unchanged :complete-unit true})
+    (finally
+      (BeamLisp.AOT/close_workspace! workspace)
+      (File/rm_rf! directory))))
+#+end_src
+#+RESULTS: bootstrap-runtime
+: {:namespace rt, :complete-unit true, :running-runtime :unchanged}
+
+
+* The host ABI is an explicit target
+
+Pinned hosts use the same workspace and constructor. For example, select
+=priv/host/compiler_data.bl= under ='host.compiler-data=, then call:
+
+#+begin_example
+(BeamLisp.AOT/prepare_host_unit workspace
+  {:namespace 'host.compiler-data :module :Elixir.BeamLisp.CompilerData})
+#+end_example
+
+The spec also accepts =:struct-fields=, =:macro-exports= and =:behaviour=.
+The canonical inventory is =seed/host-sources=; generation assembly must carry
+these exact options through. A host unit contains the named native module.
+A namespace unit contains every emitted body, forwarder, macro companion
+and deferred initializer listed by its compiler plans.
+
+* A generation has one producer
+
+=seed/produce-artifacts= owns the operation from canonical source selection
+through complete assembly. It reads the physical project's app declaration,
+prepares all boot units and each exact =seed/host-sources= target, verifies
+their bytes, and checks the resulting boot membership and source provenance.
+An aggregate input check catches an earlier unit's source changing while a
+later unit is being prepared. A private sibling directory receives the files
+and manifest before the complete generation is renamed into place.
+
+#+begin_example
+(ns compiler.builder (:require [seed]))
+(seed/produce-artifacts {:out "/tmp/my-new-compiler"})
+#+end_example
+
+The output must be absent. A per-output lock excludes participating producers.
+Refusals preserve existing output and stages belonging to other producers.
+The API returns unit receipts with their exact host targets and world IDs;
+fresh-boot and self-reproduction qualification initially remain false.
+The operation uses one VM, and never falls back to host source evaluation or
+reuses host bytes from the running floor.
+
+The executable qualification driver checks the next boundary:
+
+#+begin_example
+scripts/qualify-artifact-generation --out /tmp/my-compiler-proof
+#+end_example
+
+Run it under the memory/process-tree cap described in the script. Compiler A
+produces B. B must pass the official fresh-application and execution-descriptor
+gate. A fresh process running B then produces C; C must pass the same gate.
+Finally, every generated file must match byte-for-byte. Each process owns a
+private source image and cache. The checkout's bootstrap floor stays in place.
+
+The [[../execution-protocol-audit/generation-reproduction-checks.json][generation receipt]] records a passing B/C run: 85 units and 122 modules per
+generation, both fresh boots passing, all 124 generated files identical.
+Production takes about 91–95 seconds per generation on the recorded host.
+
+* Identity has two jobs
+
+A compilation receipt answers /which exact inputs produced this candidate?/
+A binding key answers /which declaration does this identifier mean?/
+The current =:world= and =:phase-world= IDs answer the first question: they
+include physical preceding-generation provider hashes. All 85 IDs change
+between the recorded B and C receipts, while B and C's emitted files match.
+The receipts live beside the candidates, outside their executable artifacts.
+
+The contextual frontend therefore needs a separate canonical binding identity
+and an exact artifact attestation. Self/relative references inside a phase
+bundle must be canonical before attaching the container's physical hash.
+Embedding each preceding container hash into its successor's binding keys
+would make the next hash change again. The binding migration has an explicit
+identity-convergence gate before those keys enter emitted code.
+
+* What this foundation establishes
+
+Preparation does not publish candidate code. Verification checks hashes,
+module names, bounds and exact directory membership. Activation and native
+admission remain separate responsibilities. Complete-generation assembly,
+fresh boot and generation-to-generation reproduction are distinct checks.
+
+The producer covers 13 boot units and 72 pinned hosts: 122 modules. The
+[[../execution-protocol-audit/phase-producer-checks.json][unit verification receipt]] records the individual production checks; the
+generation receipt records fresh B/C boot and complete reproduction.
+The broader [[../../!tasks/plans/PLAN-phase-aware-language-and-execution.org][architecture plan]] adds contextual
+syntax and binding resolution, finite phase/ownership analyses, and an
+enforced native execution protocol. Those are separate milestones; this
+foundation supplies their compiler-world boundary.
+
+The next chapter, [[./contextual-bindings.bl.org][Same spelling, different bindings]], demonstrates the
+contextual syntax/binding core and phase-shifted public imports. Those APIs
+are implemented in the source tier; their production Compiler adapters remain
+the next integration gate.

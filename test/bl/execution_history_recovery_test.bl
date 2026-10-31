@@ -1,0 +1,80 @@
+(ns execution.history-recovery-test)
+
+(defn- helper! [source namespace]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source "scripts/regenerate-seed.bl")
+               #(and (= "defn-" (BeamLisp.AOT/stage-head %))
+                     (= "load-fresh-hosts!" (BeamLisp.AOT/stage-symbol
+                                            (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 1 (count forms)) (throw :history-recovery-helper-changed))
+  (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+  (BeamLisp.Compiler/eval_form (first forms) (BeamLisp.Compiler/new_env namespace))
+  (BeamLisp.Env/fetch_exact! namespace "load-fresh-hosts!")))
+
+(defn- binary! [module function body]
+ (let [forms (list (tuple :attribute 1 :module module)
+                  (tuple :attribute 1 :export (list (tuple function 0)))
+                  (tuple :function 1 function 0 (list (tuple :clause 1 (list) (list) (list body)))))
+       compiled (compile/forms forms (list :binary :return))]
+  (when-not (= :ok (elem compiled 0)) (throw :history-cohort-fixture-compile-failed))
+  (elem compiled 2)))
+
+(defn- probe [action caller dependency corrupt?]
+ (let [root (Path/join (System/tmp_dir!) (str "history-cohort-" (erlang/unique_integer (list :positive))))
+       call (fn [name] (tuple :call 1 (tuple :remote 1 (tuple :atom 1 dependency) (tuple :atom 1 name)) (list)))
+       old-dependency (binary! dependency :old (tuple :integer 1 1))
+       old-caller (binary! caller :value (call :old))
+       new-caller (binary! caller :value (call :next))
+       new-dependency (binary! dependency :next (tuple :integer 1 42))
+       a (Path/join root "caller.beam") b (Path/join root "dependency.beam")]
+  (File/mkdir_p! root)
+  (try
+   (when (or (erlang/module_loaded caller) (erlang/module_loaded dependency))
+    (throw :history-private-module-already-loaded))
+   (code/load_binary dependency (String/to_charlist b) old-dependency)
+   (code/load_binary caller (String/to_charlist a) old-caller)
+   (File/write! a new-caller)
+   (File/write! b (if corrupt? "not a BEAM" new-dependency))
+   (let [before (erlang/apply caller :module_info (list :md5))
+         result (try
+                 (action (list (tuple caller a) (tuple dependency b)
+                               ;; Existing native facade must not be read or loaded.
+                               (tuple :Elixir.BeamLisp.LazyMemo (Path/join root "absent-nif-facade.beam"))))
+                 (catch error (:kind (ex-data error))))
+         after (erlang/apply caller :module_info (list :md5))
+         value (try (erlang/apply caller :value (list)) (catch _ :entry-failed))]
+    {:result result :before before :after after :value value})
+   (finally
+    ;; Only these two private fixture modules are ever purged.
+    (doseq [module (list caller dependency)] (code/purge module) (code/delete module) (code/purge module))
+    (File/rm_rf! root)))))
+
+(deftest E22-recovery-cohort-cannot-publish-a-partial-host-abi
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       source (File/read! (Path/join root "scripts/regenerate-seed.bl"))
+       before "(code/atomic_load loads)"
+       after "(Enum/reduce loads :ok (fn [entry _] (code/load_binary (elem entry 0) (elem entry 1) (elem entry 2)) :ok))"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       native-before (erlang/apply :Elixir.BeamLisp.LazyMemo :module_info (list :md5))]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-recovery-anchor-changed))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal (helper! source "history.recovery.good")
+           mutated (String/replace source before after)
+           mutant (helper! mutated "history.recovery.mutant")
+           refused (probe normal :Elixir.HistoryCohortRefusedCaller :Elixir.HistoryCohortRefusedDependency true)
+           partial (probe mutant :Elixir.HistoryCohortPartialCaller :Elixir.HistoryCohortPartialDependency true)
+           accepted (probe normal :Elixir.HistoryCohortAcceptedCaller :Elixir.HistoryCohortAcceptedDependency false)]
+      (println :history-E22 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                            :mutant-sha256 (Base/encode16 (crypto/hash :sha256 mutated))})
+      (is (= :bootstrap-host-cohort-refused (:result refused)))
+      (is (= (:before refused) (:after refused)))
+      (is (= 1 (:value refused)))
+      (is (= :ok (:result partial)))
+      (is (not= (:before partial) (:after partial)))
+      (is (= :entry-failed (:value partial)))
+      (is (= :ok (:result accepted)))
+      (is (= 42 (:value accepted)))
+      (is (= native-before (erlang/apply :Elixir.BeamLisp.LazyMemo :module_info (list :md5)))))))
+   (finally (BeamLisp.Env/destroy scope)))))

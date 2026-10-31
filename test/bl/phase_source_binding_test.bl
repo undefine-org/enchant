@@ -1,0 +1,66 @@
+(ns phase-source-binding-test (:require [compiler :as compiler]))
+(defn- form [text] (first (BeamLisp.Reader/read_string text "phase-source-binding.bl")))
+
+(defn- in-source-scope [action]
+ ;; A native compiler component control, using actual selected SDK Source and
+ ;; its original kernel proof. It grants no application or SDK emission origin.
+ (let [previous (BeamLisp.Env/capture) prior (Process/get :bl_sdk_constructor_context)
+       _ (when (or (:generation previous) (:application-identity previous))
+           (erlang/error :requires-native-compiler-scope))
+       path (BeamLisp.Loader/source_path "core")
+       input (BeamLisp.AOT/constructor_source_input! "core" path (BeamLisp.Loader/read_source path))
+       scope (BeamLisp.Env/fork :global)]
+  (try
+   (BeamLisp.Loader/without_initialization
+    (fn [] (BeamLisp.Env/with_env scope
+     (fn []
+      (Process/put :bl_sdk_constructor_context
+       {:input input :compiler-env scope :units {} :compiled {} :compiling #{}
+        :clauses {} :seen-macros #{} :kernel-modules #{} :kernel-leases (list)
+        :macro-steps 16384 :new-atoms 128 :expanded 0})
+      (BeamLisp.AOT/constructor_install_kernel!) (action)))))
+   (finally
+    (Enum/each (:kernel-leases (Process/get :bl_sdk_constructor_context)) #(BeamLisp.Env/release_code! %))
+    (BeamLisp.Env/destroy scope)
+    (if prior (Process/put :bl_sdk_constructor_context prior) (Process/delete :bl_sdk_constructor_context))
+    (BeamLisp.Env/bind previous)))))
+
+(deftest source-producer-records-existing-owned-references-as-exact-anf
+ (is (= :inactive (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" "str")))
+ (in-source-scope
+  (fn []
+   (let [inherited (compiler/compile (form "str") (compiler/new-env "clojure.string"))
+         local (compiler/compile (form "join") (compiler/new-env "clojure.string"))]
+    (is (= :global (:op inherited)))
+    (is (= ["core" "str" :exact] [(:ns inherited) (:name inherited) (:lookup inherited)]))
+    (is (= ["clojure.string" "join" :exact] [(:ns local) (:name local) (:lookup local)]))
+    (is (= nil (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" "missing-phase-binding")))))))
+
+(deftest source-routing-respects-exclusions-before-kernel-primitive-selection
+ (in-source-scope
+  (fn []
+   (let [unit (BeamLisp.AOT/constructor_unit! "clojure.string")
+         before (:units (BeamLisp.AOT/constructor_context!))]
+    ;; Native decision-unit fixture: reuse the real selected provider, changing
+    ;; only the header field whose capture/replay is tested above. This is not
+    ;; evidence of SDK Source emission or admission.
+    (try
+     (BeamLisp.AOT/constructor_context_put! :units
+      (assoc before "clojure.string" (assoc-in unit [:header :metadata :core-excludes] (list "str" "identity"))))
+     (is (= false (BeamLisp.AOT/constructor_core_owner? "clojure.string" "str" nil)))
+     (is (= nil (BeamLisp.AOT/constructor_source_owner_uncached "clojure.string" "identity")))
+     (is (= nil (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" "str")))
+     (is (= nil (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" "identity")))
+     (is (= true (BeamLisp.AOT/constructor_core_owner? "clojure.string" "core/str" :exact)))
+     (is (= ["clojure.string" "join"]
+            (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" "join")))
+     (finally (BeamLisp.AOT/constructor_context_put! :units before)))))))
+
+(deftest kernel-value-and-link-rows-have-one-compiler-binding-identity
+ (in-source-scope
+  (fn []
+   (doseq [name ["map" "assoc" "rem"]]
+    (is (= ["core" name]
+           (BeamLisp.AOT/sdk_constructor_binding_reference "clojure.string" name)))
+    (let [node (compiler/compile (form name) (compiler/new-env "clojure.string"))]
+     (is (= ["core" name :exact] [(:ns node) (:name node) (:lookup node)])))))))

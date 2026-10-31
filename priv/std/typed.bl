@@ -69,9 +69,8 @@
    'nil?     #{:nil}
    'list?    #{:list}
    'seq?     #{:seq :list}
-   'pos?     #{:int :float}
-   'neg?     #{:int :float}
-   'zero?    #{:int :float}
+   ; Value predicates do not claim an entire type. In particular, a false
+   ; zero?/pos?/neg? branch still contains numbers, so subtraction is unsound.
    'some?    #{:int :float :kw :string :bool :map :vec :set :fn :sym :js-object :js-array :undefined}})
 
 (defn t-diff [a b] (set (filter (fn [t] (not (contains? b t))) a)))
@@ -311,10 +310,16 @@
   (let [p (node-pos node)]
     (if (nil? p) (:__pos env) p)))
 
-(defn sym-type [env n]
-  (get env (node-name n) any))
+(defn binding-key
+  "A contextual ANF reference is keyed by its selected binding and phase.
+   Its printed spelling never borrows a legacy name-based fact."
+  [n]
+  (when (erlang/is_map n) (get-in n [:ann :binding-reference :id])))
 
-(defn call-sig [sigs n] (get sigs (node-name n) nil))
+(defn sym-type [env n]
+  (get env (or (binding-key n) (node-name n)) any))
+
+(defn call-sig [sigs n] (get sigs (or (binding-key n) (node-name n)) nil))
 
 (def ^:private callable-tags
   "The types a value of which can be CALLED — `RT.invoke/2`'s clause list in
@@ -366,7 +371,7 @@
           ; `(get handlers :create)` is such a union, and `(performer shared
           ; payload principal)` in live/socket.bl calls one of those correctly
           ; with three arguments. The corpus scan is what caught that.
-          (let [arities (map (fn [k] (get compiler/ifn-arities (ifn-kind k))) callable)
+          (let [arities (map (fn [k] (get (compiler/invocation-arities) (ifn-kind k))) callable)
                 unknown (some (fn [a] (nil? a)) arities)
                 allowed (set (mapcat (fn [a] (or a (list))) arities))]
             (if (and (not unknown)
@@ -378,6 +383,28 @@
                           " takes " (arity-words allowed))
                      pos whole)
               nil)))))))
+
+(defn- predicate-tags [env name]
+ ;; A spelling borrows Core facts only while it still denotes Core. Local
+ ;; values and source definitions must never inherit a builtin's refinement.
+ (when-not (or (contains? env name) (contains? (:shadowed (state)) name))
+  (get guard-tags (symbol name))))
+
+(defn- observe-call! [head actual signature pos]
+ (when-let [collector (:obligations (state))]
+  (let [declared (:args signature)
+        pairs (map (fn [a d] [a d]) actual declared)
+        refused (some (fn [[a d]] (and (seq a) (empty? (t-meet a d)))) pairs)
+        proved (and signature (= (count actual) (count declared))
+                    (every? (fn [[a d]] (t-sub? a d)) pairs))]
+   (swap! collector conj
+    {:status (cond refused :refused proved :proved :else :unknown)
+     :reason (cond refused :disjoint-argument-type proved :signature-constraint
+                    (nil? signature) :signature-unavailable
+                    (not= (count actual) (count declared)) :arity-required
+                    :else :argument-type)
+     :callee (if (= :symbol (node-tag head)) (node-name head) "<dynamic>")
+     :position (diag/whole pos) :actual actual :declared declared}))))
 
 (defn walk-call [sigs env items pos whole]
   (let [head (first items)
@@ -392,7 +419,8 @@
         nil)
       nil)
     (if (= :symbol (node-tag head))
-      (let [sig (call-sig sigs head)]
+      (let [sig (when-not (contains? env (node-name head)) (call-sig sigs head))]
+        (observe-call! head arg-types sig pos)
         (if (nil? sig)
           (do (check-head-callable env head arg-types pos whole) any)
           (do
@@ -411,7 +439,7 @@
                       nil)))
                 (:args sig)))
             (:ret sig))))
-      any)))
+      (do (observe-call! head arg-types nil pos) any))))
 
 (defn walk-if [sigs env items pos whole]
   (let [test (second items)
@@ -425,7 +453,7 @@
                    (= :symbol (node-tag (node-form (second (node-items test))))))
             (let [pred (node-name (first (node-items test)))
                   x    (node-name (second (node-items test)))
-                  tags (get guard-tags (symbol pred) nil)]
+                  tags (predicate-tags env pred)]
               (if (nil? tags)
                 [env env]
                 (let [cur (get env x any)
@@ -571,15 +599,17 @@
                 (doall (map (fn [b] (walk sigs env2 b)) (rest (rest items))))
                 #{:nil})
 
-            ; unknown macro? expand once via the compiler's own oracle,
-            ; keep OUR position, walk the expansion (its generated nodes
-            ; honestly carry none).
+            ; Raw Source does not select a transformer or grant its execution.
+            ; An unknown head may be syntax whose operands are data: neither
+            ; load its provider nor diagnose those operands as runtime calls.
+            ; Selected expansion belongs to the contextual compiler pipeline.
             :else
-              (let [orig     (list-node items)
-                    expanded (compiler/macroexpand-1 orig "p2demo")]
-                (if (identical? expanded orig)
-                  (walk-call sigs env items pos node)
-                  (walk sigs (assoc env :__pos pos) expanded)))))
+              (if (and (= :symbol (node-tag head))
+                       (not (contains? env hname))
+                       (nil? (call-sig sigs head)))
+                (do (observe-call! head (mapv (fn [_] any) (rest items)) nil pos)
+                    any)
+                (walk-call sigs env items pos node))))
 
       :else (lit-type node))))
 
@@ -655,7 +685,9 @@
 ; (it matches an unknown SUBSET of the meet). A missing guard claims
 ; everything — which is what makes later same-arity clauses dead.
 
-(defn guard-claim [guard pname]
+(defn guard-claim
+ ([guard pname] (guard-claim guard pname {}))
+ ([guard pname env]
   (if (nil? guard)
     all-tags
     (let [g (node-form guard)]
@@ -667,19 +699,21 @@
             (not (= :symbol (node-tag h))) #{}
             (= "and" (node-name h)) #{}
             (= "or" (node-name h))
-              (reduce (fn [acc d] (t-union acc (guard-claim d pname)))
+              (reduce (fn [acc d] (t-union acc (guard-claim d pname env)))
                       #{} (rest its))
             :else
               (if (and (= 2 (count its))
                        (= :symbol (node-tag (node-form (second its))))
                        (= pname (node-name (node-form (second its)))))
-                (get guard-tags (symbol (node-name h)) #{})
-                #{})))))))
+                (or (predicate-tags env (node-name h)) #{})
+                #{}))))))))
 
 ; guard-narrow: the param's type INSIDE the clause body. Meet over and-
 ; conjuncts, union over or-disjuncts, exact for a bare predicate.
 
-(defn guard-narrow [guard pname cur]
+(defn guard-narrow
+ ([guard pname cur] (guard-narrow guard pname cur {}))
+ ([guard pname cur env]
   (if (nil? guard)
     cur
     (let [g (node-form guard)]
@@ -692,18 +726,18 @@
             (let [hn (node-name h)]
               (cond
                 (= hn "and")
-                  (reduce (fn [c d] (guard-narrow d pname c)) cur (rest its))
+                  (reduce (fn [c d] (guard-narrow d pname c env)) cur (rest its))
                 (= hn "or")
                   (reduce (fn [acc d]
-                            (t-union acc (guard-narrow d pname never)))
+                            (t-union acc (guard-narrow d pname never env)))
                           never (rest its))
                 :else
                   (if (and (= 2 (count its))
                            (= :symbol (node-tag (node-form (second its))))
                            (= pname (node-name (node-form (second its)))))
-                    (let [tags (get guard-tags (symbol hn) nil)]
+                    (let [tags (predicate-tags env hn)]
                       (if (nil? tags) cur (t-meet cur tags)))
-                    cur)))))))))
+                    cur))))))))))
 
 ; check-defn: reachability across same-arity clauses + narrowed bodies.
 ; Coverage claims are single-param only — multi-param coverage is a
@@ -718,6 +752,8 @@
                                (first (:args sig)))
                  (reduce (fn [e p] (bind-pattern e p any))
                          {} (:params c))))]
+    (when-let [definitions (:definitions (state))]
+      (swap! definitions assoc name {:clauses (count clauses)}))
     (loop [cs clauses claimed #{}]
       (if (empty? cs)
         nil
@@ -737,12 +773,15 @@
                 env1 (if single-sym
                        (assoc env0 pname
                               (guard-narrow (:guard c) pname
-                                            (get env0 pname any)))
+                                            (get env0 pname any) env0))
                        env0)]
-            (doall (map (fn [b] (walk sigs env1 b)) (:body c))))
+            (let [returns (doall (map (fn [b] (walk sigs env1 b)) (:body c)))]
+             (when-let [definitions (:definitions (state))]
+              (swap! definitions update-in [name :returns]
+                     #(conj (or % []) (or (last returns) #{:nil}))))))
           (recur (rest cs)
                  (if single-sym
-                   (t-union claimed (guard-claim (:guard c) pname))
+                   (t-union claimed (guard-claim (:guard c) pname (base c)))
                    claimed)))))))
 
 ; --- entry ---------------------------------------------------------------------------------------------------
@@ -754,17 +793,37 @@
   [src ns]
   (check-source-with src ns (merge core-seeds-v2 host-seeds)))
 
+(defn- source-definitions [forms]
+ (set (mapcat (fn [form]
+  (let [form (node-form form)]
+   (if-not (= :list (node-tag form)) []
+    (let [items (node-items form) head (node-form (first items))
+          name (when (= :symbol (node-tag head)) (node-name head))]
+     (cond
+      (= "do" name) (source-definitions (rest items))
+      (contains? #{"def" "defn" "defn-" "declare"} name)
+       (keep (fn [item] (let [item (node-form item)]
+                         (when (= :symbol (node-tag item)) (node-name item))))
+             (if (= "declare" name) (rest items) [(second items)]))
+      :else []))))) forms)))
+
 (defn check-source-with
   "check-source with an explicit seed table (P6 measures with/without)."
-  [src ns seeds]
+  ([src ns seeds] (check-source-with src ns seeds {}))
+  ([src ns seeds options]
   ; Install THIS call's atoms; restore the caller's (if any) on the way out, so
   ; a check nested inside another check resumes the outer one.
-  (let [st {:warnings (atom []) :evidence (atom {})}
+  (let [st (cond-> {:warnings (atom []) :evidence (atom {})}
+             (:coverage options) (assoc :obligations (atom []) :definitions (atom {})))
         prev (erlang/get state-key)]
     (erlang/put state-key st)
     (try
       (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
-            sigs (merge core-sigs seeds (sigs-from-env ns))]
+            seeded (merge core-sigs seeds)
+            names (concat (keys seeded) (map node-name (keys guard-tags)))
+            shadowed (into (source-definitions forms) (filter #(BeamLisp.Env/local_var? ns %) names))
+            sigs (merge (reduce dissoc seeded shadowed) (sigs-from-env ns))]
+    (erlang/put state-key (assoc st :shadowed shadowed))
     (doall
       (map
         (fn [form]
@@ -789,8 +848,45 @@
 
               :else (walk sigs {} form))))
           forms))
-      {:warnings (deref (:warnings st)) :evidence (deref (:evidence st))})
-      (finally (erlang/put state-key prev)))))
+      (cond-> {:warnings (deref (:warnings st)) :evidence (deref (:evidence st))}
+       (:coverage options) (assoc :obligations @(:obligations st)
+                                 :definitions @(:definitions st))))
+      (finally (erlang/put state-key prev))))))
+
+(defn check-source-result
+ "Explicit signature/type evidence, not permission to execute or a proof of
+  effects or ownership. Missing signatures, partial argument types and unknown
+  inferred values remain obligations. Editor check-source keeps its interface."
+ ([src ns] (check-source-result src ns (merge core-seeds-v2 host-seeds)))
+ ([src ns seeds]
+  (try
+   (let [result (check-source-with src ns seeds {:coverage true})
+         unknown-values (into [] (keep (fn [[position tags]]
+                              (when (= any tags)
+                               {:status :unknown :reason :inferred-any :position position}))
+                            (:evidence result)))
+         unknown-returns (mapcat (fn [[name definition]]
+                            (keep (fn [tags]
+                                    (when (= any tags)
+                                     {:status :unknown :reason :return-type :definition name}))
+                                  (:returns definition))) (:definitions result))
+         obligations (into (into (:obligations result) unknown-values) unknown-returns)
+         counts (frequencies (map :status obligations))
+         unknown (get counts :unknown 0)
+         refused (or (pos? (get counts :refused 0))
+                      (some #(contains? #{:type-mismatch :not-callable :arity :keyword-call} (:kind %))
+                            (:warnings result)))]
+    (assoc result :status (cond refused :refused (pos? unknown) :unknown :else :proved)
+                  :obligations obligations :diagnostics (:warnings result)
+                  :coverage {:scope :signature-and-inferred-types
+                             :definitions (count (:definitions result))
+                             :clauses (reduce + 0 (map :clauses (vals (:definitions result))))
+                             :constraints (count obligations) :unknown unknown
+                             :complete (= 0 unknown)}))
+   (catch error
+    {:status :error :coverage {:complete false} :obligations []
+     :diagnostics [(diag/error :type-analysis-error
+                      (str "Type analysis failed: " (ex-message error)) {} {})]}))))
 
 (defn hover
   "The L1/L12 demo: type at [line col], delaborated for a human."

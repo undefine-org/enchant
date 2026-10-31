@@ -1,0 +1,65 @@
+(ns phase-resolution-metadata-test (:require [compiler :as compiler] [anf :as anf]))
+(defn- form [text] (first (BeamLisp.Reader/read_string text "phase-resolution.bl")))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- header [tail] (form (str "(ns phase.provider " tail ")")))
+
+(deftest core-exclusions-share-one-bounded-symbol-grammar
+ (is (= (list) (BeamLisp.CompilerData/namespace_core_excludes (list))))
+ (is (= (list "str" "map")
+        (BeamLisp.CompilerData/namespace_core_excludes
+         (list (tuple :keyword "exclude") (tuple :vector (list (tuple :symbol "str") (tuple :symbol "map")))))))
+ (let [reader (header "(:require [core :as c :refer [identity]]) (:refer-clojure :exclude [str map])")
+       metadata (get (BeamLisp.AOT/namespace_header reader) "phase.provider")]
+  (is (= (list "str" "map") (:core-excludes metadata)))
+  (is (= (list (tuple "c" "core")) (:aliases metadata)))
+  (is (= (list (tuple "identity" "core")) (:refers metadata)))
+  (is (= :let (:op (compiler/compile reader (compiler/new-env "phase.caller")))))))
+
+(deftest malformed-exclusions-refuse-in-compiler-and-artifact-capture
+ (let [before (BeamLisp.Env/capture)]
+  (doseq [tail ["(:refer-clojure :exclude)" "(:refer-clojure :exclude []) (:refer-clojure :exclude)"
+               "(:refer-clojure :only [str])" "(:refer-clojure :exclude str)"
+               "(:refer-clojure :exclude [:str])" "(:refer-clojure :exclude [42])"
+               "(:refer-clojure :exclude [nil])"]]
+   (let [reader (header tail)]
+    (is (refused? #(BeamLisp.AOT/namespace_header reader)))
+    (is (refused? #(compiler/compile reader (compiler/new-env "phase.caller"))))))
+  (is (= before (BeamLisp.Env/capture)))))
+
+(deftest excluded-core-name-can-still-be-explicitly-qualified
+ (let [reader (header "(:refer-clojure :exclude [str])")
+       metadata (get (BeamLisp.AOT/namespace_header reader) "phase.provider")]
+  (is (= (list "str") (:core-excludes metadata)))
+  (is (= :global (:op (compiler/compile (form "core/str") (compiler/new-env "phase.caller")))))
+  (is (= "core" (:ns (compiler/compile (form "core/str") (compiler/new-env "phase.caller")))))))
+
+(deftest producer-retains-resolution-data-without-reading-live-bindings
+ (let [metadata (get (BeamLisp.AOT/namespace_header
+                      (header "(:require [core :as c :refer [identity]]) (:refer-clojure :exclude [str])"))
+                     "phase.provider")
+       declarations {"phase.provider" {"answer" :public "str" :value}
+                     :callable-kinds {"phase.provider" {"answer" :function "str" :value}}}
+       digest (crypto/hash :sha256 "original Source")
+       library (BeamLisp.AOT/phase_library_data "phase.provider" {} (list) digest (list)
+                  (assoc metadata :replay-complete true :irrelevant :discard) declarations)]
+  (is (= 1 (get-in library [:resolution :version])))
+  (is (= metadata (get-in library [:resolution :header])))
+  (is (= {"answer" :public "str" :value} (get-in library [:resolution :declarations])))
+  (is (= {"answer" :function "str" :value} (get-in library [:resolution :callable-kinds])))
+  (is (= digest (:source-digest library)))
+  (is (= {} (:initializers library)))))
+
+(deftest initializer-replays-the-captured-exclusions-including-an-empty-reset
+ (doseq [names [(list "str" "map") (list)]]
+  (let [pair (BeamLisp.AOT/build_init_ast "phase.provider" :Elixir.PhaseResolutionFixture {}
+                (list) {:core-excludes names :native-declaration nil} (list) {})
+        calls (loop [todo (list (:body (elem pair 0))) out (list)]
+               (if (empty? todo) out
+                (let [node (first todo)]
+                 (recur (erlang/++ (anf/executable-children node) (rest todo))
+                   (if (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                            (= :add_core_excludes (:fun node))) (cons node out) out)))))]
+   (is (= 1 (count calls)))
+   (is (= (list {:op :lit :val "phase.provider" :ann {}} {:op :lit :val names :ann {}})
+          (:args (first calls)))))))
+

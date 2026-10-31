@@ -1,0 +1,111 @@
+(ns aot-host-artifact-test (:require [anf :as anf]))
+
+(defn- annotation-files [node]
+ (concat (when-let [file (get-in node [:ann :file])] (list file))
+         (mapcat annotation-files (anf/executable-children node))))
+
+(defn- temporary [action]
+ (let [directory (Path/join (System/tmp_dir!) (str "host-artifact-" (System/unique_integer (list :positive))))]
+  (File/mkdir_p! directory)
+  (try (action directory) (finally (File/rm_rf! directory)))))
+
+(defn- workspace [namespace file]
+ (BeamLisp.AOT/open_workspace
+  {:version 2 :phase-imports (list 'core 'sugar)
+   :sources (list {:namespace namespace :file file})} {}))
+
+(deftest pinned-host-preparation-emits-one-module-without-publishing-either-namespace
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "fixture.bl")
+         _ (File/write! file "(ns pinned.artifact.fixture) (declare later) (defn use [f] (f)) (defn first-call [] (use (fn [] (later)))) (defn later [] 42)")
+         handle (workspace 'pinned.artifact.fixture file)
+         spec {:namespace 'pinned.artifact.fixture :module :Elixir.BeamLisp.ArtifactHostProbe}
+         generations (BeamLisp.Env/namespace_generations (list "pinned.artifact.fixture"))]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_host_unit handle spec)
+           emitted (BeamLisp.AOT/emit_unit prepared (Path/join directory "host"))
+           repeated (BeamLisp.AOT/emit_unit prepared (Path/join directory "again"))
+           verified (BeamLisp.AOT/verify_unit (Path/join directory "host"))
+           ordinary (BeamLisp.AOT/prepare_unit handle 'pinned.artifact.fixture)]
+      (is (= prepared (BeamLisp.AOT/prepare_host_unit handle spec)))
+      (is (= spec (:host-spec prepared)))
+      (is (= emitted repeated))
+      (is (= 1 (count (:modules emitted))))
+      (is (= "Elixir.BeamLisp.ArtifactHostProbe" (:module (first (:modules emitted)))))
+      (is (= false (erlang/module_loaded :Elixir.BeamLisp.ArtifactHostProbe)))
+      (is (= false (erlang/module_loaded :Elixir.BeamLisp.Ns.Pinned.Artifact.Fixture)))
+      (is (= generations (BeamLisp.Env/namespace_generations (list "pinned.artifact.fixture"))))
+      (is (not= (get-in ordinary [:world :id]) (get-in prepared [:world :id])))
+      (is (= false (:native-admission verified)))
+      (is (= :artifact-host-spec-changed
+             (try (BeamLisp.AOT/prepare_host_unit handle (assoc spec :module :Elixir.BeamLisp.OtherHostProbe)) nil
+              (catch error (:kind (ex-data error))))))
+      ;; The test explicitly activates this ordinary, private probe only after
+      ;; proving preparation did not do so. No SDK module is replaced.
+      (BeamLisp.Env/publish_binaries! (:beams verified) "host-artifact-test")
+      (is (= 42 (erlang/apply :Elixir.BeamLisp.ArtifactHostProbe :first-call (list)))))
+     (finally (BeamLisp.AOT/close_workspace! handle)))))))
+
+(deftest actual-pinned-compiler-host-prepares-without-changing-its-running-code
+ (temporary
+  (fn [directory]
+   (let [file (Path/join (BeamLisp.Tiers/priv_root) "host/compiler_data.bl")
+         module :Elixir.BeamLisp.CompilerData before (erlang/apply module :module_info (list :md5))
+         generations (BeamLisp.Env/namespace_generations (list "host.compiler-data"))
+         handle (workspace 'host.compiler-data file)]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_host_unit handle {:namespace 'host.compiler-data :module module})
+           manifest (BeamLisp.AOT/emit_unit prepared (Path/join directory "compiler-data"))
+           descriptor (first (:descriptors (first (:plans prepared))))
+           files (mapcat (fn [clause]
+                           (concat (annotation-files (:body clause))
+                                   (when (:guard clause) (annotation-files (:guard clause)))))
+                         (:clauses descriptor))]
+      (is (= 1 (count (:modules manifest))))
+      (is (= "Elixir.BeamLisp.CompilerData" (:module (first (:modules manifest)))))
+      (is (= before (erlang/apply module :module_info (list :md5))))
+      (is (contains? (set files) "priv/host/compiler_data.bl"))
+      (is (every? (fn [path] (= :relative (Path/type path))) files))
+      (is (= generations (BeamLisp.Env/namespace_generations (list "host.compiler-data")))))
+     (finally (BeamLisp.AOT/close_workspace! handle)))))))
+
+(deftest pinned-host-artifacts-retain-the-existing-struct-surface
+ (temporary
+  (fn [directory]
+   (let [file (Path/join directory "struct.bl")
+         _ (File/write! file "(ns pinned.artifact.struct) (defn answer [] 42)")
+         handle (workspace 'pinned.artifact.struct file)]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_host_unit handle
+                     {:namespace 'pinned.artifact.struct :module :Elixir.BeamLisp.ArtifactHostStruct
+                      :struct-fields (list (tuple :answer 42))})
+           _ (BeamLisp.AOT/emit_unit prepared (Path/join directory "struct"))
+           unit (BeamLisp.AOT/verify_unit (Path/join directory "struct"))]
+      (BeamLisp.Env/publish_binaries! (:beams unit) "host-artifact-test")
+      (is (= {:__struct__ :Elixir.BeamLisp.ArtifactHostStruct :answer 42}
+             (erlang/apply :Elixir.BeamLisp.ArtifactHostStruct :__struct__ (list))))
+      (is (= [[:answer 0] [:__struct__ 0] [:__struct__ 1]]
+             (mapv (fn [pair] [(elem pair 0) (elem pair 1)])
+                   (erlang/apply :Elixir.BeamLisp.ArtifactHostStruct :__info__ (list :functions))))))
+     (finally (BeamLisp.AOT/close_workspace! handle)))))))
+
+(deftest host-restrictions-refuse-before-effects-or-emission
+ (temporary
+  (fn [directory]
+   (doseq [[source kind]
+            [["(ns pinned.artifact.bad) (defn outer [] (defn inner [] 42))" :nested-pinned-host-declaration]
+             ["(ns pinned.artifact.bad) (defn helper [] 42) (defn value [] helper)" :unbound-pinned-host-global]
+             ["(ns pinned.artifact.bad) (def value 42) (defn answer [] value)" :Elixir.ArgumentError]
+             ["(ns pinned.artifact.bad) (defmacro declare [& names] (File/write! \"__HOST_MARKER__\" \"bad\")) (declare missing) (defn answer [] 42)" :constructor-machine-refused]]]
+    (let [file (Path/join directory "bad.bl")
+          marker (Path/join directory "never-written")
+          _ (File/write! file (String/replace source "__HOST_MARKER__" marker))
+          handle (workspace 'pinned.artifact.bad file)]
+     (try
+      (is (= kind (try (BeamLisp.AOT/prepare_host_unit handle
+                         {:namespace 'pinned.artifact.bad :module :Elixir.BeamLisp.ArtifactBadHost}) nil
+                   (catch error (or (:kind (ex-data error)) (:__struct__ error))))))
+      (is (= false (erlang/module_loaded :Elixir.BeamLisp.ArtifactBadHost)))
+      (is (= false (File/exists? marker)))
+      (finally (BeamLisp.AOT/close_workspace! handle))))))))

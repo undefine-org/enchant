@@ -1,0 +1,74 @@
+(ns contextual-import-test (:require [binding :as b] [syntax :as s]))
+
+(defn- fixture []
+ (let [selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace 'provider :digest (crypto/hash :sha256 "provider")}
+                            {:namespace 'client :digest (crypto/hash :sha256 "client")}]}
+       p (b/scope selection 'provider [0] :module)
+       c (b/scope selection 'client [0] :module)
+       i (b/scope selection 'client [1] :import)
+       j (b/scope selection 'client [2] :import)
+       declarations [{:namespace 'provider :name 'answer :phase 0 :space 'value :kind :function
+                      :path [0] :scopes [(:id p)] :visibility :public :available-from 88}
+                     {:namespace 'provider :name 'secret :phase 0 :space 'value :kind :function
+                      :path [1] :scopes [(:id p)] :visibility :private :available-from 0}
+                     {:namespace 'client :name 'answer :phase 0 :space 'value :kind :value
+                      :path [0] :scopes [(:id c) (:id i)] :visibility :public :available-from 0}]
+       w (b/world selection [p c i j] declarations)
+       request {:from 'provider :into 'client :scope (:id i) :phase-shift 0 :space 'value :only ['answer]}]
+  {:world w :provider (:id p) :client (:id c) :import (:id i) :other-import (:id j) :request request}))
+
+(defn- identifier [f name scopes phase namespace]
+ (s/identifier name {:world (:key (:world f)) :namespace namespace :space 'value :scopes {phase scopes}}))
+
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest aliases-and-renames-preserve-declaration-and-reference-identity
+ (let [f (fixture) scopes [(:client f) (:import f)]
+       w (b/import-view (:world f) (assoc (:request f) :alias 'p))
+       renamed (b/import-view (:world f) (assoc (:request f) :rename {'answer 'renamed}))
+       original (b/resolve (:world f) (identifier f 'answer [(:provider f)] 0 'provider) 0 88)
+       imported (b/resolve w (identifier f 'p/answer scopes 0 'client) 0 0)
+       renamed-use (b/resolve renamed (identifier f 'renamed scopes 0 'client) 0 0)]
+  (is (= :resolved (:status imported)))
+  (is (= 'provider (get-in imported [:declaration :namespace])))
+  (is (= (:reference original) (:reference imported)))
+  (is (= (:reference original) (:reference renamed-use)))
+  (is (= w (b/validate-world w)))
+  (is (= renamed (b/validate-world renamed)))
+  (is (= :unbound (:status (b/resolve w (identifier f 'p/answer [(:client f)] 0 'client) 0 0))))))
+
+(deftest phase-shifts-change-reference-phase-and-do-not-change-provider-declaration
+ (let [f (fixture) w (b/import-view (:world f) (assoc (:request f) :phase-shift 1))
+       id (identifier f 'answer [(:client f) (:import f)] 1 'client)
+       shifted (b/resolve w id 1 0)
+       original (b/resolve (:world f) (identifier f 'answer [(:provider f)] 0 'provider) 0 88)]
+  (is (= :resolved (:status shifted)))
+  (is (= 0 (get-in shifted [:declaration :phase])))
+  (is (= 1 (get-in shifted [:reference :phase])))
+  (is (= (get-in shifted [:declaration :id]) (get-in original [:declaration :id])))
+  (is (not= (get-in shifted [:reference :id]) (get-in original [:reference :id])))
+  (is (= :unbound (:status (b/resolve w id 2 0))))))
+
+(deftest local-module-binding-dominates-an-import-and-private-exports-refuse
+ (let [f (fixture) w (b/import-view (:world f) (:request f))
+       result (b/resolve w (identifier f 'answer [(:client f) (:import f)] 0 'client) 0 0)]
+  (is (= :resolved (:status result)))
+  (is (= 'client (get-in result [:declaration :namespace])))
+  (is (= :binding-import-private (kind-of #(b/import-view (:world f) (assoc (:request f) :only ['secret])))))
+  (is (= :binding-import-missing (kind-of #(b/import-view (:world f) (assoc (:request f) :only ['absent])))))
+  (is (= :binding-import-scope (kind-of #(b/import-view (:world f) (assoc (:request f) :scope (:provider f))))))
+  (is (= :unbound (:status (b/resolve w (identifier f 'secret [(:provider f)] 0 'client) 0 0))))))
+
+(deftest import-serialization-order-and-input-representation-do-not-change-the-world
+ (let [f (fixture) a (assoc (:request f) :alias 'a)
+       z (assoc (:request f) :scope (:other-import f) :alias 'z)
+       forward (b/import-view (b/import-view (:world f) a) z)
+       reverse (b/import-view (b/import-view (:world f) z) a)]
+  (is (= forward reverse))
+  (is (= forward (b/validate-world forward)))
+  (is (= :binding-import-duplicate (kind-of #(b/import-view forward a))))
+  (is (= :binding-symbol (kind-of #(b/import-view (:world f) (assoc a :alias false)))))
+  (is (= :binding-import-rename (kind-of #(b/import-view (:world f) (assoc a :rename false)))))
+  (is (= :binding-import-rename (kind-of #(b/import-view (:world f) (assoc a :rename {'other 'x})))))))

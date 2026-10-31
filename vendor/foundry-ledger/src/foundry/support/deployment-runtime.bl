@@ -1,0 +1,219 @@
+; src/foundry/support/deployment-runtime.bl — how a deployment step runs a Foundry BL script.
+;
+; Two engines build job steps that run Foundry's own BL entries (the host
+; renderer and the host-identity CLI): the base adapter and the service
+; adapter. They share ONE answer to "which `bl`, which script path, which
+; environment", so a step can neither pick its interpreter from a request nor
+; inherit a caller's environment.
+;
+;   * The `bl` is FOUNDRY_BL, else the payload's own runtime at
+;     <FOUNDRY_ROOT>/runtime/bl, else `bl` through /usr/bin/env.
+;   * The script is a fixed file name resolved under the payload root. A
+;     request never names it (`args.identityHelper`, `args.renderHost`… are
+;     refused by the adapters).
+;   * The environment is the standard local PATH plus ONLY the beam-lisp
+;     runtime variables, when set in this process. No credential variable is
+;     ever forwarded: these scripts hold no credential and need none.
+
+(ns deployment-runtime (:require [deployment-exec :as x]))
+
+;; Foundry's own BL entries that steps may run. Fixed names under the payload
+;; root; a request never supplies one.
+(def identity-script "bin/identity.bl")
+
+(def step-env-keys
+  ["BEAM_LISP_PATH" "BEAM_LISP_CODE_PATH" "BEAM_LISP_AOT_CACHE_DIR"
+   "BL_DAEMON" "ELIXIR_ERL_OPTIONS" "DROP_STORE_ROOT"
+   "XDG_DATA_HOME" "HOME" "TMPDIR" "FOUNDRY_ROOT"
+   ;; Non-secret instance identity and paths must survive durable job helpers.
+   "FOUNDRY_INSTANCE" "FOUNDRY_DEPLOY_STATE" "FOUNDRY_ENV"
+   "FOUNDRY_INFRA_DIR" "XDG_CONFIG_HOME"
+   ;; The operator's pinned tool dirs. A helper must resolve `sops`/`ssh-to-age`
+   ;; the same way its own PATH was built, or a tool that is on PATH stays
+   ;; invisible to the in-process lookup (`deployment-exec/tool`). Non-secret:
+   ;; it is a list of directories the operator already chose.
+   "FOUNDRY_TOOL_PATH"
+   ;; sandbox only, non-secret: the address the host-identity CLI records
+   ;; instead of the fake provider's (deployment-identity/sandbox-address)
+   "FOUNDRY_SANDBOX_HOST_ADDR"])
+
+(defn foundry-root
+  "The payload root: FOUNDRY_ROOT, else the process cwd."
+  []
+  (or (System/get_env "FOUNDRY_ROOT") (File/cwd!)))
+
+(defn script-path
+  "Absolute path of a payload script by file name."
+  [name]
+  (str (foundry-root) "/" name))
+
+(defn infra-override
+  "An explicit operator instance's infra directory; nil keeps legacy defaults."
+  []
+  (let [v (System/get_env "FOUNDRY_INFRA_DIR")]
+    (when (and (string? v) (not= "" v)) v)))
+
+;; ── trusted tool paths ─────────────────────────────────────────────────────
+;;
+;; The operator process may select extra tool directories with
+;; FOUNDRY_TOOL_PATH (a colon-separated list, e.g. a Nix store `secret-tools`
+;; bin). They are PREFIXED to the safe defaults, so Foundry's pinned tools
+;; resolve without widening the surface to the caller's whole PATH. A malformed
+;; value is refused fail-closed: a step never runs with a partially trusted PATH.
+
+(defn- step-path []
+  (let [home (System/get_env "HOME")
+        defaults (str "/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:"
+                      (if (and (string? home) (> (count home) 0)) (str home "/.nix-profile/bin:") "")
+                      "/usr/bin:/bin")
+        tools (x/explicit-tool-dirs)]
+    (if (empty? tools) defaults (join ":" (concat tools [defaults])))))
+
+(defn- lisp-path
+  "BEAM_LISP_PATH for child scripts: the inherited value plus the payload root
+   and its application source and packaging dirs so helper namespaces resolve."
+  []
+  (let [cur (System/get_env "BEAM_LISP_PATH")
+        root (foundry-root)
+        have (if (string? cur) (String/split cur ":") [])
+        need (filter (fn [d] (not (some (fn [h] (= h d)) have)))
+                     (map (fn [rel] (if (= rel ".") root (str root "/" rel)))
+                          [".", "src", "src/foundry/engine", "src/foundry/operations", "src/foundry/release", "src/foundry/host", "src/foundry/providers", "src/foundry/credentials", "src/foundry/interfaces", "src/foundry/support", "deployments/knowledger/packaging"]))]
+    (join ":" (concat have need))))
+
+(defn- nix-config
+  "`nix-command` and `flakes` must be on for EVERY nix invocation a step makes,
+   including the nested ones nixos-anywhere runs. The step environment points
+   XDG_CONFIG_HOME at the instance directory, which HIDES the operator's
+   ~/.config/nix/nix.conf, so the features cannot be inherited. Anything the
+   operator already set is kept; ours is appended last so it wins this key."
+  []
+  (let [existing (System/get_env "NIX_CONFIG")
+        mine "experimental-features = nix-command flakes"]
+    (if (and (string? existing) (not= "" existing)) (str existing "\n" mine) mine)))
+
+(defn step-env
+  "The environment a BL-script step receives: PATH + UTF-8 locale plus the beam-lisp
+   runtime variables set in this process."
+  []
+  (assoc (reduce (fn [m k]
+                   (let [v (System/get_env k)]
+                     (if (string? v) (assoc m k v) m)))
+                 {"PATH" (step-path) "LC_ALL" "C.UTF-8" "LANG" "C.UTF-8"}
+                 step-env-keys)
+         "BEAM_LISP_PATH" (lisp-path)
+         "NIX_CONFIG" (nix-config)))
+
+(defn- tool-name?
+  "A bare tool name safe to resolve with `command -v`: one name, no path
+   separator and no metacharacter."
+  [s]
+  (and (string? s) (> (count s) 0)
+       (every? (fn [c]
+                 (or (and (>= c 97) (<= c 122))
+                     (and (>= c 65) (<= c 90))
+                     (and (>= c 48) (<= c 57))
+                     (= c 46) (= c 95) (= c 43) (= c 45)))
+               (erlang/binary_to_list (str s)))))
+
+(defn executable-available?
+  "True when `exe` is runnable under the step environment (`step-env`). An
+   absolute path is probed directly and must be a regular, executable file; a
+   bare tool name is resolved through the step PATH with `command -v`. The
+   value always travels as a positional shell parameter, never interpolated, so
+   it can carry no shell syntax. A malformed FOUNDRY_TOOL_PATH is refused by
+   `step-env` (fail-closed) and propagates; an absent tool returns false."
+  [exe]
+  (let [probe (fn [script] (x/run "/bin/sh" ["-c" script "foundry-probe" exe]
+                                  {:env (step-env) :timeout-ms 5000 :limit 1024}))]
+    (cond
+      (not (and (string? exe) (> (count exe) 0))) false
+      (String/starts_with? exe "/") (x/ok? (probe "test -f \"$1\" && test -x \"$1\""))
+      (tool-name? exe) (x/ok? (probe "command -v \"$1\" >/dev/null 2>&1"))
+      :else false)))
+
+(defn nixos-anywhere-bin
+  "Trusted installer selected by the operator process, never a request option."
+  []
+  (let [v (System/get_env "FOUNDRY_NIXOS_ANYWHERE")]
+    (if (and (string? v) (String/starts_with? v "/")) [v] ["/usr/bin/env" "nixos-anywhere"])))
+
+(defn nixos-anywhere-available? []
+  (let [argv (nixos-anywhere-bin)]
+    (if (= 1 (count argv))
+      (executable-available? (first argv))
+      (executable-available? "nixos-anywhere"))))
+
+(defn bl-bin
+  "The `bl` that runs payload scripts: FOUNDRY_BL, else a payload-local runtime
+   at <root>/runtime/bl, else the `bl` running THIS process (BL_BIN, which the
+   launcher sets to its own absolute path), else nil (the caller falls back to
+   /usr/bin/env + bl). A step's PATH is deliberately minimal, so without the
+   last two a checkout run could not find the very runtime it is running on."
+  []
+  (let [env (System/get_env "FOUNDRY_BL")
+        local (str (foundry-root) "/runtime/bl")
+        self (System/get_env "BL_BIN")]
+    (cond
+      (and (string? env) (not= env "")) env
+      (File/exists? local) local
+      (and (string? self) (String/starts_with? self "/") (File/exists? self)) self
+      :else nil)))
+
+(defn script-argv
+  "argv that runs payload script `script` (an absolute path) with `args` after
+   `--`."
+  [script args]
+  (let [bl (bl-bin)]
+    (into (if (string? bl)
+            [bl "run" script "--"]
+            ["/usr/bin/env" "bl" "run" script "--"])
+          args)))
+
+(defn process-environment
+  "The environment this Foundry PROCESS operates in: FOUNDRY_ENV, else
+   production. A spec that names a different environment is refused by the
+   engine — a sandbox rehearsal must never act through a production process
+   (state root, credentials) or the reverse. Throws on an unknown value."
+  []
+  (let [v (System/get_env "FOUNDRY_ENV")
+        env (if (and (string? v) (> (count v) 0)) v "production")]
+    (when-not (or (= env "sandbox") (= env "production"))
+      (throw (ex-info (str "FOUNDRY_ENV must be sandbox or production, got " (pr-str env))
+                      {"kind" "deployment-runtime"})))
+    env))
+
+(defn identity-argv
+  "argv for the host-identity CLI: `verb`, then `--root R --target T` and any
+   extra flags. Nothing here is a secret; the CLI prints only public values."
+  [verb root target extra]
+  (script-argv (script-path identity-script)
+               (into [verb "--root" root "--target" target] extra)))
+
+(defn identity-step
+  "A generic job step that runs the host-identity CLI (see `identity-argv`).
+   `opts` may carry timeoutSeconds / outputLimit / cancellable."
+  [id label verb root target extra opts]
+  (let [opts (if (map? opts) opts {})]
+    {"id" id
+     "label" label
+     "argv" (identity-argv verb root target extra)
+     "cwd" "/"
+     "env" (step-env)
+     "timeoutSeconds" (get opts "timeoutSeconds" 120)
+     "outputLimit" (get opts "outputLimit" 65536)
+     "cancellable" (get opts "cancellable" true)}))
+
+(defn drop-file?
+  "Check the sealed drop footer without executing a caller-selected runtime."
+  [path]
+  (try
+    (let [size (erlang/apply :filelib :file_size (list path))]
+      (if (< size 4) false
+        (let [r (erlang/apply :file :open (list path (to-list [:read :raw :binary])))]
+          (if (not= :ok (erlang/element 1 r)) false
+            (let [fh (erlang/element 2 r)]
+              (try
+                (= (tuple :ok "DRP1") (erlang/apply :file :pread (list fh (- size 4) 4)))
+                (finally (erlang/apply :file :close (list fh)))))))))
+    (catch e false)))

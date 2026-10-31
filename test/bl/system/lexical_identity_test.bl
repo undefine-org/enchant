@@ -1,0 +1,107 @@
+(ns system.lexical-identity-test
+ (:require [anf :as a] [system.ir.identity :as identity] [system.tier :as tier]
+           [system.incr :as incr] [lower :as lower] [compiler :as compiler]))
+(defn- same? [left right] (= (identity/body-identity left) (identity/body-identity right)))
+(defn- closure [capture] (a/fnn (list (a/clause (list) nil (a/var capture)))))
+(defn- native-capture [node]
+ (let [module (erlang/binary_to_atom (str "Elixir.LexicalIdentityControl" (erlang/unique_integer (list :positive))))
+       program (a/lett "left" (a/lit 42) (a/lett "right" (a/lit 99)
+                  (a/invoke node (a/empty-list-node))))]
+  (try (lower/eval-anf module program)
+   (finally (code/delete module) (code/soft_purge module)))))
+
+(deftest captured-bindings-are-free-identities-not-renamable-parameters
+ (let [left (closure "left") right (closure "right")]
+  (is (= 42 (native-capture left)))
+  (is (= 99 (native-capture right)))
+  (is (not (same? left right)))
+  (is (not= (incr/fn-identity {:params [] :body (a/var "left")})
+            (incr/fn-identity {:params [] :body (a/var "right")})))
+  (is (not (tier/alpha= left right)))))
+
+(deftest let-initializers-see-the-outer-scope
+ (let [left (a/lett "x" (a/var "x") (a/var "x"))
+       right (a/lett "y" (a/var "x") (a/var "y"))]
+  (is (tier/alpha= left right))
+  (is (same? left right))))
+
+(deftest sibling-scopes-do-not-leak-binders
+ (let [left (a/tup (list (a/lett "x" (a/lit 0) (a/var "x")) (a/var "x")))
+       right (a/tup (list (a/lett "y" (a/lit 0) (a/var "y")) (a/var "x")))]
+  (is (tier/alpha= left right))
+  (is (same? left right))))
+
+(deftest function-parameters-shadow-captures-and-preserve-their-order
+ (let [body (fn [a b result]
+              (a/fnn (list (a/clause (list (a/pvar a) (a/pvar b)) nil (a/var result)))))]
+  (is (same? (body "x" "y" "x") (body "a" "b" "a")))
+  (is (not (same? (body "x" "y" "x") (body "a" "b" "b"))))
+  (is (same? (a/lett "x" (a/lit 42) (body "x" "y" "x"))
+             (a/lett "a" (a/lit 42) (body "b" "c" "b"))))))
+
+(deftest clause-scopes-and-guards-share-only-their-own-binders
+ (let [body (fn [name]
+              (a/casee (a/var "external")
+               (list (a/clause (list (a/pvar name)) (a/var name) (a/var name))
+                     (a/clause (list (a/pvar "_")) nil (a/var "x")))))]
+  (is (tier/alpha= (body "x") (body "y")))
+  (is (same? (body "x") (body "y")))))
+
+(deftest parameter-seeds-cannot-collide-with-fresh-local-identities
+ (let [body (a/lett "local" (a/lit 42) (a/tup (list (a/var "arg") (a/var "local"))))
+       reversed (a/lett "local" (a/lit 42) (a/tup (list (a/var "local") (a/var "arg"))))]
+  (is (not= (identity/body-identity body {"arg" "v1"})
+            (identity/body-identity reversed {"arg" "v1"})))))
+
+(deftest map-pattern-keys-retain-the-enclosing-scope
+ (let [node (fn [outer inner]
+              (a/lett outer (a/lit :answer)
+               (a/casee (a/lit {:answer 42})
+                (list (a/clause (list (a/pmap (list [(a/var outer) (a/pvar inner)]))) nil (a/var inner))))))
+       left (node "key" "value") right (node "other-key" "other-value")]
+  (is (same? left right))
+  (is (tier/alpha= left right))
+  (is (= 42 (native-capture (a/fnn (list (a/clause (list) nil left))))))
+  (is (= 42 (native-capture (a/fnn (list (a/clause (list) nil right))))))))
+
+(deftest annotations-are-inert-but-literal-and-operation-fields-are-semantic
+ (let [literal {:op :var :name "literal" :ann {:line 99}}
+       node (a/lit literal)]
+  (is (= {:op :lit :val literal} (identity/body-identity (assoc node :ann {:line 1})))))
+ (let [raw (assoc (a/remote :erlang :raise (list)) :stack-format :raw)]
+  (is (not (same? raw (dissoc raw :stack-format))))
+  (is (not (tier/alpha= raw (dissoc raw :stack-format))))))
+
+(deftest unknown-grammar-cannot-become-equivalence-evidence
+ (is (not (tier/alpha= {:op :unknown-op} {:op :unknown-op})))
+ (is (= :unknown-executable-operation
+        (try (identity/body-identity {:op :unknown-op}) nil (catch error (:kind (ex-data error)))))))
+
+(deftest repeated-pattern-variables-and-wildcards-keep-their-constraints
+ (let [node (fn [left right] (a/fnn (list (a/clause (list (a/pvar left) (a/pvar right)) nil (a/lit 42)))))]
+  (is (not (same? (node "x" "x") (node "a" "b"))))
+  (is (same? (node "x" "x") (node "a" "a")))
+  (is (same? (node "_" "_") (node "_" "_")))))
+
+(deftest actual-javascript-call-operands-participate-in-lexical-identity
+ (let [compile (fn [source] (compiler/compile (BeamLisp.Reader/read_one source) (compiler/new-env "identity.js")))
+       left (compile "(let [x 42] (js/console.log x))")
+       renamed (compile "(let [y 42] (js/console.log y))")
+       changed (compile "(let [x 42] (js/console.warn x))")]
+  (is (tier/alpha= left renamed))
+  (is (not (tier/alpha= left changed)))))
+
+(deftest actual-published-function-declarations-bind-parameters-and-guards
+ (let [declaration (fn [name]
+                     {:op :defn-clause :fname :run :params (list (a/pvar name))
+                      :guard (a/remote :erlang :is_integer (list (a/var name)))
+                      :body (a/var name) :ann {:line 1}})
+       left (declaration "old") right (declaration "new")
+       different-body (assoc right :body (a/var "external"))
+       different-guard (assoc right :guard (a/lit true))
+       different-name (assoc right :fname :other)]
+  (is (same? left right))
+  (is (tier/alpha= left right))
+  (is (not (same? left different-body)))
+  (is (not (same? left different-guard)))
+  (is (not (same? left different-name)))))

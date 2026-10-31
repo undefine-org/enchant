@@ -1,0 +1,58 @@
+(ns namespace-require-grammar-test (:require [compiler :as compiler]))
+(defn- form [source] (first (BeamLisp.Reader/read_string source "require-grammar.bl")))
+(defn- environment [] (assoc (compiler/new-env "require.caller") :file "require-grammar.bl"))
+(defn- refused? [action] (try (action) false (catch _ true)))
+
+(deftest reader-tuples-use-the-syntax-domain-rather-than-runtime-vector-storage
+ (let [reader (form "[provider :as p]")]
+  (is (= reader (BeamLisp.CompilerData/check_reader_data! reader)))
+  (is (refused? #(BeamLisp.CompilerData/check_first_order! reader)))))
+
+(deftest compiler-and-artifact-metadata-share-the-same-require-requests
+ (let [before (BeamLisp.Env/capture)
+       specs ["core" "[core :as p]"
+              "[core :refer [identity inc]]" "[core :as p :refer :all]"
+              "[^:private core :refer [^:private identity]]"]
+       expected [(tuple "core" nil (list))
+                 (tuple "core" "p" (list))
+                 (tuple "core" nil (list "identity" "inc"))
+                 (tuple "core" "p" :all)
+                 (tuple "core" nil (list "identity"))]]
+  (doseq [[source row] (map (fn [source row] [source row]) specs expected)]
+   (let [reader (form (str "(ns require.target (:require " source "))"))
+         header (BeamLisp.AOT/namespace_header reader)]
+    (is (= row (BeamLisp.CompilerData/namespace_require_spec (form source))))
+    (is (= (list row) (get-in header ["require.target" :require_specs])))
+    (is (= :let (:op (compiler/compile reader (environment)))))))
+  (is (= before (BeamLisp.Env/capture)))
+  (is (BeamLisp.Env/loaded_ns? "core"))))
+
+(deftest malformed-require-grammar-refuses-before-namespace-or-provider-effects
+ (let [before (BeamLisp.Env/capture)]
+  (doseq [spec ["[]" "[42]" "[provider :as]" "[provider :refer]"
+               "[provider :as 42]" "[provider :refer answer]" "[provider :unknown true]"
+               "[provider :as p :as q]" "[provider :refer [x] :refer :all]"
+               "[provider :refer [x x]]" "[provider :refer [42]]"]]
+   (let [reader (form (str "(ns require.target (:require " spec "))"))]
+    (is (refused? #(BeamLisp.CompilerData/namespace_require_spec (form spec))))
+    (is (refused? #(BeamLisp.AOT/namespace_header reader)))
+    (is (refused? #(compiler/compile reader (environment))))))
+  (is (= before (BeamLisp.Env/capture)))))
+
+(deftest require-metadata-projection-retains-bare-alias-and-refer-all-intent
+ (let [reader (form "(ns require.target (:require provider [provider :as p :refer [answer]] [provider :refer :all]))")
+       row (get (BeamLisp.AOT/namespace_header reader) "require.target")]
+  (is (= (list "provider") (:requires row)))
+  (is (= (list (tuple "p" "provider")) (:aliases row)))
+  (is (= (list (tuple "answer" "provider")) (:refers row)))
+  (is (= (list "provider") (:refer_alls row)))
+  (is (= (list (tuple "provider" nil (list)) (tuple "provider" "p" (list "answer")) (tuple "provider" nil :all))
+         (:require_specs row)))))
+
+(deftest raw-executable-and-deferred-reader-payloads-are-not-realized
+ (let [called (atom false) callback (fn [] (reset! called true))
+       deferred (lazy-seq (do (reset! called true) (list (tuple :symbol "value"))))]
+  (doseq [spec [(tuple :vector callback)
+                (tuple :vector (list (tuple :symbol "provider") (tuple :keyword "refer") (tuple :vector deferred)))]]
+   (is (refused? #(BeamLisp.CompilerData/namespace_require_spec spec)))
+   (is (= false @called)))))

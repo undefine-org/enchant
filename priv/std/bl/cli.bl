@@ -238,7 +238,6 @@
           (= a "--fix")          (recur more (assoc-in st [:fix] true))
           (= a "--check")        (recur more (assoc-in st [:check] true))
           (= a "--remove")       (recur more (assoc-in st [:remove] true))
-          (= a "--reuse-floor")   (recur more (assoc-in st [:reuse-floor] true))
           (= a "--native")       (recur more (assoc-in st [:native] true))
           (= a "--host")
           (if (empty? more)
@@ -272,6 +271,7 @@
 
 (def command-help
   {"run"     "bl run FILE|- [-- args...]               run a program (stdin when FILE is -)"
+   "world"   "bl world check|run MANIFEST.bl | emit MANIFEST.bl --out FILE.beam | pack ARTIFACT_DIR --out DIR   compile explicit worlds"
    "eval"    "bl eval EXPR|-                           evaluate one expression, print its value"
    "repl"    "bl repl [--web|--terminal]             interactive session: a window (default), a browser tab, or the terminal loop"
    "test"    "bl test [PATH...] [--shared] [--json] [--diagnose]    run .bl tests, each file isolated (default test/)"
@@ -283,6 +283,7 @@
    "ask"     "bl ask QUESTION [TARGET] [PATH...] [--json]   codebase questions"
    "search"  "bl search QUERY [-k N] [--ns NS] [--like NAME] [-p DIR]   find functions by what they MEAN"
    "oracle"  "bl oracle stats [PATH...] [--dry-run] [--json]        what the oracle answered, and what it cost"
+   "artifacts" "bl artifacts prepare|list|compare|capsule     prepare and inspect immutable native products"
    "build"   "bl build [PATH...] [--out DIR] [--force] [--jobs N] [--native]  AOT-compile (defaults from env.bl)"
    "self-build" "bl self-build [--out PATH] [--bin LAUNCHER] [--scratch DIR]   rebuild with the qualified compiler floor"
    "deps"    "bl deps lock|verify|list|fetch|compile [--lock DIR]   the library store"
@@ -319,10 +320,10 @@
    "hooks"        "bl hooks install | status                 git hooks that keep `latest` built"})
 
 (def usage-groups
-  [["run · eval · repl"                       ["run" "eval" "repl"]]
+  [["run · eval · repl · world"               ["run" "eval" "repl" "world"]]
    ["test · examples · tasks · check · lint · fix · ask · search · oracle"
                                               ["test" "examples" "tasks" "check" "lint" "fix" "ask" "search" "oracle"]]
-   ["build"                                   ["build" "self-build" "deps" "seed"]]
+   ["build · artifacts"                       ["build" "artifacts" "self-build" "deps" "seed"]]
    ["watch · monitor · serve"                 ["watch" "monitor" "serve"]]
    ["vm · realm"                              ["vm" "realm"]]
    ["doc · js"                                ["doc" "js"]]
@@ -381,7 +382,7 @@
 
 (defn cmd-run [args st]
   (if (empty? args)
-    (u/usage-error "usage: bl run FILE.bl [-- args...]")
+    (u/usage-error "usage: bl run FILE.bl|ARTIFACT_DIR [-- args...]")
     (do (u/register-paths st)
         ;; parity with a plain `bl` program run: the last value prints. The
         ;; program sees its post-`--` args via `BeamLisp/argv`; `:dd` carries
@@ -406,33 +407,20 @@
         0)))
 
 (defn cmd-self-build
-  "`bl self-build [--out BIN] [--scratch DIR]` — the drop rebuilds itself.
-
-   Sources come from the RUNNING `priv` (in a drop, the payload's own), the
-   launcher from the compound `BL_BIN` names, and the compiler from whatever
-   image is running. So this verb is the same program in every generation, and a
-   generation builds the next with the compiler it was built by — which is why
-   the proof is the fixpoint gate, not this run."
+  "`bl self-build [--out BIN]` — publish the selected SDK's verified Nix release.
+   Compiler reproduction and packaging happen in the trusted Nix recipe."
   [_args st]
   (u/register-paths st)
-  (BeamLisp.Loader/ensure_loaded "selfbuild")
-  (let [run (BeamLisp.Env/fetch! "selfbuild" "run")
-        out (u/resolve (or (:out st) "bl-self"))
-        scratch (u/resolve (or (:scratch st) (Path/join (System/tmp_dir) "bl-selfbuild")))
-        ; `--bin` wins over `BL_BIN`, and that is the CHECKOUT path: a stock
-        ; launcher built by cargo, with no compound behind it (see
-        ; `selfbuild/launcher-file`). In a drop, BL_BIN is the compound the
-        ; launcher is extracted from.
-        bin (or (:bin st) (System/get_env "BL_BIN"))
-        r (run {:out out :scratch scratch
-                :bin (if (some? bin) (u/resolve bin) nil)
-                :jobs (:jobs st) :reuse-floor? (not= false (:reuse-floor st))})]
-    (u/each u/io-err (:errors r))
-    (when (:ok? r)
-      (println (str "self-build: " (:out r) "  (" (:compiled r) " tier sources rebuilt, "
-                    (:cached r) " reused from cache, from "
-                    (:running-root r) ", " (:len r) " payload bytes)")))
-    (if (:ok? r) 0 1)))
+  (BeamLisp.Loader/ensure_loaded "artifact")
+  (try
+    (when (:bin st)
+      (throw (ex-info "Custom launchers require a declared Nix production recipe" {})))
+    (let [context ((BeamLisp.Env/fetch! "artifact" "framework-context"))
+          out (u/resolve (or (:out st) "bl-self"))
+          result ((BeamLisp.Env/fetch! "artifact" "publish-release!") (:sdk context) out)]
+      (println (str "self-build: " out " <- " (:output result)))
+      0)
+    (catch error (u/io-err (str "self-build: " (ex-message error))) 1)))
 
 (defn cmd-deps
   "`bl deps lock|verify|list|fetch|compile [--lock DIR]` — the library store.
@@ -637,6 +625,7 @@
       ; natives. A flag still wins, and a PATH argument still means exactly what
       ; it meant — the declaration only fills the silence.
       (let [declared (:build (project-value))
+            world (when (and (empty? args) (:world declared)) (u/resolve (:world declared)))
             ; `:paths` are ROOTS to search, the driver wants FILES: expand them
             ; the same way a PATH argument is expanded, so `priv/build` means the
             ; sources under it and not the directory itself (which the driver
@@ -644,24 +633,25 @@
             paths (if (empty? args)
                     (vec (mapcat u/expand-targets (:paths declared)))
                     (vec (mapcat u/expand-targets (map u/resolve args))))]
-    (if (empty? paths)
+    (if (and (empty? paths) (nil? world))
       (u/usage-error "usage: bl build [PATH...] [--out DIR] [--force] [--jobs N] [--native]")
       (do
           (BeamLisp.Loader/ensure_loaded "build")
+          (BeamLisp.Loader/ensure_loaded "application-product")
           (BeamLisp.Loader/ensure_loaded "claim")
-          (BeamLisp.Loader/ensure_loaded "reload")
+          (BeamLisp.Loader/ensure_loaded "reload.events")
           (let [out (cond
                       (:out st) (u/resolve (:out st))
-                      (:out declared) (:out declared)
+                      (:out declared) (u/resolve (:out declared))
                       :else (u/resolve "build"))
-                held (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "claim" "held-by") (list out))]
-            (if (some? held)
+                acquired (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "claim" "acquire!") (list out "bl build"))
+                held (:held acquired)]
+            (if (not (:ok? acquired))
               (do (u/io-err (str "bl build: " out " is already being built by pid "
                                  (:pid held) " (since " (:at held) ") — not waiting"))
                   1)
               (do
-                (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "claim" "acquire!") (list out "bl build"))
-                (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "reload" "event!")
+                (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "reload.events" "event!")
                                     (list {:event :build/start :out out :sources (count paths)}))
                 (try
                   (let [; The project value is captured BEFORE the driver runs, and that is not
@@ -670,10 +660,10 @@
                         ; retaining the value also makes post-build app emission
                         ; independent of any driver rebinding.
                         proj (project-value)
-                        run (BeamLisp.Env/fetch! "build" "run")
-                        r (run {:sources paths :out out :force? (:force st)
+                        run (BeamLisp.Env/fetch! "application-product" "build!")
+                        options {:root (:root proj) :sources paths :world world :out out :force? (:force st)
                                 :jobs (or (:jobs st) (:jobs declared))
-                                :native (or (:native st) (some? (:native declared)))
+                                :native (or (:native st) (boolean (seq (:native declared))))
                                 ; The declaration's exclusions are in force for
                                 ; EVERY build this verb runs, PATH argument or
                                 ; `--force` alike: a source the project keeps
@@ -689,9 +679,13 @@
                                 ; was declared in env.bl and read by nobody, so
                                 ; every `bl build` left lib/*.ex to Mix.)
                                 :ex (:ex declared)
-                                :log println})]
+                                :log println}
+                        context ((BeamLisp.Env/fetch! "artifact" "framework-context"))
+                        r (if (and (empty? args) (= (:root proj) (:checkout context)))
+                            ((BeamLisp.Env/fetch! "application-product" "select-sdk!") (:sdk context) options)
+                            (run options))]
                     (u/each u/io-err (:errors r))
-                    (when (= 0 (:built r)) (println "beam-lisp AOT: up to date"))
+                    (when (and (= 0 (:built r)) (empty? (:errors r))) (println "beam-lisp AOT: up to date"))
                     ; THE TREE'S OWN APP RESOURCE. `beam_lisp.app` is what
                     ; `Application.ensure_all_started(:beam_lisp)` reads, and
                     ; until now nothing but Mix could write it: a build that
@@ -700,14 +694,11 @@
                     ; `:app`), written through the same writer a package's `.app`
                     ; goes through (`app-resource`), and REPORTED when the
                     ; declaration is unusable rather than quietly skipped.
-                    (let [w (do (BeamLisp.Loader/ensure_loaded "app-resource")
-                                (BeamLisp.Ns.Rt/invoke
-                                  (BeamLisp.Env/fetch! "app-resource" "write-project!")
-                                  (list proj out)))]
-                      (if (:ok? w)
-                        (println (str "  app       " (Path/basename (:path w))))
-                        (u/io-err (str "bl build: no app resource — " (:why w)))))
-                    (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "reload" "event!")
+                    (when (empty? (:errors r))
+                      (if (:app-resource r)
+                        (println (str "  app       " (:app-file r)))
+                        (u/io-err (str "bl build: no app resource — " (:app-why r)))))
+                    (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "reload.events" "event!")
                                         (list {:event :build/done :out out :built (:built r)
                                                :errors (count (:errors r))
                                                :native (:built (:native r))}))
@@ -785,17 +776,17 @@
     (do (BeamLisp.Loader/ensure_loaded "bl.doc")
         (BeamLisp.Loader/ensure_loaded "bl.doc.html")
         (let [sub (first args)
-              rest (rest args)]
+              targets (rest args)]
           (cond
             (= sub "run")
-            (if (empty? rest)
+            (if (empty? targets)
               (u/usage-error "usage: bl doc run FILE...")
-              (let [fail (doc-run-files rest (:check st))] (if (= fail 0) 0 1)))
+              (let [fail (doc-run-files targets (:check st))] (if (= fail 0) 0 1)))
 
             (= sub "build")
-            (if (empty? rest)
+            (if (empty? targets)
               (u/usage-error "usage: bl doc build TARGET... [--out DIR]")
-              (let [docs (loop [ts rest, acc []]
+              (let [docs (loop [ts targets, acc []]
                            (if (empty? ts)
                              acc
                              (recur (rest ts)
@@ -996,10 +987,12 @@
 
 (def commands
   {"run" cmd-run
+   "world" (lazy "bl.world")
    "eval" cmd-eval
    "repl" (lazy "bl.repl")
    "test"     (lazy "bl.test")
    "build" cmd-build
+   "artifacts" (lazy "bl.artifacts")
    "self-build" cmd-self-build
    "deps" cmd-deps
    "seed" cmd-seed
@@ -1118,7 +1111,7 @@
    parking its single worker on a session with no end."
   [name task argv]
   (let [dir (Path/dirname (:run task))]
-    (BeamLisp.Loader/ensure_loaded "reload")
+    (BeamLisp.Loader/ensure_loaded "reload.events")
     (Process/flag :trap_exit true)
     (println (str "bl " name ": running, then watching " dir " — Ctrl+C to stop"))
     (run-program (:run task) argv)

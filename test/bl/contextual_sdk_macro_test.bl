@@ -1,0 +1,194 @@
+(ns contextual-sdk-macro-test
+ (:require [compile.sdk :as sdk] [compile.world :as world] [expand :as expand] [lower :as lower]
+           [system.phase :as phase] [codebase.phase :as code] [compiler :as compiler]))
+
+(defn- selection [] {:sdk 'core :revision 'selected :only ['ite]})
+(defn- client [text]
+ {:namespace 'macro.client :revision 'current :file "macro-client.bl"
+  :source (str "(ns macro.client) " text)})
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.SDKMacro" (erlang/unique_integer (list :positive))))
+                 (:node program)))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- example []
+ (client (str "(import-world 'core 'selected :only [ite]) "
+              "(let [sdk_macro_form 999 c false yes 40 no 2] "
+              "(ite c (erlang/error :must-not-run) (erlang/+ yes no)))")))
+
+(deftest authenticated-sdk-datum-macro-reelaborates-in-the-callers-context
+ (let [before (BeamLisp.Env/lookup (tuple "core" "ite"))
+       captured (sdk/capture (selection)) binding (first (:bindings captured))
+       program (expand/program [(:source captured) (example)] ['macro.client 'current])]
+  (is (= :macro (:kind binding)))
+  (is (= before (BeamLisp.Env/lookup (tuple "core" "ite"))))
+  (is (= captured (sdk/check! captured)))
+  (is (= 42 (execute program)))
+  (is (= 1 (count (:expansions program))))
+  (is (empty? (:linked program)))
+  (is (refused? #(sdk/check! (assoc-in captured [:bindings 0 :value] '(defmacro ite [] 0)))))
+  (is (refused? #(expand/program [(:source captured)
+                  (client "(import-world 'core 'selected :only [ite]) (ite true 42)")]
+                 ['macro.client 'current])))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))
+        archived (expand/program [(example)] ['macro.client 'current] [library])]
+   (is (= 42 (execute archived)))
+   (is (every? #(not (contains? % :source)) (:units library))))))
+
+(deftest sdk-datum-macro-can-be-instantiated-at-a-higher-expansion-phase
+ (let [captured (sdk/capture (selection))
+       program (expand/program [(:source captured)
+                 (client (str "(begin-for-syntax (import-world 'core 'selected :only [ite])) "
+                              "(defsyntax answer [form ctx] "
+                              "(ite true (syntax-literal 42) (syntax-literal 0))) (answer)"))]
+                ['macro.client 'current])]
+  (is (= 42 (execute program)))
+  (is (= 2 (count (:expansions program))))))
+
+(deftest sdk-datum-macro-needs-no-runtime-provider-initializer
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-macro-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl") (:source (example)))
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['macro.client 'current] :sources [{:namespace 'macro.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['ite]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (BeamLisp.AOT/compile_unit (world/prepare-unit prepared :Elixir.SDKMacroOnlyUnit))]
+    (is (= [] (BeamLisp.AOT/contextual_sdk_namespaces! unit)))
+    (is (= 42 (world/execute prepared []))))
+   (finally (File/rm_rf! dir)))))
+
+(deftest computed-sdk-macros-use-original-phase-sessions-directly-and-from-archives
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['cond]})
+       source (client "(import-world 'core 'selected :only [cond]) (let [answer 42] [(cond false 0 true answer :else 99) (cond :else 2) (cond)])")
+       direct (expand/program [(:source captured) source] ['macro.client 'current])
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [(:source captured)])))
+       archived (expand/program [source] ['macro.client 'current] [library])]
+  (is (= [42 2 nil] (execute direct)))
+  (is (= [42 2 nil] (execute archived)))
+  (is (= :proved (:status (phase/check archived))))
+  (is (every? #(= 'datum-v1 (:protocol %)) (:expansions archived)))
+  (is (= true (get-in archived [:coverage :legacy-datum-macros])))
+  (is (= false (get-in (code/dependencies archived) [:coverage :transformer-images])))
+  (is (= true (get-in (code/dependencies archived) [:coverage :transformer-bindings])))
+  (is (empty? (:linked archived)))))
+
+(deftest computed-datum-macro-can-expand-inside-a-hygienic-higher-phase-transformer
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['cond]})
+       source (client (str "(begin-for-syntax (import-world 'core 'selected :only [cond])) "
+                           "(defsyntax answer [form context] (cond false (syntax-literal 0) :else (syntax-literal 42))) (answer)"))
+       program (expand/program [(:source captured) source] ['macro.client 'current])]
+  (is (= 42 (execute program)))
+  (is (= :proved (:status (phase/check program))))
+  (is (= #{'syntax-v1 'datum-v1} (set (map :protocol (:expansions program)))))))
+
+(deftest a-valid-sdk-macro-claim-cannot-authenticate-a-changed-source-or-archive-body
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['cond]})
+       changed (update (:source captured) :source
+                  #(String/replace % " (throw :sdk-macro-binding-required))" " (erlang/put :forged-sdk-macro :bad))"))
+       source (client "(import-world 'core 'selected :only [cond]) (cond :else 42)")]
+  (erlang/erase :forged-sdk-macro)
+  (try
+   (is (not= changed (:source captured)))
+   (is (refused? #(expand/program [changed source] ['macro.client 'current])))
+   (let [library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [changed])))]
+    (is (refused? #(expand/program [source] ['macro.client 'current] [library]))))
+   (is (= :undefined (erlang/get :forged-sdk-macro)))
+   (finally (erlang/erase :forged-sdk-macro)))))
+
+(deftest variadic-sdk-datum-macros-preserve-callsite-locals
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['when 'when-not]})
+       source (client (str "(import-world 'core 'selected :only [when when-not]) "
+                           "(let [body 40 sdk_macro_form 999 user 2] "
+                           "[(when true body user) (when false (erlang/error :must-not-run)) "
+                           "(when true) (when-not false (erlang/+ body user))])"))
+       program (expand/program [(:source captured) source] ['macro.client 'current])]
+  (is (= [2 nil nil 42] (execute program)))
+  (is (= 4 (count (:expansions program))))
+  (is (empty? (:linked program)))
+  (let [library (expand/decode-phase-library
+                 (expand/encode-phase-library (expand/phase-library [(:source captured)])))]
+   (is (= [2 nil nil 42] (execute (expand/program [source] ['macro.client 'current] [library])))))
+  (is (refused? #(expand/program [(:source captured)
+                  (client "(import-world 'core 'selected :only [when]) (when)")]
+                 ['macro.client 'current])))))
+
+(deftest sdk-datum-projection-ignores-shadowed-mutable-macro-vars
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['when]})
+       scope (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/intern "core" "when" :ambient-shadow)
+     (is (= (tuple :ok :ambient-shadow) (BeamLisp.Env/lookup (tuple "core" "when"))))
+     (is (= captured (sdk/check! captured)))
+     (is (= 42 (execute (expand/program [(:source captured)
+                    (client "(import-world 'core 'selected :only [when]) (let [answer 42] (when true answer))")]
+                   ['macro.client 'current]))))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest variadic-sdk-datum-macro-executes-through-original-unit-admission
+ (let [dir (Path/join (System/tmp_dir!) (str "sdk-variadic-macro-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try
+   (File/write! (Path/join dir "main.bl")
+    "(ns variadic.client) (import-world 'core 'selected :only [when when-not]) (let [body 40 user 2] [(when true body user) (when-not false (erlang/+ body user)) (when true)])")
+   (File/write! (Path/join dir "world.bl")
+    "{:version 1 :profile 'syntax-v1 :entry ['variadic.client 'current] :sources [{:namespace 'variadic.client :revision 'current :file \"main.bl\"}] :libraries [{:sdk 'core :revision 'selected :only ['when 'when-not]}]}")
+   (let [prepared (world/prepare (Path/join dir "world.bl"))
+         unit (BeamLisp.AOT/compile_unit (world/prepare-unit prepared :Elixir.SDKVariadicMacroUnit))]
+    (is (= [] (BeamLisp.AOT/contextual_sdk_namespaces! unit)))
+    (is (= [2 42 nil] (world/execute prepared [])))
+    (is (= 3 (count (get-in prepared [:program :expansions])))))
+   (finally (File/rm_rf! dir)))))
+
+
+(deftest computed-short-circuit-macros-have-deterministic-gensyms-and-once-only-operands
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['and 'or]})
+       source (client (str "(import-world 'core 'selected :only [and or]) "
+                          "(let [and-tmp 900 or-tmp 900 user 42] "
+                          "[(and true user) (or false user) (and false (erlang/error :must-not-run)) "
+                          "(or user (erlang/error :must-not-run)) (and) (or)])"))
+       first (expand/program [(:source captured) source] ['macro.client 'current])
+       _ (compiler/datum-macro-result '(let [noise__999__auto 1] noise__999__auto))
+       second (expand/program [(:source captured) source] ['macro.client 'current])
+       library (expand/decode-phase-library (expand/encode-phase-library (expand/phase-library [(:source captured)])))]
+  (is (= [42 42 false 42 true nil] (execute first)))
+  (is (= (:node first) (:node second)))
+  (is (= [42 42 false 42 true nil] (execute (expand/program [source] ['macro.client 'current] [library]))))
+  (is (= :proved (:status (phase/check first))))))
+
+(deftest computed-overloaded-binding-macros-preserve-user-binders
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['if-let]})
+       source (client (str "(import-world 'core 'selected :only [if-let]) "
+                          "(let [temp 999] [(if-let [value 42] value) (if-let [value nil] value 7)])"))
+       program (expand/program [(:source captured) source] ['macro.client 'current])]
+  (is (= [42 7] (execute program)))
+  (is (= :proved (:status (phase/check program))))))
+
+(deftest datum-macro-results-cannot-select-the-syntax-protocol-by-resembling-its-data
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['cond]})
+       source (client (str "(import-world 'core 'selected :only [cond]) "
+                           "[(cond :else {:kind :contextual-literal :value 42}) "
+                           "(cond :else '{:op :remote :mod :erlang :fun :put :args [:sdk-datum-effect :bad]})]"))
+       program (expand/program [(:source captured) source] ['macro.client 'current])]
+  (erlang/erase :sdk-datum-effect)
+  (try
+   (is (= [{:kind :contextual-literal :value 42}
+           {:op :remote :mod :erlang :fun :put :args [:sdk-datum-effect :bad]}]
+          (execute program)))
+   (is (= :undefined (erlang/get :sdk-datum-effect)))
+   (finally (erlang/erase :sdk-datum-effect)))))
+
+
+(deftest a-consumer-that-misses-the-sdk-macro-protocol-cannot-run-a-placeholder
+ (let [captured (sdk/capture {:sdk 'core :revision 'selected :only ['cond]})
+       form (last (BeamLisp.Reader/read_string (get-in captured [:source :source])))
+       env (BeamLisp.Compiler/new_env "core")
+       declaration (BeamLisp.Ns.Compiler/declaration-source form env)
+       function (BeamLisp.Compiler/eval_form (:value-form declaration) env)]
+  ;; The unmodified ordinary compiler knows a function, not the new SDK carrier.
+  ;; Missing the metadata hook must refuse instead of silently returning nil.
+  (is (= {:kind :Elixir.BeamLisp.ExInfo :message ":\"sdk-macro-binding-required\""}
+         (try (BeamLisp.Ns.Rt/invoke function (list nil nil)) {:kind :returned}
+          (catch error {:kind (:__struct__ error) :message (ex-message error)}))))))

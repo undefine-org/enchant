@@ -7,12 +7,15 @@
  (let [path (str (System/get_env "HOME") "/tmp/runtime-classes-" (erlang/unique_integer (list :positive)))]
   (File/mkdir_p! path) path))
 (defn- graph [root revision]
- (let [source (str "(ns runtime.class (:require [datom]))
+ (let [source (str "(ns runtime.class (:require [datom] [core] [credential.store :as store]))
      (defrecord Session [value]) (deftype Handle [value])
      (defn record [] (->Session " revision "))
      (defn typed [] (->Handle " revision "))
-     (defrecord QueryLike [effects] core/Seqable (-seq [this] (swap! (:effects this) inc) nil))
-     (defn query-like [effects] (->QueryLike effects))
+     (defrecord StoreLike [effects] store/Store
+       (-get [_ _ _] nil) (-put [_ _ _ value] value) (-delete [_ _ _] nil)
+       (-list [this] (swap! (:effects this) inc) []) (-where [_] \"runtime-data\"))
+     (defn store-like [effects] (->StoreLike effects))
+     (defn run-protocol [value] (store/-list value))
      (defn migrate [old] (->Session (:value old)))
      (defn migrate-typed [old] (->Handle (.-value old)))
      (defn captured [cell] (fn [] @cell))")
@@ -20,7 +23,7 @@
   (File/mkdir_p! (Path/dirname file)) (File/write! file source)
   (BeamLisp.Loader/with_load_path root
    #(generation/prepare! (generation/project-plan
-      {:application-id "runtime-class-migration" :entrypoints ["runtime.class/record" "runtime.class/typed"]
+      {:application-id "runtime-class-migration" :entrypoint "runtime.class/record"
        :fixed-runtime true})))))
 (deftest same-fields-are-not-authority-to-retag-or-share-old-class-data
  (let [root (root!) old (graph root 1) candidate (graph root 2)
@@ -114,18 +117,23 @@
     (generation/retire! old) (File/rm_rf! root)))))
 
 (deftest raw-validation-never-invokes-foreign-enumerators-or-lazy-callbacks
- (let [effects (atom 0) opaque {:__struct__ :Elixir.Range :hidden (fn [] (swap! effects inc))}]
+ (let [effects (atom 0)
+       ;; Construct the hostile runtime value after compilation. A literal
+       ;; foreign struct is correctly rejected by the compiler's data guard.
+       opaque (maps/put :__struct__ :Elixir.Range {:hidden (fn [] (swap! effects inc))})]
   (is (= :refused (:status (execution/runtime-inspection nil opaque))))
   (is (= 0 @effects))
   (is (= :refused (:status (execution/runtime-inspection nil (lazy-seq (do (swap! effects inc) (list 1)))))))
   (is (= 0 @effects))))
 
-(deftest a-registered-domain-sequence-is-inspected-without-running-its-protocol
+(deftest a-registered-domain-object-is-inspected-without-running-its-protocol
  (let [root (root!) graph (graph root 7) effects (atom 0)
-       value (generation/invoke! graph "runtime.class/query-like" [effects])]
+       value (generation/invoke! graph "runtime.class/store-like" [effects])]
   (try
    (is (= :valid (:status (execution/runtime-inspection graph value))))
    (is (= 0 @effects))
+   (is (= [] (generation/invoke! graph "runtime.class/run-protocol" [value])))
+   (is (= 1 @effects))
    (finally (generation/retire! graph) (File/rm_rf! root)))))
 
 (deftest runtime-owner-loss-inside-coordinator-fence-refuses-before-pointer-mutation

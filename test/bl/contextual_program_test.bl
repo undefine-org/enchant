@@ -1,0 +1,106 @@
+(ns contextual-program-test
+ (:require [expand :as x] [binding :as b] [codebase.phase :as catalog] [lower :as lower]))
+
+(defn- source [namespace revision text]
+ {:namespace namespace :revision revision :source text :file (str namespace ".bl")})
+(defn- run [sources entry]
+ (let [program (x/program sources entry)
+       module (erlang/binary_to_atom (str "Elixir.ContextualProgram." (erlang/unique_integer (list :positive))))]
+  (tuple (lower/eval-anf module (:node program)) program)))
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest actual-source-definitions-link-without-ambient-env
+ (let [unit (source 'example 'current
+              "(ns example) (def base 40) (defn answer [x] (erlang/+ base x)) (answer 2)")
+       r (run [unit] ['example 'current])]
+  (is (= 42 (elem r 0)))
+  (is (= 2 (count (:linked (elem r 1)))))
+  (is (= (:selection (elem r 1)) (b/validate-selection (:selection (elem r 1)))))))
+
+(deftest same-namespace-source-revisions-link-to-their-own-code
+ (let [old (source 'library 'old "(ns library) (defn answer [x] (erlang/+ x 40))")
+       new (source 'library 'new "(ns library) (defn answer [x] (erlang/+ x 100))")
+       client (source 'client 'current
+                (str "(ns client) "
+                  "(import-world 'library 'old :as old :only [answer]) "
+                  "(import-world 'library 'new :as new :only [answer]) "
+                  "[(old/answer 2) (new/answer 2)]"))
+       r (run [old new client] ['client 'current])]
+  (is (= [42 102] (elem r 0)))
+  (is (= 3 (count (get-in (elem r 1) [:selection :worlds]))))))
+
+(deftest actual-transformers-preserve-private-definition-and-caller-bindings
+ (let [provider (source 'library 'old
+                  (str "(ns library) (defn- helper [x] (erlang/+ x 40)) "
+                    "(defsyntax wrap [form context] "
+                    " (syntax-template (let [tmp 999] (helper hole)) {'hole (syntax-arg form 1)}))"))
+       client (source 'client 'current
+                 (str "(ns client) (import-world 'library 'old :only [wrap]) "
+                   "(let [tmp 2 helper (fn [x] 0)] (wrap tmp))"))
+       r (run [provider client] ['client 'current]) program (elem r 1)]
+  (is (= 42 (elem r 0)))
+  (is (= 1 (count (:expansions program))))
+  (is (= 1 (count (:transformers program))))
+  (is (= (:selection program) (b/validate-selection (:selection program))))))
+
+(deftest authored-macro-availability-and-private-exports-refuse-early
+ (is (= :binding-not-yet-available
+        (kind-of #(x/program
+          [(source 'example 'current
+             "(ns example) (later 1) (defsyntax later [form ctx] (syntax-arg form 1))")]
+          ['example 'current]))))
+ (is (= :binding-import-private
+        (kind-of #(catalog/catalog
+          [(source 'library 'old "(ns library) (defn- hidden [] 42)")
+           (source 'client 'current "(ns client) (import-world 'library 'old :only [hidden]) 42")])))))
+
+(deftest compile-time-imports-and-values-are-phase-qualified
+ (let [provider (source 'math 'old "(ns math) (defn offset [] 2)")
+       client (source 'client 'current
+          (str "(ns client) "
+            "(begin-for-syntax (import-world 'math 'old :as m :only [offset]) "
+            " (def amount (m/offset))) "
+            "(defsyntax amount-literal [form ctx] (syntax-literal amount)) "
+            "(erlang/+ 40 (amount-literal))"))
+       r (run [provider client] ['client 'current])]
+  (is (= 42 (elem r 0)))
+  (is (= 1 (:phase-shift (first (get-in (catalog/catalog [provider client]) [:selection :imports])))))
+  (is (empty? (:linked (elem r 1))))))
+
+(deftest compile-time-effects-cycles-and-unused-provider-expressions-refuse
+ (is (= :constructor-machine-refused
+        (kind-of #(x/program
+          [(source 'example 'current
+             (str "(ns example) (defsyntax bad [form ctx] (erlang/put :contextual-effect true)) "
+                  "(bad)"))] ['example 'current]))))
+ (is (= :undefined (erlang/get :contextual-effect)))
+ (is (= :contextual-initialization-cycle
+        (kind-of #(x/program [(source 'example 'current "(ns example) (def a b) (def b a) a")]
+                    ['example 'current]))))
+ (is (= :contextual-provider-expression
+        (kind-of #(x/program [(source 'provider 'old "(ns provider) (erlang/put :bad true)")
+                              (source 'example 'current "(ns example) 42")]
+                    ['example 'current])))))
+
+(deftest self-recursion-and-kernel-spelling-shadowing-use-local-bindings
+ (is (= 42 (elem (run [(source 'example 'current
+                  "(ns example) (defn count-to [x] (if (erlang/< x 42) (count-to (erlang/+ x 1)) x)) (count-to 0)")]
+                      ['example 'current]) 0)))
+ (is (= 42 (elem (run [(source 'example 'current
+                   "(ns example) (let [if (fn [x] x)] (if 42))")]
+                      ['example 'current]) 0))))
+
+(deftest phase-zero-initializers-do-not-run-in-the-constructor-session
+ (is (= 0
+        (get-in (x/program [(source 'example 'current
+                                "(ns example) (def value (erlang/put :constant-effect true)) value")]
+                            ['example 'current]) [:constructor :calls])))
+ (is (= :undefined (erlang/get :constant-effect)))
+ (is (= :undefined (erlang/get :bl_contextual_constructor_sessions))))
+
+(deftest explicit-bindings-take-precedence-over-a-native-looking-qualifier
+ (let [provider (source 'provider 'old "(ns provider) (defn answer [] 42)")
+       client (source 'client 'current
+                  "(ns client) (import-world 'provider 'old :as erlang :only [answer]) (erlang/answer)")]
+  (is (= 42 (elem (run [provider client] ['client 'current]) 0)))))

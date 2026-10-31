@@ -1,0 +1,336 @@
+#+TITLE: Compilation worlds, bootstrap phases, and artifact production
+#+DATE: 2026-10-22
+#+STATE: RESEARCH COMPLETE FOR THE OBSERVED BLOCKERS — DESIGN RECOMMENDATION
+
+* Decision
+Keep the artifact-only producer. Give compile-time bindings an explicit,
+immutable compilation-world identity. Preserve language invocation as a distinct
+ANF operation until lowering. Bootstrap through explicit generations of the
+compiler, with a source-backed phase library and an authenticated kernel ABI.
+
+The missing abstraction is a binding in a particular compilation world, rather
+than a namespace/module spelling interpreted against whichever units have been
+visited. An evaluation phase, a target generation, and a runtime admission frame
+are three different things. Represent their relationships explicitly.
+
+This recommendation follows the native probes below. It is a proposed
+implementation direction; no resolver semantics or protection checks were
+changed during the investigation. Full self-reproduction remains unqualified.
+
+* Observations and reproducible evidence
+Run =scripts/research-artifact-staging --out <empty-directory>= under the
+repository's process-tree limits. Elixir/OTP must be on PATH. The harness copies
+the current floor and sources into a private image, verifies the compiler key
+and loaded stable module identities, and uses one serial VM. It installs nothing.
+Every case uses actual Reader, Compiler, AOT preparation, emission and artifact
+verification. Erlang tracing records binding names and remote targets, with a
+delivery barrier and a bounded 512-event tail per case.
+
+There are 30 cases, including all 12 boot files and the additional =multi=
+unit required by =seed/namespaces=. Twenty-one cases emit verified artifacts;
+nine deliberately record current refusals. Expected refusal kinds and selected
+literal function bodies are checked. These are research assertions about the
+current behavior, including undesirable behavior, rather than passing bootstrap
+acceptance tests. =staging-research-checks.json= records exact results and inputs.
+
+The harness checks previously loaded BeamLisp module MD5s, selected namespace
+generations and the caller environment after every success/refusal. This checks
+those identities, not a complete inventory of every global side effect. Original
+source/floor hashes are rechecked after the VM exits. No native admission is
+granted by verification.
+
+The fresh reversed/untraced control has the same 30 semantic observations and
+identical invocation IR. All eleven successfully emitted actual floor units
+have byte-identical complete artifact directories in both VMs. Small generated
+Source probes retain their distinct private absolute source paths in BEAM
+attribution, so their bytes are compared only within a fixed input/path context.
+Whole VM times are 18.547 seconds traced and 17.969 seconds untraced; private
+image copying is excluded. Fixture files disappear with each private image.
+
+** Exact runtime cycle
+The trace of the actual =priv/boot/rt.bl= is:
+#+begin_example
+compile a runtime function containing cond
+  expand core/cond
+    call Rt.empty? -> compile source rt/empty?
+      call rt/k-empty? -> compile source rt/k-empty?
+        expand core/cond
+          call Rt.empty?
+            call rt/k-empty? -> demand the same unfinished compilation
+#+end_example
+The minimal case is only:
+#+begin_src clojure
+(ns rt)
+(defn empty? [x] (cond :else (erlang/== x ())))
+(defn probe [] (cond :else 42))
+#+end_src
+The macro needs to execute a function whose body requires that macro to finish
+compiling. This is a compilation/evaluation cycle, not ordinary function
+recursion. A declaration placeholder cannot provide the missing expanded body.
+
+A BIF-only foundation for empty?, first, eqv and nth permits the same =cond=
+probe to emit a literal 42. The foundation uses ordinary source functions and
+recursive BIF-level nth; no primitive admission was widened. An early trial
+using =lists:nth/2= encountered the separate closed-adapter refusal. That trial
+does not establish that every pure Erlang library call is supported.
+
+** Resolution depends on visited units
+With the same cyclic runtime source selected in the manifest:
+- An unrelated client using =cond= prepares successfully.
+- Adding an unused =(:require [rt])= makes that client hit the cycle.
+
+=constructor_remote_source_uncached= searches staged units and their requires
+for a namespace whose emitted module matches a remote. Thus an incidental
+candidate set changes how existing Core macro calls are interpreted. Source
+selection and lexical ownership need an explicit world; presence in a cache or
+visited-unit set must not select a different semantic provider.
+
+** Language invocation loses its identity
+These forms compile to identical ANF after removing diagnostic annotations:
+#+begin_src clojure
+(f)
+(BeamLisp.Ns.Rt/invoke f ())
+#+end_src
+Both are =:remote Rt :invoke= with the same callee and packed list. Similarly,
+=empty?= through a Core link and an explicit Rt remote have identical remote IR.
+The compiler's =linked-call= and =anf-invoke= erase their different origins.
+
+The executable control defines source =rt/invoke= to return the form
+=(defn answer [] 99)=. A macro explicitly calling that function emits 99. A
+macro invoking a lambda which returns =(defn answer [] 42)= ALSO emits 99.
+This confirms candidate lookup intercepts the language's invocation mechanism.
+The future contract is implicit invocation -> 42, explicit source call -> 99.
+A downstream module-name heuristic cannot recover information already erased.
+
+** Core has an independent bootstrap ordering requirement
+Actual =core.bl= refuses with =sdk-stage-local-macro-not-initialized=: its early
+=nil?= function uses =cond=, defined later in the file. A minimal ordinary source
+file shows the same refusal; placing the macro first succeeds. This is separate
+from the runtime cycle. Ordinary Source preparation currently enforces authored
+local macro order. Bootstrapping the prelude needs a specified preceding-phase
+macro provider, or an explicitly acyclic source foundation.
+
+** Recursion, values, effects and source semantics remain distinct
+- Recursive and mutually recursive source helpers both produce literal 42.
+- A cyclic pair of compile-time values reports the actual a -> b -> a path.
+- A macro demanding itself while compiling refuses a compilation cycle.
+- A source rt/empty? returning false affects a locally authored macro; its
+  emitted answer is 2. A blanket Rt-to-kernel rule would erase this behavior.
+- An attempted File.write! inside a macro is refused by the closed evaluator.
+- Eleven of the thirteen actual floor units emit/verify independently.
+  Rt and Core have the distinct failures above. Independent unit emission does
+  not establish that the units form one complete, compatible compiler image.
+
+* Hypothesis disposition
+| Hypothesis | Evidence and architectural consequence |
+|------------+----------------------------------------|
+| Publication or hot replacement causes this refusal | Ruled out for these probes by stable loaded identities/generations and the artifact-only path. The old regenerator's intermediate-publication bug is still independent. |
+| General recursion is unsupported | Ruled out by actual recursive/mutual helpers. Preserve recursive function groups; distinguish evaluation demands. |
+| Cyclic compile-time values caused the Rt failure | Ruled out by the exact function/macro trace; value cycles have a different witnessed refusal. |
+| Source runtime interception causes the cycle | Confirmed by exact remote/binding trace, minimal namespace control and unused-require control. |
+| Fixing only implicit invoke fixes bootstrap | Insufficient: the observed cycle involves the authored empty? call in Core's cond macro. Both binding worlds and invocation semantics matter. |
+| Prelink every definition / use an SCC scheduler | Useful for function groups, insufficient for a macro needed to compile its own evaluator dependency. Detect and report this cycle, or select a preceding phase. |
+| Change primitive/source resolver priority | A blanket rule breaks selected Rt helper semantics; source-first already intercepts implicit invocation. Neither expresses the required distinction. |
+| A process boundary alone solves it | Fresh private VM reproduces it. Isolation prevents module replacement but does not choose correct compile-time bindings. |
+| More trust, larger budgets, or SDK exemptions are needed | No supporting evidence. The small reproducible cycle survives far below budgets. Keep custody/closed-effect checks. |
+| Stale per-workspace lookup caches caused it | Fresh handles and a fresh-VM reversed/untraced control preserve outcomes. This narrows history/tracing hypotheses for this corpus; it is not a general concurrency/cache proof. |
+| Core will work once Rt works | Refuted by its independent early local macro use. Add a separate phase-provider gate. |
+| All remaining bootstrap problems are now known | Unestablished. Host artifact preparation, generated entries, full image assembly, fresh initialization and reproduction still need their own gates. |
+
+* Architecture and API contracts
+** One producer with immutable worlds
+Keep =open_workspace=, =prepare_unit=, =emit_unit=, =verify_unit= and
+=close_workspace!=. Namespace arguments remain quoted symbols. Workspace
+references are controller-local; serializable reports never authorize actions.
+
+Add a world contract to the workspace's next version. A world identifies exact
+source selections, declarations/revisions, phase providers, kernel ABI, producing
+compiler and target/backend ABI. These identities are distinct digest fields,
+even when a current same-source build makes them equal. Changing a provider
+invalidates its dependent macro/value/prepared-unit cone.
+
+Proposed internal surface, implemented initially beside existing AOT machinery:
+#+begin_example
+world/select      selected-inputs phase-plan kernel-proof -> immutable world
+world/resolve     world caller declaration-position name -> binding-ref | obligation
+world/demand      controller binding-ref kind -> prepared binding | cycle witness
+world/advance     controller prepared-phase -> new world
+#+end_example
+These names describe responsibilities, not existing public namespaces. A
+binding-ref includes world ID, normalized namespace/name, declaration revision
+and callable/value kind. Macro closures and helper recipes retain their world.
+Lookup never reconstructs it from an MFA or the currently visited unit set.
+
+The target's emitted runtime behavior retains existing var lookup, linking,
+initialization and reload semantics. A compile-time world freezes compilation
+inputs; it does not turn every runtime var into an immutable value.
+
+World data and executable authority have separate lifetimes. The producer owns
+bounded immutable source/ANF storage and disposable Env overlays; messages carry
+IDs and small requests instead of whole compiler environments. BEAM messages
+must not accidentally copy the complete world graph at every process boundary.
+Reuse the existing monitor-before-allocation guardian for resource-owning scopes;
+retain physical kernel code only during an admitted evaluation attempt. A
+workspace cache stores data recipes, never native Fns, leases or monitor handles.
+Measure retained bytes and reclamation under owner death as well as throughput.
+
+** Preserve semantics in canonical ANF
+Introduce a language-invocation node, for example:
+#+begin_src clojure
+{:op :invoke :callee callee-node :arguments packed-list-node}
+#+end_src
+Keep =:apply= for existing native fn/control uses. It currently lowers to Core
+Erlang =capply= and is not a replacement for BL keyword/collection/callable
+dispatch. The packed argument node preserves computed argument lists and order.
+
+Retain a binding reference for source calls/value reads until compile-time
+interpretation and dependency extraction have consumed it. A source call form
+can carry =:op :binding-call :target binding-ref :args nodes=; ordinary host
+calls retain =:remote=. Closed kernel operations use explicit versioned ABI
+operation IDs resolved by the authenticated controller, not =:kernel true= in
+annotations. IR describes semantics; it does not itself confer authority.
+
+=anf= owns constructors, validation, executable children, dependency edges,
+canonical hashing and callable recognition. =system.ir= reads that grammar.
+Compiler creates the nodes; the existing constructor machine interprets them;
+lower emits the same runtime ABI without a per-call world lookup. Update all
+actual ANF consumers and schema/cache keys in one coherent toolchain change.
+Use a closed node/operator inventory; unsupported consumers refuse explicitly.
+
+** Bootstrap phases
+Separate the authenticated executing kernel K0, its macro/phase library P0,
+and target sources S1. P0 macro references remain bound to their own world while
+producing S1. Candidate runtime declarations cannot intercept them.
+
+Prepare a complete Rt1/Core1 foundation using explicit preceding-phase
+providers, then establish a world whose Source macro/helpers use the prepared
+candidate bindings. A candidate macro calling its own source helper sees that
+helper's candidate behavior. An existing P0 macro does not silently switch
+providers when a candidate require is visited. Candidate definitions become
+available according to authored order and explicit phase transitions.
+
+Define the bootstrap phase plan in producer/build data. The ordinary Source
+path keeps its local macro ordering checks. Do not make all forward macro uses
+legal or silently fall back to whatever macro is live in Env.
+
+P0 must contain bounded, versioned macro/helper ANF and literal/closure recipes,
+with complete selected input identities. Current canonical Core kernel metadata
+authenticates function definitions; the investigation has not established a
+complete portable macro phase library in the current floor. Exporting and
+qualifying that library is an explicit implementation prerequisite. A floor
+hash cannot reconstruct old source bytes. A legacy transition must produce
+the phase library through the coherent recovery route, attest its exact inputs,
+and compare its semantics to the producing compiler. No captured native macro
+Fn is serialized or invoked as caller-supplied code.
+
+Finish each target image before starting its compiler in a separate VM. Build
+A -> B -> C (and a further comparison stage when ABI transitions require it).
+Record producing kernel, phase library and target identities separately.
+Compare complete inventories/bytes where reproducibility applies; otherwise
+name the ABI transition and required extra stage. Fresh initialization and
+actual changed-helper behavior are separate gates from byte identity.
+
+** Owners in this codebase
+| Existing owner | Required work |
+|----------------+---------------|
+| Reader, reader-node, source-graph / BeamLisp.SourceGraph | Reuse actual forms, spans, headers and selection. No second parser. |
+| priv/boot/compiler.bl | Retain binding/world identity and emit language invocation before linked-call erases it. Macro invocation enters the captured phase world. |
+| priv/boot/anf.bl, priv/boot/lower.bl | Canonical invocation/binding operation schema; shared traversal/hashes; lower only after phase interpretation and evidence collection. |
+| priv/host/aot.bl | Reuse workspace guardian, source staging, closed constructor machine, descriptors and assembly. Replace unit-set remote ownership with world resolution; report exact compilation/evaluation demand stacks. |
+| priv/host/aot_cache.bl, provenance, build-plan | Version world/phase/IR contracts, cache the exact dependency closure, distinguish producing kernel from target. Existing provenance namespace is provenance. |
+| codebase/index-source in :calls mode, system.source | Project actual authored call facts cheaply; retain unresolved edges. Source spelling alone cannot prove phase ownership. |
+| codebase.boundary, system.ir | Join expanded/bound dependency edges and emitted entries without reparsing; add world/phase and expansion/evaluation edge kinds. |
+| typed/check-source-result, system.arity | Validate schemas, representation and signatures with explicit unknown coverage. These APIs do not currently prove phase correctness or ownership. |
+| system.analyze, system.summary, system.footprint | Reuse bounded call/effect analysis; distinguish latent function recursion from eager macro/value demands. Enforce finite budgets. |
+| system.publication, system.publication-closure, system.execution | Bind emitted descriptors to actual bytes/callables after guarded activation. Current system.execution covers published defn dependencies; it is not native admission. |
+| diag, errors | Render source positions read-only. Keep cycle/world witnesses in the enclosing report; closed diagnostic vocabulary stays intact. |
+| server-clause, proc.contract | Reuse generated actor clause semantics and exact entry keys when inventory is extended. |
+| priv/build/seed.bl, scripts/regenerate-seed.bl | Assemble complete artifact generations; qualify in fresh VMs; install after all required gates, without intermediate hotloads into the producer. |
+
+Keep codebase/system/typed/errors out of the preboot kernel dependency graph.
+The compiler produces finite facts; richer analysis consumes those facts later.
+Native custody enforcement continues to use actual bytes, leases, monitors and
+private controller state, independently of source reports.
+
+* Alternatives and tradeoffs
+- An acyclic BIF-only macro/runtime foundation is viable: the leaf control
+  demonstrates it. Moving every Core macro dependency into that subset is a
+  language-library maintenance commitment. Use a small reviewed foundation;
+  do not rewrite the complete runtime merely to avoid representing phases.
+- Compiling/loading every helper in an isolated native VM gives fuller host
+  behavior, but isolation alone reproduces the knot and native effects still
+  need an execution protocol. Keep the bounded interpreter for pure staging;
+  use fresh native VMs for qualification.
+- A public Racket-style phase language could eventually express more programs.
+  It is unnecessary for this implementation: begin with explicit build/world
+  data and preserve ordinary Source syntax and macro order.
+- Module renaming and hotloading require retargeting every fixed host/runtime
+  ABI and mutable lookup. Complete images in fresh VMs avoid that coupling.
+- Expanding a native whitelist or treating all Rt calls as primitives loses
+  candidate helper semantics and does not authenticate arbitrary code.
+
+* Efficiency and limits
+The final research receipts report measured whole-VM and per-unit times.
+They include tracing/validation overhead and are not a performance comparison
+against a redesigned compiler. Real compiler.bl preparation/emission is about
+seven seconds on this host; a small case is about a tenth of a second.
+
+Target efficient behavior mechanically: immutable maps select bindings directly;
+memoize parsed inputs and compiled recipes by world/revision; share finite ANF
+and facts across units; invalidate only the affected phase/dependency cone.
+Each macro evaluator uses a bounded frame and cumulative workspace budgets.
+Bootstrap starts one VM per whole generation, never one per source/helper.
+The cold-start/memory and byte-validation costs remain measurable costs.
+
+World/IR checks happen during preparation, not ordinary function invocation.
+The later execution protocol can admit a retained immutable graph once and
+carry a constant-size frame/graph handle across supported boundaries. O(1)
+retention/admission is a later native implementation and measurement obligation;
+the current Source workspace does not already provide it.
+
+* Ordered implementation and acceptance gates
+1. Improve closed diagnostics with binding/world/declaration and demand-stack
+   witnesses. Convert the observed cases into focused native regressions; the
+   current research harness intentionally asserts current undesirable outcomes.
+2. Change canonical ANF and compiler binding resolution together. Gate implicit
+   invoke=42 versus explicit source invoke=99, selected helper=2, and an unused
+   require leaving a previously bound macro's meaning unchanged. Preserve
+   runtime ABI, dynamic packed arguments, guards, shadowing and evaluation order.
+3. Export/verify a bounded phase library and explicit bootstrap phase plan.
+   Require ordinary forward-macro refusal, valid bootstrap Core preparation,
+   valid Rt preparation, ordinary recursion and precise invalid demand cycles.
+4. Add artifact-only pinned host preparation using existing retarget_host and
+   host descriptor/validation logic. =compile_host_file :load? false= currently
+   still reaches load_unit; it must pass an explicit no-publication regression.
+5. Assemble all host and thirteen floor units, generated companions and phase
+   inventory. Reconcile actual output membership before any activation.
+6. Qualify complete generations in separate VMs, including no-source consumer,
+   bootstrap/native-only startup, changed-runtime helper semantics, initialization
+   once, source drift, tampering, interrupted installation and reproduction.
+7. Migrate build/cache consumers to the shared producer. Then resume native
+   execution registration, callback/actor/reload handoff and lifetime ownership.
+   Keep the 86-family ledger: these production changes do not resolve its
+   independent native, backend, platform, ordering and performance obligations.
+
+* Primary references and what they support
+These are architectural precedents, not proofs of this implementation.
+- [[https://docs.racket-lang.org/guide/phases.html][Racket phase levels]] associates bindings with phases and permits separate
+  module instances by phase. This supports explicit phase-qualified binding
+  identity; adopting Racket syntax or its complete module system is unnecessary.
+- [[https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/template_haskell.html][GHC Template Haskell]] distinguishes semantic levels from execution stages
+  and documents declaration groups. This supports separating function recursion
+  from compile-time availability rather than solving every cycle with an SCC.
+- [[https://rustc-dev-guide.rust-lang.org/building/bootstrapping/what-bootstrapping-does.html][Rust bootstrap stages]] separates compiler and library generations and
+  reserves a later stage for same-result checks. This supports recording actual
+  producing versus target identities and using a later reproduction gate.
+- [[https://www.erlang.org/doc/system/code_loading.html][OTP code loading]] documents two module code versions and external calls
+  selecting current code. This supports qualifying complete compiler images in
+  fresh VMs instead of assuming a renamed or retained generation controls all
+  fixed remote calls.
+- [[https://www.erlang.org/doc/system/eff_guide_processes.html][OTP process efficiency]] documents message copying and loss of subterm
+  sharing. Keep compilation-world graphs out of per-request process messages;
+  measure ownership and actual retained/copy costs rather than assume immutable
+  data automatically stays shared across process boundaries.
+- [[https://www.erlang.org/doc/apps/erts/match_spec.html][OTP match specifications]] documents exception tracing and its impact on tail
+  calls. Tracing here is bounded research instrumentation; an untraced control
+  checks the same observed outcomes.

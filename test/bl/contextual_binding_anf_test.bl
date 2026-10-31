@@ -1,0 +1,194 @@
+(ns contextual-binding-anf-test
+ (:require [binding :as b] [expand :as x] [anf :as a] [lower :as lower]
+           [system.ir :as ir] [codebase.phase :as code] [js.emit :as js]))
+(defn- fixture [source]
+ (let [namespace 'binding-anf
+       selection {:version 1 :profile 'syntax-v1 :target 'beam-v1
+                  :sources [{:namespace namespace :digest (crypto/hash :sha256 source)}]}
+       scope (b/scope selection namespace [0] :module)
+       world (b/world selection [scope]
+               [{:namespace namespace :name 'answer :phase 0 :space 'value :kind :function :visibility :public
+                 :path [0] :scopes [(:id scope)] :available-from 0}])
+       selection (b/select [world] [])
+       expanded (x/expression source "binding-anf.bl" {:namespace namespace :world (:key world) :selection selection})]
+  {:world world :selection selection :expanded expanded
+   :source source :options {:namespace namespace :world (:key world) :selection selection}
+   :reference (:reference (first (vals (:references expanded))))}))
+(defn- compiled [fixture]
+ (BeamLisp.Ns.Compiler/compile-contextual (get-in fixture [:expanded :reader])
+  (BeamLisp.Compiler/new_env "binding-anf") (get-in fixture [:expanded :references])))
+(defn- kind [action] (try (action) nil (catch error (or (:kind (ex-data error)) (:__struct__ error)))))
+(defn- module [body]
+ (a/module :Elixir.UnlinkedBindingArtifact
+  (list {:op :defn-clause :fname :run :params (list) :guard nil :body body :ann {}}) (list [:run 0]) (list)))
+
+(deftest selected-global-values-and-calls-retain-explicit-reference-identity
+ (let [value (fixture "answer") call (fixture "(answer)")
+       node (compiled value) invocation (compiled call)
+       frontend (x/compile-expression (:source value) "binding-anf.bl" (:options value))]
+  (is (= :binding (:op node)))
+  (is (= :unlinked-contextual-binding
+         (kind #(BeamLisp.Ns.Compiler/compile-contextual-unit
+                  (get-in value [:expanded :reader]) (BeamLisp.Compiler/new_env "binding-anf")
+                  (get-in value [:expanded :references]) (list)))))
+  (is (= :unlinked-contextual-binding
+         (kind #(BeamLisp.Compiler/prepare_program_entry
+                  (get-in value [:expanded :reader]) (BeamLisp.Compiler/new_env "binding-anf")
+                  (get-in value [:expanded :references]) (list)))))
+  (is (= (:reference value) (:reference node)))
+  (is (= :binding (get-in frontend [:node :op])))
+  (is (= (:reference value) (get-in frontend [:node :reference])))
+  (is (= :invoke (:op invocation)))
+  (is (= :binding (get-in invocation [:callee :op])))
+  (is (= (:reference call) (a/reference-of (:callee invocation))))
+  (is (= (list) (a/executable-children node)))
+  (is (= node (get (first (:clauses (module node))) :body)))))
+
+(deftest descriptor-and-constructor-refuse-malformed-reference-data-without-callbacks
+ (let [reference (:reference (fixture "answer")) marker (atom false)
+       corruptions [(dissoc reference :world) (assoc reference :extra true)
+                    (assoc reference :version 1.0) (assoc reference :world "short")
+                    (assoc reference :phase 4097) (assoc reference :phase nil)
+                    (assoc reference :space 'nil) (assoc reference :space (fn [] (reset! marker true)))]]
+  (doseq [changed corruptions]
+   (is (= :invalid-anf-binding-reference (kind #(a/binding-value changed))))
+   (is (not= nil (kind #(module {:op :binding :reference changed :ann {}})))))
+  (is (= false @marker))))
+
+(deftest shared-analysis-keeps-phase-world-and-declaration-identities-distinct
+ (let [f (fixture "answer") reference (:reference f) node (a/binding-value reference)
+       shifted (assoc reference :phase 1 :id (b/reference-id (:selection f) (:declaration reference) 1))
+       other (:reference (fixture "answer ; another revision"))
+       dependency (a/execution-dependencies (list node))]
+  (is (not= (ir/global-key node) (ir/global-key (a/binding-value shifted))))
+  (is (not= (ir/global-key node) (ir/global-key (a/binding-value other))))
+  (is (= (ir/global-key node) (ir/resource-of {} node)))
+  (is (= (ir/global-key node) (ir/alias-for {} node)))
+  (is (= false (:complete dependency)))
+  (is (= :captured-value (:kind (first (:edges dependency)))))
+  (is (= nil (:target (first (:edges dependency)))))
+  (is (= nil (ir/function-shape node)))))
+
+(deftest unlinked-native-and-javascript-emission-never-uses-ambient-resolvers
+ (let [f (fixture "answer") node (a/binding-value (:reference f)) called (atom false)
+       resolver (fn [& args] (reset! called true) "forbidden")]
+  (is (= :unlinked-contextual-binding (kind #(lower/lower-anf node))))
+  (is (= :unlinked-contextual-binding (kind #(lower/descriptor->beam (module node) {}))))
+  (is (= :unlinked-contextual-binding (kind #(js/emit node {:resolve resolver :resolve-exact resolver}))))
+  (is (= :constructor-machine-refused (kind #(BeamLisp.AOT/interpret_constructor! node {} {}))))
+  (is (= false @called))
+  (is (not (erlang/module_loaded :Elixir.UnlinkedBindingArtifact)))))
+
+(deftest phase-dependency-projection-reads-the-binding-field-rather-than-display-annotations
+ (let [program (x/program [{:namespace 'example :revision 'current :file "example.bl"
+                           :source "(ns example) (defn answer [] 42) (answer)"}] ['example 'current])
+       selected (first (filter #(= :public (get-in % [:declaration :visibility])) (vals (:references program))))
+       reference (:reference selected) forged (assoc reference :id (crypto/hash :sha256 "display-only"))
+       node (assoc (a/binding-value reference) :ann {:binding-reference forged})
+       ;; Unit facts require a coherent linked image. Retain the selected
+       ;; callee identity and put the fake reference in display-only metadata.
+       unit (assoc-in (:unit program) [:entry :ann :display] {:binding-reference forged})
+       changed (assoc program :unit unit :node (a/contextual-unit-entry unit))
+       dependencies (code/dependencies changed)]
+  (is (= reference (a/reference-of node)))
+  (is (some #(and (= :call (:kind %)) (= (:id reference) (:to %))) (:edges dependencies)))
+  (is (not (some #(= (:id forged) (:to %)) (:edges dependencies))))
+  (is (= :invalid-contextual-unit
+         (kind #(code/dependencies (assoc program :node (a/invoke node (a/empty-list-node)))))))))
+
+(deftest canonical-unit-links-selected-definitions-with-deterministic-lexical-slots
+ (let [f (fixture "(answer)") references (get-in f [:expanded :references]) name (first (keys references))
+       reader (get-in f [:expanded :reader]) env (BeamLisp.Compiler/new_env "binding-anf")
+       value (first (BeamLisp.Reader/read_string "(fn [] 42)")) links (list (tuple name value))
+       node (BeamLisp.Ns.Compiler/compile-contextual-unit reader env references links)]
+  (is (= :let (:op node)))
+  (is (= 42 (lower/eval-anf :Elixir.SelectedUnitInitializerTest
+               (a/invoke (:init node) (a/empty-list-node)))))
+  (is (= :var (get-in node [:body :callee :op])))
+  (is (= (:reference f) (a/reference-of (get-in node [:body :callee]))))
+  (is (= node (BeamLisp.Ns.Compiler/compile-contextual-unit reader env references links)))
+  (is (= 42 (lower/eval-anf :Elixir.SelectedUnitLinkTest node)))))
+
+(deftest canonical-unit-link-table-refuses-duplicates-locals-and-unselected-names
+ (let [f (fixture "answer") references (get-in f [:expanded :references]) name (first (keys references))
+       reader (get-in f [:expanded :reader]) env (BeamLisp.Compiler/new_env "binding-anf")
+       failed? (fn [links context]
+                 (try (BeamLisp.Ns.Compiler/compile-contextual-unit reader context references links) false
+                      (catch error true)))]
+  (is (failed? false env))
+  (is (failed? (list nil) env))
+  (is (failed? (list (tuple "unselected" 1)) env))
+  (is (failed? (list (tuple name 1) (tuple name 2)) env))
+  (is (failed? (list (tuple name 1)) (assoc env :locals {name "already-local"})))))
+
+(deftest prepared-unit-has-no-synthetic-reader-link-wrapper
+ (let [bundle (x/prepare-program [{:namespace 'example :revision 'current :file "example.bl"
+                                  :source "(ns example) (def base 40) (defn answer [] (erlang/+ base 2)) (answer)"}]
+                                ['example 'current])
+       program (:program bundle) reader (:reader program)
+       ;; The authored entry remains a call. Only canonical ANF owns linkage.
+       reader (if (= :meta (elem reader 0)) (elem reader 1) reader)]
+  (is (= :list (elem reader 0)))
+  (is (not= (tuple :symbol "let") (first (elem reader 1))))
+  (is (= :let (get-in program [:node :op])))
+  (is (= (:node program) (:body (elem (first (get-in bundle [:declaration :entries])) 3))))
+  (is (= 42 (lower/eval-anf :Elixir.PreparedUnitLinkTest (:node program))))))
+
+(defn- executable-nodes [node]
+ (cons node (Enum/flat_map (a/executable-children node) (fn [child] (executable-nodes child)))))
+
+(deftest unit-linkage-requires-full-identity-and-already-linked-data-targets
+ (let [f (fixture "answer") reference (:reference f) node (a/binding-value reference)
+       other (:reference (fixture "answer ; different world"))
+       phase (assoc reference :phase 1 :id (b/reference-id (:selection f) (:declaration reference) 1))
+       linked (a/link-bindings node {reference (a/lit 42)})]
+  (is (= 42 (:val linked)))
+  (is (= 42 (BeamLisp.AOT/interpret_constructor! linked {} {})))
+  (is (= "42" (:val (js/emit linked {}))))
+  (is (= reference (a/reference-of linked)))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {}))))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {other (a/lit 42)}))))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings node {phase (a/lit 42)}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node {reference node}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node {reference (a/global "ambient" "answer")}))))
+  (is (= :invalid-anf-binding-link
+         (kind #(a/link-bindings node {reference (a/fnn (list (a/clause (list) nil (a/global "ambient" "answer"))))}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings (a/lit 1) {reference nil}))))
+  (is (= :invalid-anf-binding-link (kind #(a/link-bindings node (fn [] 42)))))))
+
+(deftest unit-linkage-visits-latent-bodies-guards-cleanup-and-every-native-operand
+ (let [reference (:reference (fixture "answer")) b (a/binding-value reference)
+       clause (a/clause (list (a/pvar "argument")) b b)
+       cases [(a/invoke b b) (a/app b (list b)) (a/lett "local" b b)
+              (a/iff b b b) (a/doo (list b b)) (a/casee b (list clause))
+              (a/fnn (list clause)) (a/tryy b (list clause) b) (a/recv (list clause) b b)
+              (a/tup (list b b)) (a/mapp (list [b b])) (a/cons-cell b b)
+              (a/structt :Example (list [(a/lit :field) b]))
+              (a/remote :erlang :+ (list b b)) (a/arith :add :+ (list b b))]]
+  (doseq [node cases]
+   (let [linked (a/link-bindings node {reference (a/lit 42)})]
+    (is (not (some #(= :binding (:op %)) (executable-nodes linked))))
+    (is (= linked (:body (first (:clauses (module linked))))))))))
+
+(deftest unit-linkage-never-traverses-literal-pattern-payloads-or-display-annotations
+ (let [reference (:reference (fixture "answer")) fake (a/binding-value reference)
+       marker (atom false) callback (fn [] (reset! marker true))
+       literal (a/lit {:payload fake}) pattern (a/plit {:payload fake})
+       clause (a/clause (list pattern) nil literal)
+       node (assoc (a/casee (a/lit 1) (list clause)) :ann {:display fake :callback callback})
+       linked (a/link-bindings node {})]
+  (is (= node linked))
+  (is (= false @marker))
+  (is (= {:payload fake} (:val (:body (first (:clauses linked))))))))
+
+(deftest unit-linkage-and-analysis-visit-executable-map-pattern-keys
+ (let [reference (:reference (fixture "answer")) key (a/binding-value reference)
+       pattern (a/pmap (list [key (a/pvar "value")]))
+       clause (a/clause (list pattern) nil (a/var "value"))
+       expression (a/casee (a/mapp (list [(a/lit :key) (a/lit 42)])) (list clause))
+       linked (a/link-bindings expression {reference (a/lit :key)})]
+  (is (= (list key) (a/pattern-expressions pattern)))
+  (is (some #(= :binding (:op %)) (a/executable-children (a/fnn (list clause)))))
+  (is (= :unlinked-contextual-binding (kind #(a/link-bindings expression {}))))
+  (is (= :lit (:op (first (first (:pairs (first (:pats (first (:clauses linked))))))))))
+  (is (= 42 (lower/eval-anf :Elixir.LinkedPatternKey linked)))))

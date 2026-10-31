@@ -1,0 +1,270 @@
+#!/bin/sh
+# Internal compiler/SDK producer entry used by the closed Nix recipes.
+# Ordinary checkout commands enter bin/bl and select a completed Nix SDK.
+#
+# `mix bl` existed to start the application, put the project's beams on the code
+# path, and call `bl.cli/run-argv`. This does exactly those three things with
+# `elixir`, so the CLI survives the day `mix.exs` is deleted — and so CI can run
+# `bl` on a tree that never had Mix.
+#
+# A cold checkout stages the SHA-verified BL seed into `build/` before a VM
+# starts. A built checkout uses the same image and AOT-compiles `.bl` sources
+# on demand. No repository Elixir source or Mix build path is required.
+#
+# `BEAM_LISP_EBIN` overrides where the beams are looked for, which is how CI
+# points a fresh checkout at an artifact another job built.
+set -e
+export BL_INTERNAL_PRODUCER=1
+
+ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
+
+# The managed platform supplies the stock client, runtime and mandatory NIF
+# before any BEAM starts. Build sandboxes pass their already prepared platform.
+PLATFORM=${BL_CHECKOUT_PLATFORM:-}
+if [ -z "$PLATFORM" ]; then
+  PLATFORM=$("$ROOT/scripts/prepare-checkout-platform")
+fi
+PLATFORM=$(readlink -f "$PLATFORM")
+case "$PLATFORM" in
+  /nix/store/*) ;;
+  *) echo 'bl: checkout platform must be an immutable Nix product' >&2; exit 69 ;;
+esac
+if [ ! -f "$PLATFORM/platform.json" ] || [ ! -x "$PLATFORM/bin/drop-launcher" ]; then
+  echo 'bl: checkout platform is incomplete' >&2
+  exit 69
+fi
+export BL_CHECKOUT_PLATFORM="$PLATFORM"
+export BL_ARTIFACT_PLATFORM="$PLATFORM/artifact-platform"
+export BL_PREPARED_NATIVES="$(readlink -f "$PLATFORM/native-products")"
+export BL_BIN="$PLATFORM/bin/drop-launcher"
+export PATH="$PLATFORM/bin:$PATH"
+
+# Program argv after -- is opaque to the launcher.
+for arg in "$@"; do
+  [ "$arg" = "--" ] && break
+  if [ "$arg" = "--cold" ]; then BL_CHECKOUT_COLD=$ROOT; break; fi
+done
+
+# The native client reaches a running VM before any Elixir probe or staging.
+# Its cold child comes back through this script exactly once.
+if [ "${BL_CHECKOUT_COLD:-}" != "$ROOT" ]; then
+  CLIENT="$PLATFORM/bin/drop-launcher"
+  exec "$CLIENT" --checkout "$ROOT" -- "$@"
+fi
+unset BL_CHECKOUT_COLD
+"$PLATFORM/bin/drop-launcher" --checkout-prerequisites "$ROOT" "$PLATFORM"
+
+# `build/` is the checkout's sole application image. An explicit override is
+# for a separately prepared image; the verified floor can stage there too.
+if [ -n "${BEAM_LISP_EBIN:-}" ]; then
+  EBIN=$BEAM_LISP_EBIN
+else
+  EBIN=$ROOT/build
+fi
+
+# THE IMAGE DIRECTORY is built LOWER DOWN, once `$EBIN` is final — after the
+# cold path has decided whether it had to compile anything. It has to be there
+# and not here: on a tree that has never been built, `$EBIN` at this point is a
+# `_build/` path that does not exist, and a link to it would be created and never
+# repaired (`[ -L ] || ln` sees the dangling link as present).
+
+# THE CODE PATH, computed BEFORE anything below uses it — including the cold
+# bootstrap. Every beam the app depends on, not just the app's own: the LIBRARIES
+# now live where `bl deps compile` put them (the content-addressed cache below),
+# and a tree that still carries a `deps/` or a `_build/` from a Mix build is read
+# from there. Without them the app cannot even load: its `.app` names its
+# dependencies, and a missing one is a hard stop.
+#
+# ORDER IS THE BUILD'S OWN BEAMS LAST, and that is load-bearing: `-pa` PREPENDS,
+# so the last one named wins. This tree has both `_build/dev` and `_build/test`;
+# naming the test ebin second made it shadow the build under test, and the
+# symptom was a `bl doctor --deep` that reported a function "undefined or
+# private" while the beam it needed was sitting in the directory the launcher had
+# just been told to prefer. Dependencies first, the tree's own image last.
+PA=""
+# `HAVE_LIBS` is not bookkeeping: it decides whether the substrate's DAEMON half
+# can be compiled at all (see the compile step below). The machine with no
+# libraries is the machine that has to run `bl deps fetch` to get them.
+HAVE_LIBS=""
+for d in "$ROOT"/deps/*/ebin "$ROOT"/_build/*/lib/*/ebin; do
+  [ "$d" = "$EBIN" ] || { if [ -d "$d" ]; then PA="$PA -pa $d"; HAVE_LIBS=1; fi; }
+done
+# FUP-050's search-path rule, shell side: the libraries `bl deps compile` built
+# live in a content-addressed cache, tagged with the RUNTIME that compiled them
+# (`<name>-<vsn>-<sha8>-erts<ert>-elixir<elixir>`, the same address
+# `deps-compile` computes), because a beam compiled by another ERTS is not one
+# this VM may load.
+#
+# The tag is computed in the SAME TERMS `deps-compile/runtime-tag` uses. That is
+# the point of writing it out here too, rather than globbing `*`: a bare glob is a
+# second, weaker rule for one question, and it would put a foreign runtime's beams
+# where this one's belong. One short VM start, paid only when the cache holds
+# anything at all — which is the only case where the answer changes the path.
+# The tag is a CONSTANT of the installed toolchain, but asking for it used to
+# cost a whole `elixir` VM start on every invocation. Cache it keyed by the
+# executable identities whose change alone can change the answer (the `elixir`
+# script and the `erl` it resolves): a different path, size, inode or mtime
+# misses the cache and starts the probe VM exactly once more.
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/beam_lisp/ebin
+if [ -d "$CACHE" ] && [ -n "$(ls -A "$CACHE" 2>/dev/null || true)" ]; then
+  TAG=""
+  TAG_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/beam_lisp/runtime-tag
+  ELIXIR_BIN=$(command -v elixir 2>/dev/null || true)
+  ERL_BIN=$(command -v erl 2>/dev/null || true)
+  TAG_KEY=""
+  if [ -n "$ELIXIR_BIN" ] && [ -n "$ERL_BIN" ]; then
+    TAG_KEY=$(stat -Lc '%n:%d:%i:%s:%Y' "$ELIXIR_BIN" "$ERL_BIN" 2>/dev/null || true)
+  fi
+  if [ -n "$TAG_KEY" ] && [ -f "$TAG_CACHE" ]; then
+    CACHED_KEY=""
+    CACHED_TAG=""
+    { IFS= read -r CACHED_KEY; IFS= read -r CACHED_TAG; } < "$TAG_CACHE" 2>/dev/null || true
+    if [ "$CACHED_KEY" = "$TAG_KEY" ] && [ -n "$CACHED_TAG" ]; then
+      TAG=$CACHED_TAG
+    fi
+  fi
+  if [ -z "$TAG" ]; then
+    TAG=$(elixir -e 'IO.write("erts#{:erlang.system_info(:version)}-elixir#{System.version()}")' 2>/dev/null || true)
+    if [ -n "$TAG" ] && [ -n "$TAG_KEY" ]; then
+      mkdir -p "${TAG_CACHE%/*}" 2>/dev/null || true
+      if printf '%s\n%s\n' "$TAG_KEY" "$TAG" > "$TAG_CACHE.$$" 2>/dev/null; then
+        mv -f "$TAG_CACHE.$$" "$TAG_CACHE" 2>/dev/null || rm -f "$TAG_CACHE.$$"
+      else
+        rm -f "$TAG_CACHE.$$" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if [ -n "$TAG" ]; then
+    for d in "$CACHE"/*-"$TAG"/ebin; do
+      [ -d "$d" ] && { PA="$PA -pa $d"; HAVE_LIBS=1; }
+    done
+  fi
+fi
+
+# Always stage the data-only floor before entering a VM. Its SHA-verified host
+# beams provide the exact public module atoms even on a checkout with no build/.
+# The verified app resource is installed only when absent; a current local app
+# resource is never overwritten by an older floor.
+# AN INSTALLED DROP IS READ-ONLY. A checkout's build output must never be a
+# drop's ebin: `bl build`, the boot-tier rebuild and host staging all WRITE
+# there, and overwriting a drop's boot beams breaks that drop for every app
+# pinned to it (seen 2026-10-17: `undefined var: compiler/special-forms`).
+DROP_STORE=${XDG_DATA_HOME:-$HOME/.local/share}/drop
+case "$(readlink -f "$EBIN" 2>/dev/null || echo "$EBIN")" in
+  "$(readlink -f "$DROP_STORE" 2>/dev/null || echo "$DROP_STORE")"/*)
+    echo "bl: refusing to build into an installed drop: $EBIN" >&2
+    echo "bl: drops are read-only; use a checkout build/ (unset BEAM_LISP_EBIN, or point it elsewhere)" >&2
+    exit 1 ;;
+esac
+
+SEED_MANIFEST=$ROOT/priv/bootstrap/seed/manifest.term
+if [ ! -f "$SEED_MANIFEST" ]; then
+  echo "bl: missing data-only seed manifest: $SEED_MANIFEST" >&2
+  exit 70
+fi
+# Staging costs a whole escript VM (raise, read ~5MB, SHA-256, copy drift).
+# Its OUTCOME is a stamped fact — this manifest was fully verified and staged
+# into this ebin — so a marker beside the beams lets a warm tree skip the VM.
+# The marker is bound to the manifest CONTENT and the seed/ebin paths, and the
+# four beams the launcher itself needs before it can run `install_hosts!` must
+# still be present; anything else re-runs the verified stage (which also
+# quarantines a previous generation's namespace beams).
+STAGE_STAMP=$EBIN/.bl-host-stage
+STAGE_KEY=""
+if command -v sha256sum >/dev/null 2>&1; then
+  STAGE_KEY=$(sha256sum "$SEED_MANIFEST" 2>/dev/null | cut -d' ' -f1)
+else
+  STAGE_KEY=$(stat -Lc '%s:%Y' "$SEED_MANIFEST" 2>/dev/null || true)
+fi
+STAGE_STAMP_VALUE="$STAGE_KEY $ROOT/priv/bootstrap/seed $EBIN"
+if [ -n "$STAGE_KEY" ] && [ -f "$STAGE_STAMP" ] \
+   && [ -f "$EBIN/Elixir.BeamLisp.Launcher.beam" ] \
+   && [ -f "$EBIN/Elixir.BeamLisp.Bootstrap.beam" ] \
+   && [ -f "$EBIN/Elixir.BeamLisp.Tiers.beam" ] \
+   && [ -f "$EBIN/beam_lisp.app" ] \
+   && [ "$(cat "$STAGE_STAMP" 2>/dev/null || true)" = "$STAGE_STAMP_VALUE" ]; then
+  : # staged by this same seed generation; the launcher's install_hosts! reverifies
+else
+  "$ROOT/bin/bl-stage-hosts" "$SEED_MANIFEST" \
+    "$ROOT/priv/bootstrap/seed" "$EBIN" || exit 1
+  if [ -n "$STAGE_KEY" ]; then
+    printf '%s\n' "$STAGE_STAMP_VALUE" > "$STAGE_STAMP.$$" 2>/dev/null \
+      && mv -f "$STAGE_STAMP.$$" "$STAGE_STAMP" 2>/dev/null \
+      || rm -f "$STAGE_STAMP.$$" 2>/dev/null || true
+  fi
+fi
+
+
+# A checkout is a development image. `env.bl` says so too (its `:env` reaches the
+# real environment through the CLI), but the launcher must not depend on a file
+# it is about to help read.
+: "${BEAM_LISP_DEV:=1}"
+export BEAM_LISP_DEV
+
+# A checkout run is the SOURCE build. The daemon names its socket after the
+# build it runs (`vm.paths/endpoints`), so a VM started from here never answers
+# a drop's command, and a drop's daemon never answers this one's. Always set,
+# never inherited: a drop that execs this script must not lend it its own id.
+BL_BUILD_ID=src
+export BL_BUILD_ID
+
+# THE IMAGE DIRECTORY, now that `$EBIN` is FINAL (the cold path below may have
+# just compiled into `build/` and changed it).
+#
+# OTP answers three questions from the SHAPE of the path a beam was loaded from —
+# `code:lib_dir/1`, `code:priv_dir/1`, and therefore where a release assembly
+# looks for an app's `ebin` — and it answers them by finding a path ending
+# `<...>/<app>[-<vsn>]/ebin`. A checkout's beams live in `build/`, which is not
+# that shape, so before this every one of those answers came from a MIX-ERA
+# `_build/<env>/lib/beam_lisp/…` — the one directory on the path that WAS
+# well-formed. Measured consequence: `bl self-build` from a checkout assembled a
+# drop whose host beams were the mix-era copies, so the compound computed a
+# toolchain key its own beams were not stamped with, and the drop died at boot
+# with `undefined var: reader/delimiters` (BUG-048).
+#
+# The shape is built out of two symlinks: the ebin IS the build output, the priv
+# IS the tree's `priv/`. Nothing is copied. `-e` rather than `-L` is load-bearing:
+# a link left DANGLING by an earlier boot (the `_build` branch, on a tree that had
+# none) must be repaired, and `-L` calls a dangling link present.
+# A copied checkout can retain VALID absolute links to a different checkout.
+# Existence is insufficient: its code and priv must both belong to THIS image.
+ensure_image_link() {
+  if [ -e "$2" ] && [ ! -L "$2" ]; then
+    echo "bl: refusing to replace non-symlink image path: $2" >&2
+    exit 1
+  fi
+  [ "$(readlink "$2" 2>/dev/null || true)" = "$1" ] || ln -sfn "$1" "$2"
+}
+
+if [ -z "${BEAM_LISP_EBIN:-}" ]; then
+  IMAGE=$ROOT/.bl/lib/beam_lisp-0.1.0
+  mkdir -p "$IMAGE"
+  ensure_image_link "$EBIN" "$IMAGE/ebin"
+  ensure_image_link "$ROOT/priv" "$IMAGE/priv"
+  EBIN=$IMAGE/ebin
+fi
+
+PA="$PA -pa $EBIN"
+
+# All boot decisions live in the seeded BL host. The shell supplies the
+# verified code path and invokes its exact public module atom.
+export BL_EBIN="$EBIN"
+export BL_ROOT="$ROOT"
+# Dependency provisioning precedes compiler production in the closed recipes.
+# Its compiler is the SHA-verified committed floor: rebuilding current Source
+# here would require new host APIs before that host cohort has been produced.
+# This stage produces external dependency beams, never a current compiler/SDK.
+# The Source launcher owns argv classification and application/CLI dispatch.
+exec elixir $PA -e '
+argv = System.argv()
+if BeamLisp.Launcher.provisioning_argv?(argv) do
+  BeamLisp.Bootstrap.install!(System.fetch_env!("BL_EBIN"))
+  BeamLisp.Launcher.start_app!(argv, %{})
+else
+  if System.get_env("BL_PROFILE") not in [nil, ""] do
+    BeamLisp.ColdStartCounters.main()
+  else
+    BeamLisp.Launcher.main(argv)
+  end
+end
+' -- "$@"

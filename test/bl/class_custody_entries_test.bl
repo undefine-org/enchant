@@ -1,0 +1,67 @@
+(ns class-custody-entries-test (:require [reload.generation :as generation]))
+(when-not (Code/ensure_loaded? :Elixir.ClassCustodyComponent)
+ (Code/compile_string
+  "defmodule ClassCustodyComponent do
+     def source_class_constructor!(module, factory), do: BeamLisp.Env.source_class_constructor!(module, factory)
+     def register(module, kind, ns, name, fields), do: BeamLisp.Record.register(module, kind, ns, name, fields)
+   end"))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+(defn- fixture [action]
+ (let [g (generation/prepare! {:application-id (str "class-entries-" (erlang/unique_integer (list :positive)))
+          :native-modules #{"ClassCustodyComponent"}
+          :sources {"schema.entries"
+           "(ns schema.entries) (deftype Handle [payload]) (defrecord Packet [payload])
+            (defn type-module [] Handle)
+            (defn make [x] (let [ctor (ClassCustodyComponent/source_class_constructor! Handle :positional_ctor)] (ctor x)))
+            (defn packet [x] (let [ctor (ClassCustodyComponent/source_class_constructor! Packet :map_ctor)] (ctor {:payload x})))
+            (defn wrong [kind] (ClassCustodyComponent/source_class_constructor! Handle kind))
+            (defn foreign [m] (ClassCustodyComponent/source_class_constructor! m :positional_ctor))"}})
+       module (generation/invoke! g "schema.entries/type-module" [])]
+  (try (action g module) (finally (generation/retire! g)))))
+
+(deftest native-constructor-boundary-uses-the-original-admitted-source-profile
+ (fixture (fn [g module]
+  (is (= (tuple :bl_deftype module (tuple 42)) (generation/invoke! g "schema.entries/make" [42])))
+  (let [packet (generation/invoke! g "schema.entries/packet" [7])]
+   (is (= 7 (:payload packet)))
+   (is (contains? (:classes g) (erlang/map_get :__struct__ packet))))
+  (is (= :source_native_target_refused (reason #(generation/invoke! g "schema.entries/wrong" [:map_ctor]))))
+  (is (= :source_native_target_refused (reason #(generation/invoke! g "schema.entries/wrong" [:unknown]))))
+  (is (= :source_native_target_refused (reason #(generation/invoke! g "schema.entries/foreign" [:Elixir.BeamLisp.Env]))))
+  (is (= :unadmitted_source_callback (reason #(ClassCustodyComponent/source_class_constructor! module :positional_ctor)))))))
+
+(deftest low-level-native-registration-cannot-edit-a-held-class-schema
+ (fixture (fn [g module]
+  (let [info (BeamLisp.Record/info module)]
+   (is (BeamLisp.Env/class_schema_held? module))
+   (is (not (BeamLisp.Env/live_code_leases? module)))
+   (is (= (tuple :code_leased module)
+          (reason #(ClassCustodyComponent/register module (elem info 0) (elem info 1) (elem info 2) (list :changed)))))
+   (is (= info (BeamLisp.Record/info module)))
+   (ClassCustodyComponent/register module (elem info 0) (elem info 1) (elem info 2) (elem info 3))
+   (is (= info (BeamLisp.Record/info module)))
+   (is (= (tuple :bl_deftype module (tuple 42)) (generation/invoke! g "schema.entries/make" [42])))))))
+
+(deftest malformed-native-registration-refuses-before-writing-any-registry-row
+ (let [module :Elixir.MalformedClassCustodyEntry]
+  (doseq [[kind ns name fields] [[:deftype "scope" "Handle" (list "not-an-atom")]
+                                [:foreign "scope" "Handle" (list)]
+                                [:deftype nil "Handle" (list)]]]
+   (is (= :invalid_class_registration (reason #(ClassCustodyComponent/register module kind ns name fields)))))
+  (is (nil? (BeamLisp.Record/info module)))))
+
+(deftest first-registration-under-a-real-native-lease-requires-exact-loaded-schema
+ (let [ns (str "entries.fresh.n" (erlang/unique_integer (list :positive)))
+       descriptor (BeamLisp.Record/declaration_descriptor ns "Handle" :deftype (list "payload"))
+       module (:name descriptor)
+       lease (BeamLisp.Env/retain_exact_binary! (BeamLisp.Emit/compile_descriptor descriptor) "class-entry-initial")]
+  (try
+   (is (BeamLisp.Env/class_schema_held? module))
+   (is (= (tuple :leased_class_identity_unregistered module)
+          (reason #(ClassCustodyComponent/register module :deftype ns "Handle" (list :different)))))
+   (is (nil? (BeamLisp.Record/info module)))
+   (ClassCustodyComponent/register module :deftype ns "Handle" (list :payload))
+   (is (= (list :payload) (BeamLisp.Record/fields_of module)))
+   (finally (BeamLisp.Env/release_code! lease) (BeamLisp.Env/retire_module! module)))))

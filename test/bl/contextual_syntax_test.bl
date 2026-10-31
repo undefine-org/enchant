@@ -1,0 +1,110 @@
+(ns contextual-syntax-test (:require [syntax :as s]))
+
+(defn- ctx []
+ {:world (crypto/hash :sha256 "world") :namespace 'example :space 'value
+  :scopes {0 [(crypto/hash :sha256 "module")]}})
+
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest contextual-reader-roundtrips-actual-reader-shapes-and-authored-metadata
+ (let [source "(let [x 42] ^{:doc \"note\"} [x {:k #{1 2}} 'name #Entry{:value x}])"
+       original (BeamLisp.Reader/read_syntax source "roundtrip.bl")
+       syntax (s/read source "roundtrip.bl" (ctx))]
+  (is (= original (map s/to-reader syntax)))
+  (is (= "roundtrip.bl" (get-in (first syntax) [:origin :file])))
+  (is (= 1 (get-in (first syntax) [:origin :line])))
+  (is (= :syntax-record-datum (kind-of #(s/to-datum (first syntax)))))))
+
+(deftest datum-conversion-preserves-data-and-does-not-interpret-anf-lookalikes
+ (let [data (list 'f [1 :two] {:op :invoke :callee 'x :arguments (list 3)} #{4 5} nil true false "hello")
+       syntax (s/from-datum data (ctx))]
+  (is (= data (s/to-datum syntax)))
+  (is (= :map (:tag (nth (:children syntax) 2))))
+  (is (= :syntax-symbol (kind-of #(s/identifier "x" (ctx)))))
+  (is (= :syntax-datum (kind-of #(s/from-datum (fn [] :opaque) (ctx)))))
+  (is (= :syntax-datum (kind-of #(s/from-datum (erlang/make_ref) (ctx)))))))
+
+(deftest phase-specific-module-scopes-and-general-introduction-scopes-compose
+ (let [a (crypto/hash :sha256 "a") b (crypto/hash :sha256 "b")
+       identifier (s/identifier 'x (assoc (ctx) :scopes {0 [a a] 1 [b]}))
+       introduced (s/add-scope identifier a :all)]
+  (is (= [a] (vec (s/scopes identifier 0))))
+  (is (= [b] (vec (s/scopes identifier 1))))
+  (is (= (sort [a b]) (s/scopes introduced 1)))
+  (is (= [] (vec (s/scopes identifier -1))))
+  (is (= :syntax-phase (kind-of #(s/scopes identifier :all))))))
+
+(deftest shape-origin-and-budget-validation-refuse-before-data-escapes
+ (let [node (s/identifier 'x (ctx))
+       deep (reduce (fn [value _] (list value)) 'x (range 130))]
+  (is (= :syntax-node (kind-of #(s/validate (assoc node :op :invoke)))))
+  (is (= :syntax-node (kind-of #(s/validate (assoc node :version 1.0)))))
+  (is (= :syntax-datum (kind-of #(s/validate (assoc node :tag :scalar :value (fn [] :opaque))))))
+  (is (= :syntax-origin (kind-of #(s/validate (assoc node :origin {:opaque (erlang/make_ref)})))))
+  (is (= :syntax-bound (kind-of #(s/from-datum deep (ctx)))))
+  (is (= :syntax-bound (kind-of #(s/from-datum (vec (range 100001)) (ctx)))))))
+
+(deftest template-validates-contexts-and-total-output-work
+ (let [template (s/identifier 'body (ctx))
+       scope (crypto/hash :sha256 "introduction")
+       foreign (s/identifier 'x (assoc (ctx) :world (crypto/hash :sha256 "other")))]
+  (is (= foreign (s/template template {'body foreign} scope)))
+  (is (= :syntax-template (kind-of #(s/template template (list) scope))))
+  (is (= :syntax-node (kind-of #(s/template template {'body {:op :lit :val 42}} scope))))))
+
+(deftest repeated-template-holes-share-data-but-still-charge-total-output-work
+ (let [scope (crypto/hash :sha256 "introduction")
+       template (s/from-datum (vec (repeat 20 'body)) (ctx))
+       hole (s/from-datum (vec (range 3000)) (ctx))]
+  (is (= :syntax-bound (kind-of #(s/template template {'body hole} scope))))))
+
+(deftest datum-conversion-never-realizes-lazy-input
+ (let [called (atom false) items (map (fn [item] (reset! called true) item) [1])
+       improper (erlang/++ (list 1) :tail)]
+  (is (= :syntax-datum (kind-of #(s/from-datum items (ctx)))))
+  (is (= false @called))
+  (is (= :syntax-collection (kind-of #(s/from-datum improper (ctx)))))))
+
+(deftest contextual-map-pairs-stay-inside-the-closed-first-order-domain
+ (let [node (first (s/read "{:input [x 42]}" "map.bl" (ctx)))]
+  (is (= node (BeamLisp.CompilerData/check_first_order! node)))
+  (is (= {:input ['x 42]} (s/to-datum node)))))
+
+(deftest sequence-splices-preserve-user-context-and-introduce-only-template-syntax
+ (let [scope (crypto/hash :sha256 "splice-introduction")
+       user (s/identifier 'user (assoc (ctx) :world (crypto/hash :sha256 "use-world")))
+       value (s/from-datum 42 (:context user))
+       splice {:kind :contextual-splice :children [user value]}
+       result (s/template (s/from-datum '(do body) (ctx)) {'body splice} scope)]
+  (is (= '(do user 42) (s/to-datum result)))
+  (is (= user (nth (:children result) 1)))
+  (is (some #(= scope %) (s/scopes (first (:children result)) 0)))
+  (is (= [] (s/to-datum (s/template (s/from-datum ['body] (ctx))
+                        {'body {:kind :contextual-splice :children []}} scope))))
+  (is (= #{'user 42} (s/to-datum (s/template (s/from-datum #{'body} (ctx)) {'body splice} scope))))))
+
+(deftest splice-slots-and-payloads-refuse-invalid-structures
+ (let [scope (crypto/hash :sha256 "splice-introduction")
+       hole {:kind :contextual-splice :children [(s/from-datum 42 (ctx))]}]
+  (is (= :syntax-template-splice-context (kind-of #(s/template (s/identifier 'body (ctx)) {'body hole} scope))))
+  (is (= :syntax-template-splice-context (kind-of #(s/template (s/from-datum {:k 'body} (ctx)) {'body hole} scope))))
+  (is (= :syntax-template-splice-context
+         (kind-of #(s/template (first (s/read "#Entry{:value body}" "splice.bl" (ctx))) {'body hole} scope))))
+  (is (= :syntax-template-splice (kind-of #(s/template (s/from-datum ['body] (ctx)) {'body (assoc hole :authority true)} scope))))
+  (is (= :syntax-node (kind-of #(s/template (s/from-datum ['body] (ctx))
+                                {'body {:kind :contextual-splice :children [(fn [] :opaque)]}} scope))))))
+
+(deftest splice-validation-never-forces-a-lazy-sequence
+ (let [scope (crypto/hash :sha256 "splice-introduction") called (atom false)
+       items (map (fn [item] (reset! called true) item) [1])]
+  (is (= :syntax-collection (kind-of #(s/template (s/from-datum ['body] (ctx))
+                                    {'body {:kind :contextual-splice :children items}} scope))))
+  (is (= false @called))))
+
+(deftest every-splice-occurrence-is-charged-before-copying-output
+ (let [scope (crypto/hash :sha256 "splice-introduction")
+       hole {:kind :contextual-splice :children (:children (s/from-datum (vec (range 3000)) (ctx)))}]
+  (is (= 3000 (count (:children (s/template (s/from-datum ['body] (ctx)) {'body hole} scope)))))
+  (is (= :syntax-bound
+         (kind-of #(s/template (s/from-datum (vec (repeat 20 'body)) (ctx)) {'body hole} scope))))))

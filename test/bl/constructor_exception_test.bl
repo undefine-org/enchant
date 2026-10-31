@@ -1,0 +1,159 @@
+(ns constructor-exception-test
+ (:require [anf :as a] [compiler :as compiler] [lower :as lower] [expand :as x]))
+
+(defn- node [source]
+ (compiler/compile (BeamLisp.Reader/read_one source) (compiler/new-env "user")))
+(defn- interpret [source] (BeamLisp.AOT/interpret_constructor! (node source) {} {}))
+(defn- native [source]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.ConstructorException." (erlang/unique_integer (list :positive))))
+   (node source)))
+(defn- failure [source]
+ (try (interpret source) nil (catch error (ex-data error))))
+
+(deftest actual-compiler-exceptions-agree-with-native-execution
+ (doseq [[source expected]
+          [["(try 42 (finally nil))" 42]
+           ["(try (throw :payload) (catch error [(:__struct__ error) (:message error)]))" [:Elixir.BeamLisp.ExInfo ":payload"]]
+           ["(try (throw {:kind :constructor-machine-refused}) (catch error (:kind (ex-data error))))" :constructor-machine-refused]
+           ["(try (nth [] 9) (catch error 42))" nil]
+           ["(try ((fn [x] x) 1 2) (catch BadArityError error 42))" 42]
+           ["(try (erlang/throw :payload) (catch error error))" :payload]
+           ["(try (erlang/error :badarg) (catch ArgumentError error 42))" 42]
+           ["(try (erlang/div 1 0) (catch ArithmeticError error 42))" 42]
+           ["(try (erlang/exit :payload) (catch-raw [kind reason stack] [kind reason]))" [:exit :payload]]
+           ["(try (erlang/throw :payload) (catch-raw [kind reason stack] [kind reason (erlang/is_list stack)]))" [:throw :payload true]]
+           ["(try (erlang/error :badarg) (catch error [__EXCEPTION_KIND__ (:__struct__ error)]))" [:error :Elixir.ArgumentError]]
+           ["(try (try (erlang/throw 42) (catch ArgumentError error 0)) (catch error error))" 42]
+           ["(try (try (erlang/throw :first) (catch error (erlang/throw :second))) (catch error error))" :second]
+           ["(try (try 42 (finally (erlang/throw :cleanup))) (catch error error))" :cleanup]
+           ["(try (try (erlang/throw :first) (finally (erlang/throw :cleanup))) (catch error error))" :cleanup]
+           ["(try (try (erlang/error :badarg) (catch error (erlang/throw error))) (catch ArgumentError error 42))" 42]
+           ["(try (erlang/map_get :absent {}) (catch KeyError error 42))" 42]
+           ["(try (:key 42) (catch error 42))" nil]
+           ["(try ((fn [x] :when (> x 0) x) 0) (catch FunctionClauseError error 42))" 42]
+           ["(try (case 1 2 0) (catch CaseClauseError error 42))" nil]]]
+  (is (= expected (native source)) source)
+  (is (= expected (interpret source)) source)))
+
+(deftest source-error-data-cannot-impersonate-a-machine-refusal
+ (doseq [kind [:constructor-machine-refused :unsafe-first-order-data]]
+  (let [source (str "(try (erlang/error {:kind " (pr-str kind) " :detail :forged}) "
+                    "(catch-raw [class reason stack] [class (:kind reason)]))")]
+   (is (= [:error kind] (interpret source))))))
+
+(deftest machine-refusals-bypass-source-catches-and-cleanup
+ (let [path (str (BeamLisp/cwd) "/constructor-exception-must-not-write")]
+  (doseq [source [(str "(try (erlang/put :constructor-exception-effect true) (catch error 42))")
+                 "(try (erlang/put :constructor-exception-effect true) (catch-raw [kind reason stack] 42))"
+                 "(try (erlang/put :constructor-exception-effect true) (catch error 42) (finally (erlang/throw :masked)))"
+                 "(try (try (erlang/put :constructor-exception-effect true) (finally (erlang/throw :masked))) (catch error 42))"
+                 "(try (erlang/put :constructor-exception-effect true) (finally (erlang/put :constructor-exception-cleanup true)))"]]
+   (let [error (failure source)]
+    (is (= :constructor-machine-refused (:kind error)))
+    (is (= {:remote [:erlang :put 2]} (:detail error)))))
+  (is (= :undefined (erlang/get :constructor-exception-effect)))
+  (is (= :undefined (erlang/get :constructor-exception-cleanup)))
+  (is (= false (File/exists? path)))))
+
+(deftest a-machine-failure-in-a-native-helper-callback-is-terminal
+ (let [error (failure "(try (mapv (fn [x] (erlang/put :constructor-exception-callback x)) [1]) (catch error 42) (finally (erlang/throw :masked)))")]
+  (is (= :constructor-machine-refused (:kind error)))
+  (is (= {:remote [:erlang :put 2]} (:detail error)))
+  (is (= :undefined (erlang/get :constructor-exception-callback)))))
+
+(deftest recursive-budget-failure-cannot-turn-into-a-successful-source-value
+ (let [call {:op :remote :mod :constructor_exception_budget :fun :loop :args (list)}
+       body {:op :try :body call :after {:op :remote :mod :erlang :fun :throw :args [{:op :lit :val :masked}]}
+             :catch [{:pats [{:pop :pvar :name "kind"} {:pop :pvar :name "reason"}]
+                      :guard nil :body {:op :lit :val 42}}]}
+       error (try (BeamLisp.AOT/interpret_constructor! body {}
+                    {:remotes {[:constructor_exception_budget :loop 0]
+                                {:clauses [{:pats (list) :guard nil :body call}]}}}) nil
+               (catch error (ex-data error)))]
+  (is (= :constructor-machine-refused (:kind error)))
+  (is (= :depth-budget (:detail error)))))
+
+(deftest caught-source-exceptions-preserve-session-fuel-and-uncaught-ones-poison-it
+ (let [session (BeamLisp.AOT/open_constructor_session!)]
+  (try
+   (is (= 42 (BeamLisp.AOT/eval_constructor_session! session (node "(try (erlang/throw :payload) (catch error 42))") {})))
+   (let [first (BeamLisp.AOT/constructor_session_status session)]
+    (is (= :open (:status first)))
+    (is (= 42 (BeamLisp.AOT/eval_constructor_session! session (node "(try (erlang/error :badarg) (catch ArgumentError error 42))") {})))
+    (is (< (get-in (BeamLisp.AOT/constructor_session_status session) [:budget :remaining])
+           (get-in first [:budget :remaining]))))
+   (is (= :payload (try (BeamLisp.AOT/eval_constructor_session! session (node "(erlang/throw :payload)") {}) nil
+                    (catch-raw [kind reason stack] reason))))
+   (is (= :failed (:status (BeamLisp.AOT/constructor_session_status session))))
+   (finally (BeamLisp.AOT/close_constructor_session! session)))))
+
+(deftest normalized-exception-objects-cannot-escape-as-first-order-results
+ (is (= :unsafe-first-order-data (:kind (failure "(try (erlang/error :badarg) (catch error error))"))))
+ (is (= :unsafe-first-order-data
+        (:kind (failure "(try (erlang/error {:__struct__ :ConstructorForeignException :__exception__ true}) (catch error 42))")))))
+
+(deftest archived-transformers-can-evaluate-typed-exception-handlers
+ (let [provider {:namespace 'forms :revision 'current :file "forms.bl"
+                 :source (str "(ns forms) (begin-for-syntax (defn- checked [value] "
+                              "(try (erlang/div value 0) (catch ArithmeticError error 42) (finally nil)))) "
+                              "(defsyntax answer [form context] (syntax-literal (checked 10)))")}
+       archive (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       client {:namespace 'client :revision 'current :file "client.bl"
+               :source "(ns client) (import-world 'forms 'current :only [answer]) (answer)"}
+       program (x/program [client] ['client 'current] [archive])]
+  (is (= 42 (lower/eval-anf :Elixir.ConstructorExceptionArchived (:node program))))
+  (is (= :closed (get-in program [:constructor :status])))
+  (is (= 1 (get-in program [:constructor :calls])))))
+
+(deftest canonical-case-failure-does-not-depend-on-core-guard-optimization
+ (let [base (node "(try 0 (catch-raw [kind reason stack] [kind (erlang/element 1 reason)]))")
+       expression (assoc base :body
+                    (a/casee (a/lit 42)
+                     (list (a/clause (list (a/pvar "value")) (a/lit false) (a/lit 0)))))]
+  (is (= [:error :case_clause] (lower/eval-anf :Elixir.ConstructorCaseFailure expression)))
+  (is (= [:error :case_clause] (BeamLisp.AOT/interpret_constructor! expression {} {})))))
+
+(defn- runtime-list [values]
+ (Enum/reduce (Enum/reverse values) (a/empty-list-node)
+  (fn [value tail] (a/cons-cell value tail))))
+(defn- runtime-tuple [values]
+ (a/remote :erlang :list_to_tuple (list (runtime-list values))))
+(defn- literal [value] (a/lit value))
+
+(deftest exception-normalization-cannot-invoke-a-source-supplied-format-hook
+ (let [module :Elixir.ConstructorExceptionFormatFixture
+       _ (Code/compile_string
+          "defmodule ConstructorExceptionFormatFixture do\n def format_error(_, _) do\n Process.put(:constructor_exception_format_calls, Process.get(:constructor_exception_format_calls, 0)+1)\n %{general: \"probe\"}\n end\nend")
+       location (runtime-list [(runtime-tuple [(literal :error_info) (literal {:module module})])])
+       frames (runtime-list [(runtime-tuple [(literal :erlang) (literal :tuple_size) (literal 1) location])])
+       expression (assoc (node "(try 0 (catch ArgumentError error 42))") :body
+                    (a/remote :erlang :raise (list (literal :error) (literal :badarg) frames)))]
+  (try
+   (erlang/put :constructor_exception_format_calls 0)
+   (is (= 42 (lower/eval-anf :Elixir.ConstructorNativeFormatControl expression)))
+   (is (= 1 (erlang/get :constructor_exception_format_calls)))
+   (erlang/put :constructor_exception_format_calls 0)
+   (is (= 42 (BeamLisp.AOT/interpret_constructor! expression {} {})))
+   (is (= 0 (erlang/get :constructor_exception_format_calls)))
+   (finally (erlang/erase :constructor_exception_format_calls)
+            (code/purge module) (code/delete module)))))
+
+(deftest exception-witnesses-validate-raw-fields-without-changing-public-data
+ (let [exception (Elixir.ArgumentError/exception "bounded")
+       proof {:callables {} :recipes {} :recipe-frame nil :exceptions {exception true}}
+       cost (BeamLisp.CompilerData/constructor_data_cost! exception proof)]
+  (is (pos? (:nodes cost)))
+  (is (= :unsafe-first-order-data
+         (try (BeamLisp.CompilerData/check_first_order! exception) nil
+           (catch error (:kind (ex-data error))))))
+  (is (= :unsafe-first-order-data
+         (try (BeamLisp.AOT/interpret_constructor! (a/lit exception) {} {:exceptions {exception true}}) nil
+           (catch error (:kind (ex-data error)))))))
+ (let [callback (fn [] (erlang/put :constructor-exception-forged-callback true))
+       forged (maps/put :callback callback {:__struct__ :ConstructorForeignException :__exception__ true})
+       proof {:callables {} :recipes {} :recipe-frame nil :exceptions {forged true}}]
+  (is (erlang/is_function (maps/get :callback forged)))
+  (is (= :unsafe-first-order-data
+         (try (BeamLisp.CompilerData/constructor_data_cost! forged proof) nil
+           (catch error (:kind (ex-data error))))))
+  (is (= :undefined (erlang/get :constructor-exception-forged-callback)))))

@@ -1,0 +1,96 @@
+(ns native-execution-scoped-retirement-test
+ (:require [reload.generation :as generation]))
+
+(when-not (erlang/function_exported :Elixir.ScopedRetirementFixture :retire! 1)
+ (let [before (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.AOT/compile_host_file
+    (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (File/cwd!)) "test/fixtures/scoped_retirement.bl")
+    (list (tuple :module :Elixir.ScopedRetirementFixture) (tuple :load? true)
+          (tuple :output_dir (Path/join (System/tmp_dir!) "bl-source-fixture-beams"))))
+   (finally (BeamLisp.Env/bind before)))))
+
+(defn- graph [tag native]
+ (generation/prepare!
+  {:application-id (str "scoped-retirement-" tag) :native-modules native
+   :sources {"retirement.shared" "(ns retirement.shared) (defn value [] 42) (defn callback [] (fn [] 99))"}}))
+(defn- callback [g]
+ (generation/with! g #(BeamLisp.Execution/register! (generation/invoke! g "retirement.shared/callback" []))))
+(defn- value [g]
+ (try (generation/invoke! g "retirement.shared/value" [])
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+(defn- reason [action]
+ (try (action) :unexpected-success
+  (catch error (or (BeamLisp.ExInfo/ex_original error) (:kind (ex-data error))))))
+(defn- reserve! [g]
+ ;; Exercise the same original SDK-private reservation that precedes the native
+ ;; call in generation/attempt-native-retirement!. No native success is issued.
+ (let [modules (to-list (sort (:modules g)))]
+  (BeamLisp.Env/with_module_locks modules
+   #(BeamLisp.Ns.Rt/invoke
+     (BeamLisp.Env/fetch_exact! "reload.generation" "reserve-native-retirement!") (list g modules)))))
+
+(deftest retiring-one-graph-preserves-an-idle-sharing-graphs-admissions
+ ;; Both profiles are genuinely SDK-issued. The second graph explicitly grants
+ ;; the first graph's real owned code; no copied preparation or fake SDK flag.
+ (let [left (graph "shared-left" #{})
+       module (BeamLisp.Emit/module_for (get (:mapping left) "retirement.shared"))
+       right (graph "shared-right" #{(Atom/to_string module)})]
+  (try
+   (reserve! left)
+   (is (= 42 (value right)))
+   ;; No active right pin: an open owner alone must protect future admissions.
+   (is (= false (ScopedRetirementFixture/retire! left)))
+   (is (erlang/module_loaded module))
+   (is (= :execution_graph_closed (reason #(generation/with! left (fn [] :unreachable)))))
+   (is (= 42 (value right)))
+   (is (nil? (generation/native-retirement-outcome left)))
+   (is (= false (ScopedRetirementFixture/retire! left)))
+   (is (= 42 (value right)))
+   (is (= :retired (:status (generation/retire! right))))
+   (is (= true (ScopedRetirementFixture/retire! left)))
+   (is (not (erlang/module_loaded module)))
+   ;; Physical success alone is not the SDK owner's private resource receipt.
+   (is (nil? (generation/native-retirement-outcome left)))
+   (is (= :retired (:status (generation/retire! left))))
+   (is (= :complete (:phase (generation/native-retirement-outcome left))))
+   (finally (generation/retire! right) (generation/retire! left)))))
+
+(deftest closed-sharing-owners-still-retain-accepted-callbacks
+ (let [left (graph "pinned-left" #{})
+       module (BeamLisp.Emit/module_for (get (:mapping left) "retirement.shared"))
+       right (graph "pinned-right" #{(Atom/to_string module)}) held (callback right)]
+  (try
+   (reserve! left)
+   (is (= false (ScopedRetirementFixture/retire! left)))
+   (is (= false (ScopedRetirementFixture/retire! right)))
+   ;; Both graphs closed, but right's accepted graph pin protects shared code.
+   (is (= false (ScopedRetirementFixture/retire! left)))
+   (is (erlang/module_loaded module))
+   (is (= {:status :completed :value 99} (BeamLisp.Execution/invoke! held [])))
+   (BeamLisp.Execution/close! held)
+   (is (= true (ScopedRetirementFixture/retire! left)))
+   (is (= :retired (:status (generation/retire! right))))
+   (is (= :retired (:status (generation/retire! left))))
+   (finally (BeamLisp.Execution/close! held) (generation/retire! right) (generation/retire! left)))))
+
+(deftest edited-generations-cannot-close-original-or-foreign-admissions
+ (let [g (graph "original" #{})]
+  (try
+   (doseq [bad [(assoc g :digest "edited") (assoc g :modules [])
+               (assoc g :scope (erlang/make_ref)) {}]]
+    (is (not= :unexpected-success (reason #(ScopedRetirementFixture/retire! bad))))
+    (is (= 42 (generation/invoke! g "retirement.shared/value" []))))
+   (finally (generation/retire! g)))))
+
+(deftest a-native-grant-does-not-let-source-retire-its-own-graph
+ (let [g (generation/prepare!
+          {:application-id "scoped-retirement-source"
+           :native-modules #{"ScopedRetirementFixture"}
+           :sources {"retirement.source"
+            "(ns retirement.source) (defn value [] 43) (defn bad [g] (ScopedRetirementFixture/retire! g))"}})]
+  (try
+   (is (= :native_framework_execution_required
+          (reason #(generation/invoke! g "retirement.source/bad" [g]))))
+   (is (= 43 (generation/invoke! g "retirement.source/value" [])))
+   (finally (generation/retire! g)))))

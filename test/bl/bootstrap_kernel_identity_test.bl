@@ -1,0 +1,54 @@
+(ns bootstrap.kernel-identity-test)
+
+(deftest artifact-target-and-executing-kernel-have-separate-authenticated-identities
+ (let [scratch (Path/join (System/tmp_dir!) (str "kernel-target-" (erlang/unique_integer (list :positive))))
+       paths (Enum/flat_map (code/get_path) (fn [p] (list "-pa" (erlang/list_to_binary p))))
+       script (str
+        "Application.load(:beam_lisp)\n"
+        "for app <- Application.spec(:beam_lisp, :applications) || [], do: {:ok, _} = Application.ensure_all_started(app)\n"
+        "BeamLisp.AOT.boot()\n"
+        "root = System.fetch_env!(\"BL_KERNEL_TARGET\")\n"
+        "original = System.cwd!()\n"
+        "File.cp_r!(Path.join(original, \"priv\"), Path.join(root, \"priv\"))\n"
+        "File.cp!(Path.join(original, \"env.bl\"), Path.join(root, \"env.bl\"))\n"
+        "app = Path.join(root, \".bl/lib/beam_lisp-0.1.0\")\n"
+        "File.mkdir_p!(app)\n"
+        "File.ln_s!(Path.join(root, \"priv\"), Path.join(app, \"priv\"))\n"
+        "File.ln_s!(Path.join(root, \"priv/bootstrap/seed\"), Path.join(app, \"ebin\"))\n"
+        "Code.prepend_path(Path.join(app, \"ebin\"))\n"
+        "System.put_env(\"BL_ROOT\", root)\n"
+        "File.write!(Path.join(root, \"priv/boot/anf.bl\"), \"\\n; kernel target identity regression\\n\", [:append])\n"
+        "BeamLisp.AOTCache.reset_keys()\n"
+        "kernel = BeamLisp.Bootstrap.manifest()[\"compiler_key\"]\n"
+        "target = BeamLisp.AOTCache.current_compiler_key()\n"
+        "false = kernel == target\n"
+        "refused = fn action -> try do action.(); false catch _, _ -> true end end\n"
+        "true = refused.(fn -> BeamLisp.AOT.phase_library!({:symbol, \"core\"}) end)\n"
+        "file = Path.join(root, \"target.bl\")\n"
+        "File.write!(file, \"(ns kernel.target) (defn answer [] (cond :else 42))\")\n"
+        "prepare = fn ->\n"
+        "  w = BeamLisp.AOT.open_workspace(%{version: 2, \"phase-imports\": [{:symbol, \"core\"}, {:symbol, \"sugar\"}], sources: [%{namespace: {:symbol, \"kernel.target\"}, file: file}]}, %{})\n"
+        "  try do BeamLisp.AOT.prepare_unit(w, {:symbol, \"kernel.target\"}) after BeamLisp.AOT.close_workspace!(w) end\n"
+        "end\n"
+        "lease_before = :ets.lookup(:beam_lisp_vars, :bl_sdk_runtime_lease)\n"
+        "prepared = prepare.()\n"
+        "^kernel = prepared[:\"phase-world\"][:\"compiler-key\"]\n"
+        "^target = prepared[:world][:\"compiler-key\"]\n"
+        "^lease_before = :ets.lookup(:beam_lisp_vars, :bl_sdk_runtime_lease)\n"
+        "# Corrupt executable code in this disposable child only. A cached data\n"
+        "# recipe must never authenticate the replacement kernel provider.\n"
+        "module = BeamLisp.Ns.Body.Core\n"
+        "{:module, ^module} = Code.ensure_loaded(module)\n"
+        "Code.compile_string(\"defmodule BeamLisp.Ns.Body.Core do def changed_kernel_probe, do: :changed end\")\n"
+        "true = refused.(prepare)\n"
+        "IO.puts(\"BOOTSTRAP_KERNEL_TARGET_IDENTITY_READY\")\n")]
+  (File/mkdir_p! scratch)
+  (try
+   (let [[output status] (System/cmd "elixir" (erlang/++ paths (list "-e" script))
+                         (list (tuple :stderr_to_stdout true)
+                               (tuple :env (list (tuple "BL_DAEMON" "off")
+                                                 (tuple "BL_KERNEL_TARGET" scratch)
+                                                 (tuple "BL_ROOT" (Path/dirname (BeamLisp.Tiers/priv_root)))))))]
+    (is (= 0 status) output)
+    (is (String/contains? output "BOOTSTRAP_KERNEL_TARGET_IDENTITY_READY") output))
+   (finally (File/rm_rf! scratch)))))

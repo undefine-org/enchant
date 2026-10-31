@@ -1,0 +1,169 @@
+(ns contextual-artifact-unit-test
+ (:require [bl.world :as world] [expand :as expand] [lower :as lower] [system.phase :as phase]))
+
+(defn- fixture [action]
+ (let [dir (Path/join (System/tmp_dir!) (str "contextual-unit-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir! dir)
+  (try (action dir) (finally (File/rm_rf! dir)))))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- source [namespace text] {:namespace namespace :revision 'current :file (str namespace ".bl") :source text})
+
+(defn- observe-reader [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn
+                (fn []
+                 (loop [calls 0]
+                  (receive
+                   [:trace _ :call [:Elixir.BeamLisp.Reader :read_syntax _]] (recur (inc calls))
+                   [:finish seen] :when (= seen ticket) (erlang/send parent [:reader-calls ticket calls])
+                   _ (recur calls)))))]
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.Reader :read_syntax 2) true (list :local))
+  (erlang/trace parent true (list :call (tuple :tracer tracer)))
+  (try
+   (let [value (action) delivered (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= delivered seen) :ready
+             (after 5000 (throw :reader-trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:reader-calls seen count] :when (= seen ticket) count
+                    (after 5000 (throw :reader-trace-timeout)))])
+   (finally
+    (erlang/trace parent false (list :call))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.Reader :read_syntax 2) false (list :local))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(deftest phase-export-shares-the-exact-prepared-program-and-keeps-entry-effects-out
+ (let [sources [(source 'provider "(ns provider) (defsyntax answer [form ctx] (syntax-literal 42))")
+                (source 'main "(ns main) (import-world 'provider 'current :only [answer]) (answer)")]
+       ordinary (expand/program sources ['main 'current])
+       [prepared reads] (observe-reader #(expand/prepare-program sources ['main 'current]))
+       library (expand/decode-phase-library (expand/encode-phase-library (:phase-library prepared)))
+       imported (expand/program [(source 'consumer "(ns consumer) (import-world 'provider 'current :only [answer]) (answer)")]
+                                 ['consumer 'current] [library])]
+  (is (= 2 reads))
+  (is (= ordinary (:program prepared)))
+  (is (= 1 (get-in prepared [:program :constructor :calls])))
+  (is (every? #(empty? (:expressions %)) (:units library)))
+  (is (every? #(not (contains? % :source)) (:units library)))
+  (is (= :proved (:status (phase/check imported))))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualUnitImport (:node imported)))))
+ ;; The older provider-only archive API still refuses effectful entry sources.
+ (is (= :phase-library-unit
+        (kind #(expand/phase-library [(source 'main "(ns main) 42")])))))
+
+(deftest complete-world-unit-can-export-macros-without-provider-source-or-loading-code
+ (fixture
+  (fn [dir]
+   (let [prepared (world/prepare "test/fixtures/contextual-validation/world.bl")
+         module :Elixir.ContextualArtifactUnitProgram
+         unit (world/prepare-unit prepared module)
+         output (Path/join dir "unit")
+         emitted (BeamLisp.AOT/emit_unit unit output)
+         verified (world/read-unit output)
+         library (:phase-library verified)
+         imported (expand/program
+                    [(source 'consumer
+                      "(ns consumer) (import-world 'validation 'current :only [ratio]) [(ratio [80 2] 99) (ratio [80 0] 99)]")]
+                    ['consumer 'current] [library])
+         runtime (first (:runtime-beams verified))]
+    (is (= :prepared-artifact-unit (:kind unit)))
+    (is (= 2 (count (:modules emitted))))
+    (is (= 3 (count (File/ls! output))))
+    (is (= 1 (count (:runtime-beams verified))))
+    (is (= false (:native-admission verified)))
+    (is (= false (erlang/module_loaded module)))
+    (is (= false (erlang/module_loaded :Elixir.ContextualArtifactUnitProgram.PhaseLibrary)))
+    (is (= [42 99] (lower/eval-anf :Elixir.ContextualUnitPhaseConsumer (:node imported))))
+    (is (= module (elem runtime 0)))
+    ;; Runtime packaging carries only this captured BEAM. No phase module is
+    ;; loaded for the call, and no Source/provider files are consulted.
+    (is (= (tuple :module module) (code/load_binary module '() (elem runtime 1))))
+    (try (is (= [42 99 42] (world/run-unit output [])))
+     (finally (code/delete module) (code/purge module)))
+    (is (= false (erlang/module_loaded :Elixir.ContextualArtifactUnitProgram.PhaseLibrary)))
+    (File/write! (Path/join output "unexpected.evidence") "extra")
+    (is (= :artifact-membership-changed (kind #(world/read-unit output))))))))
+
+(deftest paired-preparation-refuses-input-drift-before-writing-any-member
+ (fixture
+  (fn [dir]
+   (let [source-file (Path/join dir "main.bl") manifest (Path/join dir "world.bl") output (Path/join dir "out")]
+    (File/write! source-file "(ns main) 42")
+    (File/write! manifest
+      "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'main :revision 'current :file \"main.bl\"}] :libraries []}")
+    (let [prepared (world/prepare manifest) unit (world/prepare-unit prepared :Elixir.ContextualUnitDrift)]
+     (File/write! source-file "(ns main) 99")
+     (is (= :artifact-source-changed (kind #(BeamLisp.AOT/emit_unit unit output))))
+     (is (= false (File/exists? output))))))))
+
+(deftest binary-phase-input-drift-cannot-disappear-through-source-normalization
+ (fixture
+  (fn [dir]
+   (let [provider (source 'forms "(ns forms) (defsyntax answer [form ctx] (syntax-literal 42))")
+         archive (Path/join dir "forms.phase") main (Path/join dir "main.bl")
+         manifest (Path/join dir "world.selection") output (Path/join dir "out")]
+    (File/write! archive (expand/encode-phase-library (expand/phase-library [provider])))
+    (File/write! main "(ns main) (import-world 'forms 'current :only [answer]) (answer)")
+    (File/write! manifest
+     "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'main :revision 'current :file \"main.bl\"}] :libraries [\"forms.phase\"]}")
+    (let [prepared (world/prepare manifest) unit (world/prepare-unit prepared :Elixir.ContextualUnitArchiveDrift)]
+     (File/write! archive "different opaque bytes")
+     (is (= :artifact-source-changed (kind #(BeamLisp.AOT/emit_unit unit output))))
+     (is (= false (File/exists? output))))))))
+
+(deftest non-source-manifest-drift-is-still-a-physical-artifact-input
+ (fixture
+  (fn [dir]
+   (let [main (Path/join dir "main.bl") manifest (Path/join dir "world.selection") output (Path/join dir "out")]
+    (File/write! main "(ns main) 42")
+    (File/write! manifest
+     "{:version 1 :profile 'syntax-v1 :entry ['main 'current] :sources [{:namespace 'main :revision 'current :file \"main.bl\"}] :libraries []}")
+    (let [prepared (world/prepare manifest) unit (world/prepare-unit prepared :Elixir.ContextualUnitManifestDrift)]
+     (File/write! manifest "changed selection")
+     (is (= :artifact-source-changed (kind #(BeamLisp.AOT/emit_unit unit output))))
+     (is (= false (File/exists? output))))))))
+
+(deftest an-application-entry-can-export-definitions-without-importing-its-entry-effect
+ (let [prepared (expand/prepare-program
+                 [(source 'application
+                   "(ns application) (defn bump [x] (erlang/+ x 1)) (erlang/error :application-entry-must-not-run)")]
+                 ['application 'current])
+       library (expand/decode-phase-library (expand/encode-phase-library (:phase-library prepared)))
+       consumer (expand/program [(source 'consumer
+                                  "(ns consumer) (import-world 'application 'current :only [bump]) (bump 41)")]
+                                 ['consumer 'current] [library])]
+  (is (= :proved (:status (phase/check consumer))))
+  (is (= 42 (lower/eval-anf :Elixir.ContextualUnitEntryExports (:node consumer))))))
+
+(deftest contextual-analysis-and-artifact-emission-share-the-compiler-entry-declaration
+ (let [prepared (world/prepare "test/fixtures/contextual-validation/world.bl")
+       declaration (:declaration prepared) entry (first (:entries declaration))
+       module :Elixir.ContextualCanonicalEntry
+       beam (world/artifact prepared module)
+       parsed (beam_lib/chunks (elem beam 1) (list :exports))]
+  (is (= :function-declaration (:kind declaration)))
+  (is (= "run" (:name declaration)))
+  (is (= (get-in prepared [:program :node]) (:body (elem entry 3))))
+  (is (some #(= (tuple :__bl_unit__ 0) %) (Keyword/get (elem (elem parsed 1) 1) :exports)))
+  (is (not (erlang/module_loaded module)))
+  (is (= (tuple :module module) (code/load_binary module '() (elem beam 1))))
+  (try (is (= [42 99 42] (BeamLisp.Loader/run_prepared_artifact_unit (world/prepare-unit prepared module) (list))))
+   (finally (code/delete module) (code/purge module)))
+  (is (= :error (BeamLisp.Env/lookup (tuple :link (:namespace declaration) "run"))))
+  (doseq [changed [(dissoc prepared :declaration)
+                    (assoc-in prepared [:declaration :entries] (list (tuple :fixed 0 :run {:op :defn-clause :fname :run :params (list) :guard nil :body {:op :lit :val :changed :ann {}}})))
+                    (assoc-in prepared [:declaration :entries] (list :bad-entry))
+                    (assoc-in prepared [:program :node] {:op :lit :val :changed :ann {}})]]
+   (is (= :world-entry-declaration (kind #(world/artifact changed module)))))))
+
+(deftest canonical-entry-does-not-grant-a-synthetic-recur-target
+ (is (try
+       (expand/prepare-program [(source 'entry-scope "(ns entry-scope) (recur)")] ['entry-scope 'current])
+       false
+       (catch error (and (= :Elixir.BeamLisp.CompileError (:__struct__ error))
+                         (includes? (:message error) "recur used with no enclosing loop or fn")))))
+ (let [prepared (expand/prepare-program
+                 [(source 'entry-scope "(ns entry-scope) (loop [x 0] (if (erlang/< x 2) (recur (erlang/+ x 1)) x))")]
+                 ['entry-scope 'current])]
+  (is (= 2 (lower/eval-anf :Elixir.ContextualEntryLoop (get-in prepared [:program :node]))))
+  (is (= (get-in prepared [:program :node])
+         (:body (elem (first (get-in prepared [:declaration :entries])) 3))))))

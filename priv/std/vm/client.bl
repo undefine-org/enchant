@@ -39,8 +39,7 @@
           (contains? r :ok)
           (let [listener (:ok r)]
             (erlang/apply :persistent_term :put (list PT-STOP false))
-            (wait-for-stop)
-            (session/stop listener)
+            (finish-session listener)
             :ok)
           ;; lost the race to another starter: that one IS the daemon, which is
           ;; what the caller wanted. Not a failure.
@@ -49,6 +48,17 @@
           :else
           (do (IO/puts :stderr (str "bl realm: failed to start: " (pr-str r)))
               {:error r})))))))
+
+(defn- finish-session [listener]
+ (loop []
+  (wait-for-stop)
+  (if (= :waiting (:status (session/stop listener)))
+   (do
+    ;; Idle expiry or a concurrent accepted request may leave real custody.
+    ;; Keep the foreground owner/listener and wait for an explicit stop retry.
+    (erlang/apply :persistent_term :put (list PT-STOP false))
+    (recur))
+   :ok)))
 
 (defn- wait-for-stop []
   (if (erlang/apply :persistent_term :get (list PT-STOP false))
@@ -112,7 +122,7 @@
 
 (defn- drain-to-exit
   "Read frames for request `id`, writing stdout/stderr, until :exit. Answers HOW it
-   ended: {:ok :exit} when the VM said it was done, {:error reason} when the
+   ended: {:ok :exit :code n} when the VM answered, {:error reason} when the
    connection ended without it (`:closed` when the VM went away, `:timeout` when it
    went quiet). Callers decide what each means for them (see `outcome`)."
   [sock id]
@@ -123,7 +133,7 @@
         (cond
           (and (= tag :stdout) (= (elem frame 3) id)) (do (IO/write (elem frame 5)) (drain-to-exit sock id))
           (and (= tag :stderr) (= (elem frame 3) id)) (do (IO/write :stderr (elem frame 5)) (drain-to-exit sock id))
-          (and (= tag :exit) (= (elem frame 3) id)) {:ok :exit}
+          (and (= tag :exit) (= (elem frame 3) id)) {:ok :exit :code (elem frame 4)}
           :else (drain-to-exit sock id))))))
 
 (defn outcome
@@ -134,10 +144,11 @@
    is gone. Anything that asks the VM to do something and KEEP RUNNING (`{:close
    root}`) is only done when the VM says so with an exit frame; a closed connection
    there means it died or refused, and reporting success would be a lie. Silence is
-   never confirmation."
+   never confirmation. Explicit exit frames preserve their numeric failure code;
+   a frame receipt without a code is incomplete and cannot report success."
   [op ended]
   (cond
-    (contains? ended :ok) 0
+    (= :exit (:ok ended)) (if (erlang/is_integer (:code ended)) (:code ended) 1)
     (and (= op :stop) (= :closed (:error ended))) 0
     :else 1))
 
@@ -168,14 +179,14 @@
   "End the project at `root`. A project with its own VM stops that VM. A project
    served by a shared VM closes only its REALM: the VM and every other project in
    it keep running (stop the process itself with `bl vm stop`). Returns 0 on stop,
-   1 if none was running."
+   nonzero when retirement is pending or no VM answers."
   [root]
   (let [root (resolve-root root)
         shared (paths/shared? root (paths/build-id))
         r (if shared
             (control root (tuple :close (erlang/list_to_binary (erlang/binary_to_list root))) nil)
             (control root :stop (str "bl realm: stopped (" root ")")))]
-    (if (= 0 r) 0
+    (if (erlang/is_integer r) r
       (do (println (str "bl realm: not running for " root)) 1))))
 
 (defn- stdout-of
@@ -194,7 +205,8 @@
                          (cond
                            (and (= tag :stdout) (= (elem frame 3) id))
                            (recur (str acc (erlang/apply :unicode :characters_to_binary (list (elem frame 5)))))
-                           (and (= tag :exit) (= (elem frame 3) id)) acc
+                           (and (= tag :exit) (= (elem frame 3) id))
+                            (when (= 0 (elem frame 4)) acc)
                            :else (recur acc))))))]
         (gen_tcp/close sock)
         text))

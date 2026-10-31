@@ -1,0 +1,75 @@
+(ns contextual-namespace-require-test
+ (:require [expand :as x] [expand-source :as catalog] [lower :as lower] [codebase.refactor :as refactor]))
+(defn- source [namespace revision text]
+ {:namespace namespace :revision revision :source text :file (str namespace ".bl")})
+(defn- provider [] (source 'provider 'v1 "(ns provider) (defn answer [x] (erlang/+ x 40)) (defn- secret [] 9)"))
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.HeaderImports." (erlang/unique_integer (list :positive)))) (:node program)))
+(defn- kind-of [action] (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest namespace-views-converge-on-selected-provider-identities
+ (doseq [pair [["provider" "(provider/answer 2)"]
+               ["[provider :as p]" "(p/answer 2)"]
+               ["[provider :refer [answer]]" "(answer 2)"]
+               ["[provider :as p :refer :all]" "(erlang/+ (p/answer 1) (answer -39))"]]]
+  (let [client (source 'client 'v1 (str "(ns client (:require " (first pair) ")) " (second pair)))
+        program (x/program [(provider) client] ['client 'v1])]
+   (is (= 42 (execute program)))
+   (is (not (empty? (get-in program [:provenance :imports]))))
+   (is (every? #(= 'provider (get-in % [:declaration :namespace])) (Map/values (:references program)))))))
+
+(deftest captured-revisions-and-runtime-entries-have-no-ambient-default
+ (let [client (source 'client 'v1 "(ns client (:require [provider :as p])) (p/answer 2)")]
+  (is (= :phase-provider-missing (kind-of #(x/program [client] ['client 'v1]))))
+  (is (= :phase-provider-ambiguous
+        (kind-of #(x/program [(provider) (assoc (provider) :revision 'v2) client] ['client 'v1]))))
+  (is (= :phase-provider-entry
+        (kind-of #(x/program [(update (provider) :source str " (erlang/error :must-not-run)") client] ['client 'v1]))))
+  (is (= :phase-provider-empty
+        (kind-of #(x/program [(source 'provider 'v1 "(ns provider)") client] ['client 'v1]))))))
+
+(deftest private-missing-and-unsupported-requests-refuse
+ (doseq [pair [["[provider :refer [secret]]" :binding-import-private]
+               ["[provider :refer [missing]]" :binding-import-missing]]]
+  (is (= (second pair) (kind-of #(x/program [(provider) (source 'client 'v1
+       (str "(ns client (:require " (first pair) ")) 42"))] ['client 'v1])))))
+ (is (= :phase-namespace-clause (kind-of #(x/program
+  [(source 'client 'v1 "(ns client (:import Some.Native)) 42")] ['client 'v1])))))
+
+(deftest archived-providers-and-transformers-use-the-same-header-selection
+ (let [library (x/phase-library [(source 'provider 'v1
+                "(ns provider) (defn- helper [x] (erlang/+ x 40)) (defsyntax answer [form ctx] (syntax-template (helper input) {'input (syntax-arg form 1)}))")])
+       restored (x/decode-phase-library (x/encode-phase-library library))
+       program (x/program [(source 'client 'v1 "(ns client (:require [provider :as p])) (p/answer 2)")] ['client 'v1] [restored])]
+  (is (= library restored))
+  (is (= 42 (execute program)))
+  (is (not (contains? (first (:units restored)) :source)))))
+
+(deftest explicit-header-refer-origins-are-exact-and-inferred-views-have-no-fake-tokens
+ (let [client (source 'client 'v1 "(ns client (:require [provider :as p :refer [answer]])) (answer 2)")
+       c (catalog/catalog [(provider) client])
+       imports (:imports (catalog/provenance c))
+       explicit (filter #(contains? (:only-origins %) 'answer) imports)
+       origin (get-in (first explicit) [:only-origins 'answer])]
+  (is (= 1 (count explicit)))
+  (is (= "answer" (String/slice (:source client) (:offset origin) (- (:end-offset origin) (:offset origin)))))
+  (is (= 2 (count (filter #(empty? (:only-origins %)) imports))))))
+
+(deftest rename-updates-only-explicit-header-tokens-and-real-uses
+ (doseq [spec ["[provider :as p :refer [answer]]" "[provider :as p :refer :all]"]]
+  (let [sources [(source 'provider 'v1 "(ns provider) (defn answer [x] (erlang/+ x 40))") (source 'client 'v1 (str "(ns client (:require " spec ")) (p/answer 2)"))]
+        program (x/program sources ['client 'v1])
+        target (:id (Enum/find (Map/values (get-in program [:selection :by-id]))
+                       #(and (= 'provider (:namespace %)) (= 'answer (:name %)))))
+        result (refactor/rename-program sources ['client 'v1] target 'result)]
+   (is (= :verified (:status result)))
+   (is (= 42 (execute (:program result))))
+   (is (String/contains? (:source (second (:sources result))) "(p/result 2)")))))
+
+(deftest header-imports-survive-a-source-free-intermediate-library
+ (let [library (x/phase-library [(provider)
+                 (source 'middle 'v1 "(ns middle (:require [provider :as p])) (defn result [] (p/answer 2))")])
+       restored (x/decode-phase-library (x/encode-phase-library library))
+       program (x/program [(source 'client 'v1 "(ns client (:require [middle :as m])) (m/result)")] ['client 'v1] [restored])]
+  (is (= library restored))
+  (is (= 42 (execute program)))))

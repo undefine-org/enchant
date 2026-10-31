@@ -8,7 +8,7 @@
 ; reached through plain erlang/-style interop. No Elixir compiler is on this
 ; path.
 
-(ns lower (:require [anf :as anf]))
+(ns lower (:require [anf :as anf] [lower-core :as core-ir]))
 
 ;; Compiler-owned collections are finite and never introduce LazySeq handles.
 (defn- map
@@ -28,8 +28,8 @@
 (defn lit [v] (cerl/abstract v))
 (defn catom [a] (cerl/c_atom a))
 (defn cvar [name] (cerl/c_var name))
-(defn ccall [m f args] (cerl/c_call (catom m) (catom f) (to-list args)))
-(defn capply [f args] (cerl/c_apply f (to-list args)))
+(defn ccall [m f args] (core-ir/call m f args))
+(defn capply [f args] (core-ir/apply f args))
 (defn cfun [vars body] (cerl/c_fun (to-list vars) body))
 (defn cfun-anno
   "cfun plus the [function: {name arity}] annotation v3_core stamps on every
@@ -76,8 +76,9 @@
 (defn cmap [pairs] (cerl/c_map (to-list pairs)))
 (defn cpair [k v] (cerl/c_map_pair k v))
 
-; The per-process counter/module keys are INLINE literal atoms, not value defs.
-; A `(def k …)` would intern a var that `set-current-module!`/`next-fresh!`
+; Per-process state uses literal atom keys, not value defs. lower-core owns
+; the fresh counter; this namespace owns current-module state. A `(def k …)`
+; would intern a var that their state operations
 ; reach through `Env.fetch!` at runtime — and when core-defvar-anf runs from a
 ; throwaway eval env (the backend switch's path, core_switch_test) that var is
 ; not interned there, so the fetch raised `undefined var: lower/…-key`.
@@ -98,19 +99,10 @@
    aot_reproducible_test pins (serial ≡ parallel ≡ post-perturbation). Per
    process, each worker's sequence is a function of its own source alone."
   []
-  (erlang/put :bl_core_fresh_seq 0)
-  nil)
-
-(defn- next-fresh!
-  "The next number from THIS PROCESS's fresh-name counter (1, 2, 3 …)."
-  []
-  (let [cur (erlang/get :bl_core_fresh_seq)
-        n (erlang/+ (if (erlang/=:= cur :undefined) 0 cur) 1)]
-    (erlang/put :bl_core_fresh_seq n)
-    n))
+  (core-ir/reset-fresh!))
 
 (defn fresh [prefix]
-  (cvar (erlang/binary_to_atom (str prefix "_ce" (next-fresh!)))))
+  (core-ir/fresh prefix))
 
 (defn- set-current-module! [m] (erlang/put :bl_core_current_module m) m)
 
@@ -173,8 +165,7 @@
   (let [clauses (:clauses n)
         cl0 (first clauses)
         arity (count (:pats cl0))
-        simple? (and (= 1 (count clauses)) (nil? (:guard cl0))
-                     (every? (fn [p] (= :pvar (:pop p))) (:pats cl0)))]
+        simple? (some? (BeamLisp.CompilerData/simple_function_clause n))]
     (if simple?
       (cfun (to-list (map (fn [p] (cvar (erlang/binary_to_atom (:name p)))) (:pats cl0)))
             (lower-anf (:body cl0)))
@@ -184,7 +175,11 @@
                                                 (cerl/clause_guard cl)
                                                 (cerl/clause_body cl)))
                         lowered)]
-        (cfun params (ccase (ctuple params) tupled))))))
+        ;; Core's inferred failure changes between if_clause/case_clause as
+        ;; patterns optimize. A language fn owns function_clause explicitly.
+        (let [failure (anno-cerl n (ccall :erlang :error (list (lit :function_clause))))
+              fallback (cclause (list (fresh "unmatched_function")) failure)]
+         (cfun params (ccase (ctuple params) (concat tupled (list fallback)))))))))
 
 (defn lower-anf-try
   [n]
@@ -195,8 +190,9 @@
                        (to-list (concat (lower-anf-clauses catch-clauses)
                                (list (cclause (list (fresh "_") (fresh "_"))
                                               (craise cls rsn stk))))))
-        handler* (clet (cvar :__STACKTRACE__) (cbuild-stacktrace stk)
-                   (clet (cvar :__STACKTRACE_RAW__) stk handler))
+        stack-bindings (BeamLisp.CompilerData/catch_stack_bindings)
+        handler* (clet (cvar (erlang/binary_to_atom (:frames stack-bindings))) (cbuild-stacktrace stk)
+                   (clet (cvar (erlang/binary_to_atom (:raw stack-bindings))) stk handler))
         after (:after n)
         caught (if (empty? catch-clauses) body
                  (cerl/c_try body (list v) v (list cls rsn stk) handler*))
@@ -252,6 +248,9 @@
     (cond
       (= op :lit) (lit (:val n))
       (= op :var) (cvar (erlang/binary_to_atom (:name n)))
+      (= op :binding)
+        (throw (ex-info "Selected binding requires unit linkage before native emission"
+                       {:kind :unlinked-contextual-binding :reference (:reference n)}))
       (= op :global) (ccall :Elixir.BeamLisp.Env (if (= :exact (:lookup n)) :fetch_exact! :fetch!) (list (lit (:ns n)) (lit (:name n))))
       (= op :remote)
         (let [m (:mod n) f (:fun n) as (to-list (:args n))]
@@ -267,13 +266,23 @@
                   (reduce (fn [tail arg] (cerl/c_cons (lower-anf arg) tail))
                           (cerl/c_nil) (reverse as)))))
             (ccall m f (to-list (map (fn [value] (lower-anf value)) as)))))
+      (= op :invoke)
+        (let [callee (fresh "callable") arguments (fresh "arguments")]
+          (clet callee (lower-anf (:callee n))
+            (clet arguments (lower-anf (:arguments n))
+              (ccall :Elixir.BeamLisp.Ns.Rt :invoke (list callee arguments)))))
       (= op :apply) (capply (lower-anf (:fn n)) (to-list (map (fn [value] (lower-anf value)) (:args n))))
       (= op :let) (clet (cvar (erlang/binary_to_atom (:name n))) (lower-anf (:init n)) (lower-anf (:body n)))
       (= op :if) (anf-if->case (lower-anf (:test n)) (lower-anf (:then n)) (lower-anf (:else n)))
       (= op :do) (reduce (fn [acc s] (cseq acc (lower-anf s)))
                          (lower-anf (first (:stmts n)))
                          (rest (:stmts n)))
-      (= op :case) (ccase (lower-anf (:subj n)) (lower-anf-clauses (:clauses n)))
+      (= op :case)
+        (let [subject (fresh "case_subject")
+              failure (anno-cerl n (ccall :erlang :error (list (ctuple (list (lit :case_clause) subject)))))
+              fallback (cclause (list (fresh "unmatched_case")) failure)]
+         (clet subject (lower-anf (:subj n))
+          (ccase subject (concat (lower-anf-clauses (:clauses n)) (list fallback)))))
       (= op :fn) (lower-anf-fn n)
       (= op :try) (lower-anf-try n)
       (= op :recv)
@@ -284,7 +293,12 @@
       (= op :tuple) (ctuple (map (fn [value] (lower-anf value)) (:elems n)))
       (= op :map) (cmap (map (fn [kv] (cpair (lower-anf (first kv)) (lower-anf (second kv)))) (:pairs n)))
       (= op :enil) (cerl/c_nil)
-      (= op :cons) (cerl/c_cons (lower-anf (:head n)) (lower-anf (:tail n)))
+      (= op :cons)
+        ;; Core's cons operands must be values: embedding effectful trees can
+        ;; evaluate the tail first. Make source head-before-tail order explicit.
+        (let [head (fresh "head") tail (fresh "tail")]
+          (clet head (lower-anf (:head n))
+            (clet tail (lower-anf (:tail n)) (cerl/c_cons head tail))))
       (= op :arith)
         ; the int/decimal dispatch, born HERE — the one place the scaffold
         ; exists. The canonical tier carries the arithmetic abstract
@@ -323,7 +337,10 @@
   "bl-ANF node (anf vocabulary) → cerl, with the node's source position
    stamped onto the cerl term (see anno-cerl)."
   [n]
-  (anno-cerl n (lower-anf-node n)))
+  (let [tree (anno-cerl n (lower-anf-node n))]
+   (if (and (contains? #{:remote :apply :invoke :global :struct} (:op n))
+            (seq (cerl/get_ann tree)))
+    (core-ir/annotate-call tree (cerl/get_ann tree)) tree)))
 
 (defn module-info-defs [mname]
   (let [k (cvar :K)]
@@ -463,22 +480,12 @@
    letrec makes this false. It reads the loaded module itself, not the ANF, so
    it cannot disagree with what the compiler emitted."
   [m]
-  (Enum/all? (erlang/apply m :module_info (list :functions))
-             (fn [f] (Enum/member? (list (tuple :run 0) (tuple :module_info 0) (tuple :module_info 1)) f))))
+  (BeamLisp.Env/eval_module_closure_free? m))
 
 (defn release-eval-module!
-  "Unload eval module `m` once its run/0 has returned, IF nothing can reach its
-   code. Returns :purged or :kept.
-
-   Closure-FREE is the whole safety argument: a fun stored in the var table is
-   invisible to the purge's process scan, so a module that could have produced
-   one is never deleted. `soft_purge`, never `purge`: a process still inside the
-   module keeps it instead of being killed."
-  [m]
-  (if (closure-free? m)
-    (do (code/delete m)
-        (if (code/soft_purge m) :purged :kept))
-    :kept))
+ "Retire closure-free eval code through the existing native lease/publication
+  fence. Closure-producing modules and code with other live users stay loaded."
+ [m] (BeamLisp.Env/release_eval_module! m))
 
 (defn eval-anf
   "Evaluate a bl-ANF node by wrapping it as the body of run/0 in a canonical

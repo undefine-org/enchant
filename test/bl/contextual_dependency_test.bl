@@ -1,0 +1,61 @@
+(ns contextual-dependency-test
+ (:require [expand :as x] [codebase.phase :as code]))
+
+(defn- unit [namespace revision source]
+ {:namespace namespace :revision revision :source source :file (str namespace ".bl")})
+(defn- declaration-id [program namespace name phase]
+ (:id (Enum/find (Map/values (get-in program [:selection :by-id]))
+         #(and (= namespace (:namespace %)) (= name (:name %)) (= phase (:phase %))
+                (not= :local (:visibility %))))))
+
+(deftest reverse-impact-keeps-same-named-provider-revisions-separate
+ (let [old (unit 'library 'old "(ns library) (defn answer [] 42)")
+       new (unit 'library 'new "(ns library) (defn answer [] 99)")
+       client (unit 'client 'current
+                  "(ns client) (import-world 'library 'old :only [answer]) (answer)")
+       program (x/program [old new client] ['client 'current])
+       graph (code/dependencies program)
+       declarations (Enum/filter (Map/values (get-in program [:selection :by-id]))
+                      #(and (= 'library (:namespace %)) (= 'answer (:name %)) (not= :local (:visibility %))))
+       used (:declaration (:reference (first (Enum/filter (:occurrences program)
+                                              #(and (= 'answer (:name %)) (not (:definition %)))))))
+       unused (:id (Enum/find declarations #(not= used (:id %))))]
+  (is (= :indexed (:status graph)))
+  (is (some #(= :call (:kind %)) (:edges graph)))
+  (is (= true (:entry-affected (code/impact program [used]))))
+  (is (= false (:entry-affected (code/impact program [unused]))))
+  (is (= false (:native-admission graph)))))
+
+(deftest compile-time-dependencies-participate-without-entering-runtime-code
+ (let [program (x/program
+                 [(unit 'client 'current
+                    (str "(ns client) (begin-for-syntax (def offset 2)) "
+                      "(defsyntax literal [form ctx] (syntax-literal offset)) (erlang/+ 40 (literal))"))]
+                 ['client 'current])
+       offset (declaration-id program 'client 'offset 1)
+       macro (declaration-id program 'client 'literal 0)
+       graph (code/dependencies program)]
+  (is (= true (:entry-affected (code/impact program [offset]))))
+  (is (= true (:entry-affected (code/impact program [macro]))))
+  (is (empty? (:linked program)))
+  (is (some #(= :expansion (:kind %)) (:edges graph)))
+  (is (= false (get-in graph [:coverage :effects])))))
+
+(deftest one-original-declaration-collects-aliases-without-a-spelling-join
+ (let [program (x/program
+                 [(unit 'library 'old "(ns library) (defn answer [] 42)")
+                  (unit 'client 'current
+                    (str "(ns client) (import-world 'library 'old :as a :only [answer]) "
+                      "(import-world 'library 'old :as z :only [answer]) [(a/answer) (z/answer)]"))]
+                 ['client 'current])
+       id (declaration-id program 'library 'answer 0)
+       names (set (Enum/map (code/uses program id) #(:name %)))]
+  (is (contains? names 'a/answer))
+  (is (contains? names 'z/answer))
+  (is (= 1 (count (Enum/uniq (Enum/map (code/uses program id) #(get-in % [:reference :id]))))))))
+
+(deftest unmatched-anf-annotations-cannot-become-indexed-dependencies
+ (let [program (x/program [(unit 'client 'current "(ns client) (let [x 42] x)")] ['client 'current])
+       altered (assoc-in program [:node :body :ann :binding-reference :id] (crypto/hash :sha256 "foreign"))]
+  (is (= :phase-unindexed-reference
+          (try (code/dependencies altered) nil (catch error (:kind (ex-data error))))))))

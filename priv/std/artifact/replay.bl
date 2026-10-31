@@ -1,0 +1,380 @@
+;; A replay capsule is a bounded description of selected immutable test inputs.
+;; It is not a command executor, live runtime observation or admission grant.
+(ns artifact.replay)
+
+(def ^:private max-files 1024)
+(def ^:private max-file-bytes 16777216)
+(def ^:private max-total-bytes 67108864)
+(def ^:private max-tools 64)
+(def ^:private max-tool-bytes 268435456)
+(def ^:private max-total-tool-bytes 1073741824)
+(def ^:private chunk-bytes 65536)
+
+(defn- refuse! [message]
+  (throw (ex-info message {:kind :artifact-replay-input})))
+
+(defn- record! [input allowed required]
+  (when-not (map? input) (refuse! "Expected a replay record"))
+  (when (> (erlang/map_size input) (count allowed)) (refuse! "Replay record exceeds its closed schema"))
+  (let [record (reduce
+                 (fn [out key]
+                   (let [name (if (keyword? key) (Atom/to_string key) key)]
+                     (when-not (and (string? name) (contains? allowed name)
+                                    (not (contains? out name)))
+                       (refuse! "Unknown or duplicate replay field"))
+                     (assoc out name (get input key)))) {} (keys input))]
+    (doseq [key (sort required)]
+      (when-not (contains? record key) (refuse! (str "Missing replay field: " key))))
+    record))
+
+(defn- optional [record key fallback]
+  ;; Only absence selects a default: explicit false/null must reach validation.
+  (if (contains? record key) (get record key) fallback))
+
+(defn- projected-field [record key]
+  (let [atom (keyword key)]
+    (when (and (contains? record key) (contains? record atom))
+      (refuse! "Duplicate reproduction field"))
+    (if (contains? record key) (get record key) (get record atom))))
+
+(defn- text! [value limit]
+  (when-not (and (string? value) (> (erlang/byte_size value) 0)
+                 (<= (erlang/byte_size value) limit)
+                 (not (String/contains? value (erlang/list_to_binary (list 0)))))
+    (refuse! "Invalid replay text"))
+  value)
+
+(defn- digest! [value]
+  (text! value 64)
+  (when-not (Regex/match? #"^[0-9a-fA-F]{64}$" value) (refuse! "Expected a replay SHA256 identity"))
+  (String/downcase value))
+
+(defn- store! [value]
+  (text! value 4096)
+  (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+$" value)
+    (refuse! "Replay identities require immutable top-level store addresses"))
+  value)
+
+(defn- relative! [value root?]
+  (text! value 4096)
+  (when-not (or (and root? (= "." value))
+               (and (not= :absolute (Path/type value))
+                    (not (String/contains? value "\\"))
+                    (not (some #(contains? #{"" "." ".."} %) (String/split value "/")))))
+    (refuse! "Replay paths must remain inside their declared immutable root"))
+  value)
+
+(defn- items! [input limit]
+  (when-not (or (erlang/is_list input) (vector? input)) (refuse! "Expected a replay array"))
+  (let [items (Enum/take input (inc limit))]
+    (when (> (count items) limit) (refuse! "Replay array exceeds capacity"))
+    items))
+
+(defn- number! [value maximum]
+  (when-not (and (int? value) (<= 0 value) (<= value maximum)) (refuse! "Invalid replay count"))
+  value)
+
+(defn- hash-bytes [bytes]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+
+(defn- identities! [input]
+  (let [keys #{"sdk" "product" "source" "test-source"}
+        record (record! input keys keys)]
+    (into {} (Enum/map (sort keys) (fn [key] [key (store! (get record key))])))))
+
+(defn- runtime! [input]
+  (let [keys #{"compiler" "build" "loadedNative"} record (record! input keys keys)]
+    (into {} (Enum/map (sort keys) (fn [key] [key (digest! (get record key))])))))
+
+(defn- tool! [input]
+  (let [keys #{"name" "path" "sha256"} record (record! input keys keys)
+        name (text! (get record "name") 64)
+        path (text! (get record "path") 4096)
+        parts (String/split path "/")]
+    (when-not (Regex/match? #"^[A-Za-z0-9][A-Za-z0-9._+-]*$" name) (refuse! "Invalid replay tool name"))
+    (when-not (and (String/starts_with? path "/nix/store/") (> (count parts) 4))
+      (refuse! "Replay tools require a file in an immutable store object"))
+    (store! (str "/nix/store/" (nth parts 3)))
+    (relative! (Enum/join (Enum/drop parts 4) "/") false)
+    {"name" name "path" path "sha256" (digest! (get record "sha256"))}))
+
+(defn- tools! [input]
+  (let [tools (Enum/map (items! input max-tools) tool!) names (Enum/map tools #(get % "name"))]
+    (when-not (= (count names) (count (distinct names))) (refuse! "Duplicate replay tool name"))
+    (Enum/sort_by tools #(get % "name"))))
+
+(defn- test-path! [path]
+  (relative! path false)
+  (when-not (or (String/ends_with? path ".bl") (String/ends_with? path ".bl.md")
+                 (String/ends_with? path ".bl.org") (String/ends_with? path "_test.exs"))
+    (refuse! "Replay selection must name explicit supported test files"))
+  path)
+
+(defn- file-row! [input]
+  (let [keys #{"path" "role" "sha256" "bytes" "executable"}
+        record (record! input keys keys) role (get record "role")]
+    (when-not (contains? #{"test" "input"} role) (refuse! "Invalid replay input role"))
+    (when-not (contains? #{true false} (get record "executable")) (refuse! "Invalid replay executable bit"))
+    {"path" (if (= role "test") (test-path! (get record "path")) (relative! (get record "path") false)) "role" role
+     "sha256" (digest! (get record "sha256"))
+     "bytes" (number! (get record "bytes") max-file-bytes)
+     "executable" (get record "executable")}))
+
+(defn- files! [input]
+  (let [files (Enum/map (items! input max-files) file-row!) paths (Enum/map files #(get % "path"))]
+    (when (empty? (filter #(= "test" (get % "role")) files)) (refuse! "Replay requires an explicit nonempty test selection"))
+    (when-not (= (count paths) (count (distinct paths))) (refuse! "Duplicate replay input path"))
+    (when (> (reduce + 0 (Enum/map files #(get % "bytes"))) max-total-bytes)
+      (refuse! "Replay input bytes exceed capacity"))
+    (Enum/sort_by files #(get % "path"))))
+
+(defn- identity-files! [input]
+  (let [files (Enum/map (items! input 2)
+                (fn [row]
+                  (let [keys #{"identity" "sha256" "bytes"} row (record! row keys keys)]
+                    (when-not (contains? #{"sdk" "product"} (get row "identity"))
+                      (refuse! "Invalid replay identity-file owner"))
+                    {"identity" (get row "identity") "sha256" (digest! (get row "sha256"))
+                     "bytes" (number! (get row "bytes") max-file-bytes)})))
+        names (Enum/map files #(get % "identity"))]
+    (when-not (= (sort names) (list "product" "sdk")) (refuse! "Replay must bind both product and SDK descriptors"))
+    (Enum/sort_by files #(get % "identity"))))
+
+(defn- reproduction! [input identities runtime]
+  (when-not (nil? input)
+    (let [keys #{"version" "kind" "output" "source" "derivation" "compiler" "loadedNative" "qualification"}
+          record (record! input keys keys)]
+      (when-not (and (= 1 (get record "version")) (= "artifact-capsule" (get record "kind"))
+                     (= (get identities "product") (store! (get record "output")))
+                     (= (get identities "source") (store! (get record "source")))
+                     (= (get runtime "compiler") (digest! (get record "compiler")))
+                     (= (get runtime "loadedNative") (digest! (get record "loadedNative"))))
+        (refuse! "Reproduction descriptor disagrees with replay identities"))
+      (text! (get record "derivation") 4096)
+      (when-not (Regex/match? #"^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+[.]drv$" (get record "derivation"))
+        (refuse! "Invalid recorded derivation"))
+      (when-not (= "not-recorded" (get record "qualification"))
+        (refuse! "Legacy reproduction qualification is not a replay outcome receipt"))
+      (assoc record "compiler" (digest! (get record "compiler"))
+                    "loadedNative" (digest! (get record "loadedNative"))))))
+
+(defn- outcome! [input binding]
+  (when-not (nil? input)
+    (let [keys #{"binding" "status" "tests" "pass" "fail" "error" "exit" "receiptDigest"}
+          row (record! input keys keys) status (get row "status")
+          _ (when-not (= binding (digest! (get row "binding"))) (refuse! "Outcome belongs to different replay inputs"))
+          tests (number! (get row "tests") 1000000)
+          passed (number! (get row "pass") 10000000)
+          failed (number! (get row "fail") 10000000)
+          errors (number! (get row "error") 10000000)
+          exit (number! (get row "exit") 255)]
+      (when-not (contains? #{"passed" "failed" "error" "cancelled" "incomplete"} status)
+        (refuse! "Invalid recorded replay outcome"))
+      (when (and (= status "passed") (or (= tests 0) (> failed 0) (> errors 0) (not= exit 0)))
+        (refuse! "Recorded passing outcome contradicts its counts"))
+      (when (and (contains? #{"failed" "error"} status) (= failed 0) (= errors 0) (= exit 0))
+        (refuse! "Recorded failed outcome has no failure observation"))
+      (assoc row "binding" binding "tests" tests "pass" passed "fail" failed "error" errors
+                 "exit" exit "receiptDigest" (digest! (get row "receiptDigest"))))))
+
+(defn- qualification! [input binding]
+  (when-not (nil? input)
+    (let [keys #{"binding" "status" "scope" "receiptDigest"} row (record! input keys keys)]
+      (when-not (and (= binding (digest! (get row "binding")))
+                     (= "selected-tests-only" (get row "scope"))
+                     (contains? #{"passed" "failed" "incomplete"} (get row "status")))
+        (refuse! "Invalid selected-test qualification attachment"))
+      (assoc row "binding" binding "receiptDigest" (digest! (get row "receiptDigest"))))))
+
+(defn- command-argv [identities files]
+  (cons "test" (Enum/map (filter #(= "test" (get % "role")) files)
+                 #(Path/join (get identities "test-source") (get % "path")))))
+
+(defn- binding-of [identities cwd files identity-files runtime tools reproduction]
+  ;; Lists of fixed-position scalars avoid dependence on map enumeration order.
+  (hash-bytes (Jason/encode!
+    (list (Enum/map ["sdk" "product" "source" "test-source"] #(get identities %)) cwd
+          (Enum/map files (fn [row] (Enum/map ["path" "role" "sha256" "bytes" "executable"] #(get row %))))
+          (Enum/map identity-files (fn [row] (Enum/map ["identity" "sha256" "bytes"] #(get row %))))
+          (Enum/map ["compiler" "build" "loadedNative"] #(get runtime %))
+          (Enum/map tools (fn [row] (Enum/map ["name" "path" "sha256"] #(get row %))))
+          (when reproduction (Enum/map ["version" "kind" "output" "source" "derivation" "compiler" "loadedNative" "qualification"]
+                               #(get reproduction %)))))))
+
+(defn validate
+  "Validate and normalize replay DATA only. File/runtime verification and live
+   execution admission remain distinct. Unknown fields never become commands."
+  [input]
+  (let [keys #{"version" "kind" "authority" "selection" "identities" "cwd" "argv" "files"
+               "identity-files" "runtime" "tools" "reproduction" "binding" "outcome" "qualification"}
+        record (record! input keys keys)
+        _ (when-not (and (= 1 (get record "version")) (= "artifact-test-replay" (get record "kind"))
+                         (= "none" (get record "authority")) (= "files" (get record "selection")))
+            (refuse! "Unsupported replay capsule"))
+        identities (identities! (get record "identities")) cwd (relative! (get record "cwd") true)
+        files (files! (get record "files")) identity-files (identity-files! (get record "identity-files"))
+        runtime (runtime! (get record "runtime")) tools (tools! (get record "tools"))
+        reproduction (reproduction! (get record "reproduction") identities runtime)
+        argv (command-argv identities files)
+        supplied-argv (items! (get record "argv") (inc max-files))
+        _ (when-not (= argv supplied-argv) (refuse! "Replay argv differs from the exact selected test files"))
+        binding (binding-of identities cwd files identity-files runtime tools reproduction)
+        _ (when-not (= binding (digest! (get record "binding"))) (refuse! "Replay capsule input binding changed"))
+        outcome (outcome! (get record "outcome") binding)
+        qualification (qualification! (get record "qualification") binding)
+        _ (when (and qualification (= "passed" (get qualification "status"))
+                     (not= "passed" (get outcome "status")))
+            (refuse! "Passing selected-test qualification requires its passing outcome attachment"))]
+    {"version" 1 "kind" "artifact-test-replay" "authority" "none" "selection" "files"
+     "identities" identities "cwd" cwd "argv" argv "files" files "identity-files" identity-files
+     "runtime" runtime "tools" tools "reproduction" reproduction "binding" binding
+     "outcome" outcome "qualification" qualification}))
+
+(defn- root! [path]
+  (store! path)
+  (when-not (= :directory (:type (File/lstat! path))) (refuse! "Replay identity root is missing or linked"))
+  path)
+
+(defn- member! [root relative directory?]
+  (root! root)
+  (let [relative (relative! relative directory?) parts (if (= relative ".") [] (String/split relative "/"))]
+    (loop [current root remaining (seq parts)]
+      (if (nil? remaining) current
+        (let [candidate (Path/join current (first remaining)) info (File/lstat! candidate)
+              expected (if (or (next remaining) directory?) :directory :regular)]
+          (when-not (= expected (:type info)) (refuse! "Replay input is missing, linked or has the wrong file type"))
+          (recur candidate (next remaining)))))))
+
+(defn- file-facts! [path remaining limit]
+  (let [info (File/lstat! path)]
+    (when-not (= :regular (:type info)) (refuse! "Replay hashing requires a regular file"))
+    (when (> (:size info) (min limit remaining)) (refuse! "Replay input bytes exceed capacity"))
+    (let [file (File/open! path (list :read :binary))]
+      (try
+        (loop [hash (crypto/hash_init :sha256) bytes 0]
+          (let [chunk (IO/binread file chunk-bytes)]
+            (if (= :eof chunk)
+              (do
+                (when-not (= bytes (:size info)) (refuse! "Replay input size changed during hashing"))
+                {"sha256" (String/downcase (Base/encode16 (crypto/hash_final hash))) "bytes" bytes
+               "executable" (not= 0 (erlang/band (:mode info) 73))})
+              (do
+                (when-not (string? chunk) (refuse! "Replay input could not be read"))
+                (let [size (+ bytes (erlang/byte_size chunk))]
+                  (when (> size (min limit remaining)) (refuse! "Replay input grew beyond capacity"))
+                  (recur (crypto/hash_update hash chunk) size))))))
+        (finally (File/close file))))))
+
+(defn- check-tool-files! [tools]
+  (reduce
+    (fn [remaining tool]
+      (let [parts (String/split (get tool "path") "/")
+            root (str "/nix/store/" (nth parts 3))
+            member (Enum/join (Enum/drop parts 4) "/")
+            facts (file-facts! (member! root member false) remaining max-tool-bytes)]
+        (when-not (and (get facts "executable") (= (get tool "sha256") (get facts "sha256")))
+          (refuse! "Required replay tool is not executable or its bytes changed"))
+        (- remaining (get facts "bytes")))) max-total-tool-bytes tools))
+
+(defn- project-reproduction! [input]
+  (when-not (nil? input)
+    (when-not (map? input) (refuse! "Invalid reproduction descriptor"))
+    (let [wrapped? (or (contains? input :descriptor) (contains? input "descriptor"))
+          wrapper (when wrapped? (record! input #{"directory" "descriptor"} #{"descriptor"}))
+          keys #{"version" "kind" "request" "manifest" "output" "derivation"
+                 "compiler" "loadedNative" "qualification"}
+          descriptor (record! (if wrapped? (get wrapper "descriptor") input) keys keys)
+          request (get descriptor "request") manifest (get descriptor "manifest")
+          _ (when-not (and (map? request) (map? manifest)) (refuse! "Invalid reproduction identity records"))
+          request-source (projected-field request "source")
+          manifest-source (projected-field manifest "source")
+          _ (when (and (not (nil? request-source)) (not (nil? manifest-source))
+                       (not= request-source manifest-source))
+              (refuse! "Reproduction source identities disagree"))]
+      ;; Raw request/manifest fields are never copied into the capsule.
+      {"version" (get descriptor "version") "kind" (get descriptor "kind")
+       "output" (get descriptor "output")
+       "source" (if (nil? request-source) manifest-source request-source)
+       "derivation" (get descriptor "derivation") "compiler" (get descriptor "compiler")
+       "loadedNative" (get descriptor "loadedNative") "qualification" (get descriptor "qualification")})))
+
+(defn capture!
+  "Hash selected immutable inputs and construct replay DATA. No test, Nix,
+   package loading or external tool runs. Caller owns durable publication."
+  [options]
+  (let [allowed #{"sdk" "product" "source" "test-source" "cwd" "tests" "inputs" "runtime" "tools" "reproduction"}
+        opts (record! options allowed #{"sdk" "product" "source" "tests" "runtime"})
+        identities (identities! {"sdk" (get opts "sdk") "product" (get opts "product") "source" (get opts "source")
+                                 "test-source" (optional opts "test-source" (get opts "source"))})
+        _ (doseq [path (vals identities)] (root! path))
+        cwd (relative! (optional opts "cwd" ".") true)
+        _ (member! (get identities "test-source") cwd true)
+        tests (Enum/map (items! (get opts "tests") max-files) test-path!)
+        inputs (Enum/map (items! (optional opts "inputs" []) max-files) #(relative! % false))
+        selected (concat (Enum/map tests (fn [path] {"path" path "role" "test"}))
+                         (Enum/map inputs (fn [path] {"path" path "role" "input"})))
+        _ (when (empty? tests) (refuse! "Replay requires an explicit nonempty test selection"))
+        _ (when (> (count selected) max-files) (refuse! "Too many selected replay inputs"))
+        _ (when-not (= (count selected) (count (distinct (Enum/map selected #(get % "path")))))
+            (refuse! "Duplicate replay input path"))
+        state (reduce (fn [[rows remaining] row]
+                        (let [facts (file-facts! (member! (get identities "test-source") (get row "path") false) remaining max-file-bytes)]
+                          [(conj rows (merge row facts)) (- remaining (get facts "bytes"))]))
+                      [[] max-total-bytes] (sort-by #(get % "path") selected))
+        files (files! (first state))
+        identity-files (identity-files! (Enum/map ["sdk" "product"]
+                                         (fn [owner]
+                                           (let [facts (file-facts! (member! (get identities owner) "artifact.json" false) max-file-bytes max-file-bytes)]
+                                             {"identity" owner "sha256" (get facts "sha256") "bytes" (get facts "bytes")}))))
+        runtime (runtime! (get opts "runtime")) tools (tools! (optional opts "tools" []))
+        _ (check-tool-files! tools)
+        reproduction (reproduction! (project-reproduction! (get opts "reproduction")) identities runtime)
+        binding (binding-of identities cwd files identity-files runtime tools reproduction)]
+    (validate {"version" 1 "kind" "artifact-test-replay" "authority" "none" "selection" "files"
+               "identities" identities "cwd" cwd "argv" (command-argv identities files) "files" files
+               "identity-files" identity-files "runtime" runtime "tools" tools "reproduction" reproduction
+               "binding" binding "outcome" nil "qualification" nil})))
+
+(defn attach-outcome [capsule receipt]
+  "Attach a bounded caller-reported outcome bound to the exact selected inputs."
+  (when (nil? receipt) (refuse! "An outcome attachment must contain its receipt"))
+  (let [capsule (validate capsule)]
+    (validate (assoc capsule "outcome" (outcome! receipt (get capsule "binding"))))))
+
+(defn attach-qualification [capsule receipt]
+  "Attach a selected-test qualification observation; this never grants admission."
+  (when (nil? receipt) (refuse! "A qualification attachment must contain its receipt"))
+  (let [capsule (validate capsule)]
+    (validate (assoc capsule "qualification" (qualification! receipt (get capsule "binding"))))))
+
+(defn plan!
+  "Recheck immutable files and required supplied observations, then return test
+   admission DATA. The caller still observes live runtime and admits execution."
+  [input observed]
+  (let [capsule (validate input) identities (get capsule "identities")
+        observed (record! observed #{"sdk" "runtime" "tools"} #{"sdk" "runtime" "tools"})
+        _ (when-not (= (get identities "sdk") (store! (get observed "sdk"))) (refuse! "Observed SDK differs from replay SDK"))
+        _ (when-not (= (get capsule "runtime") (runtime! (get observed "runtime"))) (refuse! "Required replay runtime identity changed"))
+        actual-tools (tools! (get observed "tools")) by-name (into {} (Enum/map actual-tools (fn [row] [(get row "name") row])))
+        _ (doseq [tool (get capsule "tools")]
+            (when-not (= tool (get by-name (get tool "name"))) (refuse! "Required replay tool identity is missing or changed")))
+        _ (check-tool-files! (get capsule "tools"))
+        _ (doseq [path (vals identities)] (root! path))
+        _ (member! (get identities "test-source") (get capsule "cwd") true)
+        _ (reduce (fn [remaining row]
+                    (let [facts (file-facts! (member! (get identities "test-source") (get row "path") false) remaining max-file-bytes)]
+                      (when-not (= facts (select-keys row ["sha256" "bytes" "executable"]))
+                        (refuse! "Selected replay input changed"))
+                      (- remaining (get facts "bytes")))) max-total-bytes (get capsule "files"))
+        _ (doseq [row (get capsule "identity-files")]
+            (let [facts (file-facts! (member! (get identities (get row "identity")) "artifact.json" false) max-file-bytes max-file-bytes)]
+              (when-not (and (= (get row "sha256") (get facts "sha256")) (= (get row "bytes") (get facts "bytes")))
+                (refuse! "Replay product or SDK descriptor changed"))))]
+    {"version" 1 "kind" "test-admission-plan" "authority" "none" "status" "admission-required"
+     "binding" (get capsule "binding") "sdk" (get identities "sdk") "product" (get identities "product")
+     "source" (get identities "source") "test-source" (get identities "test-source")
+     "cwd" (Path/expand (get capsule "cwd") (get identities "test-source"))
+     "argv" (get capsule "argv") "runtime" (get capsule "runtime") "tools" (get capsule "tools")
+     "coverage" "selected-test-and-declared-input-files"
+     "mutable-state" "not-captured" "environment" "not-captured"
+     "recorded-outcome" (get capsule "outcome") "recorded-qualification" (get capsule "qualification")}))

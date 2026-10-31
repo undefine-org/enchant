@@ -1,0 +1,126 @@
+#+title: Incremental sealed SDK prototype
+
+Historical experiment: the executable prototype was removed during the
+production cutover. The production producer is priv/build/unit-store.bl,
+selected by nix/bl-drop.nix. Full SDK mutation qualification uses
+test/scripts/incremental_sdk_production.py. The evidence below records the
+earlier isolated experiment and its original implementation paths.
+
+This opt-in prototype changes the reuse boundary from a complete SDK snapshot
+to a compiled unit's captured Source inputs. It runs genuine serial Nix/KVM
+workers, reuses a retained qualified compiler and dependency product, and
+assembles a sealed, source-free SDK fragment through AOT.write_sdk_inventory!.
+The production checkout launcher and release recipes are unchanged.
+
+* Run
+
+Select an existing retained SDK (a top-level Nix store product with
+artifact.json). No compiler bootstrap or cold full SDK build is needed.
+
+#+begin_src sh
+scripts/bl-mem
+systemd-run --user --collect --wait --pipe \
+  --property=MemoryMax=2G --property=MemorySwapMax=0 \
+  --property=RuntimeMaxSec=1800 --working-directory="$PWD" \
+  python3 test/scripts/incremental_sdk_prototype.py \
+  --sdk /nix/store/EXISTING-beam-lisp-sdk-selection \
+  --out .local/incremental-sdk-experiment
+#+end_src
+
+The output directory must be absent. It retains immutable products through GC
+roots, inputs, worker logs, cold consumer logs and result.json. Each Nix worker
+has 4 GiB RAM, no swap, four CPUs and a finite 16 GiB scratch disk. Workers and
+receivers run serially. The harness starts no persistent checkout realm.
+
+* What the experiment checks
+
+| Change                         | Compiled                       | Restored                     |
+|--------------------------------+--------------------------------+------------------------------|
+| Initial four-unit fragment     | provider, consumer, unrelated, errors | none                  |
+| Identical Source, fresh worker | none                           | all four                     |
+| Macro provider value 40 -> 50  | provider and macro consumer    | unrelated and errors         |
+| Add an exported fn to errors.bl| errors                         | three fixture units          |
+| Delete unrelated Source        | none                           | remaining three              |
+
+Each stage boots an empty-cache, source-free receiving image. A newly compiled
+application expression expands the packaged SDK macro and observes 42 before
+the edit and 52 after it. Another new application expression calls the newly
+exported errors function and observes 73. SDK loading performs zero legacy
+compile_file calls. Restored unit directories must match their predecessor
+byte for byte; removed units must have no output BEAM.
+
+Before compilation and after the edits, Nix evaluation checks that compiler
+and dependency identities equal the baseline. A changed host compiler Source
+must refuse reuse and request a newly qualified compiler. An independent Nix
+derivation with identical compilation inputs reproduces the initial fragment;
+the harness compares every output byte and link. An unused derivation parameter
+forces that separate realization, since distributed Nix check-mode is not
+available through every configured daemon. It never enters emitted artifacts.
+
+* Measured evidence, 2026-10-30
+
+The complete run passed in 99 seconds. All five measured production stages
+used fresh remote workers, rather than cached Nix realizations. The independent
+reproduction also ran and matched the initial product byte for byte.
+
+| Stage             | Compiled | Restored | Worker seconds | Realization seconds |
+|-------------------+----------+----------+----------------+---------------------|
+| Initial           |        4 |        0 |          3.224 |              14.794 |
+| Unchanged         |        0 |        4 |          1.886 |              13.889 |
+| Macro edit        |        2 |        2 |          2.935 |              15.043 |
+| Real library edit |        1 |        3 |          2.743 |              14.743 |
+| Deletion          |        0 |        3 |          1.705 |              13.543 |
+
+Worker time excludes initial boot/source capture; realization time includes
+the complete Nix request, VM startup, production and transfer. Five fresh
+receivers passed, including execution of the edited errors function by new
+application Source. Compiler/dependency identity checks and the changed
+compiler refusal passed. These timings measure the selected fragment, not the
+entire SDK. See evidence.json for product identities, compiler call counts and
+the hashes of the exact prototype implementation. Raw logs and GC roots remain
+in .local/incremental-sdk-prototype-7/.
+
+* Implementation
+
+- nix/incremental-sdk-prototype.nix pins the qualified baseline compiler and
+  dependencies. A conservative input guard checks boot, host, build, bootstrap,
+  multi, env.bl and bl.lock against the baseline's captured engine Source.
+  Changed compiler/driver/dependency inputs refuse this prototype path.
+- Only explicitly selected files are overlaid on the baseline Source. Other
+  SDK inputs come from the immutable baseline, so an omitted mutable edit
+  cannot affect a compilation accidentally.
+- scripts/incremental-sdk-worker.exs indexes each unit by the namespaces and
+  content digests actually captured by its constructor. Every recorded
+  namespace is re-resolved and rehashed in the next frozen source world.
+- Restoration calls the existing AOT.verify_unit and checks that its actual
+  input manifest agrees with the reuse index. New units use open_workspace,
+  prepare_unit and emit_unit. Compiler call counts are traced independently.
+- The previous product is an explicit Nix store dependency. Each worker has
+  an empty private cache. There is no shared writable compiler cache.
+- AOT.write_sdk_inventory! seals the assembled modules. Omitted units never
+  enter the new inventory. Only floor and selected-unit BEAMs enter the image;
+  its SDK Source is removed before publication.
+- Timing stays in Nix logs, outside the immutable output. The evidence report
+  distinguishes fresh workers from Nix hits, and reports worker time separately
+  from realization time (which includes VM startup, assembly and transfer).
+
+* Scope and next integration
+
+This proves a selected four-unit SDK fragment, including the real errors.bl
+library and real macro execution by an application. It does not qualify the
+entire 491-unit SDK, ordinary application CLI packaging, or Rust compilation.
+Its result deliberately has kind incremental-sdk-fragment and is not installed
+as a production SDK. Compiler changes are refused; this prototype does not
+regenerate the replacement compiler.
+
+The narrow compiler guard is conservative and the unit-input checks are
+content-based. They do not attempt interface-only reuse: a changed provider
+that the constructor read invalidates that unit even if a narrower interface
+analysis could prove reuse safe.
+
+Production integration should export this unit index during the existing SDK
+build, import it as an optional immutable predecessor, and retain the existing
+inventory/sealing and compiler qualification gates. The compiler/dependency
+recipes then need their own precise input closures; pinning an existing
+qualified baseline is the prototype's way to demonstrate that boundary
+without an emergency rewrite of bootstrap production.

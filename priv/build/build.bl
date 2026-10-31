@@ -1,3 +1,5 @@
+; Managed build/run prepares Nix application products. The compiler contract
+; below belongs to produce!, used inside the trusted Nix compiler/SDK workers.
 ; build/build.bl — the AOT build, as a program.
 ;
 ; What `mix compile.beam_lisp` and `bl build` do, in the language, so the
@@ -9,7 +11,7 @@
 ;
 ; ── Contract ────────────────────────────────────────────────────────────────
 ;
-;   (run {:sources [paths]              every source: .bl, .bl.md, .bl.org
+;   (produce! {:sources [paths]              every source: .bl, .bl.md, .bl.org
 ;         :exclude [paths]               sources this run must NEVER compile:
 ;                                        entry programs whose top-level forms
 ;                                        run on load. A path is a FILE (exact)
@@ -24,6 +26,9 @@
 ;         :ex {:root "lib"               compile a project's Elixir sources too
 ;              :exclude ["dev" "mix"]}     (RELATIVE TO :root); nil = skip the stage
 ;         :force? bool                   rebuild everything
+;         :sdk-artifacts? bool           prepare verified SDK units without
+;                                       publishing targets or running their initializers;
+;                                       requires the actual SDK :root
 ;         :jobs n                        parallel width per wave
 ;         :log (fn [msg])                progress lines (nil = silent)})
 ;   → {:built n :errors [msg …] :manifest {path → entry}}
@@ -110,17 +115,39 @@
             [substrate :as sub]
             [drop :as d]
             [store :as st]
+            [sdk-source-selection :as selection]
             [claim :as c]))
 
 ; ── manifest ─────────────────────────────────────────────────────────────────
 
 (defn namespace-sources
-  "Named namespace units under a tier root. Source fragments are evaluated by
+  "BEAM namespace units under a tier root. Native JavaScript declarations stay
+   as source for their target. Source fragments are evaluated by
    their caller in its chosen namespace; compiling them as `user` would give
    unrelated fragments the same physical output modules."
   [root]
   (Enum/filter (BeamLisp.Tiers/sources root)
-    (fn [path] (string? (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))))))
+    (fn [path] (selection/beam-source? (BeamLisp.Loader/read_source path) path))))
+
+(defn assemble-outputs!
+  "Copy complete verified producer units into a disposable release tree.
+   Verify the bytes being copied against the completed build facts; do not
+   load modules, run initializers, or rewrite the persistent originals."
+  [manifest outputs destination]
+  (File/mkdir_p! destination)
+  (doseq [[source entry] manifest]
+    (let [hashes (into {} (:digests entry))
+          names (blog/module-names (:modules entry))]
+      (when-not (= (count names) (count hashes))
+        (throw (ex-info "Incomplete persistent unit hashes" {:source source})))
+      (doseq [name names]
+        (let [file (str name ".beam")
+              bytes (File/read! (Path/join outputs file))
+              digest (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes)))]
+          (when-not (= digest (get hashes name))
+            (throw (ex-info "Persistent unit changed before assembly" {:source source :module name})))
+          (File/write! (Path/join destination file) bytes)))))
+  (count manifest))
 
 (defn write-precompiled-index!
   "Index complete compiled units by their compiler and source keys. Names are
@@ -243,48 +270,38 @@
          (thunk))))
 
 (defn- build-one-unfenced
-  "Compile `path` (or link it from the shared cache) into `out`.
-   → {:path :key :tkey :closure-key :cached? :result} where result is
-   [:ok modules] or [:error msg].
-
-   Runs in a WORKER process (pmap-ordered). Everything it returns is fully
-   realised before it is sent back: a lazy seq's thunk is a closure over
-   the worker's stack and would be forced in the parent after the worker
-   exited — a `map` here must be `mapv`, and `mods` a vector."
-  [path key tkey cache-key closure-key out log]
+  [path key tkey closure-key out log prepared syntax?]
   (when log (log (str "  " path)))
-  (let [cached (if closure-key (BeamLisp.AOTCache/fetch cache-key closure-key out) :miss)
-        ; fetch → {:ok modules} | :miss
-        hit? (and (erlang/is_tuple cached) (= :ok (erlang/element 1 cached)))
-        result (try
-                 (if hit?
-                   (let [mods (erlang/element 2 cached)
-                         ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))]
-                     ; Adopt the complete unit through the runtime's native
-                     ; loader: SDK ownership must exist BEFORE init can call
-                     ; another compiled SDK producer (notably vm.native).
-                     (if ns
-                       (BeamLisp.Loader/with_load_path (Path/dirname path)
-                         (fn [] (BeamLisp.AOT/load_cached_entry ns mods out out)))
-                       ; A bare script owns no SDK namespace to register.
-                       (BeamLisp.AOTCache/run_init_modules mods out))
-                     [:ok (vec mods)])
+  (let [result (try
+                 (if (:preparation-error prepared)
+                  [:error (str "beam-lisp AOT: " path ": " (:preparation-error prepared))]
+                 (if prepared
+                   [:ok (vec (BeamLisp.AOTCache/restore_prepared prepared out))]
                    (let [mods (retry-after-settle
-                               (fn [] (BeamLisp.AOT/compile_file path (list (erlang/list_to_tuple (list :output_dir out))
-                                                              (erlang/list_to_tuple (list :mark_loaded? true))))))]
-                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (erlang/element 1 m))))]))
-                   (catch e
-                     [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))]
-    {:path path :key key :tkey tkey :closure-key closure-key :cached? hit? :result result}))
+                               (fn [] (BeamLisp.AOT/compile_file path
+                                        (list (tuple :output_dir out) (tuple :mark_loaded? true)))))]
+                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (elem m 0))))])))
+                 (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))]
+    {:path path :key key :tkey tkey :closure-key closure-key
+     :cached? (and (some? prepared) (not (:new-artifact? prepared))) :result result
+     :replay? (or syntax? (and (= :ok (first result))
+                         (BeamLisp.AOTCache/output_replay_complete? (to-list (second result)) out)))}))
 
-(defn- build-one [path key tkey cache-key closure-key out log]
-  ;; Definitions and SDK receipts share one VM-wide publication generation.
-  ;; Another unit publishing while a declaration is checked makes a valid
-  ;; provider look unavailable. Keep each unit's publication/initialization
-  ;; together; immutable cache entries still avoid source compilation.
-  (global/trans (tuple :bl_build_unit_publication (erlang/self))
-    (fn [] (build-one-unfenced path key tkey cache-key closure-key out log))
-    (list (erlang/node))))
+(defn- prepare-one [path key tkey cache-key closure-key out log]
+  (let [syntax? (or (toolchain-source? path (BeamLisp.Tiers/priv_root))
+                    (BeamLisp.Loader/replayable_source? (BeamLisp.Loader/read_source path)))
+        candidate (when cache-key (BeamLisp.AOTCache/prepare_fetch cache-key closure-key key))
+        cached (when (and candidate (or syntax? (BeamLisp.AOTCache/prepared_replay_complete? candidate))) candidate)]
+    {:path path :key key :tkey tkey :closure-key closure-key :out out :log log
+     :prepared cached :syntax? syntax?}))
+
+(defn- publish-one [input]
+  (let [run (fn [] (build-one-unfenced (:path input) (:key input) (:tkey input)
+                    (:closure-key input) (:out input) (:log input) (:prepared input) (:syntax? input)))
+        waiting (erlang/monotonic_time :microsecond)]
+    (global/trans (tuple :bl_build_unit_publication (erlang/self))
+      (fn [] (assoc (run) :lock-wait-us (- (erlang/monotonic_time :microsecond) waiting)))
+      (list (erlang/node)))))
 
 ; ── parallel wave ────────────────────────────────────────────────────────────
 
@@ -300,7 +317,7 @@
   "Map `f` over `xs` in parallel (at most `n` at once), results in order.
    Plain spawn/receive: one process per element in a chunk, each sending
    `[ref result]` back; collected in chunk order. A crash in `f` is
-   linked, so it surfaces as the build's own failure — `build-one` already
+   linked, so it surfaces as the build's own failure — the publisher already
    catches compile errors into a result, so a crash here is a real bug."
   [n f xs]
   (let [me (erlang/self)
@@ -384,10 +401,11 @@
 
 (defn- result-fact
   "The fact a finished source writes: what it is fresh under, or why it is not."
-  [r]
+  [r out]
   (let [[tag payload] (:result r) path (:path r)]
     (if (= tag :ok)
-      (blog/built-fact path (:key r) (:tkey r) payload (:cached? r))
+      (blog/built-fact path (:key r) (:tkey r) payload (:cached? r)
+                       (blog/artifact-digests out payload) (:preparation-key r))
       (blog/failed-fact path payload))))
 
 (defn- fold-results
@@ -397,7 +415,7 @@
    completed source — and both effects come from the ONE fact list, so what the
    log records and what the state believes cannot drift."
   [st results out log-path]
-  (let [facts (vec (map result-fact results))]
+  (let [facts (vec (map (fn [r] (result-fact r out)) results))]
     (blog/append! log-path facts)
     (reduce (fn [st r]
       (let [[tag payload] (:result r) path (:path r)
@@ -408,15 +426,16 @@
         (doseq [mod (remove (fn [m] (contains? names m)) (blog/module-names old))]
           (delete-beam out mod))
         (if (= tag :ok)
-          (do (when (and (:closure-key r) (not (:cached? r)))
+          (do (when (and (:closure-key r) (:replay? r) (not (:cached? r)))
                 ; Host cache ABI takes an Erlang list. A BL vector is not
                 ; Enumerable there; store's best-effort catch hid the mismatch.
-                (BeamLisp.AOTCache/store (:tkey r) (:closure-key r) out (to-list payload)))
+                (BeamLisp.AOTCache/store (:tkey r) (:closure-key r) out (to-list payload) (:key r)))
               (-> st
                   (assoc :built (inc (:built st)))
                   (update (if (:cached? r) :cached :compiled) inc)))
           (assoc st :errors (conj (vec (:errors st)) payload)))))
-      (assoc st :state (blog/apply-facts (:state st) facts))
+      (assoc st :state (blog/apply-facts (:state st) facts)
+                :lock-wait-us (+ (or (:lock-wait-us st) 0) (reduce + 0 (map :lock-wait-us results))))
       results)))
 
 (defn- source-key
@@ -449,17 +468,15 @@
 (defn- build-wave [wave jobs st p todo? cache? hashes out log-path log root]
   (let [state (:state st)
         paths (vec (map :path (filter (fn [n] (todo? state (:path n))) wave)))
-        results (pmap-ordered jobs (fn [path]
-                  (let [tkey (source-key root path)
-                        ; Library/application units use the runtime's replay
-                        ; rule. The boot/build toolchain has its own floor
-                        ; protocol (including the prelude's declaration DSL).
-                        cache-key (when (and cache?
-                                          (or (toolchain-source? path (or root (BeamLisp.Tiers/priv_root)))
-                                              (BeamLisp.Loader/replayable_source?
-                                                (BeamLisp.Loader/read_source path)))) tkey)]
-                    (build-one path (get (:key p) path) tkey cache-key
-                      (when cache-key (get (:key p) path)) out log))) paths)]
+        results (reduce
+                  (fn [acc window]
+                    (let [prepared (pmap-ordered jobs
+                                     (fn [path]
+                                       (let [tkey (source-key root path)]
+                                         (prepare-one path (get (:key p) path) tkey (when cache? tkey)
+                                           (when cache? (get (:key p) path)) out log))) window)]
+                      (into acc (pmap-ordered 1 publish-one prepared))))
+                  [] (chunks-of (max 1 jobs) paths))]
     (fold-results st results out log-path)))
 
 (defn- build-ordinary [waves jobs st p todo? cache? hashes out log-path log root]
@@ -629,24 +646,6 @@
   (first (filter (fn [p] (File/exists? p))
                  (map (fn [n] (Path/join dir n)) (cdylib-names crate)))))
 
-(defn- run-cargo
-  "Run `cargo ARGS` with `crate-dir` as its working directory, answering
-   `[output exit]`. A cargo that cannot be STARTED (not on PATH, not executable)
-   answers `[why 127]` — the shell's own `command not found` — so an absent
-   toolchain is an ordinary failed step the caller reports, not an exception it
-   must catch.
-
-   `System/cmd` and not `:os.cmd` because the EXIT STATUS is the thing that was
-   being thrown away (FUP-100). It also takes the working directory as an option
-   instead of a shell `cd`, so a path with a space is a path and not a word."
-  [args crate-dir]
-  (try
-    (let [r (System/cmd "cargo"
-                        (to-list args)
-                        (to-list [(tuple :cd crate-dir) (tuple :stderr_to_stdout true)]))]
-      [(elem r 0) (elem r 1)])
-    (catch e [(str "cargo could not be run: " (ex-message e)) 127])))
-
 (defn cargo-verdict
   "What a finished `cargo build` MEANS: `{:ok path}` or `{:error message}`. Pure
    in the run's `exit` and `output`, the `release-dir` cargo was told to write
@@ -682,124 +681,102 @@
                    "  invocation: " invocation "\n"
                    "  expected:   " expected)})))
 
+(defn- artifact-custody [dest] (c/artifact-scope dest))
+
 (defn- install-artifact!
-  "Install `src` at `dest` ATOMICALLY: copy beside it, then rename over it.
-
-   The rename is the whole point, and it is not a flourish. `bl build` runs in
-   the SAME VM that has these `.so` files mapped as NIFs. Copying straight over
-   the destination truncates it in place, and truncating a file that is mapped
-   executable makes the kernel drop the mapped PTEs across the truncated range,
-   so the next fault re-reads the NEW file. A relocated `.got` slot then reads
-   back as zero and the next call through it jumps to address 0 — which is the
-   SIGSEGV this build carried, and why it always landed in whichever crate had
-   just been installed.
-
-   `rename` gives the destination a DIFFERENT inode, so the running VM keeps its
-   mapping of the old one and nothing it is executing changes underneath it.
-   `BeamLisp.Native.build!` (`priv/std/vm/native.bl`) has always installed this
-   way; this is the same rule, in the build path that was missing it.
-
-   The temp name carries the OS pid because the rename destination is the same
-   for every caller and a leftover temp from a killed build must not be adopted.
-
-   Identical bytes are not re-installed. The store this copies FROM is
-   content-addressed, so a cache hit hands back the same file every run — and
-   the old code still rewrote 18 MB of `.so` and churned seven inodes to arrive
-   at the bytes that were already there. Size is compared first because a
-   changed crate almost always changes its artefact's length; only a matching
-   length pays for a digest."
+  "Publish under destination custody, replacing the inode atomically so mapped
+   NIF code keeps its old bytes. Identical bytes retain their inode. A unique
+   sibling temporary is removed on failure; rename errors must reach the caller."
   [src dest]
-  (File/mkdir_p! (Path/dirname dest))
-  (if (and (File/exists? dest)
-           (= (d/file-size src) (d/file-size dest))
-           (= (d/sha256-hex-of src 0 (d/file-size src))
-              (d/sha256-hex-of dest 0 (d/file-size dest))))
-    dest
-    (let [tmp (str dest ".tmp-" (erlang/apply :os :getpid (list)))]
-      (File/cp! src tmp)
-      (erlang/apply :file :rename
-                    (list (erlang/binary_to_list tmp) (erlang/binary_to_list dest))))))
+  (c/with-writer! (artifact-custody dest) "native artifact publication"
+    (fn []
+      (File/mkdir_p! (Path/dirname dest))
+      (if (and (File/regular? dest)
+               (= (d/file-size src) (d/file-size dest))
+               (= (d/sha256-hex-of src 0 (d/file-size src))
+                  (d/sha256-hex-of dest 0 (d/file-size dest))))
+        dest
+        (let [tmp (str dest ".tmp-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
+          (try
+            (File/cp! src tmp)
+            (File/rename! tmp dest)
+            dest
+            (finally (File/rm tmp))))))))
 
-(defn- native-one
-  "One crate: find the artefact its inputs name, or make it. Written as explicit
-   `assoc`s rather than a threading chain — a stage that reports counts should
-   not also be a puzzle about which arity of `update` it meant."
-  [acc crate-dir root log]
-  (let [crate (Path/basename crate-dir)
-        key (native-key crate-dir)
-        dir (Path/join (Path/join (native-root) key) crate)
-        ; The path comes from `vm.native`, never from a literal here. The
-        ; installer and the loader must not be able to name the artefact
-        ; differently — BUG-070 was precisely that: this expression spelled the
-        ; name bare while `BeamLisp.Native` asked for `.so`, and nothing
-        ; compared the two. The name is now spelled once per layer and the two
-        ; are checked against each other (`nif-artifact-name`).
-        dest (Path/join (Path/join root "priv/native") (nif-artifact-name crate))
-        found (cdylib-in (Path/join dir "release") crate)
-        holder (c/held-by dir)
-        _ (when (some? log) (log (str "beam-lisp native: " crate
-                                     (cond (some? found) " — cache"
-                                           (some? holder) " — held"
-                                           :else " — building"))))]
-    (cond
-      (some? found)
-      (do (install-artifact! found dest)
-          (when (some? log) (log (str "beam-lisp native: " crate " from cache")))
-          (assoc acc
-                 :cached (+ 1 (:cached acc))
-                 :artifacts (conj (:artifacts acc) dest)))
+(defn- native-one-nix [acc request root log]
+  (let [crate (:crate request)
+        destination (Path/join (Path/join root "priv/native") (nif-artifact-name crate))]
+    (try
+      (BeamLisp.Loader/ensure_loaded "artifact")
+      (let [product (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "artifact" "resolve-native!")
+                      (list (assoc request :platform (:platform (BeamLisp.Ns.Rt/invoke
+                                                   (BeamLisp.Env/fetch_exact! "artifact" "framework-context") (list))))))
+            library (:library product)
+            cached (c/with-writer! (artifact-custody destination) "immutable native selection"
+          (fn []
+            (File/mkdir_p! (Path/dirname destination))
+            (if (= (tuple :ok library) (File/read_link destination))
+              true
+              (let [temporary (str destination ".nix-" (c/owner-pid) "-" (erlang/unique_integer (list :positive)))]
+              (try
+                (File/ln_s! library temporary)
+                (File/rename! temporary destination)
+                false
+                (finally (File/rm temporary)))))))]
+        (when log (log (str "beam-lisp native: " crate " -> " library)))
+        (assoc acc (if cached :cached :built) (inc (get acc (if cached :cached :built)))
+                   :artifacts (conj (:artifacts acc) destination)))
+      (catch error
+        (assoc acc :errors (conj (:errors acc) (str "native: " crate " Nix preparation failed: " (ex-message error)
+                                                        (when-let [detail (:detail (ex-data error))] (str "\n" detail)))))))))
 
-      (some? holder)
-      ; LOUD, because this branch used to be silent: it logged nothing, added an
-      ; error nothing printed, and `bl build` still exited 0 — so a crate could
-      ; be skipped on every build and the only trace was a line in a returned
-      ; map. `wry_webview` takes this branch on a machine whose claim is held by
-      ; a live pid, and the summary said nothing about it.
-      (do (when (some? log)
-            (log (str "beam-lisp native: " crate " SKIPPED — held by pid "
-                      (:pid holder) " (" (:bin holder) "); nothing was installed"
-                      " as priv/native/" (nif-artifact-name crate))))
-          (assoc acc :errors (conj (:errors acc)
-                                   (str "native: " crate " is being built by pid "
-                                        (:pid holder)))))
+(defn- native-one [acc request root log]
+  (if (= "nix" (or (erlang/apply :Elixir.System :get_env (list "BL_NATIVE_PROVIDER")) "nix"))
+    (native-one-nix acc request root log)
+    (assoc acc :errors (conj (:errors acc) "Native production requires Nix; local providers are unsupported"))))
 
-      :else
-      (do
-        (c/acquire! dir crate)
-        (try
-          (File/mkdir_p! dir)
-          ; `--target-dir dir` is not decoration: it is what puts the artefact
-          ; where the key looked for it, so the invocation and the search must
-          ; agree or nothing is ever found. Built ONCE, passed to both.
-          (let [release (Path/join dir "release")
-                args ["build" "--release" "--target-dir" dir]
-                invocation (str "cargo " (join " " args) "  (in " crate-dir ")")
-                [output exit] (run-cargo args crate-dir)
-                verdict (cargo-verdict crate release exit output invocation)]
-            (if (:error verdict)
-              ; The verdict goes to `:errors` and NOWHERE else: the caller
-              ; prints that list, so logging it here as well printed it twice.
-              (assoc acc :errors (conj (:errors acc) (:error verdict)))
-              (do
-                (install-artifact! (:ok verdict) dest)
-                (when (some? log) (log (str "beam-lisp native: " crate " built")))
-                (assoc acc
-                       :built (+ 1 (:built acc))
-                       :artifacts (conj (:artifacts acc) dest)))))
-          (finally (c/release! dir)))))))
+(defn- project-native-declarations [root]
+  (if (File/regular? (Path/join (Path/expand root) "env.bl"))
+    (do
+      (BeamLisp.Loader/ensure_loaded "bl.env")
+      (let [project (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "bl.env" "project") (list root))]
+        (when (seq (:errors project))
+          (throw (ex-info "Invalid project native configuration" {:errors (:errors project)})))
+        (get-in project [:build :native])))
+    nil))
+
+(defn- discover-native! [root declarations]
+  ;; The build driver cannot statically depend on an ordinary library. Resolve
+  ;; the shared declaration parser when native preparation is actually needed.
+  (BeamLisp.Loader/ensure_loaded "bl.native-declarations")
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "bl.native-declarations" "discover!")
+    (list root declarations)))
+
+(defn build-native-crate
+  "Prepare one declared publication alias through the normal Nix producer."
+  [root crate log]
+  (when (or (not (string? crate)) (= "" crate) (contains? #{"." ".."} crate)
+            (not= crate (Path/basename crate)) (= :absolute (Path/type crate)))
+    (throw (ex-info "Native crate must be one directory name" {:kind :native-crate-scope :crate crate})))
+  (let [root (Path/expand root)
+        request (first (filter (fn [request] (= crate (:crate request)))
+                         (discover-native! root (project-native-declarations root))))]
+    (when-not request
+      (throw (ex-info "Native crate declaration is absent" {:kind :native-crate-missing :crate crate})))
+    (native-one {:built 0 :cached 0 :artifacts [] :errors []} request root log)))
 
 (defn build-native
-  "Build (or find) every crate's artefact and install it at
-   `priv/native/<crate>.so` — the name the NIF loader asks for.
-   Returns `{:built n :cached n :artifacts [path …] :errors [msg …]}`."
-  [root log]
-  (let [crates (vec (filter (fn [dir] (File/exists? (Path/join dir "Cargo.toml")))
-                            (sort (Path/wildcard (Path/join root "native/*")))))]
-    (loop [cs crates
-           acc {:built 0 :cached 0 :artifacts [] :errors []}]
-      (if (empty? cs)
-        acc
-        (recur (rest cs) (native-one acc (first cs) root log))))))
+  "Prepare declared native products and atomically select priv/native/<crate>.so.
+   Explicit declarations can be passed by sealed application workers."
+  ([root log] (build-native root log (project-native-declarations root)))
+  ([root log declarations]
+   (let [root (Path/expand root)
+         requests (discover-native! root declarations)]
+     (loop [remaining requests
+            acc {:built 0 :cached 0 :artifacts [] :errors []}]
+       (if (empty? remaining)
+         acc
+         (recur (rest remaining) (native-one acc (first remaining) root log)))))))
 
 ; ── source selection: what a run is allowed to compile ──────────────────────
 ;
@@ -871,7 +848,7 @@
                       (filter (fn [r] (contains? excluded-ns r)) (:reqs node))))
                nodes)))
 
-(defn run
+(defn- run_unclaimed
   "One build. `opts` is the contract at the top of this file; `:scope` decides
    whether `:sources` is the whole inventory (`:full`, the default — what it
    does not name is pruned) or a subset this run owns (`:scoped` — nothing is
@@ -891,7 +868,10 @@
         ; clean run: report it, and do NOT prune — a `:full` run would read
         ; every recorded source as deleted and wipe the manifest.
         all-excluded? (and (not (empty? all-sources)) (not (empty? excl)) (empty? sources))
-        out (:out opts) force? (= true (:force? opts))
+        out (:out opts)
+        _ (File/mkdir_p! out)
+        _ (code/add_patha (String/to_charlist out))
+        force? (= true (:force? opts))
         ; WHAT THIS RUN OWNS. `:full` is the default because it is what every
         ; existing caller means; only an explicit `:scoped` — or a scope we
         ; cannot read, which is reported and answered conservatively — turns
@@ -917,10 +897,11 @@
                    (blog/state-of-manifest (read-manifest mpath)))
         read-results (map (fn [path]
                             (try (retry-after-settle
-                                   (fn [] (let [content (BeamLisp.Loader/read_source path)]
-                                            (if (plan/javascript-source? content)
+                                   (fn [] (let [content (BeamLisp.Loader/read_source path)
+                                                node (plan/memo-node path content)]
+                                            (if (:javascript? node)
                                               [:javascript path]
-                                              [:ok (plan/node-from path content)]))))
+                                              [:ok node]))))
                                  (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))) sources)
         javascript-paths (set (map second (filter (fn [r] (= :javascript (first r))) read-results)))
         read-errors (vec (map second (filter (fn [r] (= :error (first r))) read-results)))
@@ -979,14 +960,18 @@
                                         (not (namespace-output-fresh? (get nodes-by-path path)
                                                (get (:key p) path) (source-key root path) out
                                                (:modules (get (:sources state) path)))))))
-        total (count (filter (fn [n] (todo? state0 (:path n))) (:order p)))]
+        ;; Verify each completed unit once per planning snapshot. Wave dispatch
+        ;; must not reread/hash every artifact a second time.
+        work (set (map :path (filter (fn [n] (todo? state0 (:path n))) (:order p))))
+        todo? (fn [_state path] (contains? work path))
+        total (count work)]
     (when (and log (pos? total)) (log (str "beam-lisp AOT: building " total " source(s)")))
     ; the run fact goes down BEFORE the first source, and into the state with
     ; it: a build killed mid-wave leaves a log that says a run started and how
     ; far it got, and the run that finishes writes itself into the compaction
     (blog/append! lpath [started])
     (let [tc-paths (set (map :path (:toolchain part)))
-          initial {:state (blog/apply-facts state0 [started]) :built 0 :compiled 0 :cached 0 :toolchain-paths tc-paths
+          initial {:state (blog/apply-facts state0 [started]) :built 0 :compiled 0 :cached 0 :lock-wait-us 0 :toolchain-paths tc-paths
                    :errors (vec (concat read-errors cyc-errors (:errors part) scope-errors refuse-errors
                                         (if all-excluded?
                                           ["beam-lisp AOT: :exclude left no sources to build; check :build :exclude"]
@@ -1031,15 +1016,63 @@
       ; point where the log stops being history and becomes the current state.
       (blog/write! lpath (blog/facts-of st))
       (write-manifest mpath projection)
-      (let [nat (if (:native opts) (build-native (or (:root opts) ".") log)
+      (let [nat (if (:native opts) (if (contains? opts :native-declarations)
+                                         (build-native (or (:root opts) ".") log (:native-declarations opts))
+                                         (build-native (or (:root opts) ".") log))
                                   {:built 0 :cached 0 :artifacts [] :errors []})]
         {:built (:built final) :compiled (:compiled final) :cached (:cached final)
+         :lock-wait-us (:lock-wait-us final)
          :errors (vec (concat (:errors final) (:errors nat)))
          :manifest projection
          :ex-built (:ex-built with-ex)
          :native nat}))))
 
-(defn clean [out mpath]
+(defn produce!
+  "One output workspace, one writer, including its fact log and pruning.
+   The CLI may already own this process's claim. Direct SDK/API producers use
+   the same kernel exclusion rather than relying on a VM-local publication lock."
+  [opts]
+  (when-not (contains? #{nil false true} (:sdk-artifacts? opts))
+    (throw (ex-info "SDK artifact selection must be boolean" {:kind :sdk-artifact-profile})))
+  (let [out (:out opts) ours (c/owned? out)
+        acquired (if ours {:ok? true} (c/acquire! out "build producer"))]
+    (if-not (:ok? acquired)
+      {:built 0 :compiled 0 :cached 0 :lock-wait-us 0 :manifest {} :ex-built 0
+       :native {:built 0 :cached 0 :artifacts [] :errors []}
+       :errors [(str "build output held by " (pr-str (:held acquired)))]}
+      (try
+       (if (:world opts)
+        (try
+         (when (or (:ex opts) (:native opts) (seq (:sources opts)) (seq (:exclude opts)))
+          (throw (ex-info "World builds require their manifest's complete selection"
+                   {:kind :world-build-combined-options})))
+         (BeamLisp.Loader/ensure_loaded "compile.world")
+         (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "compile.world" "build!")
+           (list (:world opts) out (:force? opts)))
+         (catch error
+          {:built 0 :compiled 0 :cached 0 :lock-wait-us 0 :manifest {} :ex-built 0
+           :native {:built 0 :cached 0 :artifacts [] :errors []}
+           :errors [(str "World build refused: " (ex-message error))]}))
+        (if (:sdk-artifacts? opts)
+          (do (BeamLisp.Loader/ensure_loaded "unit-store")
+              (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "unit-store" "produce!")
+                (list (assoc opts :sources (select-sources (:sources opts) (:exclude opts))))))
+          (run_unclaimed opts)))
+       (finally (when-not ours (c/release! out)))))))
+
+(defn run
+  "Managed application production uses Nix. The separate internal producer
+   entry retains compatibility with bootstrap floors that call build/run."
+  [options]
+  (BeamLisp.Loader/ensure_loaded "artifact")
+  (let [context ((BeamLisp.Env/fetch! "artifact" "framework-context"))]
+    (if (= "1" (:producer context))
+      (produce! options)
+      (do
+        (BeamLisp.Loader/ensure_loaded "application-product")
+        ((BeamLisp.Env/fetch! "application-product" "build!") options)))))
+
+(defn- clean_unclaimed [out mpath]
   (let [lpath (blog/path-for mpath)
         logged (blog/replay (blog/read-facts lpath))
         st (if (pos? (count (:sources logged))) logged (blog/state-of-manifest (read-manifest mpath)))]
@@ -1050,3 +1083,10 @@
     (when (File/exists? mpath) (File/rm mpath))
     (when (File/exists? lpath) (File/rm lpath))
     :ok))
+
+(defn clean [out mpath]
+  (let [ours (c/owned? out)
+        acquired (if ours {:ok? true} (c/acquire! out "build clean"))]
+    (when-not (:ok? acquired)
+      (throw (ex-info "Build workspace is in use" {:kind :build-workspace-held :held (:held acquired)})))
+    (try (clean_unclaimed out mpath) (finally (when-not ours (c/release! out))))))

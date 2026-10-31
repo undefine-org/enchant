@@ -1,0 +1,129 @@
+(ns contextual-binding-test (:require [binding :as b] [syntax :as s]))
+
+(defn- selection []
+ {:version 1 :profile 'syntax-v1 :target 'beam-v1
+  :sources [{:namespace 'example :digest (crypto/hash :sha256 "source")}]})
+
+(defn- fixture []
+ (let [selection (selection)
+       module (b/scope selection 'example [0] :module)
+       outer (b/scope selection 'example [1] :lexical)
+       inner (b/scope selection 'example [2] :lexical)
+       intro (b/scope selection 'example [3] :introduction)]
+  {:selection selection :scopes [module outer inner intro]
+   :module (:id module) :outer (:id outer) :inner (:id inner) :intro (:id intro)}))
+
+(defn- declaration [name path scopes phase space]
+ {:namespace 'example :name name :path [path] :scopes scopes :phase phase :space space
+  :kind :value :visibility :local :available-from 0})
+
+(defn- identifier [f name scopes]
+ (s/identifier name {:world (b/world-key (:selection f)) :namespace 'example :space 'value
+                      :scopes {0 scopes}}))
+
+(defn- kind-of [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(deftest worlds-scopes-and-declarations-ignore-physical-repackaging
+ (let [f (fixture) selection (:selection f)
+       scope (first (:scopes f))
+       d (declaration 'x 1 [(:module f)] 0 'value)
+       w (b/world selection (:scopes f) [d])
+       repackaged (b/world (assoc selection :sources (list (first (:sources selection))))
+                          (reverse (:scopes f)) [d])]
+  (is (= w repackaged))
+  (is (= w (b/validate-world w)))
+  (is (= scope (b/scope selection 'example '(0) :module)))
+  (is (not= (:id scope) (:id (b/scope selection 'example [1] :module))))
+  (is (not= (:id scope) (:id (b/scope selection 'example [0] :lexical))))
+  (is (not= (:key w) (b/world-key (assoc-in selection [:sources 0 :digest] (crypto/hash :sha256 "changed")))))
+  (is (= :binding-fields (kind-of #(b/world-key (assoc selection :artifact (crypto/hash :sha256 "beam"))))))
+  (is (= :binding-symbol (kind-of #(b/world-key (assoc selection :profile "syntax-v1")))))))
+
+(deftest shadowing-and-incomparable-scopes-are-order-independent
+ (let [f (fixture) m (:module f) a (:outer f) z (:inner f)
+       outer (declaration 'x 1 [m] 0 'value)
+       inner (declaration 'x 2 [m a] 0 'value)
+       other (declaration 'x 3 [m z] 0 'value)
+       id (identifier f 'x [m a z])]
+  (doseq [rows [[outer inner] [inner outer]]]
+   (let [w (b/world (:selection f) (:scopes f) rows)
+         result (b/resolve w id 0 0)]
+    (is (= :resolved (:status result)))
+    (is (= '(2) (get-in result [:declaration :path])))
+    (is (= (get-in result [:reference :id])
+           (b/reference-id w (get-in result [:declaration :id]))))))
+  (is (= :ambiguous (:status (b/resolve (b/world (:selection f) (:scopes f) [outer inner other]) id 0 0))))
+  (is (= :unbound (:status (b/resolve (b/world (:selection f) (:scopes f) [inner])
+                                     (identifier f 'x [m]) 0 0))))))
+
+(deftest phases-spaces-and-authored-availability-are-independent
+ (let [f (fixture) m (:module f) a (:outer f)
+       runtime (declaration 'x 1 [m] 0 'value)
+       compile-time (declaration 'x 1 [m] 1 'value)
+       type-name (declaration 'x 1 [m] 0 'type)
+       future (assoc (declaration 'x 2 [m a] 0 'value) :kind :macro :available-from 10)
+       w (b/world (:selection f) (:scopes f) [runtime compile-time type-name future])
+       ctx {:world (:key w) :namespace 'example :space 'value :scopes {:all [m] 0 [a]}}
+       id (s/identifier 'x ctx)]
+  (is (= :not-yet-available (:status (b/resolve w id 0 9))))
+  (is (= :macro (get-in (b/resolve w id 0 10) [:declaration :kind])))
+  (is (= 1 (get-in (b/resolve w id 1 0) [:declaration :phase])))
+  (is (= 'type (get-in (b/resolve w (s/identifier 'x (assoc ctx :space 'type)) 0 0) [:declaration :space])))
+  (is (not= (get-in (b/resolve w id 0 10) [:reference :id])
+            (get-in (b/resolve w id 1 0) [:reference :id])))))
+
+(deftest validation-refuses-foreign-scope-and-tampered-index
+ (let [f (fixture) m (:module f) d (declaration 'x 1 [m] 0 'value)
+       w (b/world (:selection f) (:scopes f) [d])]
+  (is (= :binding-version (kind-of #(b/world-key (assoc (:selection f) :version 1.0)))))
+  (is (= :binding-invalid-world (kind-of #(b/validate-world (assoc w :version 1.0)))))
+  (is (= :binding-invalid-world (kind-of #(b/validate-world (assoc w :index {})))))
+  (is (= :binding-invalid-world (kind-of #(b/validate-world (assoc w :by-id {})))))
+  (is (= :binding-duplicate-declaration (kind-of #(b/world (:selection f) (:scopes f) [d d]))))
+  (is (= :binding-foreign-scope
+         (kind-of #(b/resolve w (identifier f 'x [(crypto/hash :sha256 "foreign")]) 0 0))))
+  (is (= :binding-context (kind-of #(b/resolve w {:op :binding-reference :world (:key w)} 0 0))))))
+
+(deftest template-substitution-keeps-use-site-binding-and-definition-binding-distinct
+ (let [f (fixture) m (:module f) a (:outer f) intro (:intro f)
+       ctx {:world (b/world-key (:selection f)) :namespace 'example :space 'value :scopes {:all [m]}}
+       use-site (identifier f 'tmp [m a])
+       template (first (s/read "[tmp body]" "template.bl" ctx))
+       expanded (s/template template {'body use-site} intro)
+       introduced (first (:children expanded))
+       substituted (second (:children expanded))
+       w (b/world (:selection f) (:scopes f)
+           [(declaration 'tmp 1 [m a] 0 'value) (declaration 'tmp 2 [m intro] 0 'value)])]
+  (is (= use-site substituted))
+  (is (= '(2) (get-in (b/resolve w introduced 0 0) [:declaration :path])))
+  (is (= '(1) (get-in (b/resolve w substituted 0 0) [:declaration :path])))
+  (is (= ['tmp 'tmp] (s/to-datum expanded)))
+  ;; Deliberate context erasure and recapture is explicit, rather than hygiene.
+  (let [recaptured (s/from-datum (s/to-datum substituted) ctx)]
+   (is (= :unbound (:status (b/resolve w recaptured 0 0)))))))
+
+(deftest finite-scope-lattice-matches-greatest-element-oracle
+ (let [f (fixture) a (:outer f) z (:inner f)
+       scopes [[] [a] [z] [a z]]
+       ds (mapv (fn [i] (declaration 'x i (nth scopes i) 0 'value)) (range 4))]
+  ;; Enumerate every nonempty declaration subset and every reference scope set.
+  ;; The oracle compares all candidates pairwise; production uses a union.
+  (doseq [mask (range 1 16)]
+   (let [rows (filterv #(not= 0 (erlang/band mask (erlang/bsl 1 (first (:path %))))) ds)
+         w (b/world (:selection f) (:scopes f) rows)]
+    (doseq [use scopes]
+     (let [applicable (filterv #(every? (set use) (:scopes %)) rows)
+           greatest (filterv (fn [d] (every? (fn [other] (every? (set (:scopes d)) (:scopes other))) applicable)) applicable)
+           result (b/resolve w (identifier f 'x use) 0 0)
+           expected (cond (empty? applicable) :unbound (= 1 (count greatest)) :resolved :else :ambiguous)]
+      (is (= expected (:status result)))
+      (when (= :resolved expected)
+       (is (= (:path (first greatest)) (get-in result [:declaration :path]))))))))))
+
+(deftest lazy-or-improper-inputs-never-realize-caller-code
+ (let [called (atom false) items (map (fn [item] (reset! called true) item) [1])
+       improper (erlang/++ (list 1) :tail)]
+  (is (= :binding-collection (kind-of #(b/world-key (assoc (selection) :sources items)))))
+  (is (= false @called))
+  (is (= :binding-collection (kind-of #(b/world-key (assoc (selection) :sources improper)))))))

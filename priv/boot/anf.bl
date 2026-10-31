@@ -37,6 +37,7 @@
 ;                                   emission, so analyses at this tier read the
 ;                                   arithmetic itself (the :arith cutover).
 ;   :apply  {:fn n :args [n…]}                 call a fn VALUE
+;   :invoke {:callee n :arguments list-node}   language callable dispatch
 ;   :let    {:name "x" :init n :body n}        one binding (ANF core)
 ;   :if     {:test n :then n :else n}          bl truthiness (nil/false → else)
 ;   :do     {:stmts [n…]}                      sequence, value = last
@@ -69,11 +70,31 @@
 
 ;; ── constructors (every node threads an :ann, default {}) ────────────────────
 
+(defn- binding-reference? [value]
+ ;; Native finite-data shape owner also serves artifact admission before boot.
+ ;; This is never semantic selection, Source authentication or native authority.
+ (BeamLisp.CompilerData/binding_reference? value))
+
+(defn binding-value
+ "An unresolved selected global value. No mutable namespace lookup or physical
+  address is implied; a unit linker must bind it before executable emission."
+ [reference]
+ (when-not (binding-reference? reference)
+  (throw (ex-info "Invalid ANF binding reference" {:kind :invalid-anf-binding-reference})))
+ {:op :binding :reference reference :ann {}})
+
+(defn reference-of
+ "Executable binding identity is a field on :binding. Its annotations cannot
+  override it. Lexical references retain the compiler's existing annotations."
+ [node]
+ (if (= :binding (:op node)) (:reference node) (get-in node [:ann :binding-reference])))
+
 (defn lit [v] {:op :lit :val v :ann {}})
 (defn var [name] {:op :var :name name :ann {}})
 (defn global [ns name] {:op :global :ns ns :name name :ann {}})
 (defn global-exact [ns name] {:op :global :ns ns :name name :lookup :exact :ann {}})
 (defn remote [mod fun args] {:op :remote :mod mod :fun fun :args args :ann {}})
+(defn invoke [callee arguments] {:op :invoke :callee callee :arguments arguments :ann {}})
 (defn arith
   "A 2-arity core numeric op at the CANONICAL tier: `fun` is the BeamLisp.Num
    name (:add :sub :mul :div :lt :gt :le :ge :num_eq), `bif` the Erlang BIF it
@@ -101,6 +122,87 @@
 (defn structt [mod fields] {:op :struct :mod mod :fields fields :ann {}})
 (defn clause [pats guard body] {:pats pats :guard guard :body body})
 
+(defn callable-invocation
+ "Read a language invocation, distinct from an authored host remote. The
+  packed argument list may itself be computed; annotations grant no meaning."
+ [node]
+ (when (and (map? node) (= :invoke (:op node)))
+  {:callee (:callee node) :arguments (:arguments node)}))
+
+;; The grammar owns executable children for both production and analysis.
+;; Literal payloads and pattern binders are inert; map-pattern keys are ANF
+;; expressions (the same operands Lower emits). Every result is an eager list.
+;; These structural callbacks call module-owned functions directly. Bare
+;; function values would read namespace vars while __bl_init__ is still
+;; establishing those vars during fresh bootstrap dependency inspection.
+(defn pattern-vars
+ "Variable names in a checked pattern; keys and literal data do not bind."
+ [pattern]
+ (case (:pop pattern)
+  :pvar (list (:name pattern))
+  :ptuple (BeamLisp.CompilerData/eager_mapcat (fn [pattern] (pattern-vars pattern)) (:elems pattern))
+  :pcons (finite-concat (pattern-vars (:head pattern)) (pattern-vars (:tail pattern)))
+  :palias (finite-concat (pattern-vars (:a pattern)) (pattern-vars (:b pattern)))
+  :pmap (BeamLisp.CompilerData/eager_mapcat (fn [pair] (pattern-vars (second pair))) (:pairs pattern))
+  :pstruct (BeamLisp.CompilerData/eager_mapcat (fn [pair] (pattern-vars (second pair))) (:fields pattern))
+  (list)))
+
+(defn pattern-expressions
+ "Executable map keys nested inside a pattern; binding/literal data stay inert."
+ [pattern]
+ (case (:pop pattern)
+  :pmap (BeamLisp.CompilerData/eager_mapcat
+          (fn [pair] (cons (first pair) (pattern-expressions (second pair)))) (:pairs pattern))
+  :pstruct (BeamLisp.CompilerData/eager_mapcat
+             (fn [pair] (pattern-expressions (second pair))) (:fields pattern))
+  :ptuple (BeamLisp.CompilerData/eager_mapcat (fn [pattern] (pattern-expressions pattern)) (:elems pattern))
+  :pcons (finite-concat (pattern-expressions (:head pattern)) (pattern-expressions (:tail pattern)))
+  :palias (finite-concat (pattern-expressions (:a pattern)) (pattern-expressions (:b pattern)))
+  :pvar (list) :plit (list) :pnil (list)
+  (throw (ex-info "Unknown executable ANF pattern" {:kind :unknown-executable-pattern :pop (:pop pattern)}))))
+
+(defn- executable-clause-children [clauses]
+ (BeamLisp.CompilerData/eager_mapcat
+  (fn [clause]
+   (finite-concat
+    (BeamLisp.CompilerData/eager_mapcat (fn [pattern] (pattern-expressions pattern)) (:pats clause))
+    (if (nil? (:guard clause)) (list (:body clause))
+     (list (:guard clause) (:body clause))))) clauses))
+
+(defn- executable-pair-children [pairs]
+ (BeamLisp.CompilerData/eager_mapcat (fn [pair] (list (first pair) (second pair))) pairs))
+
+(defn executable-children
+ "Immediate executable operands in grammar order, including latent function
+  bodies and clause guards. This describes syntax, not unconditional execution
+  of every branch. Unknown operations refuse; they never look effect-free."
+ [node]
+ (when-not (map? node)
+  (throw (ex-info "Executable child traversal requires an ANF node" {:kind :invalid-executable-node})))
+ (let [op (:op node)
+       children
+       (cond
+        (contains? #{:lit :var :global :binding :enil} op) (list)
+        (contains? #{:js :arith :remote} op) (:args node)
+        (= :invoke op) (list (:callee node) (:arguments node))
+        (= :apply op) (cons (:fn node) (:args node))
+        (= :let op) (list (:init node) (:body node))
+        (= :if op) (list (:test node) (:then node) (:else node))
+        (= :do op) (:stmts node)
+        (= :case op) (cons (:subj node) (executable-clause-children (:clauses node)))
+        (= :fn op) (executable-clause-children (:clauses node))
+        (= :try op) (finite-concat (list (:body node))
+                      (executable-clause-children (:catch node)) (list (:after node)))
+        (= :recv op) (finite-concat (executable-clause-children (:clauses node))
+                       (list (:timeout node) (:after node)))
+        (= :tuple op) (:elems node)
+        (= :map op) (executable-pair-children (:pairs node))
+        (= :struct op) (executable-pair-children (:fields node))
+        (= :cons op) (list (:head node) (:tail node))
+        :else (throw (ex-info "Unknown executable ANF operation"
+                       {:kind :unknown-executable-operation :op op})))]
+  (BeamLisp.CompilerData/eager_filter (fn [child] (erlang/not (erlang/== nil child))) children)))
+
 ;; pattern constructors
 (defn pvar [name] {:pop :pvar :name name})
 (defn plit [v] {:pop :plit :val v})
@@ -121,8 +223,8 @@
                   {:module (:name m) :function f :path path :value value})))
 
 (defn- exact-keys? [m ks]
-  (and (map? m) (= (count (maps/keys m)) (count ks))
-       (every? (fn [k] (contains? m k)) ks)))
+  (and (map? m) (= (erlang/map_size m) (erlang/length (to-list ks)))
+       (Enum/all? ks (fn [k] (maps/is_key k m)))))
 
 (defn- eager-list [x field]
   (if (or (erlang/is_list x) (BeamLisp.Ns.Rt/vector? x))
@@ -133,11 +235,11 @@
 (defn- literal-data? [v]
   (cond
     (erlang/is_function v) false
-    (erlang/is_tuple v) (every? (fn [value] (literal-data? value)) (erlang/tuple_to_list v))
-    (erlang/is_list v) (every? (fn [value] (literal-data? value)) v)
-    (BeamLisp.Ns.Rt/vector? v) (every? (fn [value] (literal-data? value)) (to-list v))
+    (erlang/is_tuple v) (Enum/all? (erlang/tuple_to_list v) (fn [value] (literal-data? value)))
+    (erlang/is_list v) (Enum/all? v (fn [value] (literal-data? value)))
+    (BeamLisp.Ns.Rt/vector? v) (Enum/all? (to-list v) (fn [value] (literal-data? value)))
     ; is_map-ok: Core literals include plain data structs, but never resources or thunks.
-    (erlang/is_map v) (every? (fn [k] (and (literal-data? k) (literal-data? (maps/get k v)))) (maps/keys v))
+    (erlang/is_map v) (Enum/all? (maps/keys v) (fn [k] (and (literal-data? k) (literal-data? (maps/get k v)))))
     :else (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_bitstring v))))
 
 (declare validate-node!)
@@ -197,6 +299,8 @@
     (cond
       (= op :lit) (when (or (not (exact-keys? n [:op :val :ann])) (not (literal-data? (:val n)))) (boundary-error m f path "invalid literal or fields" n))
       (= op :var) (when (or (not (exact-keys? n [:op :name :ann])) (not (erlang/is_binary (:name n)))) (boundary-error m f path "var requires binary :name" n))
+      (= op :binding) (when-not (and (exact-keys? n [:op :reference :ann]) (binding-reference? (:reference n)))
+                        (boundary-error m f path "binding requires a finite selected reference" n))
       (= op :global) (when (or (not (or (exact-keys? n [:op :ns :name :ann]) (and (exact-keys? n [:op :ns :name :lookup :ann]) (= :exact (:lookup n))))) (not (erlang/is_binary (:ns n))) (not (erlang/is_binary (:name n)))) (boundary-error m f path "global requires binary :ns/:name" n))
       (= op :remote)
         (do
@@ -210,6 +314,7 @@
             (boundary-error m f path "remote requires atom :mod/:fun and :args; raw stacks belong to internal erlang:raise/3" n))
           (nodes (:args n) (str path ".args")))
       (= op :arith) (do (when (or (not (exact-keys? n [:op :fun :bif :args :ann])) (not (erlang/is_atom (:fun n))) (not (erlang/is_atom (:bif n))) (not= 2 (count (:args n)))) (boundary-error m f path "arith requires atom :fun/:bif and exactly 2 :args" n)) (nodes (:args n) (str path ".args")))
+      (= op :invoke) (do (when (not (exact-keys? n [:op :callee :arguments :ann])) (boundary-error m f path "invalid invoke fields" n)) (node (:callee n) (str path ".callee")) (node (:arguments n) (str path ".arguments")))
       (= op :apply) (do (when (not (exact-keys? n [:op :fn :args :ann])) (boundary-error m f path "invalid apply fields" n)) (node (:fn n) (str path ".fn")) (nodes (:args n) (str path ".args")))
       (= op :let) (do (when (or (not (exact-keys? n [:op :name :init :body :ann])) (not (erlang/is_binary (:name n)))) (boundary-error m f path "invalid let fields" n)) (node (:init n) (str path ".init")) (node (:body n) (str path ".body")))
       (= op :if) (do (when (not (exact-keys? n [:op :test :then :else :ann])) (boundary-error m f path "invalid if fields" n)) (node (:test n) (str path ".test")) (node (:then n) (str path ".then")) (node (:else n) (str path ".else")))
@@ -310,6 +415,7 @@
       (cond
         (erlang/== op :lit) (and (keys-exactly? n 3 '(:op :val :ann)) (literal-data? (maps/get :val n)))
         (erlang/== op :var) (and (keys-exactly? n 3 '(:op :name :ann)) (erlang/is_binary (maps/get :name n)))
+        (erlang/== op :binding) (and (keys-exactly? n 3 '(:op :reference :ann)) (binding-reference? (maps/get :reference n)))
         (erlang/== op :global) (and (or (keys-exactly? n 4 '(:op :ns :name :ann))
                                         (and (keys-exactly? n 5 '(:op :ns :name :lookup :ann)) (erlang/== :exact (maps/get :lookup n))))
                                     (erlang/is_binary (maps/get :ns n)) (erlang/is_binary (maps/get :name n)))
@@ -323,6 +429,8 @@
         (erlang/== op :arith) (and (keys-exactly? n 5 '(:op :fun :bif :args :ann)) (erlang/is_atom (maps/get :fun n))
                                    (erlang/is_atom (maps/get :bif n)) (erlang/is_list (maps/get :args n))
                                    (erlang/== 2 (erlang/length (maps/get :args n))) (and (erlang/is_list (maps/get :args n)) (nodes-ok? (maps/get :args n))))
+        (erlang/== op :invoke) (and (keys-exactly? n 4 '(:op :callee :arguments :ann))
+                                    (node-ok? (maps/get :callee n)) (node-ok? (maps/get :arguments n)))
         (erlang/== op :apply) (and (keys-exactly? n 4 '(:op :fn :args :ann)) (node-ok? (maps/get :fn n))
                                    (and (erlang/is_list (maps/get :args n)) (nodes-ok? (maps/get :args n))))
         (erlang/== op :let) (and (keys-exactly? n 5 '(:op :name :init :body :ann)) (erlang/is_binary (maps/get :name n))
@@ -453,10 +561,202 @@
 (defn- normalize-grammar [x]
   (cond
     (and (map? x) (or (= :lit (:op x)) (= :plit (:pop x)))) x
-    (map? x) (reduce (fn [out k] (assoc out k (normalize-grammar (get x k)))) {} (maps/keys x))
+    (map? x) (Enum/reduce (maps/keys x) {} (fn [k out] (assoc out k (normalize-grammar (get x k)))))
     (BeamLisp.Ns.Rt/vector? x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) (to-list x)))
     (erlang/is_list x) (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) x))
     :else x))
+
+;; Unit linkage rewrites executable operands, including map-pattern keys.
+;; Literal payloads, pattern binders and annotations stay inert.
+(declare link-node)
+
+(defn map-pattern-expressions
+ "Rewrite only executable pattern keys; literal fields and binders stay data."
+ [f pattern]
+ (case (:pop pattern)
+  :pmap (assoc pattern :pairs (finite-map (fn [pair]
+                  [(f (first pair)) (map-pattern-expressions f (second pair))]) (:pairs pattern)))
+  :pstruct (assoc pattern :fields (finite-map (fn [pair]
+                  [(first pair) (map-pattern-expressions f (second pair))]) (:fields pattern)))
+  :ptuple (assoc pattern :elems (finite-map (fn [p] (map-pattern-expressions f p)) (:elems pattern)))
+  :pcons (assoc pattern :head (map-pattern-expressions f (:head pattern)) :tail (map-pattern-expressions f (:tail pattern)))
+  :palias (assoc pattern :a (map-pattern-expressions f (:a pattern)) :b (map-pattern-expressions f (:b pattern)))
+  :pvar pattern :plit pattern :pnil pattern
+  (throw (ex-info "Unknown executable ANF pattern" {:kind :unknown-executable-pattern :pop (:pop pattern)}))))
+
+(defn- link-clause [clause bindings]
+ (assoc clause :pats (finite-map (fn [p] (map-pattern-expressions (fn [key] (link-node key bindings)) p)) (:pats clause))
+               :guard (when (some? (:guard clause)) (link-node (:guard clause) bindings))
+               :body (link-node (:body clause) bindings)))
+
+(defn- link-node [node bindings]
+ (let [op (:op node)]
+  (if (= :binding op)
+   (let [reference (:reference node) target (get bindings reference)]
+    (when-not target
+     (throw (ex-info "Selected binding has no unit target"
+                    {:kind :unlinked-contextual-binding :reference reference})))
+    (assoc target :ann (assoc (merge (:ann target) (:ann node)) :binding-reference reference)))
+   (let [scalars (cond (= :invoke op) [:callee :arguments]
+                       (= :apply op) [:fn]
+                       (= :let op) [:init :body]
+                       (= :if op) [:test :then :else]
+                       (= :case op) [:subj]
+                       (= :try op) [:body :after]
+                       (= :recv op) [:timeout :after]
+                       (= :cons op) [:head :tail]
+                       :else [])
+         sequences (cond (contains? #{:js :arith :remote :apply} op) [:args]
+                          (= :do op) [:stmts] (= :tuple op) [:elems] :else [])
+         clauses (cond (contains? #{:case :fn :recv} op) [:clauses]
+                       (= :try op) [:catch] :else [])
+         pairs (cond (= :map op) [:pairs] (= :struct op) [:fields] :else [])
+         result (reduce (fn [out field]
+                          (if (nil? (get out field)) out
+                           (assoc out field (link-node (get out field) bindings)))) node scalars)
+         result (reduce (fn [out field]
+                          (assoc out field (finite-map (fn [child] (link-node child bindings))
+                                                       (get out field)))) result sequences)
+         result (reduce (fn [out field]
+                          (assoc out field (finite-map (fn [clause] (link-clause clause bindings))
+                                                       (get out field)))) result clauses)]
+    (reduce (fn [out field]
+             (assoc out field (finite-map (fn [pair]
+                               [(link-node (first pair) bindings) (link-node (second pair) bindings)])
+                                          (get out field)))) result pairs)))))
+
+(defn- linked-target? [node]
+ (and (not= :binding (:op node))
+      (every? (fn [child] (linked-target? child)) (executable-children node))))
+
+(defn- static-link-target? [node]
+ (and (not (contains? #{:binding :global} (:op node)))
+      (every? (fn [child] (static-link-target? child)) (executable-children node))))
+
+(defn link-bindings
+ "Resolve selected references through a finite unit-owned ANF target table.
+  Full references are keys, including world/phase/space. Targets must already
+  be linked: no recursive resolver, ambient lookup or executable callback.
+  This pure transformation grants no Source authenticity or native admission."
+ [node bindings]
+ (when-not (and (node-ok? node) (plain-map? bindings))
+  (throw (ex-info "Invalid ANF unit linkage" {:kind :invalid-anf-binding-link})))
+ ;; Check every target before traversal; even unused malformed entries refuse.
+ (doseq [entry (maps/to_list bindings)]
+  (when-not (and (binding-reference? (elem entry 0)) (node-ok? (elem entry 1))
+                 (static-link-target? (elem entry 1)))
+   (throw (ex-info "Invalid ANF binding target" {:kind :invalid-anf-binding-link}))))
+ (let [linked (link-node node bindings)]
+  ;; Future executable grammar additions cannot silently omit substitution.
+  (when-not (linked-target? linked)
+   (throw (ex-info "Unit linkage left an unresolved executable binding"
+                  {:kind :unlinked-contextual-binding})))
+  linked))
+
+
+(defn- contextual-unit-error! [reason]
+ (throw (ex-info "Invalid compiled contextual unit" {:kind :invalid-contextual-unit :reason reason})))
+
+(defn- lexical-clauses [clauses bound direct-parameters?]
+ (BeamLisp.CompilerData/eager_mapcat
+  (fn [clause]
+   (let [names (BeamLisp.CompilerData/eager_mapcat (fn [pattern] (pattern-vars pattern)) (:pats clause))
+         ;; General patterns lower '_' as a fresh wildcard. Direct Core fn
+         ;; parameters bind it literally, as selected by the shared shape view.
+         scope (reduce (fn [scope name]
+                         (if (and (= "_" name) (not direct-parameters?)) scope
+                          (assoc scope name true))) bound names)
+         keys (BeamLisp.CompilerData/eager_mapcat (fn [pattern] (pattern-expressions pattern)) (:pats clause))]
+    (finite-concat (finite-map (fn [key] [key bound]) keys)
+                   (when (:guard clause) (list [(:guard clause) scope]))
+                   (list [(:body clause) scope])))) clauses))
+
+(defn- check-lexical-node! [expression bound remaining]
+ (loop [todo (list [expression bound])]
+  (when (seq todo)
+   (when (neg? (swap! remaining dec)) (contextual-unit-error! :lexical-budget))
+   (let [[node scope] (first todo) op (:op node)
+         children
+         (case op
+          :var (do (when-not (contains? scope (:name node))
+                     (throw (ex-info "Unbound variable in contextual unit"
+                              {:kind :invalid-contextual-unit :reason :unbound-variable
+                               :name (:name node) :origin (:ann node)}))) (list))
+          :let (list [(:init node) scope] [(:body node) (assoc scope (:name node) true)])
+          :fn (lexical-clauses (:clauses node) scope
+                (some? (BeamLisp.CompilerData/simple_function_clause node)))
+          :case (cons [(:subj node) scope] (lexical-clauses (:clauses node) scope false))
+          :try (let [handler-scope (reduce (fn [bound name] (assoc bound name true)) scope
+                                     (vals (BeamLisp.CompilerData/catch_stack_bindings)))]
+                 (finite-concat (list [(:body node) scope])
+                                (lexical-clauses (:catch node) handler-scope false)
+                                (when (:after node) (list [(:after node) scope]))))
+          :recv (finite-concat (lexical-clauses (:clauses node) scope false)
+                               (when (:timeout node) (list [(:timeout node) scope]))
+                               (when (:after node) (list [(:after node) scope])))
+          (finite-map (fn [child] [child scope]) (executable-children node)))]
+    (recur (finite-concat children (rest todo)))))))
+
+(defn validate-contextual-unit!
+ "Validate one finite compiled recipe before projection or phase facts. Native
+  CompilerData owns its shape/bijections; this owner checks canonical executable
+  grammar, closed selected linkage and ordered lexical scopes. No code or
+  initializer is executed; this is not a type/effect or native-admission proof."
+ [unit]
+ (try (BeamLisp.CompilerData/check_contextual_unit! unit)
+      (catch error (contextual-unit-error! :data)))
+ (doseq [node (finite-concat (list (:entry unit)) (finite-map (fn [row] (:node row)) (:initializers unit))
+                            (BeamLisp.CompilerData/eager_mapcat
+                             (fn [step] (if (= :initialize (:op step)) (list) (list (:node step)))) (:steps unit)))]
+  (when-not (and (node-ok? node) (static-link-target? node))
+   (contextual-unit-error! :executable-image)))
+ (let [remaining (atom 262144)]
+  (let [links (into {} (finite-map (fn [link] [(:reference link) link]) (:initializers unit)))]
+   (loop [steps (:steps unit) bound {}]
+    (if (empty? steps) (check-lexical-node! (:entry unit) bound remaining)
+     (let [step (first steps) link (when (= :initialize (:op step)) (get links (:reference step)))
+           node (if link (:node link) (:node step))
+           slot (if link (:slot link) (when (= :capture (:op step)) (:slot step)))]
+      (check-lexical-node! node bound remaining)
+      (recur (rest steps) (if slot (assoc bound slot true) bound)))))))
+ unit)
+
+(defn contextual-unit-body
+ "Project the one ordered body inside its caller-owned lexical context.
+  Shape is checked here; callers must validate the enclosing executable image
+  before emission. This data projection grants no execution or provenance."
+ [unit tail]
+ (BeamLisp.CompilerData/check_contextual_unit! unit)
+ (let [links (into {} (finite-map (fn [link] [(:reference link) link]) (:initializers unit)))]
+  (reduce (fn [inner step]
+            (case (:op step)
+             :initialize (let [link (get links (:reference step))] (lett (:slot link) (:node link) inner))
+             :capture (lett (:slot step) (:node step) inner)
+             :evaluate (doo (list (:node step) inner))))
+          tail (reverse (:steps unit)))))
+
+(defn contextual-unit-entry
+ "Project the entry from the same validated recipe used by its factory."
+ [unit]
+ (validate-contextual-unit! unit)
+ (contextual-unit-body unit (:entry unit)))
+
+(defn contextual-unit-factory
+ "Project a validated recipe to canonical instance ANF. Constructing the
+  instance executes the canonical initialization schedule once. Its entry
+  thunk returns the scheduled result; data grant no activation/admission."
+ [unit]
+ (validate-contextual-unit! unit)
+ (let [targets (into {} (map (fn [link]
+                              [(:reference link)
+                               {:op :var :name (:slot link) :ann {:binding-reference (:reference link)}}])
+                            (:initializers unit)))
+       exports (mapp (finite-map (fn [reference] [(lit reference) (get targets reference)]) (:exports unit)))
+       entry (fnn (list (clause (list) nil (:entry unit))))
+       value (mapp (list [(lit :version) (lit 1)]
+                        [(lit :kind) (lit :contextual-unit-instance)]
+                        [(lit :entry) entry] [(lit :exports) exports]))]
+  (contextual-unit-body unit value)))
 
 (defn module
   "Construct and validate the canonical version-1 ANF module descriptor.
@@ -467,3 +767,167 @@
                       :clauses (to-list (BeamLisp.CompilerData/eager_map (fn [value] (normalize-grammar value)) (eager-list clauses "$.clauses")))
                       :exports (eager-list exports "$.exports")
                       :attrs (eager-list attrs "$.attrs") :ann ann})))
+
+;; Versioned executable-entry DATA. Authentication of an SDK/control origin
+;; belongs to native publication/admission, never this constructor or a tag.
+(defn- execution-entry-kinds [] (quote #{:source :sdk :actor :native-adapter :control}))
+(defn- execution-edge-kinds []
+ (quote #{:direct-call :captured-value :callable-argument :native-adapter
+           :fixed-sdk-lookup :start :message :control :handoff :cleanup}))
+
+(defn- entry-error [field]
+ (throw (ex-info "Invalid execution entry descriptor"
+          {:kind :invalid-execution-entry :field field})))
+
+(defn validate-execution-entry!
+ "Validate the closed version-1 entry schema. Entries are finite literal maps;
+  edge collections are proper native lists. Passing this shape check supplies
+  no runtime origin, context, graph custody or resource capability."
+ [entry]
+ (when-not (and (map? entry)
+                (exact-keys? entry [:version :id :definition :body-identity :kind
+                                    :arity :span :edges :dependencies-complete]))
+  (entry-error :fields))
+ (when-not (= 1 (:version entry)) (entry-error :version))
+ (when-not (and (some? (:id entry)) (literal-data? (:id entry))) (entry-error :id))
+ (when-not (string? (:definition entry)) (entry-error :definition))
+ (when-not (and (some? (:body-identity entry)) (literal-data? (:body-identity entry)))
+  (entry-error :body-identity))
+ (when-not (contains? (execution-entry-kinds) (:kind entry)) (entry-error :kind))
+ (when-not (and (map? (:arity entry)) (exact-keys? (:arity entry) [:kind :count])
+                (contains? #{:fixed :variadic} (:kind (:arity entry)))
+                (int? (:count (:arity entry)))
+                (erlang/>= (:count (:arity entry)) 0)
+                (erlang/=< (:count (:arity entry)) 255))
+  (entry-error :arity))
+ (when-not (and (map? (:span entry)) (literal-data? (:span entry))) (entry-error :span))
+ (when-not (or (= true (:dependencies-complete entry)) (= false (:dependencies-complete entry)))
+  (entry-error :dependencies-complete))
+ (when-not (erlang/is_list (:edges entry)) (entry-error :edges))
+ (Enum/each (:edges entry) (fn [edge]
+  (when-not (and (map? edge) (exact-keys? edge [:kind :target :evidence :span])
+                 (contains? (execution-edge-kinds) (:kind edge))
+                 (literal-data? (:target edge))
+                 (some? (:evidence edge)) (literal-data? (:evidence edge))
+                 (map? (:span edge)) (literal-data? (:span edge)))
+   (entry-error :edge))))
+ entry)
+
+(defn execution-entry
+ "Construct the canonical finite entry schema. Omitted dependency coverage is
+  false. Missing identities still refuse; no declaration gets inferred trust."
+ [fields]
+ (let [entry (maps/merge {:version 1 :span {} :edges (list) :dependencies-complete false} fields)
+       edges (eager-list (:edges entry) "$.execution-entry.edges")
+       edges (BeamLisp.CompilerData/eager_map
+               (fn [edge] (maps/merge {:span {} :target nil} edge)) edges)]
+  (validate-execution-entry! (assoc entry :edges edges))))
+
+(defn- execution-span [node]
+ (maps/with (list :file :line :col :offset :end-line :end-col :end-offset)
+            (or (:ann node) {})))
+
+(defn- dependency-edge [node kind target evidence]
+ {:kind kind :target target :evidence evidence :span (execution-span node)})
+
+(defn- node-dependencies [node]
+ (let [op (:op node) invocation (callable-invocation node)]
+  (cond
+   invocation
+   (list (dependency-edge node :direct-call
+           (tuple :mfa :Elixir.BeamLisp.Ns.Rt :invoke 2) [:anf :invoke])
+         (dependency-edge node :callable-argument nil
+           [:anf :invoke (:op (:callee invocation))]))
+   (= :remote op)
+   (if (and (erlang/is_atom (:mod node)) (erlang/is_atom (:fun node)))
+    (list (dependency-edge node :direct-call
+            (tuple :mfa (:mod node) (:fun node) (count (:args node))) [:anf :remote]))
+    (list (dependency-edge node :direct-call nil [:anf :dynamic-remote])))
+   (= :binding op)
+   (list (dependency-edge node :captured-value nil [:anf :binding (:reference node)]))
+   (= :global op)
+   ;; A binding is not a physical entry, even for :exact lookups. Resolution
+   ;; must authenticate its actual published provider and retained value.
+   (list (dependency-edge node :captured-value nil
+           [:anf :global (:ns node) (:name node) (:lookup node)]))
+   (= :apply op)
+   ;; Lowering adds the callable dispatcher. Do not pretend a syntax walk
+   ;; inventories backend-generated dependencies or resolves lexical values.
+   (list (dependency-edge node :callable-argument nil
+           [:anf :apply (:op (:fn node)) (count (:args node))]))
+   (contains? #{:arith :struct :js} op)
+   (list (dependency-edge node :native-adapter nil [:anf :backend-dependencies op]))
+   (and (= :lit op) (not (literal-data? (:val node))))
+   (list (dependency-edge node :captured-value nil [:anf :opaque-literal]))
+   :else (list))))
+
+(defn execution-dependencies
+ "Inventory canonical ANF dependencies, including guards and latent bodies.
+  Collection is bounded and eager. Binding/value resolution and backend-added
+  calls remain explicit obligations; this is not a dependency-closure proof."
+ [roots]
+ (loop [pending (eager-list roots "$.execution-roots") edges (list) nodes 0 complete true]
+  (if (empty? pending)
+   {:edges (lists/reverse edges) :nodes nodes :complete complete}
+   (let [node (first pending)
+         _ (when (>= nodes 32768)
+             (throw (ex-info "Execution dependency inventory exceeded its node budget"
+                             {:kind :execution-dependency-limit :limit 32768})))
+         children (executable-children node)
+         found (node-dependencies node)]
+    (recur (finite-concat children (rest pending))
+           (Enum/reduce found edges (fn [edge out] (cons edge out)))
+           (inc nodes) (and complete (Enum/all? found #(some? (:target %)))))))))
+
+(defn- emitted-entry-key [entry]
+ (when-not (and (tuple? entry) (= 5 (erlang/tuple_size entry))
+                (contains? #{:fixed :variadic} (elem entry 0))
+                (int? (elem entry 1)) (erlang/>= (elem entry 1) 0) (erlang/=< (elem entry 1) 255)
+                (erlang/is_atom (elem entry 2)) (erlang/is_atom (elem entry 4))
+                (map? (elem entry 3)) (= :defn-clause (:op (elem entry 3)))
+                (= (elem entry 2) (:fname (elem entry 3)))
+                (= (+ (elem entry 1) (if (= :variadic (elem entry 0)) 1 0))
+                   (count (:params (elem entry 3)))))
+  (entry-error :emitted-clause))
+ (tuple :mfa (elem entry 4) (elem entry 2) (count (:params (elem entry 3)))))
+
+(defn execution-entries
+ "Describe the actual five-field emitted clauses with loaded body MD5s.
+  Multiple clauses for one physical MFA form one entry. Source/AOT replay use
+  this same producer. Origin stays :source until native artifact evidence
+  authenticates another domain; annotations cannot nominate SDK/control code."
+ [ns name entries body-hashes]
+ (when-not (and (string? ns) (string? name) (not (Enum/empty? entries)))
+  (entry-error :emitted-inventory))
+ (let [groups (Enum/group_by entries (fn [entry] (emitted-entry-key entry)))]
+  (finite-map
+   (fn [id]
+    (let [clauses (get groups id) entry (first clauses)
+          body (elem entry 4) md5 (get body-hashes body)
+          _ (when-not (and (erlang/is_binary md5) (= 16 (erlang/byte_size md5)))
+              (entry-error :body-md5))
+          roots (BeamLisp.CompilerData/eager_mapcat
+                  (fn [e]
+                   (when-not (= (elem entry 0) (elem e 0)) (entry-error :dispatch))
+                   (let [clause (elem e 3)]
+                    (if (:guard clause) (list (:guard clause) (:body clause))
+                     (list (:body clause))))) clauses)
+          dependencies (execution-dependencies roots)]
+     (execution-entry
+      {:id id :definition (erlang/iolist_to_binary (list ns "/" name)) :body-identity (tuple body md5)
+       :kind :source :arity {:kind (elem entry 0) :count (elem entry 1)}
+       :span (execution-span (elem entry 3)) :edges (:edges dependencies)
+       :dependencies-complete (:complete dependencies)})))
+   (Enum/sort (maps/keys groups)))))
+
+(defn execution-clause-identities
+ "Per-MFA identities embedded by Emit in the same artifact as its code.
+  Normalize compiler grammar collections exactly as module construction does.
+  Serialize deterministically: literal maps/sets retain their values, but their
+  VM-local atom creation order must not change artifact identities. The compiler
+  key binds the OTP/toolchain version; retain full SHA256 identities."
+ [clauses]
+ (let [canonical (finite-map (fn [clause] (normalize-grammar clause)) clauses)
+       groups (Enum/group_by canonical (fn [clause] (tuple (:fname clause) (count (:params clause)))))]
+  (Enum/reduce (maps/keys groups) {} (fn [key out]
+            (assoc out key (crypto/hash :sha256 (erlang/term_to_binary (get groups key) (list :deterministic))))))))

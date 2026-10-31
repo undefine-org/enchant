@@ -88,14 +88,11 @@
 ;     registry that is not running, and a key with no process under it, are the
 ;     two live `ArgumentError`s, message for message.
 ;
-;   * `bind_init/1` — the other half of the conveyance: the server process
-;     begins with an empty process dictionary, so it resolves names at
-;     `:global`, not in the fork that started it. `start`/`start_link` tuck the
-;     captured token beside the user's init arg as a private 3-tuple whose head
-;     is `:"$bl_conveyed_env"`, and the generated `init/1` calls this on its
-;     argument before running the user body. A plain (non-wrapped) arg passes
-;     through untouched — a server started through raw OTP still works, just
-;     without conveyance.
+;   * `bind_init/1` claims the native one-shot starter before binding context
+;     or entering user init. Managed starts retain their graph; native starts
+;     retain their original class and context. Raw OTP arguments and copied
+;     context maps cannot select another startup route. `start`/`start_link`
+;     supply the user's argument only inside the admitted envelope.
 ;
 ; GUARDS AND CLAUSE HEADS BECOME BODY CHECKS. A pinned `.bl` parameter pattern
 ; compiles to a body-level match, not a clause head, so every guard
@@ -157,56 +154,40 @@
 
                 :else (erlang/iolist_to_binary (list a "." b))))]
     (Enum/reduce
-      (String/split (cat ns name) ".")
+      ;; This is a fixed native helper, including while SDK naming temporarily
+      ;; selects the global scope. Never re-enter Source invocation for it.
+      (String/split (erlang/apply cat (list ns name)) ".")
       (BeamLisp.Emit/realm_base ns :"Elixir.BeamLisp.Server")
       (fn [segment mod] (Module/concat mod (Macro/camelize segment))))))
 
 ; ── return constructors ──────────────────────────────────────────────────────
 
-(defn return_constructors
-  "The return constructors bound as locals in every server callback body. Each
-   value is a beam-lisp `$blfn` dispatching on arity, so the compiler's
-   `rt/invoke` call path can invoke it with the callback's arguments and get
-   back the exact OTP return tuple:
-
-       ok      → {:ok, s}            {:ok, s, t}          (init)
-       reply   → {:reply, r, s}      {:reply, r, s, t}    (handle_call)
-       noreply → {:noreply, s}       {:noreply, s, t}     (call/cast/info)
-       stop    → {:stop, r}          (init)
-                 {:stop, r, s}       (cast/info)
-                 {:stop, r, reply, s}(handle_call)
-       ignore      → :ignore         (init)
-       hibernate   → :hibernate      (timeout slot)
-       continue    → {:continue, t}  (timeout slot)"
+(defn return_constructor_shapes
+  "The shared return vocabulary: name -> {OTP tag, supported arities}.
+   Runtime first-class callables and compiler tuple emission use this model."
   []
-  (maps/put "ok"
-    (tuple :"$blfn"
-      (maps/put 1 (fn [s] (tuple :ok s))
-        (maps/put 2 (fn [s t] (tuple :ok s t)) (maps/new)))
-      nil)
-    (maps/put "reply"
-      (tuple :"$blfn"
-        (maps/put 2 (fn [r s] (tuple :reply r s))
-          (maps/put 3 (fn [r s t] (tuple :reply r s t)) (maps/new)))
-        nil)
-      (maps/put "noreply"
-        (tuple :"$blfn"
-          (maps/put 1 (fn [s] (tuple :noreply s))
-            (maps/put 2 (fn [s t] (tuple :noreply s t)) (maps/new)))
-          nil)
-        (maps/put "stop"
-          (tuple :"$blfn"
-            (maps/put 1 (fn [r] (tuple :stop r))
-              (maps/put 2 (fn [r s] (tuple :stop r s))
-                (maps/put 3 (fn [r reply s] (tuple :stop r reply s)) (maps/new))))
-            nil)
-          (maps/put "ignore"
-            (tuple :"$blfn" (maps/put 0 (fn [] :ignore) (maps/new)) nil)
-            (maps/put "hibernate"
-              (tuple :"$blfn" (maps/put 0 (fn [] :hibernate) (maps/new)) nil)
-              (maps/put "continue"
-                (tuple :"$blfn" (maps/put 1 (fn [t] (tuple :continue t)) (maps/new)) nil)
-                (maps/new)))))))))
+  {"ok" (tuple :ok (list 1 2)) "reply" (tuple :reply (list 2 3))
+   "noreply" (tuple :noreply (list 1 2)) "stop" (tuple :stop (list 1 2 3))
+   "ignore" (tuple :ignore (list 0)) "hibernate" (tuple :hibernate (list 0))
+   "continue" (tuple :continue (list 1))})
+
+(defn- return_constructor [tag arity]
+ (case arity
+  0 (fn [] tag)
+  1 (fn [a] (tuple tag a))
+  2 (fn [a b] (tuple tag a b))
+  3 (fn [a b c] (tuple tag a b c))))
+
+(defn return_constructors
+  "First-class return constructors with the historical $blfn callable ABI.
+   Ordinary compiled return forms emit their OTP tuple directly."
+  []
+  (Map/new (Enum/map (Map/to_list (return_constructor_shapes))
+   (fn [entry]
+    (let [name (elem entry 0) shape (elem entry 1) tag (elem shape 0)
+          fixed (Map/new (Enum/map (elem shape 1)
+                   (fn [arity] (tuple arity (return_constructor tag arity)))))]
+     (tuple name (tuple :"$blfn" fixed nil)))))))
 
 ; ── the callback vocabulary ──────────────────────────────────────────────────
 
@@ -234,30 +215,30 @@
 ; ── the env conveyed across the OTP start boundary ───────────────────────────
 
 (defn bind_init
-  "Restore the start Env and retain its whole managed graph for every actor.
+  "Claim the native starter before restoring Env or entering generated init.
+   Managed actors retain their whole graph; native actors retain their class.
    An authenticated fixed SDK actor may later explicitly adopt framework scope;
    until then it has the same safe application lifetime as an app-owned actor."
   [arg]
-  (BeamLisp.Env/assert_server_init_envelope! arg)
   (cond
     (and (erlang/is_tuple arg) (erlang/== 5 (erlang/tuple_size arg))
          (erlang/== :"$bl_conveyed_generation" (erlang/element 1 arg)))
     (do
+      (when-not (erlang/== :native-context (erlang/element 2 arg))
+        (erlang/error :server_start_context_mismatch))
       (let [context (BeamLisp.Env/claim_server_start! (erlang/element 5 arg) (erlang/element 3 arg))]
-        (when-not (erlang/== context (erlang/element 2 arg))
-          (erlang/error :server_start_context_mismatch))
         (BeamLisp.Env/bind context))
       (let [generation (Process/get :bl_generation)
             module (erlang/element 3 arg)]
         (when (erlang/== nil generation) (erlang/error :unowned_generation_server))
         (when-not (Enum/member? (Map/get generation :modules) module)
           (BeamLisp.Env/prepare_sdk_class! module))
-        (let [lease (BeamLisp.Env/retain_code! (Map/get generation :modules))]
+        (let [lease (BeamLisp.Env/retain_server_start_code! module)]
           (BeamLisp.Ns.Rt/invoke
             (BeamLisp.Env/with_env :global
               (fn [] (BeamLisp.Env/fetch_exact! "proc.owner-registry" "register-server!")))
             (list module lease))
-          (BeamLisp.Env/install_server_execution! module lease)
+          (BeamLisp.Execution/install-actor! module lease)
           (BeamLisp.Env/complete_server_start! module))
         (erlang/element 4 arg)))
     (and (erlang/is_tuple arg) (erlang/== 4 (erlang/tuple_size arg))
@@ -265,22 +246,16 @@
     (erlang/error :unadmitted_server_starter)
     (and (erlang/is_tuple arg) (erlang/== 5 (erlang/tuple_size arg))
          (erlang/== :"$bl_native_conveyed_env" (erlang/element 1 arg)))
+    (do
+     (when-not (erlang/== :native-context (erlang/element 2 arg))
+      (erlang/error :native_original_start_context_mismatch))
     (let [context (BeamLisp.Env/claim_unmanaged_start! (erlang/element 5 arg) (erlang/element 3 arg) :server)]
-      (when-not (erlang/== context (erlang/element 2 arg))
-        (erlang/error :native_original_start_context_mismatch))
       (when (Map/get context :generation) (erlang/error :unregistered_conveyed_generation))
       (BeamLisp.Env/bind context)
-      (erlang/element 4 arg))
-    (and (erlang/is_tuple arg) (erlang/== 3 (erlang/tuple_size arg))
-         (erlang/== :"$bl_conveyed_env" (erlang/element 1 arg)))
-    (do
-      (when (Map/get (erlang/element 2 arg) :generation)
-        (erlang/error :unregistered_conveyed_generation))
-      (BeamLisp.Env/bind (erlang/element 2 arg))
-      (erlang/element 3 arg))
-    :else arg))
+      (erlang/element 4 arg)))
+    :else (erlang/error :unadmitted_server_starter)))
 
-(defn- native_start [verb name module conveyed options]
+(defn- native_start [verb name module arg options]
   (when-not (Enum/member? (list :start :start_link) verb) (erlang/error :invalid_server_start_verb))
   (let [generation (BeamLisp.Env/assert_execution_context!)
         admission (when generation (BeamLisp.Env/begin_server_start! module))
@@ -288,11 +263,9 @@
                            (BeamLisp.Env/begin_unmanaged_start! module :server))
         argument (cond
                    admission
-                    (tuple :"$bl_conveyed_generation" (erlang/element 2 conveyed) module
-                      (erlang/element 4 conveyed) admission)
+                    (tuple :"$bl_conveyed_generation" :native-context module arg admission)
                    native-admission
-                    (tuple :"$bl_native_conveyed_env" (erlang/element 2 conveyed) module
-                      (erlang/element 3 conveyed) native-admission)
+                    (tuple :"$bl_native_conveyed_env" :native-context module arg native-admission)
                    :else (erlang/error :unadmitted_server_starter))]
     (try
       (when admission (BeamLisp.Env/launch_server_start! admission))
@@ -358,9 +331,6 @@
              _ (when (and generation (not (Enum/member? (Map/get generation :modules) mod)))
                  (BeamLisp.Env/prepare_sdk_class! mod))
              _ (when generation (BeamLisp.Env/ensure_sdk_owner_registry!))
-             conveyed (if generation
-                        (tuple :"$bl_conveyed_generation" (BeamLisp.Env/capture) mod arg)
-                        (tuple :"$bl_conveyed_env" (BeamLisp.Env/capture) arg))
              ; Preserve standard OTP naming values; nil alone is anonymous.
              ; The native server owns registration and duplicate refusal.
              name (if (erlang/is_map opts)
@@ -385,7 +355,7 @@
                        (if (erlang/== nil t) (list) (list (tuple :timeout t))))
                      (list))]
          (unwrap
-           (native_start :start_link name mod conveyed gopts)))))))
+           (native_start :start_link name mod arg gopts)))))))
 
 (defn start
   "Start an unsupervised server. Same contract as `start_link` — including the
@@ -436,9 +406,6 @@
              _ (when (and generation (not (Enum/member? (Map/get generation :modules) mod)))
                  (BeamLisp.Env/prepare_sdk_class! mod))
              _ (when generation (BeamLisp.Env/ensure_sdk_owner_registry!))
-             conveyed (if generation
-                        (tuple :"$bl_conveyed_generation" (BeamLisp.Env/capture) mod arg)
-                        (tuple :"$bl_conveyed_env" (BeamLisp.Env/capture) arg))
              name (if (erlang/is_map opts)
                     (let [n (Map/get opts :name)]
                       (cond
@@ -461,7 +428,7 @@
                        (if (erlang/== nil t) (list) (list (tuple :timeout t))))
                      (list))]
          (unwrap
-           (native_start :start name mod conveyed gopts)))))))
+           (native_start :start name mod arg gopts)))))))
 
 ; ── the verbs, and the registry resolution they share ────────────────────────
 

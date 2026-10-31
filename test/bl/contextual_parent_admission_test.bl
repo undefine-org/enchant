@@ -1,0 +1,76 @@
+; These controls reserve only a preparation. No fixture map/profile or SDK grant
+; is installed, and no application instruction is executed.
+(ns contextual-parent-admission-test (:require [reload.execution :as execution]))
+(defn- owner-call [name args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "reload.execution" name) (to-list args)))
+(defn- reserve [digest] (owner-call "reserve-contextual-preparation!" [digest]))
+(defn- rows [] @(BeamLisp.Env/fetch_exact! "reload.execution" "prepared"))
+(defn- reason [action] (try (action) :unexpected-success (catch e (:kind (ex-data e)))))
+(defn- cleanup [reservation]
+ (when reservation
+  (owner-call "abandon-preparation!" [(:key reservation)])
+  (BeamLisp.Env/destroy (:scope reservation))))
+
+(deftest child-reservation-is-visible-in-the-original-owner-before-publication
+ (let [parent (BeamLisp.Env/fork) reservation (atom nil) before (rows)]
+  (try
+   (reset! reservation (BeamLisp.Env/with_env parent #(reserve "captured-digest")))
+   (let [key (:key @reservation) row (get (rows) key)]
+    (is (= parent (first key)))
+    (is (= :contextual-unit (second key)))
+    (is (= "captured-digest" (nth key 2)))
+    (is (= (:scope @reservation) (nth key 3)))
+    (is (not= parent (:scope @reservation)))
+    (is (= {:phase :preparing :owner (erlang/self)} (select-keys row [:phase :owner])))
+    (is (nil? (execution/prepared-generation key)))
+    (is (= parent (BeamLisp.Env/with_env (:scope @reservation) #(second (BeamLisp.Env/chain))))))
+   (finally (cleanup @reservation) (BeamLisp.Env/destroy parent)))
+  (is (= before (rows)))))
+
+(deftest a-destroyed-parent-cannot-create-a-later-child-reservation
+ (let [parent (BeamLisp.Env/fork) before (rows) reservation (atom nil)]
+  (try
+   (BeamLisp.Env/destroy parent)
+   (is (= :retired-preparation-parent
+          (reason #(BeamLisp.Env/with_env parent
+                     (fn [] (reset! reservation (reserve "closed-parent")))))))
+   (is (nil? @reservation))
+   (is (= before (rows)))
+   (finally (cleanup @reservation) (BeamLisp.Env/destroy parent)))))
+
+(deftest parent-destruction-serializes-with-an-actual-in-flight-child-publisher
+ (let [parent (BeamLisp.Env/fork) caller (erlang/self) ticket (erlang/make_ref)
+       worker (atom nil) before (rows)
+       target (tuple :Elixir.BeamLisp.Env :with_scope_commit 2)]
+  (try
+   (erlang/trace_pattern target true (list :local))
+   (BeamLisp.Env/with_scope_commit parent
+    (fn []
+     (reset! worker
+      (erlang/spawn (fn []
+       (receive [:reserve seen] :when (= seen ticket) nil)
+       (let [reservation (atom nil)]
+        (try
+         (let [result (reason #(BeamLisp.Env/with_env parent
+                                (fn [] (reset! reservation (reserve "in-flight")))))]
+          (erlang/send caller [:result ticket result]))
+         (finally (cleanup @reservation)))))))
+     (let [pid @worker]
+     (erlang/trace pid true (list :call (tuple :tracer caller)))
+     (erlang/send @worker [:reserve ticket])
+     ;; Trace proves the worker reached the actual parent commit call, after
+     ;; child allocation. It cannot publish while this parent fence is held.
+     (is (= :at-parent-fence
+            (receive [:trace seen :call mfa]
+              :when (= seen pid)
+               (if (= parent (first (elem mfa 2))) :at-parent-fence :wrong-scope)
+              (after 5000 :missing))))
+     (is (= before (rows)))
+     (BeamLisp.Env/destroy parent))))
+   (is (= :retired-preparation-parent
+          (receive [:result seen result] :when (= seen ticket) result (after 5000 :missing))))
+   (is (= before (rows)))
+   (finally
+    (when (and @worker (Process/alive? @worker)) (Process/exit @worker :kill))
+    (erlang/trace_pattern target false (list :local))
+    (BeamLisp.Env/destroy parent)))))

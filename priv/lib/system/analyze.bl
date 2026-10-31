@@ -111,7 +111,7 @@
                                  (concat (list (typed/sym-node "fn")
                                                (typed/->tuple [:vector '()]))
                                          code))])
-              compiled (c/compile-node fn-form (c/new-env "system.analyze.program"))
+              compiled (c/compile fn-form (c/new-env "system.analyze.program"))
               clause (first (peeled-clauses compiled))]
           {:params [] :body (:body clause)})
         (catch _e nil)))))
@@ -121,7 +121,7 @@
    the body on every call that reaches it, so its calls and effects belong to
    the clause: the body is `(do guard body)` when a guard is present."
   [cl]
-  {:params (map :name (:pats cl))
+  {:params (apply list (map :name (:pats cl)))
    :body (if (some? (:guard cl))
            {:op :do :stmts (list (:guard cl) (:body cl))
             :ann (merge (:ann (:guard cl))
@@ -136,7 +136,7 @@
    and `analyze` unions the summaries. :params/:body are the FIRST clause, kept
    for consumers that read a single body (system.incr, system.linear)."
   [src]
-  (let [forms (BeamLisp.Reader/read_string src)
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
         defns (reduce
     (fn [m form]
       (if (contains? #{"defn" "defn-"} (headname form))
@@ -150,7 +150,7 @@
                         [:list (apply list
                           (concat (list (typed/sym-node "fn"))
                                   (map :node parsed)))])
-              compiled (c/compile-node fn-form (c/new-env "system.analyze.program"))
+              compiled (c/compile fn-form (c/new-env "system.analyze.program"))
               clauses (peeled-clauses compiled)]
           ;; A peel miss used to store {:params nil :body nil} and say nothing:
           ;; every analysis over that fn then agreed with every other, and a
@@ -176,14 +176,22 @@
   "Compile every program body in one isolated definition environment. All
    top-level bindings shadow ambient core links before any body is compiled."
   [src]
-  (let [environment (BeamLisp.Env/fork)]
+  (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+        environment (BeamLisp.Env/fork)]
     (try
       (BeamLisp.Env/with_env environment
         (fn []
-          (doseq [name (bound-top-names src)]
+          ;; Resolve authored aliases from the captured input, not whatever a
+          ;; prior request happened to publish under a short prefix. Header
+          ;; capture does not evaluate ns/require or initialize any provider.
+          (when (= "ns" (headname (first forms)))
+            (doseq [[_ header] (BeamLisp.AOT/namespace_header (first forms))
+                    pair (:aliases header)]
+              (BeamLisp.Env/add_alias "system.analyze.program" (elem pair 0) (elem pair 1))))
+          (doseq [name (bound-top-names forms)]
             (BeamLisp.Env/put_link "system.analyze.program" name
                                  (tuple :analysis-program {} nil)))
-          (program-bodies src)))
+          (program-bodies forms)))
       (finally (BeamLisp.Env/destroy environment)))))
 
 (defn- clauses-of
@@ -246,13 +254,15 @@
                 f1 (into [] targets)))
     :else (reduce (fn [fl ch] (flow-step defns fl fname ch)) flow (ir/child-nodes node))))
 
-(defn- flow-facts [defns]
+(defn- flow-facts [defns limit]
   (loop [flow {} n 0]
     (let [next (reduce (fn [fl [fname d]]
                          (reduce (fn [fl2 b] (flow-step defns fl2 fname b))
                                  fl (map :body (clauses-of d))))
                        flow (into [] defns))]
-      (if (or (= next flow) (> n 8)) next (recur next (inc n))))))
+      (cond (= next flow) {:facts next :complete true :rounds (inc n)}
+            (>= n limit) {:facts next :complete false :rounds (inc n)}
+            :else (recur next (inc n))))))
 
 ; ── the summary fixpoint ─────────────────────────────────────────────────
 ;
@@ -302,7 +312,7 @@
                                     (when (= :symbol (typed/node-tag nf)) (typed/node-name nf))))
                           (if (= head "declare") (rest its) (take 1 (rest its)))))
           acc)))
-    #{} (BeamLisp.Reader/read_string src)))
+    #{} (if (string? src) (BeamLisp.Reader/read_string src) src)))
 
 (defn- core-pure-resolver
   "The program-aware half of the core purity table: a first-order core value
@@ -425,9 +435,26 @@
 (defn prepare-program
   "Compile once and collect whole-program flow/shadowing evidence. Callers must
    bind reuse to both normalized bodies and the analysis implementation generation."
-  [src]
-  (let [bodies (fn-bodies src)]
-    {:bodies bodies :flow (flow-facts bodies) :shadowed (bound-top-names src)}))
+  ([src] (prepare-program src {}))
+  ([src options]
+  (let [limit (:flow-limit options 8)]
+    (when-not (and (int? limit) (<= 0 limit 256))
+      (throw (ex-info "Invalid analysis flow limit" {:flow-limit limit})))
+    (let [forms (if (string? src) (BeamLisp.Reader/read_string src) src)
+          bodies (fn-bodies forms)
+          flow (flow-facts bodies limit)
+          expected (set (keep (fn [form]
+                          (when (contains? #{"defn" "defn-"} (headname form))
+                            (typed/node-name (typed/node-form (second (typed/node-items (typed/node-form form))))))) forms))
+          missing (vec (sort (filter #(not (contains? bodies %)) expected)))
+          top? (some #(not (contains? top-skip-heads (or (headname %) ""))) forms)
+          top-complete (or (not top?) (ir/node? (:body (get bodies top-name))))]
+      {:forms forms :bodies bodies :flow (:facts flow)
+       :flow-complete? (:complete flow) :flow-rounds (:rounds flow)
+       :coverage {:definitions (count expected) :missing missing
+                  :top-level-complete (boolean top-complete)
+                  :complete (and (empty? missing) top-complete (:complete flow))}
+       :shadowed (bound-top-names forms)}))))
 
 (defn- global-dependencies [n]
   (if-not (ir/node? n) #{}
@@ -506,7 +533,10 @@
                                       (contains? fps2 callee-name) (get fps2 callee-name)
                                       :else (core callee-name)))
                 lat (latent-table defns final-resolve)]
-            {:locals locals :rounds (inc n) :summaries
+            {:locals locals :rounds (inc n) :converged? converged
+             :coverage (assoc (:coverage program) :summaries-complete converged
+                         :complete (and (= true (get-in program [:coverage :complete])) converged))
+             :summaries
              (reduce (fn [m name]
                       (let [loc (settle-applied (get locals name) (get lat name))
                             resolved (reduce (fn [s k] (into s (resolve-calls defns flow k)))

@@ -1,0 +1,116 @@
+; Genuine managed Source roundtrip and a private copy of the actual dispatch
+; admission guard. No live SDK definition or registration payload is replaced.
+(ns proc.callback-handle-boundary-test
+ (:require [reload.generation :as g] [proc.callback :as callback]
+           [proc.dispatch :as dispatch] [proc.admission :as admission]))
+
+(deftest managed-source-roundtrips-an-opaque-registration-without-a-wrapper
+ (let [graph (g/prepare!
+              {:application-id "callback-handle-source-roundtrip"
+               :native-modules #{"erlang"}
+               :stable-namespaces #{"proc.callback"}
+               :sources {"callback.handle.app"
+                "(ns callback.handle.app (:require [proc.callback :as callback]))
+                 (defn register [] (callback/register! (fn [] :source-callback)))
+                 (defn observe [handle] [(erlang/is_function handle) (callback/active? handle)])
+                 (defn invoke [handle] (callback/invoke! handle []))
+                 (defn close [handle] (callback/unregister! handle))"}})
+       retained (atom nil)]
+  (try
+   (let [handle (g/invoke! graph "callback.handle.app/register" [])]
+    (reset! retained handle)
+    (is (= 3 (erlang/tuple_size handle)))
+    (is (= :bl-execution (elem handle 0)))
+    (is (= (erlang/self) (elem handle 1)))
+    (is (erlang/is_reference (elem handle 2)))
+    (is (= [false true] (g/invoke! graph "callback.handle.app/observe" [handle])))
+    (is (= :source-callback (g/invoke! graph "callback.handle.app/invoke" [handle])))
+    (g/invoke! graph "callback.handle.app/close" [handle])
+    (is (= [false false] (g/invoke! graph "callback.handle.app/observe" [handle])))
+    (let [held (g/invoke! graph "callback.handle.app/register" [])]
+     (reset! retained held)
+    ;; Retirement must see the actual retained Source callback, rather than
+    ;; merely the absence of any public function field on its handle.
+    (is (= :waiting (:status (g/retire! graph))))
+    (is (= true (callback/active? held)))
+    (is (= :source-callback (callback/invoke! held [])))
+    ;; A pending retirement may no longer admit a new g/invoke!. Close through
+    ;; the existing registration owner, then prove physical retirement finishes.
+    (callback/unregister! held)
+    (is (= false (callback/active? held)))
+    (is (= :retired (:status (g/retire! graph))))))
+   (finally
+    (when @retained (callback/unregister! @retained))
+    (g/retire! graph)))))
+
+(defn- dispatch-form [source function]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source)
+              #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                    (= function (BeamLisp.AOT/stage-symbol
+                                  (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 1 (count forms)) (throw :dispatch-private-form-drift))
+  (let [position (BeamLisp.FormMeta/meta (first forms))]
+   (String/slice source (:offset position) (- (:end-offset position) (:offset position))))))
+
+(defn- dispatch-probes [scope]
+ (let [source (File/read! (BeamLisp.Loader/source_path "proc.dispatch"))
+       body (dispatch-form source "prepare!")
+       before "(nil? (:registration job))"
+       after "(and (nil? (:registration job)) (erlang/is_function source))"
+       dependencies (mapv #(dispatch-form source %) ["plain-map?" "field" "row" "save!" "same-slot?"])
+       suffix (str (erlang/unique_integer (list :positive)))]
+  (when-not (= 2 (count (String/split body before))) (throw :dispatch-function-shape-anchor-drift))
+  (BeamLisp.Env/with_env scope
+   #(mapv
+     (fn [historical?]
+      (let [namespace (str "history.dispatch.handle." suffix "." (if historical? "shape" "native"))]
+       (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+       (doseq [definition dependencies] (BeamLisp.Compiler/eval_string definition))
+       (BeamLisp.Compiler/eval_string (if historical? (String/replace body before after) body))
+       (BeamLisp.Env/fetch_exact! namespace "prepare!"))) [false true]))))
+
+(deftest actual-dispatch-reservation-accepts-native-lineage-not-function-shape
+ (let [server (start dispatch/dispatcher {:table :callback-handle-boundary-reservations-test
+                                         :limit 1 :max-pending 2})
+       original (callback/register! (fn [] :not-invoked-during-preparation))
+       request (admission/token (erlang/self) 30000)
+       reserved (call server [:reserve {:id :opaque-handle :request request
+                          :replay-safe? false :max-restarts 0
+                          :lease-rows (BeamLisp.Execution/observe original 'code-rows)}])
+       prepared (callback/prepare-transfer! original (:owner reserved))
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))
+       live (BeamLisp.Env/fetch_exact! "proc.dispatch" "prepare!")]
+  (try
+   (is (= :reserved (:status reserved)))
+   (is (= false (erlang/is_function original)))
+   (let [st (erlang/apply :sys :get_state (list server))
+         before (ets/lookup (:table st) :opaque-handle)
+         [current function-shaped] (dispatch-probes scope)
+         args (list st :opaque-handle (:ticket reserved) prepared
+                    (tuple (erlang/self) (erlang/make_ref)))]
+    ;; The old defect checked function shape on a public invocation field.
+    ;; Today's handle has no such field; this equivalent requirement restores
+    ;; that causal mechanism, not the obsolete record representation.
+    (is (= [{:status :refused :kind :invalid-dispatch-handoff} st]
+           (BeamLisp.Ns.Rt/invoke function-shaped args)))
+    (is (= before (ets/lookup (:table st) :opaque-handle)))
+    (is (= :pending (:status (BeamLisp.Execution/handoff-status prepared))))
+    (is (= true (callback/active? original)))
+    (is (= false (callback/active? (:accepted prepared))))
+    (is (= [{:status :prepared} st] (BeamLisp.Ns.Rt/invoke current args)))
+    (let [slot (elem (first (ets/lookup (:table st) :opaque-handle)) 1)]
+     (is (= (:accepted prepared) (:registration slot)))
+     (is (= original (:source-registration slot))))
+    ;; Indexing changes neither admission nor ownership. Native acceptance is
+    ;; still pending, and neither copy runs the application callback.
+    (is (= :pending (:status (BeamLisp.Execution/handoff-status prepared))))
+    (is (= true (callback/active? original)))
+    (is (= false (callback/active? (:accepted prepared))))
+    (is (= live (BeamLisp.Env/fetch_exact! "proc.dispatch" "prepare!"))))
+   (finally
+    ;; Use the actual actor to discharge its real reservation/watch/timer.
+    (call server [:abort :opaque-handle (:ticket reserved)])
+    (callback/unregister! original)
+    (callback/unregister! (:accepted prepared))
+    (stop server)
+    (BeamLisp.Env/destroy scope)))))

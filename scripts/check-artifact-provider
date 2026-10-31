@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Run actual artifact selectors in one explicitly supplied Source-component image.
+
+Invoke under a systemd memory/time cap. This checks the backend and its Source
+consumer; it does not qualify a compiler floor, SDK, or supported-target matrix.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCES = ['priv/build/artifact.bl', 'priv/build/artifact-process.bl',
+           'priv/build/build.bl', 'priv/std/vm/native.bl', 'nix/native-artifact.nix',
+           'nix/native-source.nix', 'flake.lock', 'test/bl/artifact_provider_test.bl',
+           'test/scripts/artifact-provider-driver.bl', 'test/scripts/execution-history-driver.bl',
+           'scripts/check-artifact-provider', 'priv/tasks/artifacts.bl',
+           'priv/std/bl/artifacts.bl', 'priv/std/bl/cli.bl',
+           'test/scripts/artifact-showcase-driver.bl', 'examples/artifacts/showcase.bl',
+           'examples/artifacts/src/artifact/showcase.bl',
+           'examples/artifacts/native/artifact_demo/Cargo.toml',
+           'examples/artifacts/native/artifact_demo/Cargo.lock',
+           'examples/artifacts/native/artifact_demo/src/lib.rs', 'priv/build/claim.bl',
+           'nix/command-executor.nix', 'nix/artifact-platform.nix', 'nix/prepare-platform.nix',
+           'scripts/test-prerequisites.json', 'scripts/test_prerequisites.py', 'nix/native-snapshot.nix']
+BOOT = '''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [], do: {:ok, _} = Application.ensure_all_started(app)
+:ok = BeamLisp.LazyMemo.ensure_loaded!()
+BeamLisp.AOT.boot()
+identity = %{scope: "source-component", root: BeamLisp.Tiers.priv_root(),
+             loaded_native: BeamLisp.LazyMemo.runtime_identity!(),
+             host_md5: Base.encode16(BeamLisp.LazyMemo.module_info(:md5), case: :lower)}
+File.write!(Path.join(System.fetch_env!("BL_ARTIFACT_OUTPUT_DIR"), "identity.json"), Jason.encode!(identity))
+BeamLisp.run_file(System.fetch_env!("BL_ARTIFACT_DRIVER"))
+BeamLisp.run_file(Path.join(System.fetch_env!("BL_ARTIFACT_SOURCE_ROOT"), "test/scripts/artifact-showcase-driver.bl"))
+'''
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--image', required=True, type=Path,
+                        help='complete component application directory with ebin/ and matching priv/')
+    parser.add_argument('--out', required=True, type=Path, help='absent output directory')
+    parser.add_argument('--native-output', required=True, type=Path)
+    parser.add_argument('--platform', type=Path, default=ROOT)
+    parser.add_argument('--elixir', default=shutil.which('elixir'))
+    parser.add_argument('--dependencies', type=Path, default=ROOT / '.bl/lib')
+    args = parser.parse_args()
+    image, out = args.image.resolve(), args.out.absolute()
+    if not args.elixir or not (image / 'ebin/Elixir.BeamLisp.LazyMemo.beam').is_file():
+        parser.error('explicit complete component image and Elixir prerequisite required')
+    if os.path.lexists(out):
+        parser.error('output must be absent; preserve earlier evidence')
+    for relative in SOURCES[:4]:
+        image_path = image / relative
+        if not image_path.is_file() or sha(image_path) != sha(ROOT / relative):
+            parser.error('component source differs: ' + relative)
+    for relative in ['nix/native-artifact.nix', 'nix/native-source.nix', 'nix/native-snapshot.nix', 'flake.lock']:
+        if sha(args.platform / relative) != sha(ROOT / relative):
+            parser.error('artifact platform differs: ' + relative)
+    import runpy
+    runpy.run_path(str(ROOT / 'scripts/test_prerequisites.py'))['require'](
+        ROOT, ['test/scripts/artifact-provider-driver.bl'])
+    out.mkdir(parents=True)
+    frozen = {relative: sha(ROOT / relative) for relative in SOURCES}
+    frozen['native-output/artifact.json'] = sha(args.native_output / 'artifact.json')
+    frozen['native-output/lib/lazy_memo.so'] = sha(args.native_output / 'lib/lazy_memo.so')
+    host = image / 'ebin/Elixir.BeamLisp.LazyMemo.beam'
+    frozen['component-host'] = sha(host)
+    runtime_native = image / 'priv/native/lazy_memo.so'
+    frozen['runtime-native'] = sha(runtime_native)
+    beams = {path.name: sha(path) for path in sorted((image / 'ebin').glob('*.beam'))}
+    frozen['component-beams'] = beams
+    (out / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
+    preflight = "\nfor path <- " + json.dumps([str(ROOT / p) for p in SOURCES[:4] + ["priv/build/claim.bl"]]) + ", do: BeamLisp.Reader.read_string(File.read!(path), path)\nBeamLisp.Loader.ensure_loaded(\"vm.native\")\n"
+    boot = BOOT.replace('BeamLisp.run_file(', preflight + 'BeamLisp.run_file(')
+    (out / 'boot.exs').write_text(boot)
+    command = [args.elixir, '--erl', '+S 2:2 +SDcpu 1:1 +SDio 1']
+    for ebin in sorted(args.dependencies.glob('*/ebin')):
+        if not ebin.parent.name.startswith('beam_lisp-'):
+            command += ['-pa', str(ebin.resolve())]
+    command += ['-pa', str(image / 'ebin'), str(out / 'boot.exs')]
+    env = {**os.environ, 'BL_ROOT': str(image), 'BL_DAEMON': 'off', 'BEAM_LISP_AOT_CACHE': 'off',
+           'BL_ARTIFACT_SOURCE_ROOT': str(ROOT), 'BL_ARTIFACT_PLATFORM': str(args.platform.resolve()),
+           'BL_ARTIFACT_OUTPUT_DIR': str(out), 'BL_ARTIFACT_DRIVER': str(ROOT / SOURCES[8]),
+           'BL_ARTIFACT_TEST_OUTPUT': str(args.native_output.resolve()), 'BL_ARTIFACT_INTEGRATION': '1'}
+    started = time.monotonic()
+    with (out / 'execution.log').open('w') as log:
+        result = subprocess.run(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=180)
+    for relative in SOURCES:
+        if sha(ROOT / relative) != frozen[relative]:
+            raise RuntimeError('source changed during qualification: ' + relative)
+    if sha(runtime_native) != frozen['runtime-native'] or beams != {
+            path.name: sha(path) for path in sorted((image / 'ebin').glob('*.beam'))}:
+        raise RuntimeError('component runtime bytes changed during qualification')
+    if sha(host) != frozen['component-host']:
+        raise RuntimeError('component host changed during qualification')
+    tests = json.loads((out / 'tests.json').read_text()) if (out / 'tests.json').exists() else {}
+    showcase = json.loads((out / 'showcase.json').read_text()) if (out / 'showcase.json').exists() else {}
+    accepted = (result.returncode == 0 and tests.get('status') == 'passed' and tests.get('tests')
+                and showcase.get('answer') == 42 and showcase.get('prepare') == 0)
+    receipt = {'scope': 'source-component', 'status': 'passed' if accepted else 'failed',
+               'seconds': round(time.monotonic() - started, 3), 'exit': result.returncode,
+               'image': str(image), 'platform': str(args.platform.resolve()), 'assertions': sum(t['pass'] for t in tests.get('tests', [])),
+               'inputs_sha256': sha(out / 'inputs.json'), 'log_sha256': sha(out / 'execution.log'),
+               'showcase': showcase, 'sdk_or_floor_qualified': False}
+    (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    print(json.dumps(receipt))
+    return 0 if accepted else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

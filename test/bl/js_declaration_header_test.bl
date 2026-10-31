@@ -1,0 +1,58 @@
+(ns js-declaration-header-test
+ (:require [js.build :as build] [lower :as lower]))
+
+(defn- forms [text] (BeamLisp.Reader/read_string text "js-declaration-header.bl"))
+(defn- value [form]
+ (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env "js.header.value")))
+(defn- fixture [source action]
+ (let [root (Path/join (System/tmp_dir!) (str "js-header-" (erlang/unique_integer (list :positive))))
+       path (Path/join root "unit.bl")]
+  (File/mkdir_p! root) (File/write! path source)
+  (try (BeamLisp.Env/isolated #(action path))
+   (finally (File/rm_rf! root)))))
+
+(deftest declaration-visibility-and-values-follow-the-shared-compiler-header
+ (let [rows (build/definition-values
+             (forms "(defn hidden \"documented\" {:private true} [x] x)
+                     (defn ^:private exposed {:private false} [x] x)
+                     (def ^:private answer \"constant\" 42)"))]
+  (is (= ["hidden" "exposed" "answer"] (mapv :name rows)))
+  (is (= [true false true] (mapv :private? rows)))
+  (is (= [:fn :fn :val] (mapv :kind rows)))
+  (is (= 42 ((value (:form (first rows))) 42)))
+  (is (= 42 (value (:form (last rows)))))))
+
+(deftest js-export-metadata-uses-canonical-private-attribute-maps
+ (fixture "(ns js.header.exports)
+           (defn hidden {:private true} [x] x)
+           (defn visible [x] x)"
+  (fn [path]
+   (let [compiled (build/compile-ns path) metadata (build/native-module-metadata compiled)]
+    (is (= [true false] (mapv :private? (:defs compiled))))
+    (is (= #{"visible"} (set (keys (get metadata "exports")))))
+    (is (= [1] (get-in metadata ["exports" "visible" "arities"])))))))
+
+(deftest projection-never-executes-metadata-or-value-initializers
+ (try
+  (Process/delete :js-header-effect)
+  (let [rows (build/definition-values
+              (forms "(defn hidden {:private true :audit (Process/put :js-header-effect :metadata)} [x] x)
+                      (def value (Process/put :js-header-effect :initializer))"))]
+   (is (= true (:private? (first rows))))
+   (is (= nil (Process/get :js-header-effect))))
+  (is (try (build/definition-values (forms "(def value 1 2)")) false (catch _ true)))
+  (finally (Process/delete :js-header-effect))))
+
+(deftest staged-helpers-keep-overloaded-dispatch-after-canonical-header-projection
+ (fixture "(ns js.header.macros)
+           (defn route \"helper\" {:private true}
+             ([x] (route x 1)) ([x y] (list 'erlang/+ x y)))
+           (defmacro bump [x] (route x))
+           (defn answer [] (bump 41))"
+  (fn [path]
+   (let [compiled (build/compile-ns path)
+         answer (first (filter #(= "answer" (:name %)) (:defs compiled)))
+         callback (lower/eval-anf :Elixir.JsHeaderMacro (:node answer))]
+    (is (= 42 (callback)))
+    (is (= true (:private? (first (:defs compiled)))))
+    (is (= #{"answer"} (set (keys (get (build/native-module-metadata compiled) "exports")))))))))

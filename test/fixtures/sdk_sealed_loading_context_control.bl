@@ -1,0 +1,212 @@
+;; Parent launches a fresh bare native bootstrap against an unchanged-byte SDK
+;; receiver with SDK Source removed. This file lives OUTSIDE that receiver.
+;; No SDK namespace flags, bindings, manifests or custody rows are modified.
+;; The Source preinit helper hashes host Sources and is deliberately inapplicable
+;; here. Use the packaged compiler key and byte-bound pipeline proof below.
+(assert (= (elem (BeamLisp.Bootstrap/packaged_keys!) 0)
+           (BeamLisp.AOTCache/current_compiler_key)))
+(ns fixture.sdk-sealed-loading-context-control
+ (:require [reload.generation :as g] [proc.server :as server]))
+
+(def TARGET "proc.reg")
+(def PROBE :Elixir.SdkSealedLoadingContextControl)
+
+(defn- helper! [mutated?]
+ (let [root (System/fetch_env! "BL_TEST_SOURCE_ROOT")
+       source (File/read! (Path/join root "priv/host/loader.bl"))
+       digest (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower)))
+       _ (assert (= digest (BeamLisp.AOT/normalized_attribute
+                             (BeamLisp.Loader/module_info :attributes) :bl_source_hash)))
+       selected
+       (loop [stream (BeamLisp.Ns.Reader/stream source "priv/host/loader.bl") found []]
+        (let [read (BeamLisp.Ns.Reader/read-next-string stream)]
+         (if (= :ok (first read))
+          (let [form (second read) text (nth read 2)]
+           (recur (nth read 3)
+            (if (String/starts_with? text "(defn- ensure_loaded_in")
+             (conj found {:text text :span (select-keys (BeamLisp.FormMeta/meta form) [:offset :end-offset])}) found)))
+          (do (assert (= 1 (count found))) (first found)))))
+       body (:text selected) anchor "(BeamLisp.AOT/sdk_library_unit? ns)"
+       historical "(let [path (source_path ns)] (and path (BeamLisp.AOT/sdk_library_source? ns path)))"
+       _ (assert (= 2 (count (String/split body anchor))))
+       changed (if mutated? (String/replace body anchor historical) body)
+       forwards
+       "(defn assert_initialization_allowed! [x] (BeamLisp.Loader/assert_initialization_allowed! x))\n(defn source_path [x] (BeamLisp.Loader/source_path x))\n(defn extra_dirs [] (BeamLisp.Loader/extra_dirs))\n(defn realm_facts [] (BeamLisp.Loader/realm_facts))\n(defn optional_timing [] (BeamLisp.Loader/optional_timing))\n(defn with_declaration_snapshot [f] (BeamLisp.Loader/with_declaration_snapshot f))\n(defn ensure_loaded_locked [x] (BeamLisp.Loader/ensure_loaded_locked x))\n(defn restore-pdict [k v] (BeamLisp.Loader/restore-pdict k v))\n"
+       scratch (Path/join (System/tmp_dir!) (str "sdk-sealed-loader-control-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! scratch)
+  (try
+   (let [path (Path/join scratch "loader-control.bl")]
+    (File/write! path (str "(ns fixture.sdk-sealed-loader-native)\n" forwards changed))
+    (BeamLisp.AOT/compile_host_file path
+     (list (tuple :module PROBE) (tuple :output_dir scratch) (tuple :load? true)))
+    (println :sealed-sdk-loader-control-source
+     {:source-sha256 digest :reader-span (:span selected)
+      :component-sha256 (Base/encode16 (crypto/hash :sha256 (File/read! path)) (list (tuple :case :lower)))
+      :mutation (if mutated? :restore-historical-source-only-recognition :none)}))
+   (finally (File/rm_rf! scratch)))))
+
+(defn- reason [error]
+ (let [original (BeamLisp.ExInfo/ex_original error)]
+  ;; Diagnostics must not dump a graph/context embedded in an exception.
+  (cond (keyword? original) original
+        (tuple? original) (elem original 0)
+        (map? original) (or (:kind original) (:__struct__ original) :map-error)
+        :else :other-error)))
+
+(defn- context []
+ {:scope (BeamLisp.Env/env_id) :generation (g/current)
+  :origin (BeamLisp.Env/execution_origin) :lease (Process/get :bl_executing_code_lease)})
+
+(defn- observed-load [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       patterns [(tuple :Elixir.BeamLisp.Env :load_sdk_library! 1)
+                 (tuple :Elixir.BeamLisp.AOT :ensure_loaded 1)
+                 (tuple :Elixir.BeamLisp.Loader :ensure_build_aot 2)
+                 (tuple :Elixir.BeamLisp.Loader :ensure_loaded_source 1)
+                 (tuple :Elixir.BeamLisp.AOT :compile_sdk_source! 3)]
+       tracer (erlang/spawn
+                (fn []
+                 (loop [counts {:target {} :source-compilation-total 0}]
+                  (receive
+                   [:trace _ :call [module function arguments]]
+                    (let [next (if (= TARGET (first arguments))
+                                 (update-in counts [:target [module function]] (fnil inc 0)) counts)]
+                     (recur (if (and (= module :Elixir.BeamLisp.AOT) (= function :compile_sdk_source!))
+                              (update next :source-compilation-total inc) next)))
+                   [:finish seen] :when (= ticket seen)
+                    (erlang/send parent [:sealed-loading-counts ticket counts])
+                   _ (recur counts)))))]
+  (doseq [pattern patterns] (erlang/trace_pattern pattern true (list :local)))
+  (erlang/trace :all true (list :call (tuple :tracer tracer)))
+  (try
+   (let [outcome (try (action) {:status :returned}
+                  (catch error {:status :refused :reason (reason error)}))
+         barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= barrier seen) :ready
+     (after 5000 (throw :sealed-loading-trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [outcome (receive [:sealed-loading-counts seen counts] :when (= ticket seen) counts
+              (after 5000 (throw :sealed-loading-trace-timeout)))])
+   (finally
+    (erlang/trace :all false (list :call))
+    (doseq [pattern patterns] (erlang/trace_pattern pattern false (list :local)))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+
+(defn- callable-usable? []
+ (try
+  ;; The real compiled export contributes pure registry state; no fake server
+  ;; or manually inserted vocabulary is needed to prove callable usability.
+  (let [init (BeamLisp.Env/with_env :global #(BeamLisp.Env/fetch_exact! TARGET "init-state"))
+        state (BeamLisp.Ns.Rt/invoke init (list [:sid]))]
+   (and (= {} (:entries state)) (= [:sid] (:keys state))
+        (= {:sid {}} (:indexes state)) (= {} (:registry-monitors state))))
+  (catch _ false)))
+
+(defn- selected-source-keeps-precedence! []
+ (let [directory (Path/join (System/tmp_dir!)
+                   (str "sealed-sdk-shadow-" (erlang/unique_integer (list :positive))))
+       source (Path/join directory "proc/reg.bl") marker (Path/join directory "must-not-run")]
+  (try
+   (File/mkdir_p! (Path/dirname source))
+   (File/write! source (str "(ns proc.reg) (File/write! " (pr-str marker) " \"wrong\")"))
+   (BeamLisp.Loader/with_search_dir directory
+    (fn []
+     (assert (= source (BeamLisp.Loader/source_path TARGET)))
+     (assert (not (BeamLisp.AOT/sdk_library_unit? TARGET)))
+     (assert (not (File/exists? marker)))))
+   (finally (File/rm_rf! directory)))))
+
+(let [mode (or (System/get_env "BL_TEST_SDK_SEALED_LOADING_CONTROL") "original")
+      _ (assert (contains? #{"original" "copied-original" "source-only-redirect"} mode))
+      root (BeamLisp.Tiers/priv_root)
+      source-files (vec (concat (Path/wildcard (Path/join root "**/*.bl"))
+                               (Path/wildcard (Path/join root "**/*.bl.md"))))
+      compiled? (BeamLisp.AOT/sdk_unit_compiled? TARGET)
+      pipeline (BeamLisp.AOT/sdk_pipeline_identity! TARGET)
+      before-loaded? (BeamLisp.Env/loaded_ns? TARGET)
+      before-registration? (contains? @server/registry :registry)
+      loader-md5 (BeamLisp.Loader/module_info :md5)
+      env-md5 (BeamLisp.Env/module_info :md5)]
+ (println :sealed-sdk-loading-preconditions
+  {:root root :sdk-index-present (File/regular? (Path/join root "sdk-code.term"))
+   :source-file-count (count source-files) :target-compiled compiled?
+   :pipeline-kind (:kind pipeline) :pipeline-unit-count (count (:units pipeline))
+   :target-loaded before-loaded? :registry-clause-present before-registration?})
+ (assert (File/regular? (Path/join root "sdk-code.term")))
+ (assert (= [] source-files))
+ ;; sdk_unit_compiled? also requires loaded members; false before init is valid.
+ (assert (= :sealed-sdk-pipeline (:kind pipeline)))
+ (assert (some (fn [unit] (= TARGET (:namespace unit))) (:units pipeline)))
+ (assert (BeamLisp.AOT/sdk_library_unit? TARGET))
+ (assert (not (BeamLisp.AOT/sdk_library_unit? "unowned.sdk-lookalike")))
+ (assert (not (BeamLisp.AOT/sdk_library_unit? "core")))
+ (selected-source-keeps-precedence!)
+ (assert (= false (BeamLisp.Env/loaded_ns? TARGET)))
+ (assert (= false before-loaded?))
+ (assert (= false before-registration?))
+ (when (not= "original" mode) (helper! (= "source-only-redirect" mode)))
+ (assert (nil? (BeamLisp.Loader/source_path TARGET)))
+ (assert (= false (BeamLisp.Env/loaded_ns? TARGET)))
+ (assert (= false (contains? @server/registry :registry)))
+ (let [graph (try (g/prepare! {:application-id "sealed-sdk-loading-context-control"
+                         :sources {"sealed.sdk.loading.application"
+                                   "(ns sealed.sdk.loading.application) (defn value [] 42)"}})
+              (catch error
+               (println :sealed-sdk-graph-preparation-refusal
+                {:data (ex-data error) :reason (reason error)})
+               (throw error)))]
+  (try
+   ;; Never clear flags if preparation begins initializing this target later.
+   (println :sealed-sdk-loading-after-preparation
+    {:target-loaded (BeamLisp.Env/loaded_ns? TARGET)
+     :registry-clause-present (contains? @server/registry :registry)})
+   (assert (= false (BeamLisp.Env/loaded_ns? TARGET)))
+   (assert (= false (contains? @server/registry :registry)))
+   (let [result
+         (g/with! graph
+          (fn []
+           (let [before (context)
+                 [outcome counts] (observed-load
+                                   #(if (= "original" mode) (BeamLisp.Loader/ensure_loaded TARGET)
+                                      (erlang/apply PROBE :ensure_loaded_in (list TARGET nil))))]
+            {:outcome outcome :counts counts :caller-restored (= before (context))})))
+         _ (println :sealed-sdk-loading-attempt result)
+         retirement (g/retire! graph)
+         loaded? (BeamLisp.Env/with_env :global #(BeamLisp.Env/loaded_ns? TARGET))
+         registered? (contains? @server/registry :registry)
+         ready? (BeamLisp.AOT/sdk_unit_callable_ready? TARGET)
+         compiled-after? (BeamLisp.AOT/sdk_unit_compiled? TARGET)
+         usable? (and loaded? (callable-usable?))
+         immutable? (and (= loader-md5 (BeamLisp.Loader/module_info :md5))
+                         (= env-md5 (BeamLisp.Env/module_info :md5)))
+         observed (assoc result :mode mode :retirement retirement :target-loaded loaded?
+                          :registry-clause-present registered? :canonical-callables-ready ready?
+                          :target-compiled-after compiled-after?
+                          :callable-usable-after-retirement usable? :native-modules-unchanged immutable?)]
+    ;; Print actual red evidence before enforcing positive expectations. In
+    ;; particular, zero Env redirect calls is an observation, not an assertion
+    ;; that a source-free initialization is safe.
+    (println :sealed-sdk-loading-context-observation observed)
+    (assert (:caller-restored result))
+    (assert (contains? #{:retired :already-retired} (:status retirement)))
+    (assert immutable?)
+    (assert (= 0 (get-in result [:counts :source-compilation-total])))
+    (assert (= 0 (get-in result [:counts :target [:Elixir.BeamLisp.Loader :ensure_loaded_source]] 0)))
+    (if (= "source-only-redirect" mode)
+     (do
+      (assert (= :refused (get-in result [:outcome :status])))
+      (assert (= :incomplete_generation_execution_lease (get-in result [:outcome :reason])))
+      (assert (= false loaded?)) (assert (= false registered?)) (assert (= false usable?))
+      (assert (= 0 (get-in result [:counts :target [:Elixir.BeamLisp.Env :load_sdk_library!]] 0)))
+      (assert (= 0 (get-in result [:counts :target [:Elixir.BeamLisp.AOT :ensure_loaded]] 0)))
+      (println "SDK_SEALED_LOADING_CONTEXT_SOURCE_ONLY_CONTROL_CAUGHT"))
+     (do
+      (assert (= :returned (get-in result [:outcome :status])))
+      (assert loaded?) (assert registered?) (assert ready?) (assert compiled-after?) (assert usable?)
+      (assert (pos? (get-in result [:counts :target [:Elixir.BeamLisp.Env :load_sdk_library!]] 0)))
+      (assert (pos? (get-in result [:counts :target [:Elixir.BeamLisp.AOT :ensure_loaded]] 0)))
+      (println (if (= "original" mode) "SDK_SEALED_LOADING_CONTEXT_READY"
+                   "SDK_SEALED_LOADING_CONTEXT_COPIED_ORIGINAL_READY")))))
+   (finally
+    (g/retire! graph)
+    (when (not= "original" mode) (code/purge PROBE) (code/delete PROBE))))))

@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Run the consumer matrix and genuine small sealed image on one frozen input set.
+
+Run under systemd-run --user --collect --wait --pipe --property=MemoryMax=4G
+--property=MemorySwapMax=0 --property=RuntimeMaxSec=4500. No installed files change.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def select_boundaries(boundaries, requested):
+    """Select an explicit affected scope without silently dropping an ID."""
+    ids = [boundary['id'] for boundary in boundaries]
+    if len(set(ids)) != len(ids) or not ids:
+        raise ValueError('empty or duplicate boundary inventory')
+    if requested is None:
+        return boundaries
+    if not requested or len(set(requested)) != len(requested):
+        raise ValueError('empty or duplicate requested boundaries')
+    unknown = set(requested) - set(ids)
+    if unknown:
+        raise ValueError('unknown boundaries: ' + ', '.join(sorted(unknown)))
+    return [boundary for boundary in boundaries if boundary['id'] in requested]
+
+
+def consumer_contexts(tests, packaged):
+    """A real cold producer may publish SDK code; a sealed receiver may not."""
+    producer_only = {'test/bl/aot_sdk_constructor_staging_test.bl'}
+    if not packaged:
+        return [], list(tests)
+    return ([path for path in tests if path in producer_only],
+            [path for path in tests if path not in producer_only])
+
+
+def consumer_receipts(path, tests):
+    """Retain the existing runner's handovers and fail-closed terminal record."""
+    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    batches = [row for row in events if row.get('type') == 'batch']
+    if len(batches) != 1 or batches[0].get('process_status') != 0:
+        raise RuntimeError('missing or failed consumer batch end')
+    identity = batches[0].get('identity')
+    if (not isinstance(identity, dict) or set(identity) != {'candidate', 'source'}
+            or any(not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v)
+                   for v in identity.values())):
+        raise RuntimeError('missing consumer artifact/source identity')
+    if any(row.get('identity') != identity for row in events):
+        raise RuntimeError('mixed consumer identities')
+    processes = [row for row in events if row.get('type') == 'process']
+    if not processes or any(row.get('process_status') != 0 for row in processes):
+        raise RuntimeError('missing or failed consumer process')
+    rows = [row for row in events if 'file' in row]
+    if len(rows) != len(tests) or {row['file'] for row in rows} != set(tests):
+        raise RuntimeError('missing, duplicate or unexpected consumer file')
+    if any(row.get('status') != 'passed'
+           or any(type(row.get(key)) is not int for key in ['tests', 'pass', 'fail', 'error'])
+           or row['tests'] <= 0 or row['pass'] <= 0 or row['fail'] or row['error'] for row in rows):
+        raise RuntimeError('empty or failed consumer coverage')
+    return rows, [row for row in events if row.get('type') == 'handover']
+
+
+def main():
+    preparation_started = time.monotonic()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument('--seed', type=Path)
+    parser.add_argument('--sdk', type=Path,
+                        help='run consumers on the normally selected immutable SDK; sealed stage remains constructed')
+    parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--audit-only', action='store_true', help='verify all discovery inventories without starting a VM or qualifying execution')
+    parser.add_argument('--boundaries', nargs='+',
+                        help='qualify only these affected boundaries; drift-check the entire map')
+    args = parser.parse_args()
+    root, output = args.root.resolve(), args.out.absolute()
+    seed = (args.seed or root / 'priv/bootstrap/seed').resolve()
+    if os.path.lexists(output):
+        parser.error('output must be absent; keep earlier receipts')
+    sdk = None
+    sdk_fingerprint = None
+    if args.sdk is not None:
+        # Reuse backend selection/verification. This is neither a provider
+        # override nor a second recipe/SDK authority implemented by the gate.
+        selected = subprocess.check_output(
+            [str(root / 'scripts/prepare-checkout-sdk'), '--selection'],
+            cwd=root, text=True).strip().split()
+        if len(selected) != 2 or Path(selected[0]).resolve() != args.sdk.resolve():
+            parser.error('requested SDK is not the normal current backend selection')
+        sdk, sdk_fingerprint = Path(selected[0]).resolve(), selected[1]
+        sdk_seed = (sdk / 'image/priv/bootstrap/seed').resolve()
+        if args.seed is not None and seed != sdk_seed:
+            parser.error('SDK consumer mode requires that SDK exact compiler floor')
+        seed = sdk_seed
+    matrix_path = root / 'research/phase-compiler/sdk-boundary-consumers.json'
+    matrix = json.loads(matrix_path.read_text())
+    profiles = runpy.run_path(str(root / 'scripts/sdk_sealed_profiles.py'))
+    timings = runpy.run_path(str(root / 'scripts/test_timings.py'))['slowest']
+    try:
+        selected = select_boundaries(matrix['boundaries'], args.boundaries)
+        if {b['id'] for b in matrix['boundaries']} != set(profiles['BOUNDARIES']):
+            raise ValueError('sealed profile map must cover the complete boundary inventory')
+        sealed_plan = profiles['plan'](args.boundaries)
+    except ValueError as error:
+        parser.error(str(error))
+    # Refuse new/unmapped consumers before paying for any BEAM startup.
+    for boundary in matrix['boundaries']:
+        search = ['rg', '-n']
+        for pattern in matrix['source_globs']:
+            search += ['--glob', pattern]
+        found = subprocess.run(search + [boundary['search'], 'priv'],
+                               cwd=root, text=True, stdout=subprocess.PIPE, check=False)
+        if found.returncode not in (0, 1):
+            parser.error('consumer discovery failed: ' + boundary['id'])
+        references = []
+        for line in found.stdout.splitlines():
+            path, number, text = line.split(':', 2)
+            references.append({'path': path, 'line': int(number), 'text': text.strip()})
+        if sorted(references, key=lambda x: (x['path'], x['line'])) != sorted(boundary['references'], key=lambda x: (x['path'], x['line'])):
+            parser.error('consumer map drift: update ' + boundary['id'])
+    # Independent preboot producers are outside priv/. Their actual API
+    # consumers must not disappear from the cheap drift gate or frozen inputs.
+    writers_path = root / 'research/execution-protocol-audit/admission-writers.json'
+    writers = json.loads(writers_path.read_text())
+    external = writers.get('external_writers')
+    if (writers.get('version') != 1 or not isinstance(external, list) or not external
+            or any(not isinstance(writer, dict) or not isinstance(writer.get('path'), str)
+                   or not writer.get('search') or not writer.get('references') for writer in external)
+            or len({writer['path'] for writer in external}) != len(external)
+            or 'tooling/drop/src/builder.rs' not in {writer['path'] for writer in external}):
+        parser.error('missing or invalid independent bootstrap writer inventory')
+    for writer in external:
+        path = (root / writer['path']).resolve()
+        if (not path.is_relative_to(root) or not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != writer['source_sha256']):
+            parser.error('external writer source drift: ' + writer['path'])
+        found = subprocess.run(['rg', '-n', '-H', writer['search'], writer['path']],
+                               cwd=root, text=True, stdout=subprocess.PIPE, check=False)
+        if found.returncode not in (0, 1):
+            parser.error('external consumer discovery failed: ' + writer['path'])
+        references = []
+        for line in found.stdout.splitlines():
+            path, number, text = line.split(':', 2)
+            references.append({'path': path, 'line': int(number), 'text': text.strip()})
+        if references != writer['references']:
+            parser.error('external consumer map drift: ' + writer['path'])
+    tests = list(dict.fromkeys(test for boundary in selected for test in boundary['tests']))
+    if not tests or any(not (root / test).is_file() for test in tests):
+        parser.error('empty or missing consumer tests')
+    if args.audit_only:
+        output.mkdir(parents=True)
+        report = {'status': 'discovery-verified', 'executed': False,
+                  'mapped_boundaries': len(matrix['boundaries']), 'external_writers': len(external),
+                  'matrix_sha256': hashlib.sha256(matrix_path.read_bytes()).hexdigest(),
+                  'writers_sha256': hashlib.sha256(writers_path.read_bytes()).hexdigest(),
+                  'complete_goal': False, 'sdk_or_floor_qualified': False}
+        (output / 'audit.json').write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps(report))
+        return
+    try:
+        runpy.run_path(str(root / 'scripts/test_prerequisites.py'))['require'](root, tests)
+    except (OSError, ValueError, RuntimeError) as error:
+        parser.error(str(error))
+    producer_tests, receiver_tests = consumer_contexts(tests, sdk is not None)
+    output.mkdir(parents=True)
+    workspace = None
+    receiver_files = {}
+    consumer_command = None
+    consumer_env = {}
+    if sdk is not None:
+        workspace = output / 'consumer-sdk'
+        shutil.copytree(sdk / 'image', workspace, symlinks=True)
+        # Host fixture tests intentionally rewrite and restore runtime inputs.
+        # Give them owned copies, keeping every product byte authenticated.
+        for path in [workspace, *workspace.rglob('*')]:
+            if path.is_symlink():
+                continue
+            if path.is_file():
+                relative = str(path.relative_to(workspace))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if digest != hashlib.sha256((sdk / 'image' / relative).read_bytes()).hexdigest():
+                    raise RuntimeError('copied SDK input changed: ' + relative)
+                receiver_files[relative] = digest
+            path.chmod(path.stat().st_mode | 0o200)
+        (workspace / 'env.bl').write_text(
+            '{:paths [' + json.dumps(str(root)) + ' ' + json.dumps(str(root / 'examples'))
+            + '] :env {"BEAM_LISP_DEV" "1"}}\n')
+        (workspace / 'test').symlink_to(root / 'test', target_is_directory=True)
+        # Keep the selected application's release layout even in a private
+        # byte-identical receiver. Cold children inherit this code path and
+        # must resolve priv_dir independently of their cwd.
+        applications = [path for path in (sdk / 'lib').iterdir()
+                        if path.name.startswith('beam_lisp-') and path.is_dir()]
+        if len(applications) != 1:
+            raise RuntimeError('SDK must contain one language application')
+        application_link = output / 'consumer-lib' / applications[0].name
+        application_link.parent.mkdir()
+        application_link.symlink_to(workspace, target_is_directory=True)
+        boot = output / 'consumer-sdk.exs'
+        boot.write_text('BeamLisp.Launcher.start_app!(System.argv(), %{})\n')
+        descriptor = json.loads((sdk / 'artifact.json').read_text())
+        consumer_command = [str(Path(descriptor['platform']) / 'bin/elixir')]
+        for dependency in sorted((sdk / 'lib').glob('*/ebin')):
+            if not dependency.parent.name.startswith('beam_lisp-'):
+                consumer_command += ['-pa', str(dependency)]
+        consumer_command += ['-pa', str(application_link / 'ebin'), '-pa', str(workspace / 'ebin'), str(boot)]
+        consumer_env = {'BL_ROOT': str(workspace), 'BL_EBIN': str(workspace / 'ebin'),
+                        'BL_DAEMON': 'off', 'BL_BUILD_ID': 'actual-sdk-consumer-receiver',
+                        'BL_SDK_PRODUCT': str(sdk), 'BL_TEST_SOURCE_ROOT': str(root),
+                        'BL_QUALIFY_CANDIDATE': str(sdk / 'bin/bl'),
+                        # Mirror ordinary checkout startup using only fields of
+                        # the authenticated immutable SDK/platform selection.
+                        'BL_ARTIFACT_PLATFORM': str(Path(descriptor['platform']) / 'artifact-platform'),
+                        'BL_PREPARATION_COORDINATOR': descriptor['coordinator'],
+                        'BL_PREPARED_NATIVES': str(Path(descriptor['platform']) / 'native-products'),
+                        'XDG_CACHE_HOME': str(output / 'consumer-cache'),
+                        'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
+        # The established runner owns file isolation, native lifetime budget
+        # handovers, private endpoints and per-file receipts. This launcher
+        # selects only the byte-identical writable receiver already checked
+        # above; it does not replace any SDK module or custody inventory.
+        receiver_cli = output / 'consumer-cli'
+        receiver_cli.write_text('#!/bin/sh\nset -eu\n'
+            + '\n'.join('export ' + key + '=' + shlex.quote(value)
+                        for key, value in consumer_env.items() if key != 'BL_QUALIFY_CANDIDATE')
+            + '\nexec ' + shlex.join(consumer_command) + ' "$@"\n')
+        receiver_cli.chmod(0o700)
+        consumer_command = [sys.executable, str(root / 'scripts/qualify-candidate.py'),
+                            '--candidate', str(receiver_cli), '--results', str(output / 'consumer-results.jsonl'),
+                            '--timeout', '900', *receiver_tests]
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    capture_tools = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools']
+
+    def capture():
+        # Freeze the entire language/runtime source inventory, not just paths
+        # known before a run; new/removed files also invalidate the candidate.
+        paths = [root / 'env.bl', root / 'flake.nix', root / 'flake.lock', matrix_path, writers_path, Path(__file__).resolve()]
+        if sdk is not None:
+            paths += [sdk / 'artifact.json', workspace / 'env.bl', output / 'consumer-sdk.exs', receiver_cli]
+        for directory in ['priv', 'test', 'scripts', 'native', 'tooling/drop', 'nix']:
+            paths += [p for p in (root / directory).rglob('*') if p.is_file()
+                      and (p.name.endswith(('.bl', '.bl.md', '.bl.org', '.clj', '.cljc', '.py', '.exs', '.erl', '.rs', '.toml', '.lock', '.so', '.nix', '.etf'))
+                           or directory == 'scripts') and 'target' not in p.parts and '__pycache__' not in p.parts
+                      and '.bl' not in p.relative_to(root).parts]
+        inputs = {str(p.relative_to(root)) if p.is_relative_to(root) else str(p): sha(p)
+                  for p in sorted(set(paths))}
+        floor = {p.name: sha(p) for p in seed.iterdir() if p.is_file()}
+        return {'inputs': inputs, 'floor': floor, 'tools': capture_tools(root),
+                'SDK_application_link': {'target': os.readlink(application_link),
+                                         'resolved': str(application_link.resolve(strict=True))} if sdk else None,
+                'SDK_receiver_bytes': {path: sha(workspace / path) for path in receiver_files}}
+
+    frozen = capture()
+    (output / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
+    report = {'version': 1, 'status': 'running', 'seed': str(seed), 'tests': tests,
+              'boundaries': [b['id'] for b in selected],
+              'mapped_boundaries': [b['id'] for b in matrix['boundaries']], 'stages': {},
+              'complete_goal': False, 'full_sdk_build': False,
+              'consumer_scope': 'byte-identical-copy-of-actual-selected-SDK' if sdk else 'private-Source-compiler-floor',
+              'producer_tests': producer_tests, 'receiver_tests': receiver_tests,
+              'sdk': str(sdk) if sdk else None, 'engine_fingerprint': sdk_fingerprint,
+              'SDK_receiver_initial_files': receiver_files,
+              'preparation_seconds': round(time.monotonic() - preparation_started, 3)}
+
+    def stage(name, command, cwd=None, extra_env=None):
+        if capture() != frozen:
+            raise RuntimeError('frozen inputs changed before ' + name)
+        start = time.monotonic()
+        deadline = start + (2400 if name == 'consumers' else 1000)
+        batches = [command]
+        executions, status = [], 0
+        with (output / (name + '.log')).open('w') as log:
+            for index, batch in enumerate(batches):
+                if capture() != frozen:
+                    raise RuntimeError('frozen inputs changed before process ' + str(index))
+                began = time.monotonic()
+                with tempfile.TemporaryDirectory(prefix='bl-preflight-',
+                        dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
+                    try:
+                        done = subprocess.run(batch, cwd=cwd or root,
+                                              env={**runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['runtime_environment'](os.environ),
+                                                   'BL_TEST_TIMES': '1', **(extra_env or {}),
+                                                   'XDG_RUNTIME_DIR': runtime},
+                                              stdout=log, stderr=subprocess.STDOUT,
+                                              timeout=max(1, deadline - began))
+                    finally:
+                        runpy.run_path(str(root / 'scripts/qualify-candidate.py'))['stop_children'](runtime)
+                status = status or done.returncode
+                executions.append({'exit': done.returncode,
+                                   'seconds': round(time.monotonic() - began, 3),
+                                   'tests': receiver_tests if name == 'consumers' and sdk else None})
+        report['stages'][name] = {'exit': status, 'seconds': round(time.monotonic()-start, 3),
+                                 'processes': executions}
+        report['stages'][name]['slowest_tests'] = timings((output / (name + '.log')).read_text())
+        if status:
+            raise RuntimeError(name + ' failed; see retained log')
+        if capture() != frozen:
+            raise RuntimeError('frozen inputs changed during ' + name)
+
+    try:
+        if sdk is not None and set(report['boundaries']) & {'preboot-identity', 'unit-metadata', 'constructor-and-scope'}:
+            stage('unit-preboot', [str(Path(descriptor['platform']) / 'bin/elixir'),
+                                  '-pa', str(workspace / 'ebin'),
+                                  str(root / 'test/scripts/contextual_unit_preboot.exs')],
+                  cwd=workspace, extra_env=consumer_env)
+            if 'CONTEXTUAL-UNIT-PREBOOT 31 passed' not in (output / 'unit-preboot.log').read_text():
+                raise RuntimeError('missing compiled-unit preboot coverage')
+            report['stages']['unit-preboot']['checks'] = 31
+        if sdk is not None and set(report['boundaries']) & {'preboot-identity', 'unit-metadata', 'source-and-class-proof', 'constructor-and-scope', 'native-custody'}:
+            stage('instance-preboot', [str(Path(descriptor['platform']) / 'bin/elixir'),
+                                      '-pa', str(workspace / 'ebin'),
+                                      str(root / 'test/scripts/source_instance_preboot.exs')],
+                  cwd=workspace, extra_env=consumer_env)
+            if 'SOURCE-INSTANCE-PREBOOT 3 refused' not in (output / 'instance-preboot.log').read_text():
+                raise RuntimeError('missing native instance preboot coverage')
+            report['stages']['instance-preboot']['refused'] = 3
+            stage('unit-instance-preboot', [str(Path(descriptor['platform']) / 'bin/elixir'),
+                                           '-pa', str(workspace / 'ebin'),
+                                           str(root / 'test/scripts/unit_instance_preboot.exs')],
+                  cwd=workspace, extra_env=consumer_env)
+            if 'UNIT-INSTANCE-PREBOOT 3 refused' not in (output / 'unit-instance-preboot.log').read_text():
+                raise RuntimeError('missing native unit instance preboot coverage')
+            report['stages']['unit-instance-preboot']['refused'] = 3
+        if sdk is not None and set(report['boundaries']) & {'unit-metadata', 'source-and-class-proof', 'preboot-identity', 'sealed-loader', 'constructor-and-scope', 'artifact-profile-and-cache', 'native-custody', 'record-representation'}:
+            stage('sdk-lambda-preboot', [str(Path(descriptor['platform']) / 'bin/elixir'),
+                                          '-pa', str(workspace / 'ebin'),
+                                          str(root / 'test/scripts/sdk_lambda_preboot.exs')],
+                  cwd=workspace, extra_env=consumer_env)
+            if 'SDK-LAMBDA-PREBOOT 10 passed' not in (output / 'sdk-lambda-preboot.log').read_text():
+                raise RuntimeError('missing positive SDK lambda preboot coverage')
+            report['stages']['sdk-lambda-preboot']['checks'] = 10
+        if sdk is None:
+            stage('consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root), '--seed', str(seed), '--test-timeout', '900',
+                                '--test', *[str(root / p) for p in tests]])
+        else:
+            if producer_tests:
+                stage('producer-consumers', [str(root / 'scripts/check-source-floor'), '--root', str(root),
+                      '--seed', str(seed), '--test-timeout', '900', '--test',
+                      *[str(root / path) for path in producer_tests]])
+            stage('consumers', consumer_command, cwd=workspace, extra_env=consumer_env)
+        log = (output / 'consumers.log').read_text()
+        if sdk is not None:
+            rows, handovers = consumer_receipts(output / 'consumer-results.jsonl', receiver_tests)
+            report['SDK_receiver_assertions'] = sum(row['pass'] for row in rows)
+            report['consumer_handovers'] = handovers
+            producer_log = (output / 'producer-consumers.log').read_text() if producer_tests else ''
+            summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', producer_log)
+            counts = re.findall(r'✓ .*?\s+(\d+) passed', producer_log)
+            if producer_tests and (summaries != [(str(len(producer_tests)), '0', '0')]
+                                   or len(counts) != len(producer_tests) or any(int(n) == 0 for n in counts)):
+                raise RuntimeError('missing or failed Source producer coverage')
+            report['Source_producer_assertions'] = sum(map(int, counts))
+            report['assertions'] = report['SDK_receiver_assertions'] + report['Source_producer_assertions']
+        else:
+            summaries = re.findall(r'(\d+) file\(s\) passed, (\d+) failed, (\d+) incoherent', log)
+            counts = re.findall(r'✓ .*?\s+(\d+) passed', log)
+            if summaries != [(str(len(tests)), '0', '0')] or len(counts) != len(tests) or any(int(n) == 0 for n in counts):
+                raise RuntimeError('missing, empty, failed or unexpected consumer test coverage')
+            report['assertions'] = sum(map(int, counts))
+        command = [str(root / 'scripts/demo-sdk-artifacts'), '--root', str(root), '--seed', str(seed),
+                   '--out', str(output / 'sealed'), '--activation-smoke', '--source-free', '--boundary-tests', '--contextual-tests']
+        if args.boundaries is not None:
+            command += ['--boundaries', *args.boundaries]
+        stage('sealed', command)
+        sealed = json.loads((output / 'sealed/result.json').read_text())
+        profiles['validate_universal'](sealed)
+        if sealed['status'] != 'passed' or not sealed['source_free_sdk'] or not sealed['missing_unit_refused_before_initialization'] or not sealed['tampering_refused_before_initialization']:
+            raise RuntimeError('incomplete sealed positive/negative controls')
+        if sealed.get('sealed_source_consumers', {}).get('status') != 'passed':
+            raise RuntimeError('sealed Source-present consumer branch was not qualified')
+        if sealed.get('contextual_consumer', {}).get('status') != 'passed':
+            raise RuntimeError('Source-free contextual build/cache consumer was not qualified')
+        profiles['validate'](sealed_plan, sealed['contextual_consumer'])
+        profiles['validate_initialization'](sealed_plan, sealed.get('sdk_initialization'))
+        if sealed.get('sealed_plan') != sealed_plan:
+            raise RuntimeError('sealed producer used a different boundary plan')
+        report.update(status='passed', frozen_inputs_unchanged=True, sealed=sealed,
+                      coverage={b['id']: {'tests': b['tests'], 'status': 'passed'} for b in selected})
+    except Exception as error:
+        report.update(status='failed', error=str(error))
+        raise
+    finally:
+        (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'status': 'passed', 'files': len(tests), 'assertions': report['assertions'],
+                      'boundaries': report['boundaries'], 'receipt': str(output / 'result.json')}))
+
+
+if __name__ == '__main__':
+    main()

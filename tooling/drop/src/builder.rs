@@ -52,46 +52,107 @@ fn bl_err(msg: String) -> String {
 // ── the machine-wide build lock ─────────────────────────────────────────────
 
 pub struct BuildLock {
-    path: PathBuf,
+    // Keep the open kernel object for the whole build. The readable PID is
+    // diagnostic data; it never authorizes acquisition or stale-lock removal.
+    _file: std::fs::File,
+    followers: PathBuf,
+    diagnostic: PathBuf,
+    owner: String,
 }
 
 impl BuildLock {
-    /// Take the lock, waiting for a live holder; a holder whose process is gone
-    /// is stale and replaced.
-    pub fn take(store: &Store) -> BuildLock {
-        let path = store.meta().join("locks").join("build");
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let mut told = false;
-        loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = write!(f, "{}", std::process::id());
-                    return BuildLock { path };
-                }
-                Err(_) => {
-                    let holder = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u32>().ok());
-                    match holder {
-                        Some(pid) if Path::new(&format!("/proc/{pid}")).exists() || !Path::new("/proc").exists() => {
-                            if !told {
-                                say(&format!("another build is running (pid {pid}); waiting for it"));
-                                told = true;
-                            }
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                        }
-                        _ => {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
+    /// One permanent inode serializes cooperating bootstrap builders, before
+    /// any BEAM/NIF exists. Do not unlink it during release or crash recovery.
+    /// Drain surviving external commands before admitting a replacement build.
+    pub fn take(store: &Store) -> Result<BuildLock, String> {
+        use std::fs::{OpenOptions, TryLockError};
+        use std::io::Write;
+        let locks = store.meta().join("locks");
+        std::fs::create_dir_all(&locks)
+            .map_err(|e| format!("cannot prepare build custody {}: {e}", locks.display()))?;
+        let anchor = locks.join("build.kernel");
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&anchor).map_err(|e| format!("cannot open build custody {}: {e}", anchor.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                say("another bootstrap build holds kernel custody; waiting for it");
+                file.lock().map_err(|e| format!("cannot acquire build custody {}: {e}", anchor.display()))?;
             }
+            Err(TryLockError::Error(e)) => return Err(format!("cannot acquire build custody {}: {e}", anchor.display())),
+        }
+        let followers = locks.join("build.kernel.followers");
+        let barrier = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&followers).map_err(|e| format!("cannot open build followers: {e}"))?;
+        match barrier.try_lock() {
+            Ok(()) => {},
+            Err(TryLockError::WouldBlock) => {
+                say("surviving bootstrap commands hold child custody; waiting for them");
+                barrier.lock().map_err(|e| format!("cannot drain build followers: {e}"))?;
+            }
+            Err(TryLockError::Error(e)) => return Err(format!("cannot drain build followers: {e}")),
+        }
+        let diagnostic = locks.join("build");
+        let owner = std::process::id().to_string();
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos();
+        let temporary = locks.join(format!("build.writing-{owner}-{nonce}"));
+        let publish = (|| -> std::io::Result<()> {
+            let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            output.write_all(owner.as_bytes())?;
+            drop(output);
+            // Replace an old diagnostic symlink; never write through it.
+            std::fs::rename(&temporary, &diagnostic)
+        })();
+        if let Err(error) = publish {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("cannot publish build owner {}: {error}", diagnostic.display()));
+        }
+        drop(barrier);
+        Ok(BuildLock { _file: file, followers, diagnostic, owner })
+    }
+
+    /// Join the already-admitted build before spawning. Only the forked child's
+    /// descriptor loses CLOEXEC; unrelated concurrent spawns never inherit it.
+    /// Descendants must preserve this descriptor when they exec/fork again.
+    fn prepare_command(&self, command: &mut Command) -> Result<(), String> {
+        #[cfg(unix)] {
+            use std::fs::OpenOptions;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            extern "C" {
+                #[link_name = "fcntl"]
+                fn custody_fcntl(fd: i32, command: i32, ...) -> i32;
+            }
+            let follower = OpenOptions::new().read(true).write(true).open(&self.followers)
+                .map_err(|e| format!("cannot open child build custody: {e}"))?;
+            follower.try_lock_shared().map_err(|e| format!("cannot admit child build custody: {e}"))?;
+            // File owns the descriptor captured by Command, so it cannot be
+            // reused before spawn. In the post-fork closure call only fcntl:
+            // no allocation, locks, pathname lookup, or authority reconstruction.
+            unsafe {
+                command.pre_exec(move || {
+                    const F_SETFD: i32 = 2;
+                    if custody_fcntl(follower.as_raw_fd(), F_SETFD, 0_i32) == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else { Ok(()) }
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))] {
+            let _ = command;
+            Err("external build custody is not implemented on this target".into())
         }
     }
 }
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.diagnostic).ok().as_deref() == Some(self.owner.as_str()) {
+            let _ = std::fs::remove_file(&self.diagnostic);
+        }
+        // The descriptor drops after diagnostic cleanup. Its inode stays.
     }
 }
 
@@ -106,8 +167,9 @@ const DEFAULT_BUILD_TIMEOUT_MIN: u64 = 45;
 /// Run `cmd`, appending its output to `log`. Ok on exit 0; else the last lines
 /// of the log, so a failure names its own cause. A step past its deadline is
 /// killed (with its process group) and reported as such.
-fn run_logged(mut cmd: Command, log: &Path, what: &str) -> Result<(), String> {
+fn run_logged(mut cmd: Command, log: &Path, what: &str, custody: &BuildLock) -> Result<(), String> {
     use std::io::Write;
+    custody.prepare_command(&mut cmd)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -189,7 +251,7 @@ pub fn main_worktree(tree: &Path) -> Option<PathBuf> {
 /// source, not this commit's (measured: a `latest` seeded from a checkout with
 /// an edited `datom_fjall` crate shipped that crate's NIF and died at load with
 /// `:nif_not_loaded`). `build_natives` compiles them from the tree instead.
-fn seed_assets(from: &Path, tree: &Path, log: &Path) -> Result<(), String> {
+fn seed_assets(from: &Path, tree: &Path, log: &Path, custody: &BuildLock) -> Result<(), String> {
     if from == tree {
         return Ok(());
     }
@@ -200,18 +262,115 @@ fn seed_assets(from: &Path, tree: &Path, log: &Path) -> Result<(), String> {
             let _ = std::fs::create_dir_all(&dst);
             let mut cmd = Command::new("cp");
             cmd.arg("-a").arg("--reflink=auto").arg(format!("{}/.", src.display())).arg(&dst);
-            run_logged(cmd, log, &format!("seed {rel} from {}", tildify(from)))?;
+            run_logged(cmd, log, &format!("seed {rel} from {}", tildify(from)), custody)?;
         }
     }
     Ok(())
 }
 
-/// Build every `native/<crate>` of `tree` with cargo and install its cdylib as
-/// `priv/native/<crate>.so` (`.dylib` on macOS is loaded under the same `.so`
-/// name, as `vm.native` installs it). The boot itself loads `lazy_memo`, so
-/// this runs before the tree's own `bin/bl` does anything. Cargo's shared
-/// target directory makes a crate that did not change a no-op.
-fn build_natives(tree: &Path, log: &Path) -> Result<(), String> {
+// The preboot publisher joins claim/artifact-scope's kernel protocol without
+// loading a BEAM/NIF. These descriptors grant filesystem exclusion only.
+struct NativePublication {
+    destination: PathBuf,
+    _writer: std::fs::File,
+    _followers: std::fs::File,
+}
+
+impl NativePublication {
+    fn take(destination: &Path) -> Result<Self, String> {
+        use std::fs::{OpenOptions, TryLockError};
+        let name = destination.file_name().ok_or("native destination needs a filename")?;
+        // Resolve directory aliases, but replace a destination symlink itself.
+        let parent = std::fs::canonicalize(destination.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+        let scope = parent.join(".bl/artifact-custody").join(name);
+        std::fs::create_dir_all(&scope).map_err(|e| e.to_string())?;
+        let scope = std::fs::canonicalize(scope).map_err(|e| e.to_string())?;
+        let base = scope.file_name().ok_or("native custody needs a filename")?;
+        let anchors = scope.parent().ok_or("native custody needs a parent")?
+            .join(if base == ".bl" { ".bl-locks" } else { ".bl" }).join("locks");
+        std::fs::create_dir_all(&anchors).map_err(|e| e.to_string())?;
+        let anchor = anchors.join(scope.file_name().ok_or("native custody needs a filename")?);
+        let lock = |path: &Path| -> Result<std::fs::File, String> {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+                .open(path).map_err(|e| format!("cannot open native publication custody: {e}"))?;
+            match file.try_lock() {
+                Ok(()) => Ok(file),
+                Err(TryLockError::WouldBlock) => Err("native publication custody held".into()),
+                Err(TryLockError::Error(e)) => Err(format!("cannot acquire native publication custody: {e}")),
+            }
+        };
+        let writer = lock(&anchor)?;
+        let mut follower_name = anchor.as_os_str().to_os_string();
+        follower_name.push(".followers");
+        let followers = lock(Path::new(&follower_name))?;
+        // No old Source follower may enter after this publisher releases. Keep
+        // the follower barrier through invalidation and destination publication.
+        match std::fs::remove_file(scope.join(".claim")) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("cannot invalidate native publication cohort: {e}")),
+        }
+        Ok(Self { destination: parent.join(name), _writer: writer, _followers: followers })
+    }
+}
+
+fn publish_native_artifact(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let custody = NativePublication::take(destination)?;
+    let destination = &custody.destination;
+    let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+    if std::fs::symlink_metadata(destination).is_ok_and(|m| m.is_file())
+        && std::fs::read(destination).is_ok_and(|installed| installed == bytes) {
+        return Ok(());
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_nanos();
+    let temporary = destination.with_file_name(format!("{}.tmp-{}-{nonce}",
+        destination.file_name().ok_or("native destination needs a filename")?.to_string_lossy(), std::process::id()));
+    // Never follow or truncate a preexisting temporary. Only remove a file we
+    // actually created; create_new failure leaves somebody else's bytes intact.
+    let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+    let publish = (|| -> std::io::Result<()> {
+        output.write_all(&bytes)?;
+        output.set_permissions(std::fs::metadata(source)?.permissions())?;
+        drop(output);
+        std::fs::rename(&temporary, destination)
+    })();
+    if let Err(error) = publish {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Select a verified immutable product under the existing destination admission.
+/// Old mapped libraries retain their immutable inodes; each request keeps a root.
+fn publish_native_reference(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(unix)] {
+        let custody = NativePublication::take(destination)?;
+        let destination = &custody.destination;
+        if std::fs::read_link(destination).is_ok_and(|path| path == source) { return Ok(()); }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+        let temporary = destination.with_extension(format!("nix-{}-{nonce}", std::process::id()));
+        std::os::unix::fs::symlink(source, &temporary).map_err(|e| e.to_string())?;
+        let result = std::fs::rename(&temporary, destination).map_err(|e| e.to_string());
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result
+    }
+    #[cfg(not(unix))] {
+        let _ = (source, destination);
+        Err("immutable native selection is unsupported on this target".into())
+    }
+}
+
+/// Prepare every declared native crate through the pinned immutable recipe.
+/// Cargo is confined to Nix workers; unsupported environments fail explicitly.
+fn build_natives(tree: &Path, _log: &Path, custody: &BuildLock) -> Result<(), String> {
+    if std::env::var("BL_NATIVE_PROVIDER").is_ok_and(|provider| provider != "nix") {
+        return Err("native production requires Nix; local providers are unsupported".into());
+    }
     let native = tree.join("native");
     let dest = tree.join("priv/native");
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
@@ -220,34 +379,31 @@ fn build_natives(tree: &Path, log: &Path) -> Result<(), String> {
     crates.sort();
     for dir in crates {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        let mut cmd = Command::new("cargo");
-        cmd.args(["build", "--release", "--message-format=short", "--manifest-path"]).arg(dir.join("Cargo.toml"));
-        run_logged(cmd, log, &format!("cargo build native/{name}"))?;
-        let out = cargo_target_dir(&dir).join("release");
-        let lib = [format!("lib{name}.so"), format!("lib{name}.dylib")]
-            .into_iter()
-            .map(|f| out.join(f))
-            .find(|p| p.is_file())
-            .ok_or_else(|| format!("native/{name}: cargo produced no cdylib in {}", out.display()))?;
-        let tmp = dest.join(format!("{name}.so.tmp-{}", std::process::id()));
-        std::fs::copy(&lib, &tmp).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, dest.join(format!("{name}.so"))).map_err(|e| e.to_string())?;
+        let library = nix_artifact::prepare(tree, &dir, &name, custody)?;
+        publish_native_reference(&library, &dest.join(format!("{name}.so")))?;
     }
     Ok(())
 }
 
-/// Where cargo writes for the crate at `dir`: `cargo metadata`'s answer, which
-/// honours `CARGO_TARGET_DIR` and any `build.target-dir` config.
-fn cargo_target_dir(dir: &Path) -> PathBuf {
-    Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"])
-        .arg(dir.join("Cargo.toml"))
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| json_string(&String::from_utf8_lossy(&o.stdout), "target_directory"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dir.join("target"))
+/// Require Cargo's successful, read-only answer. A guessed target can publish
+/// an unrelated old library after failed metadata discovery.
+fn cargo_target_dir(dir: &Path, custody: &BuildLock) -> Result<PathBuf, String> {
+    let mut command = Command::new("cargo");
+    command
+        .args(["metadata", "--locked", "--format-version", "1", "--no-deps", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"));
+    custody.prepare_command(&mut command)?;
+    let output = command.output().map_err(|e| format!("native Cargo metadata could not start for {}: {e}", dir.display()))?;
+    if !output.status.success() {
+        return Err(format!("native Cargo metadata failed for {} ({}): {}",
+            dir.display(), output.status, String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("native Cargo metadata was not valid JSON for {}: {e}", dir.display()))?;
+    let target = metadata.get("target_directory").and_then(serde_json::Value::as_str)
+        .map(PathBuf::from).filter(|p| p.is_absolute())
+        .ok_or_else(|| format!("native Cargo metadata omitted an absolute target_directory for {}", dir.display()))?;
+    Ok(target)
 }
 
 fn tree_bl(tree: &Path, args: &[&str]) -> Command {
@@ -275,7 +431,7 @@ pub struct Built {
 /// bleeding-edge and under its source key. `extra` are more pointers to move to
 /// it (`channels/latest`).
 pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -> Result<Built, String> {
-    let _lock = BuildLock::take(store);
+    let custody = BuildLock::take(store)?;
     let before = stamp(tree);
 
     // The lock was waited for: another build may have produced exactly this.
@@ -296,16 +452,16 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
     say(&format!("building {} (several minutes; log {})", tildify(tree), tildify(&log)));
 
     if let Some(main) = main_worktree(tree) {
-        seed_assets(&main, tree, &log)?;
+        seed_assets(&main, tree, &log, &custody)?;
     }
     let incoming = store.meta().join("incoming");
     std::fs::create_dir_all(&incoming).map_err(|e| e.to_string())?;
     let out = incoming.join(format!("build-{}.drop", std::process::id()));
     let scratch = cache_dir().join("scratch");
 
-    build_natives(tree, &log)?;
-    run_logged(tree_bl(tree, &["deps", "fetch"]), &log, "bl deps fetch")?;
-    run_logged(tree_bl(tree, &["deps", "compile"]), &log, "bl deps compile")?;
+    build_natives(tree, &log, &custody)?;
+    run_logged(tree_bl(tree, &["deps", "fetch"]), &log, "bl deps fetch", &custody)?;
+    run_logged(tree_bl(tree, &["deps", "compile"]), &log, "bl deps compile", &custody)?;
     let seal = tree_bl(
         tree,
         &[
@@ -318,7 +474,7 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
             &scratch.to_string_lossy(),
         ],
     );
-    run_logged(seal, &log, "bl self-build")?;
+    run_logged(seal, &log, "bl self-build", &custody)?;
 
     let id = publish_drop(store, &out)?;
     let after = stamp(tree);
@@ -385,7 +541,8 @@ pub fn build_commit(store: &Store, source: &Path, sha: &str, launcher: &Path, ex
         cmd.args(["worktree", "add", "--detach", "--force"]).arg(&tree).arg(&full);
         let log = cache_dir().join("worktree-add.log");
         let _ = std::fs::create_dir_all(cache_dir());
-        run_logged(cmd, &log, &format!("git worktree add {}", &full[..12]))?;
+        let custody = BuildLock::take(store)?;
+        run_logged(cmd, &log, &format!("git worktree add {}", &full[..12]), &custody)?;
     }
     let tree = std::fs::canonicalize(&tree).unwrap_or(tree);
     build_tree(store, &tree, launcher, extra)
@@ -741,8 +898,496 @@ mod builder_tests {
         }
     }
 
+    pub(crate) fn custody_source_identity() {
+        // A shared Cargo target selected a different tree's cached test binary
+        // in the original replay. Bind the code compiled into this test image.
+        if let Ok(expected) = std::env::var("BL_CUSTODY_TEST_SOURCE_SHA256") {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            for (path, source) in [
+            ("Cargo.toml", include_str!("../Cargo.toml")),
+            ("Cargo.lock", include_str!("../Cargo.lock")),
+            ("src/builder.rs", include_str!("builder.rs")),
+            ("src/nix_artifact.rs", include_str!("nix_artifact.rs")),
+            ("src/checkout.rs", include_str!("checkout.rs")),
+            ("src/command_domain.rs", include_str!("command_domain.rs")),
+            ("src/common.rs", include_str!("common.rs")),
+            ("src/daemon.rs", include_str!("daemon.rs")),
+            ("src/hooks.rs", include_str!("hooks.rs")),
+            ("src/launcher.rs", include_str!("launcher.rs")),
+            ("src/pack.rs", include_str!("pack.rs")),
+            ("src/store.rs", include_str!("store.rs")),
+            ("src/transport.rs", include_str!("transport.rs")),
+            ] {
+                digest.update(path.as_bytes()); digest.update([0]);
+                digest.update(source.as_bytes()); digest.update([0]);
+            }
+            let actual = hex(&digest.finalize());
+            assert_eq!(actual, expected, "requested custody Source differs from compiled test image");
+            eprintln!("BUILD-CUSTODY-SOURCE {actual}");
+        }
+    }
+
+    // Only launched by the exact subprocess test below; no build tool or BEAM.
+    #[test]
+    #[ignore = "explicit custody subprocess worker"]
+    fn custody_subprocess_worker() {
+        custody_source_identity();
+        let root = PathBuf::from(std::env::var_os("BL_CUSTODY_TEST_ROOT").expect("private test root"));
+        let store = Store { root: root.clone() };
+        std::fs::write(root.join("ready"), "ready").unwrap();
+        let _guard = BuildLock::take(&store).unwrap();
+        assert_eq!(std::fs::read_to_string(store.meta().join("locks/build")).unwrap(),
+                   std::process::id().to_string());
+        std::fs::write(root.join("entered"), "entered").unwrap();
+        while !root.join("finish").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit native-publication subprocess worker"]
+    fn native_publication_subprocess_worker() {
+        custody_source_identity();
+        let source = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_SOURCE").expect("test source"));
+        let destination = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_DESTINATION").expect("test destination"));
+        let result = PathBuf::from(std::env::var_os("BL_PUBLICATION_TEST_RESULT").expect("test result"));
+        if let Some(finish) = std::env::var_os("BL_PUBLICATION_TEST_HOLD_UNTIL") {
+            let _guard = NativePublication::take(&destination).unwrap();
+            std::fs::write(&result, "held").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !Path::new(&finish).exists() {
+                assert!(std::time::Instant::now() < deadline, "publication holder timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return;
+        }
+        let verdict = publish_native_artifact(&source, &destination);
+        std::fs::write(&result, match verdict { Ok(()) => "ok".to_string(), Err(error) => format!("error:{error}") }).unwrap();
+    }
+
+    #[test]
+    fn native_publication_preserves_old_bytes_and_releases_failed_operations() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("native-publication-failure-{}", std::process::id()));
+        let _cleanup = CustodyDirectory(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("built.so");
+        let destination = root.join("installed.so");
+        std::fs::write(&destination, "old").unwrap();
+        assert!(publish_native_artifact(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        std::fs::write(&source, "new").unwrap();
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        assert!(publish_native_artifact(&source, &destination).is_err());
+        assert!(destination.is_dir());
+        assert!(!std::fs::read_dir(&root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("installed.so.tmp-")));
+        std::fs::remove_dir(&destination).unwrap();
+        let diagnostic = root.join(".bl/artifact-custody/installed.so/.claim");
+        std::fs::create_dir(&diagnostic).unwrap();
+        assert!(publish_native_artifact(&source, &destination).unwrap_err().contains("invalidate"));
+        std::fs::remove_dir(&diagnostic).unwrap();
+        publish_native_artifact(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        #[cfg(unix)] {
+            let other = root.join("untouched.so");
+            std::fs::write(&other, "untouched").unwrap();
+            std::fs::remove_file(&destination).unwrap();
+            std::os::unix::fs::symlink(&other, &destination).unwrap();
+            publish_native_artifact(&source, &destination).unwrap();
+            assert!(!std::fs::symlink_metadata(&destination).unwrap().is_symlink());
+            assert_eq!(std::fs::read(&other).unwrap(), b"untouched");
+            assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit external custody owner worker"]
+    fn custody_external_owner_worker() {
+        custody_source_identity();
+        let root = PathBuf::from(std::env::var_os("BL_CUSTODY_TEST_ROOT").unwrap());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let mut command = if let Some(manifest) = std::env::var_os("BL_CUSTODY_EXTERNAL_CARGO_MANIFEST") {
+            let mut cargo = Command::new("cargo");
+            cargo.args(["build", "--offline", "--locked", "-j", "1", "--manifest-path"]).arg(manifest)
+                .arg("--target-dir").arg(root.join("cargo-target"));
+            cargo
+        } else {
+            let mut worker = Command::new(std::env::current_exe().unwrap());
+            worker.args(["--exact", "builder_tests::custody_external_child_worker", "--ignored", "--nocapture"]);
+            worker
+        };
+        command.env("BL_CUSTODY_TEST_ROOT", &root);
+        run_logged(command, &root.join("external.log"), "actual external worker", &custody).unwrap();
+        std::fs::write(root.join("command-returned"), "returned").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join("owner-finish").exists() {
+            assert!(std::time::Instant::now() < deadline, "external owner timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit external custody child worker"]
+    fn custody_external_child_worker() {
+        custody_source_identity();
+        let root = PathBuf::from(std::env::var_os("BL_CUSTODY_TEST_ROOT").unwrap());
+        if std::env::var_os("BL_CUSTODY_TEST_GRANDCHILD").is_some() {
+            let mut grandchild = Command::new(std::env::current_exe().unwrap());
+            grandchild.args(["--exact", "builder_tests::custody_external_child_worker", "--ignored", "--nocapture"])
+                .env_remove("BL_CUSTODY_TEST_GRANDCHILD");
+            grandchild.spawn().unwrap();
+            return;
+        }
+        std::fs::write(root.join("external-pid"), std::process::id().to_string()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join("external-finish").exists() {
+            assert!(std::time::Instant::now() < deadline, "external child timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::write(root.join("external-exited"), "exited").unwrap();
+    }
+
+    // Always release the bounded worker on failure, before removing its root.
+    struct ExternalCustodyFinish(PathBuf);
+    impl Drop for ExternalCustodyFinish {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("external-finish"), "finish");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !self.0.join("external-exited").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_custody_outlives_parent_and_intermediate_external_children() {
+        custody_source_identity();
+        for grandchild in [false, true] {
+            let root = std::env::temp_dir().join(format!("external-custody-{}-{grandchild}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let _cleanup = CustodyDirectory(root.clone());
+            let _finish = ExternalCustodyFinish(root.clone());
+            let store = Store { root: root.clone() };
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "builder_tests::custody_external_owner_worker", "--ignored", "--nocapture"])
+                .env("BL_CUSTODY_TEST_ROOT", &root);
+            if grandchild { command.env("BL_CUSTODY_TEST_GRANDCHILD", "1"); }
+            let mut owner = CustodyChild(command.spawn().unwrap());
+            await_custody_file(&root.join("external-pid"), &mut owner);
+            if grandchild { await_custody_file(&root.join("command-returned"), &mut owner); }
+            owner.0.kill().unwrap();
+            owner.0.wait().unwrap();
+            let follower = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+                .open(store.meta().join("locks/build.kernel.followers")).unwrap();
+            assert!(matches!(follower.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                    "orphaned external child still needs custody (grandchild={grandchild})");
+            // A fresh actual build owner must wait while the orphan remains.
+            let contender_output = root.join("contender.log");
+            let output = std::fs::File::create(&contender_output).unwrap();
+            let mut contender = CustodyChild(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "builder_tests::custody_subprocess_worker", "--ignored", "--nocapture"])
+                .env("BL_CUSTODY_TEST_ROOT", &root)
+                .stdout(Stdio::from(output.try_clone().unwrap())).stderr(Stdio::from(output)).spawn().unwrap());
+            await_custody_file(&root.join("ready"), &mut contender);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::fs::read_to_string(&contender_output).unwrap().contains("surviving bootstrap commands hold child custody") {
+                assert!(!root.join("entered").exists(), "replacement admitted before external child exit");
+                assert!(contender.0.try_wait().unwrap().is_none(), "contender exited before draining followers");
+                assert!(std::time::Instant::now() < deadline, "contender never reached the actual follower barrier");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!root.join("entered").exists());
+            std::fs::write(root.join("external-finish"), "finish").unwrap();
+            await_custody_file(&root.join("entered"), &mut contender);
+            std::fs::write(root.join("finish"), "finish").unwrap();
+            assert!(contender.0.wait().unwrap().success());
+            assert!(follower.try_lock().is_ok(), "last child exit releases follower custody");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_command_partial_admission_never_starts_and_releases_leases() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("external-custody-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let follower = std::fs::OpenOptions::new().read(true).write(true)
+            .open(store.meta().join("locks/build.kernel.followers")).unwrap();
+        follower.try_lock().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "builder_tests::custody_external_child_worker", "--ignored", "--nocapture"])
+            .env("BL_CUSTODY_TEST_ROOT", &root);
+        let log = root.join("must-not-start.log");
+        assert!(run_logged(command, &log, "blocked external worker", &custody).unwrap_err().contains("admit child"));
+        assert!(!log.exists(), "admission refuses before opening the step log");
+        assert!(!root.join("external-pid").exists(), "no external child was born");
+        drop(follower);
+        let log = root.join("failed-start.log");
+        assert!(run_logged(Command::new(root.join("nonexistent-executable")), &log, "missing executable", &custody)
+            .unwrap_err().contains("could not start"));
+        let follower = std::fs::OpenOptions::new().read(true).write(true)
+            .open(store.meta().join("locks/build.kernel.followers")).unwrap();
+        follower.try_lock().expect("failed spawn released the partial child lease");
+        drop(follower);
+        // Preparing one command must not make its descriptor inheritable in
+        // the parent, where an unrelated concurrent spawn could retain it.
+        let mut prepared = Command::new("unused-prepared-command");
+        custody.prepare_command(&mut prepared).unwrap();
+        let _unrelated = CustodyChild(Command::new("sleep").arg("10").spawn().unwrap());
+        drop(prepared);
+        drop(custody);
+        let follower = std::fs::OpenOptions::new().read(true).write(true)
+            .open(store.meta().join("locks/build.kernel.followers")).unwrap();
+        follower.try_lock().expect("unrelated child inherited no other command's custody");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn actual_cargo_build_script_retains_custody_after_parent_and_cargo_death() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("cargo-external-custody-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("crate/src")).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let _finish = ExternalCustodyFinish(root.clone());
+        std::fs::write(root.join("crate/Cargo.toml"), "[package]\nname=\"custody_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n").unwrap();
+        std::fs::write(root.join("crate/Cargo.lock"), "version = 4\n[[package]]\nname = \"custody_probe\"\nversion = \"0.0.0\"\n").unwrap();
+        std::fs::write(root.join("crate/src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        std::fs::write(root.join("crate/build.rs"), r#"
+fn main() {
+    let root = std::path::PathBuf::from(std::env::var_os("BL_CUSTODY_TEST_ROOT").unwrap());
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let parent = status.lines().find_map(|line| line.strip_prefix("PPid:")).unwrap().trim();
+    std::fs::write(root.join("cargo-pid"), parent).unwrap();
+    std::fs::write(root.join("external-pid"), std::process::id().to_string()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("external-finish").exists() {
+        assert!(std::time::Instant::now() < deadline, "actual build script timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::fs::write(root.join("external-exited"), "exited").unwrap();
+}
+"#).unwrap();
+        let mut owner = CustodyChild(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "builder_tests::custody_external_owner_worker", "--ignored", "--nocapture"])
+            .env("BL_CUSTODY_TEST_ROOT", &root)
+            .env("BL_CUSTODY_EXTERNAL_CARGO_MANIFEST", root.join("crate/Cargo.toml"))
+            .spawn().unwrap());
+        await_custody_file(&root.join("external-pid"), &mut owner);
+        let cargo_pid = std::fs::read_to_string(root.join("cargo-pid")).unwrap();
+        // Verify the PID supplied by the real build script belongs to Cargo,
+        // then kill both ancestors while the actual build-script process lives.
+        let cargo_executable = std::fs::read_link(format!("/proc/{cargo_pid}/exe")).unwrap();
+        let cargo_status = std::fs::read_to_string(format!("/proc/{cargo_pid}/status")).unwrap();
+        let cargo_parent: u32 = cargo_status.lines().find_map(|line| line.strip_prefix("PPid:")).unwrap().trim().parse().unwrap();
+        assert_eq!(owner.0.id(), cargo_parent, "actual Cargo must be the owner's direct child");
+        let cargo_name = cargo_executable.file_name().unwrap().to_string_lossy();
+        assert!(cargo_name.contains("cargo"), "unexpected actual Cargo executable: {}", cargo_executable.display());
+        eprintln!("EXTERNAL-CUSTODY-CARGO executable={} sha256={}", cargo_executable.display(),
+                  sha256_hex(&std::fs::read(&cargo_executable).unwrap()));
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+        assert!(Command::new("kill").args(["-9", cargo_pid.trim()]).status().unwrap().success());
+        let store = Store { root: root.clone() };
+        let follower = std::fs::OpenOptions::new().read(true).write(true)
+            .open(store.meta().join("locks/build.kernel.followers")).unwrap();
+        assert!(matches!(follower.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "actual orphaned Cargo build script lost custody");
+        std::fs::write(root.join("external-finish"), "finish").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if follower.try_lock().is_ok() { break; }
+            assert!(std::time::Instant::now() < deadline, "Cargo descendant did not release custody");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(root.join("external-exited").exists());
+    }
+
+    #[test]
+    fn cargo_target_discovery_requires_successful_real_metadata() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop cargo discovery {}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        assert!(cargo_target_dir(&root.join("missing crate"), &custody).is_err(),
+                "failed real Cargo metadata must never authorize a guessed target directory");
+        let crate_dir = root.join("valid crate");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"target_discovery_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"target_discovery_probe\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let lock_before = std::fs::read(crate_dir.join("Cargo.lock")).unwrap();
+        let discovered = cargo_target_dir(&crate_dir, &custody).unwrap();
+        assert!(discovered.is_absolute(), "actual Cargo target is an absolute address");
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target = PathBuf::from(target);
+            if target.is_absolute() { assert_eq!(target, discovered); }
+        } else {
+            assert_eq!(crate_dir.join("target"), discovered);
+        }
+        assert_eq!(lock_before, std::fs::read(crate_dir.join("Cargo.lock")).unwrap());
+        assert!(!crate_dir.join("target").exists(), "discovery must not compile an artifact");
+    }
+
+    #[test]
+    fn cargo_metadata_ignores_nested_lookalike_output_directories() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop cargo metadata shadow {}", std::process::id()));
+        std::fs::create_dir_all(root.join("crate/src")).unwrap();
+        let _cleanup = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let crate_dir = root.join("crate");
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"metadata_shadow_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[package.metadata]\ntarget_directory=\"/unrelated-old-products\"\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"metadata_shadow_probe\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+        let discovered = cargo_target_dir(&crate_dir, &custody).unwrap();
+        assert_ne!(PathBuf::from("/unrelated-old-products"), discovered,
+                   "package metadata must not nominate Cargo's output directory");
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target = PathBuf::from(target);
+            if target.is_absolute() { assert_eq!(target, discovered); }
+        }
+    }
+
+    #[test]
+    fn failed_metadata_prevents_real_native_publication_even_with_a_guessed_library() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop native metadata failure {}", std::process::id()));
+        let _cleanup = CustodyDirectory(root.clone());
+        let project = root.join("project");
+        let crate_dir = project.join("native/tiny_discovery");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"),
+            "[package]\nname=\"tiny_discovery\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n[lib]\ncrate-type=[\"cdylib\"]\n").unwrap();
+        std::fs::write(crate_dir.join("Cargo.lock"),
+            "version=4\n[[package]]\nname=\"tiny_discovery\"\nversion=\"0.0.0\"\n").unwrap();
+        std::fs::write(crate_dir.join("src/lib.rs"), "#[no_mangle]\npub extern \"C\" fn answer() -> u8 { 42 }\n").unwrap();
+        // Cargo already read its manifest. Make subsequent real metadata fail
+        // after compilation, with an unrelated library waiting at the old guess.
+        std::fs::write(crate_dir.join("build.rs"),
+            "fn main() { std::fs::remove_file(std::path::PathBuf::from(std::env::var_os(\"CARGO_MANIFEST_DIR\").unwrap()).join(\"Cargo.toml\")).unwrap(); }\n").unwrap();
+        let guessed = crate_dir.join("target/release");
+        std::fs::create_dir_all(&guessed).unwrap();
+        std::fs::write(guessed.join("libtiny_discovery.so"), "unrelated guessed product").unwrap();
+        let destination = project.join("priv/native/tiny_discovery.so");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, "old installed library").unwrap();
+        let store = Store { root: root.clone() };
+        let custody = BuildLock::take(&store).unwrap();
+        let log = root.join("build.log");
+        let error = build_natives(&project, &log, &custody)
+            .expect_err("failed metadata must prevent real native publication");
+        assert!(error.contains("native Cargo metadata"), "unexpected failure before metadata: {error}");
+        assert!(std::fs::read_to_string(log).unwrap().contains("Finished"), "actual Cargo compilation must succeed first");
+        assert!(!crate_dir.join("Cargo.toml").exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old installed library");
+        assert_eq!(std::fs::read(guessed.join("libtiny_discovery.so")).unwrap(), b"unrelated guessed product");
+    }
+
+    struct CustodyChild(std::process::Child);
+    impl Drop for CustodyChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct CustodyDirectory(PathBuf);
+    impl Drop for CustodyDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn await_custody_file(path: &Path, child: &mut CustodyChild) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "custody worker exited before {}", path.display());
+            assert!(std::time::Instant::now() < deadline, "custody worker timed out: {}", path.display());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn build_custody_survives_missing_or_forged_diagnostics_and_owner_crash() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop-custody-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _directory = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let held = BuildLock::take(&store).unwrap();
+        let diagnostic = store.meta().join("locks/build");
+        let mut child = CustodyChild(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "builder_tests::custody_subprocess_worker", "--ignored", "--nocapture"])
+            .env("BL_CUSTODY_TEST_ROOT", &root).spawn().unwrap());
+        await_custody_file(&root.join("ready"), &mut child);
+        for diagnostic_bytes in [None, Some(""), Some("999999999"), Some("handmade marker")] {
+            match diagnostic_bytes {
+                None => { let _ = std::fs::remove_file(&diagnostic); }
+                Some(bytes) => std::fs::write(&diagnostic, bytes).unwrap(),
+            }
+            // The original PID loop sleeps two seconds between probes.
+            // Observe beyond that interval; a100ms window can falsely pass.
+            std::thread::sleep(std::time::Duration::from_millis(2200));
+            assert!(!root.join("entered").exists(), "diagnostic text admitted a competing actual process");
+        }
+        drop(held);
+        await_custody_file(&root.join("entered"), &mut child);
+        // SIGKILL bypasses Rust Drop. Actual kernel custody must still release.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered = BuildLock::take(&store).unwrap();
+        assert_eq!(std::fs::read_to_string(&diagnostic).unwrap(), std::process::id().to_string());
+        drop(recovered);
+    }
+
+    #[test]
+    fn build_custody_reports_io_errors_and_releases_after_publication_failure() {
+        custody_source_identity();
+        let root = std::env::temp_dir().join(format!("drop-custody-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _directory = CustodyDirectory(root.clone());
+        let store = Store { root: root.clone() };
+        let locks = store.meta().join("locks");
+        let anchor = locks.join("build.kernel");
+        std::fs::create_dir_all(&anchor).unwrap();
+        assert!(BuildLock::take(&store).err().unwrap().contains("cannot open build custody"));
+        std::fs::remove_dir(&anchor).unwrap();
+        let followers = locks.join("build.kernel.followers");
+        std::fs::create_dir(&followers).unwrap();
+        assert!(BuildLock::take(&store).err().unwrap().contains("cannot open build followers"));
+        std::fs::File::open(&anchor).unwrap().try_lock().expect("follower open failure releases writer");
+        std::fs::remove_dir(&followers).unwrap();
+        // Publishing over a directory fails after actual kernel acquisition.
+        std::fs::create_dir(locks.join("build")).unwrap();
+        assert!(BuildLock::take(&store).err().unwrap().contains("cannot publish build owner"));
+        let observer = std::fs::OpenOptions::new().read(true).write(true).open(&anchor).unwrap();
+        observer.try_lock().expect("publication failure released its actual kernel descriptor");
+        assert!(std::fs::read_dir(&locks).unwrap().all(|entry|
+            !entry.unwrap().file_name().to_string_lossy().starts_with("build.writing-")));
+        drop(observer);
+        std::fs::remove_dir(locks.join("build")).unwrap();
+        let acquired = BuildLock::take(&store).unwrap();
+        assert!(matches!(std::fs::File::open(&anchor).unwrap().try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(acquired);
+        assert!(anchor.is_file(), "the permanent anchor survives release");
+        std::fs::File::open(&anchor).unwrap().try_lock().unwrap();
+    }
+
     #[test]
     fn the_build_lock_is_exclusive_and_stale_locks_are_taken() {
+        custody_source_identity();
         let d = std::env::temp_dir().join(format!("drop-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let store = Store { root: d.clone() };
@@ -750,7 +1395,7 @@ mod builder_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "999999999").unwrap(); // a pid that cannot be alive
         {
-            let _l = BuildLock::take(&store);
+            let _l = BuildLock::take(&store).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), std::process::id().to_string());
         }
         assert!(!path.exists(), "the lock is released on drop");

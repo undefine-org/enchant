@@ -1,0 +1,111 @@
+(ns native-execution-start-wire-test (:require [reload.generation :as g]))
+
+(defn- trace-context-fields [class action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn
+                (fn []
+                 (loop [seen {}]
+                  (receive
+                   [:trace _ :call [module :init arguments]]
+                    (let [argument (erlang/hd arguments)
+                          kind (if (= module class) :actor :supervisor)
+                          index (if (= kind :actor) 1 2)
+                          tag (when (and (tuple? argument) (= 5 (erlang/tuple_size argument))) (elem argument 0))]
+                     (if (contains? #{:bl_managed_supervisor :"$bl_conveyed_generation" :bl_native_supervisor :"$bl_native_conveyed_env"} tag)
+                      (let [field (elem argument index)]
+                       ;; Never convey/print raw contexts in diagnostic output.
+                       (recur (assoc seen kind {:map? (erlang/is_map field) :marker? (= :native-context field)})))
+                      (recur seen)))
+                   [:finish seen-ticket] :when (= seen-ticket ticket) (erlang/send parent [:wire-observations ticket seen])
+                   _ (recur seen)))))]
+  (erlang/trace_pattern (tuple class :init 1) true (list :local))
+  (erlang/trace_pattern (tuple :Elixir.BeamLisp.Supervisor :init 1) true (list :local))
+  (erlang/trace parent true (list :call :set_on_spawn (tuple :tracer tracer)))
+  (try
+   (let [value (action) delivered (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= seen delivered) :ready (after 5000 (throw :trace-delivery-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:wire-observations seen data] :when (= seen ticket) data (after 5000 (throw :wire-trace-timeout)))])
+   (finally
+    (erlang/trace parent false (list :call :set_on_spawn))
+    (erlang/trace_pattern (tuple class :init 1) false (list :local))
+    (erlang/trace_pattern (tuple :Elixir.BeamLisp.Supervisor :init 1) false (list :local))
+    (when (Process/alive? tracer) (erlang/exit tracer :kill))))))
+
+(deftest actual-otp-init-and-managed-restart-specs-carry-no-context-maps
+ (let [graph (g/prepare!
+              {:application-id "native-start-wire" :stable-namespaces #{"proc.super"}
+               :sources {"start.wire"
+                "(ns start.wire (:require [proc.super :as super]))
+                 (defserver owner (init [_] (ok nil)) (handle-call :read [_ st] (reply 42 st)))
+                 (defn class [] owner)
+                 (super/defsupervisor tree (child :owner owner nil {}))
+                 (defn start-tree [] (start-link tree))"}})
+       class (g/invoke! graph "start.wire/class" []) tree (atom nil)]
+  (try
+   (let [[pid observed] (trace-context-fields class #(g/invoke! graph "start.wire/start-tree" []))]
+    (reset! tree pid)
+    (is (= #{:actor :supervisor} (set (keys observed))))
+    (doseq [kind [:actor :supervisor]]
+     (is (= false (get-in observed [kind :map?])))
+     (is (= true (get-in observed [kind :marker?]))))
+    (let [spec (elem (erlang/apply :supervisor :get_childspec (list pid :owner)) 1)
+          name (nth (elem (:start spec) 2) 2) context (elem name 1)
+          child (elem (first (Supervisor/which_children pid)) 1)]
+     (is (= false (erlang/is_map context)))
+     (is (= :bl_native_context (when (tuple? context) (elem context 0))))
+     (is (= :waiting (:status (g/retire! graph))))
+     (Process/exit child :kill)
+     (let [next (loop [left 1000]
+                  (let [candidate (elem (first (Supervisor/which_children pid)) 1)]
+                   (cond (and (erlang/is_pid candidate) (not= child candidate)) candidate
+                         (zero? left) nil
+                         :else (do (Process/sleep 5) (recur (dec left))))))]
+      (is (erlang/is_pid next))
+      (is (= 42 (call next :read))))))
+   (finally
+    (when (and @tree (Process/alive? @tree)) (Supervisor/stop @tree :normal 5000))
+    (g/retire! graph)))))
+
+(defserver native-owner
+ (init [value] (ok {:value value :ns (:ns (BeamLisp.Env/capture))}))
+ (handle-call :read [_ state] (reply (:value state) state))
+ (handle-call :context [_ state] (reply (:ns state) state)))
+
+(deftest actual-native-otp-init-packets-carry-no-context-maps
+ (let [tree (atom nil) original-context (atom nil)]
+  (try
+   (let [[result observed]
+          (trace-context-fields native-owner
+           #(BeamLisp.Env/with_ns "native.tree.original"
+             (fn []
+              (let [spec (BeamLisp.Supervisor/server :owner native-owner 42 {})]
+               (reset! original-context (elem (nth (elem (:start spec) 2) 2) 1))
+               (BeamLisp.Supervisor/start_native_link (list spec)
+                (list (tuple :strategy :one_for_one)))))))
+         pid (elem result 1)]
+    (reset! tree pid)
+    (is (= #{:actor :supervisor} (set (keys observed))))
+    (doseq [kind [:actor :supervisor]]
+     (is (= false (get-in observed [kind :map?])))
+     (is (= true (get-in observed [kind :marker?]))))
+    (let [child (elem (first (Supervisor/which_children pid)) 1)
+          spec (elem (erlang/apply :supervisor :get_childspec (list pid :owner)) 1)
+          context (elem (nth (elem (:start spec) 2) 2) 1)]
+     ;; Stored metadata preserves the constructor selection. Actual OTP init
+     ;; packets above still carry only markers, never this context or a map.
+     (is (= @original-context context))
+     (is (= :bl_native_context (elem context 0)))
+     (is (= "native.tree.original" (call child :context)))
+     (is (= 42 (call child :read)))
+     (Process/exit child :kill)
+     (let [next (loop [left 1000]
+                  (let [candidate (elem (first (Supervisor/which_children pid)) 1)]
+                   (cond (and (erlang/is_pid candidate) (not= child candidate)) candidate
+                         (zero? left) nil
+                         :else (do (Process/sleep 5) (recur (dec left))))))]
+      (is (erlang/is_pid next))
+      (is (= "native.tree.original" (call next :context)))
+      (is (= 42 (call next :read))))))
+   (finally
+    (when (and @tree (Process/alive? @tree)) (Supervisor/stop @tree :normal 5000))))))

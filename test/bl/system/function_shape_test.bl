@@ -1,0 +1,92 @@
+(ns system.function-shape-test
+ (:require [anf :as a] [compiler :as compiler] [lower :as lower]
+           [system.ir :as ir] [system.suspension :as suspension]))
+
+(defn- compiled [source]
+ (compiler/compile (BeamLisp.Reader/read_one source) (compiler/new-env "shape.probe")))
+(defn- one [] (a/fnn (list (a/clause (list (a/pvar "x")) nil (a/lit 42)))))
+(defn- dispatch [head slot]
+ (a/tup (list (a/lit head) (a/mapp (list [(a/lit 2) slot])) (a/lit nil))))
+(defn- native-outcome [node arguments]
+ (let [module (erlang/binary_to_atom (str "Elixir.FunctionShapeProbe" (erlang/unique_integer (list :positive))))
+       packed (Enum/reduce (Enum/reverse arguments) (a/empty-list-node)
+                (fn [value tail] (a/cons-cell (a/lit value) tail)))
+       invoked (a/invoke node packed)]
+  (try (lower/eval-anf module invoked)
+   (catch error (:__struct__ error))
+   (finally (code/delete module) (code/soft_purge module)))))
+
+(deftest compiler-produced-fixed-multiple-and-variadic-shapes-remain-supported
+ (doseq [[source accepted refused]
+         [["(fn [] 42)" [0] [1 2]] ["(fn [x] x)" [1] [0 2]]
+          ["(fn ([x] x) ([x y] x))" [1 2] [0 3]]
+          ["(fn [x & rest] x)" [1 2 20] [0]]]]
+  (let [shape (ir/function-shape (compiled source))]
+   (doseq [arity accepted] (is (ir/accepts-arity? shape arity)))
+   (doseq [arity refused] (is (not (ir/accepts-arity? shape arity)))))))
+
+(deftest string-tags-cannot-supply-a-function-contract
+ (let [node (dispatch "$blfn" (compiled "(fn [x y] 42)"))]
+  (is (= :Elixir.ArgumentError (native-outcome node [1 2])))
+  (is (= false (ir/blfn-value? node)))
+  (is (nil? (ir/function-shape node)))))
+
+(deftest fixed-dispatch-keys-do-not-prove-the-native-slots-arity
+ (let [node (dispatch :"$blfn" (one))]
+  (is (= :Elixir.BadArityError (native-outcome node [1 2])))
+  (is (nil? (ir/function-shape node)))))
+
+(deftest mixed-native-clauses-cannot-promise-a-second-native-arity
+ (let [node (a/fnn (list (a/clause (list (a/pvar "x")) nil (a/lit 42))
+                        (a/clause (list (a/pvar "x") (a/pvar "y")) nil (a/lit 99))))]
+  (is (= 42 (native-outcome node [1])))
+  (is (= :Elixir.BadArityError (native-outcome node [1 2])))
+  (is (nil? (ir/function-shape node)))))
+
+(deftest self-application-must-not-hide-executable-arguments
+ (let [inner (a/fnn (list (a/clause (list) nil (a/lit 42))))
+       outer (a/fnn (list (a/clause (list (a/pvar "self")) nil inner)))
+       argument (a/recv (list) (a/lit 0) (a/lit :finished))
+       node (a/lett "self" outer (a/app (a/var "self") (list argument)))]
+  (is (= 42 (native-outcome node [])))
+  (is (= false (ir/self-scaffold? node)))
+  (is (= false (suspension/synchronous? node (fn [_] true))))
+  (is (nil? (ir/function-shape node)))))
+
+(deftest malformed-dispatch-fields-do-not-become-empty-arity-proofs
+ (doseq [node [(a/tup (list (a/lit :"$blfn")))
+               (a/tup (list (a/lit :"$blfn") (a/lit {}) (a/lit nil)))
+               (a/tup (list (a/lit :"$blfn") (a/mapp (list)) (a/lit :not-a-variadic-slot)))
+               (a/tup (list (a/lit :"$blfn") (a/mapp (list))
+                            (a/tup (list (a/lit 2) (one)))))]]
+  (is (nil? (ir/function-shape node)))))
+
+(deftest noncanonical-fields-fail-closed-before-enumeration
+ (doseq [node [(a/tup (list (a/lit :"$blfn") {:op :map :pairs 17 :ann {}} (a/lit nil)))
+               (a/tup (list (a/lit :"$blfn") (a/mapp (list 17)) (a/lit nil)))
+               (a/tup (list (a/lit :"$blfn")
+                            (a/mapp (list [(a/lit 2) (one)] [(a/lit 2) (one)])) (a/lit nil)))
+               (a/tup (list (a/lit :"$blfn") (a/mapp (list))
+                            (a/tup (list (a/lit -1) (one)))))]]
+  (is (= false (ir/blfn-value? node)))
+  (is (nil? (ir/function-shape node)))))
+
+(deftest contract-discovery-and-query-have-explicit-bounds
+ (let [deep (Enum/reduce (Enum/to_list (Range/new 1 300)) (one)
+               (fn [_ body] (a/lett "unused" (a/lit 0) body)))]
+  (is (nil? (ir/function-shape deep)))
+  (doseq [arity [nil -1 1.5 :unknown]]
+   (is (= false (ir/accepts-arity? {:arities #{} :variadic-min 0} arity))))
+  (is (= false (ir/accepts-arity? {:arities #{} :variadic-min -1} 0)))))
+
+(deftest scaffold-recognition-requires-the-complete-compiler-constructor
+ (let [canonical (compiled "(fn [] 42)")
+       wrong-parameter (assoc-in canonical [:init :clauses]
+                         (list (assoc (first (get-in canonical [:init :clauses]))
+                                 :pats (list (a/pvar "different")))))
+       guarded (assoc-in canonical [:init :clauses]
+                 (list (assoc (first (get-in canonical [:init :clauses])) :guard (a/lit true))))
+       wrong-count (assoc-in canonical [:body :args] (list))]
+  (is (ir/self-scaffold? canonical))
+  (doseq [node [wrong-parameter guarded wrong-count]]
+   (is (= false (ir/self-scaffold? node))))))

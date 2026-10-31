@@ -1,0 +1,247 @@
+; src/foundry/support/deployment-tar.bl — deterministic tar writing, safe tar extraction, sha256.
+;
+; Replaces Python tarfile/hashlib in the release-transfer and backup paths.
+;
+;   (sha256-file path)  → lowercase hex, streamed in 1 MiB chunks
+;   (sha256-hex bin)    → lowercase hex
+;   (walk root)         → sorted [{:path rel :type :file|:dir :size n :mode int}];
+;                         THROWS on any symlink/fifo/socket/device under root
+;   (write-tar! root out) → {:files n :bytes n :sha256 hex}; byte-for-byte
+;                         deterministic USTAR (sorted, uid/gid 0, mtime 0,
+;                         dirs 0755, files 0755 if any exec bit else 0644).
+;                         Headers are written here, not by :erl_tar.
+;   (read-tar-safe! tar dest {:max-bytes :max-entries :max-depth})
+;                       → {:files n :bytes n}; parses headers itself (untrusted
+;                         input), validates EVERY entry before writing anything,
+;                         accepts only regular files + dirs, refuses absolute
+;                         paths, `..`, links, devices, depth/size/count overruns.
+;                         `dest` must not exist.
+; Failures are thrown as ex-info with a clear message.
+
+(ns deployment-tar)
+
+(def block 512)
+
+(defn- tuple [& xs] (erlang/list_to_tuple (to-list xs)))
+(defn- hex [bin] (str (erlang/apply :binary :encode_hex (list bin :lowercase))))
+(defn- band [a b] (erlang/apply :erlang :band (list a b)))
+(defn- bin [& parts] (erlang/iolist_to_binary (to-list parts)))
+(defn- zeros [n] (erlang/apply :binary :copy (list (erlang/list_to_binary (list 0)) n)))
+(defn- bsize [b] (erlang/byte_size b))
+(defn- bpart [b start len] (erlang/binary_part b start len))
+(defn- fail [msg data] (throw (ex-info msg data)))
+
+(defn sha256-hex [b]
+  (hex (erlang/apply :crypto :hash (list :sha256 b))))
+
+(defn sha256-file [path]
+  (let [r (erlang/apply :file :open (list path (to-list [:read :raw :binary])))]
+    (when-not (= :ok (erlang/element 1 r)) (fail (str "cannot open " path) {:path path}))
+    (let [fh (erlang/element 2 r)]
+      (try
+        (loop [ctx (erlang/apply :crypto :hash_init (list :sha256))]
+          (let [c (erlang/apply :file :read (list fh 1048576))]
+            (if (= :eof c)
+              (hex (erlang/apply :crypto :hash_final (list ctx)))
+              (recur (erlang/apply :crypto :hash_update (list ctx (erlang/element 2 c)))))))
+        (finally (erlang/apply :file :close (list fh)))))))
+
+;; ---- walking --------------------------------------------------------------
+
+(defn- info [path]
+  (let [r (erlang/apply :file :read_link_info (list path))]
+    (when-not (= :ok (erlang/element 1 r)) (fail (str "cannot stat " path) {:path path}))
+    (let [i (erlang/element 2 r)]
+      {:type (erlang/element 3 i) :size (erlang/element 2 i) :mode (band (erlang/element 8 i) 511)})))
+
+(defn- walk-into [root rel acc]
+  (let [dir (if (= "" rel) root (str root "/" rel))]
+    (reduce
+      (fn [acc name]
+        (let [r (if (= "" rel) name (str rel "/" name))
+              i (info (str root "/" r))]
+          (cond
+            (= :directory (:type i)) (walk-into root r (conj acc {:path r :type :dir :size 0 :mode (:mode i)}))
+            (= :regular (:type i)) (conj acc {:path r :type :file :size (:size i) :mode (:mode i)})
+            :else (fail (str "refusing non-regular entry (" (name (:type i)) "): " r) {:path r :type (:type i)}))))
+      acc
+      (sort (File/ls! dir)))))
+
+(defn walk [root]
+  (vec (sort-by :path (walk-into root "" []))))
+
+;; ---- writing --------------------------------------------------------------
+
+(defn- field
+  "`s` NUL-padded/truncated to exactly n bytes."
+  [s n]
+  (let [b (str s)]
+    (when (> (bsize b) n) (fail (str "field too long: " s) {}))
+    (bin b (zeros (- n (bsize b))))))
+
+(defn- octal
+  "n as zero-padded octal of width w-1 followed by NUL."
+  [n w]
+  (let [o (erlang/integer_to_binary n 8)
+        pad (- (- w 1) (bsize o))]
+    (when (neg? pad) (fail "number too large for tar field" {:n n}))
+    (bin (erlang/apply :binary :copy (list "0" pad)) o (zeros 1))))
+
+(defn- split-path
+  "[prefix name] fitting ustar's 155/100 split, or throws."
+  [p]
+  (if (<= (bsize p) 100)
+    ["" p]
+    (let [idxs (filter (fn [i] (= "/" (bpart p i 1))) (range (bsize p)))
+          ok (filter (fn [i] (and (<= i 155) (<= (- (bsize p) i 1) 100) (> i 0))) idxs)]
+      (if (empty? ok)
+        (fail (str "path too long for ustar: " p) {:path p})
+        (let [i (last ok)] [(bpart p 0 i) (bpart p (+ i 1) (- (bsize p) i 1))])))))
+
+(defn- header [path type size mode]
+  (let [[prefix nm] (split-path (if (= :dir type) (str path "/") path))
+        nm (if (and (= :dir type) (= "" prefix) false) nm nm)
+        pre (bin (field nm 100) (octal mode 8) (octal 0 8) (octal 0 8)
+                 (octal size 12) (octal 0 12))
+        post (bin (if (= :dir type) "5" "0") (zeros 100) "ustar" (zeros 1) "00"
+                  (zeros 32) (zeros 32) (octal 0 8) (octal 0 8) (field prefix 155) (zeros 12))
+        sum (reduce + 0 (erlang/binary_to_list (bin pre "        " post)))
+        chk (bin (let [o (erlang/integer_to_binary sum 8)] (bin (erlang/apply :binary :copy (list "0" (- 6 (bsize o)))) o)) (zeros 1) " ")]
+    (bin pre chk post)))
+
+(defn- padding [n] (zeros (mod (- block (mod n block)) block)))
+
+(defn- copy-file-into!
+  "Append `path`'s bytes to open handle `out` in 1 MiB chunks. → bytes copied."
+  [path out]
+  (let [r (erlang/apply :file :open (list path (to-list [:read :raw :binary])))]
+    (when-not (= :ok (erlang/element 1 r)) (fail (str "cannot read " path) {}))
+    (let [fh (erlang/element 2 r)]
+      (try
+        (loop [n 0]
+          (let [c (erlang/apply :file :read (list fh 1048576))]
+            (if (and (tuple? c) (= :ok (erlang/element 1 c)))
+              (let [chunk (erlang/element 2 c)]
+                (erlang/apply :file :write (list out chunk))
+                (recur (+ n (bsize chunk))))
+              n)))
+        (finally (erlang/apply :file :close (list fh)))))))
+
+(defn write-tar! [root out-path]
+  (let [entries (walk root)
+        r (erlang/apply :file :open (list out-path (to-list [:write :raw :binary])))
+        _ (when-not (= :ok (erlang/element 1 r)) (fail (str "cannot write " out-path) {}))
+        fh (erlang/element 2 r)]
+    (try
+      (do
+        (doseq [e entries]
+          (let [dir? (= :dir (:type e))
+                size (if dir? 0 (:size e))
+                mode (if dir? 493 (if (zero? (band (:mode e) 73)) 420 493))]
+            (erlang/apply :file :write (list fh (header (:path e) (:type e) size mode)))
+            ;; stream the data: a release carries a ~110 MB runtime drop
+            (when-not dir?
+              (let [copied (copy-file-into! (str root "/" (:path e)) fh)]
+                (when (not= copied size)
+                  (fail (str "file changed while archiving: " (:path e)) {}))))
+            (erlang/apply :file :write (list fh (padding size)))))
+        (erlang/apply :file :write (list fh (zeros 1024))))
+      (finally (erlang/apply :file :close (list fh))))
+    {:files (count (filter (fn [e] (= :file (:type e))) entries))
+     :bytes (:size (info out-path))
+     :sha256 (sha256-file out-path)}))
+
+;; ---- reading --------------------------------------------------------------
+
+(defn- cstr [b]
+  (let [i (erlang/apply :binary :match (list b (zeros 1)))]
+    (if (= :nomatch i) b (bpart b 0 (erlang/element 1 i)))))
+
+(defn- parse-octal [b what]
+  (let [s (String/trim (str (cstr b)))]
+    (try (erlang/binary_to_integer (str (if (= "" s) "0" s)) 8)
+         (catch e (fail (str "bad tar " what " field") {})))))
+
+(defn- check-name [nm max-depth]
+  (let [segs (String/split nm "/")]
+    (cond
+      (= "" nm) (fail "empty entry name" {})
+      (String/starts_with? nm "/") (fail (str "absolute path refused: " nm) {:path nm})
+      (some (fn [s] (or (= ".." s) (= "." s) (= "" s))) segs) (fail (str "unsafe path refused: " nm) {:path nm})
+      (> (count segs) max-depth) (fail (str "entry too deep: " nm) {:path nm})
+      :else nm)))
+
+(defn- parse-entries [read! total {:keys [max-bytes max-entries max-depth]}]
+ (let []
+  (loop [pos 0 acc [] bytes 0 pending nil headers 0 seen #{}]
+   (cond
+    (> (+ pos block) total) (fail "truncated tar (no end marker)" {})
+    (= (read! pos block) (zeros block))
+      (if pending (fail "dangling GNU long name" {}) acc)
+    :else
+    (let [h (read! pos block)
+          want (parse-octal (bpart h 148 8) "checksum")
+          got (reduce + 0 (erlang/binary_to_list (bin (bpart h 0 148) "        " (bpart h 156 356))))
+          _ (when-not (= want got) (fail "tar header checksum mismatch" {}))
+          flag (bpart h 156 1) size (parse-octal (bpart h 124 12) "size")
+          start (+ pos block) next (+ start size (mod (- block (mod size block)) block))
+          _ (when (or (> (+ start size) total) (> next total)) (fail "truncated entry data" {}))
+          _ (when (>= headers (* 2 max-entries)) (fail "too many tar headers" {}))]
+     (if (= "L" flag)
+      (do
+       (when (or pending (> size 4096) (zero? size)) (fail "invalid GNU long name" {}))
+       (let [name (str (cstr (read! start size)))]
+        (check-name name max-depth)
+        (recur next acc bytes name (inc headers) seen)))
+      (let [prefix (str (cstr (bpart h 345 155))) nm0 (str (cstr (bpart h 0 100)))
+            full (or pending (if (= "" prefix) nm0 (str prefix "/" nm0)))
+            dir? (= "5" flag) reg? (or (= "0" flag) (= (zeros 1) flag))
+            _ (when-not (or dir? reg?) (fail (str "unsupported entry type refused: " full) {:path full}))
+            nm (check-name (if (and dir? (String/ends_with? full "/")) (subs full 0 (- (count full) 1)) full) max-depth)
+            _ (when (contains? seen nm) (fail "duplicate archive path" {:path nm}))
+            _ (when (and dir? (not (zero? size))) (fail "directory entry has data" {:path nm}))
+            bytes (+ bytes size)
+            _ (when (>= (count acc) max-entries) (fail "too many entries" {}))
+            _ (when (> bytes max-bytes) (fail "archive exceeds max-bytes" {}))
+            ent {:path nm :dir dir? :start start :size size
+                 :mode (if dir? 493 (if (zero? (band (parse-octal (bpart h 100 8) "mode") 73)) 420 493))}]
+       (recur next (conj acc ent) bytes nil (inc headers) (conj seen nm)))))))))
+
+(defn- read-at! [fh offset size]
+  (if (zero? size) ""
+    (let [r (erlang/apply :file :pread (list fh offset size))]
+      (when-not (and (= :ok (first r)) (= size (bsize (second r))))
+        (fail "Archive is truncated or cannot be read" {}))
+      (second r))))
+
+(defn read-tar-safe!
+  "Validate headers before extraction, then copy payloads in 1 MiB chunks.
+   Memory depends on the bounded entry inventory, never archive byte size."
+  [tar-path dest opts]
+  (let [opts (merge {:max-bytes 1073741824 :max-entries 100000 :max-depth 64} opts)
+        _ (when (File/exists? dest) (fail (str "destination exists: " dest) {}))
+        opened (erlang/apply :file :open (list tar-path (to-list [:read :raw :binary])))]
+    (when-not (= :ok (first opened)) (fail "Cannot open archive" {}))
+    (let [fh (second opened)]
+      (try
+        (let [entries (parse-entries #(read-at! fh %1 %2) (:size (info tar-path)) opts)]
+          (File/mkdir_p! dest) (File/chmod! dest 448)
+          (doseq [e entries]
+            (let [p (str dest "/" (:path e))]
+              (if (:dir e) (File/mkdir_p! p)
+                (do
+                  (File/mkdir_p! (Path/dirname p))
+                  (let [out (erlang/apply :file :open (list p (to-list [:write :exclusive :raw :binary])))]
+                    (when-not (= :ok (first out)) (fail "Cannot create archive entry" {}))
+                    (try
+                      (loop [offset (:start e) remaining (:size e)]
+                        (when (pos? remaining)
+                          (let [n (min remaining 1048576)
+                                r (erlang/apply :file :write (list (second out) (read-at! fh offset n)))]
+                            (when-not (= :ok r) (fail "Cannot write archive entry" {}))
+                            (recur (+ offset n) (- remaining n)))))
+                      (finally (erlang/apply :file :close (list (second out))))))
+                  (File/chmod! p (:mode e))))))
+          {:files (count (filter #(not (:dir %)) entries))
+           :bytes (reduce + 0 (map :size entries))})
+        (finally (erlang/apply :file :close (list fh)))))))

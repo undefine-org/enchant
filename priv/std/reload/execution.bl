@@ -1,20 +1,374 @@
 ; Exact graph execution and leases. A leaf shared by generation planning and
 ; immutable executable catalogues;never depends on datom/reload/source analysis.
-(ns reload.execution (:require [env]))
+(ns reload.execution)
 
 (defn- refuse! [kind data]
  (throw (ex-info "Immutable generation refused" (assoc data :kind kind))))
 (defn- with-lock [key action]
  (BeamLisp.Env/with_generation_lock (tuple :sealed-generation key) action))
+(def ^:private prepared (atom {}))
+
+;; One private preparation owner. A row may authenticate prepared code before
+;; initialization completes, but only a ready row can be reused or published.
+;; Runtime instances belong in this row, never in caller-mutable graph state.
+(defn- prepared-generation* [key]
+ (let [row (get @prepared key)]
+  (when (contains? #{:prepared :instance-prepared :initializing :instance-initialized :instance-failed :ready}
+                    (:phase row)) (:generation row))))
+
+(defn cached-preparation [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when-let [row (get @prepared key)]
+  (if (= :ready (:phase row))
+   (let [generation (:generation row)]
+    (when (:retired @(:state generation)) (refuse! :retirement-pending {}))
+    generation)
+   (if (= :instance-failed (:phase row))
+    (refuse! :instance-initialization-failed {})
+   (if (and (erlang/is_pid (:owner row)) (Process/alive? (:owner row)))
+    (refuse! :preparation-in-progress {})
+    ;; Caller death is not evidence that initialized resources/code are gone.
+    ;; Keep this bounded reservation until an actual lifecycle recovery exists.
+    (refuse! :runtime-handover-required {:reason :abandoned-preparation}))))))
+
+(defn preparation-limit [] 256)
+
+(defn begin-preparation! [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [owner (erlang/self) limit (preparation-limit)]
+  (swap! prepared
+   (fn [rows]
+    (when (contains? rows key) (refuse! :preparation-in-progress {}))
+    (when (>= (count rows) limit) (refuse! :runtime-handover-required {:reason :preparation-capacity}))
+    (assoc rows key {:phase :preparing :owner owner}))))
+ :ok)
+
+(defn record-prepared! [key generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key)]
+  (when-not (and (= :preparing (:phase row)) (= (erlang/self) (:owner row))
+                 (= key (:cache-key generation)))
+   (refuse! :preparation-owner-changed {}))
+  (swap! prepared assoc key {:phase :prepared :owner (erlang/self) :generation generation}))
+ generation)
+
+(defn complete-preparation! [key generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (with-lock key (fn []
+ (let [row (get @prepared key)]
+  (when-not (and (contains? #{:prepared :instance-initialized} (:phase row))
+                 (= (erlang/self) (:owner row))
+                 (erlang/== generation (:generation row)))
+   (refuse! :preparation-owner-changed {}))
+  (when (:retired @(:state generation)) (refuse! :retired-generation {}))
+  ;; Factory initialization's accepted lease may drain after a retirement has
+  ;; closed fresh admissions. Recheck native admission under the same generation
+  ;; lock as retirement before declaring it ready. Pure Source construction has
+  ;; no factory/instance yet; its existing completion adapter remains unchanged.
+  (let [ticket (when (:factory row) (BeamLisp.Env/retain_generation_code! generation))]
+   (try (swap! prepared assoc key (dissoc (assoc row :phase :ready) :owner))
+    (finally (when ticket (BeamLisp.Env/release_code! ticket))))))))
+ generation)
+
+(defn abandon-preparation! [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key)]
+  (when (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+             (= :preparing (:phase row)) (nil? (:generation row))
+             (= (erlang/self) (:owner row)))
+   ;; Keep the allocation's address until destruction actually finishes.
+   (BeamLisp.Env/destroy (nth key 3))))
+ (swap! prepared
+  (fn [rows]
+   (let [row (get rows key)]
+    ;; Once a factory has entered, caller death or an exception cannot prove
+    ;; its effects/callbacks/resources are gone. Only real retirement forgets it.
+    (if (and (= (erlang/self) (:owner row))
+             (contains? #{:preparing :prepared :instance-prepared} (:phase row)))
+     (dissoc rows key) rows))))
+ :ok)
+
+(defn ready-prepared! [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared (:cache-key generation))]
+  (when-not (and (= :ready (:phase row)) (erlang/== generation (:generation row)))
+   (refuse! :unready-prepared-generation {})))
+ generation)
+
+(defn prepare-instance!
+ "Freeze canonical factory selection in this original preparation before any
+  initializer can run. Metadata grants no native admission. Only the existing
+  preparation owner may attach it; no supplied callback becomes executable."
+ [generation module exports]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (BeamLisp.CompilerData/check_first_order! exports
+   {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+ (when-not (and (erlang/is_atom module) (not (contains? #{nil true false} module))
+                (erlang/is_list exports)
+                (every? BeamLisp.CompilerData/binding_reference? exports))
+  (refuse! :invalid-instance-factory {}))
+ (let [expected (into {} (map (fn [reference] [reference true]) exports))
+       key (:cache-key generation) row (get @prepared key)]
+  (when-not (= (count exports) (count expected)) (refuse! :invalid-instance-factory {}))
+  (when-not (and (= :prepared (:phase row)) (= (erlang/self) (:owner row))
+                 (erlang/== generation (:generation row)))
+   (refuse! :preparation-owner-changed {}))
+  (swap! prepared assoc key (assoc row :phase :instance-prepared
+                                  :factory {:module module :exports expected})))
+ generation)
+
+(defn- checked-instance! [instance expected]
+ ;; Inspect the raw map only. No user sequence, callable, Atom, class constructor
+ ;; or serialization is executed to validate the factory's result envelope.
+ (when-not (and (erlang/is_map instance) (= 4 (erlang/map_size instance))
+                (= 1 (:version instance)) (= :contextual-unit-instance (:kind instance))
+                (erlang/is_function (:entry instance) 0) (erlang/is_map (:exports instance))
+                (= (erlang/map_size expected) (erlang/map_size (:exports instance)))
+                (every? (fn [key] (erlang/is_map_key key expected)) (maps/keys (:exports instance))))
+  (refuse! :invalid-unit-instance {}))
+ instance)
+
+(defn initialize-instance!
+ "Run the frozen zero-argument factory once under actual native graph custody.
+  Save only a validated instance in the existing private row. Reentry/foreign
+  execution refuses before user code; failure retains its original preparation
+  for real retirement and cannot be turned into a fresh initializer attempt."
+ [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [key (:cache-key generation) row (get @prepared key)]
+  (when-not (erlang/== generation (:generation row)) (refuse! :unattested-prepared-generation {}))
+  (when (:retired @(:state generation)) (refuse! :retired-generation {}))
+  (cond
+   (and (:instance row) (contains? #{:instance-initialized :ready} (:phase row))) generation
+   (= :instance-failed (:phase row)) (refuse! :instance-initialization-failed {})
+   :else
+    (do
+     (when-not (and (= :instance-prepared (:phase row)) (= (erlang/self) (:owner row)))
+      (refuse! :preparation-owner-changed {}))
+     ;; No preparation/serving lock is held while Source runs. A competing
+     ;; initializer sees this private reservation and cannot execute the body.
+     (swap! prepared assoc key (assoc row :phase :initializing))
+     (try
+      (with! generation
+       (fn []
+        (let [instance
+               ;; The application-owned factory starts its own Source ingress;
+               ;; an SDK closure must never impersonate an owned Source body.
+               (BeamLisp.Env/invoke_generation_factory! (get-in row [:factory :module]))
+              checked (checked-instance! instance (get-in row [:factory :exports]))]
+         ;; Keep the actual native lease through validation and private commit;
+         ;; retirement cannot forget this row between execution and publication.
+         (swap! prepared assoc key (assoc row :phase :instance-initialized :instance checked))
+         generation)))
+      (catch error
+       ;; Admission/unwind can fail outside the retained callback. Never restore
+       ;; a row already removed by real retirement, or replace a later instance.
+       (swap! prepared
+        (fn [rows]
+         (let [current (get rows key)]
+          (if (and (= :initializing (:phase current)) (= (erlang/self) (:owner current))
+                   (erlang/== generation (:generation current)))
+           (assoc rows key (assoc row :phase :instance-failed)) rows))))
+       (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))))
+
+(defn- reserve-contextual-preparation! [digest]
+ ;; Record the fresh scope identity BEFORE allocation can reach the Env actor.
+ ;; Parent closure shares this admission fence; child allocation stays outside
+ ;; it, preserving native scope/module lock ordering.
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [parent (BeamLisp.Env/env_id)
+       scope (tuple :env (erlang/make_ref)) key [parent :contextual-unit digest scope]]
+  (try
+   (let [reservation (BeamLisp.Env/with_scope_commit parent
+                      (fn []
+                       (begin-preparation! key)
+                       (swap! prepared update key assoc :scope-allocation
+                         {:state :reserved :caps (BeamLisp.Env/caps_of parent)
+                          :max-heap (BeamLisp.Env/heap_of parent)})
+                       {:scope scope :key key}))]
+    (when (= :retired reservation) (refuse! :retired-preparation-parent {}))
+    (BeamLisp.Env/fork_prepared_scope! key)
+    reservation)
+   (catch error
+    (BeamLisp.Env/destroy scope)
+    (abandon-preparation! key)
+    (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
+
+(defn claim-contextual-scope!
+ "Fixed native allocator hook. Consume only this caller's private fresh-scope
+  reservation. Caller-supplied scope IDs or copied records grant no allocation."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [row (get @prepared key) allocation (:scope-allocation row)]
+  (when-not (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+                 (= (BeamLisp.Env/env_id) (first key))
+                 (= :preparing (:phase row)) (= (erlang/self) (:owner row))
+                 (= :reserved (:state allocation)))
+   (refuse! :unattested-scope-reservation {}))
+  (swap! prepared assoc key (assoc-in row [:scope-allocation :state] :claimed))
+  {:scope (nth key 3) :parent (first key) :caps (:caps allocation) :max-heap (:max-heap allocation)}))
+
+(defn recover-contextual-reservation!
+ "Recover only a dead caller's pre-graph reservation. No initialized graph or
+  resource is forgotten. Destruction completes before dropping the private row."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (with-lock key
+  (fn []
+   (let [row (get @prepared key)]
+    (when (and (vector? key) (= 4 (count key)) (= :contextual-unit (second key))
+               (= :preparing (:phase row)) (nil? (:generation row))
+               (erlang/is_pid (:owner row)) (not (Process/alive? (:owner row))))
+     (BeamLisp.Env/destroy (nth key 3))
+     (swap! prepared (fn [rows] (if (= row (get rows key)) (dissoc rows key) rows)))
+    :ok)))))
+
+(defn prepare-captured-unit!
+ "Prepare one activation from the native Loader's complete captured unit.
+  Passive membership/target validation precedes code publication. The result is
+  an original application preparation, never an SDK grant. No initializer runs.
+  Code bytes may be shared; each activation has its own scope and private row."
+ [verified]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [members (BeamLisp.AOT/contextual_unit_members! verified)
+       metadata (:metadata members) beam (get-in members [:runtime :beam]) module (elem beam 0)
+       runtime-beams (:runtime-beams members)
+       modules (mapv first runtime-beams)
+       classes (into #{} (map (fn [row] (first (:beam row))) (:classes members)))
+       runtime-image (BeamLisp.AOT/runtime_image_key)
+       digest (Base/encode16 (crypto/hash :sha256
+                (erlang/term_to_binary (tuple (:manifest verified) metadata
+                       (mapv #(tuple (first %) (crypto/hash :sha256 (second %))) runtime-beams))
+                                      (list :deterministic))) (list (tuple :case :lower)))]
+  (when-not (= runtime-image (:runtime-image metadata)) (refuse! :compiled-runtime-image-changed {}))
+  ;; Fixed SDK inventory/MFAs are frozen before application bytes are loaded.
+  ;; No caller metadata, namespace spelling or runtime-floor label substitutes.
+  (BeamLisp.Env/ensure_sdk_runtime!)
+  ;; Every captured-unit consumer enters here, including direct activation and
+  ;; serving adapters. Check the complete selection before starting ANY SDK
+  ;; provider or publishing application code; Loader is only an input adapter.
+  (let [namespaces (BeamLisp.AOT/contextual_sdk_namespaces! verified)]
+   (doseq [namespace namespaces]
+    (when-not (= "core" namespace) (BeamLisp.Env/load_sdk_library! namespace))))
+  (BeamLisp.AOT/passive_binary_functions! module (elem beam 1))
+  (let [reservation (reserve-contextual-preparation! digest)
+        scope (:scope reservation) key (:key reservation)]
+   (try
+    (let [lease (BeamLisp.Env/retain_exact_binaries! runtime-beams "captured-contextual-unit.beam")]
+     (try
+      (let [context (BeamLisp.Env/with_env scope #(assoc (BeamLisp.Env/capture) :generation nil))
+            generation {:digest digest :scope scope :context context :modules modules :mapping {}
+                        :resources {} :protocols {} :application-id (str "unit/" digest)
+                        :native-modules #{"erlang"} :source-ingress-version 1
+                        :classes classes :server-classes #{} :actor-inputs {} :registries {} :declarations {} :callables {}
+                        :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key}]
+       (record-prepared! key generation)
+       (prepare-instance! generation module (:exports metadata))
+       (BeamLisp.Env/register_source_profile! generation)
+       generation)
+      (finally (BeamLisp.Env/release_code! lease))))
+    (catch error
+     ;; Preparation has executed no application code. Leave shared immutable
+     ;; code loaded; deleting a physical module could invalidate another graph.
+     (BeamLisp.Env/destroy scope)
+     (abandon-preparation! key)
+     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))))
+
+(defn- instance-ready! [generation]
+ (ready-prepared! generation)
+ (let [instance (:instance (get @prepared (:cache-key generation)))]
+  (when-not instance (refuse! :uninitialized-unit-instance {})) instance))
+
+(defn invoke-instance-entry!
+ "Invoke the captured entry result in its original graph; never rerun the
+  initialization schedule or resolve a mutable namespace binding."
+ [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (with! generation #(BeamLisp.Env/invoke_generation_value! (:entry (instance-ready! generation)) (list))))
+
+(defn- invoke-instance-binding* [generation reference args]
+ (let [exports (:exports (instance-ready! generation))]
+  (when-not (erlang/is_map_key reference exports) (refuse! :unsealed-entrypoint {}))
+  (BeamLisp.Env/invoke_generation_value! (get exports reference) (BeamLisp.CompilerData/eager_to_list args))))
+
+(defn invoke-instance-binding!
+ "Invoke one canonical export from this private ready instance. No string/name
+  resolver or alternate environment lookup can substitute a different binding."
+ [generation reference args]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (with! generation #(invoke-instance-binding* generation reference args)))
+
+
+(defn prepared-generation
+ "Framework-only projection of the original private preparation; never a grant."
+ [key]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (prepared-generation* key))
+
+(defn contextual-preparations
+ "Framework observation of this parent's original contextual preparations,
+  including reservations without a graph. This is not a retirement receipt.
+  Close parent admission before using a snapshot to decide drain completion."
+ [parent]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (Enum/flat_map (Map/to_list @prepared)
+  (fn [entry]
+   (let [key (elem entry 0) row (elem entry 1)]
+    (if (and (vector? key) (= 4 (count key)) (= parent (first key))
+             (= :contextual-unit (second key)))
+     (list {:key key :scope (nth key 3) :phase (:phase row)
+            :owner (:owner row) :generation (:generation row)})
+     (list))))))
+
+(defn forget-preparation!
+ "Remove only this exact preparation after fixed owner cleanup. A later instance
+  occupying the same reusable plan key survives a lost/repeated cleanup reply."
+ [generation]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (swap! prepared
+  (fn [all]
+   (if (erlang/== generation (:generation (get all (:cache-key generation))))
+    (dissoc all (:cache-key generation)) all)))
+ :ok)
+
+(defn attested-prepared!
+ "Read-only exact private preparation-cache identity for trusted framework
+  enrollment. A copied/edited map, caller state, digest/resources flag or live
+  namespace cannot manufacture this receipt. This does not grant execution,
+  root ownership, runtime inheritance or publication authority."
+ ([generation] (attested-prepared! generation false))
+ ([generation allow-retired?]
+ (when-not (and (or (= true allow-retired?) (= false allow-retired?))
+                (erlang/is_map generation)
+                (erlang/== generation (prepared-generation* (:cache-key generation)))
+                (or allow-retired? (not (:retired @(:state generation)))))
+  (refuse! :unattested-prepared-generation {}))
+ generation))
+
 (defn current
  "Selected graph in this execution;identity alone does not confer a lease."
  [] (Process/get :bl_generation))
 
+(defn frame
+ "Read-only native frame/parent IDs. Captured or bound data cannot create one."
+ [] (BeamLisp.Env/execution_frame_observation))
+(defn selected-graph-id
+ "The actual admitted selected graph's opaque identity, or nil when unmanaged."
+ [] (BeamLisp.Env/selected_execution_graph_id))
+(defn graph-field
+ "Bounded scalar observation of the actual selected graph. No map selector."
+ [field] (BeamLisp.Env/selected_execution_graph_field field))
+
 (defn acquire! [generation]
  (with-lock (:cache-key generation)
   (fn []
+   (let [row (get @prepared (:cache-key generation))]
+    (when-not (and (erlang/== generation (:generation row))
+                   (or (= :ready (:phase row))
+                       (and (= :initializing (:phase row)) (= (erlang/self) (:owner row)))))
+     (refuse! :unready-prepared-generation {})))
    (when (:retired @(:state generation)) (refuse! :retired-generation {}))
-   (let [ticket (BeamLisp.Env/retain_code! (to-list (:modules generation)))]
+   (let [ticket (BeamLisp.Env/retain_generation_code! generation)]
     (swap! (:state generation) assoc-in [:tickets ticket] (erlang/self)) ticket))))
 
 (defn release-ticket! [generation ticket]
@@ -22,36 +376,26 @@
   (fn [] (BeamLisp.Env/release_code! ticket)
          (swap! (:state generation) update :tickets dissoc ticket) :ok)))
 
-(def ^:private EXECUTION-KEY :reload.generation/execution)
-(defn- execution-id [generation]
- (tuple (:scope generation) (:digest generation) (:state generation)))
 (defn- executing? [generation]
- (let [identity (execution-id generation)]
-  (and (= identity (Process/get EXECUTION-KEY))
-       (= (:scope generation) (env/current))
-       (= identity (execution-id (Process/get :bl_generation))))))
+ ;; The native admitted frame owns this fact. Public graph/context data and
+ ;; Source process-dictionary markers cannot establish execution custody.
+ (and (map? generation) (BeamLisp.Env/executing_generation? generation)))
 
 (defn owned?
- "Whether this process holds the framework's private execution boundary for
+ "Whether this process holds the native execution boundary for
   its selected graph. Conveyed/bound identity alone does not confer ownership."
- [] (let [generation (current)]
-      (and (some? generation)
-           (or (executing? generation) (BeamLisp.Env/executing_generation? generation)))))
+ [] (executing? (current)))
 
 (defn execute
  ([generation action]
- (let [previous (env/capture) previous-execution (Process/get EXECUTION-KEY)]
+ ;; This admitted native execution frame must restore its complete native
+ ;; context. The public env facade intentionally gives Source a restricted token.
+ (let [previous (BeamLisp.Env/capture)]
   (try
-   (env/bind (:context generation))
+   (BeamLisp.Env/bind (:context generation))
    (Process/put :bl_generation generation)
-   ;; Private execution ownership is deliberately absent from Env tokens.
-   ;; A bound graph identity alone never authorizes a child to reuse a lease.
-   (Process/put EXECUTION-KEY (execution-id generation))
    (BeamLisp.Env/with_owned_generation_execution action)
-   (finally
-    (if (nil? previous-execution) (Process/delete EXECUTION-KEY)
-     (Process/put EXECUTION-KEY previous-execution))
-    (env/bind previous)))))
+   (finally (BeamLisp.Env/bind previous)))))
  ([generation action ticket]
   (BeamLisp.Env/with_owned_code_execution ticket #(execute generation action))))
 
@@ -59,14 +403,19 @@
  ;; These immutable bindings were fetched after compilation/validation in the
  ;; graph's private environment. Retention/context checks remain at admission;
  ;; a cached function is never authority to execute a retired graph.
+ (if (:factory (get @prepared (:cache-key generation)))
+  ;; Serving slots and retained registrations use the same private instance as
+  ;; Loader. A canonical unit never falls through to ambient namespace lookup.
+  (invoke-instance-binding* generation entry args)
  (if-let [f (get (:callables generation) entry)]
   (apply f args)
-  (let [parts (String/split entry "/") name (get (:mapping generation) (first parts))]
+  (let [_ (when-not (erlang/is_binary entry) (refuse! :unsealed-entrypoint {}))
+        parts (String/split entry "/") name (get (:mapping generation) (first parts))]
    (when-not (and name (= 2 (count parts))) (refuse! :unsealed-entrypoint {:entrypoint entry}))
    (let [result (BeamLisp.Env/fetch_exact name (second parts))]
     (when-not (and (erlang/is_tuple result) (= :ok (elem result 0)))
      (refuse! :missing-entrypoint {:entrypoint entry}))
-    (apply (elem result 1) args)))))
+    (apply (elem result 1) args))))))
 
 (defn with!
  "Trusted framework execution against a prepared graph, without publication.

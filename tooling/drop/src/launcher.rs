@@ -10,9 +10,11 @@ include!("common.rs");
 include!("daemon.rs");
 include!("store.rs");
 include!("transport.rs");
+mod nix_artifact;
 include!("builder.rs");
 include!("hooks.rs");
 include!("checkout.rs");
+mod command_domain;
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
@@ -545,7 +547,11 @@ fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String
     }
     if t == Transport::Require {
         if !wait_ready(root, shared) {
-            eprintln!("bl: required warm VM did not become ready; service was not run (see `bl vm logs`)");
+            if let Some(log) = log_path(root, &build_id(), shared) {
+                eprintln!("bl: required warm VM did not become ready; command was not run; log: {}", log.display());
+            } else {
+                eprintln!("bl: required warm VM did not become ready; command was not run (see `bl vm logs`)");
+            }
             return Some(1);
         }
         return Some(after_attach(try_attach(root, argv, shared)).unwrap_or_else(|| {
@@ -608,10 +614,18 @@ pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_IN
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(status) = command_domain::dispatch(&argv) {
+        std::process::exit(status);
+    }
+    if argv.first().map(String::as_str) == Some("--checkout-prerequisites") {
+        checkout_prerequisites(&argv[1..]).unwrap_or_else(|error| fail(&error));
+        return;
+    }
     if argv.first().map(String::as_str) == Some("--checkout") {
         checkout_main(&argv[1..]);
     }
     // A drop must never inherit a checkout's launch mode or source receipt.
+    std::env::remove_var("BL_INTERNAL_PRODUCER");
     std::env::remove_var("BL_CHECKOUT_ROOT");
     std::env::remove_var("BL_CHECKOUT_GENERATION");
     let me = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));
@@ -804,6 +818,16 @@ fn supports_command_vm(dest: &std::path::Path) -> bool {
         .is_some_and(|text| text.contains("(get opts :commands-only)"))
 }
 
+fn payload_default_transport(dest: &std::path::Path, shared: bool) -> Transport {
+    if supports_command_vm(dest) {
+        // Run the first request in the persistent VM too. Start would fork a
+        // daemon AND a cold command VM, then discard the command's useful state.
+        Transport::Require
+    } else {
+        default_transport(shared)
+    }
+}
+
 fn command_vm_for(bin: &std::path::Path) -> bool {
     checkout_root().is_some() || try_read_trailer(bin)
         .is_some_and(|t| supports_command_vm(&install_dir().join(sha8_of(&t))))
@@ -885,13 +909,13 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
             // project by default, exactly as a checkout's is: otherwise every
             // `bl run` of an installed drop paid a full cold boot plus a cold
             // library load, 10-50 s, unless the user knew to pass `--warm`.
-            let own_default = if supports_command_vm(dest) { Transport::Start } else { default_transport(shared) };
+            let default = payload_default_transport(dest, shared);
             let wanted = match root.as_deref() {
                 Some(r) => {
                     let tree_text = std::fs::read_to_string(r.join(PROJECT_FILE)).ok();
                     let config_text = std::fs::read_to_string(config_path()).ok();
                     declared_transport(&argv, tree_text.as_deref(), config_text.as_deref())
-                        .unwrap_or(if shared { default_transport(true) } else { own_default })
+                        .unwrap_or(default)
                 }
                 None => default_transport(shared),
             };
@@ -992,11 +1016,17 @@ mod gc_tests {
     fn command_only_startup_requires_payload_support() {
         let dest = payload_with_paths("commands", "");
         assert!(!supports_command_vm(&dest));
+        assert_eq!(
+            payload_default_transport(&dest, false),
+            default_transport(false)
+        );
         let source = dest.join("lib/beam_lisp-0.1.0/priv/std/vm/session.bl");
         std::fs::write(&source, "(ns vm.session)").unwrap();
         assert!(!supports_command_vm(&dest));
         std::fs::write(&source, "(get opts :commands-only)").unwrap();
         assert!(supports_command_vm(&dest));
+        assert_eq!(payload_default_transport(&dest, false), Transport::Require);
+        assert_eq!(payload_default_transport(&dest, true), Transport::Require);
         let _ = std::fs::remove_dir_all(dest);
     }
 

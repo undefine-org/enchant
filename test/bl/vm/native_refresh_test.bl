@@ -1,4 +1,4 @@
-(ns vm.native-refresh-test (:require [vm.native]))
+(ns vm.native-refresh-test (:require [vm.native] [claim :as c]))
 
 (defn- refresh [root producer cargo build]
   (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "vm.native" "refresh-native-root")
@@ -81,3 +81,84 @@
         (is (= 2 @calls) "input races require a fresh producer run")
         (refresh root "producer-a" "cargo-a" build)
         (is (= 2 @calls))))))
+
+
+(defn- with-foreign-custody [scope action]
+ (let [parent (erlang/self)
+       [worker watch] (spawn-monitor
+                      (fn []
+                       (let [acquired (c/acquire! scope "other native writer")]
+                        (erlang/send parent [:native-custody (:ok? acquired)])
+                        (receive :finish :ok))))]
+  (try
+   (receive [:native-custody acquired] (assert acquired) (after 5000 (throw :native-custody-not-ready)))
+   (action)
+   (finally
+    (erlang/exit worker :kill)
+    (receive [:DOWN ref :process pid _] :when (and (= ref watch) (= pid worker)) :ok
+     (after 5000 (throw :native-custody-not-down)))))))
+
+(defn- receipt-scope [root]
+ (str (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-refresh")
+        ((BeamLisp.Env/fetch_exact! "vm.native" "native-refresh-digest") (Path/expand root))) ".custody"))
+(defn- held-kind [action] (try (action) :accepted (catch error (:kind (ex-data error)))))
+
+(deftest even-a-refresh-cache-hit-refuses-foreign-publication-before-observing-it
+ (fixture
+  (fn [root calls build artifact]
+   (refresh root "producer-a" "cargo-a" build)
+   (with-foreign-custody (c/artifact-scope artifact)
+    (fn []
+     (is (= :build-workspace-held (held-kind #(refresh root "producer-a" "cargo-a" build))))
+     (is (= 1 @calls))
+     (is (nil? (c/held-by (receipt-scope root))) "partial acquisition released the receipt claim")
+     (BeamLisp.Compiler/eval_string
+      (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+                    "test/fixtures/execution_history/unprotected_native_refresh.bl")))
+     (let [old (BeamLisp.Env/fetch_exact! "execution.history.unprotected-native-refresh" "refresh-native-root")]
+      (is (= 1 (:cached (old root "producer-a" "cargo-a" build)))
+          "the exact original consumer accepts a receipt while another publisher owns the artifact"))
+     (is (= 1 @calls))))
+   (is (= 1 (:cached (refresh root "producer-a" "cargo-a" build))))
+   (is (= 1 @calls)))))
+
+(deftest a-foreign-receipt-owner-refuses-before-the-producer-is-called
+ (fixture
+  (fn [root calls build artifact]
+   (with-foreign-custody (receipt-scope root)
+    (fn []
+     (is (= :build-workspace-held (held-kind #(refresh root "p" "c" build))))
+     (is (= 0 @calls))
+     (is (not (File/exists? artifact)))))
+   (is (= 1 (:built (refresh root "p" "c" build))))
+   (is (= 1 @calls)))))
+
+(deftest multi-artifact-refusal-preserves-existing-ownership-and-unwinds-new-claims
+ (fixture
+  (fn [root _ _ _]
+   (let [a (str root "/priv/native/a.so") z (str root "/priv/native/z.so") ran (atom false)]
+    (with-foreign-custody (c/artifact-scope z)
+     (fn []
+      (is (= :build-workspace-held (held-kind (fn [] (c/with-artifacts! [z a] "refresh" (fn [] (reset! ran true)))))))
+      (is (not @ran))
+      (is (nil? (c/held-by (c/artifact-scope a))))
+      (c/acquire! (c/artifact-scope a) "outer publisher")
+      (try
+       (is (= :build-workspace-held (held-kind #(c/with-artifacts! [a z] "refresh" (fn [] (reset! ran true))))))
+       (is (c/owned? (c/artifact-scope a)))
+       (is (not @ran))
+       (finally (c/release! (c/artifact-scope a))))))
+    (is (= :done (c/with-artifacts! [a z a] "refresh" (fn [] :done))))
+    (is (nil? (c/held-by (c/artifact-scope a))))
+    (is (nil? (c/held-by (c/artifact-scope z))))))))
+
+(deftest exceptional-producers-release-publication-and-receipt-custody
+ (fixture
+  (fn [root calls build artifact]
+   (is (thrown-with-msg? "producer exploded"
+         (refresh root "p" "c" (fn [_] (throw (ex-info "producer exploded" {}))))))
+   (is (nil? (c/held-by (receipt-scope root))))
+   (is (nil? (c/held-by (c/artifact-scope artifact))))
+   (is (= 1 (:built (refresh root "p" "c" build))))
+   (is (= 1 (:cached (refresh root "p" "c" build))))
+   (is (= 1 @calls)))))

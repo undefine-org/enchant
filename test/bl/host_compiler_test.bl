@@ -39,6 +39,24 @@
 
 (ns host.compiler.test)
 
+(deftest nested-compilation-preserves-the-callers-fresh-name-stream
+ (let [form (first (BeamLisp.Reader/read_string "(let [value 7] (erlang/+ value 1))"))
+       env (BeamLisp.Compiler/new_env "host.compiler.test")]
+  (BeamLisp.Compiler/reset_fresh!)
+  (let [expected-first (BeamLisp.Compiler/compile form env)
+        expected-second (BeamLisp.Compiler/compile form env)]
+   (is (not= expected-first expected-second))
+   (BeamLisp.Compiler/reset_fresh!)
+   (is (= expected-first (BeamLisp.Compiler/compile form env)))
+   (is (= expected-first (BeamLisp.Compiler/with_fresh_names #(BeamLisp.Compiler/compile form env))))
+   (is (= expected-second (BeamLisp.Compiler/compile form env)))
+   (BeamLisp.Compiler/reset_fresh!)
+   (BeamLisp.Compiler/compile form env)
+   (is (= :nested-compile-stopped
+         (try (BeamLisp.Compiler/with_fresh_names #(erlang/throw :nested-compile-stopped))
+          :unexpected (catch reason reason))))
+   (is (= expected-second (BeamLisp.Compiler/compile form env))))))
+
 (defn- t2 [k v] (erlang/list_to_tuple (list k v)))
 
 (defn- tmp-dir []
@@ -71,7 +89,7 @@
                   (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
         (load-pinned mod (elem res 1))))))
 
-(defn- core-env [] {:ns "core" :locals {} :recur nil :tail true})
+(defn- core-env [] {:ns "core" :locals {} :recur nil :tail true :target :beam :js-interop false})
 
 (defn- default-env-ns
   "`new_env/0`'s namespace, with the current ns PINNED: the default argument asks
@@ -109,6 +127,8 @@
   (let [let-form (one-form "(let [a 1 b 2] (+ a b))")
         macro-form (one-form "(when true 1)")
         defn-form (one-form "(defn host-compiler-diff-fn [x] x)")
+        prepared-form (one-form "(defn prepared-constant [] 47)")
+        entry-form (one-form "47")
         env (erlang/apply live :new_env (list "user"))]
     (list
       ; `new_env/0` is NOT in the corpus: its default asks `Env.current_ns/0` at
@@ -123,6 +143,10 @@
       (list :eval_form (list let-form env))
       (list :macroexpand_1 (list macro-form "user"))
       (list :prelink_defn (list defn-form "host.compiler.diff"))
+      (list :prepare_function_declaration (list prepared-form env))
+      (list :prepare_function_declaration (list prepared-form env :Elixir.HostCompilerPhysicalTarget))
+      (list :prepare_program_entry (list entry-form env {}))
+      (list :prepare_program_entry (list entry-form env {} (list)))
       (list :reset_fresh! (list))
       (list :read_data (list "(a b)"))
       (list :read_data (list "a"))
@@ -150,11 +174,13 @@
                               (erlang/function_exported probe (elem e 0) (elem e 1))))
                   (erlang/apply live :module_info (list :exports)))
           "the pinned ABI covers every FUNCTIONAL live export")
-      (is (= (Enum/sort (list (t2 :compile 2) (t2 :enable_bl_backend 0) (t2 :eval_form 2)
+      (is (= (Enum/sort (list (t2 :assert_native_evaluation! 0) (t2 :compile 2) (t2 :datum 1) (t2 :enable_bl_backend 0) (t2 :eval_form 2)
                               (t2 :eval_string 1) (t2 :eval_string 2) (t2 :eval_string 3)
                               (t2 :macroexpand_1 2) (t2 :module_info 0) (t2 :module_info 1)
-                              (t2 :new_env 0) (t2 :new_env 1) (t2 :prelink_defn 2)
-                              (t2 :read_all_data 1) (t2 :read_data 1) (t2 :reset_fresh! 0)))
+                              (t2 :new_env 0) (t2 :new_env 1) (t2 :prelink_defn 2) (t2 :prelink_type 2)
+                              (t2 :prepare_class_declaration 2) (t2 :prepare_class_declaration 3)
+                              (t2 :prepare_function_declaration 2) (t2 :prepare_function_declaration 3) (t2 :prepare_program_entry 3) (t2 :prepare_program_entry 4)
+                              (t2 :read_all_data 1) (t2 :read_data 1) (t2 :reset_fresh! 0) (t2 :with_fresh_names 1)))
              (Enum/sort (erlang/apply probe :module_info (list :exports))))
           "exactly the live call surface, nothing added, nothing dropped")
 
@@ -170,6 +196,11 @@
                                                     (erlang/apply probe :new_env (list "user"))))))
       ; a symbol datum is a `{tag, name}` TUPLE, not a map.
       (is (= (tuple :symbol "a") (erlang/apply probe :read_data (list "a"))))
+      (is (= (tuple :symbol "answer") (erlang/apply probe :datum (list (one-form "answer")))))
+      (let [too-big (tuple :vector (Enum/map (lists/seq 1 17000) (fn [_] (tuple :symbol "x"))))]
+        (is (= :invalid_reader_data
+               (try (erlang/apply probe :datum (list too-big)) :unexpected
+                (catch error (BeamLisp.ExInfo/ex_original error))))))
       (is (= 42 (erlang/apply probe :read_data (list "42"))))
       (is (= :bl (erlang/apply probe :enable_bl_backend (list))))
       (is (nil? (erlang/apply probe :reset_fresh! (list))))
@@ -377,7 +408,7 @@
         ; not core/sugar), which is the fresh-VM state.
         (doseq [nm (list "new_env" "eval_string" "compile" "enable_bl_backend"
                          "eval_form" "macroexpand_1" "prelink_defn" "reset_fresh!"
-                         "read_data" "read_all_data")]
+                         "read_data" "read_all_data" "datum")]
           (BeamLisp.Env/delete_key (tuple "host.compiler" nm)))
         (is (not (BeamLisp.Env/bound? "host.compiler" "new_env")))
         (is (not (BeamLisp.Env/bound? "host.compiler" "eval_string")))

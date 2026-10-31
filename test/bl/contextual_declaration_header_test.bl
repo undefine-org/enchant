@@ -1,0 +1,99 @@
+(ns contextual-declaration-header-test
+ (:require [expand-source :as catalog] [expand :as x] [lower :as lower] [binding :as binding]))
+
+(defn- unit [namespace text]
+ {:namespace namespace :revision 'current :file (str namespace ".bl") :source text})
+(defn- form [text] (first (BeamLisp.Reader/read_string text "declaration-header.bl")))
+(defn- env [] (assoc (BeamLisp.Compiler/new_env "declaration.header") :file "declaration-header.bl"))
+(defn- kind [action] (try (action) nil (catch error (or (:kind (ex-data error)) (:__struct__ error)))))
+(defn- execute [program]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.DeclarationHeader." (erlang/unique_integer (list :positive)))) (:node program)))
+
+(deftest compiler-header-projection-is-inert-and-agrees-with-canonical-declaration-metadata
+ (erlang/erase :declaration-header-effect)
+ (try
+  (let [reader (form "(defn ^:private identity \"documented\" {:audit (erlang/put :declaration-header-effect :bad)} [value] value)")
+        source (BeamLisp.Ns.Compiler/declaration-source reader (env))
+        declaration (BeamLisp.Compiler/prepare_function_declaration reader (assoc (env) :contextual-bindings {}))]
+   (is (= :undefined (erlang/get :declaration-header-effect)))
+   (is (= (:metadata declaration) (:metadata source)))
+   (is (= true (get-in source [:metadata :private])))
+   (is (= "documented" (get-in source [:metadata :doc])))
+   (is (= :error (BeamLisp.Env/lookup (tuple :link "declaration.header" "identity"))))
+   (is (= 42 (BeamLisp.Ns.Rt/invoke (BeamLisp.Compiler/eval_form (:value-form source) (env)) (list 42)))))
+  (finally (erlang/erase :declaration-header-effect))))
+
+(deftest metadata-private-functions-values-and-transformers-refuse-import-before-expansion
+ (doseq [definition ["(defn hidden {:private true} [value] value)"
+                     "(defn ^:private hidden [value] value)"
+                     "(def ^:private hidden 42)"
+                     "(defsyntax hidden {:private true} [form context] (syntax-literal 42))"]]
+  (let [provider (unit 'provider (str "(ns provider) " definition))
+        client (unit 'client "(ns client) (import-world 'provider 'current :only [hidden]) 0")]
+   (is (= :binding-import-private (kind #(catalog/catalog [provider client])))))))
+
+(deftest source-and-source-free-functions-use-compiler-doc-attribute-and-clause-rules
+ (let [provider (unit 'provider
+                  "(ns provider)
+                   (defn hidden \"private helper\" {:private true} [value] (erlang/+ value 40))
+                   (defn public \"guarded\" {:audit :stored} ([value] :when (int? value) (hidden value)) ([a b] (erlang/+ a b)))")
+       client (unit 'client "(ns client) (import-world 'provider 'current :only [public]) [(public 2) (public 20 22)]")
+       direct (x/program [provider client] ['client 'current])
+       library (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       imported (x/program [client] ['client 'current] [library])]
+  (is (= [42 42] (execute direct)))
+  (is (= [42 42] (execute imported)))
+  (is (= (get-in direct [:coverage :contextual-bindings]) (get-in imported [:coverage :contextual-bindings])))
+  (is (= :binding-import-private
+         (kind #(catalog/catalog [(unit 'intruder "(ns intruder) (import-world 'provider 'current :only [hidden]) 0")] [library]))))))
+
+(deftest documented-values-and-transformers-keep-initializers-and-private-phase-helpers
+ (let [provider (unit 'provider
+                  "(ns provider)
+                   (begin-for-syntax (def ^:private offset \"phase constant\" 40))
+                   (defsyntax answer \"documented transformer\" {:audit :stored} [form context] (syntax-literal (erlang/+ offset 2)))")
+       client (unit 'client "(ns client) (import-world 'provider 'current :only [answer]) (answer)")
+       library (x/decode-phase-library (x/encode-phase-library (x/phase-library [provider])))
+       program (x/program [client] ['client 'current] [library])]
+  (is (= 42 (execute program)))
+  (is (= 1 (count (:expansions program))))
+  (is (= :phase-per-environment-value
+         (kind #(catalog/catalog [(unit 'bad "(ns bad) (def ^:per-env value 42)")]))))
+  (is (= :Elixir.BeamLisp.CompileError
+         (kind #(catalog/catalog [(unit 'bad "(ns bad) (defn f \"doc\" \"invalid\")")]))))))
+
+
+(deftest consistent-library-indexes-cannot-override-the-original-declaration-metadata
+ (let [library (x/phase-library [(unit 'provider "(ns provider) (defn hidden {:private true} [value] value)")])
+       source (first (:units library)) portable (:world source)
+       public-world (binding/world (:selection portable) (:scopes portable)
+                      (mapv #(assoc (dissoc % :id) :visibility :public) (:declarations portable)))
+       by-path (into {} (map (fn [d] [(:path d) d]) (:declarations public-world)))
+       recipes (into {} (map (fn [entry]
+                              (let [recipe (elem entry 1) declaration (get by-path (get-in recipe [:declaration :path]))]
+                               [(:id declaration) (assoc recipe :declaration declaration)]))
+                            (Map/to_list (:recipes source))))
+       changed (assoc library :units
+                 (list (assoc source :world
+                         {:version 1 :selection (:selection public-world)
+                          :scopes (Enum/sort_by (Map/values (:scopes public-world)) #(:id %))
+                          :declarations (:declarations public-world)} :recipes recipes)))
+       changed (assoc changed :digest (crypto/hash :sha256
+                              (erlang/term_to_binary (dissoc changed :digest) (list :deterministic))))]
+  (is (= :public (:visibility (first (:declarations public-world)))))
+  (is (= :phase-library-recipe (kind #(x/encode-phase-library changed))))))
+
+(deftest declaration-metadata-consumption-does-not-admit-runtime-metadata-effects
+ (erlang/erase :declaration-header-effect)
+ (try
+  (is (= :syntax-profile-metadata
+         (kind #(x/program [(unit 'bad
+                  "(ns bad) (defn ^:private hidden [] ^{:audit (erlang/put :declaration-header-effect :bad)} 42) (hidden)")]
+                           ['bad 'current]))))
+  (is (= :undefined (erlang/get :declaration-header-effect)))
+  (let [provider (unit 'provider "(ns provider) (defn ^:private public {:private false} [value] value) (def public-value {:private true}) (defn numeric {:private 1} [value] value) (def ^{:per-env 0} ordinary 42)")
+        client (unit 'client "(ns client) (import-world 'provider 'current :only [public public-value]) [(public 42) public-value]")]
+   (is (= [42 {:private true}] (execute (x/program [provider client] ['client 'current]))))
+   (is (= [42 42] (execute (x/program [provider (unit 'client "(ns client) (import-world 'provider 'current :only [numeric ordinary]) [(numeric 42) ordinary]")]
+                                    ['client 'current])))))
+  (finally (erlang/erase :declaration-header-effect))))

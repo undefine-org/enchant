@@ -1,0 +1,50 @@
+(ns execution.solver-protocol-test)
+
+(defn- remaining [tag]
+ (receive [seen [:data bytes]] :when (= tag seen) bytes (after 0 :drained)))
+
+(defn- drain! [tag]
+ (when (not= :drained (remaining tag)) (drain! tag)))
+
+(deftest command-error-and-acknowledgement-share-one-frame-for-every-two-chunk-cut
+ (let [error "(error \"rejected\")" wire (str error "\n~~bl-ok~~\n")]
+  ;; These are transport/parser controls, not native ownership evidence. Drive
+  ;; the actual reader with every byte cut, including inside the marker/line.
+  (doseq [cut (range (+ 1 (erlang/byte_size wire)))]
+   (let [tag (erlang/make_ref)
+         a (binary/part wire 0 cut) b (binary/part wire cut (- (erlang/byte_size wire) cut))]
+    (try
+     (doseq [bytes [a b]] (when (not= "" bytes) (erlang/send (erlang/self) (tuple tag (tuple :data bytes)))))
+     (is (= (tuple :error error error) (BeamLisp.Z3Port/read_until_marker tag "" "")) (str "cut=" cut))
+     (is (= :drained (remaining tag)) (str "unconsumed frame at cut=" cut))
+     (finally (drain! tag)))))))
+
+(deftest successful-command-frame-does-not-consume-unrelated-mailbox-data
+ (let [tag (erlang/make_ref) other (erlang/make_ref)]
+  (try
+   (erlang/send (erlang/self) (tuple other (tuple :data "unrelated")))
+   (erlang/send (erlang/self) (tuple tag (tuple :data "output\n~~bl-ok~~\n")))
+   (is (= (tuple :marker "output") (BeamLisp.Z3Port/read_until_marker tag "" "")))
+   (is (= "unrelated" (remaining other)))
+   (is (= :drained (remaining tag)))
+   (finally (drain! tag) (drain! other)))))
+
+(deftest actual-rejected-command-is-an-error-before-the-next-command-or-query
+ (let [port (BeamLisp.Z3Port/open)]
+  (try
+   (is (= false (:ok (BeamLisp.Z3Port/raw_command port "(assert (= missing_command_symbol 1))"))))
+   (is (= true (:ok (BeamLisp.Z3Port/raw_command port "(reset)"))))
+   (is (= "unsat" (:status (BeamLisp.Z3Port/check port "(assert false)\n" false))))
+   (is (= "sat" (:status (BeamLisp.Z3Port/check port "(assert true)\n" false))))
+   (finally (BeamLisp.Z3Port/close port)))))
+
+(deftest an-echo-in-the-command-does-not-acknowledge-the-hosts-later-frame
+ (let [port (BeamLisp.Z3Port/open)]
+  (try
+   (let [result (BeamLisp.Z3Port/raw_command port
+                  "(echo \"~~bl-ok~~\")\n(assert (= missing_after_echo 1))")]
+    (is (= false (:ok result)))
+    (is (String/contains? (:output result) "~~bl-ok~~")))
+   (is (= true (:ok (BeamLisp.Z3Port/raw_command port "(reset)"))))
+   (is (= "sat" (:status (BeamLisp.Z3Port/check port "(assert true)\n" false))))
+   (finally (BeamLisp.Z3Port/close port)))))

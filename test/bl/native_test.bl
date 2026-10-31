@@ -1,40 +1,23 @@
-; test/bl/native_test.bl — W8's native stage: keyed by content, claimed, installed.
-;
-; The stage is bl code, so it is exercised from bl: the same call the build makes
-; (`(build/build-native root log)`), on a crate small enough to compile in a
-; second and real enough to be a cdylib.
-;
-; ── what is verified here ──────────────────────────────────────────────────
-;
-; 1. the key is content-addressed: it moves when a source moves, and it does NOT
-;    move when cargo writes `Cargo.lock` into the crate — measured, and the bug
-;    this file found. `Cargo.lock` sat in the key's input set unconditionally, so
-;    the first build hashed a set WITHOUT it and every later run hashed a set WITH
-;    it: two key directories under the store and an unchanged crate rebuilt
-;    (`:built 1 :cached 0`, observed). A lock naming only the crate is a function
-;    of the manifest and carries nothing, so it is no longer an input.
-; 2. a crate is built by cargo under a CLAIM, and its cdylib is installed at
-;    `priv/native/<crate>.so` — the path `vm.native` loads from.
-; 3. an unchanged crate is NOT rebuilt: the second and third runs find it.
-;
-; Run: bl test test/bl/native_test.bl
+; Native product contracts. Nix owns compilation and complete source identity;
+; the language retains destination custody, loading names and failure behavior.
+; Per-crate derivation identities and prepared-input provenance are additionally
+; exercised by scripts/tests/test_native_product_derivations.py and
+; test/bl/artifact_provider_test.bl. Legacy native-key/cargo-verdict checks below
+; cover compatibility helpers, not authoritative production identities.
 
 (ns test.native
   (:require [build :as b] [store :as st] [vm.native :as n]))
 
-(def root "/tmp/beam_lisp_native_stage")
+(def root (str (System/tmp_dir!) "/beam_lisp_native_stage-" (System/pid) "-" (erlang/unique_integer (list :positive))))
 (def crate (str root "/native/tiny"))
 
 (defn setup! []
   (File/rm_rf! root)
-  ; The native store is CONTENT-addressed and shared, so a previous run's crate
-  ; would make this one a cache hit — which is the behaviour, not a bug, and
-  ; exactly what a test must control for. (Learned by running it twice.)
-  (File/rm_rf! (str (Path/dirname (st/root)) "/native"))
   (File/mkdir_p! (str crate "/src"))
   (File/write! (str crate "/Cargo.toml")
                (str "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
                     "\n[lib]\ncrate-type = [\"cdylib\"]\n"))
+  (File/write! (str crate "/Cargo.lock") "version = 4\n\n[[package]]\nname = \"tiny\"\nversion = \"0.1.0\"\n")
   (File/write! (str crate "/src/lib.rs")
                ; `#[no_mangle] extern "C"` so the symbol REACHES the cdylib.
                ; A plain `pub fn` in a cdylib crate is mangled and dropped, so
@@ -43,7 +26,9 @@
                ; source to provoke a rebuild depend on this actually working.
                "#[no_mangle]\npub extern \"C\" fn tiny_answer() -> i32 { 42 }\n"))
 
-(defn- cargo? [] (some? (System/find_executable "cargo")))
+(defn- nix? []
+  (when-not (System/find_executable "nix") (throw (ex-info "Nix is required for native product tests" {})))
+  true)
 
 (deftest the-key-is-content
   (setup!)
@@ -54,20 +39,18 @@
     (is (not= k1 (b/native-key crate))
         "a changed source is a different key: a stale native cache is worse than none")))
 
-(deftest a-generated-lock-does-not-move-the-key
+(deftest a-missing-lock-refuses-without-mutating-project-inputs
   (setup!)
-  (if (cargo?)
-    (let [before (b/native-key crate)]
-      (is (not (File/regular? (str crate "/Cargo.lock"))) "no lock to begin with")
-      (b/build-native root nil)
-      (is (File/regular? (str crate "/Cargo.lock")) "cargo wrote one")
-      (is (= before (b/native-key crate))
-          "a lock naming only this crate decides nothing: the key must not move"))
-    (is true "skipped: no cargo on this machine")))
+  (File/rm! (str crate "/Cargo.lock"))
+  (let [result (b/build-native root nil)]
+    (is (= 0 (:built result)))
+    (is (= 1 (count (:errors result))))
+    (is (includes? (first (:errors result)) "Cargo.lock"))
+    (is (not (File/exists? (str crate "/Cargo.lock"))))))
 
 (deftest the-stage-builds-once-then-finds-it
   (setup!)
-  (if (cargo?)
+  (if (nix?)
     (let [r1 (b/build-native root println)]
       (is (empty? (:errors r1)))
       (is (= 1 (:built r1)) "the crate is built")
@@ -81,7 +64,7 @@
         (is (= 1 (:cached r2)) "it is found by the key its inputs name"))
       (let [r3 (b/build-native root nil)]
         (is (= 1 (:cached r3)) "and found again — the key is a fixpoint, not a coin")))
-    (is true "skipped: no cargo on this machine")))
+    (is true "Nix prerequisite unavailable")))
 
 ; ── the contract across the build barrier ─────────────────────────────────
 ;
@@ -137,7 +120,7 @@
 
 (deftest reinstalling-replaces-the-artefact-never-rewrites-it
   (setup!)
-  (if (cargo?)
+  (if (nix?)
     (let [_ (b/build-native root nil)
           dest (n/project-installed-path root "tiny")
           before (inode-of dest)]
@@ -158,7 +141,7 @@
                  " survived, which means it was written in place — and writing "
                  "a file the VM has mapped is BUG-074."
                  " r2=" (pr-str (select-keys r2 [:built :cached :errors :artifacts]))))))
-    (is true "skipped: no cargo on this machine")))
+    (is true "Nix prerequisite unavailable")))
 
 
 ; ── the verdict on a cargo run (FUP-100) ─────────────────────────────────
@@ -203,7 +186,7 @@
 
 (deftest a-crate-that-yields-no-artefact-is-not-reported-built
   (setup!)
-  (if (cargo?)
+  (if (nix?)
     (do
       ; `crate-type = ["rlib"]`: cargo SUCCEEDS and writes no cdylib. This is the
       ; zero-exit-no-artefact case through the REAL step, so it also pins that
@@ -217,20 +200,15 @@
         (is (= 1 (count (:errors r))))
         (let [e (first (:errors r))]
           (is (includes? e "tiny"))
-          (is (includes? e "libtiny.so"))
-          (is (includes? e "cargo build --release")))))
-    (is true "skipped: no cargo on this machine")))
+          (is (includes? e "Nix preparation failed"))
+          (is (not (File/exists? (n/project-installed-path root "tiny")))))))
+    (is true "Nix prerequisite unavailable")))
 
 ; ── the fresh-skip is a filesystem decision, not a cargo run ─────────────
 
-(deftest the-fresh-path-reports-current-without-cargo
-  ; "~1 ms when all current" is a statement about what is NOT done. The cheapest
-  ; honest way to show the fresh path never asks cargo is to give it a cargo that
-  ; CANNOT build: a shim that answers `--version` (the key's toolchain qualifier)
-  ; and exits 1 for anything else. The artefact is placed under the key its
-  ; inputs name — where a real build would leave it — so the found branch must
-  ; answer `:cached` without ever invoking the shim. An edit that made the fresh
-  ; path rebuild would run the shim, fail, and turn this red.
+(deftest a-fabricated-legacy-cache-does-not-establish-provenance
+  ; A mutable legacy target and an ambient Cargo shim cannot supply provenance.
+  ; The current recipe must select verified immutable bytes instead.
   (setup!)
   (let [orig (System/get_env "PATH")
         bin (str root "/shim")
@@ -244,13 +222,14 @@
                              "esac\n"))
       (File/chmod! shim 493)
       (System/put_env "PATH" (str bin ":" orig))
-      (let [dir (Path/join (Path/join (b/native-root) (b/native-key crate)) "tiny")]
-        (File/mkdir_p! (Path/join dir "release"))
-        (File/write! (Path/join (Path/join dir "release") "libtiny.so") "fabricated")
+      (let [dir (Path/join root "priv/native")]
+        (File/mkdir_p! dir)
+        (File/write! (Path/join dir "tiny.so") "fabricated")
         (let [r (b/build-native root nil)]
-          (is (= 1 (:cached r)) "the artefact under its key is found")
-          (is (= 0 (:built r)) "and cargo is not asked to make another")
-          (is (empty? (:errors r)) "reporting current does not require a working cargo")))
+          (is (= 0 (:cached r)) "a mutable legacy cache supplies no product provenance")
+          (is (= 1 (:built r)) "the verified Nix product is selected instead")
+          (is (empty? (:errors r)) "ambient Cargo is unnecessary")
+          (is (not= "fabricated" (File/read! (n/project-installed-path root "tiny"))))))
       (finally (System/put_env "PATH" orig)))))
 
 
@@ -346,8 +325,8 @@
       (fn []
         (File/cd! root
           (fn []
-            (is (= {:skipped :fresh} (n/build! "lazy_memo"))
-                "the installed .so is current: cargo is never asked")))))
+            (is (thrown-with-msg? "Native preparation failed for lazy_memo" (n/build! "lazy_memo"))
+                "newer installed bytes cannot substitute for a locked immutable product")))))
     (File/rm_rf! root)))
 
 (deftest a-crate-that-must-build-but-cannot-fails-loudly
@@ -363,7 +342,7 @@
       (fn []
         (File/cd! root
           (fn []
-            (is (thrown-with-msg? "cargo build failed for lazy_memo"
+            (is (thrown-with-msg? "Native preparation failed for lazy_memo"
                   (n/build! "lazy_memo"))
                 "a crate with no artefact and a cargo that cannot build it is a LOUD failure")))))
     (File/rm_rf! root)))
@@ -395,7 +374,7 @@
       (fn []
         (File/cd! root
           (fn []
-            (is (thrown-with-msg? "cargo build failed for lazy_memo"
+            (is (thrown-with-msg? "Native preparation failed for lazy_memo"
                   (n/build! "lazy_memo"))
                 "a lock newer than the artefact makes the crate stale — the build is attempted")))))
     (File/rm_rf! root)))

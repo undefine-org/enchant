@@ -1,0 +1,68 @@
+(ns native-execution-context-test)
+
+(defn- payload [registration]
+ (let [state (BeamLisp.Env/execution_registration_state registration)]
+  (BeamLisp.Env/code_callback_payload (:lease state))))
+(defn- result-kind [action]
+ (try (action) :unexpected-success (catch error (:original error))))
+
+(deftest callback-custody-contains-a-context-id-instead-of-a-context-copy
+ (let [a (BeamLisp.Execution/register! (fn [] 41))
+       b (BeamLisp.Execution/register! (fn [] 42))]
+  (try
+   (let [left (payload a) right (payload b) id (:context-id left)]
+    (is (some? id))
+    (is (= id (:context-id right)))
+    (is (not (contains? left :context)))
+    (is (not (contains? right :context))))
+   (BeamLisp.Execution/close! a)
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! b [])))
+   (let [id (:context-id (payload b))]
+    (BeamLisp.Execution/close! b)
+    (is (= :retired_execution_context (result-kind #(BeamLisp.Env/execution_context_value! id)))))
+   (finally (BeamLisp.Execution/close! a) (BeamLisp.Execution/close! b)))))
+
+(deftest consumed-source-context-remains-live-for-the-accepted-target
+ (let [source (BeamLisp.Execution/register! (fn [] 42))
+       id (:context-id (payload source))
+       offer (BeamLisp.Execution/prepare-handoff! source (erlang/self)) target (:accepted offer)]
+  (try
+   (is (= :accepted (:status (BeamLisp.Execution/accept-handoff! offer))))
+   (is (= id (:context-id (payload target))))
+   (BeamLisp.Execution/close! source)
+   (is (= {:status :completed :value 42} (BeamLisp.Execution/invoke! target [])))
+   (finally (BeamLisp.Execution/close! source) (BeamLisp.Execution/close! target)))))
+
+(deftest context-ids-do-not-convey-invocation-authority
+ (let [registration (BeamLisp.Execution/register! (fn [] 42)) id (:context-id (payload registration))]
+  (try
+   (is (some? id))
+   (is (= :retired_execution_context
+          (result-kind #(BeamLisp.Env/execution_context_value!
+                         (tuple :bl_execution_context (erlang/self) (erlang/make_ref))))))
+   (is (= nil (BeamLisp.Env/execution_origin)))
+   (finally (BeamLisp.Execution/close! registration)))))
+
+(deftest dynamic-binding-overlays-remain-distinct-and-restore-the-caller
+ (let [before (Process/get :bl_ns)
+       a (BeamLisp.Env/with_ns "context.left" #(BeamLisp.Execution/register! (fn [] (Process/get :bl_ns))))
+       b (BeamLisp.Env/with_ns "context.right" #(BeamLisp.Execution/register! (fn [] (Process/get :bl_ns))))]
+  (try
+   (is (not= (:context-id (payload a)) (:context-id (payload b))))
+   (is (= {:status :completed :value "context.left"} (BeamLisp.Execution/invoke! a [])))
+   (is (= {:status :completed :value "context.right"} (BeamLisp.Execution/invoke! b [])))
+   (is (= before (Process/get :bl_ns)))
+   (finally (BeamLisp.Execution/close! a) (BeamLisp.Execution/close! b)))))
+
+(deftest context-capacity-refusal-publishes-no-callback-and-releases-code
+ (let [warm (BeamLisp.Execution/register! (fn [] nil))
+       _ (BeamLisp.Execution/close! warm)
+       before-rows (ets/info :beam_lisp_code_leases :size)
+       before-private (ets/info :beam_lisp_source_lease_domains :size)
+       before (Process/get :bl-cli-project)]
+  (try
+   (Process/put :bl-cli-project (String/duplicate "x" 8388608))
+   (is (= :execution_context_capacity (result-kind #(BeamLisp.Execution/register! (fn [] 42)))))
+   (is (= before-rows (ets/info :beam_lisp_code_leases :size)))
+   (is (= before-private (ets/info :beam_lisp_source_lease_domains :size)))
+   (finally (if (nil? before) (Process/delete :bl-cli-project) (Process/put :bl-cli-project before))))))

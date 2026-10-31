@@ -1,0 +1,69 @@
+(ns native-execution-transition-pin-test
+ (:require [reload.generation :as g] [reload.state :as state] [proc.evolve :as evolve]))
+
+(def SOURCE
+ "(ns transition.pin)
+  (defn accepts [message] (erlang/is_binary message))
+  (defn valid [value] (erlang/is_integer value))
+  (defn identity-value [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [version digest]
+   {:version version :digest digest :handler handler :accept? accepts :check-state valid
+    :migrate-state identity-value :upcast identity-value})")
+(defn- graph [revision native]
+ (g/prepare! {:application-id "native-transition-pin" :native-modules native
+              :resources {:revision revision} :sources {"transition.pin" SOURCE}}))
+(defn- spec [graph version]
+ (g/with! graph #(evolve/prepare-spec (g/invoke! graph "transition.pin/spec" [version (:digest graph)]))))
+(defn- graph-rows [graph owner]
+ (let [marker (BeamLisp.Env/source_policy_row (tuple :execution_graph_marker (:scope graph)))]
+  (filter (fn [row]
+            (let [component (elem (elem row 0) 0)]
+             (or (= marker component) (some #(= component %) (:modules graph)))))
+    (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ owner :_) true)))))
+
+(defn- check-retention! [kind]
+ (let [original (first (Code/compile_string
+                         "defmodule TransitionPinGrantFixture do\n def value, do: 1\nend"))
+       module (elem original 0)
+       old (graph 1 #{"erlang"}) fresh (graph 2 #{"erlang" "TransitionPinGrantFixture"})
+       owner (atom nil) grant (atom nil) held (atom nil)
+       replacement (BeamLisp.Emit/compile_descriptor
+                     (BeamLisp.Emit/descriptor_for module
+                       (list (BeamLisp.Emit/function_clause :value (BeamLisp.Emit/lit 2)))))
+       publish (fn [] (try (BeamLisp.Env/publish_binaries! (list replacement) "transition-pin-replacement")
+                           :published (catch _ :refused)))]
+  (try
+   (g/with! old #(state/bind! {})) (g/inherit-runtime! fresh old)
+   (reset! owner (g/with! old #(evolve/start! (spec old 1) 7 {:managed true})))
+   (let [value (spec fresh 2)]
+    (is (empty? (:modules value [])))
+    (reset! grant (g/with! fresh #(BeamLisp.Env/begin_owner_transition! @owner)))
+    (is (= :pending (:phase (BeamLisp.Env/owner_transition_observation @grant))))
+    (is (= 1 (count (graph-rows fresh (Process/whereis :Elixir.BeamLisp.Env)))))
+    (when (= :bundle kind)
+     (reset! held (g/with! fresh #(BeamLisp.Execution/register-bundle! @grant 'proc.evolve/spec value)))
+     (is (= 1 (count (graph-rows fresh (erlang/self)))))
+     (BeamLisp.Env/abandon_owner_transition! @grant) (reset! grant nil)
+     (is (empty? (graph-rows fresh (Process/whereis :Elixir.BeamLisp.Env))))
+     (is (thrown? (BeamLisp.Execution/invoke-bundle! @held
+                    (tuple :bl_owner_transition (erlang/self) (erlang/make_ref))
+                    'proc.evolve/prepare [{} 1 []]))))
+    (is (= :refused (publish)))
+    (is (= 1 (erlang/apply module :value (list))))
+    (if @held (do (BeamLisp.Execution/close! @held) (reset! held nil))
+              (do (BeamLisp.Env/abandon_owner_transition! @grant) (reset! grant nil)))
+    (is (empty? (graph-rows fresh (erlang/self))))
+    (is (= :published (publish)))
+    (is (= 2 (erlang/apply module :value (list)))))
+   (finally
+    (when @held (BeamLisp.Execution/close! @held))
+    (when @grant (BeamLisp.Env/abandon_owner_transition! @grant))
+    (when (and @owner (Process/alive? @owner)) (GenServer/stop @owner))
+    (g/retire! fresh) (g/retire! old)
+    (BeamLisp.Env/publish_binaries! (list original) "transition-pin-restoration")))))
+
+(deftest pending-transition-pins-native-grants-before-publication
+ (check-retention! :transition))
+(deftest bundle-independently-pins-native-grants-after-pending-abandonment
+ (check-retention! :bundle))

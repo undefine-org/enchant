@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Boot a generated floor in a fresh, private source image before installation."""
+import argparse
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+
+PREBOOT = r'''
+{:ok, _} = Application.ensure_all_started(:crypto)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+# Execute packaged identity recovery before any language runtime is loaded.
+# Corrupt actual bytes, and independently replace loaded stable code. Restore
+# both in this private image before ordinary startup; no fake manifest is used.
+preboot_unloaded = fn ->
+  for module <- [BeamLisp.Ns.Core, BeamLisp.Ns.Rt, BeamLisp.Env] do
+    if :erlang.module_loaded(module), do: raise "preboot loaded #{module}"
+  end
+end
+preboot_unloaded.()
+expected_keys = {manifest["compiler_key"], manifest["build_key"]}
+^expected_keys = BeamLisp.Bootstrap.packaged_keys!()
+true = BeamLisp.Bootstrap.packaged_member?(BeamLisp.CompilerData)
+preboot_unloaded.()
+victim = "priv/bootstrap/seed/Elixir.BeamLisp.CompilerData.beam"
+original = File.read!(victim)
+refused = fn operation ->
+  try do
+    operation.()
+    false
+  catch
+    _, _ -> true
+  end
+end
+try do
+  File.write!(victim, "changed preboot bytes")
+  unless refused.(fn -> BeamLisp.Bootstrap.packaged_keys!() end),
+    do: raise "preboot accepted changed floor bytes"
+after
+  File.write!(victim, original)
+end
+try do
+  Code.compile_string("defmodule BeamLisp.CompilerData do\n def changed_preboot_probe, do: :changed\nend")
+  unless refused.(fn -> BeamLisp.Bootstrap.packaged_keys!() end),
+    do: raise "preboot accepted replaced loaded stable code"
+  unless refused.(fn -> true = BeamLisp.Bootstrap.packaged_member?(BeamLisp.CompilerData) end),
+    do: raise "preboot member accepted replaced loaded stable code"
+after
+  :code.purge(BeamLisp.CompilerData)
+  {:module, BeamLisp.CompilerData} = :code.load_binary(BeamLisp.CompilerData, String.to_charlist(victim), original)
+  :code.purge(BeamLisp.CompilerData)
+end
+^expected_keys = BeamLisp.Bootstrap.packaged_keys!()
+preboot_unloaded.()
+IO.puts("SOURCE-FLOOR preboot keys/member, corrupt bytes, replaced loaded code and native proof instructions passed")
+'''
+
+DRIVER = r'''
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [],
+  do: {:ok, _} = Application.ensure_all_started(app)
+{:ok, [manifest]} = :file.consult(~c"priv/bootstrap/seed/manifest.term")
+unless BeamLisp.AOTCache.current_compiler_key() == manifest["compiler_key"],
+  do: raise "candidate floor does not match the physical compiler inputs"
+# This host is needed before language runtime modules exist. Keep the emitted
+# dependency gate here, so bootstrap recovery catches a generic callable route
+# before a complete B/C production run pays for it.
+{:ok, {_, [atoms: atoms]}} = :beam_lib.chunks(~c"priv/bootstrap/seed/Elixir.BeamLisp.AOTCache.beam", [:atoms])
+for forbidden <- [BeamLisp.Ns.Rt, BeamLisp.Ns.Core, BeamLisp.Vector] do
+  if Enum.any?(atoms, fn {_, atom} -> atom == forbidden end),
+    do: raise "preboot cache host depends on language runtime: #{forbidden}"
+end
+# Frame validation runs inside the Source invocation guard. A dynamic keyword
+# lookup here re-enters that guard recursively; fresh unmanaged boot alone
+# cannot detect it. Judge actual emitted instructions before running user code.
+{:beam_file, _, _, _, _, frame_functions} = :beam_disasm.file(~c"priv/bootstrap/seed/Elixir.BeamLisp.Env.beam")
+if Enum.any?(frame_functions, fn {:function, name, _, _, _} -> name == :execution_frame_current end) do
+  frame_ingress = [:execution_frame_token?, :execution_frame_key, :execution_frame_row,
+                   :execution_frame_current, :execution_frame_lease_live?, :execution_proof_generation,
+                   :execution_profile_scope, :source_admitted_generation!,
+                   :source_execution_active?, :execution_origin, :assert_execution_context!]
+  for name <- frame_ingress do
+    {:function, ^name, _, _, instructions} = Enum.find(frame_functions, fn {:function, n, _, _, _} -> n == name end)
+    for instruction <- instructions, is_tuple(instruction),
+        elem(instruction, 0) in [:call_ext, :call_ext_only, :call_ext_last] do
+      {:extfunc, target, _, _} = elem(instruction, 2)
+      if target == BeamLisp.Ns.Rt,
+        do: raise "native frame ingress re-enters language invocation: #{name}"
+    end
+  end
+end
+# SDK declaration checks may name a global class while a Source frame remains
+# active. Naming is fixed native metadata work, so a local helper must not
+# route through the Source guard after the temporary scope switch.
+{:beam_file, _, _, _, _, server_functions} = :beam_disasm.file(~c"priv/bootstrap/seed/Elixir.BeamLisp.Server.beam")
+{:function, :module_for, 2, _, naming_instructions} = Enum.find(server_functions, fn {:function, n, a, _, _} -> n == :module_for and a == 2 end)
+for instruction <- naming_instructions, is_tuple(instruction),
+    elem(instruction, 0) in [:call_ext, :call_ext_only, :call_ext_last] do
+  {:extfunc, target, _, _} = elem(instruction, 2)
+  if target == BeamLisp.Ns.Rt,
+    do: raise "native actor naming re-enters Source invocation"
+end
+# Native SDK proof helpers run under a private Source frame with a temporary
+# global Env. Inspect their actual emitted code, including local helper calls.
+{:beam_file, _, _, _, _, aot_functions} = :beam_disasm.file(~c"priv/bootstrap/seed/Elixir.BeamLisp.AOT.beam")
+for name <- [:sdk_unit_source_path, :sdk_source_current?, :physical_sdk_path,
+             :physical_dir_cached, :lstat_identity, :physical_sdk_path_walk] do
+  functions = Enum.filter(aot_functions, fn {:function, n, _, _, _} -> n == name end)
+  if functions == [], do: raise "missing native SDK proof helper: #{name}"
+  for {:function, _, _, _, instructions} <- functions,
+      instruction <- instructions, is_tuple(instruction),
+      elem(instruction, 0) in [:call_ext, :call_ext_only, :call_ext_last] do
+    {:extfunc, target, _, _} = elem(instruction, 2)
+    if target == BeamLisp.Ns.Rt,
+      do: raise "native SDK proof re-enters Source invocation: #{name}"
+  end
+end
+{:ok, _} = Application.ensure_all_started(:beam_lisp)
+if expected = System.get_env("BL_FLOOR_EXPECT_Z3_SHA256") do
+  selected = BeamLisp.Z3Port.resolve_exe()
+  unless selected && Base.encode16(:crypto.hash(:sha256, File.read!(selected)), case: :lower) == expected,
+    do: raise "candidate selected another solver artifact"
+  IO.puts("SOURCE-FLOOR selected solver bytes match captured prerequisite")
+end
+# Stable compiler bodies must still be the candidate bytes after startup.
+# Mutable forwarders may extend legitimately; their stable bodies may not.
+for {name, _} <- manifest["modules"], String.ends_with?(name, ".beam") do
+  path = Path.join("priv/bootstrap/seed", name)
+  {:ok, {mod, md5}} = :beam_lib.md5(String.to_charlist(path))
+  if :erlang.module_loaded(mod) do
+    attrs = mod.module_info(:attributes)
+    unless Keyword.get(attrs, :bl_aot_artifact_role) == [:"mutable-forwarder"] or
+           mod.module_info(:md5) == md5,
+      do: raise "startup replaced candidate compiler code: #{mod}"
+  end
+end
+# Exercise the early publication path, rather than merely loading ANF exports.
+BeamLisp.eval("(ns floor.fresh.probe) (defn identity [x] x) (defn dispatch [f] (f))")
+{:ok, row} = BeamLisp.Env.lookup({:emitted_definition, "floor.fresh.probe", "identity"})
+unless row.execution.status == :bound and length(row.execution.entries) == 1 do
+  IO.inspect(row.execution, label: "SOURCE-FLOOR publication", limit: 30)
+  body = elem(hd(row.entries), 4)
+  IO.inspect(Keyword.get(body.module_info(:attributes), :bl_execution_clauses),
+             label: "SOURCE-FLOOR clause attributes", limit: 10)
+  raise "fresh publication did not bind its execution descriptor"
+end
+{:ok, dynamic} = BeamLisp.Env.lookup({:emitted_definition, "floor.fresh.probe", "dispatch"})
+unless dynamic.execution.status == :bound and
+       Enum.any?(dynamic.execution.entries, fn entry ->
+         entry[:"dependencies-complete"] == false and
+           Enum.any?(entry.edges, &(&1.kind == :"callable-argument" and is_nil(&1.target)))
+       end), do: raise "compiler callable ABI lost its unresolved execution obligation"
+# Privileged startup needs the candidate's independently admitted image, not
+# merely a replacement module emitted from genuine source. Exercise both
+# constructor families while the candidate is the actual boot floor.
+task = BeamLisp.Refs.task_exec(fn -> :floor_task_completed end, :plain)
+:floor_task_completed = Task.await(task, 3000)
+tag = make_ref()
+{pid, ref} = BeamLisp.Refs.spawn_owned(fn -> exit(:floor_child_completed) end,
+                                     :monitor, [], [tag: tag])
+receive do
+  {^tag, ^ref, :process, ^pid, :floor_child_completed} -> :ok
+  after 3000 -> raise "candidate owned start lost its tagged monitor exit"
+end
+# Exercise protected operands and native/interpreted guard agreement against
+# the candidate itself. A recovery compiler can prepare this candidate, but
+# its precompiled host bytes are not a substitute for these fresh semantics.
+escaped = BeamLisp.eval("(try (erlang/=:= true (erlang/throw :floor_operand_probe)) " <>
+                       "(catch-raw [kind reason stack] [kind reason]))")
+[:throw, :floor_operand_probe] = BeamLisp.Vector.to_list(escaped)
+for guard <- ["42", ":yes", "(+ 1 2)", "(> (tuple-size x) 0)",
+              "(= (tuple-size x) false)", "(= (rem x 0) 1)"] do
+  source = "((fn ([x] :when " <> guard <> " 0) ([x] 42)) 42)"
+  node = BeamLisp.Compiler.compile(BeamLisp.Reader.read_one(source), BeamLisp.Compiler.new_env("user"))
+  42 = BeamLisp.eval(source)
+  42 = BeamLisp.AOT.interpret_constructor!(node, %{}, %{})
+end
+position_source = "(ns floor.position.probe)\n(defn fail [xs]\n  (erlang/tuple_size\n" <>
+                  "    (erlang/hd xs)))\n(try (fail '(42)) (catch-raw [kind reason stack] stack))"
+env = BeamLisp.Compiler.new_env("user")
+frames = Enum.reduce(BeamLisp.Reader.read_string(position_source, "floor-position.bl"), nil,
+                    fn form, _ -> BeamLisp.Compiler.eval_form(form, env) end)
+frame = Enum.find(frames, fn {_, _, _, location} ->
+  to_string(Keyword.get(location, :file, "")) == "floor-position.bl"
+end)
+unless frame && Keyword.get(elem(frame, 3), :line) == 3,
+  do: raise "operand binding lost the failing call's source location"
+IO.puts("SOURCE-FLOOR fresh application, descriptors, owned starts, protected operands and guard parity passed")
+case System.argv() do
+  [] -> :ok
+  files ->
+    # Test the candidate before installing it. The actual CLI owns isolation,
+    # discovery, execution and exit status; this is only a private-image entry.
+    BeamLisp.Loader.ensure_loaded("bl.cli")
+    status = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch_exact!("bl.cli", "run-argv"),
+                                  [["test" | files]])
+    unless status == 0, do: System.halt(status)
+end
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--seed", type=Path, required=True)
+    parser.add_argument("--test", type=Path, nargs="+", default=[],
+                        help="run actual CLI tests against this private candidate before installation")
+    parser.add_argument("--test-timeout", type=int, choices=range(120, 901), default=600,
+                        metavar="SECONDS", help="bounded CLI test budget (120..900; default 600)")
+    args = parser.parse_args()
+    root, seed = args.root.resolve(), args.seed.resolve()
+    tests = [path.resolve() for path in args.test]
+    if any(not path.is_file() for path in tests):
+        parser.error("candidate test paths must be existing files")
+    with tempfile.TemporaryDirectory(prefix="bl-source-floor-") as temporary:
+        image = Path(temporary)
+        subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv"), str(image / "priv")], check=True)
+        shutil.rmtree(image / "priv/bootstrap/seed")
+        shutil.copytree(seed, image / "priv/bootstrap/seed")
+        # The preboot controls corrupt and restore their own copied bytes.
+        # An immutable Nix floor keeps read-only modes through copytree; make
+        # only this private copy writable, never the selected compiler floor.
+        private_seed = image / "priv/bootstrap/seed"
+        for path in [private_seed, *private_seed.rglob('*')]:
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | 0o200)
+        shutil.copy2(root / "env.bl", image / "env.bl")
+        if tests and (root / "test").is_dir():
+            # Authored test fixtures are readable without changing the SDK's
+            # physical Source root or letting Loader find another tree's priv.
+            (image / "test").symlink_to(root / "test", target_is_directory=True)
+        app = image / ".bl/lib/beam_lisp-0.1.0"
+        app.mkdir(parents=True)
+        (app / "priv").symlink_to(image / "priv", target_is_directory=True)
+        shutil.copytree(seed, app / "ebin")
+        driver = image / "check.exs"
+        driver.write_text(DRIVER)
+        preboot = image / "preboot.exs"
+        preboot.write_text(PREBOOT)
+        deps = sorted((root / "deps").glob("*/ebin"))
+        deps += sorted((root / "_build").glob("*/lib/*/ebin"))
+        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        # The actual Elixir runtime selects compatible cache entries, as bin/bl does.
+        tag = subprocess.check_output(["elixir", "-e", 'IO.write("erts#{:erlang.system_info(:version)}-elixir#{System.version()}")'], text=True)
+        deps += sorted((cache / "beam_lisp/ebin").glob(f"*-{tag}/ebin"))
+        command = ["elixir"]
+        for dep in dict.fromkeys(path.resolve() for path in deps):
+            command += ["-pa", str(dep)]
+        command += ["-pa", str(app / "ebin"), str(driver)]
+        if tests:
+            command += list(map(str, tests))
+        env = os.environ.copy()
+        env.update(BL_ROOT=str(image), BL_DAEMON="off", BL_BUILD_ID="floor-check",
+                   XDG_CACHE_HOME=str(image / "cache"),
+                   ELIXIR_ERL_OPTIONS="+S 4:4 +SDcpu 2:2 +SDio 1:1")
+        solver = runpy.run_path(str(root / 'scripts/check-execution-history'))['capture_tools'](root)['z3']['selected']
+        if solver and solver['sha256']:
+            env['BL_FLOOR_EXPECT_Z3_SHA256'] = solver['sha256']
+        else:
+            env.pop('BL_FLOOR_EXPECT_Z3_SHA256', None)
+        # Compile this driver in a separate VM: Elixir can load remote call
+        # targets while compiling the ordinary runtime driver itself.
+        preboot_command = command[:command.index(str(driver))] + [str(preboot)]
+        subprocess.run(preboot_command, cwd=image, env=env, check=True, timeout=120)
+        try:
+            result = subprocess.run(command, cwd=image, env=env, text=True,
+                                    stdout=None if tests else subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=args.test_timeout if tests else 120)
+        except subprocess.TimeoutExpired as error:
+            if error.stdout:
+                output = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout
+                print(output[-16000:], end="")
+            scope = f"candidate CLI tests exceeded {args.test_timeout} seconds" if tests else "fresh boot exceeded 120 seconds"
+            raise SystemExit(f"SOURCE-FLOOR {scope}")
+        if result.returncode:
+            if result.stdout:
+                print(result.stdout[-16000:], end="")
+            raise SystemExit(result.returncode)
+        if tests and result.stdout:
+            print(result.stdout, end="")
+        print(json.dumps({"kind": "fresh-source-floor", "status": "passed",
+                          "seed": str(seed), "runtime": tag,
+                          "tests": [str(path) for path in tests]}))
+
+
+if __name__ == "__main__":
+    main()

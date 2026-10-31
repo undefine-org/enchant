@@ -1,0 +1,46 @@
+(ns execution.history-solver-test)
+
+(defn- compile-probe! [file module out]
+ (let [compiled (BeamLisp.AOT/compile_host_file file
+                  (list (tuple :module module) (tuple :output_dir out) (tuple :load? false)))
+       path (elem compiled 1)]
+  (when-not (= (tuple :module module) (code/load_binary module (String/to_charlist path) (File/read! path)))
+   (throw :history-solver-probe-load-failed))))
+
+(defn- conversation [module]
+ ;; Control exact transport chunks without depending on OS scheduling. The
+ ;; native parser is real; this mailbox driver grants no execution custody.
+ (let [tag (erlang/make_ref)
+       send! (fn [text] (erlang/send (erlang/self) (tuple tag (tuple :data text))))
+       read! (fn [] (elem (erlang/apply module :read_answer (list tag "")) 0))]
+  (try
+   (send! "(error \"rejected\")\n") (send! "sat\n")
+   (let [a (read!)]
+    (send! "unsat\n")
+    (let [b (read!)] (send! "sat\n") [a b (read!)]))
+   (finally
+    (loop []
+     (receive [seen [:data _]] :when (= tag seen) (recur) (after 0 nil)))))))
+
+(deftest E75-early-error-line-return-leaves-the-status-for-the-next-query
+ (let [source (File/read! (Path/join (BeamLisp.Tiers/priv_root) "host/z3_port.bl"))
+       before "(Enum/member? (list \"sat\" \"unsat\" \"unknown\" \"error\") l)"
+       after "(or (Enum/member? (list \"sat\" \"unsat\" \"unknown\" \"error\") l) (String/starts_with? l \"(error\"))"
+       directory (Path/join (System/tmp_dir!) (str "history-solver-" (erlang/unique_integer (list :positive))))
+       good :Elixir.ExecutionHistory.SolverGood bad :Elixir.ExecutionHistory.SolverEarlyError]
+  (try
+   (is (= 2 (count (String/split source before))))
+   (when-not (= 2 (count (String/split source before))) (throw :history-solver-anchor-changed))
+   (File/mkdir_p! directory)
+   (let [original (Path/join directory "normal.bl") mutant (Path/join directory "mutant.bl")]
+    (File/write! original source) (File/write! mutant (String/replace source before after))
+    (compile-probe! original good (Path/join directory "normal"))
+    (compile-probe! mutant bad (Path/join directory "mutant"))
+    (let [normal (conversation good) changed (conversation bad)]
+     (println :history-E75 {:normal normal :mutant changed
+                            :producer-sha256 (Base/encode16 (crypto/hash :sha256 source))})
+     (is (= ["error" "unsat" "sat"] normal))
+     (is (= ["(error \"rejected\")" "sat" "unsat"] changed))))
+   (finally
+    (doseq [module [good bad]] (code/purge module) (code/delete module) (code/purge module))
+    (File/rm_rf! directory)))))

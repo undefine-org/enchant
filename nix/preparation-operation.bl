@@ -1,0 +1,501 @@
+;; Fixed preparation operations over Foundry's existing durable job mechanism.
+;; Machine results live in private files, separate from bounded progress events.
+;; The operation/receipt JSON is data, never a language execution grant.
+(ns artifact.preparation-operation
+  (:require [deployment-runner :as runner] [artifact-process :as process]))
+
+(def terminal #{"succeeded" "failed" "cancelled" "interrupted"})
+(def machine-limit 16777216)
+(def operation-limit 1048576)
+
+(defn- json-native [value]
+  ;; Preserve scalars and malformed collection types for the closed validators.
+  ;; Only actual sequential values become JSON arrays; maps recurse at any depth.
+  (cond
+    (map? value) (reduce (fn [out key]
+                          (let [normalized (if (keyword? key) (name key) key)]
+                            (when-not (string? normalized)
+                              (throw (ex-info "JSON object keys must be strings or keywords" {})))
+                            (when (contains? out normalized)
+                              (throw (ex-info "JSON object keys collide after normalization" {})))
+                            (assoc out normalized (json-native (get value key))))) {} (keys value))
+    (sequential? value) (to-list (map json-native value))
+    (keyword? value) (name value)
+    :else value))
+(defn- encode-json! [value] (Jason/encode! (json-native value)))
+
+(defn- refuse! [message] (throw (ex-info message {:kind :artifact-job-refused})))
+(defn- raw-env [key] (erlang/apply :Elixir.System :get_env (list key)))
+(defn- sha [bytes] (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+(defn- store? [path]
+  (and (string? path) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" path)))
+(defn- store! [path]
+  (when-not (and (store? path) (File/dir? path)) (refuse! "Immutable store directory required")) path)
+(defn- exact! [value names]
+  (when-not (and (map? value) (= (set (keys value)) (set names)))
+    (refuse! "Unknown or missing preparation fields")) value)
+(defn- relative? [path]
+  (and (string? path) (< 0 (count path) 4097) (not= :absolute (Path/type path))
+       (not (String/contains? path (erlang/list_to_binary (list 0))))
+       (not (some #(contains? #{"" "." ".."} %) (String/split path "/")))))
+(defn- application-relative? [path] (or (= path ".") (relative? path)))
+(defn- identity [path]
+  (let [info (File/lstat! path)]
+    {"inode" (:inode info) "device" (:major_device info) "minor-device" (:minor_device info) "uid" (:uid info)}))
+(defn- identifier? [name]
+  (and (string? name) (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]{0,127}$" name)))
+(defn- member? [name]
+  (or (= name ".")
+      (and (relative? name)
+           (every? (fn [part]
+                     (and (<= (count part) 255)
+                          (Regex/match? #"^[A-Za-z0-9_.-]+$" part)
+                          (not (String/starts_with? part "-"))
+                          (not (contains? #{".git" ".bl" "target"} part))))
+                   (String/split name "/")))))
+(defn- directory! [directory]
+  (when-not (and (string? directory) (< 1 (count directory) 4097)
+                (= :absolute (Path/type directory))
+                (not (some #(= ".." %) (String/split directory "/"))))
+    (refuse! "Private absolute preparation directory required"))
+  (let [path (Path/expand directory) info (File/lstat! path)]
+    (when-not (and (= :directory (:type info)) (= (:uid (File/stat! "/proc/self")) (:uid info)) (= 0 (erlang/band (:mode info) 63))
+                  (not= 0 (erlang/band (:mode info) 128)))
+      (refuse! "Preparation directory must be private and owner-writable")) path))
+(defn- bounded! [path limit]
+  (let [info (File/lstat! path)]
+    (when-not (and (= :regular (:type info)) (<= (:size info) limit))
+      (refuse! "Preparation file is not a bounded regular file"))
+    (File/read! path)))
+(defn- json! [path limit] (Jason/decode! (bounded! path limit)))
+(defn- owned! [path limit]
+  (let [info (File/lstat! path) stamp (identity path)]
+    (when-not (and (= :regular (:type info)) (= (:uid (File/stat! "/proc/self")) (:uid info))
+                  (= 0 (erlang/band (:mode info) 63)))
+      (refuse! "Preparation file is not private to the current operator"))
+    (let [body (bounded! path limit)]
+      (when-not (= stamp (identity path)) (refuse! "Preparation file changed during read")) body)))
+(defn- owned-json! [path limit] (Jason/decode! (owned! path limit)))
+(defn- state-path [directory] (Path/join directory "foundry-state"))
+
+(defn- atomic-json! [path value]
+  (let [temporary (str path ".tmp-" (Base/encode16 (crypto/strong_rand_bytes 16)))]
+    (try
+      (File/write! temporary (encode-json! value) (list :exclusive))
+      (File/chmod! temporary 384)
+      (File/rename! temporary path)
+      (finally (File/rm temporary)))))
+
+(defn- native-contract! [request relative-source?]
+  (let [version (get request "version")]
+    (exact! request (if (= version 2)
+                      ["version" "source" "member" "package" "crate" "abi" "target"]
+                      ["version" "source" "crate" "abi" "target"]))
+    (when-not (and (contains? #{1 2} version) (identifier? (get request "crate"))
+                  (string? (get request "abi")) (< 0 (count (get request "abi")) 129)
+                  (= "x86_64-linux" (get request "target")))
+      (refuse! "Invalid native preparation contract"))
+    (if relative-source?
+      (when-not (application-relative? (get request "source"))
+        (refuse! "Native application input must be relative to its captured project"))
+      (store! (get request "source")))
+    (when (= version 2)
+      (when-not (and (member? (get request "member")) (string? (get request "package"))
+                    (Regex/match? #"^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$" (get request "package")))
+        (refuse! "Invalid native workspace selection"))) request))
+
+(defn- native! [request] (native-contract! request false))
+
+(defn- application! [request]
+  (let [version (get request "version")
+        common ["version" "source" "sources" "world" "exclude" "ex" "native" "jobs"]]
+    (exact! request (case version
+                      1 common
+                      2 (concat common ["base" "scope"])
+                      3 (concat common ["base" "scope" "force" "attempt"])
+                      4 (concat common ["base" "scope" "force" "attempt" "nativeProducts"])
+                      (refuse! "Unsupported application request version")))
+    (store! (get request "source"))
+    (when-not (and (sequential? (get request "sources")) (<= (count (get request "sources")) 256)
+                  (every? application-relative? (get request "sources"))
+                  (sequential? (get request "exclude")) (<= (count (get request "exclude")) 256)
+                  (every? application-relative? (get request "exclude"))
+                  (or (nil? (get request "world")) (application-relative? (get request "world")))
+                  (contains? #{true false} (get request "native"))
+                  (int? (get request "jobs")) (<= 1 (get request "jobs") 4))
+      (refuse! "Invalid application preparation contract"))
+    (when (>= version 2)
+      (when-not (and (contains? #{"full" "scoped"} (get request "scope"))
+                    (not (and (= "scoped" (get request "scope")) (get request "world"))))
+        (refuse! "Invalid application scope"))
+      (when (get request "base") (store! (get request "base"))))
+    (when (= version 3)
+      (when-not (and (= true (get request "force")) (string? (get request "attempt"))
+                    (Regex/match? #"^[0-9a-f]{64}$" (get request "attempt")))
+        (refuse! "Invalid forced application attempt")))
+    (when (= version 4)
+      (let [force (get request "force") attempt (get request "attempt")
+            products (get request "nativeProducts")]
+        (when-not (and (contains? #{true false} force)
+                      (if force
+                        (and (string? attempt) (Regex/match? #"^[0-9a-f]{64}$" attempt))
+                        (nil? attempt))
+                      (sequential? products) (<= (count products) 128)
+                      (or (get request "native") (empty? products)))
+          (refuse! "Invalid application native products or attempt"))
+        (doseq [product products] (native-contract! product true))
+        (let [aliases (map #(get % "crate") products)]
+          (when-not (= (count aliases) (count (set aliases)))
+            (refuse! "Application native crate aliases must be unique")))))
+    (when-let [ex (get request "ex")]
+      (exact! ex ["root" "exclude"])
+      (when-not (and (application-relative? (get ex "root")) (sequential? (get ex "exclude"))
+                    (<= (count (get ex "exclude")) 256)
+                    (every? #(and (string? %) (<= (count %) 4096)) (get ex "exclude")))
+        (refuse! "Invalid application substrate selection"))) request))
+
+(defn- operation! [operation]
+  (when-not (if (= "sdk" (get operation "kind"))
+              (contains? #{1 2} (get operation "version"))
+              (= 1 (get operation "version")))
+    (refuse! "Unsupported preparation operation version"))
+  (case (get operation "kind")
+    "native" (do (exact! operation ["version" "kind" "request"])
+                 (native! (get operation "request")))
+    "application" (do (exact! operation ["version" "kind" "sdk" "request"])
+                      (store! (get operation "sdk")) (application! (get operation "request")))
+    "sdk" (do (exact! operation (if (= 2 (get operation "version"))
+                                  ["version" "kind" "source" "product" "previous"]
+                                  ["version" "kind" "source" "product"]))
+              (store! (get operation "source"))
+              (when (get operation "previous") (store! (get operation "previous")))
+              (when-not (contains? #{"sdk" "compiler" "dependencies" "bl-drop"} (get operation "product"))
+                (refuse! "Unsupported SDK-family product")))
+    (refuse! "Unsupported preparation operation")) operation)
+
+(defn- context []
+  ;; Both values are set by the immutable coordinator entry, never request data.
+  (let [platform (store! (raw-env "BL_PREPARATION_PLATFORM"))
+        foundry (raw-env "FOUNDRY_ROOT")
+        runtime (store! (Path/dirname foundry))
+        descriptor (json! (Path/join runtime "artifact.json") operation-limit)]
+    (when-not (and (= 1 (get descriptor "version"))
+                  (= "artifact-coordinator-runtime" (get descriptor "kind"))
+                  (= foundry (Path/join runtime "foundry")))
+      (refuse! "Coordinator runtime identity is unavailable"))
+    {:platform platform :runtime runtime :foundry foundry
+     :environment (into {} (keep (fn [key] (when-let [value (raw-env key)] [key value]))
+                             ["HOME" "XDG_RUNTIME_DIR" "DBUS_SESSION_BUS_ADDRESS"]))
+     :program (Path/join foundry "bin/preparation-operation.bl")}))
+
+(defn- loaded! [directory expected]
+  (let [directory (directory! directory) body (owned! (Path/join directory "operation.json") operation-limit)
+        digest (sha body)]
+    (when (and expected (not= expected digest)) (refuse! "Preparation request changed after submission"))
+    {:directory directory :digest digest :operation (operation! (Jason/decode! body))}))
+(defn- invoke! [directory command args]
+  (let [result (runner/invoke! (into ["--state" (state-path directory) command] args))]
+    (when-not (:ok result) (refuse! (str "Foundry preparation operation refused: " (:error result))))
+    ;; Use JSON-native keys consistently across library/CLI process boundaries.
+    (Jason/decode! (encode-json! (:value result)))))
+(defn- handle! [directory]
+  (let [loaded (loaded! directory nil)
+        handle (owned-json! (Path/join (:directory loaded) "handle.json") operation-limit)
+        actual (context)]
+    (exact! handle ["version" "kind" "id" "directory" "directory-identity" "operation-sha256" "coordinator"])
+    (when-not (and (= 1 (get handle "version")) (= "preparation-handle" (get handle "kind"))
+                  (= (:directory loaded) (get handle "directory"))
+                  (= (identity (:directory loaded)) (get handle "directory-identity"))
+                  (= (:digest loaded) (get handle "operation-sha256"))
+                  (= (:runtime actual) (get handle "coordinator"))
+                  (string? (get handle "id")) (Regex/match? #"^job_[0-9a-f]{16}$" (get handle "id")))
+      (refuse! "Preparation handle disagrees with its accepted request")) handle))
+
+(defn- fixed-request [loaded ctx]
+  (let [directory (:directory loaded) key (str "artifact-" (sha (str directory "\n" (:digest loaded))))]
+    {"idempotencyKey" key "target" key "kind" "artifact-prepare"
+     "steps" [{"id" "prepare" "label" (str "prepare " (get (:operation loaded) "kind"))
+                "argv" [(Path/join (:runtime ctx) "bin/bl") "--cold" "run" (:program ctx)
+                        "--" "worker" directory (:digest loaded) (sha (encode-json! (identity directory)))]
+                "cwd" (:foundry ctx) "env" (:environment ctx) "timeoutSeconds" 3500
+                "outputLimit" 65536 "cancellable" true}]}))
+(defn- validate-record! [loaded ctx id row]
+  (when-not (and (string? id) (Regex/match? #"^job_[0-9a-f]{16}$" id))
+    (refuse! "Invalid preparation job identity"))
+  (let [request (runner/validate-request (fixed-request loaded ctx))
+        expected (Jason/decode! (encode-json! request))]
+    (when-not (and (= id (get row "id")) (= (get expected "idempotencyKey") (get row "idempotency_key"))
+                  (= (runner/request-digest request) (get row "request_digest"))
+                  (= (get expected "target") (get row "target")) (= "artifact-prepare" (get row "kind"))
+                  (= (get expected "steps") (get row "steps_spec"))
+                  (contains? #{"queued" "running" "cancelling" "reconciling" "succeeded" "failed" "cancelled" "interrupted"} (get row "status"))
+                  (string? (get row "worker_nonce")) (Regex/match? #"^[0-9a-f]{32}$" (get row "worker_nonce"))
+                  (int? (get row "spawn_count")) (<= 0 (get row "spawn_count") 3)
+                  (sequential? (get row "steps")) (= 1 (count (get row "steps"))))
+      (refuse! "Stored job differs from the fixed accepted preparation operation")) row))
+(defn- record! [loaded ctx id]
+  ;; Validate path identity before constructing any ledger pathname.
+  (when-not (and (string? id) (Regex/match? #"^job_[0-9a-f]{16}$" id))
+    (refuse! "Invalid preparation job identity"))
+  (validate-record! loaded ctx id
+    (owned-json! (Path/join (state-path (:directory loaded)) (str "ledger/jobs/" id ".json")) operation-limit)))
+(defn- tokens [pid]
+  (try (String/split (bounded! (str "/proc/" pid "/cmdline") 65536) (erlang/list_to_binary (list 0)))
+       (catch error nil)))
+(defn- sequence? [argv expected]
+  (and argv (boolean (some #(= (vec expected) (vec (take (count expected) (drop % argv))))
+                          (range (inc (count argv)))))))
+(defn- in-unit? [pid id]
+  (try
+    (let [text (bounded! (str "/proc/" pid "/cgroup") 65536)
+          name (str "foundry-artifact-" id ".service")]
+      (boolean (some #(= name %) (String/split text #"[/\n]"))))
+    (catch error false)))
+(defn- worker-known? [loaded ctx row pid ticks]
+  (and (int? pid) (> pid 1) (int? ticks) (= ticks (runner/proc-start-ticks pid))
+       (string? (get row "worker_nonce")) (Regex/match? #"^[0-9a-f]{32}$" (get row "worker_nonce"))
+       (let [argv (tokens pid)]
+         (and (some #(= (Path/join (:foundry ctx) "bin/jobs.bl") %) argv)
+              (sequence? argv ["--state" (state-path (:directory loaded)) "worker" "--id" (get row "id")
+                               "--nonce" (get row "worker_nonce")])))))
+(defn- observation [loaded ctx row]
+  (let [pid (get row "worker_pid") ticks (get row "worker_ticks")
+        alive (and (int? pid) (> pid 1) (File/dir? (str "/proc/" pid)))
+        known (and alive (worker-known? loaded ctx row pid ticks)
+                   (or (= "queued" (get row "status")) (in-unit? pid (get row "id"))))]
+    {"id" (get row "id") "kind" (get row "kind") "status" (get row "status")
+     "createdAt" (get row "created_at") "startedAt" (get row "started_at")
+     "finishedAt" (get row "finished_at") "error" (get row "error") "exitCode" (get row "exit_code")
+     "cancelRequested" (get row "cancel_requested") "workerAlive" (boolean known)
+     "needsRecovery" (and (not (contains? terminal (get row "status"))) (not known))}))
+(defn- private-state! [directory]
+  (doseq [name ["foundry-state" "foundry-state/ledger" "foundry-state/ledger/jobs"
+               "foundry-state/ledger/keys" "foundry-state/ledger/events" "foundry-state/ledger/locks"]]
+    (let [path (Path/join directory name)]
+      (when (= :ok (elem (File/lstat path) 0)) (directory! path)))))
+(defn- submit! [directory]
+  (let [loaded (loaded! directory nil) directory (:directory loaded) ctx (context)
+        request (fixed-request loaded ctx)
+        _ (private-state! directory)
+        index (Path/join (state-path directory) (str "ledger/keys/" (sha (get request "idempotencyKey"))))
+        _ (when (File/exists? index)
+            (record! loaded ctx (String/trim (owned! index 128))))
+        record (invoke! directory "submit" ["--request" (encode-json! request)])
+        _ (record! loaded ctx (get record "id"))
+        handle {"version" 1 "kind" "preparation-handle" "id" (get record "id")
+                "directory" directory "directory-identity" (identity directory)
+                "operation-sha256" (:digest loaded) "coordinator" (:runtime ctx)}]
+    (atomic-json! (Path/join directory "handle.json") handle) handle))
+(defn- state! [directory]
+  (let [handle (handle! directory) loaded (loaded! directory (get handle "operation-sha256")) ctx (context)
+        _ (private-state! directory) row (record! loaded ctx (get handle "id"))]
+    {:handle handle :loaded loaded :context ctx :row row}))
+(defn- status! [directory]
+  (let [state (state! directory)] (observation (:loaded state) (:context state) (:row state))))
+(defn- unit! [ctx id]
+  (let [result (process/run (Path/join (:platform ctx) "bin/systemctl")
+                 ["--user" "show" (str "foundry-artifact-" id ".service")
+                  "--property=LoadState" "--property=ActiveState" "--property=MainPID"
+                  "--property=InvocationID"] {:timeout-ms 10000 :limit 8192 :env (:environment ctx)})
+        fields (into {} (keep (fn [line]
+                               (let [pair (String/split line "=" (list (tuple :parts 2)))]
+                                 (when (= 2 (count pair)) pair))) (String/split (:out result) "\n")))]
+    (when-not (and (contains? fields "LoadState") (contains? fields "MainPID"))
+      (refuse! "Managed worker cannot be observed; needs recovery")) fields))
+(defn- cancel! [directory]
+  (let [state (state! directory) loaded (:loaded state) ctx (:context state)
+        id (get (:row state) "id")
+        row (runner/update-job! (state-path directory) id
+              (fn [current]
+                (let [row (validate-record! loaded ctx id current)]
+                  ;; A queued worker must acquire this same mutex before admission.
+                  ;; Its flag is therefore observed before any step can start.
+                  ;; Running workers are stopped only through their verified unit,
+                  ;; never via the generic runner's process-group cancellation.
+                  (if (= "queued" (get row "status"))
+                    (assoc row "cancel_requested" true "updated_at" (runner/iso-now)) row))))
+        observed (observation loaded ctx row)]
+    (cond
+      (contains? terminal (get row "status")) observed
+      (= "queued" (get row "status")) (status! directory)
+      :else
+      (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))]
+        (if-not (and (get observed "workerAlive") (= pid (get row "worker_pid"))
+                     (not (empty? (get unit "InvocationID" ""))) (in-unit? pid id)
+                     (worker-known? loaded ctx row pid (get row "worker_ticks")))
+          (assoc (status! directory) "needsRecovery" true)
+          (let [stopped (process/run (Path/join (:platform ctx) "bin/systemctl")
+                          ["--user" "stop" (str "foundry-artifact-" id ".service")]
+                          {:timeout-ms 30000 :limit 8192 :env (:environment ctx)})]
+            (when-not (process/ok? stopped) (refuse! "Managed worker stop was not confirmed; needs recovery"))
+            ;; No PGID signal and no claim that an in-flight effect rolled back.
+            (runner/settle! (state-path directory) id "interrupted"
+              "Cancellation stopped the managed worker; in-flight outcome unknown" nil)
+            (status! directory)))))))
+
+(defn- recover! [directory]
+  (let [state (state! directory) loaded (:loaded state) ctx (:context state)
+        id (get (:row state) "id")]
+    ;; The existing Foundry mutex serializes competing recovery claims. Spawn
+    ;; while holding it: the new worker cannot claim queued until its identity
+    ;; has been recorded, and another recover sees that recorded live process.
+    (runner/update-job! (state-path directory) id
+      (fn [current]
+        (let [row (validate-record! loaded ctx id current)
+              observed (observation loaded ctx row)]
+          (if (or (contains? terminal (get row "status")) (get observed "workerAlive")) row
+            (let [unit (unit! ctx id) pid (String/to_integer (get unit "MainPID" "0"))
+                  recorded (get row "worker_pid")
+                  recorded-live (and (int? recorded) (> recorded 1) (File/dir? (str "/proc/" recorded)))]
+              (if (or (> pid 0) recorded-live) row
+                (if (and (= "queued" (get row "status")) (not (get row "cancel_requested"))
+                         (< (get row "spawn_count" 0) 3))
+                  (let [spawned (runner/spawn-worker! (state-path directory) id (get row "worker_nonce"))]
+                    (assoc row "worker_pid" spawned "worker_ticks" (runner/proc-start-ticks spawned)
+                      "spawn_count" (inc (get row "spawn_count" 0)) "updated_at" (runner/iso-now)))
+                  ;; No unverified process is signalled or adopted. Preserve
+                  ;; roots and the ledger for explicit outcome investigation.
+                  row)))))))
+    (status! directory)))
+
+(defn- run! [ctx directory label executable argv]
+  (let [path (Path/join directory (str label "-" (Base/encode16 (crypto/strong_rand_bytes 16)) ".json"))
+        result (process/run executable argv {:timeout-ms 3300000 :limit 65536 :stdout-file path
+                                            :on-line (fn [line] (println (str "progress " label ": " line)))
+                                            :on-truncate (fn [limit]
+                                                           (println (str "progress " label ": truncated at " limit " bytes")))
+                                            :env (merge (:environment ctx)
+                                                   {"PATH" (str (:platform ctx) "/bin:/usr/bin:/bin")
+                                                    "NIX_CONFIG" "experimental-features = nix-command flakes"})})]
+    (when-not (process/ok? result)
+      (refuse! (str "Preparation " label " failed: " (:error result) " " (:out result))))
+    (json! path machine-limit)))
+(defn- retain! [ctx directory name input]
+  (let [root (Path/join directory name)
+        result (process/run (Path/join (:platform ctx) "bin/nix-store")
+                 ["--add-root" root "--indirect" "--realise" input]
+                 {:timeout-ms 60000 :limit 65536 :env (:environment ctx)})]
+    (when-not (and (process/ok? result) (= (tuple :ok input) (File/read_link root)))
+      (refuse! "Preparation input retention failed"))))
+(defn- file-digest! [path]
+  (let [device (File/open! path (list :read :binary))]
+    (try
+      (loop [hash (crypto/hash_init :sha256)]
+        (let [part (IO/binread device 1048576)]
+          (cond
+            (= :eof part) (String/downcase (Base/encode16 (crypto/hash_final hash)))
+            (string? part) (recur (crypto/hash_update hash part))
+            :else (refuse! "Could not read produced artifact"))))
+      (finally (File/close device)))))
+
+(defn- verify-output! [ctx directory operation output]
+  (case (get operation "kind")
+    "native"
+      (let [request (get operation "request") descriptor (json! (Path/join output "artifact.json") operation-limit)
+            library (str "lib/" (get request "crate") ".so")
+            fields (if (= 2 (get request "version")) ["version" "source" "member" "package" "crate" "abi" "target"]
+                       ["version" "source" "crate" "abi" "target"])]
+        (when-not (and (= "native-library" (get descriptor "kind")) (= library (get descriptor "library"))
+                      (every? #(= (get request %) (get descriptor %)) fields)
+                      (= :regular (:type (File/lstat! (Path/join output library))))
+                      (= (file-digest! (Path/join output library)) (get descriptor "sha256")))
+          (refuse! "Native preparation output failed verification")))
+    "application"
+      (run! ctx directory "verification" (Path/join (:platform ctx) "bin/python3")
+        [(Path/join (:platform ctx) "nix/application-inventory.py") "verify" output
+         (get operation "sdk") (get-in operation ["request" "source"])])
+    "sdk"
+      (case (get operation "product")
+        "sdk" (let [descriptor (json! (Path/join output "artifact.json") operation-limit)]
+                (when-not (and (= 1 (get descriptor "version")) (= "sdk" (get descriptor "kind"))
+                              (= "x86_64-linux" (get descriptor "target"))
+                              (File/regular? (Path/join output "image/ebin/Elixir.BeamLisp.Launcher.beam")))
+                  (refuse! "SDK preparation output failed verification")))
+        "compiler" (when-not (and (File/regular? (Path/join output "seed/manifest.term"))
+                                    (File/regular? (Path/join output "seed/Elixir.BeamLisp.Launcher.beam")))
+                       (refuse! "Compiler preparation output is incomplete"))
+        "dependencies" (when-not (File/dir? (Path/join output "ebin"))
+                           (refuse! "Dependency preparation output is incomplete"))
+        "bl-drop" (let [descriptor (json! (Path/join output "artifact.json") operation-limit)]
+                    (when-not (and (= "release" (get descriptor "kind"))
+                                  (= "bl.drop" (get descriptor "file"))
+                                  (= (file-digest! (Path/join output "bl.drop")) (get descriptor "sha256")))
+                      (refuse! "Release preparation output failed verification"))))))
+
+(defn- worker! [directory digest directory-digest]
+  (when-not (= directory-digest (sha (encode-json! (identity (directory! directory)))))
+    (refuse! "Preparation directory changed after submission"))
+  (let [loaded (loaded! directory digest) directory (:directory loaded) operation (:operation loaded)
+        ctx (context) platform (:platform ctx) kind (get operation "kind")
+        source (if (= kind "sdk") (get operation "source") (get-in operation ["request" "source"]))
+        sdk (get operation "sdk") base (or (get operation "previous") (get-in operation ["request" "base"]))
+        _ (retain! ctx directory "source-retained" source)
+        _ (when sdk (retain! ctx directory "sdk-retained" sdk))
+        _ (when base (retain! ctx directory "base-retained" base))
+        arguments (case kind
+                    "native" ["--file" (Path/join platform "nix/native-artifact.nix")
+                              "--argstr" "requestJson" (encode-json! (get operation "request"))]
+                    "application" ["--file" (Path/join platform "nix/application-artifact.nix")
+                                   "--argstr" "requestJson" (encode-json! (get operation "request"))
+                                   "--argstr" "sdk" sdk]
+                    "sdk" (concat ["--file" (Path/join platform "nix/sdk-artifact.nix")
+                           "--argstr" "source" source "--argstr" "product" (get operation "product")]
+                           (when base ["--argstr" "previous" base])))
+        rows (run! ctx directory "machine" (Path/join platform "bin/nix")
+               (concat ["build" "--impure"] arguments
+                 ["--json" "--out-link" (Path/join directory "retained") "--max-jobs" "0"
+                  "--option" "timeout" "3300"]))
+        _ (when-not (and (sequential? rows) (= 1 (count rows))) (refuse! "Expected one preparation output"))
+        output (store! (get-in (first rows) ["outputs" "out"]))
+        _ (when-not (= (tuple :ok output) (File/read_link (Path/join directory "retained")))
+            (refuse! "Preparation output is not retained"))
+        _ (verify-output! ctx directory operation output)
+        receipt {"version" 1 "kind" "preparation-result" "operation" kind "output" output
+                 "source" source "sdk" sdk "product" (get operation "product")
+                 "operation-sha256" digest "derivation" (get (first rows) "drvPath")
+                 "retention-root" (Path/join directory "retained")}]
+    (atomic-json! (Path/join directory "machine.json") rows)
+    (atomic-json! (Path/join directory "result.json") receipt) receipt))
+
+(defn- await! [directory milliseconds]
+  (when-not (and (int? milliseconds) (<= 1000 milliseconds 3600000))
+    (refuse! "Await deadline must be between one second and one hour"))
+  (let [until (+ (System/monotonic_time :millisecond) milliseconds)]
+    (loop []
+      (let [status (status! directory) state (get status "status")]
+        (cond
+          (= state "succeeded")
+            (let [handle (handle! directory) receipt (owned-json! (Path/join directory "result.json") machine-limit)]
+              (when-not (and (= (get handle "operation-sha256") (get receipt "operation-sha256"))
+                            (= "preparation-result" (get receipt "kind"))
+                            (= (tuple :ok (get receipt "output")) (File/read_link (get receipt "retention-root"))))
+                (refuse! "Completed preparation receipt disagrees")) receipt)
+          (contains? terminal state) (refuse! (str "Preparation ended " state ": " (get status "error")))
+          (get status "needsRecovery") (refuse! "Preparation needs recovery; worker ownership is not established")
+          (>= (System/monotonic_time :millisecond) until)
+            (refuse! "Await deadline expired; durable preparation continues")
+          :else (do (Process/sleep 250) (recur)))))))
+
+(defn- dispatch! [args]
+  (let [args (vec args) mode (first args) directory (second args)]
+    (case mode
+      "submit" (do (when-not (= 2 (count args)) (refuse! "submit requires a request directory")) (submit! directory))
+      "worker" (do (when-not (and (= 4 (count args))
+                                  (every? #(and (string? %) (Regex/match? #"^[0-9a-f]{64}$" %)) (drop 2 args)))
+                     (refuse! "worker requires directory, operation digest and directory identity"))
+                   (worker! directory (nth args 2) (nth args 3)))
+      "status" (do (when-not (= 2 (count args)) (refuse! "status requires a request directory")) (status! directory))
+      "cancel" (do (when-not (= 2 (count args)) (refuse! "cancel requires a request directory")) (cancel! directory))
+      "recover" (do (when-not (= 2 (count args)) (refuse! "recover requires a request directory")) (recover! directory))
+      "events" (do (when-not (= 4 (count args)) (refuse! "events requires directory, cursor and limit"))
+                   (let [state (state! directory) handle (:handle state)]
+                     (invoke! directory "events" ["--id" (get handle "id") "--cursor" (nth args 2) "--limit" (nth args 3)])))
+      "await" (do (when-not (= 3 (count args)) (refuse! "await requires directory and milliseconds"))
+                  (await! directory (String/to_integer (nth args 2))))
+      (refuse! "Unknown preparation command"))))
+
+(try
+  (let [value (dispatch! (BeamLisp/argv))]
+    (println (encode-json! {"ok" true "value" value})) (System/halt 0))
+  (catch error
+    (println (encode-json! {"ok" false "error" (ex-message error)})) (System/halt 1)))

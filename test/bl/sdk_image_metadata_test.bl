@@ -48,3 +48,121 @@
      (is (= :refused (refused #(BeamLisp.Env/sdk_image_metadata! identity row {:role :stable-body}))))
      (is (= first (BeamLisp.AOT/image_sdk_entry! root identity row)))))
     (finally (erlang/trace_pattern pattern false (list :local :call_count))))))))
+
+(deftest inventory-row-lookups-decode-once-and-refuse-invalid-replacements
+ (let [key (BeamLisp.AOTCache/compiler_key)
+       bytes (fn [row] (erlang/term_to_binary
+                        {:version 2 :identities :binary :compiler-key key :modules {"fixture" row}}))
+       first (bytes {:marker 1}) changed (bytes {:marker 2})
+       invalid (erlang/term_to_binary {:version 2 :identities :binary :compiler-key "wrong" :modules {}})
+       pattern (tuple :Elixir.BeamLisp.AOT :decode_sdk_inventory! 1)]
+  (try
+   (erlang/trace_pattern pattern true (list :local :call_count))
+   (doseq [_ (range 20)]
+    (is (= {:marker 1} (BeamLisp.Env/sdk_inventory_metadata! first "fixture"))))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (= {"fixture" {:marker 1}} (BeamLisp.Env/sdk_inventory_metadata! first nil)))
+   (is (nil? (BeamLisp.Env/sdk_inventory_metadata! first "absent")))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (= {:marker 2} (BeamLisp.Env/sdk_inventory_metadata! changed "fixture")))
+   (is (= (tuple :call_count 2) (erlang/trace_info pattern :call_count)))
+   (is (= :refused (refused #(BeamLisp.Env/sdk_inventory_metadata! invalid "fixture"))))
+   (let [after-refusal (erlang/trace_info pattern :call_count)]
+    (is (= {:marker 2} (BeamLisp.Env/sdk_inventory_metadata! changed "fixture")))
+    (is (= after-refusal (erlang/trace_info pattern :call_count))))
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(deftest inventory-file-cache-observes-new-bytes-with-preserved-mtime
+ (let [root (Path/join (System/tmp_dir!) (str "bl-inventory-bytes-" (erlang/unique_integer (list :positive))))
+       path (Path/join root "sdk-code.term")
+       bytes (fn [marker] (erlang/term_to_binary
+                {:version 2 :identities :binary :compiler-key (BeamLisp.AOTCache/compiler_key)
+                 :modules {"fixture" {:marker marker}}}))]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path (bytes 1))
+   (let [before (File/stat! path)]
+    (is (= {"fixture" {:marker 1}} (BeamLisp.AOT/inventory_term path)))
+    (File/write! path (bytes 2))
+    (File/touch! path (:mtime before))
+    (is (= {"fixture" {:marker 2}} (BeamLisp.AOT/inventory_term path))))
+   (finally (File/rm_rf! root)))))
+
+(deftest each-complete-unit-check-captures-one-fresh-inventory
+ (let [pattern (tuple :Elixir.BeamLisp.AOT :sdk_inventory_input 0)]
+  (try
+   (erlang/trace_pattern pattern true (list :local :call_count))
+   (is (BeamLisp.AOT/sdk_unit_compiled? "proc.owner-registry"))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (BeamLisp.AOT/sdk_unit_compiled? "proc.owner-registry"))
+   (is (= (tuple :call_count 2) (erlang/trace_info pattern :call_count)))
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(deftest sealed-unit-policy-must-match-the-emitted-bytes
+ (let [module :Elixir.BeamLisp.SDKSealedPolicyFixture
+       digest (crypto/hash :sha256 "actual source input")
+       requires (list "errors")
+       beam (BeamLisp.Emit/compile_descriptor
+              (BeamLisp.Emit/descriptor_for module
+                (list (BeamLisp.Emit/function_clause :value (BeamLisp.Emit/lit 42)))
+                (list (tuple :bl_aot_artifact_version 1)
+                      (tuple :bl_aot_artifact_role :stable-body)
+                      (tuple :bl_unit_namespace "policy")
+                      (tuple :bl_unit_source_digest digest)
+                      (tuple :bl_unit_requires (tuple :requires requires)))))
+       bytes (elem beam 1) identity (Atom/to_string module)
+       imports (Enum/uniq (Enum/map
+                  (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
+                  (fn [entry] (Atom/to_string (elem entry 0)))))
+       row {:source "std/policy.bl" :source-digest digest :role :stable-body
+            :requires requires :imports imports :sha256 (crypto/hash :sha256 bytes)}]
+  (is (= module (elem (BeamLisp.Env/sdk_image_metadata! identity row bytes) 0)))
+  (is (= "policy" (:unit-namespace (elem (BeamLisp.Env/sdk_image_metadata! identity row bytes) 1))))
+  (doseq [[field value] [[:source-digest (crypto/hash :sha256 "different source")]
+                         [:role :actor] [:declaration-owner (tuple "policy" "actor")]
+                         [:unit-references (list "Elixir.Foreign")]
+                         [:unit-namespace "foreign"]
+                         [:requires (list "foreign")]]]
+   (is (= :refused (refused #(BeamLisp.Env/sdk_image_metadata! identity (assoc row field value) bytes)))))
+  (doseq [namespace [false 7 "" (String/duplicate "x" 513)]]
+   (let [invalid (elem (BeamLisp.Emit/compile_descriptor
+                         (BeamLisp.Emit/descriptor_for module
+                           (list (BeamLisp.Emit/function_clause :value (BeamLisp.Emit/lit 42)))
+                           (list (tuple :bl_aot_artifact_version 1)
+                                 (tuple :bl_aot_artifact_role :stable-body)
+                                 (tuple :bl_unit_namespace namespace)
+                                 (tuple :bl_unit_source_digest digest)
+                                 (tuple :bl_unit_requires (tuple :requires requires))))) 1)
+         changed-row (assoc row :sha256 (crypto/hash :sha256 invalid))]
+    (is (= :refused (refused #(BeamLisp.Env/sdk_image_metadata! identity changed-row invalid))))))
+  (is (= module (elem (BeamLisp.Env/sdk_image_metadata! identity row bytes) 0)))))
+
+(deftest recorded-source-locations-do-not-become-source-or-image-authority
+ (fixture (fn [{:keys [root module row]}]
+  (let [name "omitted/library.bl" source (Path/join root name)
+        claimed (assoc row :source name :source-digest (crypto/hash :sha256 "omitted"))]
+   (is (= source (BeamLisp.AOT/sdk_unit_source_path root name)))
+   (is (not (BeamLisp.AOT/sdk_source_current? root module claimed)))
+   (is (nil? (BeamLisp.AOT/sdk_unit_source_path root "../outside.bl")))
+   (is (nil? (BeamLisp.AOT/sdk_unit_source_path root "/absolute.bl")))
+   (let [link (Path/join root "dangling.bl")]
+    (File/ln_s! "/absent-sdk-input" link)
+    (is (nil? (BeamLisp.AOT/sdk_unit_source_path root "dangling.bl"))))))))
+
+(deftest source-provenance-data-checks-do-not-enter-generic-language-invocation
+ (fixture (fn [{:keys [root module row]}]
+  (let [name "plain.bl" file (Path/join root name) source "(ns plain)"
+        claimed (assoc row :source name :source-digest (crypto/hash :sha256 source))
+        pattern (tuple :Elixir.BeamLisp.Ns.Body.Rt :call-invoke 2)]
+   (File/write! file source)
+   (try
+    (let [started (erlang/trace_pattern pattern true (list :local :call_count))
+          path (BeamLisp.AOT/sdk_unit_source_path root name)
+          current (BeamLisp.AOT/sdk_source_current? root module claimed)
+          calls (erlang/trace_info pattern :call_count)]
+     (erlang/trace_pattern pattern false (list :local :call_count))
+     (is (= 1 started))
+     (is (= file path))
+     (is (= true current))
+     (is (= (tuple :call_count 0) calls)))
+    (finally (erlang/trace_pattern pattern false (list :local :call_count))))))))

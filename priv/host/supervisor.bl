@@ -276,7 +276,9 @@
                                                   (tuple own :start_server
                                                          ;; The supervisor may predate this namespace/realm. Carry the spec
                                                          ;; creator's bindings into initial starts and OTP restarts.
-                                                         (list mod arg (tuple :"$bl_supervised_context" (BeamLisp.Env/capture) (Map/get opts :name))))
+                                                         (list mod arg (tuple :"$bl_supervised_context"
+                                                           (BeamLisp.Env/capture_native_context!)
+                                                           (Map/get opts :name))))
                                                   (maps/put :id id (maps/new)))
                                         :restart)
                              :shutdown)
@@ -308,7 +310,18 @@
          (erlang/== :"$bl_supervised_context" (erlang/element 1 name)))
     (let [previous (BeamLisp.Env/capture)]
       (try
-        (BeamLisp.Env/bind (erlang/element 2 name))
+        (let [context (erlang/element 2 name)]
+         (BeamLisp.Env/bind
+          (cond
+           (erlang/== :native-context context)
+            (do
+             ;; Native trees bind their actual launch context before OTP init.
+             ;; Reuse it for initial children and restarts. A marker conveys
+             ;; no data or authority, and cannot choose a managed generation.
+             (when (BeamLisp.Env/assert_execution_context!)
+              (erlang/error :unregistered_conveyed_generation))
+             previous)
+           :else (BeamLisp.Env/resolve_native_context! context))))
         (if (Process/get :bl_generation)
           (BeamLisp.Env/with_supervisor_execution!
             (fn [] (start_server mod arg (erlang/element 3 name))))
@@ -410,29 +423,77 @@
  [argument]
  (if (and (erlang/is_tuple argument) (erlang/== 5 (erlang/tuple_size argument))
           (erlang/== :bl_native_supervisor (erlang/element 1 argument)))
+  (do
+   (when-not (erlang/== :native-context (erlang/element 3 argument))
+    (erlang/error :native_original_start_context_mismatch))
   (let [context (BeamLisp.Env/claim_unmanaged_start! (erlang/element 2 argument)
                   :Elixir.BeamLisp.Supervisor :supervisor)]
-   (when-not (erlang/== context (erlang/element 3 argument))
-    (erlang/error :native_original_start_context_mismatch))
    (when (Map/get context :generation) (erlang/error :unregistered_conveyed_generation))
    (BeamLisp.Env/bind context)
-   (Supervisor/init (erlang/element 4 argument) (erlang/element 5 argument)))
+   (Supervisor/init (erlang/element 4 argument) (erlang/element 5 argument))))
   (do
   (when-not (and (erlang/is_tuple argument) (erlang/== 5 (erlang/tuple_size argument))
                 (erlang/== :bl_managed_supervisor (erlang/element 1 argument)))
     (erlang/error :unadmitted_supervisor_starter))
+  (when-not (erlang/== :native-context (erlang/element 3 argument))
+   (erlang/error :supervisor_start_context_mismatch))
   (let [context (BeamLisp.Env/claim_supervisor_start! (erlang/element 2 argument))]
-    (when-not (erlang/== context (erlang/element 3 argument))
-      (erlang/error :supervisor_start_context_mismatch))
     (BeamLisp.Env/bind context)
     (let [generation (Process/get :bl_generation)
-          lease (BeamLisp.Env/retain_code! (BeamLisp.Vector/to_list (Map/get generation :modules)))]
+          lease (BeamLisp.Env/retain_supervisor_start_code!)]
       (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/with_env :global
         (fn [] (BeamLisp.Env/fetch_exact! "proc.owner-registry" "register-supervisor!")))
         (list (erlang/self) lease))
       (BeamLisp.Env/install_supervisor_execution! lease)
       (BeamLisp.Env/complete_supervisor_start!))
     (Supervisor/init (erlang/element 4 argument) (erlang/element 5 argument))))))
+
+(defn- validated_children [children options]
+ ;; Module child_spec/1 callbacks run once in the caller. OTP then validates
+ ;; every normalized map and duplicate id before any linked process exists.
+ (let [initialized (Supervisor/init children options)
+       flags (erlang/element 1 (erlang/element 2 initialized))
+       children (erlang/element 2 (erlang/element 2 initialized))
+       checked (supervisor/check_childspecs children (Map/get flags :auto_shutdown :never))]
+  (when-not (erlang/== :ok checked) (erlang/error (erlang/element 2 checked)))
+  children))
+
+(defn- native_children [children context own depth remaining]
+ ;; Only fixed constructor MFAs carry environment metadata. Arbitrary native
+ ;; workers retain their original specs. Preserve constructor-issued opaque
+ ;; child contexts through initial starts and restarts. Plain fixed MFAs inherit
+ ;; the actual native tree context. Validate all selected handles before birth.
+ (when (or (erlang/> depth 64) (erlang/< remaining 0)) (erlang/error :supervisor_child_budget))
+ (Enum/map_reduce children remaining
+  (fn [child left]
+   (when (erlang/=< left 0) (erlang/error :supervisor_child_budget))
+   (let [mfa (Map/get child :start)
+         fixed? (and (erlang/is_tuple mfa) (erlang/== 3 (erlang/tuple_size mfa))
+                     (Enum/member? (list own :Elixir.BeamLisp.Supervisor) (erlang/element 1 mfa))
+                     (erlang/is_list (erlang/element 3 mfa)))
+         entry (when fixed? (erlang/element 2 mfa))
+         args (when fixed? (erlang/element 3 mfa))]
+    (cond
+     (and (erlang/== :start_server entry) (erlang/== 3 (erlang/length args)))
+      (let [name (Enum/at args 2)
+            wrapped? (and (erlang/is_tuple name) (erlang/== 3 (erlang/tuple_size name))
+                          (erlang/== :"$bl_supervised_context" (erlang/element 1 name)))
+            selected (if wrapped? (erlang/element 2 name) context)
+            bare (if wrapped? (erlang/element 3 name) name)]
+       (when-not (erlang/== :native-context selected)
+        (when (Map/get (BeamLisp.Env/resolve_native_context! selected) :generation)
+         (erlang/error :unregistered_conveyed_generation)))
+       (tuple (Map/put child :start
+                (tuple (erlang/element 1 mfa) entry
+                  (list (Enum/at args 0) (Enum/at args 1) (tuple :"$bl_supervised_context" selected bare))))
+              (erlang/- left 1)))
+     (and (erlang/== :start_named_sup entry) (erlang/== 2 (erlang/length args)))
+      (let [nested (native_children (validated_children (erlang/hd args) (list (tuple :strategy :one_for_one))) context own
+                                    (erlang/+ depth 1) (erlang/- left 1))]
+       (tuple (Map/put child :start
+                (tuple (erlang/element 1 mfa) entry (list (erlang/element 1 nested) (Enum/at args 1))))
+              (erlang/element 2 nested)))
+     :else (tuple child (erlang/- left 1)))))))
 
 (defn start_native_link
  "Start an unmanaged native tree with original launch provenance. Returns the
@@ -441,11 +502,17 @@
  [children options]
  (when-not (and (erlang/is_list children) (erlang/is_list options))
   (erlang/error :invalid_native_supervisor_arguments))
- (let [admission (BeamLisp.Env/begin_unmanaged_start! :Elixir.BeamLisp.Supervisor :supervisor)
-       context (BeamLisp.Env/capture)]
+ ;; Normalize module/tuple child declarations in the caller. A malformed later
+ ;; child must fail before OTP creates a linked supervisor or starts any child.
+ (let [children (validated_children children options)
+       own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+       ;; The actual native supervisor already owns the launch overlay in its
+       ;; process bindings. Restart specs need neither a map nor a pool token.
+       children (erlang/element 1 (native_children children :native-context own 0 4096))
+       admission (BeamLisp.Env/begin_unmanaged_start! :Elixir.BeamLisp.Supervisor :supervisor)]
   (try
    (let [result (Supervisor/start_link :Elixir.BeamLisp.Supervisor
-                  (tuple :bl_native_supervisor admission context children options)
+                  (tuple :bl_native_supervisor admission :native-context children options)
                   (Keyword/take options (list :name)))]
     (BeamLisp.Env/finish_unmanaged_start! admission result) result)
    (catch error
@@ -453,11 +520,12 @@
     (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
 
 (defn- start_managed_tree [children options context]
-  (let [admission (BeamLisp.Env/begin_supervisor_start!)]
+  (let [children (validated_children children options)
+        admission (BeamLisp.Env/begin_supervisor_start!)]
     (try
       (BeamLisp.Env/launch_server_start! admission)
       (let [result (Supervisor/start_link :Elixir.BeamLisp.Supervisor
-                     (tuple :bl_managed_supervisor admission context children options)
+                     (tuple :bl_managed_supervisor admission :native-context children options)
                      (Keyword/take options (list :name)))]
         (BeamLisp.Env/finish_server_start! admission result) result)
       (catch error
@@ -533,8 +601,9 @@
                 ;; Construct all specs before Supervisor can start any child.
                 ;; A descriptor cannot smuggle a managed raw MFA or borrow the
                 ;; ambient environment of an earlier tree declaration.
+                child-context (when generation (BeamLisp.Env/capture_native_context!))
                 children (if generation
-                           (erlang/element 1 (managed_children children context generation 0 4096))
+                           (erlang/element 1 (managed_children children child-context generation 0 4096))
                            children)
                 result (if generation (start_managed_tree children sup-opts context)
                          (start_native_link children sup-opts))]

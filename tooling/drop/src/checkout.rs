@@ -4,6 +4,57 @@ fn checkout_root() -> Option<PathBuf> {
     std::env::var_os("BL_CHECKOUT_ROOT").map(PathBuf::from)
 }
 
+// This supplies filesystem prerequisites only. It grants no Source invocation
+// authority and uses the same publication custody as the bootstrap builder.
+fn checkout_prerequisites(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 { return Err("usage: --checkout-prerequisites ROOT PLATFORM".into()); }
+    let root = std::fs::canonicalize(&args[0]).map_err(|e| e.to_string())?;
+    if !root.join("priv/bootstrap/seed/manifest.term").is_file() {
+        return Err("checkout bootstrap manifest is required".into());
+    }
+    let platform = std::fs::canonicalize(&args[1]).map_err(|e| e.to_string())?;
+    if !platform.to_str().is_some_and(nix_artifact::store_object) {
+        return Err("checkout platform must be an immutable store object".into());
+    }
+    let descriptor: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(platform.join("platform.json")).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if descriptor["version"] != 1 || descriptor["kind"] != "checkout-platform"
+        || descriptor["target"] != "x86_64-linux" {
+        return Err("unsupported checkout platform".into());
+    }
+    let bundle = std::fs::canonicalize(platform.join("native-products")).map_err(|e| e.to_string())?;
+    if !bundle.to_str().is_some_and(nix_artifact::store_object) {
+        return Err("native set must be an immutable store object".into());
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundle.join("artifacts.json")).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if manifest["version"] != 1 || manifest["kind"] != "native-set"
+        || manifest["target"] != "x86_64-linux" { return Err("unsupported native set".into()); }
+    let products = manifest["products"].as_object().ok_or("native set omits products")?;
+    if products.is_empty() || products.len() > 128 || !products.contains_key("lazy_memo") {
+        return Err("native set omits mandatory products or exceeds capacity".into());
+    }
+    let mut selections = Vec::new();
+    for (name, row) in products {
+        let output = row["output"].as_str().ok_or("native set omits product output")?;
+        let request = serde_json::json!({"version": 1, "crate": name,
+            "abi": format!("beam-lisp-native-{name}-v1"), "target": "x86_64-linux",
+            "source": row["source"]});
+        let library = nix_artifact::verify(Path::new(output), &request)?;
+        selections.push((library, root.join("priv/native").join(format!("{name}.so"))));
+    }
+    // Validate the whole set before publishing anything. All selection occurs
+    // before BEAM boot can freeze native-host physical-library identities.
+    for (library, destination) in selections {
+        if std::fs::read_link(&destination).is_ok_and(|selected| selected == library) { continue; }
+        std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
+        publish_native_reference(&library, &destination)?;
+    }
+    Ok(())
+}
+
 fn checkout_main(args: &[String]) -> ! {
     let root = args
         .first()
@@ -20,10 +71,13 @@ fn checkout_main(args: &[String]) -> ! {
         .unwrap_or_else(|| cwd.clone());
     let project = std::fs::canonicalize(project).unwrap_or_else(|e| fail(&e.to_string()));
     let extra_sources = checkout_extra_sources(&project, &request_cwd(&cwd, argv), argv);
-    let generation = checkout_generation_with_paths(&root, &project, &extra_sources)
-        .unwrap_or_else(|e| fail(&format!("checkout source inventory: {e}")));
+    let runtime = checkout_runtime_generation(&root)
+        .unwrap_or_else(|e| fail(&format!("checkout runtime inventory: {e}")));
+    let sources = checkout_project_generation(&root, &project, &extra_sources)
+        .unwrap_or_else(|e| fail(&format!("checkout project inventory: {e}")));
     std::env::set_var("BL_CHECKOUT_ROOT", &root);
-    std::env::set_var("BL_CHECKOUT_GENERATION", generation);
+    std::env::set_var("BL_CHECKOUT_GENERATION", runtime);
+    std::env::set_var("BL_CHECKOUT_SOURCE_GENERATION", sources);
     exec_payload(&root, "src", argv)
 }
 
@@ -160,11 +214,15 @@ fn checkout_scope(command: Command) -> Command {
 
 #[cfg(test)]
 fn checkout_generation(root: &Path, project: &Path) -> std::io::Result<String> {
-    checkout_generation_with_paths(
-        root,
-        project,
-        &checkout_extra_sources(project, project, &[]),
-    )
+    Ok(format!(
+        "{}:{}",
+        checkout_runtime_generation(root)?,
+        checkout_project_generation(
+            root,
+            project,
+            &checkout_extra_sources(project, project, &[])
+        )?
+    ))
 }
 
 fn checkout_extra_sources(project: &Path, cwd: &Path, argv: &[String]) -> Vec<PathBuf> {
@@ -211,22 +269,14 @@ fn checkout_extra_sources(project: &Path, cwd: &Path, argv: &[String]) -> Vec<Pa
     roots
 }
 
-fn checkout_generation_with_paths(
-    root: &Path,
-    project: &Path,
-    extra_sources: &[PathBuf],
-) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
+fn checkout_runtime_generation(root: &Path) -> std::io::Result<String> {
     let mut files = Vec::new();
     checkout_sources(&root.join("priv"), &mut files)?;
     checkout_sources(&root.join("native"), &mut files)?;
-    checkout_sources(project, &mut files)?;
-    for path in extra_sources {
-        checkout_sources(path, &mut files)?;
-    }
     for name in [
         "bin/bl",
         "bin/bl-stage-hosts",
+        "env.bl",
         "priv/bootstrap/seed/manifest.term",
         "priv/codegen.sources",
         ".cargo/config.toml",
@@ -238,14 +288,37 @@ fn checkout_generation_with_paths(
             files.push(root.join(name));
         }
     }
-    // An explicit application image is part of this invocation's authority.
     if let Some(ebin) = std::env::var_os("BEAM_LISP_EBIN") {
         checkout_sources(&PathBuf::from(ebin), &mut files)?;
     }
+    checkout_hash_files(root, files)
+}
+
+fn checkout_project_generation(
+    root: &Path,
+    project: &Path,
+    extra_sources: &[PathBuf],
+) -> std::io::Result<String> {
+    let mut files = Vec::new();
+    checkout_sources(project, &mut files)?;
+    // The runtime pin already covers these trees. In an engine checkout,
+    // avoid reading its SDK and native binaries again for the project pin.
+    // Explicit extra paths below retain their own complete inventory.
+    let sdk = root.join("priv");
+    let native = root.join("native");
+    files.retain(|path| !path.starts_with(&sdk) && !path.starts_with(&native));
+    for path in extra_sources {
+        checkout_sources(path, &mut files)?;
+    }
+    checkout_hash_files(root, files)
+}
+
+fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
     files.sort();
     files.dedup();
     let mut hash = Sha256::new();
-    hash.update(b"checkout-generation-v1\0");
+    hash.update(b"checkout-generation-v2\0");
     hash.update(root.as_os_str().as_encoded_bytes());
     for key in [
         "HOME",
@@ -262,6 +335,8 @@ fn checkout_generation_with_paths(
         "BEAM_LISP_EBIN",
         "BEAM_LISP_PATH",
         "BL_BOOTSTRAP_SEED",
+        "BL_CHECKOUT_PLATFORM",
+        "BL_CHECKOUT_SDK_INPUTS",
     ] {
         hash.update(key.as_bytes());
         hash.update([0]);
@@ -330,9 +405,11 @@ fn checkout_sources_walk(
                 || name.ends_with(".rs")
                 || name.ends_with(".so")
                 || name.ends_with(".beam")
+                || name.ends_with(".app")
                 || name == "Cargo.toml"
                 || name == "Cargo.lock"
                 || name == "sdk-code.term"
+                || name == "precompiled.term"
                 || name == "rust-toolchain.toml"
                 || name == "rust-toolchain"
                 || (dir.file_name().is_some_and(|n| n == ".cargo")
@@ -368,6 +445,36 @@ mod checkout_tests {
         let before = checkout_generation(&root, &project).unwrap();
         std::fs::write(project.join(".local/lib/example.bl"), "(ns example)").unwrap();
         assert_ne!(before, checkout_generation(&root, &project).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_edits_change_the_realm_input_but_preserve_the_runtime_pin() {
+        let root =
+            std::env::temp_dir().join(format!("checkout-runtime-pin-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(root.join("priv")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(root.join("priv/runtime.bl"), "runtime 1").unwrap();
+        std::fs::write(project.join("value.bl"), "value 1").unwrap();
+        let runtime = checkout_runtime_generation(&root).unwrap();
+        let sources = checkout_project_generation(&root, &project, &[]).unwrap();
+        std::fs::write(project.join("value.bl"), "value 2").unwrap();
+        assert_eq!(runtime, checkout_runtime_generation(&root).unwrap());
+        assert_ne!(
+            sources,
+            checkout_project_generation(&root, &project, &[]).unwrap()
+        );
+        let engine_sources = checkout_project_generation(&root, &root, &[]).unwrap();
+        std::fs::write(root.join("priv/runtime.bl"), "runtime 2").unwrap();
+        assert_ne!(runtime, checkout_runtime_generation(&root).unwrap());
+        assert_eq!(
+            engine_sources,
+            checkout_project_generation(&root, &root, &[]).unwrap()
+        );
+        let configured = checkout_runtime_generation(&root).unwrap();
+        std::fs::write(root.join("env.bl"), "{:deps []}").unwrap();
+        assert_ne!(configured, checkout_runtime_generation(&root).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -416,10 +523,7 @@ mod checkout_tests {
             "--root".to_string(),
             root.join("nested").to_string_lossy().into_owned(),
         ];
-        assert_eq!(
-            invocation_tree(&root, &argv),
-            Some(root.join("nested"))
-        );
+        assert_eq!(invocation_tree(&root, &argv), Some(root.join("nested")));
         std::fs::remove_dir_all(root).unwrap();
     }
 

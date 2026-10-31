@@ -1,0 +1,91 @@
+(ns native-server-initializer-extent-test (:require [proc.task :as task]))
+
+(defn- refused [action]
+ (try (action) :unexpected-entry
+  (catch error (BeamLisp.ExInfo/ex_original error))))
+
+(defserver phase-probe
+ (init []
+  (let [module (elem (erlang/fun_info (fn [] nil) :module) 1)
+        before (BeamLisp.Env/capture)
+        active (BeamLisp.Env/server_initializing? module)
+        nested (refused (fn [] (BeamLisp.Env/with_server_execution! module :init
+                           (fn [] (Process/put :unexpected-init-entry :called)))))
+        adoption (refused #(BeamLisp.Env/adopt_sdk_runtime!))]
+   (ok {:module module :active active :nested nested
+        :unexpected (Process/get :unexpected-init-entry)
+        :adoption-refused (not= :unexpected-entry adoption)
+        :caller-restored (= before (BeamLisp.Env/capture))})))
+ (handle-call :inspect [from st]
+  (let [replay (refused (fn [] (BeamLisp.Env/with_server_execution! (:module st) :init
+                          (fn [] (Process/put :unexpected-replayed-init :called)))))]
+   (reply (assoc st :after (BeamLisp.Env/server_initializing? (:module st))
+                   :replay replay :replayed-effect (Process/get :unexpected-replayed-init)) st))))
+
+(deftest genuine-unmanaged-init-is-active-once-and-cannot-be-reentered-or-replayed
+ (let [pid (start phase-probe nil {:timeout 5000})]
+  (try
+   (let [observed (call pid :inspect)]
+    (is (= true (:active observed)))
+    (is (= :unadmitted_native_server_initializer (:nested observed)))
+    (is (= nil (:unexpected observed)))
+    (is (= true (:adoption-refused observed)))
+    (is (= true (:caller-restored observed)))
+    (is (= false (:after observed)))
+    (is (= :unadmitted_native_server_initializer (:replay observed)))
+    (is (= nil (:replayed-effect observed))))
+   (finally (GenServer/stop pid)))))
+
+(deftest an-unclaimed-initializer-action-refuses-before-effects
+ (let [key :unclaimed-native-initializer]
+  (try
+   (is (= :unadmitted_native_server_initializer
+          (refused (fn [] (BeamLisp.Env/with_server_execution! :Elixir.UnclaimedNativeInitializer :init
+                      (fn [] (Process/put key :called)))))))
+   (is (= nil (Process/get key)))
+   (finally (Process/delete key)))))
+
+(deftest an-owned-task-is-not-a-native-class-initializer
+ (let [worker (task/async-nolink
+               (fn []
+                (let [before (BeamLisp.Env/capture) key :foreign-owned-task-init
+                      reason (refused (fn []
+                               (BeamLisp.Env/with_server_execution! :Elixir.UnclaimedNativeInitializer :init
+                                 (fn [] (Process/put key :called)))))]
+                 [reason (Process/get key) (= before (BeamLisp.Env/capture))])))
+       result (task/await worker 10000)]
+  (is (= :unadmitted_native_server_initializer (nth result 0)))
+  (is (= nil (nth result 1)))
+  (is (= true (nth result 2)))))
+
+(defserver draining-probe
+ (init [observer]
+  (let [module (elem (erlang/fun_info (fn [] nil) :module) 1)]
+   (erlang/send observer [:native-init-entered (erlang/self) (BeamLisp.Env/server_initializing? module)])
+   (receive :finish-native-init
+     (erlang/send observer [:native-init-drained (erlang/self) (BeamLisp.Env/server_initializing? module)])
+     (after 10000 (throw :native-init-drain-timeout)))
+   (ok {:module module})))
+ (handle-call :active [from st]
+  (reply (BeamLisp.Env/server_initializing? (:module st)) st)))
+
+(deftest already-claimed-native-init-drains-after-creator-death
+ (let [observer (erlang/self)
+       starter (spawn #(start draining-probe observer {:timeout 15000}))
+       actor (atom nil)]
+  (try
+   (let [entered (receive [:native-init-entered pid active] [pid active] (after 10000 nil))]
+    (reset! actor (first entered))
+    (is (erlang/is_pid @actor))
+    (is (= true (second entered)))
+    (let [monitor (erlang/monitor :process starter)]
+     (Process/exit starter :kill)
+     (is (receive [:DOWN ref :process pid reason] :when (= ref monitor) true (after 10000 false))))
+    (is (Process/alive? @actor))
+    (erlang/send @actor :finish-native-init)
+    (let [expected-pid @actor]
+     (is (receive [:native-init-drained pid active] :when (= pid expected-pid) active (after 10000 false))))
+    (is (= false (call @actor :active))))
+   (finally
+    (when (and @actor (Process/alive? @actor)) (GenServer/stop @actor))
+    (when (Process/alive? starter) (Process/exit starter :kill))))))

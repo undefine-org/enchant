@@ -122,6 +122,26 @@ then the why of every failure), and the aggregate for a gate — `--json` for
 anything reading the number rather than the picture.
 
 ```beam-lisp silent
+(defn- isolated-result [paths observer]
+  (BeamLisp.Loader/ensure_loaded "reload.ward")
+  (let [ward (BeamLisp.Env/fetch! "reload.ward" "run")
+        inputs (to-list (entries paths))]
+    (if observer (ward inputs observer) (ward inputs))))
+
+(defn run-selected-data!
+  "Run an exact nonempty selection through normal isolated test admission.
+   Returns aggregate observations without changing runner mode or printing a report."
+  [paths]
+  (when-not (and (sequential? paths) (<= 1 (count paths) 1024)
+                 (= (count paths) (count (distinct paths)))
+                 (every? (fn [path]
+                           (and (string? path) (= :absolute (Path/type path))
+                                (String/ends_with? path ".bl")
+                                (= :regular (:type (File/lstat! path))))) paths))
+    (throw (ex-info "Selected tests require distinct absolute regular .bl files" {:kind :test-selection})))
+  (let [result (isolated-result paths nil)]
+    (assoc (totals result) :ok (boolean (:ok? result)) :exit (if (:ok? result) 0 1))))
+
 (defn run-isolated
   "Run files through the isolated runner and report. Returns an exit code.
 
@@ -133,17 +153,13 @@ anything reading the number rather than the picture.
    per-surface counters and the keys each file wrote. A clean run prints
    NOTHING extra, and without the flag the ledger is not even loaded."
   [paths st]
-  (BeamLisp.Loader/ensure_loaded "reload")
   (BeamLisp.Loader/ensure_loaded "reload.ward")
-  (let [ward (BeamLisp.Env/fetch! "reload.ward" "run")
-        report (BeamLisp.Env/fetch! "reload.ward" "report")
+  (let [report (BeamLisp.Env/fetch! "reload.ward" "report")
         diag (if (:diagnose st)
                (do (BeamLisp.Loader/ensure_loaded "reload.ward-diag")
                    (BeamLisp.Env/fetch! "reload.ward-diag" "observer"))
                nil)
-        result (if (nil? diag)
-                 (ward (to-list (entries paths)))
-                 (ward (to-list (entries paths)) (diag {:deep (:deep st)})))]
+        result (isolated-result paths (when diag (diag {:deep (:deep st)})))]
     (if (:json st)
       (u/emit st (assoc (totals result) :ok (get result :ok?)
                         :contamination

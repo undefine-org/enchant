@@ -1,0 +1,60 @@
+;; Compiler control: exercise the internal producer; normal build/run uses Nix.
+(ns sdk.artifact.all (:require [build :as build] [build-plan :as plan] [app-resource :as app]))
+
+(defn selected-test-dependencies
+ "Read selected test headers with the canonical inert owner. Dynamic loads
+  remain explicit roots; no test definitions or initializers execute here."
+ []
+ (if (not= "yes" (System/get_env "BL_SDK_CONTEXTUAL_TESTS")) []
+  (let [source (System/fetch_env! "BL_SDK_CONTEXTUAL_ROOT")
+        selection (Jason/decode! (File/read! (System/fetch_env! "BL_SDK_SEALED_PLAN"))
+                                (list (tuple :keys :atoms)))]
+   (vec (Enum/sort (Enum/uniq
+     (Enum/flat_map (:groups selection)
+      (fn [group]
+       (Enum/flat_map (:tests group)
+        (fn [test]
+         (let [path (Path/join source (:path test))
+               form (first (BeamLisp.Reader/read_string (BeamLisp.Loader/read_source path) path))
+               header (BeamLisp.AOT/namespace_header form)]
+          (Enum/flat_map (Map/values header) (fn [row] (:requires row))))))))))))))
+
+(let [root (BeamLisp.Tiers/priv_root) output (System/fetch_env! "BL_SDK_ARTIFACT_OUT")
+      smoke? (= "yes" (System/get_env "BL_SDK_ARTIFACT_SMOKE"))
+      test-dependencies (selected-test-dependencies)
+      selected (if smoke?
+                 (BeamLisp.Loader/with_declaration_snapshot
+                  (fn []
+                   (distinct (mapcat
+                    (fn [namespace]
+                     (map #(BeamLisp.Loader/source_path (:ns %))
+                      (BeamLisp.BuildPlan/nodes_from_resolver namespace
+                       (fn [name]
+                        (when-let [content (BeamLisp.Loader/source_content name)]
+                         (plan/memo-node name content))))))
+                    (concat ["sdk.artifact.consumer" "typed" "errors" "proc.owner-registry" "vm.native" "reload.generation"]
+                      (when (= "yes" (System/get_env "BL_SDK_BOUNDARY_TESTS"))
+                        ["data.bounded-cache" "bl.check" "bl.cli" "bl.test" "reload.ward"])
+                      (when (= "yes" (System/get_env "BL_SDK_CONTEXTUAL_TESTS"))
+                        (concat test-dependencies (:roots (Jason/decode! (File/read! (System/fetch_env! "BL_SDK_SEALED_PLAN"))
+                                               (list (tuple :keys :atoms)))))))))))
+                 (build/namespace-sources root))
+      sources (vec (remove (fn [path] (or (BeamLisp.AOT/floor_file? path) (String/ends_with? path "-fixture.bl"))) selected))
+      destination (Path/join output "all-units")
+      before (BeamLisp.Env/capture)
+      result (build/produce! {:sources sources :root root :out destination :jobs 2 :sdk-artifacts? true :log println})]
+ (assert (= before (BeamLisp.Env/capture)))
+ (File/write! (Path/join output "all-result.term") (erlang/term_to_binary result))
+ (doseq [error (:errors result)] (println "SDK-ALL-ERROR" error))
+ (assert (= [] (:errors result)))
+ (let [ebin (Path/join (Path/dirname root) "ebin")
+       _ (build/assemble-outputs! (:manifest result) destination ebin)
+       inventory (BeamLisp.AOT/write_sdk_inventory! root (:manifest result) ebin (Path/join root "sdk-code.term"))]
+  (build/write-precompiled-index! (:manifest result) ebin (Path/join root "precompiled.term"))
+  (assert (:ok? (app/write! (Path/join ebin "beam_lisp.app") "beam_lisp" "0.1.0" (app/modules-in ebin)
+                 (Application/spec :beam_lisp :applications) (Application/spec :beam_lisp :mod))))
+  (File/write! (Path/join output "producer.json")
+    (Jason/encode! {:status "passed" :source-units (count sources) :compiled (:compiled result)
+                    :cached (:cached result) :sdk-code-modules inventory :all-sdk-source-production (not smoke?)
+                    :activation-smoke smoke? :test-header-dependencies (to-list test-dependencies)})))
+ (println "SDK-ALL-PRODUCER passed"))

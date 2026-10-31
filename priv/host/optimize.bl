@@ -379,12 +379,13 @@
 
 (defn- first-filter-shape [n]
   (when (and (call? n (runtime-module) :first) (erlang/== 1 (erlang/length (getv n :args))))
-    (let [inner (item (getv n :args) 0) args (getv inner :args)]
+    (let [inner (item (getv n :args) 0) args (getv inner :args)
+          invocation (BeamLisp.Ns.Anf/callable-invocation inner)]
       (cond
         (and (call? inner (runtime-module) :filter) (erlang/== 2 (erlang/length args)))
           {:predicate (item args 0) :source (item args 1)}
-        (and (call? inner (runtime-module) :invoke) (erlang/== 2 (erlang/length args)))
-          (let [f (item args 0) packed (unpack (item args 1)) xs (getv packed :args)]
+        (some? invocation)
+          (let [f (getv invocation :callee) packed (unpack (getv invocation :arguments)) xs (getv packed :args)]
             (when (and (op? f :global) (erlang/== "filter" (getv f :name))
                        (some? packed) (erlang/== 2 (erlang/length xs)))
               {:callee f :predicate (item xs 0) :source (item xs 1)}))
@@ -392,7 +393,7 @@
 
 (defn- first-filter-result
   "One private total consumer. Capture the live callee BEFORE the packed args,
-   then preserve packed-cons order (source before predicate). Guard failure calls
+   then preserve packed-cons order (predicate before source). Guard failure calls
    the captured value: it never rereads a binding or repeats an argument."
   [spec state]
   (let [fp (argument-name state) cp (argument-name (elem fp 1)) pp (argument-name (elem cp 1))
@@ -413,19 +414,18 @@
                 :test (BeamLisp.Ns.Anf/remote (runtime-module) :core_filter_2? (list f))
                 :then fused
                 :else (BeamLisp.Ns.Anf/remote (runtime-module) :first
-                        (list (BeamLisp.Ns.Anf/remote (runtime-module) :invoke
-                                (list f {:op :cons :head p
+                        (list (BeamLisp.Ns.Anf/invoke f {:op :cons :head p
                                          :tail {:op :cons :head c :tail {:op :enil :ann {}} :ann {}}
-                                         :ann {}}))))}
+                                         :ann {}})))}
                fused)
-        bound (BeamLisp.Ns.Anf/lett (elem cp 0) (getv spec :source)
-                (BeamLisp.Ns.Anf/lett (elem pp 0) (getv spec :predicate) body))
+        bound (BeamLisp.Ns.Anf/lett (elem pp 0) (getv spec :predicate)
+                (BeamLisp.Ns.Anf/lett (elem cp 0) (getv spec :source) body))
         result (if (some? (getv spec :callee))
                  (BeamLisp.Ns.Anf/lett (elem fp 0) (getv spec :callee) bound) bound)]
     (tuple result (elem xp 1))))
 
 (defn- ordered-apply
-  "Preserve the backend's observed packed-cons order: tail before head.
+  "Preserve canonical packed-cons order: head before tail.
    Core apply may schedule complex arguments differently, so bind them in
    that same order. Atomic arguments need no bindings. Observed names prevent
    capture; argument positions themselves remain unchanged."
@@ -437,7 +437,7 @@
         (let [body (put (BeamLisp.Ns.Anf/app f (lists/reverse vars)) :ann ann)
               result (lists/foldl (fn [b inner]
                                     (put (BeamLisp.Ns.Anf/lett (elem b 0) (elem b 1) inner) :ann ann))
-                                  body (lists/reverse bindings))]
+                                  body bindings)]
           (tuple result s))
         (let [p (argument-name s) name (elem p 0)]
           (recur (erlang/tl rest) (cons (BeamLisp.Ns.Anf/var name) vars)
@@ -471,7 +471,8 @@
 
 (defn- rewrite [n env state mod]
   (let [own (own-module n mod) numeric (numeric-domain n env)
-        consumer (first-filter-shape n)]
+        consumer (first-filter-shape n)
+        invocation (BeamLisp.Ns.Anf/callable-invocation n)]
     (cond
       (some? own) (tuple own (applied state :own-module n :own-literal-closure))
       (some? numeric) (tuple numeric (applied state :numeric-domain n :non-map-operands))
@@ -492,8 +493,8 @@
                         :ownership :immediate-single-consumer :resources :ordinary-heap
                         :binding (if (some? (getv consumer :callee)) :captured-runtime-identity :direct-intrinsic)
                         :order :callee-then-packed-arguments :halt :first-matching-element}))))
-      (and (call? n (runtime-module) :invoke) (erlang/== 2 (erlang/length (getv n :args))))
-        (let [args (getv n :args) f (item args 0) unpacked (unpack (item args 1))
+      (some? invocation)
+        (let [f (getv invocation :callee) unpacked (unpack (getv invocation :arguments))
               arity (getv (fact f env) :arity)]
           (if (and (some? unpacked) (some? arity) (erlang/== arity (erlang/length (getv unpacked :args))))
             (let [p (ordered-apply f (getv unpacked :args) (getv n :ann) state)]
@@ -572,6 +573,10 @@
               np (walk (getv n :else) env (elem yp 1) mod)]
           (tuple (put (put (put n :test (elem tp 0)) :then (elem yp 0)) :else (elem np 0)) (elem np 1)))
       (or (erlang/== op :remote) (erlang/== op :arith)) (fields-list n :args env state mod)
+      (erlang/== op :invoke)
+        (let [cp (walk (getv n :callee) env state mod)
+              ap (walk (getv n :arguments) env (elem cp 1) mod)]
+          (tuple (put (put n :callee (elem cp 0)) :arguments (elem ap 0)) (elem ap 1)))
       (erlang/== op :apply)
         (let [fp (field n :fn env state mod)] (fields-list (elem fp 0) :args env (elem fp 1) mod))
       (erlang/== op :fn)

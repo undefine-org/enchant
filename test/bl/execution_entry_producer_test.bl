@@ -1,0 +1,114 @@
+(ns execution.entry-producer-test (:require [anf :as anf]))
+
+(defn clause [name params guard body]
+ {:op :defn-clause :fname name :params params :guard guard :body body :ann {:line 7}})
+(defn entry [kind count name clause]
+ (tuple kind count name clause :Elixir.ExecutionProducer.Body))
+(defn hashes [] {:Elixir.ExecutionProducer.Body (crypto/hash :md5 "loaded body")})
+(defn descriptors [entries] (anf/execution-entries "example" "choose" entries (hashes)))
+
+(deftest actual-mfa-groups-guards-and-all-same-arity-clauses
+ (let [param (list (anf/pvar "x"))
+       a (clause :choose param (anf/remote :erlang :is_atom (list (anf/var "x"))) (anf/lit :atom))
+       b (clause :choose param nil (anf/remote :erlang :tuple_size (list (anf/var "x"))))
+       result (descriptors (list (entry :fixed 1 :choose a) (entry :fixed 1 :choose b)))
+       descriptor (first result)]
+  (is (erlang/is_list result))
+  (is (= 1 (count result)))
+  (is (= (tuple :mfa :Elixir.ExecutionProducer.Body :choose 1) (:id descriptor)))
+  (is (= (tuple :Elixir.ExecutionProducer.Body (get (hashes) :Elixir.ExecutionProducer.Body))
+         (:body-identity descriptor)))
+  (is (= {:kind :fixed :count 1} (:arity descriptor)))
+  (is (= {:line 7} (:span descriptor)))
+  (is (= true (:dependencies-complete descriptor)))
+  (is (= (list (tuple :mfa :erlang :is_atom 1) (tuple :mfa :erlang :tuple_size 1))
+         (map :target (:edges descriptor))))))
+
+(deftest variadic-entry-keeps-logical-minimum-and-physical-rest-parameter
+ (let [c (clause :choose__bl_v (list (anf/pvar "x") (anf/pvar "rest")) nil (anf/var "x"))
+       d (first (descriptors (list (entry :variadic 1 :choose__bl_v c))))]
+  (is (= {:kind :variadic :count 1} (:arity d)))
+  (is (= (tuple :mfa :Elixir.ExecutionProducer.Body :choose__bl_v 2) (:id d)))))
+
+(deftest the-compilers-packed-callable-abi-is-an-unresolved-invocation
+ (let [node (anf/invoke (anf/var "f") (anf/cons-cell (anf/lit 1) (anf/empty-list-node)))
+       result (anf/execution-dependencies (list node))]
+  (is (= false (:complete result)))
+  (is (= [:direct-call :callable-argument] (mapv :kind (:edges result))))
+  (is (= [:anf :invoke :var] (:evidence (second (:edges result)))))))
+
+(deftest latent-captures-cleanup-and-dynamic-calls-remain-obligations
+ (let [latent (anf/fnn (list (anf/clause (list) nil (anf/global-exact "sdk" "callback"))))
+       body (anf/tryy (anf/app (anf/var "f") (list latent)) (list)
+                      (assoc (anf/remote :erlang :send (list (anf/var "pid") (anf/lit :done)))
+                             :ann {:line 12 :col 4}))
+       c (clause :choose (list (anf/pvar "f") (anf/pvar "pid")) nil body)
+       d (first (descriptors (list (entry :fixed 2 :choose c))))]
+  (is (= false (:dependencies-complete d)))
+  (is (= [:callable-argument :captured-value :direct-call] (mapv :kind (:edges d))))
+  (is (= nil (:target (first (:edges d)))))
+  (is (= [:anf :global "sdk" "callback" :exact] (:evidence (second (:edges d)))))
+  (is (= {:line 12 :col 4} (:span (last (:edges d)))))
+  (is (= :source (:kind d)))))
+
+(deftest literals-are-inert-but-resource-captures-and-backend-calls-are-not-hidden
+ (let [data {:op :remote :mod :erlang :fun :error :args (list)}
+       roots (list (anf/lit data) (anf/lit (erlang/self))
+                    (anf/arith :add :+ (list (anf/lit 1) (anf/lit 2))))
+       result (anf/execution-dependencies roots)]
+  (is (= 2 (count (:edges result))))
+  (is (= false (:complete result)))
+  (is (= [[:anf :opaque-literal] [:anf :backend-dependencies :arith]]
+         (mapv :evidence (:edges result))))
+  (is (every? nil? (map :target (:edges result))))))
+
+(deftest malformed-empty-and-unknown-inventories-refuse-before-publication
+ (is (thrown? (descriptors (list))))
+ (is (thrown? (descriptors (list (tuple :fixed 0 :choose {} :Elixir.ExecutionProducer.Body)))))
+ (is (thrown? (descriptors (list (entry :fixed 1 :choose
+                                   (clause :choose (list) nil (anf/lit 1)))))))
+ (is (thrown? (anf/execution-entries "example" "choose"
+                 (list (entry :fixed 0 :choose (clause :choose (list) nil (anf/lit 1)))) {})))
+ (is (thrown? (anf/execution-dependencies (list {:op :new-unknown-operation}))))
+ (is (thrown? (anf/execution-dependencies (vec (repeat 32769 (anf/lit nil)))))))
+
+(deftest artifact-identities-cover-clause-order-guards-and-normalized-operands
+ (let [c (clause :choose [(anf/pvar "x")] nil (anf/var "x"))
+       c-list (assoc c :params (list (anf/pvar "x")))
+       other (assoc c :body (anf/lit 99))
+       identify (fn [clauses] (anf/execution-clause-identities clauses))]
+  (is (= (identify [c]) (identify (list c-list))))
+  (is (not= (identify [c]) (identify [other])))
+  (is (not= (identify [c other]) (identify [other c])))
+  (is (not= (identify [c]) (identify [(assoc c :guard (anf/lit false))])))))
+
+(deftest structural-pattern-roles-do-not-read-unpublished-runtime-vars
+ ;; Fresh boot inventories ANF before __bl_init__ has populated its vars.
+ ;; Forked values model that order without replacing the canonical module.
+ (let [previous (BeamLisp.Env/capture) scope (BeamLisp.Env/fork :global)
+       key (anf/remote :erlang :node (list))
+       pattern (anf/ptuple (list (anf/pmap (list [key (anf/pvar "value")]))))
+       function (anf/fnn (list (anf/clause (list pattern) nil (anf/var "value"))))
+       unit {:version 2 :kind :compiled-contextual-unit :initializers (list) :steps (list)
+             :entry function :exports (list)}]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (doseq [poison [nil {:op :invalid-callback}]]
+      (BeamLisp.Env/intern "anf" "pattern-vars" poison)
+      (BeamLisp.Env/intern "anf" "pattern-expressions" poison)
+      (is (= (list "value") (anf/pattern-vars pattern)))
+      (is (= (list key) (anf/pattern-expressions pattern)))
+      (let [result (anf/execution-dependencies (list function))]
+       (is (= true (:complete result)))
+       (is (= (list (tuple :mfa :erlang :node 0)) (map :target (:edges result)))))
+      (is (= unit (anf/validate-contextual-unit! unit)))
+      (is (thrown? (anf/validate-contextual-unit!
+                     (assoc-in unit [:entry :clauses]
+                       (list (anf/clause (list pattern) nil (anf/var "missing")))))))
+      (let [unbound-key (anf/ptuple
+                          (list (anf/pmap (list [(anf/var "value") (anf/pvar "value")]))))]
+       (is (thrown? (anf/validate-contextual-unit!
+                      (assoc-in unit [:entry :clauses]
+                        (list (anf/clause (list unbound-key) nil (anf/var "value")))))))))))
+   (finally (BeamLisp.Env/destroy scope) (BeamLisp.Env/bind previous)))))

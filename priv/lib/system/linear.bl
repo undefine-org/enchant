@@ -41,13 +41,15 @@
 ;      cheap: one walk, one hash per node. This is what `lsp/diagnostics`
 ;      surfaces and what the boot build asserts over the whole toolchain.
 ;
-; Tier 1 proves the compiler's source has the property; tier 2 proves the
+; Tier 1 checks a recognized subset of compiler Source (coverage limits below);
+; it is not an unconditional proof of the complete compiler. Tier 2 proves the
 ; property implies the bound; tier 3 measures the artefact. A regression in
 ; any of the three fails a test with the offending function named.
 
 (ns system.linear
   (:require [oracle]
             [system.ir :as ir]
+            [system.emission :as emission]
             [system.incr :as incr]
             [system.analyze :as analyze]
             [compiler :as c]
@@ -65,65 +67,13 @@
     (reduce (fn [acc c] (+ acc (size c))) 1 (ir/child-nodes n))
     0))
 
-(defn- subtree-key
-  "The content address of a subtree: alpha-normalized, :ann-free."
-  [n]
-  (incr/body-hash n))
-
-;; WHAT COUNTS AS A DUPLICATE. Two structurally equal subtrees are legitimate
-;; when they come from two SOURCE sites: `(f (first kv)) (f (second kv))`
-;; written twice, two `recur`s that both emit `((self self) (rest s))`. A
-;; spliced compiled child is one source site placed twice — and every node
-;; carries its source span in :ann. So the key is (structure, span): equal
-;; structure AT THE SAME SPAN more than once is exactly "the compiler (or a
-;; macro) placed this compiled child again". No size threshold is needed;
-;; `min-size` (default 3) only drops leaves, whose spans legitimately repeat
-;; (a variable read twice).
-;;
-;; Not every node is positioned: a fn scaffold, a macro's own output, carry
-;; `{}`. Their PROVENANCE is still readable — the set of spans of the
-;; positioned nodes INSIDE them. Two hand-written twins (`(fn [x] (= (f x)
-;; fv))` on two lines of partition-by) have disjoint inner spans; a spliced
-;; copy carries the SAME inner spans as its sibling, because both were
-;; compiled from the one argument form. So the key is (structure, inner-
-;; spans), and a subtree with NO positioned node at all (pure macro output)
-;; keys on structure alone above `unpositioned-resolution` — the trivial
-;; idioms a macro legitimately emits at several sites (`(recur (rest s))`,
-;; ≤ 8 nodes) stay below it.
-(defn- own-span [n]
-  (let [a (:ann n)]
-    (when (and (map? a) (int? (:line a)))
-      [(:line a) (:col a) (:end-line a) (:end-col a)])))
-
-(def unpositioned-resolution 9)
+(def unpositioned-resolution emission/unpositioned-resolution)
 
 (defn duplicates
-  "The subtrees that occur MORE THAN ONCE under `root` with the SAME source
-   span, as [{:hash :span :count :size :sample}]. Sorted by size desc so the
-   worst offender is first. See the note above for why span is the key."
-  ([root] (duplicates root 3))
-  ([root min-size]
-   (let [seen (atom {})
-         ; one bottom-up pass: each node's {:size :spans} is folded from its
-         ; children's, so provenance costs O(n) for the whole tree
-         walk (fn walk [n]
-                (if (not (ir/node? n))
-                  {:size 0 :spans #{}}
-                  (let [kids (into [] (map walk (ir/child-nodes n)))
-                        sz (reduce (fn [a k] (+ a (:size k))) 1 kids)
-                        spans (reduce (fn [a k] (into a (:spans k)))
-                                      (if-let [s (own-span n)] #{s} #{}) kids)
-                        sp (if (empty? spans) :unpositioned (sort spans))]
-                    (when (>= sz (if (= sp :unpositioned) (max min-size unpositioned-resolution) min-size))
-                      (let [k [(subtree-key n) sp]]
-                        (swap! seen (fn [m] (let [e (get m k)]
-                                              (assoc m k (if e (update e :count inc)
-                                                           {:hash (first k) :span sp :count 1 :size sz
-                                                            :sample (incr/strip-ann n)})))))))
-                    {:size sz :spans spans})))]
-     (walk root)
-     (into [] (sort-by (fn [d] (- (:size d)))
-                       (filter (fn [d] (> (:count d) 1)) (vals (deref seen))))))))
+  "Maximal duplicate emission witnesses. Pure detection lives separately from
+   compiler/database/SMT proofs so diagnostics load only what they use."
+  ([root] (emission/duplicates root))
+  ([root min-size] (emission/duplicates root min-size)))
 
 (defn linear?
   "Does the emitted tree under `root` contain no duplicated non-trivial
@@ -137,7 +87,7 @@
    heaviest scaffolds: a `for` is ~12 nodes of source and ~450 of IR);
    before the fix a 3-deep `for` measured in the thousands."
   [src ns]
-  (let [node (c/compile-node (first (BeamLisp.Reader/read_string src)) (c/new-env ns))
+  (let [node (c/compile (first (BeamLisp.Reader/read_string src)) (c/new-env ns))
         data (c/read-data src)
         src-size (fn src-size [f] (cond (or (list? f) (vector? f)) (reduce + 1 (map src-size f))
                                         (map? f) (reduce + 1 (map src-size (vals f)))
@@ -194,28 +144,13 @@
                       (incr/clauses-of d)))
             (analyze/fn-bodies src))))
 
+(defn diagnostics-bodies [bodies] (emission/diagnostics-bodies bodies))
+
 (defn diagnostics
-  "Tier 3 as LSP diagnostics: one per non-linear fn, positioned on the fn's
-   body (the :ann the compiler stamped), naming the largest duplicated
-   subtree and how many copies. A macro that splices its body twice shows
-   up here on the CALLER's function — where the cost is paid."
+  "Emission-linearity diagnostics for source text. Prepared consumers use
+   diagnostics-bodies to share their existing lowering pass."
   [src]
-  (into []
-    (mapcat (fn [[name d]]
-              ; every clause: a duplicate in a later arity is the caller's cost
-              ; just as much as one in the first, and each clause carries its
-              ; own :ann to position the diagnostic
-              (mapcat (fn [c]
-                        (let [ds (duplicates (:body c))]
-                          (when (and (seq ds) (not= analyze/top-name name))
-                            (let [worst (first ds) ann (or (get-in c [:body :ann]) {})]
-                              [{:kind :non-linear-emission :fn name
-                                :line (get ann :line 0) :col (get ann :col 0)
-                                :msg (str name ": emitted IR duplicates a " (:size worst) "-node subtree ×" (:count worst)
-                                          " (" (count ds) " duplicated shape" (if (> (count ds) 1) "s" "") ")"
-                                          " — a macro or constructor splices a compiled child more than once")}]))))
-                      (incr/clauses-of d)))
-            (analyze/fn-bodies src))))
+  (diagnostics-bodies (analyze/fn-bodies src)))
 
 ; ════════════════════════════════════════════════════════════════════════
 ; TIER 1 — the structural proof over the compiler's own source
@@ -239,27 +174,10 @@
   #{"lit" "var" "global" "global-exact" "remote" "app" "lett" "iff" "doo" "casee" "fnn" "tryy"
     "recv" "tup" "mapp" "cons-cell" "structt" "clause"})
 
-;; ── THE TWO SHAPES ONE CONSTRUCTOR CALL TAKES ───────────────────────────
-;
-; `(a/lett self outer inner)` is ONE source form that compiles to one of TWO
-; node shapes, decided by how the prefix `a` happens to resolve in the VM doing
-; the analyzing:
-;
-;   {:op :remote :mod :a :fun :lett :args […]}
-;     the prefix read as a HOST MODULE — a direct remote call; and
-;
-;   {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke
-;    :args [{:op :global :ns "a" :name "lett"} …]}
-;     the prefix read as a beam-lisp VAR, so the call is the general RT.invoke
-;     of a fetched fn. anf.global keeps :ns and :name APART, so the spelling
-;     `a/lett` survives only as the pair ("a", "lett").
-;
-; WHICH SHAPE APPEARS DEPENDS ON AMBIENT VM STATE — whether a namespace named
-; `a` is loaded, or the prefix is resolvable, is a property of the warm daemon,
-; not of the source. A recognizer reading only the first shape reports "no
-; violations" over a source that is nothing BUT constructor calls (BUG-054).
-; Both are read here, and the NAMESPACE is what makes a call a constructor: an
-; arbitrary RT.invoke is never one.
+;; Constructors arrive either as canonical callable invocations or as actual
+;; native remote calls. Read the shared call view; a native RT.invoke call is
+;; not a second spelling of callable invocation. Namespace identity decides
+;; whether the callee belongs to the constructor vocabulary.
 
 (def ^:private constructor-ns
   "The beam-lisp namespaces the ANF constructors live in."
@@ -276,32 +194,22 @@
   (let [i (index-of nm "/")]
     (if (and i (>= i 0)) (subs nm (inc i)) nm)))
 
-(defn- invoke-callee
-  "The callee node of an `RT.invoke(callee, args)` application, or nil — the
-   wrapper a var-resolved prefix compiles to (see the note above)."
-  [n]
-  (when (and (ir/node? n) (= :remote (:op n))
-             (= :Elixir.BeamLisp.Ns.Rt (:mod n)) (= "invoke" (str (:fun n))))
-    (first (:args n))))
-
 (defn- global-callee
-  "The `{:op :global :ns :name}` node a call applies — as the direct target of
-   an `:apply`, or as the callee inside an RT.invoke wrapper — or nil."
+  "The exact global callee of a canonical invocation, or nil."
   [n]
-  (let [f (if (= :apply (:op n)) (:fn n) (invoke-callee n))]
+  (let [f (:callee (ir/call-site n))]
     (when (and (ir/node? f) (= :global (:op f))) f)))
 
 (defn- callee-name
-  "The unqualified callee name of a call node, or nil — reading BOTH shapes."
+  "The unqualified name from the canonical call view or a native remote."
   [n]
   (if-let [f (global-callee n)]
     (unqualified (get-in f [:name]))
     (when (= :remote (:op n)) (str (:fun n)))))
 
 (defn- constructor-call?
-  "A call into anf.bl's constructors, in EITHER shape. The NAMESPACE decides,
-   so an arbitrary RT.invoke is never counted: a var-resolved callee must name
-   `a`/`anf`, and a direct remote must target their module."
+  "A call into anf.bl's constructors. An exact global must name `a`/`anf`;
+   an actual native remote must target a constructor module."
   [n]
   (and (ir/node? n)
        (let [nm (callee-name n)]
@@ -321,21 +229,15 @@
   (contains? #{"var" "lit" "global" "global-exact"} (callee-name n)))
 
 (defn- compiled-init?
-  "Is this let-init the compilation of a child? A call whose callee name
-   starts with `compile` (compile-node, compile-body, compile-each-notail …)
-   or ends in `-node`/`-steps`, or a NON-LEAF constructor call itself.
-   NB: the `compile*` clause still reads only the DIRECT-remote and `:apply`
-   spellings, so a call that compiled to the RT.invoke shape is not seen here
-   — see the BUG-054 note in !tasks/bugs before relying on it."
+  "Conservatively recognize compiled-child producers through the same call
+   view as constructor recognition: compile*, self-apply*, nest-lets*, or a
+   non-leaf constructor. Naming conventions classify children, not authority."
   [init]
-  (or (and (constructor-call? init) (not (leaf-constructor? init)))
-      (and (ir/node? init) (= :apply (:op init)) (ir/node? (:fn init))
-           (= :global (get-in init [:fn :op]))
-           (let [nm (get-in init [:fn :name])]
-             (or (zero? (index-of nm "compile")) (zero? (index-of nm "self-apply"))
-                 (zero? (index-of nm "nest-lets")))))
-      (and (ir/node? init) (= :remote (:op init))
-           (zero? (index-of (str (:fun init)) "compile")))))
+  (let [nm (callee-name init)]
+    (or (and (constructor-call? init) (not (leaf-constructor? init)))
+        (and nm (or (zero? (index-of nm "compile"))
+                    (zero? (index-of nm "self-apply"))
+                    (zero? (index-of nm "nest-lets")))))))
 
 ;; ── PLACEMENT COUNTING ──────────────────────────────────────────────────
 ;;
@@ -396,31 +298,39 @@
    emitted tree}. `children` are the names that denote compiled nodes (params
    by convention + let-bound compiled inits). A let-bound CONSTRUCTOR local
    `l` with direct placements D(l) and itself placed P(l) times contributes
-   P(l)·D(l)(c) to each child c."
+   P(l)·D(l)(c) to each child c. Actual compiler :if arms combine by
+   maximum; emitted constructor arguments still add. This is a conservative
+   bound within the recognized producer vocabulary, not complete coverage."
   [params body]
   (let [lets (atom {})            ; local → init node (constructor-built locals)
         children (atom (set (filter node-name? params)))
-        sites (atom [])           ; top-level constructor sites (not let-inits)
+        ;; Constructor arguments are data for the emitted tree. Only an actual
+        ;; :if in the compiler's executable ANF chooses one source branch.
         walk (fn walk [n in-init?]
-               (when (ir/node? n)
+               (if-not (ir/node? n) {}
                  (cond
                    (= :let (:op n))
                      (do (when (compiled-init? (:init n)) (swap! children conj (:name n)))
                          (when (constructor-call? (:init n)) (swap! lets assoc (:name n) (:init n)))
-                         (walk (:init n) true)
-                         (walk (:body n) false))
+                         (merge-with + (walk (:init n) true) (walk (:body n) false)))
+                   (= :if (:op n))
+                     (merge-with + (walk (:test n) in-init?)
+                       (merge-with max (walk (:then n) in-init?) (walk (:else n) in-init?)))
                    (constructor-call? n)
-                     (do (when (not in-init?) (swap! sites conj n))
-                         (doseq [ch (ir/child-nodes n)] (walk ch false)))
-                   :else (doseq [ch (ir/child-nodes n)] (walk ch in-init?)))))]
-    (walk body false)
+                     (reduce (fn [m ch] (merge-with + m (walk ch false)))
+                       (if in-init? {} (direct-placements n)) (ir/child-nodes n))
+                   :else (reduce (fn [m ch] (merge-with + m (walk ch in-init?)))
+                           {} (ir/child-nodes n)))))
+        top (walk body false)]
+    ;; Branch maxima are componentwise upper bounds. Dependency propagation
+    ;; deliberately forgets correlations, so it may over-report; it must not
+    ;; turn an emitted a/iff's two constructor arguments into alternatives.
     ;; P(l) = top(l) + Σ_other D(other)(l)·P(other). The let chain is acyclic
     ;; (a local's init can only mention EARLIER locals), so P is a fixpoint
     ;; reached by iterating over the locals; each round is one pass, and
     ;; rounds ≤ chain depth. Direct placements are computed once per local.
     (let [ls (deref lets)
           dl (into {} (map (fn [[l init]] [l (direct-placements init)]) ls))
-          top (reduce (fn [m s] (merge-with + m (direct-placements s))) {} (deref sites))
           step (fn [p]
                  (into {} (map (fn [[l _]]
                                  [l (+ (get top l 0)
@@ -525,9 +435,12 @@
 (defn check-compiler
   "Tier 1 over the compiler source: [{:fn :violations}] for every function
    that places a compiled child — a let-bound one or a parameter — more than
-   once in the tree it emits. Empty ⇒ the compiler is emission-linear BY
-   CONSTRUCTION. This is the theorem; tier 3 is its measurement. Raises
-   instead of answering vacuously; see `refuse-vacuity!`."
+   once under the recognized producer/constructor vocabulary. Counts are
+   conservative across compiler-source branches and transitive constructor
+   locals. Empty is conditional on that vocabulary and naming convention;
+   it does not certify complete compiler coverage. Tier 2 proves the arithmetic
+   implication, tier 3 measures actual output. Raises on the wholly blind
+   constructor census; see `refuse-vacuity!`."
   [compiler-src]
   (into []
     (mapcat (fn [[name d]]

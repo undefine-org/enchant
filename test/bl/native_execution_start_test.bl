@@ -1,0 +1,48 @@
+(ns native-execution-start-test)
+
+(defn- down! [pid]
+ (let [monitor (Process/monitor pid)]
+  (try (receive [:DOWN seen :process stopped _] :when (and (= seen monitor) (= stopped pid)) true
+         (after 10000 false))
+   (finally (Process/demonitor monitor (list :flush))))))
+
+(deftest raw-callers-cannot-nominate-start-constructor-or-entry-authority
+ (let [parent (erlang/self) called (atom false)
+       registration (BeamLisp.Execution/register! (fn [] (reset! called true)) [:Elixir.BeamLisp.Refs])
+       child (erlang/spawn (fn [] (receive :stop nil)))
+       ticket (erlang/make_ref)]
+  (try
+   (is (thrown? (BeamLisp.Execution/register-start! (fn [] :not-a-native-constructor) [])))
+   (is (thrown? (BeamLisp.Execution/prepare-start! registration child ticket)))
+   (is (thrown? (BeamLisp.Execution/accept-start! {:source registration :accepted registration} ticket)))
+   (is (thrown? (BeamLisp.Execution/invoke-start! registration ticket)))
+   (is (= false @called))
+   (is (thrown? (BeamLisp.Env/native_process_start_evidence! child parent)))
+   (is (= :active (:status (BeamLisp.Execution/observe registration))))
+   (finally (BeamLisp.Execution/close! registration) (erlang/send child :stop)))))
+
+(deftest delayed-offer-acknowledgement-cancels-only-the-unaccepted-epoch
+ (let [parent (erlang/self) ticket (erlang/make_ref) entered (atom false)
+       registration (BeamLisp.Execution/register! #(reset! entered true) [:Elixir.BeamLisp.Refs])
+       child (erlang/spawn (fn [] (BeamLisp.Refs/await_owned_start parent ticket)))
+       suspended (atom false)]
+  (try
+   (is (receive [:bl_owned_waiting seen pid] :when (and (= seen ticket) (= pid child)) true
+         (after 5000 false)))
+   (erlang/suspend_process child)
+   (reset! suspended true)
+   ;; Requeue the actual readiness signal after parking the genuine SDK frame.
+   ;; The kernel still authenticates its loaded code, stack and inactive slot.
+   (erlang/send parent (tuple :bl_owned_waiting ticket child))
+   (is (= :ok (BeamLisp.Refs/publish_owned_start registration child ticket)))
+   (is (= false @entered))
+   (is (thrown? (BeamLisp.Env/native_process_start_evidence! child parent)))
+   (BeamLisp.Execution/close! registration)
+   (erlang/resume_process child)
+   (reset! suspended false)
+   (is (down! child))
+   (is (= false @entered))
+   (finally
+    (when @suspended (erlang/resume_process child))
+    (BeamLisp.Execution/close! registration)
+    (when (Process/alive? child) (erlang/exit child :kill))))))

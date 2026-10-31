@@ -3,20 +3,33 @@
 (ns reload.server-starter-test
  (:require [reload.generation :as g] [reload.execution :as execution] [env]
            [live.lifecycle :as lifecycle] [datom :as d] [datom.conn :as conn]))
+(defn- fixture-observer! []
+ ;; An explicit external native fixture, with no callable in runtime bindings.
+ ;; Source can observe the real mailbox/ancestry without an unmanaged primitive.
+ (let [module :Elixir.StarterObserverFixture]
+  (when-not (erlang/function_exported module :observe 3)
+   (Code/compile_string
+    "defmodule StarterObserverFixture do
+      def observe(:message, target, message), do: send(target, message)
+      def observe(:ancestor, target, _), do: Process.put(:\"$ancestors\", [target])
+     end"))
+  module))
 (defn- graph []
  (let [root (str (System/get_env "HOME") "/tmp/server-starter-" (erlang/unique_integer (list :positive)))
-       file (str root "/starter/fixture.bl")]
+       file (str root "/starter/fixture.bl")
+       observer (fixture-observer!)
+       native (String/replace_prefix (Atom/to_string observer) "Elixir." "")
+       target "StarterObserverFixture/observe"]
   (File/mkdir_p! (Path/dirname file))
-  (File/write! file
+  (File/write! file (String/replace
    "(ns starter.fixture (:require [proc.server :as server] [reload.execution :as execution]
                                  [datom :as d]))
     (server/defserver owner
      (init [opts]
-      (do
-       (when (:pretend-parent opts) (Process/put :\"$ancestors\" (list (:pretend-parent opts))))
-       (when (:observer opts) (erlang/send (:observer opts) [:user-init (:ticket opts) (erlang/self)]))
+       (when (:pretend-parent opts) (FIXTURE-OBSERVE :ancestor (:pretend-parent opts) nil))
+       (when (:observer opts) (FIXTURE-OBSERVE :message (:observer opts) [:user-init (:ticket opts) (erlang/self)]))
        (when (:held opts) (receive :release :released))
-       (ok {:owned (execution/owned?) :connection (when (:create-store opts) (d/connect))})))
+       (ok {:owned (execution/owned?) :connection (when (:create-store opts) (d/connect))}))
      (handle-call :read [_ state] (reply state state))
      (handle-call :allocate [_ state]
       (let [next (assoc state :connection (d/connect))] (reply next next)))
@@ -29,17 +42,17 @@
     (defn linked-owner [opts] (start-link owner opts))
     (defn peer-constructor [opts]
      (let [ticket (:ticket opts)]
-      (erlang/send (:peer opts) [:create ticket (erlang/self)])
+      (FIXTURE-OBSERVE :message (:peer opts) [:create ticket (erlang/self)])
       (receive [:constructed seen pid] :when (= seen ticket) {:pid pid}
        (after 10000 (throw :peer-construction-lost)))))
     (defn peer-background []
      (peer-constructor {:peer (execution/runtime-resource :starter/peer)
-                        :ticket (execution/runtime-resource :starter/ticket)}))")
+                        :ticket (execution/runtime-resource :starter/ticket)}))" "FIXTURE-OBSERVE" target))
   (try
    (BeamLisp.Loader/with_load_path root
     #(g/prepare! (g/project-plan {:application-id "server-starter-test"
        :entrypoint "starter.fixture/start-owner" :fixed-runtime true
-       :native-modules #{"erlang" "Process"}})))
+       :native-modules #{"erlang" "Process" native}})))
    (finally (File/rm_rf! root)))))
 (defn- stop! [pid]
  (when (and pid (Process/alive? pid)) (try (GenServer/stop pid :normal 5000) (catch _ nil))))
@@ -52,20 +65,21 @@
  (BeamLisp.Env/server_start_observation (elem capability 2)))
 
 (deftest genuine-start-retains-immutable-starter-before-init-and-handler-store-creation
- (let [graph (graph) root (str (System/get_env "HOME") "/tmp")
+ (let [graph (graph)
        pid (g/invoke! graph "starter.fixture/start-owner" [{:create-store true}])]
   (try
    (let [evidence (g/owner-evidence pid) receipt (:starter evidence)
          initial (call pid :read)
-         stores (g/with! graph #(conn/owned-connections (:application-id graph) root []))]
+         created (conn/creation-evidence! (:connection initial))]
     (is (= (erlang/self) (:creator receipt))) (is (= pid (:child receipt)))
     (is (= (:module evidence) (:module receipt)))
     (is (erlang/is_reference (:attempt receipt))) (is (erlang/is_reference (:ticket receipt)))
-    (is (= true (:owned initial))) (is (some #(= (:connection initial) %) stores))
+    (is (= true (:owned initial)))
+    (is (= (select-keys graph [:application-id :scope :digest]) (:creator created)))
     (d/close! (:connection initial))
     (let [next (call pid :allocate)
-          stores (g/with! graph #(conn/owned-connections (:application-id graph) root []))]
-     (is (some #(= (:connection next) %) stores)))
+          created (conn/creation-evidence! (:connection next))]
+     (is (= (select-keys graph [:application-id :scope :digest]) (:creator created))))
     (is (nil? (pending (tuple :bl_server_start (erlang/self) (:ticket receipt))))))
    (finally (stop! pid) (g/retire! graph)))))
 
@@ -88,7 +102,7 @@
                     (tuple :"$bl_conveyed_env" (assoc token :generation nil)
                       {:observer (erlang/self) :ticket ticket})
                     (tuple :"$bl_conveyed_generation" token class {:observer (erlang/self) :ticket ticket})
-                    (tuple :"$bl_conveyed_generation" token class {:observer (erlang/self) :ticket ticket}
+                    (tuple :"$bl_conveyed_generation" :native-context class {:observer (erlang/self) :ticket ticket}
                       (tuple :bl_server_start (erlang/self) (erlang/make_ref)))]]
     (let [result (erlang/apply :gen_server :start (list class argument (list)))]
      (when (= :ok (elem result 0)) (stop! (elem result 1)))
@@ -123,7 +137,7 @@
    (g/with! graph (fn []
     (let [class (g/invoke! graph "starter.fixture/actor-class" [])
           admission (BeamLisp.Env/begin_server_start! class)
-          argument (tuple :"$bl_conveyed_generation" (env/capture) class
+          argument (tuple :"$bl_conveyed_generation" :native-context class
                      {:observer parent :ticket ticket} admission)]
      (BeamLisp.Env/launch_server_start! admission)
      (let [first (erlang/apply :gen_server :start (list class argument (list)))]
@@ -140,14 +154,17 @@
 (deftest a-subset-executing-ticket-does-not-authorize-full-graph-start
  (let [graph (graph) token (g/with! graph env/capture)
        class (g/invoke! graph "starter.fixture/actor-class" [])
-       lease (BeamLisp.Env/retain_code! (list class)) before (env/capture)]
+       lease (BeamLisp.Env/retain_code! (list class)) before (env/capture)
+       entered (atom false)]
   (try
    (is (> (count (:modules graph)) 1))
    (env/bind token)
-   (is (= :refused
-          (BeamLisp.Env/with_owned_code_execution lease
-           #(BeamLisp.Env/with_owned_generation_execution
-             (fn [] (try (BeamLisp.Server/start class {}) :accepted (catch _ :refused)))))))
+   (is (= :incomplete_generation_execution_lease
+          (try (BeamLisp.Env/with_owned_code_execution lease
+                 #(BeamLisp.Env/with_owned_generation_execution
+                    (fn [] (reset! entered true) (BeamLisp.Server/start class {}))))
+               :unexpected (catch error (BeamLisp.ExInfo/ex_original error)))))
+   (is (= false @entered))
    (finally (env/bind before) (BeamLisp.Env/release_code! lease) (g/retire! graph)))))
 
 (deftest native-start-link-keeps-the-actual-starter-link
@@ -159,6 +176,9 @@
    (finally (stop! pid) (g/retire! graph)))))
 
 (deftest mutable-ancestors-cannot-attribute-a-peer-created-actor-to-the-observer
+ ;; Deferred SDK initialization must finish before the peer's mailbox
+ ;; deadline starts; native ownership capture itself remains the operation.
+ (BeamLisp.Env/with_env :global #(BeamLisp.Loader/ensure_loaded "live.lifecycle"))
  (let [graph (graph) ticket (erlang/make_ref) observer (erlang/self) created (atom nil)
        peer (spawn (fn []
         (receive [:create seen victim] :when (= seen ticket)
@@ -174,6 +194,9 @@
    (finally (stop! @created) (g/retire! graph)))))
 
 (deftest background-readiness-does-not-ignore-a-peer-owned-fresh-actor
+ ;; Deferred SDK initialization must finish before the peer's mailbox
+ ;; deadline starts; native ownership capture itself remains the operation.
+ (BeamLisp.Env/with_env :global #(BeamLisp.Loader/ensure_loaded "live.lifecycle"))
  (let [graph (graph) ticket (erlang/make_ref) created (atom nil)
        peer (spawn (fn []
         (receive [:create seen victim] :when (= seen ticket)
@@ -228,12 +251,12 @@
 (deftest checked-source-cannot-call-or-borrow-the-internal-context-unwrapper
  (doseq [body ["(BeamLisp.Server/bind_init nil)"
                "(let [unwrap BeamLisp.Server/bind_init] (unwrap nil))"]]
-  (is (= :unmanaged-compiled-producer
+  (is (= :unmanaged-generation-producer
          (try (g/prepare! {:application-id "source-server-unwrapper-refusal"
                  :native-modules #{"BeamLisp.Server"}
                  :sources {"internal.server" (str "(ns internal.server) (defn invoke [] " body ")")}})
               :accepted (catch error (:kind (ex-data error)))))))
- (is (= :unmanaged-compiled-producer
+ (is (= :unmanaged-generation-producer
         (try (g/prepare! {:application-id "source-server-nested-unwrapper-refusal"
                 :native-modules #{"BeamLisp.Server"}
                 :sources {"internal.actor" "(ns internal.actor)
@@ -246,15 +269,27 @@
  (init [opts]
   (erlang/send (:observer opts) [:ordinary-dev-init (:ticket opts)])
   (ok opts)))
-(deftest ordinary-nonsealed-dev-native-start-keeps-raw-and-nil-generation-compatibility
+(deftest ordinary-native-server-init-requires-native-start-admission
  (let [ticket (erlang/make_ref) opts {:observer (erlang/self) :ticket ticket}
        token (assoc (env/capture) :generation nil)]
+  ;; Both historical raw routes would enter this exact init with opts.
   (doseq [argument [opts (tuple :"$bl_conveyed_env" token opts)]]
    (let [result (erlang/apply :gen_server :start (list ordinary-origin-dev-owner argument (list)))
          pid (when (= :ok (elem result 0)) (elem result 1))]
     (try
-     (is (= :ok (elem result 0)))
+     (is (= :error (elem result 0)))
+     (is (= false (receive [:ordinary-dev-init seen] :when (= seen ticket) true
+                       (after 0 false))))
+     (finally (stop! pid)))))
+  ;; Ordinary native owners use the existing custody protocol, without a graph.
+  (doseq [start [(fn [] (BeamLisp.Server/start ordinary-origin-dev-owner opts))
+                 (fn [] (BeamLisp.Server/start_link ordinary-origin-dev-owner opts))]]
+   (let [pid (start)]
+    (try
      (is (= :entered (receive [:ordinary-dev-init seen] :when (= seen ticket) :entered
                        (after 5000 :missing))))
      (is (nil? (g/owner-evidence pid)))
+     (let [receipts (:receipts (BeamLisp.Env/native_process_start_evidence! pid (erlang/self)))]
+      (is (= 1 (count receipts)))
+      (is (= :unmanaged-native-class (:custody-kind (first receipts)))))
      (finally (stop! pid)))))))
