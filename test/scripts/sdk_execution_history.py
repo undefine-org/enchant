@@ -91,14 +91,16 @@ def main():
     receipt = {'version': 1, 'status': 'running', 'sdk': str(sdk), 'engine': selected[1],
                'cases': ids, 'complete_goal': False, 'scope': 'exact-SDK historical selector replay'}
     start = time.monotonic()
-    cleanup = runpy.run_path(str(ROOT / 'scripts/qualify-candidate.py'))['stop_children']
+    qualifier = runpy.run_path(str(ROOT / 'scripts/qualify-candidate.py'))
+    cleanup = qualifier['stop_children']
+    base_environment = qualifier['runtime_environment'](os.environ)
     try:
         pending, results, segments = plan, [], []
         while pending:
             number = len(segments)
             (out / 'plan.json').write_text(json.dumps(pending, indent=2) + '\n')
             with tempfile.TemporaryDirectory(prefix='bl-history-', dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
-                env = dict(os.environ, BL_EXECUTION_HISTORY_ROOT=str(ROOT),
+                env = dict(base_environment, BL_EXECUTION_HISTORY_ROOT=str(ROOT),
                            BL_EXECUTION_HISTORY_RUNTIME_ROOT=str(image), BL_EXECUTION_HISTORY_OUT=str(out),
                            BL_EXECUTION_HISTORY_HANDOVER='1',
                            BL_TEST_SOURCE_ROOT=str(ROOT), BL_QUALIFY_CANDIDATE=str(sdk / 'bin/bl'),

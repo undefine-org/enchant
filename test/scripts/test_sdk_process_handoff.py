@@ -30,8 +30,14 @@ class ProcessHandoffControls(unittest.TestCase):
         bad = namespace['phase_command']
         for tool in ['systemd-run', 'systemctl', 'elixir']:
             self.assertIsNotNone(shutil.which(tool), f'missing required prerequisite: {tool}')
+        # Endpoint isolation must not redirect systemctl/systemd-run away from
+        # the real user manager. These clients use XDG_RUNTIME_DIR/systemd,
+        # including when DBUS_SESSION_BUS_ADDRESS is explicitly preserved.
+        manager_env = dict(os.environ)
+        if manager_env.get('BL_TEST_USER_RUNTIME_DIR'):
+            manager_env['XDG_RUNTIME_DIR'] = manager_env['BL_TEST_USER_RUNTIME_DIR']
         manager = subprocess.run(['systemctl', '--user', 'show-environment'],
-                                 capture_output=True, text=True, check=True, timeout=10).stdout
+                                 env=manager_env, capture_output=True, text=True, check=True, timeout=10).stdout
         with tempfile.TemporaryDirectory(prefix='history-service-path-') as temporary:
             work = Path(temporary)
             setup = work / 'setup toolchain'
@@ -45,7 +51,7 @@ class ProcessHandoffControls(unittest.TestCase):
             expression = (f'{{{json.dumps(token)}, 0}} = System.cmd({json.dumps(leaf)}, [])\n'
                           'IO.puts("HANDOFF_REAL_ELIXIR_READY")')
             command = [shutil.which('elixir'), '--erl', '+S 2:2 +SDcpu 1:1 +SDio 1', '-e', expression]
-            env = {**os.environ, 'PATH': str(setup) + os.pathsep + os.environ['PATH'],
+            env = {**manager_env, 'PATH': str(setup) + os.pathsep + os.environ['PATH'],
                    'BL_ROOT': str(work), 'PROBE_WORK': str(work), 'PROBE_PHASE': 'handoff',
                    'BEAM_LISP_AOT_CACHE_DIR': str(work / 'cache'), 'BL_DAEMON': 'off',
                    'ELIXIR_ERL_OPTIONS': '+S 2:2 +SDcpu 1:1 +SDio 1'}
@@ -68,7 +74,7 @@ class ProcessHandoffControls(unittest.TestCase):
                                         or 'exec: erl: not found' in output, output)
                 finally:
                     subprocess.run(['systemctl', '--user', 'stop', unit],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                                   env=manager_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
             print('history-E12 ' + json.dumps(outcomes, sort_keys=True))
 
 

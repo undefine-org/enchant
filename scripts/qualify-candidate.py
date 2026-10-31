@@ -85,6 +85,14 @@ def process_groups(files, isolated):
     return ([warm] if warm else []) + [[name] for name in files if name in isolated]
 
 
+def runtime_environment(environ):
+    """Retain the manager runtime for fixtures with nested systemd clients."""
+    env = dict(environ)
+    if env.get("XDG_RUNTIME_DIR"):
+        env.setdefault("BL_TEST_USER_RUNTIME_DIR", env["XDG_RUNTIME_DIR"])
+    return env
+
+
 def separate_last_record(path):
     """Preserve an interrupted record while keeping the next append parseable."""
     if path.exists() and path.stat().st_size:
@@ -118,7 +126,7 @@ def main():
     args.results.parent.mkdir(parents=True, exist_ok=True)
     status = batch_status(args.results, identity) if args.resume else -1
     if pending:
-        env = dict(os.environ, BL_QUALIFY_FILES="\n".join(pending),
+        env = dict(runtime_environment(os.environ), BL_QUALIFY_FILES="\n".join(pending),
                    BL_QUALIFY_TIMEOUT_MS=str(args.timeout * 1000), BL_TEST_SOURCE_ROOT=str(ROOT),
                    BL_DAEMON="off", BL_TEST_TIMES="1", BL_QUALIFY_CANDIDATE=str(candidate))
         # Source inputs belong to tests; compiler/runtime inputs belong to the

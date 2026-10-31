@@ -15,6 +15,14 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class Receipts(unittest.TestCase):
+    def test_private_runtime_preserves_the_real_user_manager_directory(self):
+        env = RUNNER.runtime_environment({"XDG_RUNTIME_DIR": "/run/user/1000"})
+        env["XDG_RUNTIME_DIR"] = "/run/user/1000/private-check"
+        self.assertEqual(env["BL_TEST_USER_RUNTIME_DIR"], "/run/user/1000")
+        explicit = {"XDG_RUNTIME_DIR": "/run/user/1000/private", "BL_TEST_USER_RUNTIME_DIR": "/run/user/1000"}
+        self.assertEqual(RUNNER.runtime_environment(explicit), explicit)
+        self.assertNotIn("BL_TEST_USER_RUNTIME_DIR", RUNNER.runtime_environment({}))
+
     def run_process_control(self, fail_first=False, empty_suite=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
