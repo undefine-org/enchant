@@ -47,6 +47,7 @@
 
 (def ^:private probe :Elixir.BeamLisp.HostAotProbe)
 (def ^:private live :Elixir.BeamLisp.AOT)
+(def ^:private probe-cache (atom nil))
 
 (defn- shim [] (BeamLisp.Emit/module_for "host.aot"))
 
@@ -63,11 +64,21 @@
 ; The compile EVALUATES the source, whose `(ns host.aot)` form switches the
 ; current namespace — so the caller's ns is restored around it.
 (defn- compile-pinned [mod dir]
-  (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
-    (fn []
-      (let [res (BeamLisp.AOT/compile_host_file (aot-source)
-                  (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
-        (load-pinned mod (elem res 1))))))
+  (File/mkdir_p! dir)
+  (let [key [mod (crypto/hash :sha256 (File/read! (aot-source))) (BeamLisp.AOTCache/compiler_key)]
+        retained @probe-cache]
+    ;; All four tests use the same private facade. Recompiling its complete
+    ;; Source four times exhausted the file's bound before the final test ran.
+    (if (and (= key (:key retained)) (erlang/module_loaded mod)
+             (= (:md5 retained) (erlang/apply mod :module_info (list :md5))))
+      mod
+      (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+        (fn []
+          (let [res (BeamLisp.AOT/compile_host_file (aot-source)
+                      (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
+            (load-pinned mod (elem res 1))
+            (reset! probe-cache {:key key :md5 (erlang/apply mod :module_info (list :md5))})
+            mod))))))
 
 ; ── the observation: a call's whole answer, a raise's class included ────────
 
@@ -357,12 +368,17 @@
                       :refers (list (tuple "b" "beta") (tuple "c" "beta"))
                       :refer_alls (list "gamma")
                       :requires (list "alpha" "beta" "gamma" "delta")
+                      :core-excludes (list)
                       :require_specs (list (tuple "alpha" "a" (list))
                                            (tuple "beta" nil (list "b" "c"))
                                            (tuple "gamma" nil :all)
                                            (tuple "delta" nil (list)))}}
                (erlang/apply probe :capture_ns_decl
                  (list {} (read1 "(ns x (:require [alpha :as a] [beta :refer [b c]] [gamma :refer :all] delta))")))))
+        (is (= (list "map" "filter")
+               (get-in (erlang/apply probe :capture_ns_decl
+                         (list {} (read1 "(ns x (:refer-clojure :exclude [map filter]))")))
+                       ["x" :core-excludes])))
 
         (let [init (read1 "42")
               form (read1 "(def answer 42)")]

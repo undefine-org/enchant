@@ -1,8 +1,8 @@
-; pinned_kernel_lowering_test.bl — the pinned-kernel lowering inside `Emit`.
+; pinned_kernel_lowering_test.bl — canonical lowering through pinned `Emit`.
 ;
-; `priv/host/emit.bl` is the ONE place a bl-ANF descriptor becomes a beam. The
-; pass that runs there is deliberately narrow, and this suite pins BOTH what it
-; changes and what it must leave alone.
+; `priv/host/emit.bl` delegates to the one Lower/optimize descriptor pipeline.
+; This suite compares that adapter with reference emission with checked
+; optimization disabled, and pins what may fold and what must remain observable.
 ;
 ; WHAT IT CHANGES (two rewrites):
 ;
@@ -306,7 +306,8 @@
           low-path (load-beam! low "impureltt-l")]
       (is (not= (list) (machinery-calls low-path :run 0))
           "an observably-positioned operand must keep the tuple machinery")
-      (is (= (list :a :b) (run-beam low "impureltt-v")))
+      ; Call operands run left-to-right; conj PREPENDS to this list log.
+      (is (= (list :b :a) (run-beam low "impureltt-v")))
       (is (erlang/== (run-beam low "impureltt-v2") (run-beam ref "impureltt-rv")))))
   (testing "a dynamic list keeps the BIF"
     (let [src "(erlang/list_to_tuple xs)"
@@ -508,10 +509,10 @@
           (list :b :a))
     (list "ltt-effects"
           "(let [a (atom (list))] (erlang/list_to_tuple (list (swap! a conj :a) (swap! a conj :b))) (deref a))"
-          (list :a :b))
+          (list :b :a))
     (list "ltt-effects3"
           "(let [a (atom (list))] (erlang/list_to_tuple (list (swap! a conj :a) (swap! a conj :b) (swap! a conj :c))) (deref a))"
-          (list :a :b :c))
+          (list :c :b :a))
     (list "self-read-first"
           (str "(let [a (atom (list))] (tuple " self-read " (do (swap! a conj :x) 1)) (deref a))")
           (list :x))
@@ -520,10 +521,33 @@
           (list :x))
     (list "immediate-apply"
           "(let [a (atom (list))] ((fn [x y] (swap! a conj :called)) (swap! a conj :a) (swap! a conj :b)) (deref a))"
-          (list :called :a :b))
+          (list :called :b :a))
     (list "apply-through-list"
           "(let [a (atom (list))] (erlang/apply (fn [x y] (swap! a conj :called)) (list (swap! a conj :a) (swap! a conj :b))) (deref a))"
-          (list :called :a :b))))
+          (list :called :b :a))))
+
+(deftest operand-effects-follow-source-order-and-failure-stops-the-tail
+  ;; Append to a raw process-local log, so the observation directly names the
+  ;; evaluation sequence without conj's reversed list representation. Both
+  ;; paths must meet this explicit contract, not merely agree with each other.
+  (doseq [[body expected]
+           [["(list (mark :a) (mark :b))" (list :a :b)]
+            ["(tuple (mark :a) (mark :b))" (list :a :b)]
+            ["(erlang/list_to_tuple (list (mark :a) (mark :b)))" (list :a :b)]
+            ["((fn [x y] (mark :called)) (mark :a) (mark :b))" (list :a :b :called)]
+            ["(erlang/apply (fn [x y] (mark :called)) (list (mark :a) (mark :b)))"
+             (list :a :b :called)]
+            ["((do (mark :callee) (fn [x y] (mark :called))) (mark :a) (mark :b))"
+             (list :callee :a :b :called)]
+            ["(try (erlang/list_to_tuple (list (do (mark :a) (erlang/throw :stop)) (mark :b))) (catch-raw [kind reason stack] (mark :caught)))"
+             (list :a :caught)]]]
+    (let [source (str "(do (erlang/put :pkl-source-order (list)) "
+                      "(let [mark (fn [tag] (erlang/put :pkl-source-order "
+                      "(erlang/++ (erlang/get :pkl-source-order) (list tag))) tag)] " body ") "
+                      "(let [events (erlang/get :pkl-source-order)] (erlang/erase :pkl-source-order) events))")]
+      (doseq [beam [(lowered "source-order" source (list))
+                   (reference "reference-order" source (list))]]
+        (is (erlang/=:= expected (run-beam beam "observed-source-order")) body)))))
 
 (deftest effect-order-is-observed-and-unchanged
   (testing "the lowered beam observes exactly the reference sequence"
