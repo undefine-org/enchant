@@ -62,7 +62,7 @@ class SDKCacheSelectionTests(unittest.TestCase):
                                if key not in ('engine_source', 'engine_fingerprint')}
                 with patch.object(CACHE, 'describe_sdk', return_value=description), \
                         patch.object(CACHE, 'store_path', return_value=Path(self.record['engine_source'])), \
-                        patch.object(CACHE, 'source_fingerprint', return_value=self.record['engine_fingerprint']), \
+                        patch.object(CACHE, 'retained_source_fingerprint', return_value=self.record['engine_fingerprint']), \
                         patch.object(CACHE.subprocess, 'run'), patch.object(CACHE, 'retain') as retain:
                     with self.assertRaisesRegex(ValueError, 'no longer matches'):
                         CACHE.restore(self.root, self.cache)

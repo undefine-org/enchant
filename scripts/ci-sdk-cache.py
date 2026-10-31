@@ -17,6 +17,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 STORE = re.compile(r'/nix/store/[0-9a-z]{32}-[^/]+')
+CI_ONLY_EXCLUSIONS = ('nix/ci-check.nix', 'nix/ci-release-runtime.nix', 'nix/ci-sdk-gates.nix')
 
 
 def model_input():
@@ -37,13 +38,31 @@ def store_path(value):
     return Path(value).resolve(strict=True)
 
 
-def source_fingerprint(source):
+def source_fingerprint(source, policy=None):
     loader = importlib.machinery.SourceFileLoader('ci_sdk_inputs', str(ROOT / 'scripts/sdk-inputs'))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
     # Use the current preparation policy, exactly as prepare-checkout-sdk does
     # when comparing the captured engine to the caller's declared inputs.
-    return module.fingerprint(source, json.loads((ROOT / 'nix/engine-inputs.json').read_text()))
+    if policy is None:
+        policy = json.loads((ROOT / 'nix/engine-inputs.json').read_text())
+    return module.fingerprint(source, policy)
+
+
+def retained_source_fingerprint(source):
+    current = json.loads((ROOT / 'nix/engine-inputs.json').read_text())
+    captured = json.loads((source / 'nix/engine-inputs.json').read_text())
+    # One explicit transition, not arbitrary historical policy admission. The
+    # immediate predecessor counted these unused CI recipes as engine inputs.
+    # Preserve its original identity so normal preparation can reuse its units.
+    allowed = [current]
+    if all(current['excluded'].count(name) == 1 for name in CI_ONLY_EXCLUSIONS):
+        allowed.append(dict(current, excluded=[name for name in current['excluded']
+                                               if name not in CI_ONLY_EXCLUSIONS]))
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'))
+    if canonical(captured) not in [canonical(policy) for policy in allowed]:
+        raise ValueError('Retained engine policy is neither current nor the exact CI-only predecessor')
+    return source_fingerprint(source, captured)
 
 
 def describe_sdk(sdk):
@@ -78,7 +97,7 @@ def verify_record(record):
     engine = store_path(record['engine_source'])
     subprocess.run(['nix-store', '--check-validity', str(engine)], check=True,
                    stdout=subprocess.DEVNULL)
-    current.update(engine_source=str(engine), engine_fingerprint=source_fingerprint(engine))
+    current.update(engine_source=str(engine), engine_fingerprint=retained_source_fingerprint(engine))
     if record != current:
         raise ValueError('Retained SDK cache receipt no longer matches immutable bytes')
     return current
