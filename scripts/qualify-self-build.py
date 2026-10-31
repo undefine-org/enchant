@@ -69,7 +69,8 @@ def main():
                 expected = str(elixir / 'lib/elixir/lib/elixir')
                 # A warm native realm runs the portable release's own Elixir.
                 # This regression concerns the SDK's cold platform bootstrap.
-                assert expected in run('--cold', 'eval', '(println (erlang/list_to_binary (code/lib_dir :elixir)))')
+                observed = run('--cold', 'eval', '(println (Path/expand (erlang/list_to_binary (code/lib_dir :elixir))))')
+                assert expected in observed, (expected, observed)
                 print('SDK_PLATFORM_ELIXIR_READY', flush=True)
             print('\n'.join(run('version')), flush=True)
             assert '42' in run('eval', '(println (+ 40 2))')
