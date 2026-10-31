@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Run declared real-Nix inventory serially on an explicitly selected host.
+
+The host must have its real Nix daemon, registered store, configured worker
+policy, KVM and user manager. This never starts SDK production or creates a
+daemon in a sandbox. Ordinary files belong to scripts/ci-check's bounded VMs.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def helper(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / ('scripts/' + name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def unit_command(root, sdk, runtime, request, raw, endpoint, environ, python=sys.executable):
+    command = ['systemd-run', '--user', '--collect', '--wait', '--pipe', '--quiet',
+               f'--working-directory={root}', '--property=MemoryMax=6G',
+               '--property=MemorySwapMax=0', '--property=RuntimeMaxSec=5400',
+               '--property=KillMode=control-group']
+    values = {'PATH': environ.get('PATH', ''), 'HOME': environ['HOME'],
+              'XDG_RUNTIME_DIR': str(endpoint), 'BL_TEST_USER_RUNTIME_DIR': str(endpoint),
+              'DBUS_SESSION_BUS_ADDRESS': environ.get('DBUS_SESSION_BUS_ADDRESS', ''),
+              'CI_CHECK_SDK_RETAINED': '1', 'GIT_CONFIG_NOSYSTEM': '1',
+              'GIT_CONFIG_GLOBAL': '/dev/null',
+              'ELIXIR_ERL_OPTIONS': '+fnu +S 2:2 +SDcpu 1:1 +SDio 1:1'}
+    if environ.get('BEAM_LISP_MODEL_DIR'):
+        values['BEAM_LISP_MODEL_DIR'] = environ['BEAM_LISP_MODEL_DIR']
+    command += [f'--setenv={name}={value}' for name, value in values.items()]
+    # The prefix must follow the manager's -- delimiter. An outer PRoot would
+    # lose the FHS loader when systemd starts the actual qualifier process.
+    command += ['--', python, str(root / 'scripts/with-release-runtime'),
+                '--runtime', str(runtime), '--sdk', str(sdk), '--',
+                python, str(root / 'scripts/ci-check-worker.py'), '--host-nix',
+                '--sdk', str(sdk), '--root', str(root), '--request', str(request), '--out', str(raw)]
+    return command
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--local', action='store_true', help='Explicitly execute the host qualifier here')
+    parser.add_argument('--sdk', type=Path, required=True)
+    parser.add_argument('--source', type=Path, default=ROOT)
+    parser.add_argument('--runtime', type=Path, default=Path('.bl/ci-release-runtime'))
+    parser.add_argument('--models', type=Path)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    if not args.local:
+        parser.error('Host Nix checks require explicit --local on a configured CI/station host')
+    if args.out.exists() or args.out.is_symlink():
+        parser.error('Output must be absent; preserve prior receipts')
+    sdk, runtime = args.sdk.resolve(strict=True), args.runtime.resolve(strict=True)
+    subprocess.run(['nix-store', '--check-validity', str(sdk)], check=True)
+    environ = dict(os.environ)
+    if args.models:
+        models = args.models.resolve(strict=True)
+        subprocess.run(['nix-store', '--check-validity', str(models)], check=True)
+        helper('ci-model-input').verify(models, args.source)
+        environ['BEAM_LISP_MODEL_DIR'] = str(models)
+    endpoint_parent = environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='bl-ci-host-') as temporary, \
+            tempfile.TemporaryDirectory(prefix='bl-ci-endpoint-', dir=endpoint_parent) as endpoint:
+        temporary = Path(temporary)
+        snapshot = temporary / 'source'
+        helper('ci-source').capture(args.source, snapshot)
+        request = temporary / 'request.json'
+        request.write_text(json.dumps({'kind': 'host-nix'}))
+        raw = temporary / 'raw'
+        process = subprocess.run(unit_command(snapshot, sdk, runtime, request, raw, endpoint, environ))
+        if raw.is_dir():
+            helper('ci-receipt').publish(raw, args.out)
+        if not (args.out / 'result.json').is_file():
+            raise RuntimeError(f'Host worker failed before collecting receipts: status {process.returncode}')
+        receipt = json.loads((args.out / 'result.json').read_text())
+        print(json.dumps(receipt, indent=2))
+        identity_valid = (receipt.get('request') == {'kind': 'host-nix'}
+                          and receipt.get('sdk_descriptor_sha256') == hashlib.sha256(
+                              (sdk / 'artifact.json').read_bytes()).hexdigest()
+                          and all(re.fullmatch('[0-9a-f]{64}', receipt.get(name, ''))
+                                  for name in ('sdk_descriptor_sha256', 'candidate_sha256',
+                                               'compiler_manifest_sha256', 'source_sha256')))
+        return int(bool(process.returncode or receipt.get('status') != 'passed'
+                        or receipt.get('execution') != 'host-nix'
+                        or receipt.get('frozen_inputs_unchanged') is not True
+                        or type(receipt.get('assertions')) is not int
+                        or receipt['assertions'] <= 0 or not identity_valid))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

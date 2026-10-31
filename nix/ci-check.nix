@@ -4,7 +4,7 @@
 let
   root = /. + source;
   roots = builtins.filter (name: builtins.pathExists (root + "/${name}")) [
-    ".gitignore" ".github" "AGENTS.md" "README.md" "bin" "nix" "scripts"
+    ".gitignore" ".github" "AGENTS.md" "README.md" "README.bl.org" "examples" "bin" "nix" "scripts"
     "test" "priv" "native" "tooling/drop" "vendor/foundry-ledger"
     "docs" "research" "env.bl" "bl.lock" "flake.nix" "flake.lock"
     "rust-toolchain" "rust-toolchain.toml"
@@ -24,9 +24,18 @@ let
     let entry = prerequisites.${name} or {}; in (entry.all or []) ++ (entry.linux or [])
   ) selectedFiles);
   toolPackages = { cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools; };
+  nativeFixture = builtins.elem "test/bl/execution_qualification_test.bl" selectedFiles;
+  # E50 compiles two private Rustler variants with --offline. Retain the same
+  # lock-addressed vendor input used by native-compile.nix, without compiling
+  # the SDK/native producer again or relying on a developer Cargo registry.
+  fixtureCargoDeps = pkgs.rustPlatform.importCargoLock {
+    lockFile = pkgs.writeText "native-Cargo.lock" (builtins.unsafeDiscardStringContext
+      (builtins.readFile (input + "/native/lazy_memo/Cargo.lock")));
+  };
   # The SDK platform supplies the exact Erlang/Elixir, Nix and user-manager
   # tools. Add only the remaining declared external test tools here.
   fixtureTools = map (name: toolPackages.${name}) (builtins.filter (name: builtins.hasAttr name toolPackages) tools)
+    ++ pkgs.lib.optionals nativeFixture [ pkgs.stdenv.cc ]
     ++ pkgs.lib.optionals (requestData.kind == "shard") [ pkgs.tesseract ];
   selection = if sdk == null then import (input + "/nix/sdk-artifact.nix") {
     source = toString input;
@@ -53,6 +62,16 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
     export BEAM_LISP_MODEL_DIR=${builtins.storePath models}
   ''}
   mkdir -p "$HOME"
+  ${pkgs.lib.optionalString nativeFixture ''
+    export CARGO_HOME="$HOME/.cargo"
+    mkdir -p "$CARGO_HOME"
+    cat > "$CARGO_HOME/config.toml" <<'CARGO'
+    [source.crates-io]
+    replace-with = "ci-pinned-vendor"
+    [source.ci-pinned-vendor]
+    directory = "${fixtureCargoDeps}"
+    CARGO
+  ''}
   cd /build/project
   python3 ${./../scripts/ci-check-worker.py} --sdk ${selection} --request ${/. + request} --root /build/project --out /build/raw-receipts
   python3 ${./../scripts/ci-receipt.py} --source /build/raw-receipts --out "$out"
