@@ -351,7 +351,7 @@ function checkFirstOrder(value, options) {
       if (rawSymbol(v)) walk(ownData(items, 1, "native-tuple"), depth + 1);
       else if (items.length === 3 && ownData(items, 0, "native-tuple") === R.kw("meta")) {
         const form = ownData(items, 1, "native-tuple"), metadata = ownData(items, 2, "native-tuple");
-        if (!(rawSymbol(form) || form === EMPTY || form instanceof Cons || form instanceof HMap || form instanceof R.Vec || form instanceof R.HSet) ||
+        if (!(rawSymbol(form) || form === EMPTY || form instanceof Cons || form instanceof HMap || form instanceof R.Vec || form instanceof R.HSet || form instanceof R.Dec) ||
             !(metadata instanceof HMap) || rawEntries(metadata, nodes).some(([k]) => k === R.kw("__struct__"))) dataRefuse("native-tuple");
         walk(form, depth + 1); walk(metadata, depth + 1);
       } else dataRefuse("native-tuple");

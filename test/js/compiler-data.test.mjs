@@ -60,7 +60,7 @@ test("form metadata admits bounded passive collections without invoking payloads
   let calls = 0;
   const marked = (form, metadata = R.hashMap(kw("line"), 1)) => T(kw("meta"), form, metadata);
   for (const form of [symbol("x"), R.EMPTY, list(symbol("inc"), 4), R.hashMap(kw("x"), 1),
-    R.vecFromArray([1, 2]), R.hashSet(1)]) {
+    R.vecFromArray([1, 2]), R.hashSet(1), R.dec(123n, 2)]) {
     const value = marked(form);
     assert.equal(check(value, R.EMPTY_MAP), value);
     assert.throws(() => check(value, opts("max-nodes", 1)), /bounded first-order/);
