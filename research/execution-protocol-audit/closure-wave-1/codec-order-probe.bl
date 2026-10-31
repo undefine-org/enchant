@@ -1,0 +1,104 @@
+;; Causal controls use actual producer Source in private namespaces. They never
+;; replace an installed SDK module, synthesize runtime admission, or rebuild it.
+(ns execution.history-codec-order-probe
+ (:require [datom.codec :as codec] [compiler :as c]))
+
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+
+(defn- mutate-once [source before after]
+ (when-not (= 2 (count (String/split source before)))
+  (throw (ex-info "Causal producer anchor changed" {:before before})))
+ (String/replace source before after))
+
+(defn- fingerprint [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+
+(defn- private-namespace [label]
+ (str "history.closure." label ".n" (erlang/unique_integer (list :positive))))
+
+(defn- install-namespace [source original namespace]
+ (BeamLisp.Compiler/eval_string
+  (mutate-once source (str "(ns " original) (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace))
+ namespace)
+
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+
+(defn- in-private-scope [action]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try (BeamLisp.Env/with_env scope action)
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(defn- install-comparator [source namespace]
+ (let [wanted #{"family-rank" "k-compare"}
+       forms (Enum/filter (BeamLisp.Reader/read_string source "priv/boot/rt.bl")
+               #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                     (contains? wanted (BeamLisp.AOT/stage-symbol
+                                         (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 2 (count forms)) (throw :comparator-causal-forms-changed))
+  (BeamLisp.Compiler/eval_string
+   (str "(ns " namespace ") "
+    "(defn unwrap-meta [x] (BeamLisp.Ns.Rt/unwrap-meta x)) "
+    "(defn kind-kind [x] (BeamLisp.Ns.Rt/kind-kind x)) "
+    "(defn kind-family [x] (BeamLisp.Ns.Rt/kind-family x)) "
+    "(defn same-family [family a b] (BeamLisp.Ns.Rt/same-family family a b))"))
+  (doseq [form forms] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))
+  namespace))
+
+(deftest E46-real-comparator-mutation-disagrees-with-unchanged-durable-encoding
+ (let [source (producer "priv/boot/rt.bl")
+       before "(erlang/== fam :tuple) 12" after "(erlang/== fam :tuple) 9"]
+  (in-private-scope
+   (fn []
+    (let [normal (install-comparator source (private-namespace "compare-good"))
+          mutant (install-comparator (mutate-once source before after) (private-namespace "compare-mutant"))
+          reference (erlang/make_ref) value (tuple 1)
+          samples [nil false true -1 0 1 1.5 "" "a" :key [] [1] {} {:a 1} #{1}
+                   (list) (list 1) reference (erlang/self) (tuple) value (tuple 1 2)]
+          sign (fn [a b] (cond (erlang/< a b) -1 (erlang/> a b) 1 :else 0))
+          mismatches (fn [checker]
+                       (reduce + 0
+                        (for [a samples b samples]
+                         (if (= (invoke checker "k-compare" [a b])
+                                (sign (codec/encode-value a) (codec/encode-value b))) 0 1))))]
+     (is (= 0 (mismatches normal)))
+     (is (> (mismatches mutant) 0) "the historical tuple/identity rank inversion must break persisted order")
+     (is (= -1 (invoke normal "k-compare" [reference value])))
+     (is (= 1 (invoke mutant "k-compare" [reference value])))
+     (is (= 118 (binary/at (codec/encode-value reference) 0)))
+     (is (= 122 (binary/at (codec/encode-value value) 0)))
+     (println :closure-E46 {:producer-sha256 (fingerprint source)
+                           :mutant-sha256 (fingerprint (mutate-once source before after))
+                           :pairs (* (count samples) (count samples))
+                           :normal-mismatches (mismatches normal) :mutant-mismatches (mismatches mutant)}))))))
+
+(deftest E46-private-canonical-codec-demonstrates-semantic-fix-and-legacy-key-incompatibility
+ (let [source (producer "priv/lib/datom/codec.bl")
+       before "(erlang/is_list v)\n      (erlang/iolist_to_binary\n        (to-list [(tag-byte TAG-LIST)"
+       after "(erlang/is_list v)\n      (erlang/iolist_to_binary\n        (to-list [(tag-byte TAG-VECTOR)"]
+  (in-private-scope
+   (fn []
+    (let [candidate (install-namespace (mutate-once source before after) "datom.codec" (private-namespace "canonical-codec"))
+          pairs [[(list) []] [(list 1 2) [1 2]]
+                 [{:items (list 1 2)} {:items [1 2]}]
+                 [(tuple (list 1)) (tuple [1])]
+                 [(list (list 1)) [[1]]]
+                 [(map identity [1 2]) [1 2]]]]
+     (doseq [[a b] pairs]
+      (is (= a b) "the sequential family remains one language value")
+      (is (= (invoke candidate "encode-value" [a]) (invoke candidate "encode-value" [b]))
+          "candidate canonicalizes sequential equality recursively"))
+     (let [value (list 1 2)
+           legacy (codec/encode-value value)
+           canonical (invoke candidate "encode-value" [value])]
+      (is (= 112 (binary/at legacy 0)))
+      (is (= 113 (binary/at canonical 0)))
+      (is (not= legacy canonical) "deploying this candidate requires a durable-key migration or compatible lookup strategy")
+      (is (= 112 (BeamLisp.Env/fetch_exact! candidate "TAG-LIST")) "legacy tag constant remains named; preserving it alone cannot migrate old keys")
+      (println :closure-E46-private-candidate
+       {:producer-sha256 (fingerprint source)
+        :candidate-sha256 (fingerprint (mutate-once source before after))
+        :legacy-tag (binary/at legacy 0) :canonical-tag (binary/at canonical 0)
+        :compatible-with-existing-list-keys false :production-files-changed false})))))))

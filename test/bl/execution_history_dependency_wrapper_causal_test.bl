@@ -1,0 +1,63 @@
+(ns execution.history-dependency-wrapper-causal-test)
+(defn- producer []
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) "priv/host/lazy_memo.bl")))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before))) (throw :dependency-producer-anchor-changed))
+ (String/replace source before after))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- install [source namespace]
+ (let [wanted #{"deps_scalar?" "deps_lazy_node?" "deps_walk"}
+       helpers ["nif_resource_id" "nif_dependency_resource" "nif_id" "deps_env"
+                "deps_clean_hit?" "deps_big?" "deps_walked!" "deps_clean_remember!" "deps_merge_resources"]
+       forms (Enum/filter (BeamLisp.Reader/read_string source "priv/host/lazy_memo.bl")
+              #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                    (contains? wanted (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 3 (count forms)) (throw :dependency-producer-forms-changed))
+  (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+  (doseq [name helpers]
+   (BeamLisp.Compiler/eval_string
+    (str "(defn " name " [& xs] (erlang/apply :Elixir.BeamLisp.LazyMemo :" name " (to-list xs)))")))
+  (doseq [form forms] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace))) namespace))
+(defn- walk [namespace value]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace "deps_walk")
+  (list :inspect value (list) (MapSet/new) (MapSet/new) (list))))
+
+(deftest E04-real-dependency-walker-validates-wrappers-before-native-resource-access
+ (let [source (producer)
+       before "(deps_lazy_node? cur)"
+       after "(and (erlang/is_map cur) (erlang/== :\"Elixir.BeamLisp.LazySeq\" (maps/get :__struct__ cur nil)))"
+       identity-before "identity (nif_resource_id resource)"
+       identity-after "identity (nif_id resource)"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [prefix (str "history.closure.dependencies.n" (erlang/unique_integer (list :positive)))
+           normal (install source (str prefix ".good"))
+           mutant (install (replace-once source before after) (str prefix ".mutant"))
+           identity-mutant (install (replace-once source identity-before identity-after) (str prefix ".identity-mutant"))
+           effects (atom 0) actual (BeamLisp.LazySeq/new #(do (swap! effects inc) (list 42)))
+           resource (:resource actual)
+           tag (fn [attributes] (assoc attributes :__struct__ :Elixir.BeamLisp.LazySeq))
+           forged [(tag {:metadata actual})
+                   (tag {:resource 42 :metadata actual})
+                   (tag {:resource (erlang/make_ref) :metadata actual :extra true})
+                   (tag {:resource (erlang/make_ref) :metadata actual})]]
+      (is (= [resource] (vec (walk normal actual))))
+      (doseq [value forged]
+       (is (= [resource] (vec (walk normal value))) "malformed wrappers are ordinary data, and nested real resources remain discoverable"))
+      (is (= 0 @effects) "dependency discovery never forces the nested real lazy producer")
+      (doseq [[walker value] [[mutant (first forged)] [identity-mutant (last forged)]]]
+       (let [error (try (walk walker value) nil (catch error error))]
+        (is (some? error) "public tag-only classification revives missing-field or invalid-resource failure")
+        ;; Render the actual original failure, including malformed tagged data.
+        ;; Inspection may realize a nested lazy value; discovery above cannot.
+        (is (string? (Elixir.Exception/format :error error (list))))))
+      (is (<= @effects 1) "diagnostic inspection cannot rerun the once-only producer")
+      (is (= [resource] (vec (BeamLisp.LazyMemo/dependencies (first forged)))))
+      (println :closure-E04 {:producer-sha256 (digest source)
+                            :mutant-sha256 (digest (replace-once source before after))
+                            :identity-mutant-sha256 (digest (replace-once source identity-before identity-after))
+                            :forged-variants (count forged) :producer-effects @effects}))))
+   (finally (BeamLisp.Env/destroy scope)))))

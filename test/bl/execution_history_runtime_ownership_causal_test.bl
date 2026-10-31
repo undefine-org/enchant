@@ -1,0 +1,216 @@
+;; Current producer bodies compiled at private native probe atoms. Ordinary
+;; artifact emission uses the existing compiler. No SDK code or evidence rows
+;; are replaced, and no runtime/compiler generation is rebuilt.
+(ns execution.history-runtime-ownership-causal-test)
+
+(def ^:private SOURCE (atom nil))
+(defn- source []
+ (or @SOURCE
+  (let [path (Path/join (BeamLisp.Tiers/priv_root) "host/aot.bl")
+        text (File/read! path)
+        value {:path path :text text :forms (BeamLisp.Reader/read_string text path)
+               :sha256 (Base/encode16 (crypto/hash :sha256 text) (list (tuple :case :lower)))}]
+   (reset! SOURCE value) value)))
+(defn- actual-form [name]
+ (let [found (filterv
+       (fn [form]
+        (and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head form))
+             (= name (BeamLisp.AOT/stage-symbol
+                       (second (BeamLisp.AOT/stage-items form :list)))))) (:forms (source)))]
+  (assert (= 1 (count found)))
+  (let [span (BeamLisp.FormMeta/meta (first found))]
+   (String/slice (:text (source)) (:offset span) (- (:end-offset span) (:offset span))))))
+(defn- changed-once [text before after]
+ (assert (= 2 (count (String/split text before))))
+ (String/replace text before after))
+(def LOAD-FORWARDS
+ "(defn boot [] (BeamLisp.AOT/boot))
+(defn floor_file? [x] (BeamLisp.AOT/floor_file? x))
+(defn floor_source [x] (BeamLisp.AOT/floor_source x))
+(defn unit_defns [x] (BeamLisp.AOT/unit_defns x))
+(defn ns_decl [x] (BeamLisp.AOT/ns_decl x))
+(defn expand_replay_form [x ns fuel] (BeamLisp.AOT/expand_replay_form x ns fuel))
+(defn capture_ns_decl [x y] (BeamLisp.AOT/capture_ns_decl x y))
+(defn replay_form? [x] (BeamLisp.AOT/replay_form? x))
+(defn constructor_context [] (BeamLisp.AOT/constructor_context))
+")
+(def CAPTURE-FORWARDS
+ "(defn reg2? [x tag] (BeamLisp.AOT/reg2? x tag))
+(defn reg3? [x tag] (BeamLisp.AOT/reg3? x tag))
+(defn bare_name [x] (BeamLisp.AOT/bare_name x))
+(defn put_value_def ([a b c d e] (BeamLisp.AOT/put_value_def a b c d e)) ([a b c d e f] (BeamLisp.AOT/put_value_def a b c d e f)))
+(defn compile_initializer [x e] (BeamLisp.AOT/compile_initializer x e))
+(defn definition_name [x y] (BeamLisp.AOT/definition_name x y))
+(defn replayed_form? [x] (BeamLisp.AOT/replayed_form? x))
+")
+(defn- probe! [directory module body]
+ (let [path (Path/join directory (str (Atom/to_string module) ".bl"))]
+  (File/write! path (str "(ns history.runtime-ownership.native)\n" body))
+  (BeamLisp.AOT/compile_host_file path
+   (list (tuple :module module) (tuple :output_dir directory) (tuple :load? true)))
+  module))
+(defn- function-module [value] (elem (erlang/fun_info value :module) 1))
+(defn- run-unit [module label nested?]
+ (let [suffix (str (erlang/unique_integer (list :positive)))
+       namespace (str "history.runtime.ownership." label suffix)
+       directory (Path/join (System/tmp_dir!) (str "runtime-ownership-unit-" suffix))
+       file (Path/join directory "fixture.bl")
+       text (str "(ns " namespace ") "
+             "(def initialization-sentinel (Process/put :history-runtime-inits (inc (Process/get :history-runtime-inits 0)))) "
+             "(defn answer [x] (+ x 40)) "
+             (when nested?
+              "(defmacro bundle [] '(do (def first-value 1) (do (def second-value 2) (def first-value 3)))) (bundle)"))
+       build (BeamLisp.Env/fork :global) replay (BeamLisp.Env/fork :global)
+       emitted (atom (list)) prior (Process/get :history-runtime-inits)]
+  (File/mkdir_p! directory) (File/write! file text)
+  (Process/delete :history-runtime-inits)
+  (try
+   (let [built (BeamLisp.Env/with_env build
+                (fn []
+                 (let [unit (BeamLisp.Loader/with_declaration_snapshot
+                             #(erlang/apply module :load_unit_in_snapshot (list text (list (tuple :file file)))))
+                       nsdefs (get (elem unit 0) namespace)
+                       metadata (get (elem unit 3) namespace)
+                       rows (BeamLisp.AOT/emit_module namespace
+                              (get (elem unit 1) namespace (list)) metadata directory file
+                              nsdefs (crypto/hash :sha256 text) (elem unit 5))
+                       _ (reset! emitted (Enum/map rows first))
+                       shim (BeamLisp.Emit/module_for namespace)
+                       definitions (erlang/apply shim :__bl_ns_defs__ (list))
+                       expected (elem (first (get definitions "answer")) 4)
+                       value (BeamLisp.Env/fetch_exact! namespace "answer")]
+                  {:shim shim :provider expected :value-module (function-module value)
+                   :value (value 2) :initializations (Process/get :history-runtime-inits)
+                   :collected-values (mapv first (get (elem unit 1) namespace (list)))
+                   :declarations (elem unit 5)})))
+         replayed (BeamLisp.Env/with_env replay
+                   (fn []
+                    (assert (= :error (BeamLisp.Env/fetch_exact namespace "first-value")))
+                    (erlang/apply (:shim built) :__bl_init__ (list))
+                    {:first (BeamLisp.Env/fetch_exact namespace "first-value")
+                     :second (BeamLisp.Env/fetch_exact namespace "second-value")}))]
+    (assoc built :replayed replayed))
+   (finally
+    (BeamLisp.Env/destroy build) (BeamLisp.Env/destroy replay)
+    (when (seq @emitted) (BeamLisp.Env/retire_modules! @emitted))
+    (if (nil? prior) (Process/delete :history-runtime-inits) (Process/put :history-runtime-inits prior))
+    (File/rm_rf! directory)))))
+
+(deftest E08-current-staged-declarations-select-the-same-provider-as-the-emitted-table
+ (let [directory (Path/join (System/tmp_dir!) (str "runtime-materialization-control-" (erlang/unique_integer (list :positive))))
+       current :Elixir.HistoryRuntimeOwnership.MaterializationCurrent
+       historical :Elixir.HistoryRuntimeOwnership.MaterializationManagedOnly
+       body (actual-form "load_unit_in_snapshot")
+       ;; Restore managed-only publication at the actual collected-metadata
+       ;; return boundary. Empty metadata is the current recovery descriptor;
+       ;; disabling the token itself introduces an earlier nil-map ABI error.
+       before "(Map/get (Process/get :bl_definition_collector) :declarations)"
+       after "(if (constructor_context) (Map/get (Process/get :bl_definition_collector) :declarations) {})"
+       forwards (str LOAD-FORWARDS "(defn capture_value_def [a b c] (BeamLisp.AOT/capture_value_def a b c))\n")
+       aot-md5 (BeamLisp.AOT/module_info :md5)]
+  (File/mkdir_p! directory)
+  (try
+   (assert (nil? (BeamLisp.AOT/constructor_context)))
+   (probe! directory current (str forwards body))
+   (probe! directory historical (str forwards (changed-once body before after)))
+   (let [good (run-unit current "materialized" false)
+         mutant (run-unit historical "unmaterialized" false)]
+    (println :history-wave-E08 {:producer-sha256 (:sha256 (source)) :normal good :mutant mutant})
+    (is (map? (:declarations good)))
+    (is (= {} (:declarations mutant)))
+    (is (= (:provider good) (:value-module good)))
+    (is (not= (:provider mutant) (:value-module mutant)))
+    (is (= 42 (:value good) (:value mutant)))
+    (is (= 1 (:initializations good) (:initializations mutant)))
+    (is (= aot-md5 (BeamLisp.AOT/module_info :md5))))
+   (finally
+    (doseq [module [current historical]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))
+
+(deftest E18-current-nested-collector-emits-values-that-survive-fresh-replay
+ (let [directory (Path/join (System/tmp_dir!) (str "runtime-value-collection-control-" (erlang/unique_integer (list :positive))))
+       current :Elixir.HistoryRuntimeOwnership.CollectionCurrent
+       historical :Elixir.HistoryRuntimeOwnership.CollectionOuterOnly
+       loader (actual-form "load_unit_in_snapshot") body (actual-form "capture_value_def")
+       before "(Enum/reduce (rest (elem form 1)) vdefs\n        (fn [nested out] (capture_value_def out nested ns)))"
+       after "vdefs" aot-md5 (BeamLisp.AOT/module_info :md5)]
+  (File/mkdir_p! directory)
+  (try
+   (probe! directory current (str LOAD-FORWARDS CAPTURE-FORWARDS body "\n" loader))
+   (probe! directory historical (str LOAD-FORWARDS CAPTURE-FORWARDS (changed-once body before after) "\n" loader))
+   (let [good (run-unit current "collected" true)
+         mutant (run-unit historical "outeronly" true)]
+    (println :history-wave-E18 {:producer-sha256 (:sha256 (source)) :normal good :mutant mutant})
+    (is (= (tuple :ok 3) (get-in good [:replayed :first])))
+    (is (= (tuple :ok 2) (get-in good [:replayed :second])))
+    (is (= :error (get-in mutant [:replayed :first])))
+    (is (= :error (get-in mutant [:replayed :second])))
+    (is (contains? (set (:collected-values good)) "first-value"))
+    (is (not (contains? (set (:collected-values mutant)) "first-value")))
+    (is (= 1 (:initializations good) (:initializations mutant)))
+    (is (= aot-md5 (BeamLisp.AOT/module_info :md5))))
+   (finally
+    (doseq [module [current historical]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))
+
+(defn- actual-loader-form [name]
+ (let [path (Path/join (BeamLisp.Tiers/priv_root) "host/loader.bl")
+       text (File/read! path)
+       found (filterv
+        (fn [form]
+         (and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head form))
+              (= name (BeamLisp.AOT/stage-symbol
+                       (second (BeamLisp.AOT/stage-items form :list))))))
+        (BeamLisp.Reader/read_string text path))]
+  (assert (= 1 (count found)))
+  (let [span (BeamLisp.FormMeta/meta (first found))]
+   {:text text :body (String/slice text (:offset span) (- (:end-offset span) (:offset span)))})))
+
+(deftest E85-tier-ownership-requires-a-real-SDK-row-and-physical-library-path
+ (let [directory (Path/join (System/tmp_dir!) (str "runtime-sdk-home-control-" (erlang/unique_integer (list :positive))))
+       current :Elixir.HistoryRuntimeOwnership.TierHomeCurrent
+       historical :Elixir.HistoryRuntimeOwnership.TierHomeInitOnly
+       loader (actual-loader-form "tier_owns?")
+       before "(and loaded (erlang/is_list path)\n             (erlang/== (Path/dirname (Path/expand (erlang/list_to_binary path))) (Path/expand ebin))\n             (erlang/function_exported mod :__bl_init__ 0)\n             (let [row (BeamLisp.AOT/sdk_compiler_row mod)]\n               (and row (erlang/== ns (Map/get row :forwarder-namespace))\n                        (erlang/== :mutable-forwarder (Map/get row :role)))))"
+       after "(and loaded (erlang/function_exported mod :__bl_init__ 0))"
+       forwards "(defn source_relatives [ns] (BeamLisp.Loader/source_relatives ns))\n"
+       namespace (str "history.ordinary-home" (erlang/unique_integer (list :positive)))
+       scope (BeamLisp.Env/fork :global) emitted (atom (list))
+       loader-md5 (BeamLisp.Loader/module_info :md5)]
+  (File/mkdir_p! directory)
+  (try
+   (probe! directory current (str forwards (:body loader)))
+   (probe! directory historical (str forwards (changed-once (:body loader) before after)))
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [rows (BeamLisp.AOT/compile_source
+                  (str "(ns " namespace ") (defn answer [] 42)")
+                  (list (tuple :output_dir directory)))
+           _ (reset! emitted (mapv first rows))
+           module (BeamLisp.Emit/base_module_for namespace)
+           normal (erlang/apply current :tier_owns? (list namespace))
+           mutant (erlang/apply historical :tier_owns? (list namespace))
+           sdk-ns "datom" sdk-module (BeamLisp.Emit/base_module_for sdk-ns)
+           sdk-row (BeamLisp.AOT/sdk_compiler_row sdk-module)
+           self-path (Path/join (BeamLisp.Tiers/priv_root) "self/anf.bl")
+           tooling-path (Path/join (BeamLisp.Tiers/priv_root) "lib/tooling/trace.bl.md")]
+      (is (erlang/function_exported module :__bl_init__ 0))
+      (is (= false normal)) (is (= true mutant))
+      (is (= false (BeamLisp.Loader/tier_owns? namespace)))
+      (is (= :mutable-forwarder (:role sdk-row)))
+      (is (= sdk-ns (:forwarder-namespace sdk-row)))
+      (is (= true (erlang/apply current :tier_owns? (list sdk-ns))))
+      (is (= true (BeamLisp.Loader/tier_owns? sdk-ns)))
+      (is (File/regular? self-path)) (is (File/regular? tooling-path))
+      (is (= false (BeamLisp.AOT/sdk_library_source? "self.anf" self-path)))
+      (is (= true (BeamLisp.AOT/sdk_library_source? "tooling.trace" tooling-path)))
+      (is (= loader-md5 (BeamLisp.Loader/module_info :md5)))
+      (println :history-wave-E85
+       {:producer-sha256 (Base/encode16 (crypto/hash :sha256 (:text loader)) (list (tuple :case :lower)))
+        :ordinary-normal normal :ordinary-mutant mutant :genuine-sdk-owner sdk-ns
+        :self-is-sdk false :tooling-library-is-sdk true :installed-loader-unchanged true}))))
+   (finally
+    (BeamLisp.Env/destroy scope)
+    (when (seq @emitted) (BeamLisp.Env/retire_modules! @emitted))
+    (doseq [module [current historical]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))

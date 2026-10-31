@@ -1,0 +1,142 @@
+(ns execution.history-data-boundary-causal-test
+ (:require [lsp] [data.bounded-cache :as cache]))
+
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before)))
+  (throw (ex-info "Causal producer anchor changed" {:before before})))
+ (String/replace source before after))
+(defn- private-name [label]
+ (str "history.closure.boundary." label ".n" (erlang/unique_integer (list :positive))))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- forms-named [source path wanted]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source path)
+               #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                     (contains? wanted (BeamLisp.AOT/stage-symbol
+                                         (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= (count wanted) (count forms)) (throw :causal-producer-forms-changed))
+  forms))
+(defn- install-rt-boundaries [source namespace]
+ (let [forms (forms-named source "priv/boot/rt.bl" #{"call-shape" "call-call-shape-error" "hash-hash-key"})
+       helpers ["tuple2" "plural" "call-describe" "hash-struct-mod" "carries-meta?"
+                "dense-items?" "needs-normalizing?" "k-to-list" "any-meta-in-list?"
+                "any-meta-in-map?" "normalize-map" "normalize-set"]]
+  (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+  (doseq [name helpers]
+   (BeamLisp.Compiler/eval_string
+    (str "(defn " name " [& xs] (erlang/apply :Elixir.BeamLisp.Ns.Rt :" name " (to-list xs)))")))
+  (doseq [form forms] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))
+  namespace))
+
+(deftest E19-real-map-arity-and-symbol-hash-mutations-preserve-scalar-delay-variant
+ (let [source (producer "priv/boot/rt.bl")
+       map-before "(and (erlang/is_atom m) (erlang/=/= m nil)) nil"
+       map-after "(erlang/is_atom m) nil"
+       hash-before "(hash-hash-key (erlang/element 2 x))"
+       hash-after "x"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal (install-rt-boundaries source (private-name "representation-good"))
+           map-mutant (install-rt-boundaries (replace-once source map-before map-after) (private-name "map-mutant"))
+           hash-mutant (install-rt-boundaries (replace-once source hash-before hash-after) (private-name "hash-mutant"))
+           symbol (with-meta 'fixture/Owner {:tag :service :doc "retained"})
+           plain 'fixture/Owner]
+      (doseq [arity [0 3]]
+       (is (String/starts_with? (invoke normal "call-call-shape-error" [{} arity]) "a map called with"))
+       (is (String/starts_with? (invoke map-mutant "call-call-shape-error" [{} arity]) "cannot call")))
+      (is (= 42 ({:a 42} :a)))
+      (is (= :missing ({} :absent :missing)))
+      (is (= symbol plain))
+      (let [normal-symbol (invoke normal "hash-hash-key" [symbol])
+            normal-plain (invoke normal "hash-hash-key" [plain])
+            mutant-symbol (invoke hash-mutant "hash-hash-key" [symbol])]
+       (is (erlang/== normal-symbol normal-plain))
+       (is (erlang/not (erlang/== mutant-symbol normal-plain)))
+       (is (= :found (maps/get normal-plain (maps/from_list (list (tuple normal-symbol :found)))))))
+      (let [effects (atom 0) value (delay (do (swap! effects inc) 42))
+            pending (pr-str value)]
+       (is (string? pending))
+       (is (= 1 @effects) "opaque struct inspection realizes the backing cell once")
+       (is (String/contains? pending "#LazySeq<42>"))
+       (is (= 42 (force value)))
+       (is (string? (pr-str value)))
+       (is (= 1 @effects) "printing the completed scalar delay must not invoke it twice"))
+      (let [printer (producer "priv/host/lazy_seq_inspect.bl")
+            before "sampled (if scalar? (tuple (list cell) false)"
+            after "sampled (if false (tuple (list cell) false)"
+            normal (private-name "scalar-printer") mutant (private-name "scalar-printer-mutant")
+            opts (Inspect.Opts/__struct__)]
+       (doseq [[namespace text] [[normal printer] [mutant (replace-once printer before after)]]]
+        (BeamLisp.Compiler/eval_string
+         (replace-once text "(ns host.lazy-seq-inspect)" (str "(ns " namespace ")"))
+         (BeamLisp.Compiler/new_env namespace)))
+       (let [lazy (BeamLisp.LazySeq/new (fn [] 42))
+             rendered (invoke normal "inspect" [lazy opts])
+             error (try (invoke mutant "inspect" [lazy opts]) nil (catch error error))]
+        (is (some? rendered))
+        (is (some? error) "sampling a scalar as a sequence revives the original inspector defect"))
+       (println :closure-E19-scalar {:producer-sha256 (digest printer)
+                                    :mutant-sha256 (digest (replace-once printer before after))}))
+      (println :closure-E19 {:producer-sha256 (digest source)
+                            :map-mutant-sha256 (digest (replace-once source map-before map-after))
+                            :hash-mutant-sha256 (digest (replace-once source hash-before hash-after))}))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(defn- install-memo-context [source namespace]
+ (let [form (first (forms-named source "priv/lib/lsp.bl" #{"memo-context"}))]
+  (BeamLisp.Compiler/eval_string
+   (str "(ns " namespace " (:require [data.bounded-cache :as cache])) "
+    "(defn snapshot [] (BeamLisp.Env/namespace_generations (BeamLisp.Env/namespaces)))"))
+  (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace))
+  namespace))
+
+(deftest E64-real-fingerprint-boundary-bounds-growing-native-inventory-and-live-bundles
+ (let [source (producer "priv/lib/lsp.bl")
+       before "(crypto/hash :sha256 (erlang/term_to_binary data (list :deterministic)))"
+       after "data"
+       ;; Feed both copies the actual growing native namespace inventory. The
+       ;; fixture changes only this read boundary; neither copy creates scope
+       ;; authority or installs a value into the real LSP implementation.
+       boundary-source (replace-once source "(BeamLisp.Env/definition_context)" "(snapshot)")
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal (install-memo-context boundary-source (private-name "memo-good"))
+           mutant (install-memo-context (replace-once boundary-source before after) (private-name "memo-mutant"))
+           prefix (private-name "inventory")
+           observations (atom [])
+           document "(defn closure-retention-small-document [x] (+ x 1))"]
+      ;; Warm the real analysis/cache owners before measuring its retained data.
+      (lsp/analyzed document)
+      (lsp/analyzed document)
+      (doseq [amount [16 64 256]]
+       (doseq [i (range amount)] (BeamLisp.Env/declare_ns (str prefix ".n" amount ".n" i)))
+       (let [fixed (invoke normal "memo-context" [])
+             expanded (invoke mutant "memo-context" [])
+             native (BeamLisp.Env/definition_context)
+             _ (lsp/analyzed document)
+             bundle (lsp/analyzed document)]
+        (is (= 32 (erlang/byte_size fixed)))
+        (is (< (erlang/external_size native) 2048) "native validity evidence grows by environment chain, not namespace inventory")
+        (is (erlang/is_binary (:context bundle)))
+        (is (= 32 (erlang/byte_size (:context bundle))))
+        (is (< (cache/footprint bundle) 32768) "the actual small document never retains the expanding namespace inventory")
+        (swap! observations conj {:namespaces (count (BeamLisp.Env/namespaces))
+                                  :fixed-bytes (erlang/external_size fixed)
+                                  :mutant-bytes (erlang/external_size expanded)
+                                  :bundle-bytes (cache/footprint bundle)})))
+      (is (< (:mutant-bytes (first @observations)) (:mutant-bytes (last @observations))))
+      (is (> (- (:mutant-bytes (last @observations)) (:mutant-bytes (first @observations))) 4096))
+      (is (= (:fixed-bytes (first @observations)) (:fixed-bytes (last @observations))))
+      (println :closure-E64 {:producer-sha256 (digest source)
+                            :mutant-source-sha256 (digest (replace-once source before after))
+                            :read-boundary :actual-native-namespace-generations
+                            :observations @observations}))))
+   (finally (BeamLisp.Env/destroy scope)))))

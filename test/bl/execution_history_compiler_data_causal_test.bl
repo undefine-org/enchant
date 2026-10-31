@@ -1,0 +1,94 @@
+;; Causal controls use actual producer Source in private namespaces. They never
+;; replace an installed SDK module, synthesize runtime admission, or rebuild it.
+(ns execution.history-compiler-data-causal-test
+ (:require [compiler :as c]))
+
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+
+(defn- mutate-once [source before after]
+ (when-not (= 2 (count (String/split source before)))
+  (throw (ex-info "Causal producer anchor changed" {:before before})))
+ (String/replace source before after))
+
+(defn- fingerprint [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+
+(defn- private-namespace [label]
+ (str "history.closure." label ".n" (erlang/unique_integer (list :positive))))
+
+(defn- install-namespace [source original namespace]
+ (BeamLisp.Compiler/eval_string
+  (mutate-once source (str "(ns " original) (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace))
+ namespace)
+
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+
+(defn- in-private-scope [action]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try (BeamLisp.Env/with_env scope action)
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest E33-actual-type-checker-rejects-unsound-numeric-and-shadowing-mutations
+ (let [source (producer "priv/std/typed.bl")
+       numeric-before "   'some?    #{"
+       numeric-after "   'zero? #{:int :float}\n   'pos? #{:int :float}\n   'neg? #{:int :float}\n   'some?    #{"
+       predicate-before "(when-not (or (contains? env name) (contains? (:shadowed (state)) name))"
+       predicate-after "(when-not false"
+       signature-before "sigs (merge (reduce dissoc seeded shadowed) (sigs-from-env ns))"
+       signature-after "sigs (merge seeded (sigs-from-env ns))"]
+  (in-private-scope
+   (fn []
+    (let [normal (install-namespace source "typed" (private-namespace "typed-good"))
+          numeric (install-namespace (mutate-once source numeric-before numeric-after) "typed" (private-namespace "typed-numeric-mutant"))
+          predicate (install-namespace (mutate-once source predicate-before predicate-after) "typed" (private-namespace "typed-shadow-mutant"))
+          signature (install-namespace (mutate-once source signature-before signature-after) "typed" (private-namespace "typed-signature-mutant"))
+          warnings (fn [checker text]
+                     (:warnings (invoke checker "check-source" [text "history.closure.typed.fixture"])))]
+     (doseq [name ["zero?" "pos?" "neg?"]]
+      (let [text (str "(defn run [n] (if (" name " n) 0 (dec n)))")]
+       (is (= [] (vec (warnings normal text))))
+       (is (seq (warnings numeric text)) (str name " mutant must revive the original false-branch defect"))))
+     (doseq [text ["(defn string? [x] true) (defn run [x] (if (string? x) (inc x) 0))"
+                   "(defn run [string? x] (if (string? x) (inc x) 0))"
+                   "(defn run [x] (let [string? identity] (if (string? x) (inc x) 0)))"]]
+      (is (= [] (vec (warnings normal text))))
+      (is (seq (warnings predicate text)) "a locally shadowed predicate cannot claim builtin facts"))
+     (let [text "(defn keep [x] (fn [] x)) (defn run [x] (keep (inc x)))"]
+      (is (= [] (vec (warnings normal text))))
+      (is (seq (warnings signature text)) "source definitions cannot inherit a Core signature"))
+     (doseq [text ["(defn run [] (let [keep 42] (keep 1)))"
+                   "(defn run [] (keep 42 [1]))"]]
+      (is (seq (warnings normal text)) "the candidate still diagnoses actual invalid calls"))
+     (println :closure-E33 {:producer-sha256 (fingerprint source)
+                           :numeric-mutant (fingerprint (mutate-once source numeric-before numeric-after))
+                           :predicate-mutant (fingerprint (mutate-once source predicate-before predicate-after))
+                           :signature-mutant (fingerprint (mutate-once source signature-before signature-after))}))))))
+
+(deftest E72-actual-return-analysis-distinguishes-lexical-flow-from-unknown-backedges
+ (let [source (producer "priv/lib/system/summary.bl")
+       before "(= :var (:op n)) (get locals (:name n) all-tags)"
+       after "(= :var (:op n)) all-tags"
+       fixtures [["(let [x \"outer\"] (let [x 1] x))" #{:int}]
+                 ["(loop [i 0 acc 0] (if (< i 3) (recur (+ i 1) (+ acc 2)) acc))" #{:int}]
+                 ["(loop [i 0 value 1] (if (< i 3) (recur (+ i 1) \"changed\") value))" #{:int :string}]]]
+  (in-private-scope
+   (fn []
+    (let [normal (install-namespace source "system.summary" (private-namespace "returns-good"))
+          mutant (install-namespace (mutate-once source before after) "system.summary" (private-namespace "returns-mutant"))
+          analyze (fn [checker text]
+                    (let [node (c/compile (first (BeamLisp.Reader/read_string text))
+                                          (c/new-env "history.closure.return.fixture"))]
+                     (invoke checker "returns-tag" [{} node])))]
+     (doseq [[text expected] fixtures]
+      (is (= expected (analyze normal text)))
+      (is (not= expected (analyze mutant text)) "removing lexical flow must revive imprecision"))
+     (is (= (BeamLisp.Env/fetch_exact! normal "all-tags")
+            (analyze normal "(loop [i 0 value 1] (if (< i 3) (recur (+ i 1) (unknown i)) value))")))
+     (is (contains? (analyze normal "(loop [i 0 value 1] (if (< i 3) (recur (+ i 1) (+ value 0.5)) value))") :float))
+     (is (= #{} (analyze normal "(loop [value 1] (recur \"changed\"))")))
+     (println :closure-E72 {:producer-sha256 (fingerprint source)
+                           :mutant-sha256 (fingerprint (mutate-once source before after))}))))))
+

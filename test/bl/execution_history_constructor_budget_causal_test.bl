@@ -1,0 +1,56 @@
+;; Pure accounting copies from the actual constructor producer. The map below
+;; is a private numeric fixture, never an interpreter capability or SDK grant.
+(ns execution.history-constructor-budget-causal-test)
+
+(defn- install [source namespace]
+ (let [wanted #{"constructor_refuse" "constructor_counter!" "constructor_step!" "constructor_walk_steps!"}
+       forms (Enum/filter (BeamLisp.Reader/read_string source "priv/host/aot.bl")
+               #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                     (contains? wanted (BeamLisp.AOT/stage-symbol
+                                         (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 4 (count forms)) (throw :constructor-budget-causal-forms-changed))
+  (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+  (doseq [form forms] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))
+  namespace))
+(defn- call [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- observe [namespace counters steps]
+ (let [key (erlang/make_ref)]
+  (try
+   (erlang/put key counters)
+   (let [result (try
+                 (call namespace "constructor_walk_steps!" [{:counter-frame key} steps])
+                 :accepted
+                 (catch error (:detail (ex-data error))))]
+    {:result result :counters (erlang/get key)})
+   (finally (erlang/erase key)))))
+
+(deftest E17-real-budget-accounting-separates-shape-reads-from-interpreter-work
+ (let [path (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) "priv/host/aot.bl")
+       source (File/read! path)
+       before "(and (erlang/is_map counters) (erlang/is_map_key :walk-steps counters))"
+       after "false"
+       _ (when-not (= 2 (count (String/split source before))) (throw :constructor-budget-causal-anchor-changed))
+       changed (String/replace source before after)
+       suffix (str (erlang/unique_integer (list :positive)))
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal (install source (str "history.closure.budget.good.n" suffix))
+           mutant (install changed (str "history.closure.budget.mutant.n" suffix))
+           budgets {:remaining 1000000 :walk-steps 16000000 :allocation-nodes 1000000 :allocation-bytes 67108864}
+           observed (observe normal budgets 1070000)
+           failed (observe mutant budgets 1070000)]
+      (is (= :accepted (:result observed)))
+      (is (= :step-budget (:result failed)) "the old shared accounting rejects the original finite walk count")
+      (is (= 1000000 (get-in observed [:counters :remaining])))
+      (is (= 14930000 (get-in observed [:counters :walk-steps])))
+      (is (= 1000000 (get-in observed [:counters :allocation-nodes])))
+      (is (= 67108864 (get-in observed [:counters :allocation-bytes])))
+      (is (= :walk-budget (:result (observe normal budgets 16000001))) "read work remains bounded")
+      (is (= :step-budget (:result (observe normal {:remaining 2} 3))) "legacy private numeric fixtures retain shared accounting")
+      (println :closure-E17 {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source))
+                            :mutant-sha256 (Base/encode16 (crypto/hash :sha256 changed))
+                            :normal observed :mutant failed}))))
+   (finally (BeamLisp.Env/destroy scope)))))

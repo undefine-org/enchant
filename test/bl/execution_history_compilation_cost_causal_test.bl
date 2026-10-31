@@ -1,0 +1,190 @@
+;; Finite operation controls, not timing thresholds. Actual producer Source is
+;; cloned only into private namespaces; the selected SDK is never rebuilt.
+(ns execution.history-compilation-cost-causal-test
+ (:require [build-plan :as plan] [js.build :as js] [js.emit :as emit] [system.ir :as ir]))
+
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before)))
+  (throw (ex-info "Causal producer anchor changed" {:before before})))
+ (String/replace source before after))
+(defn- private-name [label]
+ (str "history.closure.cost." label ".n" (erlang/unique_integer (list :positive))))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- install [source original namespace]
+ (BeamLisp.Compiler/eval_string
+  (replace-once source (str "(ns " original) (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace)) namespace)
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- in-scope [action]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try (BeamLisp.Env/with_env scope action)
+   (finally (BeamLisp.Env/destroy scope)))))
+(defn- observed [targets action]
+ (doseq [mfa targets]
+  (when-not (= 1 (erlang/trace_pattern mfa true (list :local :call_count)))
+   (throw (ex-info "Missing operation counter" {:mfa mfa}))))
+ (try
+  (let [value (action)]
+   {:value value :calls (mapv #(elem (erlang/trace_info % :call_count) 1) targets)})
+  (catch error
+   (println :operation-probe-error (ex-message error) __STACKTRACE__)
+   (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+  (finally (doseq [mfa targets] (erlang/trace_pattern mfa false (list :local :call_count))))))
+
+(deftest E03-real-planner-folds-only-requested-keys-and-reuses-target-parts
+ (let [source (producer "priv/host/build_plan.bl")
+       before "keyed (if (erlang/== nil requested) order"
+       after "keyed (if true order"
+       ;; Counting is the same observation-only addition in both copies.
+       counted (replace-once source "key-of (fn [node]\n                 (let"
+                "key-of (fn [node]\n                 (Process/put :history-key-folds (inc (or (Process/get :history-key-folds) 0)))\n                 (let")]
+  (in-scope
+   (fn []
+    (let [normal (install counted "host.build-plan" (private-name "graph"))
+          mutant (install (replace-once counted before after) "host.build-plan" (private-name "graph-mutant"))
+          nodes (mapv (fn [i] {:path (str "n" i) :ns (str "n" i)
+                               :reqs (if (zero? i) [] [(str "n" (dec i))])
+                               :hash (str "body-" i) :iface (str "interface-" i)
+                               :refs {} :inames []}) (range 64))
+          run (fn [namespace requested]
+                (Process/put :history-key-folds 0)
+                (let [result (invoke namespace "plan" [nodes requested])]
+                 {:keys (:key result) :folds (Process/get :history-key-folds)}))
+          one (run normal (list "n63")) all (run normal nil) old (run mutant (list "n63"))]
+     (is (= 1 (:folds one)))
+     (is (= 64 (:folds all)))
+     (is (= 64 (:folds old)) "the original all-key path performs 64 folds for one requested key")
+     (is (= (get (:keys all) "n63") (get (:keys one) "n63") (get (:keys old) "n63")))
+     (is (= #{"n63"} (set (keys (:keys one)))))
+     (let [namespace (private-name "target")
+           content (str "(ns ^:js " namespace ") (defn value [] 42)")
+           targets [(tuple :Elixir.BeamLisp.BuildPlan :build-content-parts 1)
+                    (tuple :Elixir.BeamLisp.BuildPlan :javascript-forms? 1)]
+           cold (observed targets #(plan/memo-node namespace content))
+           warm (observed targets #(mapv (fn [i] (plan/memo-node (str namespace "." i) content)) (range 48)))
+           changed (observed targets #(plan/memo-node namespace (str content "\n(def changed 1)")))]
+      (is (= [1 1] (:calls cold)))
+      (is (= [0 0] (:calls warm)) "path relabeling reuses both parsed node and validated target facts")
+      (is (= [1 1] (:calls changed)) "a source edit cannot reuse old target/node validation")
+      (is (= true (:javascript? (:value cold))))
+      (is (every? :javascript? (:value warm)))
+      (println :closure-E03 {:producer-sha256 (digest source)
+                            :fold-mutant-sha256 (digest (replace-once source before after))
+                            :requested-folds (:folds one) :all-folds (:folds all) :mutant-folds (:folds old)
+                            :cold-calls (:calls cold) :warm-calls (:calls warm) :edited-calls (:calls changed)}))))
+   )
+  (Process/delete :history-key-folds)))
+
+(deftest E44-real-readiness-cache-skips-descriptor-walks-for-canonical-roots
+ (let [source (producer "priv/std/reload/sdk-readiness.bl")
+       before "cached (get @closures key)" after "cached nil"
+       counted (replace-once source "(walk [node]\n"
+                  "(walk [node]\n            (Process/put :history-readiness-visits (inc (or (Process/get :history-readiness-visits) 0)))\n")
+       roots [[:binding "clojure.string" "upper-case"]]]
+  (in-scope
+   (fn []
+    (let [normal (install counted "reload.sdk-readiness" (private-name "readiness"))
+          mutant (install (replace-once counted before after) "reload.sdk-readiness" (private-name "readiness-mutant"))
+          targets [(tuple :Elixir.BeamLisp.Env :ns_defs 1)
+                   (tuple :Elixir.BeamLisp.SourceGraph :header 1)
+                   (tuple :Elixir.BeamLisp.Env :load_sdk_library! 1)]
+          run (fn [namespace references]
+                (Process/put :history-readiness-visits 0)
+                (assoc (observed targets #(invoke namespace "prepare!" [references]))
+                       :visits (Process/get :history-readiness-visits)))
+          cold (run normal roots)
+          _ (run normal roots)
+          definition (first (BeamLisp.Env/ns_definition "clojure.string" "upper-case"))
+          provider (elem definition 4) arity (count (:params (elem definition 3)))
+          equivalent [[:remote provider :upper-case arity] [:namespace "clojure.string"]]
+          warm-binding (run normal roots) warm-remote (run normal equivalent)
+          mutant-warm (do (run mutant roots) (run mutant roots))
+          cache @(BeamLisp.Env/fetch_exact! normal "closures")
+          entries (filterv #(= roots (nth (first %) 3)) (vec cache))]
+     (is (= true (:value cold) (:value warm-binding) (:value warm-remote) (:value mutant-warm)))
+     (is (> (:visits cold) 0))
+     (is (= 0 (:visits warm-binding) (:visits warm-remote)))
+     (is (> (:visits mutant-warm) 0) "disabling the actual cache revives graph traversal on each request")
+     ;; Root normalization still validates its metadata. A hit skips transitive
+     ;; descriptor walks; it must never skip provider/source validation.
+     (is (= (nth (:calls warm-binding) 0) (nth (:calls warm-remote) 0)))
+     (is (= (nth (:calls warm-binding) 2) (nth (:calls warm-remote) 2)))
+     (is (<= (nth (:calls warm-remote) 1) (inc (nth (:calls warm-binding) 1))))
+     (is (every? true? (mapv <= (:calls warm-binding) (:calls cold))))
+     (is (= 1 (count entries)))
+     (let [entry (second (first entries))]
+      (is (= #{:namespaces :sources :generations} (set (keys entry))))
+      (is (< (erlang/external_size entry) 65536) "cached evidence never retains namespace descriptor graphs"))
+     (is (not (String/contains? source "BeamLisp.LazyMemo/")) "invocation-local metadata frames do not cross native memo-copy boundaries")
+     (println :closure-E44 {:producer-sha256 (digest source)
+                           :mutant-sha256 (digest (replace-once source before after))
+                           :cold (:calls cold) :cold-visits (:visits cold)
+                           :warm-binding (:calls warm-binding) :warm-remote (:calls warm-remote)
+                           :warm-visits (:visits warm-binding) :mutant-visits (:visits mutant-warm)
+                           :retained-bytes (erlang/external_size (second (first entries)))}))))
+  (Process/delete :history-readiness-visits)))
+
+(defn- ir-count [node]
+ (inc (reduce + 0 (mapv ir-count (ir/child-nodes node)))))
+
+(deftest E38-real-runtime-module-emits-with-bounded-lazy-intermediates
+ (let [source (producer "priv/lib/js/emit.bl")
+       before "(reduce (fn [out value] (into out (f value))) [] values)"
+       after "(vec (mapcat f values))"
+       targets [(tuple :Elixir.BeamLisp.LazySeq :new 1)
+                (tuple :Elixir.BeamLisp.LazySeq :new 2)]]
+  (in-scope
+   (fn []
+    (let [normal (install source "js.emit" (private-name "emitter"))
+          mutant (install (replace-once source before after) "js.emit" (private-name "emitter-mutant"))
+          node (BeamLisp.Ns.Compiler/compile
+                (BeamLisp.Ns.Reader/read_one
+                 "(fn [x] (case x 1 {:a 2} 2 {:a 4} {:a 6}))")
+                (BeamLisp.Ns.Compiler/new_env "history.emission.fixture"))
+          ctx (js/link-ctx {:ns "history.emission.fixture" :requires []}
+                {"rt" (set (map first (BeamLisp.Env/ns_defs "rt")))}
+                #{} (atom []) #{} #{} (atom #{}))
+          emit-one (fn [namespace]
+                     (invoke namespace "reset-state!" [])
+                     (observed targets #(invoke namespace "emit" [node ctx])))
+          strict (emit-one normal) lazy (emit-one mutant)]
+     (is (= (:value strict) (:value lazy)) "the cost mutation must preserve generated JavaScript")
+     (is (< (reduce + 0 (:calls strict)) (reduce + 0 (:calls lazy)))
+         "restoring lazy mapcat creates native memo cells for finite output intermediates")
+     ;; Compile only the actual runtime source to ANF, then emit its one module.
+     ;; This invokes the already selected SDK compiler, not a self-build or an
+     ;; SDK/package generation, and executes no application initializer.
+     (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+           path (Path/join root "priv/boot/rt.bl")
+           _ (println :closure-E38-stage :runtime-source-compilation)
+           compiled (js/compile-ns path)
+           definitions (:defs compiled)
+           count-nodes (reduce + 0 (mapv #(ir-count (:node %)) definitions))
+           table {"rt" (set (keep :name definitions))}
+           missing (atom [])
+           _ (println :closure-E38-stage :runtime-module-emission)
+           result (observed targets #(js/emit-ns compiled table #{} missing #{} #{} ["rt"]))
+           module (:value result)
+           intermediates (reduce + 0 (:calls result))
+           temporary (Path/join (System/tmp_dir!) (str "history-runtime-emission-" (erlang/unique_integer (list :positive)) ".mjs"))]
+      (is (= "rt" (:ns compiled)))
+      (is (> (count definitions) 200) "the full runtime module, not a tiny emitter fixture, is exercised")
+      (is (> count-nodes (count definitions)))
+      (is (string? module))
+      (is (String/contains? module "export const d_call_invoke"))
+      (is (< intermediates (* 8 count-nodes)) "native lazy intermediates stay below a fixed budget per actual IR node")
+      (try
+       (File/write! temporary module)
+       (let [checked (System/cmd "node" (list "--check" temporary))]
+        (is (= 0 (elem checked 1)) (elem checked 0)))
+       (finally (File/rm temporary)))
+      (println :closure-E38 {:producer-sha256 (digest source)
+                            :mutant-sha256 (digest (replace-once source before after))
+                            :fixture-strict-cells (:calls strict) :fixture-mutant-cells (:calls lazy)
+                            :runtime-source-sha256 (digest (File/read! path))
+                            :runtime-definitions (count definitions) :runtime-ir-nodes count-nodes
+                            :runtime-lazy-cells (:calls result) :runtime-output-bytes (erlang/byte_size module)})))))))

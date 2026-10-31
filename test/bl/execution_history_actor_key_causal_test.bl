@@ -1,0 +1,56 @@
+;; Native key equality is stricter than language sequential equality. Preserve
+;; the literal the unchanged SDK compiler actually emitted into the callback.
+(ns execution.history-actor-key-causal-test
+ (:require [reload.server-entry :as entry] [data.first-order :as data]))
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before))) (throw :actor-key-anchor-changed))
+ (String/replace source before after))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- install [source namespace]
+ (BeamLisp.Compiler/eval_string
+  (replace-once source "(ns reload.server-entry" (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace)) namespace)
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+
+(deftest E70-real-emitted-literal-is-language-equal-but-native-distinct-from-reconstructed-key
+ (let [source (producer "priv/std/reload/server-entry.bl")
+       before ":key (:val (second (:args (:else first-node))))"
+       after ":key (input-key clause)"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [namespace (str "history.closure.key.n" (erlang/unique_integer (list :positive)))
+           normal (install source (str namespace ".good"))
+           mutant (install (replace-once source before after) (str namespace ".mutant"))
+           form (first (BeamLisp.Reader/read_string
+                 "(defserver sample (init [parent] (ok parent)) (handle-call [:run n] [_ parent] :when (and (number? n) (pid? parent)) (reply (erlang/+ n 1) parent)))"))
+           compiled (BeamLisp.Compiler/compile form (BeamLisp.Compiler/new_env namespace))
+           descriptor (:val (first (:args (first (:stmts compiled)))))
+           clause (last (filter #(= :handle_call (:fname %)) (:clauses descriptor)))
+           _ (data/check! (select-keys clause [:params :guard]) {:max-nodes 16384 :max-depth 64 :max-bytes 262144})
+           actual (invoke normal "input-body" [(:name descriptor) clause])
+           old (invoke mutant "input-body" [(:name descriptor) clause])
+           reconstructed (entry/input-key clause)
+           hook (first (:stmts (entry/validation-body (:name descriptor) clause)))
+           emitted (:val (second (:args (:else hook))))]
+      (is (= :pstruct (:pop (first (:params clause)))))
+      (is (= true (:enforced actual) (:enforced old)))
+      (is (= emitted reconstructed) "both representations are the same language sequential value")
+      (is (erlang/not (erlang/== emitted reconstructed)) "the actual emitted literal preserves different native pair representations")
+      (is (erlang/== emitted (:key actual)))
+      (is (erlang/== reconstructed (:key old)))
+      (is (= :checked (maps/get emitted (maps/from_list (list (tuple (:key actual) :checked))))))
+      (is (= :missing (maps/get emitted (maps/from_list (list (tuple (:key old) :checked))) :missing)))
+      (is (= (:body actual) (:body old)))
+      (is (not (erlang/module_loaded (:name descriptor))) "no actor initializer or handler is executed by this compiler boundary proof")
+      (println :closure-E70 {:producer-sha256 (digest source)
+                            :mutant-sha256 (digest (replace-once source before after))
+                            :language-equal (= emitted reconstructed) :native-equal (erlang/== emitted reconstructed)
+                            :exact-key-bytes (erlang/external_size emitted)
+                            :reconstructed-key-bytes (erlang/external_size reconstructed)}))))
+   (finally (BeamLisp.Env/destroy scope)))))

@@ -1,0 +1,81 @@
+;; Actual fixed-SDK readiness Source at fresh ordinary namespace homes. The
+;; observer records descriptor reads, grants no invocation/initialization rights,
+;; and forwards every real SDK load through the original native boundary.
+(ns execution.history-readiness-causal-test)
+
+(defn- replace-one [text before after]
+ (assert (= 2 (count (String/split text before))))
+ (String/replace text before after))
+
+(defn- readiness-probe [variant]
+ (let [directory (Path/join (System/tmp_dir!) (str "history-readiness-" (erlang/unique_integer (list :positive))))
+       namespace (str "history.readiness." variant (erlang/unique_integer (list :positive)))
+       path (Path/join (BeamLisp.Tiers/priv_root) "std/reload/sdk-readiness.bl")
+       original (File/read! path)
+       observed (-> original
+                  (replace-one "(ns reload.sdk-readiness (:require [reload.native-call :as native-call]))"
+                    (str "(ns " namespace " (:require [reload.native-call :as native-call]))"))
+                  (replace-one "(def ^:private closures (atom {}))"
+                    "(def ^:private closures (atom {}))\n(def history-visits (atom []))\n(def history-shapes (atom []))")
+                  (replace-one "(enqueue! [target] (when target (write! :pending (conj (read :pending) target))))"
+                    "(enqueue! [target] (when target (swap! history-visits conj target) (write! :pending (conj (read :pending) target))))")
+                  (replace-one "(write! :namespaces (maps/put namespace info (read :namespaces))) info)"
+                    "(when info (swap! history-shapes conj {:namespace namespace :map? (map? (:definitions info)) :list? (erlang/is_list (:definitions info))})) (write! :namespaces (maps/put namespace info (read :namespaces))) info)"))
+       compiled (if (= variant "list-as-map")
+                  ;; Env/ns_defs now materializes a map. Recreate the original
+                  ;; list container explicitly; retaining its current map is
+                  ;; a no-op and does not exercise the historical schema fault.
+                  (replace-one observed ":definitions (Map/new definitions)" ":definitions (Enum/to_list definitions)")
+                  observed)
+       scope (BeamLisp.Env/fork :global) modules (atom (list))
+       untouched "loader.path.fallback-fixture"
+       untouched-before (BeamLisp.Env/loaded_ns? untouched)]
+  (File/mkdir_p! directory)
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [products (BeamLisp.AOT/compile_source compiled
+                     (list (tuple :output_dir directory)))
+           _ (reset! modules (mapv first products))
+           prepare (BeamLisp.Env/fetch_exact! namespace "prepare!")
+           visits (BeamLisp.Env/fetch_exact! namespace "history-visits")
+           shapes (BeamLisp.Env/fetch_exact! namespace "history-shapes")
+           result (prepare [[:binding "data.keys" "keywordize-existing"]])]
+      {:result result :visits @visits :shapes @shapes :namespace namespace
+       :producer-sha256 (Base/encode16 (crypto/hash :sha256 original) (list (tuple :case :lower)))
+       :unused-namespace-unchanged (= untouched-before (BeamLisp.Env/loaded_ns? untouched))})))
+   (finally
+    (BeamLisp.Env/destroy scope)
+    (when (seq @modules) (BeamLisp.Env/retire_modules! @modules))
+    (File/rm_rf! directory)))))
+
+(deftest E62-current-definition-list-walk-reaches-real-SDK-helper-bodies
+ (let [sdk-readiness-md5 (let [module (BeamLisp.Emit/base_module_for "reload.sdk-readiness")]
+                           (code/ensure_loaded module) (erlang/apply module :module_info (list :md5)))
+       normal (readiness-probe "current") mutant (readiness-probe "list-as-map")
+       targets (set (:visits normal)) broken (set (:visits mutant))
+       helper [:binding "data.first-order" "check!"]
+       native-one [:remote :Elixir.BeamLisp.CompilerData :check_first_order! 1]
+       native-two [:remote :Elixir.BeamLisp.CompilerData :check_first_order! 2]]
+  (println :history-wave-E62
+   {:producer-sha256 (:producer-sha256 normal)
+    :actual-helper helper :normal-follows-helper (contains? targets helper)
+    :mutant-follows-helper (contains? broken helper)
+    :normal-follows-helper-body (and (contains? targets native-one) (contains? targets native-two))
+    :mutant-follows-helper-body (or (contains? broken native-one) (contains? broken native-two))
+    :normal-reference-count (count targets) :mutant-reference-count (count broken)
+    :normal-actual-definition-shapes (:shapes normal) :mutant-actual-definition-shapes (:shapes mutant)
+    :unused-namespace-unchanged (:unused-namespace-unchanged normal)})
+  (is (= true (:result normal) (:result mutant)))
+  (is (contains? targets helper))
+  (is (contains? targets native-one))
+  (is (contains? targets native-two))
+  (is (not (contains? broken helper)))
+  (is (not (contains? broken native-one)))
+  (is (not (contains? broken native-two)))
+  (is (:unused-namespace-unchanged normal))
+  (is (:unused-namespace-unchanged mutant))
+  (is (every? :map? (:shapes normal)))
+  (is (every? :list? (:shapes mutant)))
+  (is (= sdk-readiness-md5
+         (erlang/apply (BeamLisp.Emit/base_module_for "reload.sdk-readiness") :module_info (list :md5))))))
