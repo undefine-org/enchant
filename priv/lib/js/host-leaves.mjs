@@ -405,11 +405,15 @@ export const BEAM_ONLY = Object.fromEntries([
   // Compiler hooks remain resolvable in shared code. function_exported is
   // false on JS, and explicit use cannot manufacture BEAM custody/metadata.
   "Elixir.BeamLisp.AOT/constructor_metadata_compiling?/0",
+  "Elixir.BeamLisp.AOT/constructor_call!/5",
+  "Elixir.BeamLisp.AOT/sdk_constructor_binding_reference/2",
+  "Elixir.BeamLisp.AOT/sdk_constructor_declaration_kind/2",
   "Elixir.BeamLisp.AOT/sdk_declaration_kind/2",
   "Elixir.BeamLisp.AOT/staged_macro_kind/2",
   "Elixir.BeamLisp.AOT/staged_macro_lookup/2",
   "Elixir.BeamLisp.Env/assert_native_framework_execution!/0",
   "Elixir.BeamLisp.Record/declaration_descriptor/4",
+  "Elixir.BeamLisp.Record/declaration_descriptor/5",
   "Elixir.BeamLisp.Record/declaration_kind/3",
   // Native contextual units use the BEAM's raw-term/class validator. Keep
   // its shared ANF callers linkable, but never replace that guard with a

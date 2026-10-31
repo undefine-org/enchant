@@ -24,7 +24,7 @@ import * as J from "./interop.mjs";
 import * as A from "./abi.mjs";
 import * as C from "./actor/module.mjs";
 import { exactCandidates, ENV } from "./env.mjs";
-import { LAZY_LEAVES, cell } from "./lazy.mjs";
+import { LAZY_LEAVES, cell, LazySeq, Delay, SeqCursor } from "./lazy.mjs";
 import { HOST_LEAVES, bindTable, registerModule, resolveRemote, mangle } from "./host-leaves.mjs";
 import { LINKS, RETURN_CONSTRUCTOR_SHAPES } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
@@ -252,7 +252,245 @@ function simpleFunctionClause(node) {
   }
   return clause;
 }
+
+// CompilerData's raw guards run during live macro expansion and namespace
+// declaration. Inspect this host's storage directly: never realize a lazy
+// value, call a collection protocol, or trust a user-supplied struct tag.
+function dataRefuse(reason) {
+  throw new BLError("Expected bounded first-order data",
+    R.hashMap(R.kw("kind"), R.kw("unsafe-first-order-data"), R.kw("reason"), R.kw(reason)));
+}
+function ownData(value, key, reason) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor || !("value" in descriptor)) dataRefuse(reason);
+  return descriptor.value;
+}
+function rawEntries(value, maximum) {
+  if (value instanceof HMap && ownData(value, "cnt", "map-storage") > maximum) dataRefuse("node-limit");
+  try { return R.rawMapEntries(value, maximum); }
+  catch { return dataRefuse("map-storage"); }
+}
+function rawField(entries, key, fallback = null) {
+  const entry = entries.find(([k]) => k === R.kw(key));
+  return entry ? entry[1] : fallback;
+}
+function numberBytes(value) {
+  if (value instanceof R.Flt) return 10; // version, NEW_FLOAT_EXT tag, eight payload bytes
+  const n = typeof value === "bigint" ? value : BigInt(value);
+  if (n >= 0n && n <= 255n) return 3;
+  if (n >= -2147483648n && n <= 2147483647n) return 6;
+  const magnitude = n < 0n ? -n : n;
+  const digits = Math.ceil(magnitude.toString(2).length / 8);
+  return digits + (digits < 256 ? 4 : 7);
+}
+function scalarBytes(value) {
+  if (typeof value === "string") return byteSize(value);
+  if (value instanceof Kw) {
+    const name = ownData(value, "fq", "opaque-value");
+    if (typeof name !== "string") dataRefuse("opaque-value");
+    return byteSize(name);
+  }
+  if (value === null) return 3;
+  if (typeof value === "boolean") return value ? 4 : 5;
+  if (value instanceof R.Flt && !Number.isFinite(ownData(value, "v", "opaque-value"))) dataRefuse("opaque-value");
+  if (integer(value) || value instanceof R.Flt) return numberBytes(value);
+  return 0;
+}
+const scalarData = (value) => value === null || typeof value === "boolean" ||
+  typeof value === "string" || integer(value) || value instanceof Kw || value instanceof R.Flt;
+
+function rawSymbol(value) {
+  if (!(value instanceof Tup)) return false;
+  const items = ownData(value, "items", "native-tuple");
+  return Array.isArray(items) && items.length === 2 && ownData(items, 0, "native-tuple") === R.kw("symbol") &&
+    typeof ownData(items, 1, "native-tuple") === "string";
+}
+function checkFirstOrder(value, options) {
+  if (!(options instanceof HMap)) dataRefuse("invalid-limits");
+  const settings = rawEntries(options, 1000000);
+  if (settings.some(([k]) => k === R.kw("__struct__"))) dataRefuse("invalid-limits");
+  const maxNodes = rawField(settings, "max-nodes", 16384), maxBytes = rawField(settings, "max-bytes", 1048576),
+    maxDepth = rawField(settings, "max-depth", 64);
+  if (!integer(maxNodes) || maxNodes < 1 || maxNodes > 1000000 ||
+      !integer(maxBytes) || maxBytes < 1 || maxBytes > 67108864 ||
+      !integer(maxDepth) || maxDepth < 1 || maxDepth > 128) dataRefuse("invalid-limits");
+  let nodes = Number(maxNodes), bytes = Number(maxBytes);
+  const spend = (depth, amount = 0) => {
+    if (depth > maxDepth) dataRefuse("depth-limit");
+    if (--nodes < 0) dataRefuse("node-limit");
+    if ((bytes -= amount) < 0) dataRefuse("byte-limit");
+  };
+  const dense = (items, count, depth) => {
+    if (!Array.isArray(items) || items.length !== count || count > 32) dataRefuse("vector-storage");
+    for (let i = 0; i < count; i++) walk(ownData(items, i, "vector-storage"), depth + 1);
+  };
+  const trie = (node, level, expected, depth) => {
+    spend(depth);
+    if (!Array.isArray(node)) dataRefuse("vector-trie");
+    if (level === 0) { if (expected !== 32) dataRefuse("vector-count"); dense(node, 32, depth); return; }
+    const capacity = 2 ** level, children = Math.ceil(expected / capacity);
+    if (node.length !== children || children > 32) dataRefuse("vector-placement");
+    for (let i = 0, left = expected; i < 32; i++) {
+      const amount = Math.min(left, capacity);
+      if (amount === 0) spend(depth + 1); // native vectors carry explicit nil lanes
+      else { trie(ownData(node, i, "vector-trie"), level - 5, amount, depth + 1); left -= amount; }
+    }
+  };
+  const walk = (v, depth) => {
+    spend(depth, scalarBytes(v));
+    if (scalarData(v)) return;
+    if (v === EMPTY || v instanceof Cons) {
+      for (let remaining = v; remaining !== EMPTY;) {
+        if (!(remaining instanceof Cons)) dataRefuse("improper-list");
+        walk(ownData(remaining, "h", "improper-list"), depth + 1);
+        remaining = ownData(remaining, "t", "improper-list");
+      }
+    } else if (v instanceof Tup) {
+      const items = ownData(v, "items", "native-tuple");
+      if (!Array.isArray(items)) dataRefuse("native-tuple");
+      if (rawSymbol(v)) walk(ownData(items, 1, "native-tuple"), depth + 1);
+      else if (items.length === 3 && ownData(items, 0, "native-tuple") === R.kw("meta")) {
+        const symbol = ownData(items, 1, "native-tuple"), metadata = ownData(items, 2, "native-tuple");
+        if (!rawSymbol(symbol) || !(metadata instanceof HMap) || rawEntries(metadata, nodes).some(([k]) => k === R.kw("__struct__"))) dataRefuse("native-tuple");
+        walk(symbol, depth + 1); walk(metadata, depth + 1);
+      } else dataRefuse("native-tuple");
+    } else if (v instanceof Vec) {
+      walk(ownData(v, "meta", "vector-fields"), depth + 1);
+      const count = ownData(v, "cnt", "vector-storage"), shift = ownData(v, "shift", "vector-trie"),
+        root = ownData(v, "root", "vector-trie"), tail = ownData(v, "tail", "vector-storage");
+      if (!Number.isSafeInteger(count) || count < 0 || !Array.isArray(tail)) dataRefuse("vector-storage");
+      if (count <= 32) {
+        if (shift !== 5 || !Array.isArray(root) || root.length !== 0) dataRefuse("vector-storage");
+        dense(tail, count, depth);
+      } else {
+        if (count > maxNodes) dataRefuse("node-limit");
+        if (!Number.isInteger(shift) || shift < 5 || shift > 30 || shift % 5 || tail.length < 1 || tail.length > 32) dataRefuse("vector-trie");
+        const treeCount = count - tail.length;
+        if (treeCount % 32 || tail.length !== 1 + (count - 1) % 32 || (shift !== 5 && treeCount <= 2 ** shift)) dataRefuse("vector-count");
+        trie(root, shift, treeCount, depth + 1); dense(tail, tail.length, depth + 1);
+      }
+    } else if (v instanceof R.HSet) {
+      const members = ownData(v, "m", "set-storage");
+      if (!(members instanceof HMap)) dataRefuse("set-storage");
+      spend(depth + 1);
+      for (const [key, marker] of rawEntries(members, nodes)) {
+        if (marker !== true) dataRefuse("set-storage");
+        walk(key, depth + 2); walk(EMPTY, depth + 2);
+      }
+    } else if (v instanceof R.Dec) {
+      const unscaled = ownData(v, "u", "decimal-storage"), scale = ownData(v, "s", "decimal-storage");
+      if (!integer(unscaled) || !integer(scale) || scale < 0) dataRefuse("decimal-storage");
+      walk(unscaled, depth + 1); walk(scale, depth + 1);
+    } else if (v instanceof HMap) {
+      const entries = rawEntries(v, nodes);
+      if (entries.some(([k]) => k === R.kw("__struct__"))) dataRefuse("foreign-struct");
+      for (const [key, item] of entries) { walk(key, depth + 1); walk(item, depth + 1); }
+    } else if (v instanceof LazySeq || v instanceof Delay || v instanceof SeqCursor || v instanceof R.Atom) dataRefuse("foreign-struct");
+    else dataRefuse("opaque-value");
+  };
+  walk(value, 0);
+  return value;
+}
+
+function rawError(kind, reason) {
+  const data = reason === undefined ? R.kw(kind) : T(R.kw(kind), R.kw(reason));
+  throw Object.assign(new BLError(kind + (reason === undefined ? "" : ": " + reason)), {data});
+}
+function checkReaderData(form) {
+  const pending = [[form, 0]];
+  let nodes = 16384, bytes = 1048576;
+  try {
+    while (pending.length) {
+      const [value, depth] = pending.pop();
+      if (--nodes < 0 || (bytes -= 8 + (typeof value === "string" ? byteSize(value) : 0)) < 0 || depth > 64) rawError("invalid_reader_data");
+      if (value instanceof R.Flt && !Number.isFinite(ownData(value, "v", "opaque-value"))) rawError("invalid_reader_data");
+      if (scalarData(value) || value === EMPTY) continue;
+      if (value instanceof Cons) {
+        pending.push([ownData(value, "t", "improper-list"), depth], [ownData(value, "h", "improper-list"), depth + 1]);
+      } else if (value instanceof Tup) {
+        const items = ownData(value, "items", "native-tuple");
+        if (!Array.isArray(items) || items.length > nodes) rawError("invalid_reader_data");
+        for (let i = items.length - 1; i >= 0; i--) pending.push([ownData(items, i, "native-tuple"), depth + 1]);
+      } else if (value instanceof HMap) {
+        const entries = rawEntries(value, nodes);
+        if (entries.some(([k]) => k === R.kw("__struct__"))) rawError("invalid_reader_data");
+        for (const [key, item] of entries) pending.push([item, depth + 1], [key, depth + 1]);
+      } else if (value instanceof R.Dec) {
+        const unscaled = ownData(value, "u", "decimal-storage"), scale = ownData(value, "s", "decimal-storage");
+        if (!integer(unscaled) || !integer(scale) || scale < 0) rawError("invalid_reader_data");
+        // The native Reader delegates decimal fields to the first-order raw
+        // walker: numeric ETF byte costs, without Reader's eight-byte overhead.
+        for (const part of [unscaled, scale]) {
+          if (--nodes < 0 || (bytes -= numberBytes(part)) < 0 || depth + 1 > 64) rawError("invalid_reader_data");
+        }
+      } else rawError("invalid_reader_data");
+    }
+  } catch { rawError("invalid_reader_data"); }
+  return form;
+}
+const unmetaReader = (node) => node instanceof Tup && node.items.length === 3 && node.items[0] === R.kw("meta") ? unmetaReader(node.items[1]) : node;
+const readerTag = (node, tag) => node instanceof Tup && node.items.length === 2 && node.items[0] === R.kw(tag);
+function requireName(node) {
+  node = unmetaReader(node);
+  if (!readerTag(node, "symbol") || typeof node.items[1] !== "string" || !byteSize(node.items[1])) rawError("invalid_namespace_require", "symbol");
+  return node.items[1];
+}
+function namespaceRequire(spec) {
+  checkReaderData(spec);
+  const node = unmetaReader(spec);
+  if (readerTag(node, "symbol")) return T(requireName(node), null, EMPTY);
+  if (!readerTag(node, "vector") || !isList(node.items[1]) || node.items[1] === EMPTY) rawError("invalid_namespace_require", "shape");
+  const items = arr(node.items[1]), target = requireName(items[0]), seen = new Set();
+  let alias = null, refers = EMPTY;
+  for (let i = 1; i < items.length; i += 2) {
+    if (i + 1 === items.length) rawError("invalid_namespace_require", "missing-option-value");
+    const key = unmetaReader(items[i]), value = unmetaReader(items[i + 1]);
+    if (!readerTag(key, "keyword") || !["as", "refer"].includes(key.items[1])) rawError("invalid_namespace_require", "option");
+    const option = key.items[1];
+    if (seen.has(option)) rawError("invalid_namespace_require", "duplicate-option");
+    seen.add(option);
+    if (option === "as") alias = requireName(value);
+    else if (readerTag(value, "keyword") && value.items[1] === "all") refers = R.kw("all");
+    else {
+      if (!readerTag(value, "vector") || !isList(value.items[1])) rawError("invalid_namespace_require", "refer");
+      const names = arr(value.items[1]).map(requireName);
+      if (new Set(names).size !== names.length) rawError("invalid_namespace_require", "duplicate-refer");
+      refers = list(names);
+    }
+  }
+  return T(target, alias, refers);
+}
+function namespaceExcludes(specs) {
+  checkReaderData(specs);
+  if (!isList(specs)) rawError("invalid_namespace_excludes", "shape");
+  const items = arr(specs), out = [];
+  for (let i = 0; i < items.length; i += 2) {
+    if (i + 1 === items.length) rawError("invalid_namespace_excludes", "missing-value");
+    const key = unmetaReader(items[i]), value = unmetaReader(items[i + 1]);
+    if (!readerTag(key, "keyword") || key.items[1] !== "exclude" || !readerTag(value, "vector") || !isList(value.items[1])) rawError("invalid_namespace_excludes", "option");
+    out.push(...arr(value.items[1]).map(requireName));
+  }
+  return list(out);
+}
+function namespaceClauses(forms) {
+  checkReaderData(forms);
+  if (!isList(forms)) rawError("invalid_namespace_header", "clauses");
+  const clauses = forms instanceof Cons && typeof unmetaReader(forms.h) === "string" ? forms.t : forms;
+  for (const clause of arr(clauses)) {
+    const node = unmetaReader(clause);
+    if (!readerTag(node, "list") || !isList(node.items[1]) || node.items[1] === EMPTY) rawError("invalid_namespace_header", "clause");
+    const head = unmetaReader(node.items[1].h);
+    if (!readerTag(head, "keyword") || !["require", "import", "refer-clojure"].includes(head.items[1])) rawError("invalid_namespace_header", "clause");
+  }
+  return clauses;
+}
 Object.assign(LEAVES, {
+  "Elixir.BeamLisp.CompilerData/check_first_order!/1": (v) => checkFirstOrder(v, R.EMPTY_MAP),
+  "Elixir.BeamLisp.CompilerData/check_first_order!/2": checkFirstOrder,
+  "Elixir.BeamLisp.CompilerData/check_reader_data!/1": checkReaderData,
+  "Elixir.BeamLisp.CompilerData/namespace_require_spec/1": namespaceRequire,
+  "Elixir.BeamLisp.CompilerData/namespace_core_excludes/1": namespaceExcludes,
+  "Elixir.BeamLisp.CompilerData/namespace_clauses/1": namespaceClauses,
   "Elixir.BeamLisp.CompilerData/binding_reference?/1": bindingReference,
   "Elixir.BeamLisp.CompilerData/simple_function_clause/1": simpleFunctionClause,
   "Elixir.BeamLisp.CompilerData/catch_stack_bindings/0": () => R.hashMap(R.kw("frames"), "__STACKTRACE__", R.kw("raw"), "__STACKTRACE_RAW__"),
@@ -269,6 +507,27 @@ Object.assign(LEAVES, {
     return out;
   },
   "Elixir.Enum/map/2": (c, f) => list(eagerList(c).map((x) => A.invoke(f, x))),
+  "Elixir.Enum/filter/2": (c, f) => {
+    const out = [];
+    for (const x of enumerable(c)) if (R.truthy(A.invoke(f, x))) out.push(x);
+    return list(out);
+  },
+  "Elixir.Enum/map_reduce/3": (c, acc, f) => {
+    const out = [];
+    for (const x of enumerable(c)) {
+      const pair = A.invoke(f, x, acc);
+      if (!(pair instanceof Tup) || pair.items.length !== 2) return badarg("map_reduce result", pair);
+      out.push(pair.items[0]); acc = pair.items[1];
+    }
+    return T(list(out), acc);
+  },
+  "Elixir.Enum/reverse/1": (c) => list(Array.from(enumerable(c)).reverse()),
+  "Elixir.Enum/sort_by/2": (c, f) => {
+    const keyed = [];
+    for (const value of enumerable(c)) keyed.push([A.invoke(f, value), value]);
+    return list(keyed.sort((a, b) => R.termCompare(a[0], b[0])).map(([, value]) => value));
+  },
+  "Elixir.Enum/with_index/1": (c) => list(Array.from(enumerable(c)).map((x, i) => T(x, i))),
   "Elixir.Enum/flat_map/2": (c, f) => list(eagerList(c).flatMap((x) => eagerList(A.invoke(f, x)))),
   "Elixir.Enum/reduce/3": (c, acc, f) => eagerList(c).reduce((a, x) => A.invoke(f, x, a), acc),
   "Elixir.Enum/sort/1": (c) => list(eagerList(c).sort(R.compare)),
@@ -276,6 +535,15 @@ Object.assign(LEAVES, {
   "Elixir.Enum/zip/2": (a, b) => { const xs = eagerList(a), ys = eagerList(b); return list(xs.slice(0, ys.length).map((x, i) => T(x, ys[i]))); },
   "Elixir.Enum/drop/2": (c, n) => { const xs = eagerList(c); return list(n < 0 ? xs.slice(0, Math.max(0, xs.length + n)) : xs.slice(n)); },
   "Elixir.Map/get/2": (m, k) => m.get(k, null),
+  "Elixir.Map/new/1": (c) => {
+    let out = R.EMPTY_MAP;
+    for (const pair of enumerable(c)) {
+      if (!(pair instanceof Tup) || pair.items.length !== 2) return badarg("Map.new entry", pair);
+      out = out.assoc(pair.items[0], pair.items[1]);
+    }
+    return out;
+  },
+  "Elixir.Atom/to_string/1": (a) => a === null ? "nil" : typeof a === "boolean" ? String(a) : a instanceof Kw ? a.fq : badarg("atom", a),
   "Elixir.Map/to_list/1": (m) => list(m.entries().map(([k, v]) => T(k, v))),
   "lists/seq/2": (a, b) => { if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || b < a - 1) return badarg("seq", T(a, b)); return list(Array.from({length: Math.max(0, b - a + 1)}, (_, i) => a + i)); },
   "lists/all/2": (f, xs) => { for (const x of arr(xs)) { const v = A.invoke(f, x); if (v === false) return false; if (v !== true) return badarg("all predicate", v); } return true; },
@@ -291,6 +559,7 @@ Object.assign(LEAVES, {
   // erlang:get/put answer the atom `undefined` for a missing key, not nil
   "erlang/get/1": (k) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED),
   "erlang/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED; PDICT.set(pkey(k), v); return old; },
+  "erlang/erase/1": (k) => { const key = pkey(k), old = PDICT.has(key) ? PDICT.get(key) : UNDEFINED; PDICT.delete(key); return old; },
   "Elixir.Process/get/1": (k) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null),
   "Elixir.Process/get/2": (k, d) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : d),
   "Elixir.Process/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null; PDICT.set(pkey(k), v); return old; },

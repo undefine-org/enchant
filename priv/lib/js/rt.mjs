@@ -391,6 +391,44 @@ export class HMap {
   entries() { return sortedEntries([...nodeEntries(this.root)]); }
 }
 export const EMPTY_MAP = new HMap(0, EMPTY_BNODE, null);
+/** Bounded storage view for the compiler's passive-data validators. Unlike
+    entries()/Enumerable this never compares keys or calls an instance method.
+    Keep the private HAMT marker/class checks here, beside their representation. */
+export function rawMapEntries(map, maximum) {
+  const own = (object, key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor || !("value" in descriptor)) throw new TypeError("invalid raw map storage");
+    return descriptor.value;
+  };
+  if (!(map instanceof HMap)) throw new TypeError("invalid raw map storage");
+  const count = own(map, "cnt");
+  if (!Number.isSafeInteger(count) || count < 0 || count > maximum) throw new TypeError("invalid raw map count");
+  const pending = [[own(map, "root"), 0]], entries = [];
+  let remaining = 8 * Math.max(1, count) + 1;
+  while (pending.length) {
+    if (--remaining < 0) throw new TypeError("invalid raw map storage");
+    const [node, depth] = pending.pop();
+    if (!(node instanceof BNode || node instanceof CNode) || depth > 7) throw new TypeError("invalid raw map node");
+    const values = own(node, "arr");
+    if (!Array.isArray(values) || values.length % 2 || values.length > 2 * Math.max(1, count)) throw new TypeError("invalid raw map storage");
+    if (node instanceof BNode) {
+      const bitmap = own(node, "bitmap");
+      if (!Number.isInteger(bitmap) || (bitmap | 0) !== bitmap || values.length !== 2 * popcount(bitmap)) throw new TypeError("invalid raw map bitmap");
+    }
+    for (let i = 0; i < values.length; i += 2) {
+      const key = own(values, i), value = own(values, i + 1);
+      if (key === NODE_MARK) {
+        if (!(node instanceof BNode)) throw new TypeError("invalid raw map marker");
+        pending.push([value, depth + 1]);
+      } else {
+        if (entries.length >= count) throw new TypeError("invalid raw map count");
+        entries.push([key, value]);
+      }
+    }
+  }
+  if (entries.length !== count) throw new TypeError("invalid raw map count");
+  return entries;
+}
 export function hashMap(...kvs) {
   let m = EMPTY_MAP;
   for (let i = 0; i < kvs.length; i += 2) m = m.assoc(kvs[i], kvs[i + 1]);
