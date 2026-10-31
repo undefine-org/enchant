@@ -1,6 +1,7 @@
 (ns proc.queue-protocol-test
  (:require [proc :as proc] [proc.queue :as q] [datom :as d] [datom.conn :as dc]
-           [datom.store-map :as sm] [datom.store :as ds] [proc.evolve :as ev]))
+           [datom.store-map :as sm] [datom.store :as ds] [proc.evolve :as ev]
+           [reload.generation :as generation] [reload.state :as state]))
 
 (proc/defserver protocol-q
  (queue {:of :test/work :protocol 2 :generation "release-b"
@@ -98,33 +99,67 @@
    (is (= "g3" (:job/generation again)))
    (is (= :store-already-bound (try (q/attach-store! srv (dc/connect-with (sm/open) [])) nil (catch e (:kind (ex-data e)))))))))
 
+(defn- retirement-generation [version]
+ (generation/prepare!
+  {:application-id "queue-retirement-proof" :fixed-runtime true
+   :resources {:fixture-version version} :protocols {:retirement-proof-q 1}
+   :native-modules #{"erlang"}
+   :sources {"queue.retirement"
+    "(ns queue.retirement)
+     (defn accepts [message] (erlang/is_binary message))
+     (defn state-valid [value] (erlang/is_integer value))
+     (defn migrate [value] value)
+     (defn upcast [message] message)
+     (defn handler [message value] {:reply message :state value})
+     (defn spec [version digest]
+      {:version version :digest digest :accept? accepts :check-state state-valid
+       :handler handler :migrate-state migrate :upcast upcast})"}}))
+(defn- retirement-spec [graph version]
+ (ev/prepare-spec (generation/invoke! graph "queue.retirement/spec" [version (:digest graph)])))
+
 (deftest managed-retirement-observes-durable-failures-and-closes-producers
- (let [srv :retirement-proof-q c (dc/connect-with (sm/open) [])
-       base {:version 1 :digest "m1" :accept? (fn [_] true)
-             :check-state (fn [_] true) :handler (fn [m s] {:reply m :state s})}
-       p (ev/start! base nil {:managed true})]
+ (let [srv (q/scoped-server "queue-retirement-proof" :retirement-proof-q)
+       c (dc/connect-with (sm/open) [])
+       old (retirement-generation 1) fresh (retirement-generation 2) owner (atom nil)]
   (try
+   (generation/with! old #(state/bind! {}))
+   (generation/inherit-runtime! fresh old)
+   (reset! owner (generation/with! old #(ev/start! (retirement-spec old 1) 0 {:managed true})))
    (q/attach-store! srv c)
    (d/transact! c [{:db/id -1 :queue/key (name srv)
                    :queue/decl (assoc (q/normalise-decl {:of :test/retirement}) :server (name srv))}])
    (let [j (q/enqueue! srv {:test/value 9})]
-    (is (= :bound (:status (ev/bind-queue! p srv))))
-    (ev/upgrade! p 1 (assoc base :version 2 :digest "m2" :migrate-state (fn [s] s) :upcast (fn [m] m)))
-    (let [waiting (ev/retire! p 2 1)]
+    (is (= :bound (:status (ev/bind-queue! @owner srv))))
+    ;; The explicit public protocol keeps the exact preparation ticket through
+    ;; cold future-domain admission, then commits that ticket once.
+    (let [transition (generation/with! fresh
+                       (fn []
+                        (let [prepared (ev/prepare-upgrade! @owner 1 (retirement-spec fresh 2))]
+                         {:prepared prepared
+                          :committed (when (= :prepared (:status prepared))
+                                       (ev/commit-upgrade! @owner (:ticket prepared)))})))]
+     (is (= :prepared (:status (:prepared transition))) (pr-str transition))
+     (is (= :applied (:status (:committed transition))) (pr-str transition)))
+    (let [waiting (ev/retire! @owner 2 1)]
      (is (= :waiting (:status waiting)))
      (is (= 1 (:durable waiting))))
     (is (= 1 (:fenced-through (q/protocol-inventory srv))))
     (d/transact! c [[:db/add (:db/id j) :job/state :failed]])
-    (is (= :waiting (:status (ev/retire! p 2 1))) "failed work retains the adapter")
+    (is (= :waiting (:status (ev/retire! @owner 2 1))) "failed work retains the adapter")
     (d/transact! c [[:db/add (:db/id j) :job/state :cancelled]])
-    (is (= :retired (:status (ev/retire! p 2 1))))
-    (is (= :bound (:status (ev/bind-queue! p srv))))
-    (let [other :retirement-late-proof-q other-c (dc/connect-with (sm/open) [])]
+    (is (= :retired (:status (ev/retire! @owner 2 1))))
+    (is (= :bound (:status (ev/bind-queue! @owner srv))))
+    (let [other (q/scoped-server "queue-retirement-proof" :retirement-late-proof-q)
+          other-c (dc/connect-with (sm/open) [])]
      (q/attach-store! other other-c)
      (d/transact! other-c [{:db/id -1 :queue/key (name other)
                            :queue/decl (assoc (q/normalise-decl {:of :test/late-retirement}) :server (name other))}])
-     (is (= :inventory-sealed (:kind (ev/bind-queue! p other))))))
-   (finally (GenServer/stop p)))))
+     (try
+      (is (= :inventory-sealed (:kind (ev/bind-queue! @owner other))))
+      (finally (dc/close! other-c)))))
+   (finally
+    (when (and @owner (Process/alive? @owner)) (GenServer/stop @owner))
+    (generation/retire! fresh) (generation/retire! old) (dc/close! c)))))
 
 (def submissions (atom 0))
 (def lookups (atom 0))
@@ -177,23 +212,34 @@
     (is (= :complete (:status (q/begin-effect! srv b :upload))))))))
 
 (deftest sealed-producer-context-prevents-current-declaration-mislabeling
- (let [srv :sealed-producer-q c (dc/connect-with (sm/open) []) prior (Process/get :bl_generation)]
+ (let [application "queue-producer-proof"
+       graph (fn [version protocols]
+               (generation/prepare!
+                {:application-id application :protocols protocols :resources {:fixture-version version}
+                 :sources {"queue.producer" "(ns queue.producer) (defn value [] 42)"}}))
+       old (graph 1 {:sealed-producer-q 1}) fresh (graph 2 {:sealed-producer-q 2})
+       unmapped (graph 3 {}) srv (q/scoped-server application :sealed-producer-q)
+       c (dc/connect-with (sm/open) [])]
   (q/attach-store! srv c)
   (d/transact! c [{:db/id -1 :queue/key (name srv)
-                  :queue/decl (assoc (q/normalise-decl {:of :test/sealed :protocol 2 :generation "new"}) :server (name srv))}])
+                  :queue/decl (assoc (q/normalise-decl
+                                 {:of :test/sealed :protocol 2 :generation (:digest fresh)}) :server (name srv))}])
   (try
-   (Process/put :bl_generation {:digest "old" :protocols {"sealed-producer-q" {:protocol 1 :generation "old"}}})
-   (let [j (q/enqueue! srv {:test/old 12})]
+   (let [j (generation/with! old #(q/enqueue! srv {:test/old 12}))]
     (is (= 1 (:job/protocol j)))
-    (is (= "old" (:job/generation j))))
+    (is (= (:digest old) (:job/generation j))))
    (is (= :generation-conflict
-          (try (q/enqueue! srv {:test/old 12} {:generation "new"}) nil (catch e (:kind (ex-data e))))))
-   (Process/put :bl_generation {:digest "unmapped" :protocols {}})
+          (try (generation/with! old #(q/enqueue! srv {:test/old 12} {:generation (:digest fresh)}))
+           nil (catch e (:kind (ex-data e))))))
    (is (= :undeclared-queue-protocol
-          (try (q/enqueue! srv {:test/old 13}) nil (catch e (:kind (ex-data e))))))
+          (try (generation/with! unmapped #(q/enqueue! srv {:test/old 13}))
+           nil (catch e (:kind (ex-data e))))))
    (is (= :undeclared-queue-protocol
-          (try (q/enqueue! srv {:test/old 14} {:protocol 1}) nil (catch e (:kind (ex-data e))))))
-   (finally (Process/put :bl_generation prior)))))
+          (try (generation/with! unmapped #(q/enqueue! srv {:test/old 14} {:protocol 1}))
+           nil (catch e (:kind (ex-data e))))))
+   (finally
+    (generation/retire! unmapped) (generation/retire! fresh) (generation/retire! old)
+    (dc/close! c)))))
 
 (deftest retry-and-prune-share-one-writer-decision
  (let [srv :retry-prune-q c (dc/connect-with (sm/open) [])]
