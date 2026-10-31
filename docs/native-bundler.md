@@ -621,11 +621,13 @@ only what it reads:
 | `natives` (six server NIFs) | `native/<6 crates>` + their `Cargo.lock`s | a crate changes |
 | `bl-drop` (deps, `bl build`, native seed/check, self-build, ELF retarget) | `bin priv env.bl bl.lock` + `tooling/drop/{src,Cargo.*}` | any `.bl` change |
 
-Both the Nix server build and release CI regenerate the native bootstrap floor
-with `bl seed --ebin build` after compilation, then verify it with `bl seed
---check` before self-build. Pinned host modules load from that floor; editing
-`priv/host` alone does not replace their executable bytes. The source check is
-a release gate so a source revision cannot silently package older host fixes.
+The canonical `nix/compiler-product.nix` prepares P, then produces B and C,
+fresh-boots each through `check-source-floor`, and requires every B/C file to
+match before installing C as the compiler seed. CI verifies the selected
+compiler's immutable qualification and every installed seed byte with
+`scripts/check-produced-compiler.py`; the SDK image must contain that exact
+floor. The committed bootstrap seed supplies a predecessor, rather than a
+second output that release CI regenerates and compares against C.
 
 `bl-drop` compiles no Rust: it takes the launcher/`drop` from `drop-tools`, and a
 `cargo` shim answers `bl build`'s native stage from `natives` (real cargo for
