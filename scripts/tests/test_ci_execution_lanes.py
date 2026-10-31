@@ -24,7 +24,8 @@ class ExecutionLaneTests(unittest.TestCase):
         original = [name for group in inventory.partitions(ROOT, 4) for name in group]
         bounded = [name for group in inventory.partitions(ROOT, 4, lane='bounded') for name in group]
         host = inventory.partitions(ROOT, 1, lane='host-nix')[0]
-        self.assertEqual({'test/bl/native_test.bl', 'test/bl/native_runtime_custody_test.bl'}, set(host))
+        self.assertEqual({'test/bl/native_test.bl', 'test/bl/native_runtime_custody_test.bl',
+                          'test/bl/build_session_test.bl', 'test/bl/contextual_build_test.bl'}, set(host))
         self.assertEqual(set(original), set(bounded + host))
         self.assertEqual(len(original), len(bounded + host))
         self.assertFalse(set(host) & set(bounded))
