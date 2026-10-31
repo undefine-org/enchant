@@ -56,6 +56,25 @@ test("dense/trie vectors, decimals and reserved set members remain data", () => 
     R.dec(123n, 2), R.hashSet(kw("__struct__")), R.hashMap(kw("a"), list(1, symbol("x")))]) assert.equal(check(value, R.EMPTY_MAP), value);
 });
 
+test("form metadata admits bounded passive collections without invoking payloads", () => {
+  let calls = 0;
+  const marked = (form, metadata = R.hashMap(kw("line"), 1)) => T(kw("meta"), form, metadata);
+  for (const form of [symbol("x"), R.EMPTY, list(symbol("inc"), 4), R.hashMap(kw("x"), 1),
+    R.vecFromArray([1, 2]), R.hashSet(1)]) {
+    const value = marked(form);
+    assert.equal(check(value, R.EMPTY_MAP), value);
+    assert.throws(() => check(value, opts("max-nodes", 1)), /bounded first-order/);
+  }
+  const callback = () => { calls++; return list(1); };
+  for (const value of [marked(7), marked(T(kw("x"), 1)), marked(Z.newLazy(callback)),
+    marked(list(callback)), marked(R.hashMap(kw("hidden"), R.makeRef())),
+    marked(symbol("x"), R.hashMap(kw("hidden"), callback)),
+    marked(R.hashMap(kw("__struct__"), kw("foreign")))]) {
+    assert.throws(() => check(value, R.EMPTY_MAP), /bounded first-order/);
+  }
+  assert.equal(calls, 0);
+});
+
 test("raw guards refuse resources, callbacks and malformed storage without forcing", () => {
   let calls = 0;
   const lazy = Z.newLazy(() => { calls++; return list(1); });

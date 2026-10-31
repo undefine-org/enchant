@@ -350,9 +350,10 @@ function checkFirstOrder(value, options) {
       if (!Array.isArray(items)) dataRefuse("native-tuple");
       if (rawSymbol(v)) walk(ownData(items, 1, "native-tuple"), depth + 1);
       else if (items.length === 3 && ownData(items, 0, "native-tuple") === R.kw("meta")) {
-        const symbol = ownData(items, 1, "native-tuple"), metadata = ownData(items, 2, "native-tuple");
-        if (!rawSymbol(symbol) || !(metadata instanceof HMap) || rawEntries(metadata, nodes).some(([k]) => k === R.kw("__struct__"))) dataRefuse("native-tuple");
-        walk(symbol, depth + 1); walk(metadata, depth + 1);
+        const form = ownData(items, 1, "native-tuple"), metadata = ownData(items, 2, "native-tuple");
+        if (!(rawSymbol(form) || form === EMPTY || form instanceof Cons || form instanceof HMap || form instanceof R.Vec || form instanceof R.HSet) ||
+            !(metadata instanceof HMap) || rawEntries(metadata, nodes).some(([k]) => k === R.kw("__struct__"))) dataRefuse("native-tuple");
+        walk(form, depth + 1); walk(metadata, depth + 1);
       } else dataRefuse("native-tuple");
     } else if (v instanceof Vec) {
       walk(ownData(v, "meta", "vector-fields"), depth + 1);
