@@ -328,72 +328,81 @@ a lost connection there is an unknown outcome (exit 1), not a re-run.
 
 ## 13. Building the blessed `bl`
 
-`mix bl.build` is the one command: compile → `mix release bl` (prod) → build the
-Rust launcher + pack tool → `drop pack` → install `./bl`. Options: `--out PATH`,
-`--release DIR` (reuse a tree), `--skip-cargo`, `--target os/arch`. The escript
-(`mix escript.build`) still builds as a legacy path; prefer the drop.
+`./bin/bl --cold self-build --out ./bl-release` publishes the portable release
+from the canonical Nix SDK producer. It selects retained compiler, dependency,
+native and SDK unit products by their inputs. A stdlib edit reuses completed
+units from the retained predecessor. There is no separate Mix release recipe.
+
+Release labels and commit provenance are packaging metadata. CI does not edit
+`env.bl` to stamp a tag: that file is a compiler input, so restamping it would
+rebuild the compiler on every release. The application version remains the
+version declared by the SDK; the release requirements receipt identifies the
+exact release commit and binary digest.
 
 ## 14. CI — GitHub Actions (`.github/workflows/release.yml`)
 
-One drop per target, attached to a GitHub release on a `v*` tag (or built
-without publishing via `workflow_dispatch`).
+The qualified release target is **Linux x86_64 only**. ARM and macOS builds
+remain unavailable until their production paths and native surfaces pass the
+same qualification. They are absent from the release matrix and asset list.
 
-| artifact | runner | note |
+| work | runner | runtime contract |
 |---|---|---|
-| `bl-linux-x86_64` | `ubuntu-24.04` | glibc ≥ 2.39 — that is the pinned z3 asset's floor (`z3-4.16.0-x64-glibc-2.39`), which the fetch task smoke-runs |
-| `bl-linux-aarch64` | `ubuntu-24.04-arm` | z3's aarch64 asset is glibc 2.38 |
-| `bl-macos-arm64` | `macos-15` | |
-| `bl-macos-x86_64` | `macos-15-intel` | `macos-13` was retired 2025-12; `macos-15-intel` is its replacement |
+| Canonical SDK producer | `blacksmith-8vcpu-ubuntu-2604` | one SDK and one portable candidate |
+| Inventory and publication consumers | `blacksmith-4vcpu-ubuntu-2604` | exact retained producer SDK/drop |
+| Published `bl-linux-x86_64` | Linux x86_64 | measured glibc floor, currently 2.44; standard C++/OpenSSL/ncurses/zlib/brotli/zstd runtime libraries |
 
-**Each target is built natively, on its own runner.** That is the design, not
-a shortcut:
+The shared Nix cache retains registered products and a verified predecessor SDK,
+including completed units. Consumers require the producer's exact cache key and
+SDK identity; a miss fails instead of creating another producer. No paid cache
+service or Sticky Disk is required.
 
-* every NIF is compiled against the runner's own libc/ABI, so it always
-  matches the ERTS `mix release` copies in. Cross-packing onto the
-  beam-machine `linux/any` (musl) bundles instead triggers the libc rule (§11):
-  the Rust NIFs would need musl artifacts (`cargo zigbuild`) **and** the pinned
-  z3 linux assets are glibc-only, so a pure-musl payload could not carry the
-  solver at all.
-* `mix bl.z3.fetch` picks its asset from the host OS/arch, and
-  `explorer`'s `rustler_precompiled` NIF matches the runner triple.
+A successful main CI run triggers the rolling release through `workflow_run`.
+The release checks out that run's `head_sha`, verifies its tiny SDK selection
+receipt, and copies the exact portable bytes from the restored SDK. It reuses
+that successful inventory instead of rebuilding or repeating the full suite.
+Tagged releases and explicit build dispatches use the same canonical recipe and
+qualify the resulting candidate before publication. Each inventory shard runs
+inside a bounded Nix worker, and failed checks retain their per-file receipts.
 
-The legs all run the same sequence — `mix bl.build` (§13) with its
-prerequisites in front:
+**The runner's libc is not the release runtime.** The pinned producer currently
+links against glibc 2.44. Stock Ubuntu 24.04 and 26.04 do not satisfy that floor.
+CI runs portable checks under the same pinned loader and libraries, using the
+PRoot adapter in `nix/ci-release-runtime.nix`. It preserves the candidate bytes
+and its native launcher's `/proc/self/exe` identity. Running the loader directly
+as `ld-linux ./bl` would lose that identity and its embedded payload discovery.
+The public launcher and SDK provider tools retain their own Nix interpreter and
+library paths. The bounded inventory worker supplies its pinned FHS loader too.
+
+Every release includes `bl-linux-x86_64.requirements.json`. It records the binary
+SHA256, source commit, SDK/compiler provenance, application version, measured
+`minimum_glibc` and limiting ELF. The measurement includes the outer launcher as
+well as payload executables and libraries. Publication verifies the receipt
+against the downloaded binary and exact triggering commit before running it.
+
+On a supported host:
 
 ```sh
-mix deps.get
-mix compile                 # also creates _build/$MIX_ENV/lib/beam_lisp/priv
-mix bl.z3.fetch      # writes through that priv symlink into priv/z3
-mix bl.build --out bl-<target>
+ldd --version                 # must meet minimum_glibc in the receipt
+sha256sum -c bl-linux-x86_64.sha256
+chmod +x bl-linux-x86_64
+./bl-linux-x86_64 version
+./bl-linux-x86_64 eval '(+ 1 2)'
 ```
 
-`BL_VERSION` (the tag minus its leading `v`, normalized to a valid
-`Version`: `v2026.0` → `2026.0.0`) stamps the release, so `bl version` on the
-artifact reports it; the GitHub release keeps the tag's name. On macOS the
-fetched z3 binary is ad-hoc signed before packing — Apple Silicon will not
-execute unsigned pages.
+An older host must upgrade to a supported OS/runtime before using this portable
+binary. The CI adapter does not lower its advertised host requirement or bundle
+glibc into the download. Developers with the retained Nix SDK can reproduce the
+ABI check without compiling anything again:
 
-**Per-platform prerequisites.** `wry_webview` is a Linux capability (gtk3 +
-webkit2gtk + wlr-layer-shell): its Cargo dependencies are `cfg(target_os =
-"linux")`-gated and its `lib.rs` is crate-level `cfg(target_os = "linux")`, so
-the macOS legs compile it to an empty cdylib and `wry/*` reads as ABSENT
-(§5, and the `defnative` doctrine). The Linux legs install
-`libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev` first.
+```sh
+nix-build nix/ci-release-runtime.nix -o .bl/ci-release-runtime
+scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- ./bl-release --cold eval '(+ 1 2)'
+```
 
-The smoke step runs the artifact the way a user does — cold, no warm VM, no
-checkout — and asserts a live native surface of each tier: the language, a
-Rust NIF (`datom.store-fjall/available?`), Explorer (`datom.frame/available?`),
-the `lazy_memo` runtime, and the z3 port (`z3/check` → `sat`). A payload that
-silently lost its native tier fails in CI, not on a user's machine.
-
-**Deliberately not in CI:** code signing / notarization (§8 — org policy, not
-bundler policy), and single-host cross-target packs (`--target`) until
-per-target NIF staging lands (§5).
-
-The same workflow runs on every push to `main`: the drops are stamped
-`0.1.0-latest.<sha8>`, and the `publish-latest` job moves the tag `latest` to
-that commit and replaces the assets of the `latest` pre-release. That release
-is what `bl self-update latest` fetches on a machine with no beam-lisp checkout.
+The producer checks fresh startup, concurrent first extraction, lifecycle and
+native capabilities against the sealed candidate. The release inventory checks
+the complete conventional Linux corpus. Code signing and unsupported platform
+builds remain outside this qualified release contract.
 
 ## 15. One `bl` on PATH, many builds behind it
 
@@ -556,11 +565,13 @@ Upgrade an older host before activating this runtime; preserve its original
 reads as absent.
 
 The last step rewrites every ELF in the payload to the FHS loader
-(`/lib64/ld-linux-x86-64.so.2`) with no RUNPATH, so the drop never depends on
-`/nix/store` paths existing on the target. On NixOS that loader is `nix-ld`'s
-(enabled by Foundry's host module), which resolves libc **from the host** — the
-host's glibc must therefore be ≥ the drop's floor, which is exactly the property
-this build guarantees.
+(`/lib64/ld-linux-x86-64.so.2`) with no RUNPATH, so the drop does not require
+`/nix/store` paths on the target. On NixOS that loader can be supplied by
+`nix-ld`, which resolves libc from the host. The host must supply a compatible
+loader and libraries with glibc at least as new as the measured artifact floor;
+using Nix for production alone does not make an older host compatible. The
+release receipt and pinned FHS qualification in §14 enforce and report that
+boundary.
 
 ```sh
 nix build .#bl-drop                                  # → result/bl.drop
@@ -568,7 +579,9 @@ tooling/drop/glibc-floor.sh result/bl.drop           # → "2.44  <file>"; must 
 ```
 
 `glibc-floor.sh DROP|DIR` prints the highest `GLIBC_2.N` needed by the launcher
-or any payload ELF (and which file). Both must meet the host ceiling.
+or any payload ELF (and which file), using required symbol versions. A broken
+ELF inspection fails rather than approving a zero floor. Both the launcher and
+payload must meet the host ceiling.
 Foundry's release builder enforces the same rule on its own (`release.py build
 --max-glibc`, refusal `runtime-glibc-too-new`), so a too-new drop fails in a
 second instead of at the server's first start.

@@ -1,48 +1,51 @@
 name: release
 
-# Every declared platform waits for the complete Linux inventory. The current
-# Nix producer supports x86_64-linux; other requested targets fail their explicit
-# backend preflight until their native production paths are qualified.
+# Only x86_64-linux has a qualified production path. The inventory and
+# publication gates consume the producer's exact SDK/drop, never a new build.
 
 on:
   push:
     tags: ["v*"]
-    # Every push to main republishes the rolling `latest` pre-release (see the
-    # `publish-latest` job): the build a downstream project on `:bl "latest"`
-    # gets when its machine has no beam-lisp checkout (`bl self-update latest`).
+  workflow_run:
+    workflows: [ci]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to stamp when not building a tag (e.g. 2026.0 → 2026.0.0)"
+        description: "Release provenance label (does not rebuild or restamp the compiler)"
         required: false
         default: ""
 
 # Superseded branch candidates are disposable. Tagged releases are allowed
 # to finish, and have a separate concurrency group from main/dispatch builds.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: write
+  actions: read
+
+env:
+  RELEASE_REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
-  # Common SDK regressions must pass on Linux before spending three more
-  # native builds. Both stages call the same build and qualification workflow.
+  # One stable production SDK and one portable candidate for all consumers.
   linux:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository)
     uses: ./.github/workflows/build-drop.yml
     with:
       artifact: linux-x86_64
-      runner: ubuntu-24.04
       version: ${{ inputs.version || '' }}
+      revision: ${{ github.event.workflow_run.head_sha || github.sha }}
+      runtime_run: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '' }}
 
-  # Exercise the complete conventional Linux inventory on the already built
-  # candidate before starting three more platform builds. Each shard consumes
-  # the same checksum-verified drop; it never invokes self-build or SDK prepare.
   linux-inventory:
+    # A successful main CI run already qualified these exact SDK/drop bytes.
+    if: github.event_name != 'workflow_run'
     needs: linux
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 100
     strategy:
       fail-fast: false
@@ -51,121 +54,69 @@ jobs:
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
         with:
-          otp-version: "29.0.1"
-          elixir-version: "1.20.4"
-      - name: Enable the bounded inventory worker
+          ref: ${{ env.RELEASE_REVISION }}
+      - uses: ./.github/actions/nix-worker
+      - name: Restore the producer's exact registered SDK
+        uses: ./.github/actions/nix-sdk-cache
+        with:
+          key: ${{ needs.linux.outputs.cache-key }}
+          required: 'true'
+          sdk: ${{ needs.linux.outputs.sdk }}
+      # The bounded worker supplies the pinned FHS loader/libraries and derives
+      # the candidate from this SDK. Host Ubuntu's libc is never substituted.
+      - name: Run the complete inventory partition without SDK production
+        env:
+          QUALIFIED_SDK: ${{ needs.linux.outputs.sdk }}
         run: |
-          set -eu
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          sudo systemctl start "user@$uid.service"
-          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+          scripts/ci-check --local --sdk "$QUALIFIED_SDK" \
+            --models "$HOME/.cache/enchant-ci/models-root" \
+            --shard ${{ matrix.shard }} --shards 4 \
+            --out "$RUNNER_TEMP/release-results-${{ matrix.shard }}"
+      - name: Retain exact per-file receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/release-results-${{ matrix.shard }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-latest:
+    name: publish latest (rolling)
+    if: always() && github.event_name == 'workflow_run' && needs.linux.result == 'success' && needs.linux-inventory.result == 'skipped'
+    needs: [linux, linux-inventory]
+    runs-on: blacksmith-4vcpu-ubuntu-2604
+    # One `latest` at a time: a newer push supersedes an older one mid-upload.
+    concurrency:
+      group: publish-latest
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
             max-jobs = 1
             cores = 2
-            extra-system-features = kvm
-            extra-sandbox-paths = /dev/kvm
-
-      - name: Verify bounded Nix workers can access KVM
-        run: |
-          set -eu
-          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends acl
-          sudo setfacl -m g:nixbld:rw /dev/kvm
-          build_gid=$(getent group nixbld | cut -d: -f3)
-          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
-          test -n "$build_user"
-          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
-
-      - name: Select the shared native test toolchain
-        run: |
-          set -eu
-          rustup toolchain install 1.99.1 --profile minimal
-          rustup override set 1.99.1
-          echo "RUSTUP_TOOLCHAIN=1.99.1" >> "$GITHUB_ENV"
-      - name: Install runtime test prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr inotify-tools
-      - uses: actions/download-artifact@v4
-        with:
-          name: bl-linux-x86_64
-          path: ${{ runner.temp }}/qualified-linux
-      - name: Select the exact Linux candidate without rebuilding
-        run: |
-          set -eu
-          cd "$RUNNER_TEMP/qualified-linux"
-          sha256sum -c bl-linux-x86_64.sha256
-          mkdir -p "$GITHUB_WORKSPACE/.bl"
-          install -m 755 bl-linux-x86_64 "$GITHUB_WORKSPACE/.bl/ci-candidate"
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-linux-runtime
-          path: ${{ runner.temp }}/release-linux-runtime
-      - name: Restore the exact direct-runtime fixture projection and models
-        run: |
-          set -eu
-          tar -xzf "$RUNNER_TEMP/release-linux-runtime/ci-runtime.tar.gz"
-          tar -xzf "$RUNNER_TEMP/release-linux-runtime/ci-store.tar.gz" -C "$HOME"
-          cd "$RUNNER_TEMP/qualified-linux"
-          sha256sum -c bl-linux-x86_64.sha256
-          cmp bl-linux-x86_64 "$GITHUB_WORKSPACE/.bl/ci-candidate"
-      - name: Run the complete inventory partition
-        run: python3 scripts/ci-test-shard.py --index ${{ matrix.shard }} --count 4
-      - name: Retain exact per-file receipts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux-results-${{ matrix.shard }}
-          path: ${{ runner.temp }}/bl-test-results-${{ matrix.shard }}.jsonl
-          if-no-files-found: error
-          retention-days: 7
-
-  build:
-    needs: [linux, linux-inventory]
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - artifact: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - artifact: macos-arm64
-            runner: macos-15
-          - artifact: macos-x86_64
-            runner: macos-15-intel
-    uses: ./.github/workflows/build-drop.yml
-    with:
-      artifact: ${{ matrix.artifact }}
-      runner: ${{ matrix.runner }}
-      version: ${{ inputs.version || '' }}
-
-  publish-latest:
-    name: publish latest (rolling)
-    if: github.ref_type == 'branch' && github.ref_name == 'main'
-    needs: [linux, linux-inventory, build]
-    runs-on: ubuntu-24.04
-    # One `latest` at a time: a newer push supersedes an older one mid-upload.
-    concurrency:
-      group: publish-latest
-      cancel-in-progress: true
-    steps:
+      - name: Prepare the pinned FHS publication check adapter
+        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
           pattern: bl-*
 
-      - name: Verify the Linux drop runs on this host
+      - name: Verify the exact Linux drop under its qualified pinned runtime
+        shell: ./scripts/with-release-runtime -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -eu
+          (cd dist && sha256sum -c bl-linux-x86_64.sha256)
+          python3 scripts/release-requirements.py verify \
+            --candidate dist/bl-linux-x86_64 --receipt dist/bl-linux-x86_64.requirements.json \
+            --revision "$RELEASE_REVISION"
           chmod +x dist/bl-linux-x86_64
           ./dist/bl-linux-x86_64 --cold version
 
@@ -177,32 +128,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true \
-            || gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref=refs/tags/latest -f sha="$GITHUB_SHA"
-          notes="Rolling build of main at ${GITHUB_SHA:0:8}. Replaced on every push to main; for a fixed version use a vX.Y release."
+          gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/latest" -f sha="$RELEASE_REVISION" -F force=true \
+            || gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref=refs/tags/latest -f sha="$RELEASE_REVISION"
+          notes="Rolling build of main at ${RELEASE_REVISION:0:8}. Linux x86_64 only; glibc >= $(python3 -c 'import json; print(json.load(open("dist/bl-linux-x86_64.requirements.json"))["minimum_glibc"])'). Application version stays stable to reuse compiled SDK units; the requirements receipt identifies this commit and exact binary. Replaced on every push to main; for a fixed version use a vX.Y release."
           if gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release edit latest -R "${{ github.repository }}" --prerelease --title "latest (main ${GITHUB_SHA:0:8})" --notes "$notes"
+            gh release edit latest -R "${{ github.repository }}" --prerelease --title "latest (main ${RELEASE_REVISION:0:8})" --notes "$notes"
           else
-            gh release create latest -R "${{ github.repository }}" --prerelease --title "latest (main ${GITHUB_SHA:0:8})" --notes "$notes"
+            gh release create latest -R "${{ github.repository }}" --prerelease --title "latest (main ${RELEASE_REVISION:0:8})" --notes "$notes"
           fi
           gh release upload latest dist/* -R "${{ github.repository }}" --clobber
 
   publish:
     name: publish release
-    if: github.ref_type == 'tag'
-    needs: [linux, linux-inventory, build]
-    runs-on: ubuntu-24.04
+    if: always() && github.ref_type == 'tag' && needs.linux.result == 'success' && needs.linux-inventory.result == 'success'
+    needs: [linux, linux-inventory]
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 1
+            cores = 2
+      - name: Prepare the pinned FHS publication check adapter
+        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
           pattern: bl-*
 
-      - name: Verify the Linux drop runs on this host
+      - name: Verify the exact Linux drop under its qualified pinned runtime
+        shell: ./scripts/with-release-runtime -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -eu
           ls -la dist
+          (cd dist && sha256sum -c bl-linux-x86_64.sha256)
+          python3 scripts/release-requirements.py verify \
+            --candidate dist/bl-linux-x86_64 --receipt dist/bl-linux-x86_64.requirements.json \
+            --revision "$RELEASE_REVISION"
           chmod +x dist/bl-linux-x86_64
           ./dist/bl-linux-x86_64 --cold version
           ./dist/bl-linux-x86_64 --cold eval '(+ 1 2)'
@@ -211,31 +178,29 @@ jobs:
         with:
           files: dist/*
           body: |
-            Self-contained `bl` — ERTS + language + native tier (datom Rust
-            crates, z3, Explorer). No Erlang/OTP needed on the host.
+            Linux x86_64 `bl`, including ERTS, the language and the server native
+            tier (datom Rust crates, z3, Explorer). No host Erlang/OTP required.
+            ARM and macOS releases are pending qualification.
 
-            | file | runs on |
-            |---|---|
-            | `bl-linux-x86_64` | Linux x86_64 (glibc ≥ 2.39) |
-            | `bl-linux-aarch64` | Linux arm64 (glibc ≥ 2.39) |
-            | `bl-macos-arm64` | macOS on Apple Silicon |
-            | `bl-macos-x86_64` | macOS on Intel |
+            The host must meet the measured `minimum_glibc` in
+            `bl-linux-x86_64.requirements.json` (currently **2.44**) and provide
+            the standard C++/OpenSSL/ncurses/zlib/brotli/zstd runtime libraries.
+            Ubuntu 24.04 and 26.04's stock libc do not meet this requirement.
+            CI qualifies the unchanged binary using the producer's pinned FHS
+            loader and libraries; it does not claim stock Ubuntu compatibility.
 
             ```sh
+            ldd --version  # verify glibc meets the requirements receipt
+            sha256sum -c bl-linux-x86_64.sha256
             chmod +x bl-linux-x86_64
             ./bl-linux-x86_64 version
             ./bl-linux-x86_64 eval '(+ 1 2)'
             ```
 
-            The binaries are not code-signed. On macOS, Gatekeeper may require
-            `xattr -d com.apple.quarantine ./bl-macos-arm64` after a browser
-            download; `gh`/`curl` downloads are not quarantined.
+            Application version remains stable so release tags do not rebuild
+            the compiler. The requirements receipt binds the release commit,
+            SDK/compiler provenance and host requirements to the binary SHA256.
 
-            Checksums ship alongside each file as `<name>.sha256`.
-
-            ## License
-
-            Eclipse Public License 2.0. These binaries are Distributed under it,
-            so the Source Code is available under the same Agreement:
+            Eclipse Public License 2.0. Source:
             [`LICENSE`](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/LICENSE)
             · [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})

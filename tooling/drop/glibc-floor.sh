@@ -1,42 +1,56 @@
 #!/usr/bin/env sh
-# glibc-floor.sh DROP|DIR — the highest GLIBC_2.N symbol version any ELF in a
-# drop (or an unpacked payload dir) needs. A host whose glibc is older than this
-# cannot run the drop (`version 'GLIBC_2.N' not found`). docs/native-bundler.md,
-# "Nix-built server drop — glibc floor = host".
-#
-#   tooling/drop/glibc-floor.sh result/bl.drop        → "2.40  erts-17.0.1/bin/beam.smp"
-#   tooling/drop/glibc-floor.sh /path/to/payload      (already unpacked)
-#
-# Needs `readelf` (binutils). For a .drop it needs the `drop` tool
-# (cargo build --release --manifest-path tooling/drop/Cargo.toml) on PATH or in
-# $DROP_BIN, to unpack into a temporary directory.
+# glibc-floor.sh DROP|DIR — highest required GLIBC symbol version in the
+# launcher and payload. This measures ELF version needs, not exported versions.
+# Requires readelf (binutils); a packed drop also needs DROP_BIN or drop on PATH.
 set -eu
+export LC_ALL=C
 target=${1:?usage: glibc-floor.sh DROP|DIR}
-command -v readelf >/dev/null || { echo "glibc-floor: readelf not found (binutils)" >&2; exit 2; }
+readelf=${READELF:-readelf}
+"$readelf" --version >/dev/null 2>&1 || { echo "glibc-floor: usable readelf not found (binutils)" >&2; exit 2; }
+[ -e "$target" ] || { echo "glibc-floor: target does not exist: $target" >&2; exit 2; }
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 
 dir=$target
-tmp=""
+launcher=""
 if [ -f "$target" ]; then
   drop=${DROP_BIN:-$(command -v drop || true)}
-  [ -n "$drop" ] || { echo "glibc-floor: no 'drop' tool (set DROP_BIN)" >&2; exit 2; }
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
-  "$drop" unpack "$target" --dir "$tmp/payload" >/dev/null
-  dir=$tmp/payload
+  [ -n "$drop" ] || { echo "glibc-floor: no drop unpacker (set DROP_BIN)" >&2; exit 2; }
+  "$drop" unpack "$target" --dir "$work/payload" >/dev/null
+  dir=$work/payload
+  launcher=$target
 fi
-
-best=0.0; bestfile="(no dynamic glibc ELF)"
-# The executable launcher is outside the payload and may have a higher floor.
-# Inspect it too: checking only unpacked files can approve an unstartable drop.
-if [ -f "$target" ]; then
-  v=$(readelf -V --wide "$target" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -t. -k2 -n | tail -1)
-  if [ -n "$v" ]; then best=$v; bestfile="(launcher)"; fi
+[ -d "$dir" ] || { echo "glibc-floor: payload is not a directory" >&2; exit 2; }
+export GLIBC_SCAN_ROOT="$dir" GLIBC_SCAN_LAUNCHER="$launcher" READELF="$readelf"
+# find passes each pathname as an argument, preserving spaces. Inspect failures
+# are errors: silently treating them as an absent GLIBC requirement is unsafe.
+# shellcheck disable=SC2016 # Variables belong to the child shell, not this one.
+scan='
+  set -eu
+  for f do
+    magic=$(od -An -tx1 -N4 "$f" | tr -d " \n")
+    [ "$magic" = 7f454c46 ] || continue
+    versions=$("$READELF" --version-info --wide "$f") || exit 2
+    v=$(printf "%s\n" "$versions" |
+      awk "/Version needs section/ { needs=1; next } /^Version / { needs=0 } needs" |
+      grep -oE "GLIBC_[0-9]+(\.[0-9]+)+" | sed "s/GLIBC_//" | sort -V | tail -1)
+    [ -n "$v" ] || continue
+    if [ "$f" = "$GLIBC_SCAN_LAUNCHER" ]; then label="(launcher)"; else label=${f#"$GLIBC_SCAN_ROOT"/}; fi
+    printf "%s  %s\n" "$v" "$label"
+  done
+'
+if ! find "$dir" -type f -size +0c -exec sh -c "$scan" sh {} + >"$work/versions"; then
+  echo "glibc-floor: could not inspect payload ELF requirements" >&2
+  exit 2
 fi
-# every regular file whose first bytes are the ELF magic
-for f in $(find "$dir" -type f -size +0); do
-  [ "$(head -c4 "$f" | od -An -c | tr -d ' \n')" = '177ELF' ] || continue
-  v=$(readelf -V --wide "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -t. -k2 -n | tail -1)
-  [ -n "$v" ] || continue
-  if [ "${v#2.}" -gt "${best#*.}" ] 2>/dev/null; then best=$v; bestfile=${f#"$dir"/}; fi
-done
-printf '%s  %s\n' "$best" "$bestfile"
+if [ -n "$launcher" ]; then
+  if ! sh -c "$scan" sh "$launcher" >>"$work/versions"; then
+    echo "glibc-floor: could not inspect launcher ELF requirements" >&2
+    exit 2
+  fi
+fi
+if [ -s "$work/versions" ]; then
+  sort -V -k1,1 "$work/versions" | tail -1
+else
+  printf '0.0  (no dynamic glibc ELF)\n'
+fi
