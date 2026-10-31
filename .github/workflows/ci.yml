@@ -1,353 +1,111 @@
-name: ci
-
-# The public checkout launcher produces one immutable Nix SDK and portable
-# candidate. Qualification consumers reuse those bytes and report every file.
-
+name: SDK transfer
 on:
-  push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
-      runtime_run:
-        description: "Reuse a prior CI runtime for qualification-only changes (run ID)"
+      source_run:
+        type: string
+        required: true
+      revision:
+        type: string
+        required: true
+      known_paths:
+        type: string
         required: false
-        default: ""
-
-# Full qualifications supersede older full runs on the same branch. Draft
-# checks have a separate slot: a late push event for the SAME revision must
-# not cancel an explicitly requested full qualification.
-concurrency:
-  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'quick' || 'full' }}-${{ inputs.runtime_run || 'producer' }}
-  cancel-in-progress: true
-
+        default: ''
 permissions:
   contents: read
   actions: read
-
 jobs:
-  public-evidence:
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - name: Install source audit prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ripgrep
-          nix-instantiate --version
-          rg --version
-      - name: Embedded test library matches its source
-        run: python3 scripts/embed-test-library.py --check
-      - name: CI, embedding and publication boundary controls
-        run: python3 -m unittest discover -s scripts/tests
-      - name: Inspect every new commit blob before native builds
-        env:
-          PUBLIC_EVIDENCE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          PUBLIC_EVIDENCE_EVENT: ${{ github.event_name }}
-          PUBLIC_EVIDENCE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -eu
-          # Dispatch events have no before/base SHA. Compare the branch's new
-          # commits to its actual merge base, as PR checks do; scanning every
-          # historical blob would recheck already-deleted baseline artifacts.
-          if [ "$PUBLIC_EVIDENCE_EVENT" = workflow_dispatch ] && [ -z "$PUBLIC_EVIDENCE_BASE" ]; then
-            git fetch --no-tags origin "refs/heads/$PUBLIC_EVIDENCE_DEFAULT_BRANCH:refs/remotes/origin/$PUBLIC_EVIDENCE_DEFAULT_BRANCH"
-            PUBLIC_EVIDENCE_BASE=$(git merge-base HEAD "refs/remotes/origin/$PUBLIC_EVIDENCE_DEFAULT_BRANCH")
-            if [ "$PUBLIC_EVIDENCE_BASE" = "$(git rev-parse HEAD)" ]; then
-              PUBLIC_EVIDENCE_BASE=$(git rev-parse --verify HEAD^ 2>/dev/null || true)
-            fi
-          fi
-          if [ -n "$PUBLIC_EVIDENCE_BASE" ] && ! printf '%s' "$PUBLIC_EVIDENCE_BASE" | grep -Eq '^0+$'; then
-            git cat-file -e "$PUBLIC_EVIDENCE_BASE^{commit}" 2>/dev/null || git fetch --no-tags origin "$PUBLIC_EVIDENCE_BASE"
-            python3 scripts/check-public-evidence.py --base "$PUBLIC_EVIDENCE_BASE" --head HEAD
-          else
-            python3 scripts/check-public-evidence.py --head HEAD
-          fi
-
-  prepare-linux:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !inputs.runtime_run
-    needs: public-evidence
-    runs-on: blacksmith-8vcpu-ubuntu-2604
-    timeout-minutes: 90
-    outputs:
-      cache-key: ${{ steps.sdk-cache.outputs.key }}
-      sdk: ${{ steps.save-sdk.outputs.sdk }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/nix-worker
-      - name: Restore the previous immutable SDK and completed AOT units
-        id: sdk-cache
-        uses: ./.github/actions/nix-sdk-cache
-
-      - name: no Mix in the tree
-        run: |
-          test ! -e mix.exs
-          test ! -e mix.lock
-          test ! -d lib/mix
-      - name: the launcher is executable
-        run: test -x bin/bl
-
-      - name: Install runtime fixture prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr inotify-tools
-
-      - name: Prepare the shared SDK through the normal self-build
-        id: dependencies
-        run: ./bin/bl --cold self-build --out "$RUNNER_TEMP/bl-ci-producer"
-      - name: Materialize the exact candidate for direct-runtime fixtures
-        run: |
-          python3 scripts/ci-materialize-candidate.py \
-            --sdk .bl/sdks/current-sdk --candidate "$RUNNER_TEMP/bl-ci-producer"
-      - name: Prepare the pinned adapter for the unchanged portable release
-        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
-      - name: Provision and verify pinned embeddings through the selected Nix SDK
-        run: |
-          python3 scripts/ci-model-input.py provision --sdk .bl/sdks/current-sdk \
-            --models "$HOME/.cache/beam_lisp/models"
-      # The canonical compiler producer already prepared P and freshly booted
-      # B/C before enforcing exact reproduction. Verify that immutable proof
-      # and the installed C bytes; do not start a second compiler producer.
-      - name: Verify the produced compiler and its P/B/C qualification
-        run: |
-          python3 scripts/check-produced-compiler.py --sdk .bl/sdks/current-sdk \
-            --out "$RUNNER_TEMP/produced-compiler.json"
-      - name: Kernel file custody and owned monitors use the produced image
-        run: |
-          scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/file_locks.py --image .bl/ci-image
-          scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/owned_monitor.py --image .bl/ci-image
-      - name: Verify persistent builds use the genuine produced SDK lifecycle
-        run: scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- python3 test/scripts/sdk_build_persistence.py --image .bl/ci-image
-
-      - name: Retain the qualified SDK and Nix closure for the next checkout
-        id: save-sdk
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          operation: save
-          key: ${{ steps.sdk-cache.outputs.key }}
-          sdk: .bl/sdks/current-sdk
-      - name: Record the immutable producer selection for explicit reuse
-        env:
-          CACHE_KEY: ${{ steps.sdk-cache.outputs.key }}
-        run: |
-          python3 scripts/ci-sdk-cache.py write-selector \
-            --selector "$RUNNER_TEMP/ci-sdk-selection.json" --key "$CACHE_KEY" \
-            --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ci-sdk-selection
-          path: ${{ runner.temp }}/ci-sdk-selection.json
-          retention-days: 7
-      # A later fixture failure must not discard a completed immutable SDK or
-      # dependency product. This cache is a hint, never a successful selector.
-      - name: Preserve completed Nix products after producer failure
-        if: ${{ failure() && !cancelled() && steps.sdk-cache.outcome == 'success' && steps.save-sdk.outcome != 'success' }}
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          operation: save-products
-          key: ${{ steps.sdk-cache.outputs.key }}
-
-  reuse-linux:
-    if: inputs.runtime_run
-    needs: public-evidence
+  export:
     runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 15
-    outputs:
-      cache-key: ${{ steps.selection.outputs.key }}
-      sdk: ${{ steps.selection.outputs.sdk }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Prove this qualification uses the producer's exact runtime inputs
+      - name: Validate the addressed producer
         env:
           GH_TOKEN: ${{ github.token }}
-          RUNTIME_RUN: ${{ inputs.runtime_run }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          SOURCE_REVISION: ${{ inputs.revision }}
         run: |
-          set -eu
-          python3 -c 'import os; assert os.environ["RUNTIME_RUN"].isdigit()'
-          producer=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN" --jq .head_sha)
-          python3 scripts/check-ci-runtime-reuse.py --base "$producer"
-          printf '%s\n' "$producer" > "$RUNNER_TEMP/runtime-producer-sha"
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import os,re
+          assert os.environ['GITHUB_REPOSITORY'] == 'undefine-org/enchant'
+          assert re.fullmatch(r'[0-9]+',os.environ['SOURCE_RUN'])
+          assert re.fullmatch(r'[0-9a-f]{40}',os.environ['SOURCE_REVISION'])
+          PYTHON
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$RUNNER_TEMP/producer-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs?per_page=100" > "$RUNNER_TEMP/producer-jobs.json"
+          python3 - <<'PYTHON'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          run=json.loads((root/'producer-run.json').read_text())
+          assert run['head_sha']==os.environ['SOURCE_REVISION']
+          assert run['head_branch']=='main' and run['event']=='push'
+          assert run['path']=='.github/workflows/ci.yml'
+          jobs=json.loads((root/'producer-jobs.json').read_text())['jobs']
+          assert any(j['name']=='prepare-linux' and j['status']=='completed' and j['conclusion']=='success' for j in jobs)
+          PYTHON
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
       - uses: actions/download-artifact@v4
         with:
           name: ci-sdk-selection
-          path: ${{ runner.temp }}/ci-sdk-selection
+          path: ${{ runner.temp }}/selection
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.runtime_run }}
-      - name: Read the original producer's immutable SDK selection
+          run-id: ${{ inputs.source_run }}
+      - name: Read the authenticated producer selection
         id: selection
         env:
-          PRODUCER_RUN: ${{ inputs.runtime_run }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          SOURCE_REVISION: ${{ inputs.revision }}
         run: |
-          python3 scripts/ci-sdk-cache.py read-selector \
-            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
-            --revision "$(cat "$RUNNER_TEMP/runtime-producer-sha")" \
-            --run-id "$PRODUCER_RUN" --github-output
+          set -euo pipefail
+          python3 scripts/ci-sdk-cache.py read-selector --selector "$RUNNER_TEMP/selection/ci-sdk-selection.json" \
+            --revision "$SOURCE_REVISION" --run-id "$SOURCE_RUN" --github-output
       - uses: ./.github/actions/nix-worker
-      - name: Validate and retain the original qualified SDK
-        uses: ./.github/actions/nix-sdk-cache
+      - uses: ./.github/actions/nix-sdk-cache
         with:
           key: ${{ steps.selection.outputs.key }}
           sdk: ${{ steps.selection.outputs.sdk }}
           required: 'true'
-      - name: Bind the same engine and candidate to this qualification revision
+      - name: Verify and export existing registered paths
         env:
-          CACHE_KEY: ${{ steps.selection.outputs.key }}
-          PRODUCER_RUN: ${{ inputs.runtime_run }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          SOURCE_REVISION: ${{ inputs.revision }}
+          KNOWN_PATHS: ${{ inputs.known_paths }}
         run: |
-          python3 scripts/ci-sdk-cache.py verify-selector \
-            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
-            --revision "$(cat "$RUNNER_TEMP/runtime-producer-sha")" --run-id "$PRODUCER_RUN"
-          python3 scripts/ci-sdk-cache.py write-selector \
-            --selector "$RUNNER_TEMP/ci-sdk-selection.json" --key "$CACHE_KEY" \
-            --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID"
+          set -euo pipefail
+          python3 scripts/ci-sdk-cache.py verify-selector --selector "$RUNNER_TEMP/selection/ci-sdk-selection.json" \
+            --revision "$SOURCE_REVISION" --run-id "$SOURCE_RUN"
+          python3 - <<'PYTHON'
+          import hashlib,json,os,pathlib,re,subprocess
+          selector=pathlib.Path(os.environ['RUNNER_TEMP'])/'selection/ci-sdk-selection.json'
+          record=json.loads(selector.read_text())
+          known=set(filter(None,os.environ['KNOWN_PATHS'].splitlines()))
+          assert all(re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/\s]+',p) for p in known)
+          closure=set(subprocess.check_output(['nix-store','--query','--requisites',record['sdk']],text=True).splitlines())
+          assert record['sdk'] in closure
+          missing=sorted(closure-known)
+          assert missing and all(re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/\s]+',p) for p in missing)
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'sdk-transfer';out.mkdir()
+          archive=out/'sdk-paths.nar.zst'
+          exporter=subprocess.Popen(['nix-store','--export',*missing],stdout=subprocess.PIPE)
+          try:
+              subprocess.run(['zstd','-T2','-3','-o',str(archive)],stdin=exporter.stdout,check=True)
+          finally:
+              exporter.stdout.close()
+          assert exporter.wait()==0
+          with archive.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+          metadata={'version':1,'kind':'ci-sdk-transfer','producer':record,
+                    'archive_sha256':digest,'known_paths_sha256':hashlib.sha256(('\n'.join(sorted(known))+'\n').encode()).hexdigest(),
+                    'closure':sorted(closure),'exported':missing,'sdk_production_requested':False}
+          (out/'transfer.json').write_text(json.dumps(metadata,indent=2)+'\n')
+          print(json.dumps({'exported_paths':len(missing),'known_closure_paths':len(closure&known),'compressed_bytes':archive.stat().st_size,'sdk':record['sdk'],'sdk_production_requested':False}))
+          PYTHON
       - uses: actions/upload-artifact@v4
         with:
-          name: ci-sdk-selection
-          path: ${{ runner.temp }}/ci-sdk-selection.json
-          retention-days: 7
-
-  test:
-    if: ${{ !cancelled() && (needs.prepare-linux.result == 'success' || needs.reuse-linux.result == 'success') }}
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: [0, 1, 2, 3]
-    needs: [prepare-linux, reuse-linux]
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 100
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-worker
-      - name: Restore this run's exact SDK and retained provider context
-        id: sdk-cache
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          key: ${{ needs.prepare-linux.outputs.cache-key || needs.reuse-linux.outputs.cache-key }}
-          sdk: ${{ needs.prepare-linux.outputs.sdk || needs.reuse-linux.outputs.sdk }}
-          required: 'true'
-      # The bounded worker materializes the exact candidate from the SDK. All
-      # provider fixtures receive its genuine immutable compiler context.
-      - name: test partition
-        run: |
-          scripts/ci-check --local --sdk '${{ steps.sdk-cache.outputs.sdk }}' \
-            --models "$HOME/.cache/enchant-ci/models-root" \
-            --shard ${{ matrix.shard }} --shards 4 --out "$RUNNER_TEMP/check-${{ matrix.shard }}"
-      - name: Keep per-file qualification receipts even on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-${{ matrix.shard }}
-          path: ${{ runner.temp }}/check-${{ matrix.shard }}/
-          if-no-files-found: warn
-          retention-days: 7
-
-  test-nix:
-    if: ${{ !cancelled() && (needs.prepare-linux.result == 'success' || needs.reuse-linux.result == 'success') }}
-    needs: [prepare-linux, reuse-linux]
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 100
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-worker
-      - name: Restore the same SDK for real Nix producer tests
-        id: sdk-cache
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          key: ${{ needs.prepare-linux.outputs.cache-key || needs.reuse-linux.outputs.cache-key }}
-          sdk: ${{ needs.prepare-linux.outputs.sdk || needs.reuse-linux.outputs.sdk }}
-          required: 'true'
-      - name: Prepare the pinned host qualifier adapter
-        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
-      - name: Run declared real Nix consumers serially under their host cap
-        run: |
-          scripts/ci-host-nix-check --local --sdk '${{ steps.sdk-cache.outputs.sdk }}' \
-            --models "$HOME/.cache/enchant-ci/models-root" --out "$RUNNER_TEMP/check-host-nix"
-      - name: Keep host qualification receipts even on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-host-nix
-          path: ${{ runner.temp }}/check-host-nix/
-          if-no-files-found: error
-          retention-days: 7
-
-  qualify-linux:
-    if: ${{ !inputs.runtime_run }}
-    needs: prepare-linux
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-worker
-      - name: Restore this run's exact SDK
-        id: sdk-cache
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          key: ${{ needs.prepare-linux.outputs.cache-key }}
-          sdk: ${{ needs.prepare-linux.outputs.sdk }}
-          required: 'true'
-      - name: Prepare the pinned adapter for the unchanged portable release
-        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
-      - name: the exact produced drop reuses its default VM
-        run: |
-          systemd-run --user --collect --wait --pipe --quiet \
-            --working-directory="$PWD" --property=MemoryMax=6G --property=MemorySwapMax=0 \
-            --property=RuntimeMaxSec=1800 --setenv=PATH="$PATH" \
-            scripts/with-release-runtime --sdk '${{ steps.sdk-cache.outputs.sdk }}' -- \
-            python3 scripts/qualify-self-build.py --sdk '${{ steps.sdk-cache.outputs.sdk }}'
-
-  # Evaluate the complete flake, then execute the runtime and measured ABI
-  # checks against the exact selected release. No second SDK/drop production.
-  nix-drop:
-    if: ${{ !inputs.runtime_run && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
-    needs: prepare-linux
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/nix-worker
-      - name: Restore the already qualified SDK
-        id: sdk-cache
-        uses: ./.github/actions/nix-sdk-cache
-        with:
-          key: ${{ needs.prepare-linux.outputs.cache-key }}
-          sdk: ${{ needs.prepare-linux.outputs.sdk }}
-          required: 'true'
-
-      - name: Pins agree with the servers
-        # apps/foundry is a separate repo; only checked where it is checked out
-        run: if [ -f apps/foundry/infra/flake.lock ]; then tooling/drop/check-pins.sh; else echo 'foundry not checked out; pin check skipped'; fi
-
-      - name: Evaluate the flake outputs and checks
-        run: nix flake check --no-build -L
-
-      - name: Check the already produced drop and its measured libc floor
-        run: |
-          nix-build nix/ci-sdk-gates.nix --argstr sdk '${{ steps.sdk-cache.outputs.sdk }}' \
-            --out-link .bl/ci-sdk-gates
-
-  producer-gates:
-    if: inputs.runtime_run
-    needs: [reuse-linux, test, test-nix]
-    runs-on: blacksmith-4vcpu-ubuntu-2604
-    timeout-minutes: 130
-    steps:
-      - uses: actions/checkout@v4
-      - name: Require the original runtime's floor, self-build and Nix gates
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/wait-ci-producer.py --run '${{ inputs.runtime_run }}'
+          name: sdk-transfer-${{ inputs.source_run }}
+          path: ${{ runner.temp }}/sdk-transfer/
+          compression-level: 0
+          retention-days: 1
