@@ -977,7 +977,17 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BL_ORACLE_SESSIONS` | override | where the oracle looks for sessions |
 | `BL_SEED_EBIN` / `BL_SEED_EBIN_FALLBACK` | override | the beam directory `bl seed` reads (`--ebin` is the flag) |
 | `BL_BIN` / `BL_ROOT` / `BL_BUILD_ID` / `BL_BOOT_REEXECED` / `BL_EBIN` | protocol | the launcher's handoff to the VM: which launcher, which tree, which build. Do not set these |
+| `BL_SDK_PRODUCT` / `BL_ARTIFACT_PLATFORM` / `BL_CHECKOUT_PLATFORM` / `BL_CHECKOUT_SDK_INPUTS` | protocol | immutable SDK selection, its platform and captured checkout inputs, supplied by the Nix launcher |
+| `BL_PREPARATION_COORDINATOR` / `BL_PREPARED_NATIVES` / `BL_PREVIOUS_UNIT_STORE` | protocol | retained preparation coordinator, native products and prior qualified AOT units used by the producer |
+| `BL_INTERNAL_PRODUCER` / `BL_ARTIFACT_TOOL_PATH` | protocol | trusted Nix worker entry and its declared executable search path |
+| `BL_NATIVE_PROVIDER` | protocol | native production provider; the accepted value is `nix` |
+| `BEAM_LISP_CUSTODY_COMMAND_V1` | protocol | serialized native custody request passed to an isolated command process |
+| `BL_RUNTIME_PROGRAM` | protocol | emitted runtime artifact selected by its release launcher |
+| `BL_SEED_DIR` | test | seed setting cleared from isolated release children |
 | `BL_TEST_TIMEOUT` / `BL_TEST_TIMES` / `BL_TEST_UID` / `BL_SELFBUILD_GATE` | test | test-runner seams |
+| `BL_CUSTODY_EXTERNAL_CARGO_MANIFEST` / `BL_CUSTODY_TEST_GRANDCHILD` / `BL_CUSTODY_TEST_ROOT` / `BL_CUSTODY_TEST_SOURCE_SHA256` | test | private Cargo fixture and child-process custody controls |
+| `BL_NIX_ARTIFACT_TEST_RECEIPT` | test | destination for a private native artifact fixture receipt |
+| `BL_PUBLICATION_TEST_DESTINATION` / `BL_PUBLICATION_TEST_HOLD_UNTIL` / `BL_PUBLICATION_TEST_RESULT` / `BL_PUBLICATION_TEST_SOURCE` | test | isolated publication fixture paths and synchronization |
 | `BL_Z3_TIMEOUT` / `BL_Z3_READ_TIMEOUT` | override | the z3 solver's time limits |
 
 `BL_VERSION` is not here: only the release workflow sets it, to stamp `env.bl :app :vsn`; nothing reads it at run time.
