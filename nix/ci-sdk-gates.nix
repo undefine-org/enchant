@@ -3,11 +3,14 @@
 let
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
   pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
+  # readFile can carry reference context from the selection descriptor. Parse
+  # data as text, then explicitly retain each output consumed by the checks.
+  descriptor = path: builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile path));
   selection = builtins.storePath sdk;
-  metadata = builtins.fromJSON (builtins.readFile (selection + "/artifact.json"));
+  metadata = descriptor (selection + "/artifact.json");
   release = builtins.storePath metadata.release;
-  portable = builtins.fromJSON (builtins.readFile (release + "/artifact.json"));
-  platform = builtins.fromJSON (builtins.readFile (builtins.storePath metadata.platform + "/platform.json"));
+  portable = descriptor (release + "/artifact.json");
+  platform = descriptor (builtins.storePath metadata.platform + "/platform.json");
   executor = builtins.storePath platform.executor;
   runs = import ./drop-runs.nix { inherit pkgs; drop = release; };
   floor = pkgs.runCommand "bl-selected-sdk-glibc-floor" {
