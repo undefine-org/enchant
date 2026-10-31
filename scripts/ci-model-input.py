@@ -2,7 +2,9 @@
 """Capture only the pinned embedding prerequisite, without an SDK build."""
 import argparse
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -87,15 +89,40 @@ def capture(models, cache):
     return record
 
 
+def selected_sdk(sdk):
+    spec = importlib.util.spec_from_file_location('ci_model_sdk_cache', ROOT / 'scripts/ci-sdk-cache.py')
+    sdk_cache = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sdk_cache)
+    return Path(sdk_cache.describe_sdk(sdk)['sdk'])
+
+
+def provision(sdk, models, cache):
+    # Use the same genuine SDK selection as the inventory. Its Nix-linked
+    # Elixir/OTP need neither the portable FHS loader nor PRoot's tracer.
+    selected = selected_sdk(sdk)
+    environment = dict(os.environ, BL_DAEMON='off', BEAM_LISP_MODEL_DIR=str(models))
+    subprocess.run([str(selected / 'bin/bl'), '--cold', 'install', 'embed'],
+                   env=environment, check=True, timeout=600)
+    # Exit status alone is insufficient: an aborted launcher/tracer may return
+    # zero without downloading anything. capture verifies all pins and DIGEST
+    # before it can retain a model root or publish a model-ready cache hint.
+    return capture(models, cache)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('capture', 'restore', 'verify'))
+    parser.add_argument('operation', choices=('provision', 'capture', 'restore', 'verify'))
     parser.add_argument('--models', type=Path)
+    parser.add_argument('--sdk', type=Path, help='genuine selected SDK, required for provision')
     parser.add_argument('--cache', type=Path, default=Path.home() / '.cache/enchant-ci')
     args = parser.parse_args()
     if args.operation != 'restore' and not args.models:
         parser.error('An explicit --models root is required')
-    if args.operation == 'capture':
+    if args.operation == 'provision' and not args.sdk:
+        parser.error('provision requires --sdk')
+    if args.operation == 'provision':
+        record = provision(args.sdk, args.models.resolve(), args.cache.resolve())
+    elif args.operation == 'capture':
         record = capture(args.models.resolve(), args.cache.resolve())
     elif args.operation == 'restore':
         record = restore(args.cache.resolve())
