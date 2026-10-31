@@ -31,7 +31,10 @@ def producer_configuration(workflow):
                 if re.match(r'^  [A-Za-z0-9_-]+:', lines[i])), len(lines))
     producer = [line for line in lines[start:end]
                 if not line.startswith('    if:')]
-    version = next(line for line in lines if line.startswith('  CI_RUST_VERSION:'))
+    # Older producer workflows selected a host Cargo version. Current ones use
+    # only the pinned Nix platform; keep old/new configurations distinct when
+    # comparing receipts, without requiring an unused second toolchain.
+    version = next((line for line in lines if line.startswith('  CI_RUST_VERSION:')), None)
     return producer, version
 
 def main():

@@ -16,7 +16,8 @@ class RuntimeReuseTests(unittest.TestCase):
     def test_every_runtime_and_unknown_input_requires_a_new_producer(self):
         paths = ['priv/std/test.bl', 'priv/lib/source.bl.md', 'env.bl',
                  'native/lazy_memo/src/lib.rs', 'tooling/drop/src/launcher.rs',
-                 'scripts/embed-test-library.py', 'bin/bl', 'flake.nix', '.github/workflows/build-drop.yml', 'unknown.input']
+                 'scripts/embed-test-library.py', 'bin/bl', 'flake.nix', 'flake.lock', 'nix/beam.nix',
+                 '.github/actions/nix-worker/action.yml', '.github/workflows/build-drop.yml', 'unknown.input']
         self.assertEqual(paths, REUSE.runtime_changes(paths))
 
 if __name__ == '__main__':
@@ -42,6 +43,14 @@ class ProducerGateTests(unittest.TestCase):
             self.gates.result([{'name': 'nix-drop', 'status': 'completed', 'conclusion': 'failure'}])
 
 class ProducerConfigurationTests(unittest.TestCase):
+    def test_current_nix_only_producer_configuration_needs_no_host_toolchain(self):
+        workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
+        producer, legacy_version = REUSE.producer_configuration(workflow)
+        self.assertIsNone(legacy_version)
+        changed = workflow.replace('uses: ./.github/actions/nix-worker',
+                                   'uses: ./.github/actions/different-worker', 1)
+        self.assertNotEqual((producer, legacy_version), REUSE.producer_configuration(changed))
+
     def test_orchestration_can_change_but_native_steps_and_version_cannot(self):
         before = 'env:\n  CI_RUST_VERSION: "1.99.1"\njobs:\n  prepare-linux:\n    if: true\n    steps:\n      - run: build-native\n  test:\n    steps: []\n'
         after = before.replace('if: true', 'if: !inputs.runtime_run').replace('  test:', '  reuse-linux:\n    steps: []\n  test:')
