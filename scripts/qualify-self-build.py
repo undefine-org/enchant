@@ -36,7 +36,9 @@ def stop_owned(runtime):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--candidate', type=Path, help='check an existing drop instead of rebuilding')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--candidate', type=Path, help='check an existing drop instead of rebuilding')
+    selection.add_argument('--sdk', type=Path, help='check SDK platform boot and its packaged native launcher')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='bl-self-qualify-') as scratch:
         scratch = Path(scratch)
@@ -48,28 +50,33 @@ def main():
         for name in ('BL_ROOT', 'BL_BIN', 'BL_DAEMON', 'BL_USE', 'BL_CHECKOUT_ROOT',
                      'BL_CHECKOUT_COLD', 'BL_CHECKOUT_GENERATION', 'BL_CHECKOUT_SOURCE_GENERATION'):
             env.pop(name, None)
-        candidate = args.candidate.resolve() if args.candidate else scratch / 'bl-self'
+        sdk = args.sdk.resolve() if args.sdk else None
+        candidate = (sdk / 'bl').resolve() if sdk else args.candidate.resolve() if args.candidate else scratch / 'bl-self'
         try:
-            if not args.candidate:
+            if not args.candidate and not sdk:
                 subprocess.run([str(ROOT / 'bin/bl'), '--cold', 'self-build', '--bin',
                                 str(ROOT / 'tooling/drop/target/release/drop-launcher'),
                                 '--out', str(candidate)], cwd=ROOT, env=env, check=True, timeout=1200)
 
-            def run(*argv):
-                result = subprocess.run([str(candidate), *argv], cwd=project, env=env,
+            def invoke(executable, *argv):
+                result = subprocess.run([str(executable), *argv], cwd=project, env=env,
                                         text=True, capture_output=True, timeout=420)
                 if result.returncode:
                     raise RuntimeError(f'{argv}: {result.stdout}\n{result.stderr}')
                 return result.stdout.strip().splitlines()
 
-            metadata = candidate.parent.parent / 'artifact.json'
-            if metadata.is_file() and json.loads(metadata.read_text()).get('kind') == 'sdk':
-                platform = Path(json.loads(metadata.read_text())['platform'])
+            def run(*argv):
+                return invoke(candidate, *argv)
+
+            if sdk:
+                metadata = json.loads((sdk / 'artifact.json').read_text())
+                assert metadata['kind'] == 'sdk'
+                platform = Path(metadata['platform'])
                 elixir = Path(json.loads((platform / 'platform.json').read_text())['elixir'])
                 expected = str(elixir / 'lib/elixir/lib/elixir')
                 # A warm native realm runs the portable release's own Elixir.
                 # This regression concerns the SDK's cold platform bootstrap.
-                observed = run('--cold', 'eval', '(println (Path/expand (erlang/list_to_binary (code/lib_dir :elixir))))')
+                observed = invoke(sdk / 'bin/bl', '--cold', 'eval', '(println (Path/expand (erlang/list_to_binary (code/lib_dir :elixir))))')
                 assert expected in observed, (expected, observed)
                 print('SDK_PLATFORM_ELIXIR_READY', flush=True)
             print('\n'.join(run('version')), flush=True)
