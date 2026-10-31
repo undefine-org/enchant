@@ -26,6 +26,18 @@ def load(name, path):
 
 
 class Prerequisites(unittest.TestCase):
+    def test_ssh_executor_declares_both_real_client_tools_before_vm_start(self):
+        name = 'test/bl/executor/ssh_bl_test.bl'
+        with self.assertRaisesRegex(RuntimeError, 'before VM startup.*ssh;.*ssh-keygen'):
+            REQUIRE(ROOT, [name], platform='linux', path='')
+        with tempfile.TemporaryDirectory() as directory:
+            for tool in ['ssh', 'ssh-keygen']:
+                executable = Path(directory) / tool
+                executable.write_text('#!/bin/sh\nexit 0\n')
+                executable.chmod(0o755)
+            self.assertEqual(['ssh', 'ssh-keygen'],
+                             [row['tool'] for row in REQUIRE(ROOT, [name], path=directory)])
+
     def test_external_command_consumers_require_controllers_before_vm_start(self):
         for name in ['test/bl/native_test.bl', 'test/bl/native_runtime_custody_test.bl',
                      'test/bl/build_custody_operations_test.bl']:
