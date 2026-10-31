@@ -12,6 +12,17 @@ SPEC.loader.exec_module(MODEL)
 
 
 class PinnedModelInputTests(unittest.TestCase):
+    def test_capture_reuses_verified_immutable_models_without_a_second_store_copy(self):
+        retained = {'version': 1, 'kind': 'ci-model-input',
+                    'path': '/nix/store/' + 'a' * 32 + '-models', 'pins_sha256': 'b' * 64}
+        models, cache = Path('/explicit/downloaded/models'), Path('/private/ci-cache')
+        with patch.object(MODEL, 'verify') as verify, \
+                patch.object(MODEL, 'restore', return_value=retained), \
+                patch.object(MODEL.subprocess, 'check_output') as add:
+            self.assertEqual(retained, MODEL.capture(models, cache))
+            verify.assert_called_once_with(models)
+            add.assert_not_called()
+
     def test_actual_declared_pin_inventory_has_one_model_and_three_files(self):
         name, pins, identity = MODEL.pins()
         self.assertEqual('potion-code-16M-v2', name)

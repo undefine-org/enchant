@@ -68,6 +68,9 @@ def restore(cache):
 def capture(models, cache):
     name, files, identity = pins()
     verify(models)
+    retained = restore(cache)
+    if retained:
+        return retained
     with tempfile.TemporaryDirectory(prefix='bl-ci-pinned-models-') as temporary:
         snapshot = Path(temporary) / 'models'
         destination = snapshot / name
