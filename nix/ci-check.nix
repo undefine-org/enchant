@@ -77,6 +77,10 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
     CARGO
   ''}
   cd /build/project
-  python3 ${./../scripts/ci-check-worker.py} --sdk ${selection} --request ${/. + request} --root /build/project --out /build/raw-receipts
+  # The VM's user manager needs uid 0, but ordinary filesystem checks must
+  # observe permission bits just as developer commands do. Keep the manager
+  # and remove only the capabilities that bypass discretionary file access.
+  setpriv --bounding-set=-dac_override,-dac_read_search --no-new-privs \
+    python3 ${./../scripts/ci-check-worker.py} --sdk ${selection} --request ${/. + request} --root /build/project --out /build/raw-receipts
   python3 ${./../scripts/ci-receipt.py} --source /build/raw-receipts --out "$out"
 '')
