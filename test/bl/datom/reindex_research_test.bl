@@ -1,0 +1,100 @@
+;; Research controls only. No paths, application startup, source admission
+;; bypass, migrator, cutover or production database access.
+(ns research.datom-reindex-probe
+ (:require [datom.index :as index] [datom.codec :as codec]
+  [datom.value-codec :as payload] [datom.current :as current]
+  [datom.conn :as conn] [datom.store :as store]
+  [datom.store-ets :as ets-store] [datom.schema :as schema]))
+
+(defn payload-bytes [d] (payload/encode-slot d))
+(defn key-collisions [datoms]
+ (filterv (fn [group] (> (count (set (mapv payload-bytes group))) 1))
+  (vals (group-by #(index/key-for :eavt %) datoms))))
+
+(defn claims-at [datoms basis]
+ (let [visible (filterv #(<= (index/-tx %) basis) datoms)
+       live (mapcat (fn [[pair history]]
+                     (mapv (fn [v] [(first pair) v]) (current/from-history history)))
+                    (group-by #(identity [(index/-e %) (index/-a %)]) visible))]
+  (filterv (fn [group] (> (count (set (mapv first group))) 1))
+   (vals (group-by #(index/value-key (second %)) live)))))
+
+(defn legacy-list-eavt-key [d]
+ ;; Exact legacy list tag for this bounded synthetic list fixture only.
+ ;; Not a general legacy codec or migration reader.
+ (let [encoded (codec/encode-value (index/-v d))]
+  (codec/concat-bins [(index/key-prefix :eavt (index/-e d) (index/-a d))
+   (erlang/list_to_binary (list 112))
+   (binary/part encoded 1 (dec (erlang/byte_size encoded)))
+   (codec/encode-value (index/-tx d)) (codec/encode-value (index/-op d))])))
+
+(deftest separate-synthetic-destination-retains-retractions-payloads-and-counter-gaps
+ (let [source (ets-store/open) destination (ets-store/open)
+       history [[101 :probe/value (list 1) 1000001 true]
+                [101 :probe/value (list 1) 1000002 false]
+                [102 :probe/value (list 2) 1000003 true]]
+       metadata-key (erlang/list_to_binary (list 0 122))]
+  (try
+   (store/-commit source
+    (into (mapv #(identity [:put (legacy-list-eavt-key %) %]) history)
+     [[:put conn/ENTITY-COUNTER-KEY 5000] [:put conn/TX-COUNTER-KEY 1000100]
+      [:put metadata-key {:provenance "synthetic-only"}]]))
+   (let [before (mapv (fn [[k v]] [k (payload-bytes v)]) (store/-range source nil nil))
+         extracted (mapv second (store/-range source (index/key-prefix :eavt)
+                                      (index/prefix-end (index/key-prefix :eavt))))]
+    (is (= 3 (count extracted)))
+    (is (= [] (key-collisions extracted)))
+    (is (= :incompatible-index-key-format
+           (try (conn/connect-with source) :accepted (catch e (:kind (ex-data e))))))
+    ;; Tiny fixture construction, deliberately NOT a supported migration API.
+    (index/write-datoms destination (schema/empty-schema) extracted
+     [[:put conn/ENTITY-COUNTER-KEY (store/-get source conn/ENTITY-COUNTER-KEY)]
+      [:put conn/TX-COUNTER-KEY (store/-get source conn/TX-COUNTER-KEY)]
+      [:put metadata-key (store/-get source metadata-key)]])
+    (is (= (set (mapv payload-bytes history))
+           (set (mapv payload-bytes (index/scan destination :eavt)))))
+    (is (= 1 (count (filterv index/retraction? (index/scan destination :aevt)))))
+    (is (= 5000 (store/-get destination conn/ENTITY-COUNTER-KEY)))
+    (is (= 1000100 (store/-get destination conn/TX-COUNTER-KEY)))
+    (is (= {:provenance "synthetic-only"} (store/-get destination metadata-key)))
+    (is (= index/KEY-FORMAT (store/-get destination index/KEY-FORMAT-KEY)))
+    (is (= before (mapv (fn [[k v]] [k (payload-bytes v)]) (store/-range source nil nil)))))
+   (finally (ets-store/close source) (ets-store/close destination)))))
+
+(deftest naive-rekey-can-overwrite-a-distinct-payload
+ (doseq [[left right] [[(list 1) [1]] [9007199254740994 9007199254740994.0]]]
+  (let [s (ets-store/open)
+        a [101 :probe/value left 1000001 true]
+        b [101 :probe/value right 1000001 true]]
+   (try
+    (is (= true (= (index/key-for :eavt a) (index/key-for :eavt b))))
+    (is (= false (= (payload-bytes a) (payload-bytes b))))
+    (is (= 1 (count (key-collisions [a b]))))
+    (index/write-datoms s (schema/empty-schema) [a b])
+    (is (= 1 (count (index/scan s :eavt))))
+    (finally (ets-store/close s))))))
+
+(deftest unique-check-needs-overlapping-claims-at-every-history-boundary
+ (let [a [101 :probe/unique (list 1) 1000001 true]
+       retract [101 :probe/unique (list 1) 1000002 false]
+       b [102 :probe/unique [1] 1000003 true]]
+  (is (= 0 (count (claims-at [a retract b] 1000003))))
+  (is (= 1 (count (claims-at [a b] 1000003))))
+  ;; A clean final state does not establish clean history.
+  (let [end [102 :probe/unique [1] 1000004 false]]
+   (is (= 1 (count (claims-at [a b end] 1000003))))
+   (is (= 0 (count (claims-at [a b end] 1000004)))))))
+
+(deftest tx-watermark-without-delete-journal-cannot-replay-excision
+ (let [s (ets-store/open)
+       c (conn/connect-with s [{:db/ident :probe/value :db/valueType :db.type/long}])]
+  (try
+   (conn/transact! c [[:db/add 101 :probe/value 7]])
+   (let [before (:basis-t (conn/db c))
+         captured (vec (index/scan s :eavt 101 :probe/value))]
+    (is (= 1 (count captured)))
+    (is (= 1 (:excised (conn/excise! c [[:attr 101 :probe/value]]))))
+    (is (> (:basis-t (conn/db c)) before))
+    (is (= [] (index/scan s :eavt 101 :probe/value)))
+    (is (= [] (filterv #(> (index/-tx %) before) (index/scan s :eavt)))))
+   (finally (conn/release! c) (ets-store/close s)))))

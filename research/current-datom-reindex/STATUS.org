@@ -1,0 +1,454 @@
+#+title: Datom format-2 reindex safety investigation
+#+date: 2026-10-31
+
+* Decision and scope
+
+Keep the =ec819ce8= persistent-store format cutover out of unattended business
+application updates. A separate-destination offline upgrader is feasible, but
+is not implemented or qualified. Incremental background conversion needs a
+durable mutation journal and a generation/writer handover protocol that the
+current transaction broadcasts do not provide. The existing admission refusal
+must remain; writing a format-2 descriptor into a legacy store is invalid.
+
+This branch contains research and isolated synthetic controls only. No real
+application database was opened, inventoried, mutated, migrated, relabeled,
+deleted or activated. No compiler/SDK build, local cold BEAM, CI/release edit,
+push or merge is part of this work. Read =AGENTS.md=, the key-format document,
+and =research/current-build-efficiency/{STATUS.org,checks.json}=. Base inspected:
+=c4850a7b=, including =ec819ce8=. Root's origin/hosting transition is independent
+of this research and was not changed here.
+
+* Automatic offline upgrade first
+
+The smallest credible automated upgrade has a maintenance window, an immutable
+source snapshot, a fresh destination, exhaustive validation, then a separate
+activation handshake. It never converts the active database in place. The old
+executable and complete original generation remain available through rollback.
+
+Automatic preparation can be introduced before automatic activation. A failed
+or ambiguous preparation leaves the old application selected. The format-2
+header certifies how keys are encoded; it does NOT certify migration completion.
+A private partially built destination may already carry this header and must
+remain inaccessible to application startup until its independent completion
+receipt is validated.
+
+Two different collision gates are required:
+
+1. *Physical key collision.* Distinct legacy EAVT rows can have the same new
+   =(e,a,canonical(v),tx,op)= key but different payload representations. Example:
+   =[101 :x (list 1) t true]= and =[101 :x [1] t true]=. Exact large integer and
+   equal float representations can do the same. =index/write-datoms= uses
+   ordinary puts, so a naive loop overwrites one payload. Format 2 has no slot
+   for both. Stop before accepting that destination; preserve both source rows
+   in the immutable snapshot and report them. An archival sidecar can preserve
+   bytes but does not by itself preserve Datom history/query semantics. A new
+   representation or explicitly reviewed semantic remediation is needed for
+   these stores. Never auto-pick a winner or call this lossless deduplication.
+2. *Semantic uniqueness collision.* Two entities can hold canonically equal
+   values on an identity/value-unique attribute, despite different legacy keys.
+   Their new keys still differ in entity, so a successful write says nothing
+   about uniqueness. Check claims using the new =index/value-key= at every
+   transaction boundary relevant to the supported history contract, with
+   retractions applied and same-transaction retraction precedence matching
+   =current/from-history=. A legal retract-then-transfer is not a duplicate.
+   A clean final state does not prove clean history. Stop on ambiguity; never
+   let ordinary tempid upsert merge business entities during a format upgrade.
+
+Migration cannot reconstruct rows that an older encoder already overwrote, or
+data deliberately excised before the snapshot. Its preservation claim must be
+relative to all surviving source records, plus a declared supported semantics
+contract. In particular list/vector identity and exact numeric equality are
+intentional semantic corrections, not a promise of identical buggy old query
+results.
+
+The collision controls construct adversarial raw row pairs. They establish
+the consequence of those rows, not their prevalence in existing stores or their
+reachability through every version of the public transaction API. No real-store
+scan was performed to answer those questions.
+
+* Inventory: what must survive
+
+| Data class | Evidence and retention requirement |
+|------------+------------------------------------|
+| Full surviving EAV history | Raw EAVT payloads are =[e a v tx op]=. Keep assertion AND retraction, exact entity/tx IDs, operation bit, and representation of every payload, including nested list/vector, integer/float, decimals, temporal/file/vector/term values. Do not export only current entities, query projections or a filtered history view. |
+| Covering-index integrity | EAVT and AEVT cover every datom. AVET is selective for indexed/unique/ref attributes; VAET for refs. Independently verify legacy copies against the declared old encoder and schema/coverage rules before choosing EAVT as authoritative. Missing or conflicting redundant copies are corruption, not permission to take a union or discard one. Re-encode all required destination indexes; never copy legacy ordered keys. |
+| Counters and basis | =[0,101]= entity counter and =[0,116]= tx counter are stored outside indexes. Preserve their exact high-water values, including gaps from allocation/failure/excision. Reopen basis comes from the tx counter. =max(tx in EAVT)= is insufficient. Explicit positive IDs can exceed the allocator's counter: retain and diagnose the source condition, do not silently reseed it as part of reindexing. |
+| Schema and tuple facts | Schema is ordinary datoms, including ident, type, cardinality, unique, index, tupleAttrs, fulltext and doc. Preserve schema entity IDs and all schema history, builtin/user definitions, stored derived tuple facts and their transaction origins. Recover a schema map without running application initializers. Never derive missing historical tuples at new invented transactions. |
+| Excision state | The post-excision absence of facts is authoritative. =excise!= deletes all copies, advances tx/basis and attr marks; it records no intrinsic tombstone/audit fact. Caller audit facts, if present, must survive. Do not resurrect facts from an earlier snapshot while replaying only additions. No general excision ledger was found in the engine. |
+| Transaction provenance | =:db/txInstant=, valid-time annotations, actor/request/authority annotations on the transaction entity, and arbitrary business provenance are datoms. Preserve them with original IDs and values. Do not regenerate timestamps. |
+| Operational data | Migration =id/digest/started-id= ledger, partial backfill progress, queue jobs/leases/retry/idempotency records, projection intents/answers, upgrade/live-backup records and any application-owned operational attributes are data even if they look internal. Preserve all their history. External control stores, app manifest/configuration and blob bindings need explicit inventory too. |
+| Blobs and attachment descriptors | File datoms store descriptors, not bytes. Default Fjall bytes live at canonical =<store-path>.blobs=; explicit FS/ETS/S3 tiers can differ. Preserve every historically referenced blob, even for retracted files; validate SHA-256 and descriptor size. Preserve the complete captured blob inventory for initial lossless backup, including orphan/unclassified and derived blobs; no GC during reindex. Secrets remain outside public receipts. |
+| Internal KV metadata | Non-index keys are not all counters or disposable cache. Account for every key and every derived identity. ETF =derived= identifiers live below =[0,100]=; retain authoritative attr write marks and unknown records with a declared handler, or refuse. Unknown key ranges/record identities cannot silently be dropped or blindly relabeled current. |
+| Derived artifacts | Current pair projection, reverse-current rows/dirty rows, AVET coverage certificates, fulltext postings/frequencies/readiness, rank tree registry/header/nodes/membership/retirement, corpus packed/resident pointers/blobs and ETS query caches all need classification. Preserve originals in backup; invalidate/rebuild recognized destination caches under the new semantics. Do not copy their readiness certificates into the rebuilt generation. |
+| Versions and identity | Track old/final ordered-key descriptor, unchanged value-slot codec (legacy ETF plus packed lanes), backend/storage format, schema/procedure/command versions, text version 2, reverse-current version 2, index-coverage version 1, rank version 1 and corpus code/schema/basis certificates. =facts-8= is for disposable Codebase/ask caches only. It does not authorize deleting or rebuilding an application store. |
+
+The schema implementation explicitly documents a limitation: old data is read
+through today's schema map. Preserve schema history without claiming to fix
+historical-schema interpretation in this upgrade. Tightened uniqueness needs a
+declared policy for historical checks; a conservative first release can refuse
+any historical canonical ambiguity rather than invent an interpretation. A
+current query-equivalence comparison with the old runtime alone is not an
+adequate validator because old equality/ordering was the bug being corrected.
+
+* Existing APIs: useful seams and missing guarantees
+
+- =datom.store/checkpoint!= and its capture/begin/step/finish/abort protocols
+  make a raw logical KV copy of a tracked Fjall MVCC snapshot, not a reindex.
+  This preserves the old header/keys and every internal row. Capture pins the
+  exact source engine/inode claim. The checkpoint sequence is a Fjall sequence,
+  NOT a Datom tx number or a publicly replayable change-log cursor.
+- Native checkpoint publication syncs target writes, closes the private engine,
+  syncs the tree/receipt, uses Linux =RENAME_NOREPLACE=, then syncs the parent.
+  =BL_CHECKPOINT_V1= records source/sequence/count/bytes, not full content hashes,
+  blob inventory, schema identity or reindex qualification. Unsupported atomic
+  publication platforms refuse. Accepted finalization can outlive its caller;
+  a lost reply is an unknown outcome to reconcile, not permission to overwrite.
+- =store-fjall/publish-directory!= and =sync-directory!= can publish/reconcile
+  a caller-owned immutable artifact. They do not move a live engine or atomically
+  replace an application's active pointer. Raw copying of a running LSM directory
+  is not the checkpoint API and cannot substitute for it.
+- =BlobRetention= supports node-local FS/ETS pins and excludes deletion/GC while
+  puts continue. Dead-owner pins are pruned. This is not cross-process or
+  cross-host retention, nor permanent crash-resume protection. S3 implements no
+  such capability here. A coordinator must capture store(s) plus blob inventory
+  under one owner boundary; unsupported tiers require offline exclusion or a
+  separately qualified immutable/versioned snapshot adapter.
+- =datom.migrate/{plan,plan-with,apply!,step!,apply-batched!}= support schema/data
+  evolution on an already admitted store. They use digests, expected-basis,
+  serialized checks and started/completed ledger facts. They neither bypass
+  the new legacy-format refusal nor preserve arbitrary original tx IDs when
+  replayed through =transact!=. =load-facts!= also assigns a new tx/txInstant
+  and omits validations; it is not a historical import API.
+- Inspection of =datom=, the CLI and =priv/compat/datahike/api.bl= found no
+  general lossless history/metadata/blob export-import or format-conversion
+  command. Datahike's compatibility layer projects lifecycle/transactions onto
+  Datom; it does not provide a second storage migration engine.
+- =index/put-ops= and =write-datoms= accept original datom tuples and can fan
+  out new keys, but do not detect migration collisions, recover metadata or
+  rebuild all auxiliary indexes. Generic Store range/page APIs decode payloads;
+  raw checkpoint export copies bytes. A production reindex reader needs bounded
+  raw KV enumeration (or exact representation checks on decoded/re-encoded
+  slots), explicit codec/size limits and strict failures. It must not interpret
+  opaque/corrupt/oversize rows as end-of-scan.
+- =conn/serialized!= is a short per-store writer turn, not a multi-store atomic
+  transaction or durable global maintenance lock. Existing managed native
+  command fences are useful enforcement seams; =migration-policy= currently
+  admits bounded additive schema expansion and rejects tuple/contract lanes.
+  None constitutes a qualified cross-format generation switch.
+- =current/adoption-step=, =index-coverage/ensure!=, =text/reindex-page!= and rank-build
+  demonstrate bounded pages, coverage tracking, atomic source-mark updates and
+  dirty-set draining. AVET/rank progress is durable; text's cursor is a bounded
+  expiring process cache. They operate inside one compatible keyspace. Reusing the
+  pattern is reasonable; treating it as a ready format-upgrade implementation
+  is not. The repository's historical live-checkpoint evidence is supporting
+  context, not proof of a current complete business reindex/restore command.
+
+* Proposed offline protocol and exact acceptance invariants
+
+These steps describe future code, not commands implemented or executed here.
+
+1. *Discover/fence.* Use a declared application storage manifest with stable
+   app/store identities, complete store/blob inventory and current generation.
+   Acquire a durable maintenance/admission lease outside both databases. Drain
+   app requests, jobs, schedules, schema changes, raw store writes, blob puts,
+   deletes and GC; block restart/reopen by another generation. Acquire OS claims
+   for the exact canonical directories where appropriate. An inode flock alone
+   does not prevent two different generation directories accepting app writes.
+2. *Snapshot.* Under the old compatible owner capture all declared store cursors
+   and blob retention/inventory at one coordinated boundary, or stop the owner
+   and make a qualified consistent offline backup. Publish a sealed immutable
+   backup generation with content hashes and old executable/codec identity.
+   Keep originals. Do not open a business store with the new =Conn= or an old
+   =connect-with= that may install schema/repair indexes. Current native open
+   is read/write capable and can recover engine files: open a disposable COPY
+   of the sealed snapshot for extraction, unless a genuine read-only adapter
+   is added. Hash the sealed snapshot before/after; preserve it byte-exact.
+3. *Inventory/validate source.* Recognize supported unversioned source by an
+   explicit old-codec contract, not a guessed version label. Scan every KV
+   namespace and blob, recover full raw datoms and schema, cross-check redundant
+   indexes and counters, and block on corruption/unknown metadata. Do not run
+   application or migration callbacks to obtain schema.
+4. *Build.* Allocate an absent separate destination and distinct blob binding.
+   Reject aliases, symlinks, ancestry/overlap, inode replacement, and a raced
+   preexisting destination. Emit canonical keys from payloads with original
+   e/a/v/tx/op. Preserve raw slot bytes where possible because payload encoding
+   is unchanged. Guard every new key against a distinct preimage, including
+   across chunk/resume boundaries. Copy recognized authoritative metadata;
+   invalidate recognized caches. All other rows require a handler or refusal.
+   A spillable collision table/external sort avoids holding all history in RAM.
+5. *Resume/durability.* Bind job ID and checkpoints to snapshot content digest,
+   source-format/schema identities, tool/encoder hash, destination identity and
+   chunk hashes/counts. Commit each page's data and its cursor together, then
+   sync before publishing durable progress. A retry must compare exact existing
+   values; a conflicting retry is an error. Journal phases =captured -> building
+   -> validating -> ready -> activating -> active= with CAS and fsync. Never
+   resume against the live source, a changed snapshot or a changed tool. Current
+   native checkpoint cursors/artifacts are process resources, so after process
+   death restart snapshot export or reconcile an already published artifact;
+   they are not an on-disk resumable migration journal.
+6. *Validate independently.* Exhaustively compare source payload multiset and
+   target EAVT payload multiset with representation-sensitive framing/hashes,
+   not language equality or set counts alone. Include op=false, tx annotations,
+   every counter gap, schema/operational metadata and blob bytes. Independently
+   generate and compare every required target index key/value, absence of old
+   keys and stale readiness certificates, and schema/coverage consistency.
+   Validate canonical uniqueness/cardinality and history boundaries, numeric
+   neighbor ranges, refs/tuples, current/as-of/since/valid-time views, file
+   fetches and app-declared read-only invariants. Counts alone are insufficient.
+   A second verifier should not share the converter's entire implementation.
+7. *Publish ready.* Rebuild mandatory derived indexes before activation; optional
+   ones may be explicitly absent only where readers have a tested correct
+   fallback. Preserve source attr write marks, drop stale build marks/artifact
+   certificates and regenerate coverage against the target. Close validation
+   readers/native pins; sync target DB, blobs, manifest and directories. Publish
+   a no-clobber immutable generation and a ready receipt binding all hashes,
+   exact counters, validation results and predecessor. Marking a header current
+   is never the final step standing in for validation.
+8. *Activate/acknowledge.* While maintenance fence is still held, CAS the active
+   generation pointer from the exact predecessor/epoch to the ready generation.
+   This requires a new small manifest/pointer primitive: atomic replacement of
+   one file on the same filesystem, file+parent sync, and recovery journal.
+   Pointer selects DB(s), blob binding, executable and control-store identities
+   together; two separate directory renames cannot do this atomically. Never
+   rename an open Fjall directory. Restart the new owner using the exact receipt,
+   keep ingress/jobs paused for read-only health checks, then acknowledge the
+   selected generation durably before admitting writes. Each writer validates
+   the generation/fencing epoch; stale aliases/handles cannot regain authority.
+
+Acceptance requires all of the following, not just a successful exit:
+
+- *I1 source conservation:* sealed source snapshot digests and retained original
+  generation are unchanged; conversion writes occur only in the named stage.
+- *I2 history conservation:* a bijection between surviving source datom payloads
+  and target EAVT payloads, preserving representation and all five components.
+  Any many-to-one target-key mapping with distinct payloads blocks acceptance.
+- *I3 index completeness:* required index rows equal independent fan-out of that
+  history under the declared target schema/coverage policy, with no extra rows.
+- *I4 allocator/metadata conservation:* exact counters/basis and authoritative
+  metadata/ledger/provenance, with every other KV classified and accounted for.
+- *I5 blob completeness:* inventory and verified bytes cover all historical file
+  descriptors and retained operational/unknown references; no destructive sweep.
+- *I6 semantic validity:* no unreviewed canonical unique/cardinality/schema
+  conflict at the checked boundaries; intentional semantic changes are explicit.
+- *I7 durable readiness:* full validation and sync precede a content-bound ready
+  receipt; partial, unknown and corrupt artifacts can never become active.
+- *I8 writer exclusivity:* at most one admitted application writer generation;
+  pointer epoch, OS identity, ingress, jobs and all mutation APIs obey the fence.
+- *I9 recoverable publication:* every crash resolves to the durable old selection
+  or the validated new selection; unknown outcomes remain fenced pending
+  reconciliation. Visibility or process death alone does not establish safety.
+- *I10 rollback accounting:* reverting before new writes is verified and simple;
+  after new writes, reverting requires a qualified reverse replay/forward repair
+  that preserves all acknowledged new writes. A retained backup alone does not
+  make post-write pointer rollback lossless.
+
+* Incremental background upgrade assessment
+
+Online conversion would retain the same separate-generation model. It cannot
+start by opening a legacy business store in the new runtime. First deploy an
+old-format-compatible writer capable of a durable upgrade journal, without
+changing the format gate. Under that writer's short serialization boundary,
+capture a consistent snapshot and its journal offset S0 together. Pin blobs and
+retention for the full capture/replay window. Rebuild the snapshot in the
+background, then apply complete ordered mutation envelopes after S0.
+
+The envelope needs stable source/store generation, monotone commit sequence,
+original tx IDs and payloads, retractions AND physical excision deletes, schema,
+counters and all authoritative internal mutations. Blob publication and deletion
+need ordered durable references and retention. Replay data plus last-applied
+offset must commit together, be retry-idempotent and validate envelope hashes.
+A gap, truncated record, duplicate sequence with different content or source
+generation change blocks. Retain journal segments until acknowledged durable
+replay, impose lag/disk budgets and throttle/pause rather than lose changes.
+
+Journal admission must cover native mutations/counter allocations as well as
+successful high-level transactions: the latter do not include failed-allocation
+gaps or arbitrary metadata commits. Excision envelopes need the removed datom
+preimages (or a verified old-to-new identity map) so replay can delete the new
+covering keys without copying or guessing old ordered keys. Replay stored
+effects, not transaction functions, tempid resolution or fresh timestamps.
+
+Neither Datom's tx counter nor =:datom/tx= messages meet this contract. The
+counter allocates separately before index commit and can have holes; excision
+can leave no datom at its new tx; raw metadata writes and blob operations are
+outside a normal tx report. Reports are process messages emitted after commit,
+without durable subscriber offsets/acknowledgements. Crash between commit and
+send loses the message. Fjall snapshot sequence alone exposes no durable
+application replay feed in these APIs.
+
+For cutover, acquire a durable fence on ALL writer routes, drain accepted
+unknown-outcome operations and queues, sync source, seal final offset Sf and
+blob inventory, replay through Sf, and compare final exact state while fenced.
+Then use the same ready/pointer/owner-ack handshake. If whole-history comparison
+cannot meet the downtime budget, separately qualify a trustworthy incremental
+digest plus exhaustive earlier snapshot verification; do not silently replace
+it with a sample. Freeze schema/excision during the first supported online lane
+unless their full journal semantics are implemented. Writer fencing still must
+cover raw puts/commits, opens/restarts, file collection and runtime maintenance.
+
+Dual writing to two independent Fjall stores cannot atomically commit both.
+Do not acknowledge success on an unjournaled partial dual write. A source-side
+atomic outbox/journal or a qualified shared transaction mechanism is required.
+Snapshot lifetime holds the source inode lock: release capture/export/reader
+pins and drain old handles before another VM can own it. The OS flock protects
+one physical directory, not the logical app across old/new directories.
+
+The existing incremental builders are useful for lazy reconstruction of optional
+derived caches AFTER a qualified offline key conversion. That is the quickest
+background-upgrade benefit. A general online key-format conversion is a later,
+separately qualified feature.
+
+* Minimal future command and activation handshake
+
+Proposed interface only; no =bl datom reindex= command exists or ran here:
+
+#+begin_src sh
+# Maintenance coordinator supplies a sealed, consistent snapshot bundle.
+./bin/bl datom reindex prepare --snapshot SNAPSHOT_BUNDLE \
+  --destination ABSENT_GENERATION --target-format 2 --resume JOB_RECEIPT
+# Exit 0 only for a fully verified READY receipt; never selects an app.
+./bin/bl datom reindex activate --ready READY_RECEIPT \
+  --active-manifest APP_MANIFEST --expect-generation OLD_ID --expect-epoch N
+#+end_src
+
+One =prepare= invocation can inventory/build/verify/resume automatically, with
+finite memory/disk budgets, bounded pages, progress and cancellation. First use
+creates the job receipt; later =--resume= must bind the exact existing job. A
+successful activation returns =selected, awaiting-owner-ack=, not =serving=.
+The app adapter returns =owner-ready(generation,epoch,receipt-hash)= after
+exclusive ownership and read-only validation, and only then admits writes.
+Timeout, changed pointer, stale epoch, missing blob, incompatible schema,
+unknown store or absent rollback artifact leaves the app fenced. All retries
+reconcile durable phase/pointer state; timeout never means permission to run
+activation or data transforms twice.
+
+The manifest adapter and owner-ack protocol must ship before the activation verb.
+Do not invent a generic pointer for existing apps that hardcode DB paths. Start
+with supported explicit manifests; otherwise produce a ready artifact for a
+reviewed maintenance procedure. This research does not authorize that procedure
+against any real store.
+
+* Required adversarial controls before production qualification
+
+| Control | Required observation |
+|---------+----------------------|
+| SIGKILL/power-loss boundaries | Kill before/after page commit, progress fsync, target sync, ready receipt, artifact rename, parent fsync, pointer CAS and owner acknowledgement. Fresh-process recovery selects only old or validated new; unknown outcomes stay fenced. SIGKILL alone does not simulate storage power failure. |
+| Resume/retry ambiguity | Repeat completed pages and lost-reply finishes; change tool, schema, snapshot, destination inode or receipt. Exact retries converge; mismatches refuse. Never delete a published artifact because a submitter died. |
+| Corruption | Truncate/bitflip slot lanes, ETF envelopes, index copies, schema, counters, blob bytes, chunk journal, ready manifest. Refuse boundedly; no skipped rows, false EOF or active artifact. Include oversized and opaque runtime terms without stringifying them. |
+| Key collisions | List/vector and nested map/set/tuple equality, metadata variants, exact integer/equal float and numeric neighbors. Same new full key/different payload refuses across chunks; equality of encoded keys does not authorize payload loss. |
+| Claim collisions | Unique identity and unique value across entities, same and different tx; historical overlap with clean final state; legal retract/transfer; cardinality-one conflicts; schema tightening and tuple component changes. Report before activation without merging entities. |
+| Concurrent writes | Pause at snapshot S0 and final fence, issue normal/bulk/schema/excision/raw-metadata/blob/GC writes, crash writer before report delivery, reconnect through aliases and stale generations. Replay all accepted mutations exactly once or refuse; no second writer admission. |
+| Disk and path failures | ENOSPC/short write/fsync error, inode replacement, symlink/ancestor overlap, destination race, cross-filesystem rename, lock contention. Preserve source and selected generation; no clobber or unsafe fallback. |
+| Blob/cross-store capture | Retracted attachments, missing/hash-mismatched bytes, orphan/unknown refs, two stores changing together, S3 without retention, exporter death releasing node pins. Require a consistent declared boundary or block. |
+| Rollback | Roll back before first new write; then attempt rollback after acknowledged new writes. The latter refuses unless a separately verified preservation/replay path exists. Include old executable and control-store compatibility. |
+
+Meaningful production qualification needs both retained-old-SDK fixture creation
+and fixed-SDK conversion/independent verification in fresh processes, plus crash
+and concurrent-write controls above on synthetic durable stores. Existing 627
+assertions/12 files from the prior key fix are inherited evidence, not a migration
+qualification result. No finite test set proves zero data loss.
+
+* What can ship quickly and what blocks unattended updates
+
+Quickest useful scope: retain the refusal and actionable diagnostics; publish
+this inventory/contract and controls; implement an offline =prepare= utility for
+explicitly supported snapshot formats/storage manifests; collision/source
+integrity scans, a separate target, exhaustive verifier, durable ready receipt,
+resource bounds and restartable progress. Leave source and active pointer alone.
+Use correct fallback/lazy rebuilding for recognized optional derived indexes.
+
+Unattended existing-app format updates must block until: supported legacy reader
+and full namespace inventory; both collision policies; exact payload/history,
+counter/schema/metadata/blob conservation; source integrity verification;
+crash-resume/durable publication; actual app manifest and writer-fence/owner-ack
+integration; verified pre-write rollback and explicit post-write policy; durable
+synthetic cross-SDK/crash/concurrency qualification; and sufficient disk/retention
+budget. Online activation additionally blocks on atomic durable journal/outbox,
+replay gap controls and final fenced consistency. A passing key-format test or
+merely retaining the old directory is insufficient to lift root's cutover hold.
+
+* Concrete source map
+
+All references are to this worktree at the inspected base unless noted.
+
+- [[../../docs/datom-index-key-format.md][Key-format contract]]; [[../../priv/lib/datom/index.bl::56][index.bl:56]]
+  descriptor/admission, :156 full key identity, :248 selective fan-out, :411
+  write-datoms; [[../../priv/lib/datom/codec.bl][ordered codec]] versus
+  [[../../priv/lib/datom/value-codec.bl::336][value-codec.bl:336]] legacy payload compatibility.
+- [[../../priv/lib/datom/conn.bl::91][conn.bl:91]] counters; :633 admission/recovery;
+  :1310 excision; :1372 audit responsibility; :1506 schema coverage/tuple backfill;
+  :1660 bulk-load limitations; :2295 pipeline/tx allocation and metadata;
+  :3550 managed native/schema journal; :3952 native command turns.
+- [[../../priv/lib/datom/schema.bl::27][schema.bl:27]] current schema map/history limitation;
+  [[../../priv/lib/datom/db.bl::53][db.bl:53]] Db admission/basis and :111 valid-time metadata;
+  [[../../priv/lib/datom/current.bl::24][current.bl:24]] canonical history folding and :98 reverse format.
+- [[../../priv/lib/datom/derived.bl::52][derived.bl:52]] ETF internal namespace/pointers;
+  [[../../priv/lib/datom/attr-basis.bl::95][attr-basis.bl:95]] write/build identities and :143 atomic marks;
+  [[../../priv/lib/datom/index-coverage.bl::60][index-coverage.bl:60]] resumable AVET coverage;
+  [[../../priv/lib/datom/text.bl::9][text.bl:9]] text version/prefix and :211 backfill;
+  [[../../priv/lib/datom/query/rank-build.bl::1][rank-build.bl:1]] bounded source/dirty/checkpoint pattern;
+  [[../../priv/lib/datom/query/corpus.bl::350][corpus.bl:350]] durable artifact parts.
+- [[../../priv/lib/datom/store.bl::590][store.bl:590]] checkpoint protocol;
+  [[../../priv/lib/datom/store-fjall.bl::313][store-fjall.bl:313]] canonical ownership/open;
+  :521 durability; :555 checkpoint wrappers; :581 publish and reconcile;
+  [[../../native/datom_fjall/src/checkpoint.rs::69][checkpoint.rs:69]] snapshot capture;
+  :237 finish/publication; [[../../native/datom_fjall/src/lib.rs::143][native lib.rs:143]] claim lifetime;
+  :716 strict datom reads; :893 decode budgets; :1439 sync.
+- [[../../priv/lib/datom/blob.bl::114][blob.bl:114]] retention capability;
+  [[../../priv/lib/datom/blob-retention.bl::1][blob-retention.bl:1]] node-local/live-owner scope;
+  [[../../priv/lib/datom/blob-fs.bl::36][blob-fs.bl:36]] tier layout/open, :68 put and :137 import;
+  [[../../priv/lib/datom/blob-s3.bl][S3 implementation]]; [[../../priv/lib/datom/conn.bl::1233][conn.bl:1233]]
+  historical attachment retention in GC. Migration must sync verified blob files;
+  ordinary FS put's atomic rename alone is not a durable backup guarantee.
+- [[../../priv/lib/datom/migrate.bl::63][migrate.bl:63]] ledger, :333/:372 previews,
+  :404 apply, :470 incremental step;
+  [[../../priv/lib/datom/migration-policy.bl::1][migration-policy.bl:1]] limited additive policy;
+  [[../../priv/lib/datom/broadcast.bl::1][broadcast.bl:1]] volatile report transport;
+  [[../../priv/lib/datom/conn.bl::543][conn.bl:543]] serialized! limits.
+- [[../../test/bl/datom/sequential_key_test.bl][Key-format refusal/payload tests]];
+  [[../../test/bl/datom/checkpoint_test.bl][native checkpoint controls]];
+  [[../../test/bl/datom/reindex_research_test.bl][new synthetic research probe]].
+  Historical checkpoint notes: [[../../!tasks/evidence/live-migration/LIVE-CHECKPOINTS.org][LIVE-CHECKPOINTS.org]],
+  [[../../!tasks/evidence/live-migration/LIVE-BLOB-RETENTION.org][LIVE-BLOB-RETENTION.org]].
+
+* Validation receipts
+
+The retained fixed SDK
+=/nix/store/96a3w4yrg7kjk8qd1bk641l606j62hfj-beam-lisp-sdk-selection=
+passed the new research probe: *27 assertions / 4 tests*, 33.469 seconds in the
+station check (includes setup/qualification). It uses only private ETS fixtures:
+legacy list-key extraction into a separate target with retractions, payload
+representation, counter gaps and a deliberately explicit metadata copy; full-key
+overwrites for list/vector and integer/equal-float; historical unique overlap
+versus legal transfer; and an excision missed by tx-watermark-only replay.
+The fixture does not provide a legacy reader, schema/namespace validator, blob
+copy, durable migrator, resume implementation or activation command. Its small
+single-attribute claim check is an explanatory control, not a general validator.
+
+The existing native synthetic Fjall checkpoint file passed *35 assertions /
+5 tests* in the earlier two-file run. That aggregate run failed because the
+first research draft used an unsupported =vector= function (13 passing
+assertions, 5 errors); vector literals corrected the helper before the passing
+27-assertion rerun. The initial request under =research/= was refused by the
+runner's test-path admission before a test VM. Another request refused changed
+source during capture before VM launch. All obtained receipts, including failed
+ones, are preserved under =receipts/= and hashed in =findings.json=.
+
+Both executed checks used the existing immutable SDK, one bounded station VM
+at a time, approximately 6 GiB memory limit and zero swap allocation; worker
+shutdown was observed. The accepted receipt has zero Nix references. No local
+BEAM or compiler/SDK rebuild was started. The old retained SDK descriptor and
+legacy codec source were inspected; old-SDK fixture generation was not executed
+in this session. Root's existing 627 assertions remain separate inherited
+evidence. These controls do not establish production migration safety or a
+zero-data-loss guarantee.
+
+Reproduce the finite research check with an absent receipt destination:
+
+#+begin_src sh
+/home/othman/code/undefine/beam-lisp--execution-protocol/scripts/ci-check \
+  --sdk /nix/store/96a3w4yrg7kjk8qd1bk641l606j62hfj-beam-lisp-sdk-selection \
+  --source /home/othman/code/undefine/beam-lisp--datom-offline-reindex \
+  --out ABSENT_ABSOLUTE_RECEIPT_DIRECTORY \
+  test/bl/datom/reindex_research_test.bl
+#+end_src
