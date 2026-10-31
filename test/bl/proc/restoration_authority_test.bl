@@ -1,6 +1,6 @@
 (ns proc.restoration-authority-test
  (:require [proc.queue :as q] [proc.queue-runtime :as runtime]
-           [datom.conn :as dc] [datom.store-map :as sm]))
+           [datom.conn :as dc] [datom.store-map :as sm] [reload.generation :as generation]))
 
 (defn handler [srv digest]
  (runtime/prepare srv {:declaration {:of :test/restoration :generation digest}
@@ -40,33 +40,41 @@
     (is (= :restoration-already-bound (result-kind #(runtime/restore! srv "dead-v1" [qh]))))
     (finally (runtime/release-restoration! replacement))))))
 
-(defn in-app [app action]
- (let [before (Process/get :bl_generation)]
-  (try (Process/put :bl_generation {:application-id app}) (action)
-       (finally (Process/put :bl_generation before)))))
+(defn queue-graph [app]
+ (generation/prepare! {:application-id app :protocols {:imports 1}
+   :stable-namespaces #{"proc.queue-runtime"}
+   :sources {"restoration.queue.app"
+    "(ns restoration.queue.app (:require [proc.queue-runtime :as runtime]))
+     (defn handler []
+      (runtime/prepare :imports {:declaration {:of :test/restoration :protocol 1}
+                                 :perform (fn [_] :ok)}))"}}))
+(defn in-app [graph action] (generation/with! graph action))
 
 (deftest application-queue-identities-are-pinned-and-never-fall-back
- (let [a (in-app "alpha" #(handler :imports "a-v1"))
-       b (in-app "beta" #(handler :imports "b-v1"))
+ (let [ga (queue-graph "alpha") gb (queue-graph "beta")
+       a (generation/invoke! ga "restoration.queue.app/handler" [])
+       b (generation/invoke! gb "restoration.queue.app/handler" [])
        ca (dc/connect-with (sm/open) []) cb (dc/connect-with (sm/open) [])]
   (is (= :imports (q/resolve-server :imports)))
   (is (= :blq.alpha__imports (:server a)))
   (is (= :blq.beta__imports (:server b)))
   (is (= "imports" (q/logical-name (:server a))))
   (is (= "alpha" (q/application-id (:server a))))
-  (is (= :queue-application-mismatch (in-app "alpha" #(result-kind (fn [] (q/conn (:server b)))))))
+  (is (= :queue-application-mismatch (in-app ga #(result-kind (fn [] (q/conn (:server b)))))))
   (q/attach-store! (:server a) ca) (q/attach-store! (:server b) cb)
   (let [pa (runtime/start! a) pb (runtime/start! b)]
    (try
     (is (not= pa pb))
-    (is (= ca (in-app "alpha" #(q/conn :imports))))
-    (is (= cb (in-app "beta" #(q/conn :imports))))
-    (is (= "a-v1" (:generation (runtime/status (:server a)))))
-    (is (= "b-v1" (:generation (runtime/status (:server b)))))
-    (is (= #{:blq.alpha__imports} (in-app "alpha" #(set (map :server (q/registered-queues))))))
+    (is (= ca (in-app ga #(q/conn :imports))))
+    (is (= cb (in-app gb #(q/conn :imports))))
+    (is (= (:digest ga) (:generation (runtime/status (:server a)))))
+    (is (= (:digest gb) (:generation (runtime/status (:server b)))))
+    (is (= #{:blq.alpha__imports} (in-app ga #(set (map :server (q/registered-queues))))))
     (is (= :stopped (:status (runtime/stop! (:server a)))))
-    (is (= "b-v1" (:generation (runtime/status (:server b)))))
-    (finally (runtime/stop! (:server a)) (runtime/stop! (:server b)))))))
+    (is (= (:digest gb) (:generation (runtime/status (:server b)))))
+    (finally (runtime/stop! (:server a)) (runtime/stop! (:server b))
+             (dc/close! ca) (dc/close! cb)
+             (generation/retire! ga) (generation/retire! gb))))))
 
 (deftest competing-store-attachments-cannot-publish-two-source-authorities
  (let [srv :competing-store-authority parent (erlang/self)
