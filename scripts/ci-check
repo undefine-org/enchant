@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Run bounded current checks through the host's configured Nix worker policy."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--sdk', help='Existing immutable SDK selection; default uses normal production')
+parser.add_argument('--previous', help='Retained SDK whose completed units may be reused by production')
+parser.add_argument('--out', type=Path, required=True)
+parser.add_argument('--source', type=Path, default=root, help='Checkout to snapshot; defaults to this tree')
+parser.add_argument('--shard', type=int)
+parser.add_argument('--shards', type=int, default=4)
+parser.add_argument('files', nargs='*')
+args = parser.parse_args()
+project = args.source.resolve(strict=True)
+if args.out.exists() or args.out.is_symlink():
+    parser.error('Output must be absent; preserve prior receipts')
+if args.shard is None:
+    if not args.files:
+        parser.error('Select files or an explicit shard')
+    request = {'kind': 'files', 'files': args.files}
+else:
+    if args.files or not 0 <= args.shard < args.shards:
+        parser.error('Select a valid shard without file arguments')
+    request = {'kind': 'shard', 'index': args.shard, 'count': args.shards}
+args.out.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='bl-ci-request-') as temporary:
+    path = Path(temporary) / 'request.json'
+    path.write_text(json.dumps(request))
+    # Snapshot Git-visible files, including current edits, without developer
+    # caches, credentials or ignored outputs. Materialize repository-local file
+    # links so Nix receives a self-contained input rather than mutable links.
+    snapshot = Path(temporary) / 'source'
+    snapshot.mkdir()
+    names = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=project)
+    copied = {}
+    selected = {'.gitignore', '.github', 'AGENTS.md', 'README.md', 'bin', 'nix', 'scripts',
+                'test', 'priv', 'native', 'tooling', 'vendor', 'docs', 'research',
+                'env.bl', 'bl.lock', 'flake.nix', 'flake.lock', 'rust-toolchain', 'rust-toolchain.toml'}
+    for raw in sorted(set(names.split(b'\0')) - {b''}):
+        name = raw.decode()
+        if Path(name).parts[0] not in selected:
+            continue
+        source = project / name
+        if not source.is_file():
+            continue
+        if not source.resolve().is_relative_to(project):
+            parser.error('Source link escapes the checkout: ' + name)
+        target = snapshot / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        target.chmod(source.stat().st_mode & 0o777)
+        copied[name] = hashlib.sha256(target.read_bytes()).digest()
+    if any(not (project / name).is_file() or hashlib.sha256((project / name).read_bytes()).digest() != sha
+           for name, sha in copied.items()):
+        parser.error('Source changed during capture; retry the finite check')
+    command = ['nix-build', str(root / 'nix/ci-check.nix'), '--argstr', 'source', str(snapshot),
+               '--argstr', 'request', str(path), '--out-link', str(args.out.absolute()),
+               '--max-jobs', '0', '--option', 'timeout', '5700',
+               '--option', 'experimental-features', 'nix-command flakes']
+    for key in ('sdk', 'previous'):
+        if getattr(args, key):
+            command += ['--argstr', key, str(Path(getattr(args, key)).resolve(strict=True))]
+    subprocess.run(command, cwd=root, check=True)
+receipt = json.loads((args.out / 'result.json').read_text())
+print(json.dumps(receipt, indent=2))
+passed = (receipt.get('status') == 'passed' and receipt.get('request') == request
+          and receipt.get('frozen_inputs_unchanged') is True
+          and type(receipt.get('assertions')) is int and receipt['assertions'] > 0
+          and all(re.fullmatch('[0-9a-f]{64}', receipt.get(name, ''))
+                  for name in ('sdk_descriptor_sha256', 'candidate_sha256', 'compiler_manifest_sha256', 'source_sha256')))
+if args.sdk:
+    passed = passed and receipt.get('sdk_descriptor_sha256') == hashlib.sha256(
+        (Path(args.sdk).resolve() / 'artifact.json').read_bytes()).hexdigest()
+raise SystemExit(0 if passed else 1)
