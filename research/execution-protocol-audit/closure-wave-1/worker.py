@@ -52,6 +52,7 @@ def main():
                BL_EXECUTION_HISTORY_OUT=str(out), BL_TEST_USER_RUNTIME_DIR=os.environ['XDG_RUNTIME_DIR'],
                ELIXIR_ERL_OPTIONS='+S 2:2 +SDcpu 1:1 +SDio 1:1 +fnu')
     env['CLOSURE_PROOF_SDK'] = str(sdk)
+    env['BL_HISTORY_SDK'] = str(sdk)
     env['CLOSURE_PROOF_OUTPUT'] = str(out)
     for key in ['BL_ROOT', 'BL_EBIN', 'BL_BIN', 'BL_USE', 'BL_CHECKOUT_ROOT', 'BL_SDK_PRODUCT']:
         env.pop(key, None)

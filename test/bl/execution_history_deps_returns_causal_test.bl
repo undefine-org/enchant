@@ -1,0 +1,196 @@
+;; Second pass: actual dependency metadata writers and compiler return lowering.
+;; All producers are cloned privately; installed SDK files/modules stay intact.
+(ns execution.history-deps-returns-causal-test
+ (:require [app-resource :as app] [anf :as anf]))
+(defn- root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(defn- producer [path] (File/read! (Path/join (root) path)))
+(defn- private-name [label]
+ (str "history.second." label ".n" (erlang/unique_integer (list :positive))))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before)))
+  (throw (ex-info "Second-pass causal anchor changed" {:before before})))
+ (String/replace source before after))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- forms-named [source path heads names]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source path)
+               #(and (contains? heads (BeamLisp.AOT/stage-head %))
+                     (contains? names (BeamLisp.AOT/stage-symbol
+                                      (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= (count names) (count forms)) (throw :second-pass-forms-changed)) forms))
+(defn- install [source original namespace]
+ (BeamLisp.Compiler/eval_string
+  (replace-once source (str "(ns " original) (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace)) namespace)
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- prop [props key]
+ (when props (proplists/get_value key props nil)))
+(defn- app-environment [path]
+ (let [read (file/consult (erlang/binary_to_list path))]
+  (when-not (= :ok (elem read 0)) (throw (ex-info "Cannot consult real .app" {:read read})))
+  (prop (elem (first (elem read 1)) 2) :env)))
+(defn- with-scope [action]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try (BeamLisp.Env/with_env scope action)
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest E36-actual-dependency-writer-and-mix-declaration-mutations-drop-required-metadata
+ (let [writer (producer "priv/build/deps-compile.bl")
+       writer-before "(ar/write! (app-file e) (:name e) (:vsn e) mods apps mod environment)"
+       writer-after "(ar/write! (app-file e) (:name e) (:vsn e) mods apps mod (list))"
+       shim (producer "priv/build/mix-shim.bl")
+       shim-before "\"  def compilers, do: [:erlang, :elixir, :app]\\n\""
+       shim-after "\"\""
+       temporary (Path/join (System/tmp_dir!) (private-name "deps"))
+       previous (System/get_env "XDG_CACHE_HOME")]
+  (try
+   (System/put_env "XDG_CACHE_HOME" temporary)
+   (with-scope
+    (fn []
+     (let [normal (install writer "deps-compile" (private-name "writer"))
+           mutant (install (replace-once writer writer-before writer-after) "deps-compile" (private-name "writer-mutant"))
+           shim-normal (install shim "mix-shim" (private-name "shim"))
+           shim-mutant (install (replace-once shim shim-before shim-after) "mix-shim" (private-name "shim-mutant"))
+           fixture-ns (private-name "original-dependency-fixtures")
+           fixture-source (producer "test/bl/deps_compile_test.bl")
+           _ (BeamLisp.Compiler/eval_string (str "(ns " fixture-ns ")"))
+           _ (doseq [form (forms-named fixture-source "test/bl/deps_compile_test.bl" #{"def"} #{"elixir-pkg" "erlang-pkg"})]
+               (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env fixture-ns)))
+           elixir-files (BeamLisp.Env/fetch_exact! fixture-ns "elixir-pkg")
+           erlang-files (BeamLisp.Env/fetch_exact! fixture-ns "erlang-pkg")
+           mix-text (second (first elixir-files))
+           generated (atom [])
+           project-data
+           (mapv (fn [[owner prefix]]
+                  (let [mix-name (str "HistoryPrivateMix" (erlang/unique_integer (list :positive)))
+                        project-name (str "HistoryPrivateProject" (erlang/unique_integer (list :positive)))
+                        raw (BeamLisp.Env/fetch_exact! owner "source")
+                        ;; Rename both original Mix declarations so no live Mix
+                        ;; or SDK module is replaced even for the mutant.
+                        text (String/replace raw "defmodule Mix" (str "defmodule " mix-name))
+                        compiled (Code/compile_string text)
+                        _ (swap! generated into (mapv #(elem % 0) compiled))
+                        project-text (-> mix-text
+                                      (String/replace "use Mix.Project" "")
+                                      (String/replace "DepsCompileFx.MixProject" project-name)
+                                      (String/replace "Mix.compilers()" (str mix-name ".compilers()")))
+                        project-module (elem (first (Code/compile_string project-text)) 0)
+                        _ (swap! generated conj project-module)]
+                   (try {:project (erlang/apply project-module :project (list))
+                         :application (erlang/apply project-module :application (list))}
+                    (catch error {:error error :message (ex-message error)}))))
+                 [[shim-normal :normal] [shim-mutant :mutant]])
+           normal-project (first project-data) old-project (second project-data)
+           environment (prop (:application normal-project) :env)
+           entry {:name (str "history_env_" (erlang/unique_integer (list :positive)))
+                  :vsn "0.1.0" :sha (digest mix-text)}]
+      (try
+       (is (= [:erlang :elixir :app] (vec (prop (:project normal-project) :compilers))))
+       (is (some? (:error old-project)) "the actual project declaration cannot call the removed Mix.compilers API")
+       (is (String/contains? (:message old-project) "compilers"))
+       (is (= false (prop environment :fixture_enabled)))
+       (is (= 7 (prop (prop environment :fixture_nested) :limit)))
+       (invoke normal "write-app!" [entry (list) [:kernel :stdlib :logger] nil environment])
+       (let [path (invoke normal "app-file" [entry]) actual (app-environment path)]
+        (is (= environment actual))
+        (invoke mutant "write-app!" [entry (list) [:kernel :stdlib :logger] nil environment])
+        (is (not= environment (app-environment path)))
+        (is (nil? (prop (app-environment path) :fixture_enabled))))
+       ;; The actual Erlang .app.src fixture goes through the unchanged reader,
+       ;; then the SAME actual dependency writer and loss-of-env mutation.
+       (let [source-dir (Path/join temporary "erlang-source")]
+        (doseq [[relative text] erlang-files]
+         (let [path (Path/join source-dir relative)]
+          (File/mkdir_p! (Path/dirname path)) (File/write! path text)))
+        (let [declared (invoke normal "erlang-declared" [source-dir]) env (:env declared)
+              erlang-entry (assoc entry :name (str (:name entry) "_erl") :vsn "0.2.0")]
+         (is (= 11 (prop env :fixture_limit)))
+         (invoke normal "write-app!" [erlang-entry (list) (:applications declared) (:mod declared) env])
+         (let [path (invoke normal "app-file" [erlang-entry])]
+          (is (= env (app-environment path)))
+          (invoke mutant "write-app!" [erlang-entry (list) (:applications declared) (:mod declared) env])
+          (is (nil? (prop (app-environment path) :fixture_limit))))))
+       (println :closure-E36-second-pass {:writer-source-sha256 (digest writer)
+                                         :writer-mutant-sha256 (digest (replace-once writer writer-before writer-after))
+                                         :shim-source-sha256 (digest shim)
+                                         :shim-mutant-sha256 (digest (replace-once shim shim-before shim-after))
+                                         :original-fixture-sha256 (digest fixture-source)
+                                         :dependency-beams-compiled 0 :SDK-rebuilt false})
+       (finally (doseq [module @generated] (code/purge module) (code/delete module)))))))
+   (finally
+    (if previous (System/put_env "XDG_CACHE_HOME" previous) (System/delete_env "XDG_CACHE_HOME"))
+    (File/rm_rf! temporary)))))
+
+(defn- install-return [source namespace]
+ (let [forms (forms-named source "priv/boot/compiler.bl" #{"defn" "defn-"} #{"server-return-call"})]
+  (BeamLisp.Compiler/eval_string
+   (str "(ns " namespace " (:require [anf :as a])) "
+        "(defn fresh-var [base] (BeamLisp.Ns.Compiler/fresh-var base))"))
+  (BeamLisp.Compiler/eval_form (first forms) (BeamLisp.Compiler/new_env namespace)) namespace))
+(defn- evaluate-return [namespace shape operands]
+ (let [node (invoke namespace "server-return-call" [shape (to-list operands)])
+       module (erlang/binary_to_atom (str "Elixir.HistoryReturn" (erlang/unique_integer (list :positive))))]
+  (BeamLisp.Ns.Lower/eval-anf module node)))
+(defn- count-constructor-fetches [action]
+ (let [mfa (tuple :Elixir.BeamLisp.Server :return_constructors 0)]
+  (when-not (= 1 (erlang/trace_pattern mfa true (list :local :call_count))) (throw :missing-real-return-constructor-counter))
+  (try {:value (action) :calls (elem (erlang/trace_info mfa :call_count) 1)}
+   (finally (erlang/trace_pattern mfa false (list :local :call_count))))))
+
+(deftest E48-actual-return-lowering-preserves-effects-and-avoids-constructor-retrieval
+ (let [source (producer "priv/boot/compiler.bl")
+       order-before "(Enum/reverse (Enum/zip names arguments))"
+       order-after "(Enum/zip names arguments)"
+       fetch-before "result (a/tup (cons (a/lit (elem shape 0)) (Enum/map names (fn [name] (a/var name)))))]"
+       fetch-after (str "result (a/invoke (a/remote :maps :get (list (a/lit (erlang/atom_to_binary (elem shape 0) :utf8)) "
+                        "(a/remote :Elixir.BeamLisp.Server :return_constructors (list)))) "
+                        "(reduce (fn [tail name] (a/cons-cell (a/var name) tail)) (a/empty-list-node) (reverse names)))]")]
+  (with-scope
+   (fn []
+    (let [normal (install-return source (private-name "returns"))
+          order-mutant (install-return (replace-once source order-before order-after) (private-name "returns-order-mutant"))
+          fetch-mutant (install-return (replace-once source fetch-before fetch-after) (private-name "returns-fetch-mutant"))
+          fixture (private-name "return-operands")
+          _ (BeamLisp.Compiler/eval_string
+             (str "(ns " fixture ") (def events (atom [])) "
+                  "(defn mark [n] (swap! events conj n) n) "
+                  "(defn first-error [] (mark 1) (throw (ex-info \"first operand\" {:kind :first-operand}))) "
+                  "(defn clear [] (reset! events [])) (defn observed [] @events)"))
+          compile (fn [text] (BeamLisp.Compiler/compile (first (BeamLisp.Reader/read_string text)) (BeamLisp.Compiler/new_env fixture)))
+          shapes (BeamLisp.Server/return_constructor_shapes)
+          clear #(invoke fixture "clear" []) observed #(invoke fixture "observed" [])
+          operands [(compile "(mark 1)") (compile "(mark 2)")]
+          shape (get shapes "reply")]
+     (clear)
+     (let [result (count-constructor-fetches #(evaluate-return normal shape operands))]
+      (is (= (tuple :reply 1 2) (:value result)))
+      (is (= [1 2] (observed)))
+      (is (= 0 (:calls result))))
+     (clear)
+     (is (= (tuple :reply 1 2) (evaluate-return order-mutant shape operands)))
+     (is (= [2 1] (observed)) "removing the reverse nesting evaluates the final operand first")
+     (clear)
+     (let [result (count-constructor-fetches #(evaluate-return fetch-mutant shape operands))]
+      (is (= (tuple :reply 1 2) (:value result)))
+      (is (= [1 2] (observed)))
+      (is (= 1 (:calls result)) "old constructor retrieval adds an actual native lookup to every direct return"))
+     (let [throwing [(compile "(first-error)") (compile "(mark 2)")]
+           capture (fn [namespace]
+                     (clear)
+                     (let [error (try (evaluate-return namespace shape throwing) nil (catch error error))]
+                      {:kind (:kind (ex-data error)) :events (observed)}))]
+      (is (= {:kind :first-operand :events [1]} (capture normal)))
+      (is (= {:kind :first-operand :events [2 1]} (capture order-mutant))))
+     (doseq [entry (maps/to_list shapes) arity (elem (elem entry 1) 1)]
+      (let [name (elem entry 0) shape (elem entry 1)
+            values (vec (range 1 (inc arity)))
+            args (mapv #(compile (str "(mark " % ")")) values)
+            expected (if (zero? arity) (elem shape 0) (erlang/list_to_tuple (cons (elem shape 0) (to-list values))))]
+       (clear)
+       (is (= expected (evaluate-return normal shape args)) (str "actual shared return shape " name "/" arity))
+       (is (= values (observed)))))
+     (println :closure-E48-second-pass {:producer-sha256 (digest source)
+                                       :order-mutant-sha256 (digest (replace-once source order-before order-after))
+                                       :fetch-mutant-sha256 (digest (replace-once source fetch-before fetch-after))
+                                       :SDK-rebuilt false}))))))

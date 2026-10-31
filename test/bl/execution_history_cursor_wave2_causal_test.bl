@@ -1,0 +1,106 @@
+;; Private native copies of the actual ETS page producer. The explicit native
+;; grant authenticates these generated probe bytes; it grants no ETS export and
+;; creates no SDK origin, admission, permit or native-index row.
+(ns execution.history-cursor-wave2-causal-test
+ (:require [reload.generation :as g] [datom.store :as store] [datom.store-ets :as ets-store]))
+
+(defn- once [source before after]
+ (assert (= 2 (count (String/split source before))))
+ (String/replace source before after))
+(defn- method-source []
+ (let [path (Path/join (BeamLisp.Tiers/priv_root) "lib/datom/store-ets.bl") source (File/read! path)
+       forms (filterv #(and (= "extend-protocol" (BeamLisp.AOT/stage-head %))
+                            (= "datom.store/OrderedPageScan" (BeamLisp.AOT/stage-symbol
+                                (second (BeamLisp.AOT/stage-items % :list)))) )
+                      (BeamLisp.Reader/read_string source path))]
+  (assert (= 1 (count forms)))
+  (let [method (nth (BeamLisp.AOT/stage-items (first forms) :list) 3)
+        _ (assert (= "-ordered-page" (BeamLisp.AOT/stage-head method)))
+        span (BeamLisp.FormMeta/meta method)]
+   {:source source :body (String/slice source (:offset span) (- (:end-offset span) (:offset span)))})))
+(defn- probe! [directory module body]
+ (let [path (Path/join directory (str (Atom/to_string module) ".bl"))
+       footprint-module (BeamLisp.Emit/module_for "data.bounded-cache")]
+  (File/write! path
+   (str "(ns history.cursor.native)\n"
+        "(defn end-of-table? [key] (= key :\"$end_of_table\"))\n"
+        "(defn history-footprint [entry] (erlang/apply :" (Atom/to_string footprint-module)
+        " :footprint (list entry)))\n" body))
+  (BeamLisp.AOT/compile_host_file path
+   (list (tuple :module module) (tuple :output_dir directory) (tuple :load? true)))))
+(defn- original-error [action]
+ (try {:returned (action)}
+  (catch error {:refused (BeamLisp.ExInfo/ex_original error) :message (ex-message error)})))
+
+(def SOURCE
+ "(ns history.cursor.source (:require [datom.store :as store]))
+  (defn pages [page s lo hi size direction]
+   (loop [after nil rows [] turns 0]
+    (when (> turns 40) (throw (ex-info \"cursor failed to terminate\" {})))
+    (let [result (page s lo after hi size direction 1048576)]
+     (when (> (count (:datoms result)) size) (throw (ex-info \"page exceeded bound\" {})))
+     (if (:end? result) {:rows (into rows (:datoms result)) :pages (inc turns)}
+      (recur (:last result) (into rows (:datoms result)) (inc turns))))))
+  (defn sdk-page [s lo after hi size direction max-bytes]
+   (store/ordered-page s lo after hi size direction max-bytes))
+  (defn sdk-pages [s lo hi size direction]
+   (pages sdk-page s lo hi size direction))
+  (defn call-raw [f args] (apply f args))")
+
+(deftest E81-actual-page-producer-keeps-native-cursor-operations-behind-declared-callbacks
+ (let [directory (Path/join (System/tmp_dir!) (str "history-cursor-native-" (erlang/unique_integer (list :positive))))
+       current :Elixir.HistoryRuntimeOwnership.CursorCurrent
+       historical :Elixir.HistoryRuntimeOwnership.CursorRawNative
+       actual (method-source)
+       body (-> (:body actual)
+              (once "(-ordered-page [" "(defn ordered-page [")
+              (once "cache/footprint" "history-footprint"))
+       before "step (fn [key] (if descending? (ets/prev table key) (ets/next table key)))"
+       after "step (if descending? ets/prev ets/next)"
+       broken (-> body (once before after)
+                  (once "(step after)" "(step table after)")
+                  (once "(step bound)" "(step table bound)")
+                  (once "(step k)" "(step table k)"))
+       graph (atom nil) s (ets-store/open)
+       rows (mapv (fn [i] [i :history/value i 1 true]) (range 17))
+       keys (mapv #(String/pad_leading (str %) 2 "0") (range 17))
+       producer-md5 (let [m (BeamLisp.Emit/base_module_for "datom.store-ets")]
+                      (erlang/apply m :module_info (list :md5)))]
+  (File/mkdir_p! directory)
+  (try
+   (probe! directory current body) (probe! directory historical broken)
+   (println :history-wave2-E81-stage :private-producers-compiled)
+   (doseq [[key row] (map (fn [key row] [key row]) keys rows)] (store/-put s key row))
+   (reset! graph (g/prepare! {:application-id "history-cursor-wave2"
+                    :sources {"history.cursor.source" SOURCE}
+                    :stable-namespaces #{"datom.store"}
+                    :native-modules #{"HistoryRuntimeOwnership.CursorCurrent" "HistoryRuntimeOwnership.CursorRawNative"}}))
+   (println :history-wave2-E81-stage :real-source-graph-prepared)
+   (let [fixed (erlang/make_fun current :ordered-page 7)
+         mutant (erlang/make_fun historical :ordered-page 7)
+         observations (atom [])]
+    (doseq [direction [:asc :desc] size [1 3 5]]
+     (let [expected (if (= direction :desc) (vec (reverse rows)) rows)
+           arguments [s (first keys) (last keys) size direction]
+           production (g/invoke! @graph "history.cursor.source/sdk-pages" arguments)
+           _ (println :history-wave2-E81-stage {:actual-SDK-pages-completed direction :size size})
+           copied (g/invoke! @graph "history.cursor.source/pages" (into [fixed] arguments))
+           failure (original-error #(g/invoke! @graph "history.cursor.source/pages" (into [mutant] arguments)))]
+      (is (= expected (:rows production)))
+      (is (= expected (:rows copied)))
+      (is (> (:pages production) 1))
+      (is (= :source_native_target_refused (:refused failure)))
+      (swap! observations conj {:direction direction :size size :SDK-pages (:pages production)
+                               :copied-pages (:pages copied) :original-mutation failure})))
+    (let [raw (erlang/make_fun :ets :next 2)
+          refused (original-error #(g/invoke! @graph "history.cursor.source/call-raw" [raw [(:table s) (first keys)]]))]
+     (is (= :source_native_target_refused (:refused refused)))
+     (is (= producer-md5 (erlang/apply (BeamLisp.Emit/base_module_for "datom.store-ets") :module_info (list :md5))))
+     (println :history-wave2-E81
+      {:producer-sha256 (Base/encode16 (crypto/hash :sha256 (:source actual)) (list (tuple :case :lower)))
+       :directions-and-page-sizes @observations :raw-native-carrier refused :installed-SDK-unchanged true})))
+   (finally
+    (when @graph (g/retire! @graph))
+    (when (not= :undefined (ets/info (:table s))) (ets/delete (:table s)))
+    (doseq [module [current historical]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))

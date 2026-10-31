@@ -1,0 +1,126 @@
+(ns execution.history.observation-causal-test)
+
+(defn- source-root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(defn- source-function [source name path]
+ (let [forms (filterv #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                             (= name (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list)))))
+                      (BeamLisp.Reader/read_string source path))]
+  (when-not (= 1 (count forms)) (throw :observation-source-function-drift))
+  (let [position (BeamLisp.FormMeta/meta (first forms))]
+   (String/slice source (:offset position) (- (:end-offset position) (:offset position))))))
+(defn- install-private [namespace source]
+ (BeamLisp.Compiler/eval_string (str "(ns " namespace ")\n" source))
+ (BeamLisp.Env/mark_loaded namespace))
+(defn- invoke [namespace name argv]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace name) (to-list argv)))
+
+(deftest E78-real-read-access-time-does-not-claim-a-memo-write
+ (let [source (BeamLisp.Loader/read_source (Path/join (source-root) "test/bl/code/index_manifest_test.bl"))
+       before "(= (dissoc (Map/from_struct before) :atime)\n             (dissoc (Map/from_struct (File/stat! memo)) :atime))"
+       after "(= (Map/from_struct before) (Map/from_struct (File/stat! memo)))"
+       suffix (erlang/unique_integer (list :positive))
+       current (str "qualification.atime.current" suffix)
+       mutant (str "qualification.atime.fullstat" suffix)
+       root (Path/join (System/tmp_dir!) (str "qualification-read-atime-" suffix))
+       memo (Path/join root "memo.term")
+       scope (BeamLisp.Env/fork)]
+  (when-not (= 2 (count (String/split source before))) (throw :memo-stat-comparator-drift))
+  (try
+   (File/mkdir_p! root)
+   (File/write! memo "real immutable memo bytes")
+   ;; Change timestamps before the observed turn. The subsequent read, rather
+   ;; than utime, must produce the atime change without changing ctime/mtime.
+   (is (= :ok (erlang/apply :file :change_time
+                (list (String/to_charlist memo) (tuple (tuple 1970 1 2) (tuple 0 0 0))
+                      (erlang/apply :calendar :local_time (list))))))
+   (let [stat (File/stat! memo)]
+    (is (= "real immutable memo bytes" (File/read! memo)))
+    (let [after-read (File/stat! memo)]
+     (is (not= (:atime stat) (:atime after-read)) "the actual filesystem must record this read")
+     (is (= (:mtime stat) (:mtime after-read)))
+     (is (= (:ctime stat) (:ctime after-read)))
+     (BeamLisp.Env/with_env scope
+      (fn []
+       (install-private current (str "(defn compare [before memo] " before ")"))
+       (install-private mutant (str "(defn compare [before memo] " after ")"))
+       (is (= true (invoke current "compare" [stat memo])))
+       (is (= false (invoke mutant "compare" [stat memo])))))
+     (println :qualification-E78-atime
+      {:producer-sha256 (String/downcase (Base/encode16 (crypto/hash :sha256 source)))
+       :before before :after after :prior-atime (:atime stat) :read-atime (:atime after-read)
+       :mtime-unchanged (= (:mtime stat) (:mtime after-read))
+       :ctime-unchanged (= (:ctime stat) (:ctime after-read))})))
+   (finally (BeamLisp.Env/destroy scope) (File/rm_rf! root)))))
+
+(defn- queued-system-status? [pid]
+ (let [info (Process/info pid :messages)]
+  (and info
+   (Enum/any? (elem info 1)
+    #(and (erlang/is_tuple %) (= 3 (erlang/tuple_size %))
+          (= :system (elem % 0)) (= :get_status (elem % 2)))))))
+(defn- await-status-request [pid]
+ (loop [left 5000]
+  (cond (queued-system-status? pid) true
+        (zero? left) false
+        :else (do (Process/sleep 1) (recur (dec left))))))
+
+(deftest E78-between-turn-snapshot-refuses-the-live-temporary-context-observation
+ (let [source (BeamLisp.Loader/read_source (Path/join (source-root) "test/bl/proc/queue_owner_lifetime_test.bl"))
+       original (source-function source "ambient-generation" "test/bl/proc/queue_owner_lifetime_test.bl")
+       before "(Keyword/get (first (elem (erlang/apply :sys :get_status (list pid)) 3)) :bl_generation)"
+       after "(Keyword/get (elem (Process/info pid :dictionary) 1) :bl_generation)"
+       suffix (erlang/unique_integer (list :positive))
+       current (str "qualification.snapshot.current" suffix)
+       mutant (str "qualification.snapshot.live" suffix)
+       scope (BeamLisp.Env/fork) parent (erlang/self) ticket (erlang/make_ref)
+       actor (atom nil) handler (atom nil) query (atom nil)]
+  (when-not (= 2 (count (String/split original before))) (throw :ambient-snapshot-source-drift))
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     ;; The marker is ordinary fixture data. Never synthesize an SDK generation
+     ;; handle or change SDK-private dictionary keys in this shared VM.
+     (install-private current (String/replace original ":bl_generation" ":qualification-snapshot-marker"))
+     (install-private mutant (String/replace (String/replace original before after)
+                                            ":bl_generation" ":qualification-snapshot-marker"))
+     (let [[status pid] (Agent/start_link (fn [] (Process/put :qualification-snapshot-marker :ambient) 0))]
+      (is (= :ok status))
+      (reset! actor pid)
+      (reset! handler
+       (spawn-monitor
+        (fn []
+         (let [result (Agent/get pid
+                      (fn [_]
+                       (Process/put :qualification-snapshot-marker :temporary)
+                       (erlang/send parent [ticket :handler-entered])
+                       (try
+                        (receive [:release seen] :when (= seen ticket) :released
+                         (after 30000 (throw :snapshot-handler-timeout)))
+                        (finally (Process/put :qualification-snapshot-marker :ambient)))))]
+          (erlang/send parent [ticket :handler-done result])))))
+      (is (= :entered (receive [seen :handler-entered] :when (= seen ticket) :entered
+                         (after 5000 :timeout))))
+      (is (= :temporary (invoke mutant "ambient-generation" [pid])))
+      (reset! query
+       (spawn-monitor
+        (fn [] (erlang/send parent [ticket :snapshot (invoke current "ambient-generation" [pid])]))))
+      (is (await-status-request pid) "the actual sys request is queued behind the held callback")
+      (is (= :not-yet (receive [seen :snapshot _] :when (= seen ticket) :too-early (after 0 :not-yet))))
+      (erlang/send pid [:release ticket])
+      (is (= :ambient (receive [seen :snapshot value] :when (= seen ticket) value (after 5000 :timeout))))
+      (is (= :released (receive [seen :handler-done value] :when (= seen ticket) value (after 5000 :timeout))))
+      (is (= :ambient (invoke mutant "ambient-generation" [pid])))
+      (println :qualification-E78-snapshot
+       {:producer-sha256 (String/downcase (Base/encode16 (crypto/hash :sha256 source)))
+        :before before :after after :common-data-key :qualification-snapshot-marker
+        :live-while-handler-held :temporary :between-turn-status :ambient}))))
+   (finally
+    (when (and @actor (Process/alive? @actor))
+     (erlang/send @actor [:release ticket])
+     (Agent/stop @actor))
+    (doseq [started [@handler @query]]
+     (when started
+      (let [[pid monitor] started]
+       (when (Process/alive? pid) (erlang/exit pid :kill))
+       (Process/demonitor monitor (list :flush)))))
+    (BeamLisp.Env/destroy scope)))))

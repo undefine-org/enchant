@@ -1,0 +1,169 @@
+;; Third pass: one snapshot per validation phase and compiler-owned future route.
+(ns execution.history-package-future-causal-test
+ (:require [reload.generation :as generation] [env]))
+(defn- producer [relative]
+ (File/read! (Path/join (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)) relative)))
+(defn- private-name [label]
+ (str "history.third." label ".n" (erlang/unique_integer (list :positive))))
+(defn- replace-once [source before after]
+ (when-not (= 2 (count (String/split source before))) (throw :third-pass-source-anchor-changed))
+ (String/replace source before after))
+(defn- digest [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+(defn- named-form [source path name]
+ (let [forms (Enum/filter (BeamLisp.Reader/read_string source path)
+               #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                     (= name (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list))))))]
+  (when-not (= 1 (count forms)) (throw :third-pass-form-changed)) (first forms)))
+(defn- install [source original namespace]
+ (BeamLisp.Compiler/eval_string
+  (replace-once source (str "(ns " original) (str "(ns " namespace))
+  (BeamLisp.Compiler/new_env namespace)) namespace)
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- realm-run [key action]
+ (let [scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (BeamLisp.Env/put_key (tuple :realm_key) key)
+     (BeamLisp.Env/put_key (tuple :realm_decl) {:shadow [] :uses {}})
+     (action)))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(deftest E15-real-package-source-drift-requires-fresh-validation-after-compilation
+ ;; Release authority deliberately uses the actual global SDK compiler, as
+ ;; the original release-test fixture does; harness Core additions stay scoped.
+ (BeamLisp.Env/with_env :global
+  (fn []
+   (BeamLisp.Loader/ensure_loaded "application.package")
+   (let [source (producer "priv/lib/application/package.bl")
+         before "(fn [] (build-unit! entry out roots))"
+         after "(fn [] (BeamLisp.AOT/with_source_snapshot (fn [] (build-unit! entry out roots))))"
+         ;; Restore the actual historical temporal fault: the unchanged
+         ;; validation runs before compile-time effects, then its certificate
+         ;; is trusted afterward. Keep every validation predicate intact.
+         result-start "         result (if realm (realm-compile! units ebin homes)"
+         validation-start "         _ (when realm\n"
+         manifest-start "         manifest {:format"
+         result-part (first (String/split (second (String/split source result-start)) validation-start))
+         validation-part (first (String/split (second (String/split source validation-start)) manifest-start))
+         phase-before (str result-start result-part validation-start validation-part)
+         phase-after (str validation-start validation-part result-start result-part)
+         normal (install source "application.package" (private-name "package"))
+         widened (install (replace-once source before after) "application.package" (private-name "package-wide-snapshot"))
+         mutant (install (replace-once source phase-before phase-after) "application.package" (private-name "package-prevalidated"))
+         root (Path/join (System/tmp_dir!) (private-name "package-drift"))
+         search (str root "/src") leaf (str search "/hpdrift/leaf.bl") entry (str root "/entry.bl")
+         original "(ns hpdrift.leaf) (defn value [] 1)"
+         changed "(ns hpdrift.leaf) (defn value [] 2)"]
+    (try
+     (File/mkdir_p! (Path/dirname leaf))
+     (let [consumer (str "(ns hpdrift.consumer (:require [hpdrift.leaf])) "
+                         "(def touched (File/write! " (pr-str leaf) " " (pr-str changed) ")) "
+                         "(defn answer [] 7)")
+           _ (File/write! (str search "/hpdrift/consumer.bl") consumer)
+           _ (File/write! entry "(ns hpdrift.entry (:require [hpdrift.consumer]))")
+           observations
+           (mapv (fn [[namespace suffix]]
+                   (File/write! leaf original)
+                   (let [output (str root "/" suffix)
+                         key (str "HistoryPackageDrift" (erlang/unique_integer (list :positive)))
+                         result (BeamLisp.Loader/with_search_dir search
+                                  #(realm-run key
+                                    (fn []
+                                     (try {:value (invoke namespace "build!" [entry output []])}
+                                      (catch error {:error error :message (ex-message error)})))))]
+                    (assoc result :output output :realm key :leaf (File/read! leaf)
+                                  :published (File/exists? output))))
+                 [[normal "normal"] [widened "wide"] [mutant "prevalidated"]])
+           good (first observations) still-guarded (second observations) old (nth observations 2)]
+      (is (some? (:error good)))
+      (is (String/contains? (:message good) "Realm provider changed while packaging"))
+      (is (= false (:published good)))
+      (is (some? (:error still-guarded)))
+      (is (String/contains? (:message still-guarded) "Realm provider changed while packaging"))
+      (is (= false (:published still-guarded)) "fresh byte validation rejects even an accidentally widened source snapshot")
+      (is (= changed (:leaf good) (:leaf still-guarded) (:leaf old)) "actual compilation performed the same provider-file change in all copies")
+      (is (nil? (:error old)) (:message old))
+      (is (= true (:published old)) "precompile validation incorrectly certifies and publishes the package after source drift")
+      (is (= 2 (:format (:value old))))
+      (is (= original (File/read! (str (:output old) "/source/hpdrift/leaf.bl"))))
+      (let [fresh (BeamLisp.Loader/with_search_dir search
+                    #(realm-run (:realm old)
+                       (fn [] (BeamLisp.AOT/with_source_snapshot
+                                (fn [] (BeamLisp.AOT/ns_closure_hash "hpdrift.leaf"))))))]
+       (is (string? fresh))
+       (is (not= fresh (get-in old [:value :closures "hpdrift.leaf"]))
+           "the freshly read live closure disagrees with the stale published receipt"))
+      (println :closure-E15-third-pass {:producer-sha256 (digest source)
+                                       :wide-snapshot-sha256 (digest (replace-once source before after))
+                                       :mutant-sha256 (digest (replace-once source phase-before phase-after))
+                                       :normal-published (:published good) :wide-published (:published still-guarded)
+                                       :mutant-published (:published old)
+                                       :SDK-rebuilt false}))
+     (finally (File/rm_rf! root)))))))
+
+(defn- install-classifier [source namespace]
+ (BeamLisp.Compiler/eval_string (str "(ns " namespace ")"))
+ (BeamLisp.Compiler/eval_form
+  (named-form source "priv/std/reload/source-producer.bl" "compiler-runtime-call?")
+  (BeamLisp.Compiler/new_env namespace))
+ (BeamLisp.Env/mark_loaded namespace)
+ namespace)
+(defn- install-anf-checker [source classifier namespace]
+ (BeamLisp.Compiler/eval_string
+  (str "(ns " namespace " (:require [" classifier " :as source-producer] "
+       "[reload.binding-data :as binding-data] [reload.native-call :as native-call] "
+       "[reload.sdk-readiness :as sdk-readiness]))"))
+ (doseq [name ["analyzed-namespace-modules" "sdk-pool-data-target?" "unmanaged-store-binding?"
+               "reflective-global?" "native-hazard?" "authorized-system-bridge?" "refuse!"]]
+  (BeamLisp.Compiler/eval_string
+   (str "(defn " name " [& xs] (BeamLisp.Ns.Rt/invoke "
+        "(BeamLisp.Env/fetch_exact! \"reload.generation\" \"" name "\") (to-list xs)))")))
+ (BeamLisp.Compiler/eval_form (named-form source "priv/std/reload/generation.bl" "check-anf!")
+                            (BeamLisp.Compiler/new_env namespace)) namespace)
+
+(deftest E65-actual-compiler-future-is-refused-only-by-the-old-generic-native-check
+ (let [source (producer "priv/std/reload/source-producer.bl")
+       generation-source (producer "priv/std/reload/generation.bl")
+       before "(and (= :Elixir.BeamLisp.Refs module) (= :future_exec function) (= 1 arity))"
+       after "false"
+       scope (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (let [normal-classifier (install-classifier source (private-name "future-classifier"))
+           old-classifier (install-classifier (replace-once source before after) (private-name "future-classifier-mutant"))
+           normal (install-anf-checker generation-source normal-classifier (private-name "future-checker"))
+           mutant (install-anf-checker generation-source old-classifier (private-name "future-checker-mutant"))
+           planned (generation/plan {:application-id (private-name "future-plan")
+                                    :sources {"future.app" "(ns future.app) (defn run [] (future 42))"}})
+           planned (assoc planned :forbidden-remotes
+                    (invoke "reload.generation" "forbidden-remotes" []))
+           home (get (:mapping planned) "future.app")
+           compiled (BeamLisp.Compiler/compile
+                      (first (BeamLisp.Reader/read_string "(fn [] (future 42))"))
+                      (assoc (BeamLisp.Compiler/new_env home) :managed-source true))
+           ;; Both checkers consume the SAME exact compiler tree. Their helpers
+           ;; bridge actual SDK code; only the future recognition exception differs.
+           good (try (invoke normal "check-anf!" [planned compiled]) :accepted
+                  (catch error {:kind (:kind (ex-data error)) :message (ex-message error)}))
+           old (try (invoke mutant "check-anf!" [planned compiled]) :accepted
+                 (catch error {:kind (:kind (ex-data error)) :message (ex-message error)}))]
+      (is (= :accepted good))
+      (is (= :unmanaged-compiled-producer (:kind old)))
+      (is (= true (invoke normal-classifier "compiler-runtime-call?" [:Elixir.BeamLisp.Refs :future_exec 1])))
+      (is (= false (invoke old-classifier "compiler-runtime-call?" [:Elixir.BeamLisp.Refs :future_exec 1])))
+      (is (= false (invoke normal-classifier "compiler-runtime-call?" [:Elixir.BeamLisp.Refs :future_exec 2])))
+      (is (= :dynamic-code-dependency
+             (try
+              (generation/plan {:application-id (private-name "raw-future") :native-modules #{"BeamLisp.Refs"}
+                                :sources {"raw.future" "(ns raw.future) (defn run [] (BeamLisp.Refs/future_exec (fn [] 1)))"}})
+              :accepted (catch error (:kind (ex-data error))))))
+      (println :closure-E65-third-pass {:producer-sha256 (digest source)
+                                       :mutant-sha256 (digest (replace-once source before after))
+                                       :checker-source-sha256 (digest generation-source)
+                                       :normal good :mutant old :application-future-executed false
+                                       :SDK-rebuilt false}))))
+   (finally (BeamLisp.Env/destroy scope)))))

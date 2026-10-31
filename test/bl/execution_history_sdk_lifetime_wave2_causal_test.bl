@@ -1,0 +1,94 @@
+;; A real SDK class supplies private initializer authority. The options thunk
+;; is legitimate native init input and binds an actual captured unmanaged Env;
+;; it does not manufacture a generation, origin, init selector or SDK row.
+(ns execution.history-sdk-lifetime-wave2-causal-test (:require [proc.table :as table]))
+
+(defn- actual-form [source name]
+ (let [forms (filterv #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                            (= name (BeamLisp.AOT/stage-symbol
+                              (second (BeamLisp.AOT/stage-items % :list)))))
+                      (BeamLisp.Reader/read_string source))]
+  (assert (= 1 (count forms)))
+  (let [span (BeamLisp.FormMeta/meta (first forms))]
+   (String/slice source (:offset span) (- (:end-offset span) (:offset span))))))
+(defn- once [source before after]
+ (assert (= 2 (count (String/split source before))))
+ (String/replace source before after))
+(defn- probe! [directory module body]
+ (let [path (Path/join directory (str (Atom/to_string module) ".bl"))]
+  (File/write! path (str "(ns history.sdk.lifetime.native)\n" body))
+  (BeamLisp.AOT/compile_host_file path
+   (list (tuple :module module) (tuple :output_dir directory) (tuple :load? true)))))
+(defn- ambient [pid]
+ (let [dictionary (first (elem (erlang/apply :sys :get_status (list pid)) 3))]
+  {:env (Keyword/get dictionary :bl_env) :generation (Keyword/get dictionary :bl_generation)}))
+(defn- stop-owner! [pid name]
+ (when (and pid (Process/alive? pid))
+  ;; Delete inside its genuine owner before shutdown, so an existing global
+  ;; table heir cannot inherit this uniquely named fixture table.
+  (erlang/apply :sys :replace_state
+   (list pid (fn [state]
+               (when (not= :undefined (ets/whereis name)) (ets/delete name)) state)))
+  (GenServer/stop pid)))
+(defn- real-init [constructor context name]
+ (let [seen (atom nil) owner (atom nil)
+       options (lazy-seq
+                 (BeamLisp.Env/bind context)
+                 (let [before (BeamLisp.Env/capture)
+                       callable (erlang/apply constructor :sdk_callable! (list "proc.framework" "adopt-runtime!" 0))
+                       result (erlang/apply callable (list))
+                       after (BeamLisp.Env/capture)]
+                  (reset! seen {:before {:env (:env before) :generation (:generation before)}
+                                :after {:env (:env after) :generation (:generation after)}
+                                :adoption-result result :actual-init-pid (erlang/self)}))
+                 (list :public :named_table))]
+  (try
+   ;; Actual immutable SDK class and actual Server native start protocol. The
+   ;; class's normal initial adoption is unchanged; the thunk then exercises a
+   ;; nested helper's independent authenticated adoption in that same init.
+   (reset! owner (start table/table-keeper {:table name :options options}))
+   (let [origin (BeamLisp.Env/native_process_start_evidence! @owner (erlang/self))
+         receipt (first (:receipts origin))]
+    {:during @seen :after-native-init (ambient @owner)
+     :actual-class (:module receipt) :actual-class-md5 (:module-md5 receipt) :actual-child @owner
+     :original-native-start origin})
+   (finally (stop-owner! @owner name)))))
+
+(deftest E79-real-SDK-init-adoption-survives-direct-construction-and-detects-restoring-global-wrapper
+ (let [directory (Path/join (System/tmp_dir!) (str "history-sdk-lifetime-native-" (erlang/unique_integer (list :positive))))
+       current :Elixir.HistoryRuntimeOwnership.SdkCallableDirect
+       historical :Elixir.HistoryRuntimeOwnership.SdkCallableGlobalWrapper
+       path (Path/join (BeamLisp.Tiers/priv_root) "host/env.bl") source (File/read! path)
+       body (actual-form source "sdk_callable!")
+       before "(BeamLisp.AOT/sdk_named_constructor! namespace name arity)"
+       after "(let [callable (BeamLisp.AOT/sdk_named_constructor! namespace name arity)] (fn [] (BeamLisp.Env/with_env :global (fn [] (erlang/apply callable (list))))))"
+       scope (BeamLisp.Env/fork :global)
+       context (BeamLisp.Env/with_env scope (fn [] (BeamLisp.Env/capture)))
+       sdk-class table/table-keeper class-md5 (erlang/apply sdk-class :module_info (list :md5))
+       env-md5 (BeamLisp.Env/module_info :md5)]
+  (File/mkdir_p! directory)
+  (try
+   (assert (nil? (:generation context)))
+   (assert (= scope (:env context)))
+   (probe! directory current body)
+   (probe! directory historical (once body before after))
+   (let [normal (real-init current context :history_sdk_direct_adoption)
+         mutant (real-init historical context :history_sdk_wrapped_adoption)]
+    (println :history-wave2-E79
+     {:producer-sha256 (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower)))
+      :current normal :global-wrapper-mutant mutant :real-unmanaged-fork scope})
+    (is (= [sdk-class class-md5]
+           [(:actual-class normal) (:actual-class-md5 normal)]
+           [(:actual-class mutant) (:actual-class-md5 mutant)]))
+    (is (= (:actual-child normal) (get-in normal [:during :actual-init-pid])))
+    (is (= (:actual-child mutant) (get-in mutant [:during :actual-init-pid])))
+    (is (= {:env scope :generation nil} (get-in normal [:during :before]) (get-in mutant [:during :before])))
+    (is (= :sdk-runtime (get-in normal [:during :adoption-result]) (get-in mutant [:during :adoption-result])))
+    (is (= {:env :global :generation nil} (get-in normal [:during :after]) (:after-native-init normal)))
+    (is (= {:env scope :generation nil} (get-in mutant [:during :after]) (:after-native-init mutant)))
+    (is (= class-md5 (erlang/apply sdk-class :module_info (list :md5))))
+    (is (= env-md5 (BeamLisp.Env/module_info :md5))))
+   (finally
+    (BeamLisp.Env/destroy scope)
+    (doseq [module [current historical]] (code/purge module) (code/delete module))
+    (File/rm_rf! directory)))))
