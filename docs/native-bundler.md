@@ -360,8 +360,11 @@ A successful main CI run triggers the rolling release through `workflow_run`.
 The release checks out that run's `head_sha`, verifies its tiny SDK selection
 receipt, and copies the exact portable bytes from the restored SDK. It reuses
 that successful inventory instead of rebuilding or repeating the full suite.
-Tagged releases and explicit build dispatches use the same canonical recipe and
-qualify the resulting candidate before publication. Ordinary inventory shards
+Tagged releases and explicit build dispatches first look for fully successful
+main push CI for the exact release commit. When present, they verify and reuse
+that run's same selector, SDK and candidate without repeating production or the
+inventory. Otherwise they use the canonical recipe and qualify the resulting
+candidate before publication. Ordinary inventory shards
 run inside bounded Nix workers. The two declared real-Nix consumers run serially
 on the host under a 6 GiB cgroup, using its real daemon and the same candidate.
 These lanes cover the original inventory exactly once and retain failed checks'
@@ -394,7 +397,10 @@ chmod +x bl-linux-x86_64
 
 An older host must upgrade to a supported OS/runtime before using this portable
 binary. The CI adapter does not lower its advertised host requirement or bundle
-glibc into the download. Developers with the retained Nix SDK can reproduce the
+glibc into the download. The native updater currently verifies the binary's
+published checksum, but does not read the requirements receipt or reject an
+incompatible host before moving its channel pointer; check the host requirements
+manually before updating. Developers with the retained Nix SDK can reproduce the
 ABI check without compiling anything again:
 
 ```sh
@@ -486,6 +492,13 @@ bl hooks install [DIR]           the staleness warnings / the latest guard, for 
 bl hooks status [DIR]            which recorded build no longer matches its inputs
 bl self-gc [--dry-run]           what the store holds, and why each build stays
 ```
+
+Bare `bl self-update` stops if the stable release lookup fails; it does not then
+try the rolling prerelease. On a repository with only a `latest` prerelease,
+request `bl self-update latest` explicitly. With a configured `:source`, that
+command builds the local source's main branch instead of downloading CI's
+release. The `:default` setting controls ordinary build selection and does not
+change this update sequence.
 
 `bl hooks install` in a beam-lisp checkout adds `post-commit`, `post-merge`,
 `post-checkout` and `post-rewrite` to the hooks every worktree shares. Each is

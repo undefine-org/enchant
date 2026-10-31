@@ -31,20 +31,43 @@ env:
   RELEASE_REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
+  resolve-runtime:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: blacksmith-4vcpu-ubuntu-2604
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      runtime_run: ${{ steps.qualified.outputs.runtime_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
+      - name: Resolve fully successful main CI for this exact commit
+        id: qualified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_RUN: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '' }}
+        run: |
+          args=(--revision "$RELEASE_REVISION" --github-output "$GITHUB_OUTPUT")
+          if [ -n "$EVENT_RUN" ]; then args+=(--run-id "$EVENT_RUN"); fi
+          python3 scripts/resolve-ci-runtime.py "${args[@]}"
+
   # One stable production SDK and one portable candidate for all consumers.
   linux:
-    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository)
+    needs: resolve-runtime
     uses: ./.github/workflows/build-drop.yml
     with:
       artifact: linux-x86_64
       version: ${{ inputs.version || '' }}
       revision: ${{ github.event.workflow_run.head_sha || github.sha }}
-      runtime_run: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '' }}
+      runtime_run: ${{ needs.resolve-runtime.outputs.runtime_run }}
 
   linux-inventory:
-    # A successful main CI run already qualified these exact SDK/drop bytes.
-    if: github.event_name != 'workflow_run'
-    needs: linux
+    # Only a fully successful exact main CI run permits inventory reuse.
+    if: needs.resolve-runtime.outputs.runtime_run == ''
+    needs: [resolve-runtime, linux]
     runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 100
     strategy:
@@ -83,8 +106,8 @@ jobs:
           retention-days: 7
 
   linux-native-inventory:
-    if: github.event_name != 'workflow_run'
-    needs: linux
+    if: needs.resolve-runtime.outputs.runtime_run == ''
+    needs: [resolve-runtime, linux]
     runs-on: blacksmith-4vcpu-ubuntu-2604
     timeout-minutes: 100
     steps:
@@ -116,8 +139,8 @@ jobs:
 
   publish-latest:
     name: publish latest (rolling)
-    if: always() && github.event_name == 'workflow_run' && needs.linux.result == 'success' && needs.linux-inventory.result == 'skipped' && needs.linux-native-inventory.result == 'skipped'
-    needs: [linux, linux-inventory, linux-native-inventory]
+    if: always() && github.event_name == 'workflow_run' && needs.resolve-runtime.result == 'success' && needs.resolve-runtime.outputs.runtime_run != '' && needs.linux.result == 'success' && needs.linux-inventory.result == 'skipped' && needs.linux-native-inventory.result == 'skipped'
+    needs: [resolve-runtime, linux, linux-inventory, linux-native-inventory]
     runs-on: blacksmith-4vcpu-ubuntu-2604
     # One `latest` at a time: a newer push supersedes an older one mid-upload.
     concurrency:
@@ -177,8 +200,11 @@ jobs:
 
   publish:
     name: publish release
-    if: always() && github.ref_type == 'tag' && needs.linux.result == 'success' && needs.linux-inventory.result == 'success' && needs.linux-native-inventory.result == 'success'
-    needs: [linux, linux-inventory, linux-native-inventory]
+    if: >-
+      always() && github.ref_type == 'tag' && needs.resolve-runtime.result == 'success' && needs.linux.result == 'success' &&
+      ((needs.resolve-runtime.outputs.runtime_run != '' && needs.linux-inventory.result == 'skipped' && needs.linux-native-inventory.result == 'skipped') ||
+      (needs.resolve-runtime.outputs.runtime_run == '' && needs.linux-inventory.result == 'success' && needs.linux-native-inventory.result == 'success'))
+    needs: [resolve-runtime, linux, linux-inventory, linux-native-inventory]
     runs-on: blacksmith-4vcpu-ubuntu-2604
     steps:
       - uses: actions/checkout@v4
