@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check an assembled drop's default transport in its own ordinary project."""
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -62,6 +63,13 @@ def main():
                 return result.stdout.strip().splitlines()
 
             print('\n'.join(run('version')), flush=True)
+            metadata = candidate.parent.parent / 'artifact.json'
+            if metadata.is_file() and json.loads(metadata.read_text()).get('kind') == 'sdk':
+                platform = Path(json.loads(metadata.read_text())['platform'])
+                elixir = Path(json.loads((platform / 'platform.json').read_text())['elixir'])
+                expected = str(elixir / 'lib/elixir/lib/elixir')
+                assert expected in run('eval', '(println (erlang/list_to_binary (code/lib_dir :elixir)))')
+                print('SDK_PLATFORM_ELIXIR_READY', flush=True)
             assert '42' in run('eval', '(println (+ 40 2))')
             first = run('eval', '(println (str "OWNER " (System/pid)))')
             second = run('eval', '(println (str "OWNER " (System/pid)))')

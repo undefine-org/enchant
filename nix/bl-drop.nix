@@ -243,7 +243,11 @@ let
       chmod 555 "$sdk/bl"
       mkdir -p "$sdk/bin"
       cat > "$sdk/boot.exs" <<EOF
+      # The platform owns the running Elixir installation and its CLI scripts.
+      # The portable payload's ebin-only copy must not shadow that installation.
+      elixir_ebin = :code.lib_dir(:elixir, :ebin)
       for path <- Path.wildcard("$sdk/lib/*/ebin"), do: Code.prepend_path(path)
+      Code.prepend_path(elixir_ebin)
       Code.prepend_path("$sdk/image/ebin")
       :code.del_path(~c".")
       BeamLisp.Launcher.start_app!(System.argv(), %{})
