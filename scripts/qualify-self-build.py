@@ -62,14 +62,16 @@ def main():
                     raise RuntimeError(f'{argv}: {result.stdout}\n{result.stderr}')
                 return result.stdout.strip().splitlines()
 
-            print('\n'.join(run('version')), flush=True)
             metadata = candidate.parent.parent / 'artifact.json'
             if metadata.is_file() and json.loads(metadata.read_text()).get('kind') == 'sdk':
                 platform = Path(json.loads(metadata.read_text())['platform'])
                 elixir = Path(json.loads((platform / 'platform.json').read_text())['elixir'])
                 expected = str(elixir / 'lib/elixir/lib/elixir')
-                assert expected in run('eval', '(println (erlang/list_to_binary (code/lib_dir :elixir)))')
+                # A warm native realm runs the portable release's own Elixir.
+                # This regression concerns the SDK's cold platform bootstrap.
+                assert expected in run('--cold', 'eval', '(println (erlang/list_to_binary (code/lib_dir :elixir)))')
                 print('SDK_PLATFORM_ELIXIR_READY', flush=True)
+            print('\n'.join(run('version')), flush=True)
             assert '42' in run('eval', '(println (+ 40 2))')
             first = run('eval', '(println (str "OWNER " (System/pid)))')
             second = run('eval', '(println (str "OWNER " (System/pid)))')
