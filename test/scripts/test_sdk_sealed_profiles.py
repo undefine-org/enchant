@@ -10,6 +10,10 @@ PROFILE = runpy.run_path(str(ROOT / 'scripts/sdk_sealed_profiles.py'))
 
 
 class SealedProfiles(unittest.TestCase):
+    def test_runtime_factory_keeps_dynamic_world_cli_provider(self):
+        selection = PROFILE['plan'](['native-custody'])
+        self.assertIn('bl.world', selection['roots'])
+
     def test_existing_test_timings_keep_namespace_and_exclude_startup(self):
         slowest = runpy.run_path(str(ROOT / 'scripts/test_timings.py'))['slowest']
         self.assertEqual([{'namespace': 'two', 'test': 'slow', 'milliseconds': 12},

@@ -1,4 +1,4 @@
-(ns sdk.selected.consumer)
+(ns sdk.selected.consumer (:require [reload.ward :as ward]))
 (let [output (System/fetch_env! "BL_SDK_ARTIFACT_OUT")
       source (System/fetch_env! "BL_SDK_CONTEXTUAL_ROOT")
       plan (Jason/decode! (File/read! (System/fetch_env! "BL_SDK_SEALED_PLAN"))
@@ -6,21 +6,31 @@
       rows (atom [])]
  (assert (= "yes" (System/get_env "BL_SDK_ARTIFACT_SOURCE_FREE")))
  (assert (BeamLisp.AOTCache/packaged_compiler?))
+ ;; The producer's explicit runtime roots must enter through the real Loader
+ ;; before Ward freezes its warm base. A declaration snapshot alone does not
+ ;; initialize or retain a generated class in a fresh Source-free receiver.
+ (doseq [namespace (:roots plan)] (BeamLisp.Loader/ensure_loaded namespace))
  (when (:pipeline plan)
   (BeamLisp/run_file (Path/join source "test/scripts/sdk-contextual-consumer.bl"))
   (assert (= "passed" (:status (Jason/decode! (File/read! (Path/join output "contextual-pipeline.json"))
                                              (list (tuple :keys :atoms)))))))
  (doseq [group (:groups plan) test (:tests group)]
   (let [started (System/monotonic_time :millisecond)
-        result (try (BeamLisp.TestRT/run_suite (list (Path/join source (:path test))))
+        result (try
+                 (let [path (Path/join source (:path test))
+                       suite (ward/run [{:path path :src (BeamLisp.Loader/read_source path)}])
+                       file (first (:files suite))]
+                  (assoc (merge {:tests 0 :pass 0 :fail 0 :error 0} (:totals file))
+                    :status (:status file)
+                    :details (Kernel/inspect (select-keys file [:reports :errors]))))
                  (catch error {:tests 0 :pass 0 :fail 0 :error 1
                                :load-error (String/slice (ex-message error) 0 2048)}))]
    ;; Keep file failures observable without hiding later consumer failures.
    ;; Exact counts and nonempty coverage remain mandatory before success.
-   (swap! rows conj (assoc (select-keys result [:tests :pass :fail :error :load-error])
+   (swap! rows conj (assoc (select-keys result [:tests :pass :fail :error :load-error :details])
                      :group (:id group) :path (:path test)
                      :expected-assertions (:assertions test)
-                     :status (if (and (> (:tests result) 0)
+                     :status (if (and (= :passed (:status result)) (> (:tests result) 0)
                                       (= (:assertions test) (:pass result))
                                       (= 0 (:fail result)) (= 0 (:error result))) "passed" "failed")
                      :elapsed-ms (- (System/monotonic_time :millisecond) started)))))
