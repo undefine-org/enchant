@@ -139,6 +139,42 @@ def capture(root, cache, sdk):
     return record['sdk']
 
 
+def capture_completed(root, cache, sdk=None):
+    """Keep completed products after failure, without a qualification selector."""
+    rejected = (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError)
+    # Freeze the actual candidate before retaining an older hint can update
+    # current-sdk. Missing/unfinished SDKs still permit caching dependencies.
+    candidate = sdk or root / '.bl/sdks/current-sdk'
+    candidate = candidate.resolve() if (candidate / 'artifact.json').is_file() else None
+    prior = cache / 'selection.json'
+    previous = None
+    if prior.is_file():
+        try:
+            previous = verify_record(json.loads(prior.read_text()))
+        except rejected as error:
+            print('ci-sdk-cache: dropping invalid predecessor hint: ' + str(error), file=sys.stderr)
+            prior.unlink(missing_ok=True)
+            for name in ('sdk-root', 'engine-root'):
+                (cache / name).unlink(missing_ok=True)
+    selected = ''
+    if candidate:
+        try:
+            # The same source/operation/result binding as a successful save.
+            selected = capture(root, cache, candidate)
+        except rejected as error:
+            print('ci-sdk-cache: completed SDK hint rejected: ' + str(error), file=sys.stderr)
+    if not selected and previous:
+        retain(root, cache, previous)
+        selected = previous['sdk']
+    try:
+        model_input().restore(cache)
+    except rejected as error:
+        print('ci-sdk-cache: omitting incomplete model hint: ' + str(error), file=sys.stderr)
+        for name in ('models.json', 'models-root'):
+            (cache / name).unlink(missing_ok=True)
+    return selected
+
+
 def restore(root, cache, expected=None, required=False):
     path = cache / 'selection.json'
     if not path.is_file():
@@ -216,7 +252,7 @@ def verify_selector(root, cache, path, revision, run_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('restore', 'save', 'write-selector', 'read-selector', 'verify-selector'))
+    parser.add_argument('operation', choices=('restore', 'save', 'save-products', 'write-selector', 'read-selector', 'verify-selector'))
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--cache', type=Path, default=Path.home() / '.cache/enchant-ci')
     parser.add_argument('--sdk', type=Path)
@@ -250,8 +286,11 @@ def main():
                     print('sdk=' + record['sdk'], file=output)
             print(json.dumps(record, sort_keys=True))
             return 0
-        sdk = (capture(args.root.resolve(), args.cache.resolve(), args.sdk) if args.operation == 'save'
-               else restore(args.root.resolve(), args.cache.resolve(), args.sdk, args.required))
+        if args.operation == 'save-products':
+            sdk = capture_completed(args.root.resolve(), args.cache.resolve(), args.sdk)
+        else:
+            sdk = (capture(args.root.resolve(), args.cache.resolve(), args.sdk) if args.operation == 'save'
+                   else restore(args.root.resolve(), args.cache.resolve(), args.sdk, args.required))
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         print('ci-sdk-cache: ' + str(error), file=sys.stderr)
         return 1
