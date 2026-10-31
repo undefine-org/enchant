@@ -43,6 +43,9 @@ def package_runtime(root, destination, candidate=None):
             archive.add(root / relative, arcname=relative)
         if candidate is not None:
             archive.add(candidate, arcname=".bl/ci-candidate", recursive=False)
+        if (root / ".bl/ci-sdk.json").is_file():
+            for relative in (".bl/ci-runtime", ".bl/lib", ".bl/ci-image", ".bl/ci-sdk.json", "env.bl"):
+                archive.add(root / relative, arcname=str(relative))
 
 
 def main():
@@ -53,6 +56,7 @@ def main():
     parser.add_argument("--candidate", type=Path, required=True)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    args.store.mkdir(parents=True, exist_ok=True)
     package_runtime(args.root, args.out / "ci-runtime.tar.gz", args.candidate)
     count = package_store(args.store, args.out / "ci-store.tar.gz")
     print(f"Prepared runtime: {count} native products; Cargo intermediates remain in the producer cache")

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import subprocess
 import signal
@@ -31,6 +32,35 @@ def partitions(root, count):
         groups[index].append(name)
         loads[index] += max(1, timings.get(name, 1000))
     return groups
+
+
+def verified_context(environ):
+    names = ("BL_SDK_PRODUCT", "BL_ARTIFACT_PLATFORM", "BL_PREPARATION_COORDINATOR",
+             "BL_PREPARED_NATIVES", "BL_TEST_CHECKOUT_PLATFORM")
+    if not any(environ.get(name) for name in names):
+        return {}
+    sdk = Path(environ["BL_SDK_PRODUCT"]).resolve(strict=True)
+    if not re.fullmatch(r"/nix/store/[0-9a-z]{32}-[^/]+", str(sdk)):
+        raise ValueError("CI SDK context requires a retained immutable selection")
+    metadata = json.loads((sdk / "artifact.json").read_text())
+    if (metadata["version"], metadata["kind"], metadata["target"]) != (1, "sdk", "x86_64-linux"):
+        raise ValueError("CI SDK context has unsupported identity")
+    platform = Path(metadata["platform"]).resolve(strict=True)
+    coordinator = (sdk / "preparation-coordinator").resolve(strict=True)
+    if str(coordinator) != metadata["coordinator"]:
+        raise ValueError("CI SDK coordinator retention disagrees")
+    expected = {"BL_SDK_PRODUCT": sdk, "BL_ARTIFACT_PLATFORM": platform / "artifact-platform",
+                "BL_PREPARATION_COORDINATOR": coordinator,
+                "BL_PREPARED_NATIVES": (platform / "native-products").resolve(strict=True),
+                "BL_TEST_CHECKOUT_PLATFORM": platform}
+    for name, path in expected.items():
+        path = path.resolve(strict=True)
+        if not path.is_dir() or path.parts[:3] != ("/", "nix", "store"):
+            raise ValueError(name + " must select an existing immutable Nix path")
+        if environ.get(name) and Path(environ[name]).resolve(strict=True) != path:
+            raise ValueError(name + " disagrees with the selected SDK")
+        expected[name] = str(path)
+    return expected
 
 
 def main():
@@ -69,6 +99,15 @@ def main():
     if os.environ.get("RUSTUP_TOOLCHAIN"):
         command.insert(command.index(sys.executable),
                        f"--setenv=RUSTUP_TOOLCHAIN={os.environ['RUSTUP_TOOLCHAIN']}")
+    # CI may select an already-retained SDK on this host. Only its fixed
+    # immutable provider context crosses this manager boundary; never producer
+    # flags, checkout source roots, or arbitrary caller overrides.
+    try:
+        context = verified_context(os.environ)
+    except (KeyError, OSError, ValueError) as error:
+        parser.error(str(error))
+    for name, value in context.items():
+        command.insert(command.index(sys.executable), f"--setenv={name}={value}")
     runtime_parent = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-", dir=runtime_parent) as runtime:
         # Keep automatic checkout endpoints local to this shard. Preserve the

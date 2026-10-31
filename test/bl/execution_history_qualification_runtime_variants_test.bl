@@ -1,0 +1,158 @@
+(ns execution.history.qualification-runtime-variants-test
+ (:require [bl.profile :as profile]))
+
+(defn- source-root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(defn- unique-ns [prefix] (str prefix (erlang/unique_integer (list :positive))))
+(defn- eval-private [source namespace]
+ (BeamLisp.Compiler/eval_string source)
+ (BeamLisp.Env/mark_loaded namespace)
+ namespace)
+(defn- invoke [namespace name argv]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! namespace name) (to-list argv)))
+
+(deftest E42-source-derived-memory-collection-includes-direct-vms-and-swap
+ (let [root (source-root)
+       [output status] (System/cmd "python3"
+          (list (Path/join root "test/scripts/execution-qualification-driver.py")
+                "test/scripts/test_history_qualification_extra.py"
+                "QualificationExtra.test_E42_actual_memory_collection_counts_direct_vms_swap_and_total")
+          (list (tuple :cd root) (tuple :stderr_to_stdout true)))]
+  (is (= 0 status) output)
+  (is (String/contains? output "BL-HISTORY-UNITTEST "))
+  (is (String/contains? output "\"complete\": true"))))
+
+(deftest E42-native-call-count-and-delivered-trace-reach-the-observer
+ (let [module (Module/concat :Elixir.QualificationTrace (str "Probe" (erlang/unique_integer (list :positive))))
+       forms (list (tuple :attribute 1 :module module)
+                   (tuple :attribute 1 :export (list (tuple :hit 1)))
+                   (tuple :function 1 :hit 1
+                    (list (tuple :clause 1 (list (tuple :var 1 :X)) (list) (list (tuple :var 1 :X))))))
+       compiled (erlang/apply :compile :forms (list forms (list :binary :return_errors)))
+       _ (assert (= :ok (elem compiled 0)))
+       _ (code/load_binary module (String/to_charlist "qualification-trace-fixture.beam") (elem compiled 2))
+       owner (erlang/self) ticket (erlang/make_ref)
+       collector (erlang/spawn
+                   (fn []
+                    (loop [events []]
+                     (receive
+                      [:trace pid :call [observed :hit args]] :when (= observed module)
+                       (recur (conj events {:pid pid :args args}))
+                      [:trace-finish actual reply-to] :when (= actual ticket)
+                       (erlang/send reply-to [:trace-events actual events])))))]
+  (try
+   (is (= 1 (erlang/trace_pattern (tuple module :hit 1) true (list :local :call_count))))
+   (is (= 1 (erlang/trace owner true (list :call (tuple :tracer collector)))))
+   (doseq [value (range 7)] (is (= value (erlang/apply module :hit (list value)))))
+   (let [barrier (erlang/trace_delivered owner)]
+    (is (= :delivered (receive [:trace_delivered actual ref] :when (and (= actual owner) (= ref barrier)) :delivered (after 5000 :timeout))))
+    ;; trace_delivered confirms the preceding events reached the tracer.
+    ;; The finish request can now observe every preceding call.
+    (erlang/trace owner false (list :call))
+    (erlang/send collector [:trace-finish ticket owner])
+    (let [events (receive [:trace-events actual rows] :when (= actual ticket) rows (after 5000 []))]
+     (is (= 7 (count events)))
+     (is (every? #(= owner (:pid %)) events))))
+   (is (= (tuple :call_count 7) (erlang/trace_info (tuple module :hit 1) :call_count)))
+   (let [result (profile/call-time #(doseq [value (range 7)] (erlang/apply module :hit (list value))))
+         rows (filter #(and (= (String/replace_prefix (Atom/to_string module) "Elixir." "") (:ns %))
+                            (= "hit" (:fn %))) (:rows result))]
+    (is (:profiled? result))
+    (is (= 7 (reduce + 0 (map :calls rows)))))
+   (finally
+    (erlang/trace owner false (list :call))
+    (erlang/trace_pattern (tuple module :hit 1) false (list :local :call_count))
+    (when (Process/alive? collector) (erlang/exit collector :kill))
+    (code/purge module) (code/delete module)))))
+
+(defn- ward-probe [source namespace outside?]
+ (let [header "(ns reload.ward"
+       checked "(check/coherence {ns src})"
+       injection "(if (= ns \"qualification.injected.first\") (throw (ex-info \"source-check-control\" {:kind :qualification-source-check-fault})) (check/coherence {ns src}))"
+       boundary "        ns (ns-of src)\n        before (os-env)]"
+       mutated "        ns (ns-of src)\n        _ (check-source ns src)\n        before (os-env)]"
+       _ (when-not (and (= 2 (count (String/split source checked)))
+                         (= 2 (count (String/split source boundary))))
+           (throw :ward-source-mutation-anchor-drift))
+       source (String/replace source header (str "(ns " namespace))
+       source (String/replace source checked injection)
+       source (if outside? (String/replace source boundary mutated) source)]
+  (eval-private source namespace)))
+
+(deftest E53-actual-ward-worker-contains-source-check-fault-and-reports-later-file
+ (let [source (BeamLisp.Loader/read_source (Path/join (source-root) "priv/std/reload/ward.bl"))
+       current (unique-ns "qualification.ward.current")
+       mutant (unique-ns "qualification.ward.mutant")
+       scope (BeamLisp.Env/fork)
+       entries ["(ns qualification.injected.first) (deftest sample (is true))"
+                "(ns qualification.injected.second) (deftest sample (is (= 42 (+ 40 2))))"]]
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     (ward-probe source current false)
+     (ward-probe source mutant true)
+     (let [done (atom [])
+           observer (fn [event] (when (= :file-done (:phase event)) (swap! done conj (:ns event))))
+           result (invoke current "run" [entries observer])]
+      (is (= 2 (count (:files result))))
+      (is (= :incoherent (:status (first (:files result)))))
+      (is (= :passed (:status (second (:files result)))))
+      (is (= 1 (get-in (second (:files result)) [:totals :pass])))
+      (is (= ["qualification.injected.first" "qualification.injected.second"] @done))
+      (is (not (:ok? result))))
+     (let [done (atom [])
+           outcome (try (invoke mutant "run" [entries (fn [event] (when (= :file-done (:phase event)) (swap! done conj (:ns event))))]) :unexpected
+                     (catch error (:kind (ex-data error))))]
+      (is (= :qualification-source-check-fault outcome))
+      (is (= [] @done)))))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(defn- browser-probe [namespace missing? source suite]
+ (let [source (String/replace source "(ns browser.kernel " (str "(ns " namespace " "))
+       source (if missing? (String/replace source "(defn replays [c s]" "(defn unavailable-replays [c s]") source)
+       tests (str namespace ".contracts")
+       suite (String/replace suite "(ns browser.kernel.test" (str "(ns " tests))
+       suite (String/replace suite "[browser.kernel :as k]" (str "[" namespace " :as k]"))]
+  (eval-private source namespace)
+  (BeamLisp.TestRT/declarations #(BeamLisp.Compiler/eval_string suite))
+  (BeamLisp.TestRT/run_ns tests)))
+
+(deftest E69-complete-declared-browser-contracts-detect-a-missing-supported-entry
+ (let [root (source-root) scope (BeamLisp.Env/fork)
+       source (BeamLisp.Loader/read_source (Path/join root "priv/std/browser/kernel.bl"))
+       suite (BeamLisp.Loader/read_source (Path/join root "test/bl/browser/kernel_test.bl"))
+       parent (erlang/self) ticket (erlang/make_ref)]
+  (try
+   ;; TestRT's run counters and current assertion context are process-local.
+   ;; Keep the nested suite in its own monitored actor so its run_ns cannot
+   ;; replace the outer selector's assertion collector.
+   (let [[worker monitor]
+         (spawn-monitor
+          (fn []
+           (try
+            (let [results
+                  (BeamLisp.Env/with_env scope
+                   (fn []
+                    {:current (browser-probe (unique-ns "qualification.browser.current") false source suite)
+                     :mutant (try (browser-probe (unique-ns "qualification.browser.missing") true source suite)
+                              (catch error {:load-error (ex-message error)}))}))]
+             (erlang/send parent [ticket :ok results]))
+            (catch error (erlang/send parent [ticket :error (ex-message error)])))))
+         results
+         (receive
+          [seen :ok result] :when (= seen ticket)
+           (do (Process/demonitor monitor (list :flush)) result)
+          [seen :error message] :when (= seen ticket)
+           (do (Process/demonitor monitor (list :flush)) (throw (ex-info message {:kind :browser-contract-worker})))
+          [:DOWN ref :process pid reason] :when (and (= ref monitor) (= pid worker))
+           (throw (ex-info "Browser contract worker died" {:reason reason}))
+          (after 30000
+           (erlang/exit worker :kill)
+           (receive [:DOWN ref :process pid _] :when (and (= ref monitor) (= pid worker)) nil)
+           (throw :browser-contract-worker-timeout)))
+         current (:current results) mutant (:mutant results)]
+    (is (= 31 (:tests current)))
+    (is (> (:pass current) 100))
+    (is (= 0 (:fail current)))
+    (is (= 0 (:error current)))
+    (is (or (:load-error mutant) (> (+ (or (:fail mutant) 0) (or (:error mutant) 0)) 0))))
+   (finally (BeamLisp.Env/destroy scope)))))

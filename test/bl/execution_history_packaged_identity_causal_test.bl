@@ -1,0 +1,66 @@
+(ns execution.history.packaged-identity-causal-test)
+
+(defn- source-root [] (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+
+(deftest E25-and-E49-exact-portable-parent-and-fixture-child-identity
+ (let [root (source-root)
+       ;; A standalone proof selects an existing SDK explicitly. This never
+       ;; invokes preparation or tries to derive authority from caller Source.
+       sdk (or (System/get_env "BL_HISTORY_SDK") (System/get_env "BL_SDK_PRODUCT"))
+       out (Path/join (System/tmp_dir!) (str "packaged-identity-control-" (erlang/unique_integer (list :positive))))]
+  (when-not sdk (throw :packaged-identity-control-needs-existing-sdk))
+  (try
+   (let [[output status] (System/cmd "python3"
+             (list (Path/join root "test/scripts/qualification_packaged_identity.py") "--sdk" sdk "--out" out)
+             (list (tuple :cd root) (tuple :stderr_to_stdout true)))]
+    (is (= 0 status) output)
+    (is (String/contains? output "PACKAGED_IDENTITY_CONTROLS_READY") output)
+    (is (String/contains? output "FOREIGN_CHILD_REFUSED_BEFORE_APPLICATION_READY") output))
+   (finally (File/rm_rf! out)))))
+
+(defn- source-function [source name]
+ (let [forms (filterv #(and (contains? #{"defn" "defn-"} (BeamLisp.AOT/stage-head %))
+                             (= name (BeamLisp.AOT/stage-symbol (second (BeamLisp.AOT/stage-items % :list)))))
+                      (BeamLisp.Reader/read_string source "priv/host/aot_cache.bl"))]
+  (when-not (= 1 (count forms)) (throw :cache-root-source-selection-drift))
+  (let [position (BeamLisp.FormMeta/meta (first forms))]
+   (String/slice source (:offset position) (- (:end-offset position) (:offset position))))))
+
+(deftest E49-private-cache-root-selects-running-application-before-caller
+ (let [source (BeamLisp.Loader/read_source (Path/join (source-root) "priv/host/aot_cache.bl"))
+       helper (source-function source "lst")
+       original (source-function source "codegen_source_roots")
+       input "(erlang/apply :Elixir.System :get_env (lst \"BL_ROOT\"))"
+       before "(cond (erlang/== r nil) (Path/dirname (BeamLisp.Tiers/priv_root)) :else r)"
+       after "(cond (erlang/== r nil) (File/cwd!) :else r)"
+       scope (BeamLisp.Env/fork)
+       suffix (erlang/unique_integer (list :positive))
+       current (str "qualification.cache-root.current" suffix)
+       mutant (str "qualification.cache-root.caller" suffix)
+       owned (Path/join (Path/dirname (BeamLisp.Tiers/priv_root)) "lib")
+       caller (Path/join (File/cwd!) "lib")]
+  (when-not (and (= 2 (count (String/split original input)))
+                 (= 2 (count (String/split original before))))
+   (throw :cache-root-mutation-anchor-drift))
+  (try
+   (BeamLisp.Env/with_env scope
+    (fn []
+     ;; Model the absent caller override at this one OS-input seam, identically
+     ;; in both probes. Do not mutate BL_ROOT in the shared VM or installed SDK.
+     (doseq [[namespace changed?] [[current false] [mutant true]]]
+      (let [body (String/replace original input "nil")
+            body (if changed? (String/replace body before after) body)]
+       (BeamLisp.Compiler/eval_string (str "(ns " namespace ")\n" helper "\n" body))
+       (BeamLisp.Env/mark_loaded namespace)))
+     (let [normal (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! current "codegen_source_roots") (list))
+           wrong (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! mutant "codegen_source_roots") (list))]
+      (println :qualification-E49-source-root-control
+       {:producer-sha256 (String/downcase (Base/encode16 (crypto/hash :sha256 source)))
+        :before before :after after :current normal :mutant wrong})
+      (is (not= owned caller) "the actual caller and selected SDK are distinct")
+      (is (= owned (first normal)))
+      (is (= caller (first wrong)))
+      (is (not= (first normal) (first wrong)))
+      (is (= owned (second normal)))
+      (is (= owned (second wrong))))))
+   (finally (BeamLisp.Env/destroy scope)))))

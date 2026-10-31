@@ -17,8 +17,6 @@ DRIVER = r'''
 root = System.fetch_env!("BL_ROOT")
 work = System.fetch_env!("PROBE_WORK")
 phase = System.fetch_env!("PROBE_PHASE")
-{:ok, [floor]} = :file.consult(String.to_charlist(Path.join(root, "priv/bootstrap/seed/manifest.term")))
-:persistent_term.put({BeamLisp.AOTCache, :toolchain_key}, floor["compiler_key"])
 tag = "erts#{:erlang.system_info(:version)}-elixir#{System.version()}"
 for path <- :code.get_path() do
   name = List.to_string(path)
@@ -27,7 +25,6 @@ end
 Application.ensure_all_started(:crypto)
 Application.load(:beam_lisp)
 for app <- Application.spec(:beam_lisp, :applications) || [], do: Application.ensure_all_started(app)
-{:ok, _} = Supervisor.start_link([BeamLisp.Env, BeamLisp.Loader.Server], strategy: :one_for_one, name: BeamLisp.Supervisor)
 overlay = Path.join(root, "host-overlay/Elixir.BeamLisp.AOT.beam")
 bootstrap = System.get_env("PROBE_BOOTSTRAP")
 install = fn bytes ->
@@ -40,13 +37,19 @@ install = fn bytes ->
   File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [manifest]))
   {:module, BeamLisp.AOT} = :code.load_binary(BeamLisp.AOT, ~c"probe-host", bytes)
 end
-if bootstrap, do: install.(File.read!(Path.join(bootstrap, "ebin/Elixir.BeamLisp.AOT.beam")))
-BeamLisp.AOT.boot()
 if bootstrap do
+  # An explicitly unsealed compiler component image has a different lifecycle
+  # from a produced SDK. Its private host overlay remains confined here.
+  {:ok, _} = Supervisor.start_link([BeamLisp.Env, BeamLisp.Loader.Server], strategy: :one_for_one, name: BeamLisp.Supervisor)
+  install.(File.read!(Path.join(bootstrap, "ebin/Elixir.BeamLisp.AOT.beam")))
+  BeamLisp.AOT.boot()
   BeamLisp.AOT.bootstrap_sdk_native_hosts!()
   install.(File.read!(overlay))
+else
+  # The actual application owns supervision, initialization and sealed SDK
+  # admission. No probe is permitted to mint a replacement retention lease.
+  {:ok, _} = Application.ensure_all_started(:beam_lisp)
 end
-BeamLisp.Env.retain_sdk_runtime!()
 # Pin the bootstrap case too: forward declarations are compile-time scaffolding
 # for native hosts, while ordinary namespace artifacts must replay them.
 pinned = Path.join(work, "pinned-host.bl")
@@ -59,7 +62,11 @@ for leaf <- ["build-plan.bl", "build-log.bl", "build.bl"] do
   src = Path.join(work, leaf)
   BeamLisp.AOT.compile_file(src, output_dir: Path.join(work, "driver"), mark_loaded?: true)
 end
-run = BeamLisp.Env.fetch_exact!("sdk-build-driver", "run")
+# This probe measures the private-source artifact component, with real output
+# custody. build/run is the public Nix application route; it is not the entry
+# for these six scratch sources. The SDK-only unit-store profile also requires
+# the actual SDK priv root, so it cannot describe this private workspace.
+run = BeamLisp.Env.fetch_exact!("sdk-build-driver", "produce!")
 files = Path.wildcard(Path.join(work, "sources/*.bl"))
 if phase == "first" do
   # The loader uses strict Erlang booleans. Missing compiler evidence must be
@@ -69,7 +76,9 @@ end
 patterns = %{build_parses: {BeamLisp.BuildPlan, :"build-content-parts", 1}, compilations: {BeamLisp.AOT, :compile_file, 2},
              source_initializations: {BeamLisp.AOT, :load_unit, 2},
              artifact_restorations: {BeamLisp.AOTCache, :restore_prepared, 2},
-             artifact_preparations: {BeamLisp.AOTCache, :prepare_fetch, 2},
+             # prepare-one passes cache key, closure key and source key. The
+             # /2 convenience wrapper does not observe those actual requests.
+             artifact_preparations: {BeamLisp.AOTCache, :prepare_fetch, 3},
              initializer_guard_entries: {BeamLisp.Loader, :assert_initializer_execution_allowed!, 1},
              inventory_walks: {BeamLisp.AOT, :sdk_runtime_inventory!, 1}}
 for {_, mfa} <- patterns, do: :erlang.trace_pattern(mfa, true, [:local, :call_count])
@@ -204,6 +213,8 @@ def phase_command(command, env, *, use_systemd, image, unit):
            '--property=MemoryMax=6G', '--property=MemorySwapMax=0', '--property=RuntimeMaxSec=300']
     if 'PROBE_BOOTSTRAP' in env:
         cap += [f"--setenv=PROBE_BOOTSTRAP={env['PROBE_BOOTSTRAP']}"]
+    if env.get('LD_LIBRARY_PATH'):
+        cap += [f"--setenv=LD_LIBRARY_PATH={env['LD_LIBRARY_PATH']}"]
     # The user manager predates setup-beam/asdf/Nix's shell PATH.
     # Elixir also resolves its erl child through that same PATH.
     for key in ('PATH', 'BL_ROOT', 'PROBE_WORK', 'PROBE_PHASE', 'BEAM_LISP_AOT_CACHE_DIR', 'BL_DAEMON', 'ELIXIR_ERL_OPTIONS'):
@@ -261,7 +272,7 @@ def main():
                 (sources / 'sdkbuild-consumer.bl').write_text('(ns sdkbuild-consumer (:require [sdkbuild-base :as b] [sdkbuild-custom :as c])) (def answer (+ (b/f) c/answer))\n')
             env = {**os.environ, 'BL_ROOT': str(image), 'PROBE_WORK': str(work), 'PROBE_PHASE': phase,
                    'BEAM_LISP_AOT_CACHE_DIR': str(work / 'cache'), 'BL_DAEMON': 'off',
-                   'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1'}
+                   'ELIXIR_ERL_OPTIONS': '+S 4:4 +SDcpu 2:2 +SDio 1:1 +fnu'}
             if args.bootstrap_image:
                 env['PROBE_BOOTSTRAP'] = str(args.bootstrap_image.resolve())
             unit = f'bl-sdk-probe-{os.getpid()}-{phase}'
