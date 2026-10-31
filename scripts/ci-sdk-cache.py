@@ -52,16 +52,21 @@ def source_fingerprint(source, policy=None):
 def retained_source_fingerprint(source):
     current = json.loads((ROOT / 'nix/engine-inputs.json').read_text())
     captured = json.loads((source / 'nix/engine-inputs.json').read_text())
-    # One explicit transition, not arbitrary historical policy admission. The
-    # immediate predecessor counted these unused CI recipes as engine inputs.
-    # Preserve its original identity so normal preparation can reuse its units.
+    # Exact known policy transitions, never arbitrary historical admission.
+    # Preserve each predecessor's original identity and filtering rules so
+    # existing SDK units remain reusable without relabelling their source.
     allowed = [current]
-    if all(current['excluded'].count(name) == 1 for name in CI_ONLY_EXCLUSIONS):
-        allowed.append(dict(current, excluded=[name for name in current['excluded']
-                                               if name not in CI_ONLY_EXCLUSIONS]))
+    predecessor = current
+    if current['reserved'].count('__pycache__') == 1:
+        predecessor = dict(current, reserved=[name for name in current['reserved']
+                                              if name != '__pycache__'])
+        allowed.append(predecessor)
+    if all(predecessor['excluded'].count(name) == 1 for name in CI_ONLY_EXCLUSIONS):
+        allowed.append(dict(predecessor, excluded=[name for name in predecessor['excluded']
+                                                   if name not in CI_ONLY_EXCLUSIONS]))
     canonical = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'))
     if canonical(captured) not in [canonical(policy) for policy in allowed]:
-        raise ValueError('Retained engine policy is neither current nor the exact CI-only predecessor')
+        raise ValueError('Retained engine policy is neither current nor an exact supported predecessor')
     return source_fingerprint(source, captured)
 
 

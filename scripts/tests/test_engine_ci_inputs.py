@@ -1,9 +1,12 @@
-"""CI-only recipes cannot invalidate SDKs or relabel an older engine selection."""
+"""Generated state and CI recipes cannot invalidate SDKs or relabel old inputs."""
 import copy
 import importlib.util
 import json
 from pathlib import Path
+import py_compile
+import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -39,12 +42,67 @@ class EngineCIInputTests(unittest.TestCase):
         self.write_policy(self.root, self.policy)
         self.engine = self.base / 'retained-engine'
         shutil.copytree(self.root, self.engine)
-        self.previous = dict(self.policy, excluded=[name for name in self.policy['excluded']
-                                                  if name not in CACHE.CI_ONLY_EXCLUSIONS])
+        self.bytecode_previous = dict(self.policy, reserved=[name for name in self.policy['reserved']
+                                                            if name != '__pycache__'])
+        self.previous = dict(self.bytecode_previous, excluded=[name for name in self.policy['excluded']
+                                                             if name not in CACHE.CI_ONLY_EXCLUSIONS])
         self.write_policy(self.engine, self.previous)
 
     def write_policy(self, source, policy):
         (source / 'nix/engine-inputs.json').write_text(json.dumps(policy, sort_keys=True) + '\n')
+
+    def capture(self):
+        # Evaluate the actual canonical capture filter and derivation identity;
+        # build no snapshot derivation, SDK, compiler or VM.
+        expression = 'let product = import ' + json.dumps(str(ROOT / 'nix/sdk-source.nix')) + \
+                     ' { source = ' + json.dumps(str(self.root)) + '; }; in ' + \
+                     '{ derivation = product.drvPath; command = product.buildCommand; }'
+        data = json.loads(subprocess.check_output(
+            ['nix-instantiate', '--eval', '--strict', '--json', '--read-write-mode',
+             '--expr', expression, '--option', 'experimental-features', 'nix-command flakes'],
+            text=True, timeout=60))
+        match = re.search(r'python3 (/nix/store/[a-z0-9]{32}-beam-lisp-engine-source)/scripts/sdk-inputs',
+                          data['command'])
+        self.assertIsNotNone(match, data['command'])
+        return Path(match.group(1)), data['derivation']
+
+    def test_python_bytecode_cache_never_changes_fingerprint_or_canonical_capture(self):
+        source = self.root / 'nix/application-inventory.py'
+        source.write_text('VERSION = 1\n')
+        before = CACHE.source_fingerprint(self.root)
+        captured = self.capture()
+        self.assertEqual(source.read_bytes(), (captured[0] / source.relative_to(self.root)).read_bytes())
+        bytecode = Path(py_compile.compile(str(source), doraise=True))
+        self.assertEqual('__pycache__', bytecode.parent.name)
+        self.assertEqual(before, CACHE.source_fingerprint(self.root))
+        self.assertEqual(captured, self.capture())
+        self.assertFalse((captured[0] / 'nix/__pycache__').exists())
+        bytecode.write_bytes(bytecode.read_bytes() + b'edited generated cache')
+        self.assertEqual(before, CACHE.source_fingerprint(self.root))
+        self.assertEqual(captured, self.capture())
+        bytecode.unlink()
+        bytecode.parent.rmdir()
+        self.assertEqual(before, CACHE.source_fingerprint(self.root))
+        self.assertEqual(captured, self.capture())
+        source.write_text('VERSION = 2\n')
+        self.assertNotEqual(before, CACHE.source_fingerprint(self.root))
+        changed = self.capture()
+        self.assertNotEqual(captured[0], changed[0])
+        self.assertNotEqual(captured[1], changed[1])
+        self.assertEqual(source.read_bytes(), (changed[0] / source.relative_to(self.root)).read_bytes())
+
+    def test_bytecode_predecessor_retains_its_own_cache_bytes_and_fingerprint(self):
+        self.write_policy(self.engine, self.bytecode_previous)
+        cache = self.engine / 'nix/__pycache__/application-inventory.pyc'
+        cache.parent.mkdir()
+        cache.write_bytes(b'actual retained bytecode bytes')
+        original = CACHE.source_fingerprint(self.engine, self.bytecode_previous)
+        self.assertEqual(original, CACHE.retained_source_fingerprint(self.engine))
+        self.assertNotEqual(original, CACHE.source_fingerprint(self.engine))
+        cache.write_bytes(b'changed retained bytecode bytes')
+        self.assertNotEqual(original, CACHE.retained_source_fingerprint(self.engine))
+        self.assertEqual(CACHE.source_fingerprint(self.engine, self.bytecode_previous),
+                         CACHE.retained_source_fingerprint(self.engine))
 
     def test_exact_three_ci_recipes_can_change_be_added_or_removed(self):
         self.assertEqual({'nix/ci-check.nix', 'nix/ci-release-runtime.nix', 'nix/ci-sdk-gates.nix'},
@@ -93,10 +151,13 @@ class EngineCIInputTests(unittest.TestCase):
         value = copy.deepcopy(self.previous); value['limits']['depth'] += 1; variants.append(value)
         value = copy.deepcopy(self.previous); value['version'] = True; variants.append(value)
         value = copy.deepcopy(self.previous); value['reserved'].append('other'); variants.append(value)
+        # This cross-product never existed: excluding bytecode was introduced
+        # after the three CI-only exclusions, not before them.
+        value = copy.deepcopy(self.previous); value['reserved'].append('__pycache__'); variants.append(value)
         for policy in variants:
             with self.subTest(policy=policy):
                 self.write_policy(self.engine, policy)
-                with self.assertRaisesRegex(ValueError, 'exact CI-only predecessor'):
+                with self.assertRaisesRegex(ValueError, 'exact supported predecessor'):
                     CACHE.retained_source_fingerprint(self.engine)
 
     def test_real_old_digest_is_restored_only_under_its_original_identity(self):
