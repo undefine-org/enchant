@@ -29,6 +29,8 @@ class Receipts(unittest.TestCase):
             (root / "scripts").mkdir()
             (root / "scripts/test-prerequisites.json").write_text('{"version":1,"tests":{}}')
             (root / "scripts/test-isolation.json").write_text('{"fault.bl": "isolated"}')
+            outer_runtime = root / "preflight-private-endpoints"
+            outer_runtime.mkdir()
             candidate = root / "candidate"
             candidate.write_text("#!/usr/bin/env python3\n" + f"fail_first = {fail_first!r}\n" + '''
 import json, os
@@ -48,7 +50,8 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
             argv = ["qualify", "--candidate", str(candidate), "--results", str(results),
                     "empty_test.bl" if empty_suite else "a.bl", "b.bl", "fault.bl"]
             with patch.object(RUNNER, "ROOT", root), patch.object(RUNNER, "source_digest", return_value="source"), \
-                    patch.object(sys, "argv", argv), patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory,
+                    patch.object(sys, "argv", argv), patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(outer_runtime),
+                    "BL_TEST_USER_RUNTIME_DIR": directory,
                     "EXPECTED_RUNTIME_PARENT": directory}), contextlib.redirect_stdout(io.StringIO()):
                 status = RUNNER.main()
             return status, [json.loads(line) for line in results.read_text().splitlines()]

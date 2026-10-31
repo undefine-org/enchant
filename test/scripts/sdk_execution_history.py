@@ -99,7 +99,7 @@ def main():
         while pending:
             number = len(segments)
             (out / 'plan.json').write_text(json.dumps(pending, indent=2) + '\n')
-            with tempfile.TemporaryDirectory(prefix='bl-history-', dir=os.environ.get('XDG_RUNTIME_DIR')) as runtime:
+            with tempfile.TemporaryDirectory(prefix='bl-history-', dir=base_environment.get('BL_TEST_USER_RUNTIME_DIR')) as runtime:
                 env = dict(base_environment, BL_EXECUTION_HISTORY_ROOT=str(ROOT),
                            BL_EXECUTION_HISTORY_RUNTIME_ROOT=str(image), BL_EXECUTION_HISTORY_OUT=str(out),
                            BL_EXECUTION_HISTORY_HANDOVER='1',

@@ -149,8 +149,10 @@ def main():
                 # privileged fixtures stay serial inside the caller's tree cap.
                 # Preserve the host's runtime-filesystem contract as well as
                 # endpoint isolation (health publishers reject /tmp sockets).
+                # Nested gates retain the original runtime parent so endpoint
+                # names do not grow past the native socket-path limit.
                 with tempfile.TemporaryDirectory(prefix="bl-qualify-",
-                        dir=os.environ.get("XDG_RUNTIME_DIR")) as runtime:
+                        dir=env.get("BL_TEST_USER_RUNTIME_DIR")) as runtime:
                     env["XDG_RUNTIME_DIR"] = runtime
                     command = [str(candidate), "--cold", "run", str(ROOT / "scripts/qualify-candidate.bl")]
                     process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,
