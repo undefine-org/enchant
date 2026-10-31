@@ -83,11 +83,10 @@ def main():
         return frozen
 
     out.mkdir(parents=True)
-    # Fixture libraries resolve through the pinned test tree; SDK libraries
-    # resolve through the selected image rather than checkout priv directories.
-    (out / 'env.bl').write_text('{:paths [' + json.dumps(str(ROOT)) + ']}\n')
+    # Fixtures retain their authored checkout-relative paths. The shared driver
+    # removes checkout priv search paths and requires SDK declarations, as the
+    # established whole-file candidate runner does. ROOT/env.bl is captured.
     frozen = capture()
-    frozen['receiver_project'] = HISTORY['digest'](out / 'env.bl')
     (out / 'inputs.json').write_text(json.dumps(frozen, indent=2) + '\n')
     receipt = {'version': 1, 'status': 'running', 'sdk': str(sdk), 'engine': selected[1],
                'cases': ids, 'complete_goal': False, 'scope': 'exact-SDK historical selector replay'}
@@ -112,7 +111,7 @@ def main():
                 try:
                     with (out / f'run-{number:03d}.log').open('w') as log:
                         result = subprocess.run([str(sdk / 'bin/bl'), '--cold', 'run', str(ROOT / HISTORY['DRIVER'])],
-                                                cwd=out, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                                cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                                 timeout=max(1, args.timeout - (time.monotonic() - start)))
                 finally:
                     cleanup(runtime)
@@ -126,12 +125,10 @@ def main():
             results.extend(files)
             segments.append({'files': len(files), 'handover': execution.get('handover')})
             current = capture()
-            current['receiver_project'] = HISTORY['digest'](out / 'env.bl')
             if current != frozen:
                 raise RuntimeError('frozen source/test/tool/SDK/floor inputs changed')
         receipt['segments'] = segments
         current = capture()
-        current['receiver_project'] = HISTORY['digest'](out / 'env.bl')
         if current != frozen:
             raise RuntimeError('frozen source/test/tool/SDK/floor inputs changed')
         if subprocess.check_output([str(ROOT / 'scripts/prepare-checkout-sdk'), '--fingerprint'],
