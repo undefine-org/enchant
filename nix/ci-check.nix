@@ -50,11 +50,14 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
 } ''
   cp -a --no-preserve=ownership ${input}/. /build/project
   chmod -R u+w /build/project
-  mkdir -p /usr/bin /bin /lib64
+  mkdir -p /usr/bin /bin /lib64 /etc/ssl/certs
   test -e /usr/bin/env || ln -s ${pkgs.coreutils}/bin/env /usr/bin/env
   test -e /bin/sh || ln -s ${pkgs.bash}/bin/sh /bin/sh
   test -e /bin/bash || ln -s ${pkgs.bash}/bin/bash /bin/bash
   test -e /lib64/ld-linux-x86-64.so.2 || ln -s ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+  # OTP's public_key.cacerts_get/0 uses the operating system's trust store even
+  # when a connector's served fixture is HTTP. Keep normal TLS verification.
+  ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
   export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.openssl pkgs.ncurses pkgs.zlib pkgs.glibc pkgs.stdenv.cc.cc.lib pkgs.brotli pkgs.zstd ]}
   export ELIXIR_ERL_OPTIONS='+fnu +S ${toString cpuCount}:${toString cpuCount} +SDcpu 1:1 +SDio 1:1'
   export HOME=/build/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
