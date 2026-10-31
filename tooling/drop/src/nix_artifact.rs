@@ -166,8 +166,7 @@ pub(super) fn prepare_request(_tree: &Path, requested: &Value,
             platform.join("nix/native-snapshot.nix").to_string_lossy().into_owned(),
             "--argstr".into(), "source".into(), source.into(),
             "--argstr".into(), "crate".into(), name.into(), "--json".into(),
-            "--out-link".into(), snapshot_root.to_string_lossy().into_owned(),
-            "--max-jobs".into(), "0".into()];
+            "--out-link".into(), snapshot_root.to_string_lossy().into_owned()];
         if version == 2 {
             snapshot_args.extend([
                 "--arg".into(), "version".into(), "2".into(),
