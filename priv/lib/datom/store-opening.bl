@@ -134,12 +134,7 @@
     ;; Once native entry happened, a generic exception cannot prove no handle.
     (lifetime/release! (:guardian opening)) (throw error))
    (finally (Process/delete :datom.store-opening/producer)))))
-(defn claim
- "PURE SDK decision inside Conn's registry turn. Caller must commit returned
-  :cells only together with actual native lifetime creation/borrowing. Original
-  creator is preserved; opaque or foreign opening does not become new authority.
-  Returned guardians are released OUTSIDE that Agent after commit."
- [cells store creator]
+(defn- opening-view! [cells store creator]
  (let [rows (get cells :datom.conn/store-openings {})
        matches (filterv (fn [[_ row]] (= store (:store row))) rows)
        origins (set (map (fn [[_ row]] (:creator row)) matches))
@@ -157,14 +152,49 @@
    (fail :ambiguous-store-opening))
   (when (and (seq matches) (not= (:application-id creator) (:application-id (first origins))))
    (fail :foreign-store-opening))
-  (let [remaining (apply dissoc rows (map first matches))]
-   {:creator (if (seq matches) (first origins) creator)
+  {:rows rows :matches matches :creator (if (seq matches) (first origins) creator)}))
+
+(defn returned-queue-opening
+ "PURE non-consuming preflight observation of one already-indexed returned
+  queue store. Identity, owner, original graph/path and opening ticket must
+  agree; a caller marker, path alone or copied role supplies no evidence.
+  The caller must still run the native policy validation in this same registry
+  read. This neither claims a Conn nor releases its opening guardian."
+ [cells store creator owner path]
+ (let [rows (get cells :datom.conn/store-openings {})
+       exact (filterv (fn [[_ row]] (erlang/=:= store (:store row))) rows)]
+  (when (some (fn [[_ row]] (some? (:queue-role row))) exact)
+   (let [view (opening-view! cells store creator) matches (:matches view)
+         entry (first exact) ticket (first entry) row (second entry) role (:queue-role row)]
+    (when (> (count matches) 1) (fail :ambiguous-queue-family-opening))
+    (when-not (and (= :returned (:phase row)) (= :fjall (:producer row))
+                   (erlang/is_reference ticket) (= ticket (:ticket row))
+                   (= owner (:owner row)) (= creator (:creator row))
+                   (erlang/is_map store) (string? path)
+                   (= path (:path row)) (= path (maps/get :path store nil))
+                   (= :native-queue-allocation (:kind role))
+                   (= ticket (:opening-ticket role)) (= owner (:owner role))
+                   (= (:application-id creator) (:application-id role))
+                   (= (:scope creator) (:scope role)) (= (:digest creator) (:generation role))
+                   (= path (:path role)))
+     (fail :queue-family-allocation-ticket-refused))
+    row))))
+
+(defn claim
+ "PURE SDK decision inside Conn's registry turn. Caller must commit returned
+  :cells only together with actual native lifetime creation/borrowing. Original
+  creator is preserved; opaque or foreign opening does not become new authority.
+  Returned guardians are released OUTSIDE that Agent after commit."
+ [cells store creator]
+ (let [view (opening-view! cells store creator) rows (:rows view) matches (:matches view)
+       remaining (apply dissoc rows (map first matches))]
+   {:creator (:creator view)
     :queue-role (let [roles (vec (keep (fn [[_ row]] (:queue-role row)) matches))]
                   (when (> (count roles) 1) (fail :ambiguous-queue-family-opening))
                   (first roles))
     :guardians (mapv (fn [[_ row]] (:guardian row)) matches)
     :cells (if (empty? remaining) (dissoc cells :datom.conn/store-openings)
-             (assoc cells :datom.conn/store-openings remaining))})))
+             (assoc cells :datom.conn/store-openings remaining))}))
 (defn finish-claim! [guardians]
  (doseq [guardian guardians] (lifetime/release! guardian)) :claimed)
 (defn check-publication!

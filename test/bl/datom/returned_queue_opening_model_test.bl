@@ -1,0 +1,87 @@
+; Pure metadata controls. Symbolic role rows below NEVER enter the live Conn
+; registry or SDK owner tables and are not native allocation/admission proofs.
+(ns datom.returned-queue-opening-model-test
+ (:require [datom.store-opening :as opening] [datom.migration-policy :as policy]))
+
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- fixture []
+ (let [ticket (erlang/make_ref) owner (erlang/self) scope (erlang/make_ref)
+       creator {:application-id "returned-opening-model" :scope scope :digest "model-digest"}
+       raw {:path "/returned-opening-model/queue" :model-store (erlang/make_ref)}
+       role {:kind :native-queue-allocation :opening-ticket ticket :owner owner
+             :application-id (:application-id creator) :scope scope :generation (:digest creator) :path (:path raw)}
+       row {:ticket ticket :owner owner :creator creator :path (:path raw) :producer :fjall
+            :argument (:path raw) :phase :returned :store raw :queue-role role :guardian :model-guardian}
+       cells {:datom.conn/store-openings {ticket row}}]
+  {:ticket ticket :owner owner :creator creator :raw raw :row row :cells cells}))
+(defn- observe [f cells]
+ (opening/returned-queue-opening cells (:raw f) (:creator f) (:owner f) (get-in f [:raw :path])))
+
+(deftest observation-preserves-the-original-opening-and-does-not-consume-or-claim
+ (let [f (fixture) before (:cells f) row (:row f)]
+  (is (= row (observe f before)))
+  (is (= row (observe f before)) "repeated reads do not consume the native opening")
+  (is (= before (:cells f)))
+  (is (= :store-opening-pending
+         (kind #(opening/check-publication! before (get-in f [:creator :application-id]) "/returned-opening-model"))))
+  (let [claimed (opening/claim before (:raw f) (:creator f))]
+   (is (= (:creator f) (:creator claimed)))
+   (is (= (:queue-role row) (:queue-role claimed)))
+   (is (= [:model-guardian] (:guardians claimed)))
+   (is (nil? (observe f (:cells claimed))) "the old role cannot replay after actual claim removes its row")
+   (is (nil? (get-in claimed [:cells :datom.conn/store-openings (:ticket f)])))
+   (is (= :ready (opening/check-publication! (:cells claimed) (get-in f [:creator :application-id]) "/returned-opening-model"))))))
+
+(deftest wrong-owner-graph-path-and-ticket-refuse-without-consuming-the-opening
+ (let [f (fixture) cells (:cells f) ticket (:ticket f)]
+  (is (nil? (observe (assoc-in f [:raw :path] "/returned-opening-model/other") cells)))
+  (is (= (:row f) (get-in cells [:datom.conn/store-openings ticket])))
+  ;; Owner/graph differences preserve the raw identity and therefore must
+  ;; refuse rather than silently select a different caller's recorded role.
+  (doseq [changed [(assoc f :owner :different-owner)
+                   (assoc-in f [:creator :scope] (erlang/make_ref))
+                   (assoc-in f [:creator :digest] "different-model-generation")]]
+   (is (= :queue-family-allocation-ticket-refused (kind #(observe changed cells)))))
+  (is (= :queue-family-allocation-ticket-refused
+         (kind #(opening/returned-queue-opening cells (:raw f) (:creator f) (:owner f) "/wrong-request-path"))))
+  (doseq [changed [(assoc-in cells [:datom.conn/store-openings ticket :ticket] (erlang/make_ref))
+                   (assoc-in cells [:datom.conn/store-openings ticket :queue-role :owner] :different-role-owner)
+                   (assoc-in cells [:datom.conn/store-openings ticket :queue-role :opening-ticket] (erlang/make_ref))
+                   (assoc-in cells [:datom.conn/store-openings ticket :queue-role :scope] (erlang/make_ref))
+                   (assoc-in cells [:datom.conn/store-openings ticket :queue-role :generation] "different-role-generation")
+                   (assoc-in cells [:datom.conn/store-openings ticket :queue-role :path] "/wrong-role-path")]]
+   (is (= :queue-family-allocation-ticket-refused (kind #(observe f changed)))))))
+
+(deftest unmatched-or-copied-data-never-becomes-a-native-opening
+ (let [f (fixture) cells (:cells f)
+       foreign-raw (assoc (:raw f) :model-store (erlang/make_ref))]
+  (is (nil? (opening/returned-queue-opening cells foreign-raw (:creator f) (:owner f) (:path foreign-raw))))
+  (is (nil? (observe f {})))
+  (is (= :foreign-store-opening
+         (kind #(observe (assoc-in f [:creator :application-id] "different-app") cells))))
+  (is (= :store-opening-uncertain (kind #(opening/claim cells foreign-raw (:creator f)))))
+  (let [without-role (update-in cells [:datom.conn/store-openings (:ticket f)] dissoc :queue-role)]
+   (is (nil? (observe f without-role)))
+   (is (= (:creator f) (:creator (opening/claim without-role (:raw f) (:creator f)))))
+   (let [next (assoc (:creator f) :scope (erlang/make_ref) :digest "another-generation")]
+    (is (nil? (opening/returned-queue-opening without-role (:raw f) next (:owner f) (get-in f [:raw :path]))))
+    (is (= (:creator f) (:creator (opening/claim without-role (:raw f) next)))
+        "nonqueue claims still preserve an accepted opening's original generation")))
+  (let [installed {(policy/table-key) {(get-in f [:creator :application-id])
+                   {:application-id (get-in f [:creator :application-id]) :root "/returned-opening-model"
+                    :state :active :permits {}}}}]
+   ;; Selection of passive model data is not a native role grant. The real
+   ;; policy still refuses this unregistered symbolic owner/membership.
+   (is (= :migration-managed-open-required
+          (kind #(policy/check-opening installed (observe f cells) nil)))))))
+
+(deftest uncertainty-and-duplicate-returned-rows-stay-held
+ (let [f (fixture) ticket (:ticket f) cells (:cells f)
+       uncertain (opening/lose-owner cells ticket)
+       duplicate (assoc-in cells [:datom.conn/store-openings (erlang/make_ref)] (:row f))]
+  (is (= :store-opening-uncertain (kind #(observe f uncertain))))
+  (is (= :store-opening-uncertain
+         (kind #(observe f (assoc-in cells [:datom.conn/store-openings ticket :phase] :pending)))))
+  (is (= :uncertain (get-in uncertain [:datom.conn/store-openings ticket :phase])))
+  (is (= :ambiguous-queue-family-opening (kind #(observe f duplicate))))
+  (is (= 2 (count (:datom.conn/store-openings duplicate))))))
