@@ -109,7 +109,7 @@
 ; way round in byte space, so the scanned window was empty, and an empty result
 ; from a range scan is indistinguishable from `there is nothing there`.
 ; Assigned AFTER the collection tags, because `RT.compare` ranks every
-; collection (list 7, vector 7.1, set 7.3, map 7.6) BELOW every opaque
+; collection (sequential, set, map) BELOW every opaque
 ; term (reference 8, function 9, port 10, pid 11) — and a tuple, rank
 ; 12, above them all.
 ;
@@ -124,17 +124,13 @@
 ; two disagree — Erlang puts tuple < map < list; compare puts sequential
 ; < set < map — compare wins, because that is what `sort`, `sorted-set`
 ; and every query predicate use.
-(def TAG-LIST 112)      ; 0x70  a cons list / lazy seq
-; A VECTOR gets its own tag because this language keeps `[]` and `()`
-; DISTINCT — wave 3's deliberate split, pinned in wave26_laziness_test.
-; `(= [1 2] '(1 2))` is false here, so encoding them identically would
-; put two `=`-distinct values at one key: a caller could store `[1 2]`
-; and fail to find it, or find it under a value they never wrote.
-;
-; The codec follows `=` rather than arguing with it. Both tags sit
-; adjacent so the two still sort together, which is what `compare`'s
-; shared rank asks for.
-(def TAG-VECTOR 113)    ; 0x71
+; 112 was the old list-only tag. It is intentionally unused: lists, vectors
+; and realized lazy sequences share equality and lexicographic comparison.
+; Their index keys must therefore share one tag, recursively. Keep 113 so
+; existing vector keys and all scalar/native fast lanes retain their bytes.
+; This codec encodes KEYS; datom.value-codec preserves stored payload shape.
+(def TAG-LIST 112)      ; legacy key tag; never emitted by this encoder
+(def TAG-VECTOR 113)    ; 0x71, the canonical sequential key family
 (def TAG-SET 114)       ; 0x72
 (def TAG-MAP 116)       ; 0x74
 (def TAG-TUPLE 122)     ; 0x7A  past the collections AND the opaques (rank 12)
@@ -358,7 +354,8 @@
    which is a PREFIX of another sorts before it (\"ab\" < \"abc\"), and so
    that a following component cannot be confused with more of this one."
   [v]
-  (cond
+  (let [v (BeamLisp.Ns.Rt/unwrap-meta v)]
+   (cond
     (nil? v) (tag-byte TAG-NIL)
     (= v false) (tag-byte TAG-FALSE)
     (= v true) (tag-byte TAG-TRUE)
@@ -419,9 +416,9 @@
     ; short encoding and the second a long one meant the comparison
     ; ended at the length difference, in the wrong direction.
     ;
-    ;   marker 0  a negative integer needing an exact tie-break
+    ;   marker 0  an integer below its rounded float prefix
     ;   marker 1  a float, or an integer a float represents exactly
-    ;   marker 2  a positive integer needing an exact tie-break
+    ;   marker 2  an integer above its rounded float prefix
     ;
     ; So among values sharing a float, exact-negatives sort below the
     ; float, which sorts below exact-positives — which is right, since
@@ -430,11 +427,15 @@
       (if (and (<= v MAX-EXACT-INT) (>= v (- 0 MAX-EXACT-INT)))
         (erlang/iolist_to_binary
           (to-list [(tag-byte TAG-NUM) (encode-float (erlang/float v)) (tag-byte 1)]))
-        (erlang/iolist_to_binary
-          (to-list [(tag-byte TAG-NUM)
-                    (encode-float (erlang/float v))
-                    (tag-byte (if (>= v 0) 2 0))
-                    (encode-bignum-magnitude v)])))
+        (let [prefix (erlang/float v) rounded (erlang/trunc prefix)]
+          (if (= v rounded)
+            (erlang/iolist_to_binary
+              (to-list [(tag-byte TAG-NUM) (encode-float prefix) (tag-byte 1)]))
+            (erlang/iolist_to_binary
+              (to-list [(tag-byte TAG-NUM)
+                        (encode-float prefix)
+                        (tag-byte (if (< v rounded) 0 2))
+                        (encode-bignum-magnitude v)])))))
 
     (float? v) (erlang/iolist_to_binary
                  (to-list [(tag-byte TAG-NUM) (encode-float v) (tag-byte 1)]))
@@ -471,20 +472,11 @@
     ; 0x00 terminator produces exactly that: a proper prefix ends before
     ; its extensions continue.
     ;
-    ; Beam-lisp vectors are lists to the layers above, so they take this
-    ; path and sort with them.
-    ; A LAZY SEQ is `=` to a vector with the same elements (wave 3's
-    ; rule: `[] ≠ ()` but a realized lazy seq equals either), so it
-    ; encodes as one. Falling through to the opaque branch encoded it by
-    ; its unrealized THUNK, which is neither stable nor comparable — two
-    ; equal seqs would have landed at different keys.
-    (or (vector? v) (BeamLisp.LazySeq/lazy? v))
+    ; Native lists, vectors and lazy sequences are one equality/order family.
+    ; Canonicalize keys here without changing their separately stored values.
+    (or (vector? v) (BeamLisp.LazySeq/lazy? v) (erlang/is_list v))
       (erlang/iolist_to_binary
         (to-list [(tag-byte TAG-VECTOR) (encode-seq (into [] (seq v))) (tag-byte 0)]))
-
-    (erlang/is_list v)
-      (erlang/iolist_to_binary
-        (to-list [(tag-byte TAG-LIST) (encode-seq (to-list v)) (tag-byte 0)]))
 
     ; A SORTED collection encodes exactly as its hashed sibling.
     ; `(= (sorted-set 1 2) #{1 2})` is true — sortedness is an INDEX
@@ -556,7 +548,7 @@
     ; taught, so `datom.schema` refuses `:db/index` on such an attribute
     ; rather than letting a range scan be silently wrong.
     :else (erlang/iolist_to_binary
-            (to-list [(tag-byte TAG-REF) (escape-nul (erlang/term_to_binary v)) (tag-byte 0)]))))
+            (to-list [(tag-byte TAG-REF) (escape-nul (erlang/term_to_binary v)) (tag-byte 0)])))))
 
 (defn concat-bins
   "Concatenate encoded components into one key."

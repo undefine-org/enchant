@@ -1,0 +1,214 @@
+(ns datom.sequential-key-test
+ (:require [datom :as d] [datom.codec :as codec] [datom.value-codec :as payload]
+  [datom.index :as index] [datom.identity :as identity] [datom.current :as current]
+  [datom.db :as db] [datom.schema :as schema] [datom.conn :as conn]
+  [datom.store :as store] [datom.store-ets :as ets-store] [datom.store-fjall :as fjall]))
+
+(defn- sign [a b] (cond (erlang/< a b) -1 (erlang/> a b) 1 :else 0))
+(defn- close-store! [s]
+ (let [path (:path s)]
+  (store/close s)
+  (when path (File/rm_rf! path))))
+(defn- openers [] [(fn [] (ets-store/open)) (fn [] (fjall/open-fresh))])
+
+(deftest sequential-key-equality-and-order-match-the-language-recursively
+ (let [reference (erlang/make_ref)
+       values [nil false true -1 0 1 1.5 "" "a" :key [] [1] [1 2] [2]
+               (list) (list 1) (list 1 2) (list 2)
+               {} {:items [1]} {:items (list 1)} #{1} reference (erlang/self)
+               (tuple) (tuple 1) (tuple (list 1)) (tuple [1])]
+       mismatches (reduce + 0
+                    (for [a values b values]
+                     (if (= (compare a b) (sign (codec/encode-value a) (codec/encode-value b))) 0 1)))]
+  (is (= 0 mismatches)))
+ (doseq [[a b] [[(list) []] [(list 1 2) [1 2]]
+                [{:items (list 1 (list 2))} {:items [1 [2]]}]
+                [#{(list 1)} #{[1]}]
+                [(tuple (list 1)) (tuple [1])]
+                [(with-meta (list 1 2) {:origin :ignored}) [1 2]]
+                [(map identity [1 2]) [1 2]]]]
+  (is (= a b))
+  (is (= (codec/encode-value a) (codec/encode-value b)))))
+
+(deftest fact-map-keys-canonicalize-composites-without-binary-or-tuple-collisions
+ (let [value (list 1 2) bytes (codec/encode-value value)
+       key (index/value-key value)]
+  (is (= key (index/value-key [1 2])))
+  (is (not= key (index/value-key bytes)))
+  (is (not= key (index/value-key key)))
+  (is (= (index/value-key {:items (list 1)}) (index/value-key {:items [1]})))
+  (is (= (index/value-key #{(list 1)}) (index/value-key #{[1]})))
+  (is (= (index/value-key 1) (index/value-key 1.0)))
+  (is (= (index/value-key 1) (index/value-key 1M)))
+  (is (= "primitive" (index/value-key "primitive")))))
+
+(deftest large-integer-float-keys-share-exact-equality-and-rounding-order
+ (let [base 9007199254740992
+       integers (vec (concat (mapv #(+ base %) (range 5))
+                             (mapv #(- 0 (+ base %)) (range 5))))
+       values (into integers (mapv #(erlang/float %) integers))
+       mismatches (reduce + 0
+                    (for [a values b values]
+                     (if (= (compare a b) (sign (codec/encode-value a) (codec/encode-value b))) 0 1)))]
+  (is (= 0 mismatches) "byte order must follow exact values on both sides of a rounded float prefix")
+  (doseq [n [base (+ base 2) (+ base 4) (- 0 base) (- 0 (+ base 2)) (- 0 (+ base 4))]]
+   (is (= n (erlang/float n)))
+   (is (= true (= (codec/encode-value n) (codec/encode-value (erlang/float n)))))
+   (is (= (identity/digest n) (identity/digest (erlang/float n)))))))
+
+(deftest canonical-keys-do-not-change-lossless-stored-payloads
+ (doseq [value [(list 1 2) [1 2] {:items (list 1)} {:items [1]}]]
+  (let [restored (payload/decode-slot (payload/encode-slot [101 :seq/value value 1000001 true]))
+        actual (get restored 2)]
+   (is (erlang/=:= value actual))))
+ (let [list-value (list 1 2) vector-value [1 2]]
+  (is (= (codec/encode-value list-value) (codec/encode-value vector-value)))
+  (is (not= (payload/encode-slot list-value) (payload/encode-slot vector-value)))))
+
+(def SCHEMA [{:db/ident :seq/id :db/valueType :db.type/term :db/unique :db.unique/identity}
+             {:db/ident :seq/value :db/valueType :db.type/term :db/index true}])
+(defn- matching-ids [database attr value]
+ (set (mapv first (d/q '[:find ?e :in $ ?attr ?value :where [?e ?attr ?value]] database attr value))))
+
+(deftest large-number-indexes-and-identity-claims-use-exact-numeric-equality
+ (doseq [open (openers)]
+  (let [s (open) c (conn/connect-with s SCHEMA)
+        exact 9007199254740994 neighbor 9007199254740995 rounded (erlang/float neighbor)]
+   (try
+    (let [report (d/transact! c [{:db/id -1 :seq/id exact}
+                                {:db/id -2 :seq/id (erlang/float exact)}])
+          entity (get (:tempids report) -1)]
+     (is (= entity (get (:tempids report) -2)))
+     (is (= #{entity} (matching-ids (d/db c) :seq/id exact)))
+     (is (= #{entity} (matching-ids (d/db c) :seq/id (erlang/float exact)))))
+    (d/transact! c [[:db/add 101 :seq/value neighbor]
+                    [:db/add 102 :seq/value rounded]
+                    [:db/add 103 :seq/value (- 0 neighbor)]
+                    [:db/add 104 :seq/value (- 0 rounded)]])
+    (is (= [104 103 101 102] (mapv index/-e (db/datoms (d/db c) :avet :seq/value))))
+    (is (= [101 102] (mapv index/-e
+                        (db/range-datoms (d/db c) :avet [:seq/value] neighbor rounded))))
+    (d/transact! c [[:db/add 105 :seq/value exact]])
+    (let [report (d/transact! c [[:db/add 105 :seq/value (erlang/float exact)]])]
+     (is (empty? (filterv #(= :seq/value (index/-a %)) (:tx-datoms report)))))
+    (is (= #{105} (matching-ids (d/db c) :seq/value (erlang/float exact))))
+    (d/transact! c [[:db/retract 105 :seq/value (erlang/float exact)]])
+    (is (= #{} (matching-ids (d/db c) :seq/value exact)))
+    (is (= [] (current/values s 105 :seq/value)))
+    (finally (conn/close! c) (when (:path s) (File/rm_rf! (:path s))))))))
+
+(deftest real-indexes-upsert-query-and-retract-equal-sequential-values
+ (doseq [open (openers)]
+  (let [s (open) c (conn/connect-with s SCHEMA)]
+   (try
+    (let [first (d/transact! c [{:db/id -1 :seq/id (list 1 2)}])
+          entity (get (:tempids first) -1)
+          second (d/transact! c [{:db/id -2 :seq/id [1 2]}])]
+     (is (= entity (get (:tempids second) -2)))
+     (is (= #{entity} (matching-ids (d/db c) :seq/id (list 1 2))))
+     (is (= #{entity} (matching-ids (d/db c) :seq/id [1 2])))
+     (is (= 1 (count (db/datoms (d/db c) :avet :seq/id [1 2])))))
+    (doseq [[left right] [[(list 7 8) [7 8]]
+                         [{:items (list 7)} {:items [7]}]
+                         [#{(list 7)} #{[7]}]]]
+     (let [report (d/transact! c [{:db/id -3 :seq/id left} {:db/id -4 :seq/id right}])
+           entity (get (:tempids report) -3)]
+      (is (= entity (get (:tempids report) -4)) "same-batch identity claims share one entity")
+      (is (= #{entity} (matching-ids (d/db c) :seq/id right)))))
+    (d/transact! c [[:db/add 101 :seq/value (list 1)]
+                    [:db/add 102 :seq/value [1 2]]
+                    [:db/add 103 :seq/value (list 2)]])
+    (let [database (d/db c)]
+     (is (= [101 102 103] (mapv index/-e (db/datoms database :avet :seq/value))))
+     (is (= [101 102] (mapv index/-e (db/range-datoms database :avet [:seq/value] [1] (list 1 2)))))
+     (is (erlang/is_list (:seq/value (d/entity database 101))))
+     (is (vector? (:seq/value (d/entity database 102))))
+     (is (= #{101} (matching-ids database :seq/value [1])))
+     (is (= #{101 102 103} (set (mapv first (:rows (current/reverse-values database :seq/value)))))))
+    ;; Cross-representation no-op, CAS and retraction must agree with the keys.
+    (let [report (d/transact! c [[:db/add 101 :seq/value [1]]])]
+     (is (empty? (filterv #(= :seq/value (index/-a %)) (:tx-datoms report)))))
+    (d/transact! c [[:db/cas 102 :seq/value (list 1 2) (list 3)]])
+    (is (= #{102} (matching-ids (d/db c) :seq/value [3])))
+    (d/transact! c [[:db/retract 101 :seq/value [1]]])
+    (is (= #{} (matching-ids (d/db c) :seq/value (list 1))))
+    (is (= [] (current/values s 101 :seq/value)))
+    (is (= [] (db/datoms (d/db c) :eavt 101 :seq/value)))
+    ;; Nested values take the same canonical route through transaction maps.
+    (d/transact! c [[:db/add 104 :seq/value {:items (list 1)}]
+                    [:db/add 105 :seq/value #{(list 1)}]])
+    (is (= #{104} (matching-ids (d/db c) :seq/value {:items [1]})))
+    (is (= #{105} (matching-ids (d/db c) :seq/value #{[1]})))
+    (d/transact! c [[:db/retract 104 :seq/value {:items [1]}]
+                    [:db/retract 105 :seq/value #{[1]}]])
+    (is (= #{} (matching-ids (d/db c) :seq/value {:items (list 1)})))
+    (is (= #{} (matching-ids (d/db c) :seq/value #{(list 1)})))
+    (finally (conn/close! c) (when (:path s) (File/rm_rf! (:path s))))))))
+
+(deftest canonical-durable-indexes-reopen-with-original-payload-shapes
+ (let [s (fjall/open-fresh) path (:path s) c (conn/connect-with s SCHEMA)]
+  (try
+   (d/transact! c [[:db/add 101 :seq/value (list 1 2)] [:db/add 102 :seq/value [1 2]]])
+   (conn/close! c)
+   (let [again (fjall/open path) reopened (conn/connect-with again)]
+    (try
+     (is (= index/KEY-FORMAT (store/-get again index/KEY-FORMAT-KEY)))
+     (is (= #{101 102} (matching-ids (d/db reopened) :seq/value [1 2])))
+     (is (erlang/is_list (:seq/value (d/entity (d/db reopened) 101))))
+     (is (vector? (:seq/value (d/entity (d/db reopened) 102))))
+     (finally (conn/close! reopened))))
+   (finally (conn/close! c) (File/rm_rf! path)))))
+
+(defn- legacy-key [datom]
+ (let [encoded (codec/encode-value (index/-v datom))
+       old-value (codec/concat-bins [(erlang/list_to_binary (list 112))
+                      (binary/part encoded 1 (dec (erlang/byte_size encoded)))])]
+  (codec/concat-bins [(index/key-prefix :eavt (index/-e datom) (index/-a datom))
+                     old-value (codec/encode-value (index/-tx datom)) (codec/encode-value (index/-op datom))])))
+(deftest incompatible-nonempty-stores-refuse-before-any-schema-or-counter-write
+ (doseq [open (openers) header [nil {:version 1 :sequential-tag 112}]]
+  (let [s (open) datom [101 :seq/value (list 1) 1000001 true]
+        ops (cond-> [[:put (legacy-key datom) datom]]
+               header (conj [:put index/KEY-FORMAT-KEY header]))]
+   (try
+    (store/-commit s ops)
+    (let [before (vec (store/-range s nil nil))
+          error (try (conn/connect-with s SCHEMA) nil (catch error error))]
+     (is (= :incompatible-index-key-format (:kind (ex-data error))))
+     (is (= :offline-reindex-required (:action (ex-data error))))
+     (is (= before (vec (store/-range s nil nil))))
+     (is (= header (store/-get s index/KEY-FORMAT-KEY)))
+     (is (= :incompatible-index-key-format
+            (try (db/db-value s (schema/empty-schema) 1000002)
+                 :accepted (catch error (:kind (ex-data error))))))
+     (is (= :incompatible-index-key-format
+            (try (index/write-datoms s (schema/empty-schema) [[102 :seq/value [1] 1000002 true]])
+                 :accepted (catch error (:kind (ex-data error))))))
+     (is (= before (vec (store/-range s nil nil)))))
+    (finally (close-store! s))))))
+
+(defrecord CommitObserved [inner seen fail]
+ store/Store
+ (-get [s key] (store/-get (:inner s) key))
+ (-range [s lo hi] (store/-range (:inner s) lo hi))
+ (-put [s key value] (store/-put (:inner s) key value))
+ (-delete [s key] (store/-delete (:inner s) key))
+ (-update [s key change] (store/-update (:inner s) key change))
+ (-commit [s ops]
+  (swap! (:seen s) conj ops)
+  (when @(:fail s) (throw (ex-info "injected first commit failure" {})))
+  (store/-commit (:inner s) ops)))
+(deftest first-direct-index-commit-publishes-format-and-data-together
+ (let [inner (ets-store/open) seen (atom []) fail (atom true)
+       observed (->CommitObserved inner seen fail) datom [101 :seq/value (list 1) 1000001 true]]
+  (try
+   (is (try (index/write-datoms observed (schema/empty-schema) [datom]) false (catch _ true)))
+   (is (nil? (store/-get inner index/KEY-FORMAT-KEY)))
+   (is (= [] (vec (store/-range inner nil nil))))
+   (reset! fail false)
+   (index/write-datoms observed (schema/empty-schema) [datom])
+   (is (= 2 (count @seen)))
+   (is (some #(= [:put index/KEY-FORMAT-KEY index/KEY-FORMAT] %) (last @seen)))
+   (is (some #(= [:put (index/key-for :eavt datom) datom] %) (last @seen)))
+   (is (= index/KEY-FORMAT (store/-get inner index/KEY-FORMAT-KEY)))
+   (finally (ets-store/close inner)))))

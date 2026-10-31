@@ -51,6 +51,60 @@
 (ns datom.index
   (:require [datom.codec] [datom.schema] [datom.store]))
 
+;; A missing header is not evidence that old bytes use the current codec.
+;; Version 2 merges native-list/vector keys; payload encoding is unchanged.
+(def KEY-FORMAT-KEY (erlang/list_to_binary (list 0 107)))
+(def KEY-FORMAT {:version 2 :sequential-tag 113})
+
+(defn- refuse-key-format! [found reason]
+ (throw (ex-info "Datom index key format requires offline reindex before opening this store"
+          {:kind :incompatible-index-key-format :reason reason
+           :expected KEY-FORMAT :found found :action :offline-reindex-required})))
+
+(defn check-key-format!
+ "Check once at store admission, before reading schema or changing counters.
+  Nonempty unversioned stores require offline reindex into a separate new store;
+  never relabel them or mix old list keys with canonical sequential keys.
+  Native substrates inspect at most one key. The generic Store fallback is
+  used only for an unversioned store lacking the bounded Count capability."
+ [store]
+ (let [found (datom.store/-get store KEY-FORMAT-KEY)]
+  (cond
+   (erlang/=:= found KEY-FORMAT) :current
+   (some? found) (refuse-key-format! found :unsupported-format)
+   :else
+    (let [counted (datom.store/count-range store nil nil 1)
+          nonempty? (if counted (pos? (:count counted))
+                       (seq (datom.store/-range store nil nil)))]
+     (when nonempty? (refuse-key-format! nil :unversioned-nonempty-store))
+     :empty))))
+
+(defn open-key-format!
+ "Admit an empty/current store. Publish only the format header for a new empty
+  store so concurrent opens and counter initialization see the same format.
+  The check never modifies an incompatible existing store."
+ [store]
+ (when (= :empty (check-key-format! store))
+  (datom.store/-update store KEY-FORMAT-KEY
+   (fn [found]
+    (when (and (some? found) (erlang/not (erlang/=:= found KEY-FORMAT)))
+     (refuse-key-format! found :unsupported-format))
+    KEY-FORMAT)))
+ store)
+
+(defn value-key
+ "Datom-local equality key for temporary fact maps/sets. Primitive native
+  lanes stay allocation-free. Composite bytes are tagged so they cannot alias
+  a user's binary or tuple value. Stored payloads are never replaced by keys."
+ [value]
+ (let [value (BeamLisp.Ns.Rt/unwrap-meta value)]
+  (cond
+   (or (erlang/is_integer value) (erlang/is_binary value) (erlang/is_atom value)) value
+   (number? value)
+    (let [key (BeamLisp.Ns.Rt/semantic-key value)]
+     (if (= 1 (elem key 2)) (elem key 1) (tuple :datom.index/number-key key)))
+   :else (tuple :datom.index/composite-key (datom.codec/encode-value value)))))
+
 ;; ── datom construction and access ───────────────────────────────────
 ;;
 ;; Positional accessors rather than a record: a datom is a vector, and
@@ -383,7 +437,8 @@
   ;; crossing (native-put-ops), ~630x the per-datom bl codec on the key work.
   ;; It returns nil (fall back) when the NIF is absent or any value is out of a
   ;; native lane, so the bl path below is always the correctness floor.
-  (let [ops (or (native-put-ops schema (into [] datoms))
+  (let [format (check-key-format! store)
+        ops (or (native-put-ops schema (into [] datoms))
                 (get (reduce
                        (fn [acc d]
                          (let [a (-a d)
@@ -396,7 +451,8 @@
                        [[] {}]
                        datoms)
                      0))]
-    (let [ops (if (empty? extra-ops) ops (into ops extra-ops))
+    (let [ops (if (= :empty format) (conj ops [:put KEY-FORMAT-KEY KEY-FORMAT]) ops)
+          ops (if (empty? extra-ops) ops (into ops extra-ops))
           measured? (and (identical? store (Process/get :datom_rank_maintenance_store))
                          (seq (Process/get :datom_rank_maintenance)))
           started (when measured? (erlang/monotonic_time :microsecond))
