@@ -1,6 +1,6 @@
 # Execute a finite check where the retained SDK lives; return only receipts.
 # Existing SDK selection is optional. The default uses the ordinary SDK recipe.
-{ source, request, sdk ? null, previous ? null, memoryMiB ? 6144, cpuCount ? 2 }:
+{ source, request, sdk ? null, previous ? null, models ? null, memoryMiB ? 6144, cpuCount ? 2 }:
 let
   root = /. + source;
   roots = builtins.filter (name: builtins.pathExists (root + "/${name}")) [
@@ -17,14 +17,26 @@ let
   };
   lock = builtins.fromJSON (builtins.readFile (input + "/flake.lock"));
   pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
+  requestData = builtins.fromJSON (builtins.readFile (/. + request));
+  prerequisites = (builtins.fromJSON (builtins.readFile (input + "/scripts/test-prerequisites.json"))).tests;
+  selectedFiles = if requestData.kind == "shard" then builtins.attrNames prerequisites else requestData.files;
+  tools = pkgs.lib.unique (pkgs.lib.concatMap (name:
+    let entry = prerequisites.${name} or {}; in (entry.all or []) ++ (entry.linux or [])
+  ) selectedFiles);
+  toolPackages = { cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools; };
+  # The SDK platform supplies the exact Erlang/Elixir, Nix and user-manager
+  # tools. Add only the remaining declared external test tools here.
+  fixtureTools = map (name: toolPackages.${name}) (builtins.filter (name: builtins.hasAttr name toolPackages) tools)
+    ++ pkgs.lib.optionals (requestData.kind == "shard") [ pkgs.tesseract ];
   selection = if sdk == null then import (input + "/nix/sdk-artifact.nix") {
     source = toString input;
     inherit previous;
   } else builtins.storePath sdk;
   bounded = import ./bounded-build.nix { inherit pkgs memoryMiB cpuCount; diskMiB = 24576; commandManager = true; };
 in bounded (pkgs.runCommand "beam-lisp-ci-check" {
-  nativeBuildInputs = [ pkgs.python3 pkgs.git pkgs.ripgrep pkgs.util-linux pkgs.nodejs ];
-  allowedReferences = [];
+  __structuredAttrs = true;
+  nativeBuildInputs = [ pkgs.python3 pkgs.git pkgs.ripgrep pkgs.util-linux pkgs.nodejs ] ++ fixtureTools;
+  outputChecks.out.allowedReferences = [];
 } ''
   cp -a --no-preserve=ownership ${input}/. /build/project
   chmod -R u+w /build/project
@@ -37,6 +49,9 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
   export ELIXIR_ERL_OPTIONS='+fnu +S ${toString cpuCount}:${toString cpuCount} +SDcpu 1:1 +SDio 1:1'
   export HOME=/build/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
   export CI_CHECK_SDK_RETAINED=${if sdk == null then "0" else "1"}
+  ${pkgs.lib.optionalString (models != null) ''
+    export BEAM_LISP_MODEL_DIR=${builtins.storePath models}
+  ''}
   mkdir -p "$HOME"
   cd /build/project
   python3 ${./../scripts/ci-check-worker.py} --sdk ${selection} --request ${/. + request} --root /build/project --out /build/raw-receipts

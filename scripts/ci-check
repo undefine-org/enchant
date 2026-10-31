@@ -2,6 +2,7 @@
 """Run bounded current checks through the host's configured Nix worker policy."""
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -13,6 +14,9 @@ root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sdk', help='Existing immutable SDK selection; default uses normal production')
 parser.add_argument('--previous', help='Retained SDK whose completed units may be reused by production')
+parser.add_argument('--local', action='store_true',
+                    help='Explicitly use this host\'s bounded KVM worker; default requires the build station')
+parser.add_argument('--models', type=Path, help='Explicit immutable pinned model root for inventory prerequisites')
 parser.add_argument('--out', type=Path, required=True)
 parser.add_argument('--source', type=Path, default=root, help='Checkout to snapshot; defaults to this tree')
 parser.add_argument('--shard', type=int)
@@ -20,6 +24,16 @@ parser.add_argument('--shards', type=int, default=4)
 parser.add_argument('files', nargs='*')
 args = parser.parse_args()
 project = args.source.resolve(strict=True)
+models = None
+if args.models:
+    models = args.models.resolve(strict=True)
+    if not re.fullmatch(r'/nix/store/[0-9a-z]{32}-[^/]+', str(models)):
+        parser.error('Models must name an immutable Nix store input')
+    spec = importlib.util.spec_from_file_location('ci_model_input', root / 'scripts/ci-model-input.py')
+    model_input = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(model_input)
+    subprocess.run(['nix-store', '--check-validity', str(models)], check=True)
+    model_input.verify(models, project)
 if args.out.exists() or args.out.is_symlink():
     parser.error('Output must be absent; preserve prior receipts')
 if args.shard is None:
@@ -63,11 +77,13 @@ with tempfile.TemporaryDirectory(prefix='bl-ci-request-') as temporary:
         parser.error('Source changed during capture; retry the finite check')
     command = ['nix-build', str(root / 'nix/ci-check.nix'), '--argstr', 'source', str(snapshot),
                '--argstr', 'request', str(path), '--out-link', str(args.out.absolute()),
-               '--max-jobs', '0', '--option', 'timeout', '5700',
+               '--max-jobs', '1' if args.local else '0', '--option', 'timeout', '5700',
                '--option', 'experimental-features', 'nix-command flakes']
     for key in ('sdk', 'previous'):
         if getattr(args, key):
             command += ['--argstr', key, str(Path(getattr(args, key)).resolve(strict=True))]
+    if models:
+        command += ['--argstr', 'models', str(models)]
     subprocess.run(command, cwd=root, check=True)
 receipt = json.loads((args.out / 'result.json').read_text())
 print(json.dumps(receipt, indent=2))
