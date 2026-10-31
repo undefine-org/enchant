@@ -1,0 +1,102 @@
+; Component proof on actual Source copies; never replace the installed loader
+; or SDK. The combined SDK run exercises the original REPL compatibility files.
+(ns source-less.namespace-route-test)
+
+(defn- source-function [file signature]
+ (let [parts (String/split (File/read! file) signature (list (tuple :parts 2)))]
+  (assert (= 2 (count parts)))
+  (str signature (first (String/split (nth parts 1) "\n(defn" (list (tuple :parts 2)))) "\n")))
+
+(defn- raised [action]
+ (try (action) nil (catch error error)))
+
+(deftest actual-source-classifies-ordinary-values-without-sdk-admission
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       aot (Path/join root "priv/host/aot.bl") loader (Path/join root "priv/host/loader.bl")
+       directory (Path/join (System/tmp_dir!)
+                   (str "bl-source-less-control-" (System/unique_integer (list :positive))))
+       file (Path/join directory "control.bl")
+       module :Elixir.BeamLisp.SourceLessNamespaceControl
+       original-aot (erlang/apply :Elixir.BeamLisp.AOT :module_info (list :md5))
+       original-loader (erlang/apply :Elixir.BeamLisp.Loader :module_info (list :md5))
+       ordinary (str "inmemory.control" (System/unique_integer (list :positive)))
+       unclaimed (str ordinary ".unclaimed") unclaimed-module (BeamLisp.Emit/module_for unclaimed)
+       environment (BeamLisp.Env/fork)
+       input (source-function aot "(defn- sdk_inventory_input []")
+       classification (source-function aot "(defn sdk_namespace_classification")
+       route (source-function loader "(defn- source_less_namespace_route")
+       source (str
+        "(ns fixture.source-less-control)\n"
+        "(defn physical_sdk_path [p] (BeamLisp.AOT/physical_sdk_path p))\n"
+        "(defn probe_read_input [p] (let [b (File/read! p) m (Process/get :source_less_control_mode)] "
+        "(cond (= :missing m) nil (= :corrupt m) \"invalid SDK inventory\" "
+        "(= :partial m) (erlang/term_to_binary (Map/put (erlang/binary_to_term b (list :safe)) :modules {}) (list :deterministic)) "
+        "(= :changing m) (let [n (Process/get :source_less_control_reads 0)] "
+        "(Process/put :source_less_control_reads (+ n 1)) (when (= n 0) b)) :else b)))\n"
+        (String/replace input "(File/read! image)" "(probe_read_input image)")
+        classification
+        (String/replace route "(BeamLisp.AOT/sdk_namespace_classification ns)" "(sdk_namespace_classification ns)")
+        "(defn route [n] (source_less_namespace_route n))\n")
+       classify (fn [n] (erlang/apply module :sdk_namespace_classification (list n)))
+       selected-route (fn [n] (erlang/apply module :route (list n)))]
+  (try
+   (File/mkdir_p! directory) (File/write! file source)
+   (BeamLisp.Env/with_env environment
+    (fn []
+     (BeamLisp.AOT/compile_host_file file
+      (list (tuple :module module) (tuple :output_dir directory) (tuple :load? true)))
+     (BeamLisp.Compiler/eval_string (str "(ns " ordinary ") (defn double [x] (* 2 x))")
+       (BeamLisp.Compiler/new_env "user") file)
+     (BeamLisp.Env/in_ns "source-less.namespace-route-test")
+     (is (nil? (BeamLisp.Loader/source_path ordinary)))
+     (is (= :ordinary (classify ordinary)))
+     (is (= :source (selected-route ordinary)))
+     (is (= 42 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! ordinary "double") (list 21))))
+     ;; The old source-less :aot route still refuses this ordinary namespace;
+     ;; its SDK verifier remains unchanged by the caller classification fix.
+     (let [error (raised #(BeamLisp.AOT/ensure_loaded ordinary))]
+      (is (= (tuple :sdk_image_unit_missing ordinary) (:original error))))
+     (is (= :aot (selected-route (str ordinary ".undeclared"))))
+     ;; Loading an arbitrary shim with an initializer is not a declaration.
+     ;; It keeps the SDK refusal path and its initializer must never execute.
+     (let [clause (BeamLisp.Emit/function_clause :__bl_init__
+                    (BeamLisp.Emit/remote :erlang :put
+                     (list (BeamLisp.Emit/lit :source_less_initializer) (BeamLisp.Emit/lit :ran))))
+           compiled (BeamLisp.Emit/compile_descriptor
+                     (BeamLisp.Emit/descriptor_for unclaimed-module (list clause) (list)
+                       {:file "unclaimed-source-less-control"}))]
+      (code/load_binary unclaimed-module (list) (elem compiled 1))
+      (is (= :aot (selected-route unclaimed)))
+      (let [error (raised #(BeamLisp.AOT/ensure_loaded unclaimed))]
+       (is (= (tuple :sdk_image_unit_missing unclaimed) (:original error))))
+      (is (nil? (Process/get :source_less_initializer))))
+     (doseq [fixed ["compiler" "rt" "bl.json"]]
+      (is (= :sdk (classify fixed))))
+     (is (= :aot (selected-route "compiler")))
+     ;; A valid partial index omitting every row cannot hide a physical member.
+     (Process/put :source_less_control_mode :partial)
+     (is (= :sdk (classify "bl.json")))
+     (is (= :aot (selected-route "bl.json")))
+     (Process/put :source_less_control_mode :missing)
+     (is (= :unavailable (classify ordinary)))
+     (is (= :aot (selected-route ordinary)))
+     (Process/put :source_less_control_mode :corrupt)
+     (is (some? (raised #(selected-route ordinary))))
+     (Process/put :source_less_control_mode :changing)
+     (Process/put :source_less_control_reads 0)
+     (is (= :unavailable (classify ordinary)))
+     (Process/delete :source_less_control_mode)
+     (is (= :source (selected-route ordinary)))
+     (is (= 42 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! ordinary "double") (list 21))))
+     (is (= original-aot (erlang/apply :Elixir.BeamLisp.AOT :module_info (list :md5))))
+     (is (= original-loader (erlang/apply :Elixir.BeamLisp.Loader :module_info (list :md5))))))
+   (finally
+    (Process/delete :source_less_control_mode) (Process/delete :source_less_control_reads)
+    (Process/delete :source_less_initializer)
+    (BeamLisp.Env/in_ns "source-less.namespace-route-test")
+    (BeamLisp.Env/destroy environment)
+    (doseq [beam (Path/wildcard (Path/join directory "*.beam"))]
+     (let [owned (String/to_existing_atom (Path/rootname (Path/basename beam)))]
+      (code/purge owned) (code/delete owned)))
+    (code/purge unclaimed-module) (code/delete unclaimed-module)
+    (File/rm_rf! directory)))))
