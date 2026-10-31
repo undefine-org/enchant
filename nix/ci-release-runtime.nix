@@ -1,5 +1,5 @@
 # Test the unchanged FHS release with its producer's pinned loader and libraries.
-# This small adapter has no SDK, compiler or native compilation dependency.
+# This adapter does not produce an SDK, compiler cohort or native NIF.
 let
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
   pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
@@ -10,17 +10,31 @@ let
   tools = [ pkgs.coreutils pkgs.bash pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.gawk
     pkgs.python3 pkgs.gitMinimal pkgs.util-linux pkgs.diffutils ];
   toolsPath = pkgs.lib.makeBinPath tools;
+  command = pkgs.writeShellScript "ci-release-command" ''
+    unset BL_CI_RELEASE_CALLER_PATH
+    exec "$@"
+  '';
+  fhs = pkgs.buildFHSEnv {
+    name = "beam-lisp-ci-fhs-runtime";
+    targetPkgs = _: libraries ++ tools;
+    multiPkgs = _: [];
+    multiArch = false;
+    # Custody tickets and cgroup limits use the host's actual process identity.
+    unsharePid = false;
+    unshareCgroup = false;
+    privateTmp = false;
+    runScript = toString command;
+    # The standard /etc/profile prepends FHS paths. Restore the caller's exact
+    # SDK platform selection after pinned utility paths; do not lose its OTP.
+    profile = ''
+      export PATH=${toolsPath}:"$BL_CI_RELEASE_CALLER_PATH"
+    '';
+  };
   runner = pkgs.writeShellScriptBin "with-release-runtime" ''
     set -eu
-    export PROOT_NO_SECCOMP=1
-    export PATH=${toolsPath}:"$PATH"
-    exec ${pkgs.proot}/bin/proot --kill-on-exit \
-      -b ${pkgs.glibc}/lib/ld-linux-x86-64.so.2:/lib64/ld-linux-x86-64.so.2 \
-      -b ${pkgs.coreutils}/bin/env:/usr/bin/env \
-      -b ${pkgs.bash}/bin/bash:/bin/sh \
-      -b ${pkgs.bash}/bin/bash:/bin/bash \
-      -w "$PWD" ${pkgs.coreutils}/bin/env \
-      LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries} "$@"
+    export BL_CI_RELEASE_CALLER_PATH="$PATH"
+    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
+    exec ${fhs}/bin/beam-lisp-ci-fhs-runtime "$@"
   '';
 in pkgs.runCommand "beam-lisp-ci-release-runtime" {} ''
   mkdir -p "$out/bin"
@@ -34,6 +48,7 @@ in pkgs.runCommand "beam-lisp-ci-release-runtime" {} ''
     nixpkgs = lock.nodes.nixpkgs.locked.rev;
     glibc = toString pkgs.glibc;
     glibcVersion = pkgs.glibc.version;
+    backend = "bubblewrap-fhs";
     inherit toolsPath;
   }}
   JSON

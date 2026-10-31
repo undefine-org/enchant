@@ -11,12 +11,12 @@ ROOT = Path(__file__).resolve().parents[2]
 class PinnedRuntimePathTests(unittest.TestCase):
     def test_actual_adapter_path_prevents_host_tools_and_keeps_sdk_elixir(self):
         source = (ROOT / 'nix/ci-release-runtime.nix').read_text()
-        prefix = '    export PATH=${toolsPath}:"$PATH"'
+        prefix = '      export PATH=${toolsPath}:"$BL_CI_RELEASE_CALLER_PATH"'
         self.assertEqual(1, source.count(prefix))
         bash = shutil.which('bash')
         self.assertIsNotNone(bash)
         # Execute the actual adapter assignment with isolated tool directories;
-        # the station smoke checks the real pinned binaries and PRoot loader.
+        # the station smoke checks the real pinned FHS mount namespace.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             pinned, sdk, host = [root / name for name in ('pinned', 'sdk', 'host')]
@@ -32,7 +32,8 @@ class PinnedRuntimePathTests(unittest.TestCase):
             elixir = sdk / 'elixir'
             elixir.write_text('#!/bin/sh\nprintf "selected-sdk-elixir\\n"\n')
             elixir.chmod(0o755)
-            environment = dict(os.environ, PATH=str(sdk) + os.pathsep + str(host))
+            caller = str(sdk) + os.pathsep + str(host)
+            environment = dict(os.environ, PATH=str(host), BL_CI_RELEASE_CALLER_PATH=caller)
             assignment = prefix.strip().replace('${toolsPath}', str(pinned))
             commands = '\ndirname /a/b\nbasename /a/b\nelixir\n'
             result = subprocess.run([bash, '-eu', '-c', assignment + commands], env=environment,
@@ -40,6 +41,11 @@ class PinnedRuntimePathTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(['pinned-dirname', 'pinned-basename', 'selected-sdk-elixir'],
                              result.stdout.splitlines())
+            reset_path = assignment.replace('$BL_CI_RELEASE_CALLER_PATH', '$PATH')
+            reset = subprocess.run([bash, '-eu', '-c', reset_path + commands], env=environment,
+                                   text=True, capture_output=True)
+            self.assertEqual(127, reset.returncode)
+            self.assertIn('elixir: command not found', reset.stderr)
             original = subprocess.run([bash, '-eu', '-c', commands], env=environment,
                                       text=True, capture_output=True)
             self.assertEqual(91, original.returncode)

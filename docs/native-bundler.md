@@ -373,8 +373,11 @@ per-file receipts.
 **The runner's libc is not the release runtime.** The pinned producer currently
 links against glibc 2.44. Stock Ubuntu 24.04 and 26.04 do not satisfy that floor.
 CI runs portable checks under the same pinned loader and libraries, using the
-PRoot adapter in `nix/ci-release-runtime.nix`. It preserves the candidate bytes
-and its native launcher's `/proc/self/exe` identity. Running the loader directly
+standard FHS mount namespace built with bubblewrap in
+`nix/ci-release-runtime.nix`. It preserves the candidate bytes, inode and native
+launcher's `/proc/self/exe` identity, and retains the caller's PID namespace for
+process custody. This requires the runner to permit bubblewrap's mount and user
+namespaces. Running the loader directly
 as `ld-linux ./bl` would lose that identity and its embedded payload discovery.
 The public launcher and SDK provider tools retain their own Nix interpreter and
 library paths. The bounded inventory worker supplies its pinned FHS loader too.
