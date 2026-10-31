@@ -38,7 +38,7 @@
 (ns datom.query.engine
   (:require [datom.db] [datom.index] [datom.store] [datom.query.agg] [datom.query.parse]
             [datom.query.plan] [datom.schema] [datom.query.analytic]
-            [data.bounded-cache :as cache-data] [data.cache-ring :as cache-ring]
+            [data.bounded-cache :as cache-data]
             [datom.cache-validity :as validity] [datom.query.relation :as relation]
             [datom.query.rules] [datom.query.read-plan :as read-plan]
             [datom.query.rank-demand :as rank-demand]
@@ -969,12 +969,51 @@
    Parse + validate + plan measured ~0.45 ms of a ~0.86 ms point query —
    half of every call, for a form that is a literal in the source. Keyed by
    the query VALUE, so the same form from any caller is one entry."
-  (atom {:entries {} :order [] :hits 0 :misses 0}))
+  (BeamLisp.LazyMemo/create_ref {:entries {} :order (queue/new) :hits 0 :misses 0}))
+
+(defn- offer-plan [state query entry charge]
+ (let [entries (Map/get state :entries)
+       admitted? (and (erlang/is_integer charge) (> charge 0)
+                      (<= charge PLAN-CACHE-ENTRY-MAX))
+       added? (and admitted? (not (maps/is_key query entries)))
+       entries (if added? (Map/put entries query entry) entries)
+       order (if added? (queue/in query (Map/get state :order)) (Map/get state :order))
+       popped (when (> (erlang/map_size entries) PLAN-CACHE-MAX) (queue/out order))
+       entries (if popped (Map/delete entries (elem (elem popped 0) 1)) entries)
+       order (if popped (elem popped 1) order)]
+  (Map/merge state
+   {:entries entries :order order :misses (inc (Map/get state :misses))
+    :largest-entry-bytes (max (Map/get state :largest-entry-bytes 0) (or charge 0))
+    :declined (+ (Map/get state :declined 0)
+                 (if (or (nil? charge) (> charge PLAN-CACHE-ENTRY-MAX)) 1 0))})))
+
+(defn- update-plan-cache! [operation query entry charge]
+ ;; This private cell holds only charged finite plan data. Its closed metadata
+ ;; operations accept neither an application callback nor a caller-selected
+ ;; cell. Generic swap! would send the entire unrelated memo through Source's
+ ;; callable-argument guard even for a one-counter hit; cache growth must not
+ ;; consume an application's callback budget. Actual query callbacks retain
+ ;; their ordinary invocation checks. CAS retries preserve concurrent updates.
+ (loop []
+  (let [current (BeamLisp.LazyMemo/read_versioned PLAN-CACHE)
+        version (elem current 0) state (elem current 1)
+        next (case operation
+               :hit (Map/put state :hits (inc (Map/get state :hits)))
+               :offer (offer-plan state query entry charge)
+               :rank-watch (let [entries (Map/get state :entries) old (Map/get entries query)]
+                             (if old (Map/put state :entries
+                                       (Map/put entries query (Map/put old :rank-watch? true))) state))
+               :result-cache (let [entries (Map/get state :entries) old (Map/get entries query)]
+                               (if old (Map/put state :entries
+                                         (Map/put entries query (Map/put old :result-cache? true))) state)))
+        result (BeamLisp.LazyMemo/exchange_version PLAN-CACHE version next :keep)]
+   (case result :ok :ok :retry (recur)
+    (throw (ex-info "Invalid private query plan cache transition" {:kind :invalid-plan-cache-transition}))))))
 
 (defn plan-cache-stats
   "`{:size :hits :misses}` — for tests and `datom/explain`."
   []
-  (let [c (deref PLAN-CACHE)]
+  (let [c (BeamLisp.LazyMemo/read PLAN-CACHE)]
     {:size (count (:entries c)) :hits (:hits c) :misses (:misses c)
      :declined (or (:declined c) 0) :largest-entry-bytes (or (:largest-entry-bytes c) 0)
      :max-entry-bytes PLAN-CACHE-ENTRY-MAX}))
@@ -984,9 +1023,9 @@
    this exact form has been seen. Throws `invalid query` exactly as the
    unmemoised path did — an invalid form is never cached."
   [query]
-  (let [hit (get (:entries (deref PLAN-CACHE)) query)]
+  (let [hit (get (:entries (BeamLisp.LazyMemo/read PLAN-CACHE)) query)]
     (if (some? hit)
-      (do (swap! PLAN-CACHE (fn [c] (assoc c :hits (+ 1 (:hits c)))))
+      (do (update-plan-cache! :hit nil nil nil)
           hit)
       (let [parsed (datom.query.parse/parse query)
             problems (into (datom.query.parse/validate parsed)
@@ -998,15 +1037,7 @@
                        :in-forms (datom.query.parse/input-forms parsed)
                        :result-cache? false :rank-watch? false}]
             (let [charge (cache-data/footprint (tuple query entry))]
-              (swap! PLAN-CACHE
-                     (fn [c]
-                       (let [next (update (cache-ring/offer c query entry charge
-                                                            PLAN-CACHE-ENTRY-MAX PLAN-CACHE-MAX)
-                                          :misses inc)]
-                         (assoc next
-                           :largest-entry-bytes (max (or (:largest-entry-bytes c) 0) (or charge 0))
-                           :declined (+ (or (:declined c) 0)
-                                        (if (or (nil? charge) (> charge PLAN-CACHE-ENTRY-MAX)) 1 0)))))))
+              (update-plan-cache! :offer query entry charge))
             entry))))))
 
 (defn watch-rank-query!
@@ -1014,8 +1045,7 @@
    query forms never normalize store/retained keys for index economics."
   [query]
   (prepare query)
-  (swap! PLAN-CACHE (fn [c]
-    (if (get (:entries c) query) (assoc-in c [:entries query :rank-watch?] true) c)))
+  (update-plan-cache! :rank-watch query nil nil)
   :ok)
 
 (defn- execute-prepared* [prepared db inputs]
@@ -1222,9 +1252,7 @@
         (when (and (not tracing?) (>= (:work executed) 32)
                    (finite-cache-inputs? (:parsed prepared) inputs))
           (when-let [attrs (or attrs (plain-read-attrs (:parsed prepared)))]
-            (swap! PLAN-CACHE (fn [c]
-                               (if (get (:entries c) query)
-                                 (assoc-in c [:entries query :result-cache?] true) c)))
+            (update-plan-cache! :result-cache query nil nil)
             ;; First use learns the work hint only. Retention requires
             ;; evidence from BEFORE execution, including empty reads and code.
             (when stamp
