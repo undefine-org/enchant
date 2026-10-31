@@ -28,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('sdk', 'request', 'root', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--host-nix', action='store_true')
     args = parser.parse_args()
     root, sdk, out = args.root.resolve(), args.sdk.resolve(), args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -44,17 +45,32 @@ def main():
                'candidate_sha256': digest(portable),
                'compiler_manifest_sha256': digest(sdk / 'image/priv/bootstrap/seed/manifest.term'),
                'SDK_production_requested': os.environ['CI_CHECK_SDK_RETAINED'] != '1',
-               'worker_memory_kib': int(os.environ['BL_WORKER_MEMORY_KIB']),
-               'worker_swap_kib': int(os.environ['BL_WORKER_SWAP_KIB'])}
+               'execution': 'host-nix' if args.host_nix else 'bounded-vm'}
     started = time.monotonic()
     try:
-        if request['kind'] == 'shard':
-            groups = module(root / 'scripts/ci-test-shard.py').partitions(root, request['count'])
+        inventory = module(root / 'scripts/ci-test-shard.py')
+        if args.host_nix:
+            # A host check must already be inside the actual manager unit.
+            row = next(line for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+            group = Path('/sys/fs/cgroup') / row[3:].lstrip('/')
+            maximum = int((group / 'memory.max').read_text())
+            swap = int((group / 'memory.swap.max').read_text())
+            assert 0 < maximum <= 6 * 1024 ** 3 and swap == 0
+            receipt.update(worker_memory_kib=maximum // 1024, worker_swap_kib=swap)
+            assert request == {'kind': 'host-nix'}
+            files = inventory.partitions(root, 1, lane='host-nix')[0]
+        elif request['kind'] == 'shard':
+            groups = inventory.partitions(root, request['count'], lane='bounded')
             files = groups[request['index']]
         elif request['kind'] == 'files':
             files = request['files']
         else:
             raise ValueError('Check kind must be files or shard')
+        if not args.host_nix:
+            receipt.update(worker_memory_kib=int(os.environ['BL_WORKER_MEMORY_KIB']),
+                           worker_swap_kib=int(os.environ['BL_WORKER_SWAP_KIB']))
+            if set(files) & inventory.host_nix_files(root):
+                raise ValueError('Real Nix consumers require the host-nix execution lane')
         assert files and len(files) == len(set(files))
         for name in files:
             path = (root / name).resolve(strict=True)

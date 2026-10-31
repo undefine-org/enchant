@@ -13,7 +13,20 @@ import tempfile
 import time
 
 
-def partitions(root, count):
+def host_nix_files(root):
+    """Only declared real Nix consumers need the host daemon and writable store."""
+    manifest = Path(root) / 'scripts/test-prerequisites.json'
+    if not manifest.is_file():
+        return set()
+    # Use the existing validator, without admitting or starting any test tool.
+    runpy.run_path(str(Path(__file__).with_name('test_prerequisites.py')))['require'](root, [])
+    entries = json.loads(manifest.read_text())['tests']
+    return {name for name, targets in entries.items()
+            if {'nix', 'nix-instantiate', 'nix-store'} &
+            set(targets.get('all', []) + targets.get('linux', []))}
+
+
+def partitions(root, count, *, lane='all'):
     if count < 1:
         raise ValueError("count must be positive")
     files = []
@@ -22,6 +35,11 @@ def partitions(root, count):
         for name in names:
             if name.endswith(("_test.bl", "_test.exs")):
                 files.append(str((Path(directory) / name).relative_to(root)))
+    if lane not in {'all', 'bounded', 'host-nix'}:
+        raise ValueError('Unknown inventory execution lane')
+    if lane != 'all':
+        host = host_nix_files(root)
+        files = [name for name in files if (name in host) == (lane == 'host-nix')]
     timing_file = root / "scripts/test-durations.json"
     if not timing_file.exists():
         return [sorted(files)[index::count] for index in range(count)]

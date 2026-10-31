@@ -361,8 +361,11 @@ The release checks out that run's `head_sha`, verifies its tiny SDK selection
 receipt, and copies the exact portable bytes from the restored SDK. It reuses
 that successful inventory instead of rebuilding or repeating the full suite.
 Tagged releases and explicit build dispatches use the same canonical recipe and
-qualify the resulting candidate before publication. Each inventory shard runs
-inside a bounded Nix worker, and failed checks retain their per-file receipts.
+qualify the resulting candidate before publication. Ordinary inventory shards
+run inside bounded Nix workers. The two declared real-Nix consumers run serially
+on the host under a 6 GiB cgroup, using its real daemon and the same candidate.
+These lanes cover the original inventory exactly once and retain failed checks'
+per-file receipts.
 
 **The runner's libc is not the release runtime.** The pinned producer currently
 links against glibc 2.44. Stock Ubuntu 24.04 and 26.04 do not satisfy that floor.
