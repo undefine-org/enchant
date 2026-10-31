@@ -6,116 +6,97 @@ on:
       artifact:
         required: true
         type: string
-      runner:
-        required: true
+      revision:
+        description: Exact source commit; defaults to the invoking revision
+        required: false
+        default: ""
+        type: string
+      runtime_run:
+        description: Successful CI run whose exact qualified SDK should be reused
+        required: false
+        default: ""
         type: string
       version:
         required: false
         default: ""
         type: string
+    outputs:
+      sdk:
+        description: Exact qualified immutable SDK selection
+        value: ${{ jobs.build.outputs.sdk }}
+      cache-key:
+        description: Exact registered Nix cache for qualification consumers
+        value: ${{ jobs.build.outputs.cache-key }}
 
 permissions:
   contents: read
+  actions: read
+
+env:
+  RELEASE_REVISION: ${{ inputs.revision || github.sha }}
 
 jobs:
   build:
     name: ${{ inputs.artifact }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runtime_run != '' && 'blacksmith-4vcpu-ubuntu-2604' || 'blacksmith-8vcpu-ubuntu-2604' }}
+    outputs:
+      sdk: ${{ steps.sdk.outputs.path }}
+      cache-key: ${{ steps.sdk-cache.outputs.key }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REVISION }}
 
       - name: Require a supported Nix production target
         run: |
           set -eu
-          if [ "$(uname -s)/$(uname -m)" != Linux/x86_64 ]; then
+          if [ "$(uname -s)/$(uname -m)" != Linux/x86_64 ] || [ "${{ inputs.artifact }}" != linux-x86_64 ]; then
             echo "::error::The qualified Nix SDK producer currently supports x86_64-linux only"
             exit 69
           fi
 
-      - name: Enable the bounded Nix preparation worker
-        if: runner.os == 'Linux'
-        run: |
-          set -eu
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          sudo systemctl start "user@$uid.service"
-          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+      - name: Prepare the bounded Nix worker
+        uses: ./.github/actions/nix-worker
 
-      - uses: cachix/install-nix-action@v31
-        if: runner.os == 'Linux'
+      - name: Download the successful CI selection receipt
+        if: inputs.runtime_run != ''
+        uses: actions/download-artifact@v4
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            max-jobs = 1
-            cores = 2
-            extra-system-features = kvm
-            extra-sandbox-paths = /dev/kvm
-
-      - name: Verify bounded Nix workers can access KVM
-        if: runner.os == 'Linux'
+          name: ci-sdk-selection
+          path: ${{ runner.temp }}/ci-sdk-selection
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run }}
+      - name: Bind the retained CI selection to this exact release commit
+        if: inputs.runtime_run != ''
+        id: selector
+        env:
+          QUALIFIED_RUN: ${{ inputs.runtime_run }}
         run: |
-          set -eu
-          test -c /dev/kvm || { echo "::error::The bounded Nix backend requires /dev/kvm"; exit 69; }
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends acl
-          sudo setfacl -m g:nixbld:rw /dev/kvm
-          build_gid=$(getent group nixbld | cut -d: -f3)
-          build_user=$(getent passwd | awk -F: -v gid="$build_gid" '$4 == gid {print $1; exit}')
-          test -n "$build_user"
-          sudo -u "$build_user" python3 -c 'import fcntl, os; fd=os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00, 0)==12; vm=fcntl.ioctl(fd, 0xAE01, 0); os.close(vm); os.close(fd)'
-
-      - name: Set up OTP 29 + Elixir 1.20
-        uses: erlef/setup-beam@v1
+          python3 scripts/ci-sdk-cache.py read-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
+            --revision "$RELEASE_REVISION" --run-id "$QUALIFIED_RUN" --github-output
+      - name: Restore registered Nix products and completed SDK units
+        id: sdk-cache
+        uses: ./.github/actions/nix-sdk-cache
         with:
-          otp-version: "29.0.1"
-          elixir-version: "1.20.4"
-
-      - name: Resolve version
-        id: version
+          key: ${{ steps.selector.outputs.key }}
+          sdk: ${{ steps.selector.outputs.sdk }}
+          required: ${{ inputs.runtime_run != '' && 'true' || 'false' }}
+      - name: Verify retained CI bytes and source identity after restoration
+        if: inputs.runtime_run != ''
+        env:
+          QUALIFIED_RUN: ${{ inputs.runtime_run }}
         run: |
-          set -eu
-          v="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
-          v="${v#v}"
-          [ -n "$v" ] || v="0.1.0-dev"
-          # A push to main is `latest`: a prerelease of the next version, named
-          # by its commit, so `bl version` says which main it is.
-          if [ "${{ github.ref_type }}" = branch ] && [ -z "${{ inputs.version }}" ]; then
-            v="0.1.0-latest.${GITHUB_SHA:0:8}"
-          fi
-          # Elixir's Version is major.minor.patch, so a CalVer tag like `v2026.0`
-          # is stamped as `2026.0.0`. The GitHub release keeps the tag's name;
-          # only the app version (what `bl version` reports) is normalized.
-          case "$v" in
-            *.*.*) ;;
-            *.*) v="$v.0" ;;
-            *)   v="$v.0.0" ;;
-          esac
-          echo "BL_VERSION=$v" >> "$GITHUB_ENV"
-          echo "value=$v" >> "$GITHUB_OUTPUT"
-          echo "building beam-lisp $v for ${{ inputs.artifact }} (ref ${{ github.ref_name }})"
+          python3 scripts/ci-sdk-cache.py verify-selector \
+            --selector "$RUNNER_TEMP/ci-sdk-selection/ci-sdk-selection.json" \
+            --revision "$RELEASE_REVISION" --run-id "$QUALIFIED_RUN"
 
-      - name: Restore addressed test assets
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/beam_lisp
-          key: ${{ inputs.artifact }}-test-assets-${{ hashFiles('bl.lock') }}
-          restore-keys: |
-            ${{ inputs.artifact }}-test-assets-
-
-      # The version lives in the DECLARATION (env.bl `:app :vsn`) — that is what
-      # the app resource is written from, and the app resource is what the
-      # release assembly reads — so the release stamps it there instead of
-      # passing it through a build tool's environment. Both occurrences: the
-      # application's own vsn and the release's.
-      - name: Stamp the version into env.bl
-        run: |
-          set -eu
-          perl -pi -e "s/:vsn \"0\.1\.0\"/:vsn \"$BL_VERSION\"/" env.bl
-          grep -n ':vsn' env.bl
+      - name: Prepare the pinned FHS release check adapter
+        run: nix-build nix/ci-release-runtime.nix --out-link .bl/ci-release-runtime
 
       - name: Install runtime fixture prerequisites
+        if: inputs.runtime_run == ''
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -124,34 +105,62 @@ jobs:
       # Public self-build publishes the selected Nix release. Its normal recipe
       # already produces dependencies, natives, floor, solver and stock launcher.
       - name: Build the drop through the normal Nix SDK path
+        if: inputs.runtime_run == ''
         run: ./bin/bl --cold self-build --out "bl-${{ inputs.artifact }}"
+      - name: Reuse the successful CI candidate without invoking production
+        if: inputs.runtime_run != ''
+        env:
+          QUALIFIED_SDK: ${{ steps.sdk-cache.outputs.sdk }}
+        run: |
+          python3 - <<'REUSE'
+          import json, os, shutil
+          from pathlib import Path
+          metadata = json.loads((Path(os.environ['QUALIFIED_SDK']) / 'artifact.json').read_text())
+          target = Path('bl-${{ inputs.artifact }}')
+          shutil.copyfile(Path(metadata['release']) / 'bl.drop', target)
+          target.chmod(0o755)
+          REUSE
+      - name: Capture the exact stable SDK and application version
+        id: sdk
+        env:
+          RELEASE_LABEL: ${{ inputs.version || github.ref_name }}
+        run: |
+          set -eu
+          sdk=$(readlink -f .bl/sdks/current-sdk)
+          printf 'path=%s\n' "$sdk" >> "$GITHUB_OUTPUT"
+          python3 scripts/release-requirements.py create \
+            --sdk "$sdk" --candidate "bl-${{ inputs.artifact }}" \
+            --runtime .bl/ci-release-runtime --revision "$RELEASE_REVISION" --label "$RELEASE_LABEL" \
+            --out "bl-${{ inputs.artifact }}.requirements.json"
+          python3 - <<'VERSION'
+          import json, os
+          from pathlib import Path
+          value = json.loads(Path('bl-${{ inputs.artifact }}.requirements.json').read_text())
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('BL_VERSION=' + value['application_version'] + '\n')
+          VERSION
       - name: Materialize the exact portable candidate for native fixtures
+        if: inputs.runtime_run == ''
         run: |
           python3 scripts/ci-materialize-candidate.py \
             --sdk .bl/sdks/current-sdk --candidate "bl-${{ inputs.artifact }}"
       - name: Verify persistent SDK builds restore without initialization
+        if: inputs.runtime_run == ''
+        shell: ./scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           python3 test/scripts/sdk_build_persistence.py --image .bl/ci-image
           python3 test/scripts/file_locks.py --image .bl/ci-image
           python3 test/scripts/owned_monitor.py --image .bl/ci-image
       - name: Fetch pinned embeddings for the complete Linux inventory
-        if: inputs.artifact == 'linux-x86_64'
+        shell: ./scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- bash --noprofile --norc -e -o pipefail {0}
+        if: inputs.runtime_run == ''
         run: ./bl-${{ inputs.artifact }} --cold install embed
-      - name: Package the already-built Linux runtime for inventory consumers
-        if: inputs.artifact == 'linux-x86_64'
-        run: python3 scripts/package-ci-runtime.py --out "$RUNNER_TEMP" --candidate "bl-${{ inputs.artifact }}"
-      - name: Retain the exact Linux runtime projection
-        if: inputs.artifact == 'linux-x86_64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux-runtime
-          path: |
-            ${{ runner.temp }}/ci-runtime.tar.gz
-            ${{ runner.temp }}/ci-store.tar.gz
-          compression-level: 0
-          retention-days: 1
-
+      - name: Retain only verified model pins for bounded inventory workers
+        if: inputs.runtime_run == ''
+        run: python3 scripts/ci-model-input.py capture --models "$HOME/.cache/beam_lisp/models"
       - name: Verify fresh SDK startup uses compiled units
+        if: inputs.runtime_run == ''
+        shell: ./scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- bash --noprofile --norc -e -o pipefail {0}
         run: python3 test/scripts/drop_startup.py "bl-${{ inputs.artifact }}" --samples 1 --runtime-regressions
 
       # A drop gets launched in parallel more often than it looks — an editor
@@ -164,6 +173,8 @@ jobs:
       # below, because that one extracts this same payload and would leave the
       # directory warm.
       - name: Smoke test (concurrent first launch)
+        if: inputs.runtime_run == ''
+        shell: ./scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -eu
           cp "bl-${{ inputs.artifact }}" "$RUNNER_TEMP/bl-race"
@@ -193,6 +204,8 @@ jobs:
       # lazy_memo runtime, Explorer/Polars, and the z3 port — so a payload that
       # silently lost its native tier fails here rather than on a user's machine.
       - name: Smoke test (cold, no warm VM, no checkout)
+        if: inputs.runtime_run == ''
+        shell: ./scripts/with-release-runtime --sdk .bl/sdks/current-sdk -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -eu
           cp "bl-${{ inputs.artifact }}" "$RUNNER_TEMP/bl"
@@ -259,6 +272,14 @@ jobs:
               echo "FAIL lsp serve: expected an initialize result, got '$got'" >&2; exit 1 ;;
           esac
 
+      - name: Retain the qualified SDK for exact consumers and the next producer
+        if: inputs.runtime_run == ''
+        uses: ./.github/actions/nix-sdk-cache
+        with:
+          operation: save
+          key: ${{ steps.sdk-cache.outputs.key }}
+          sdk: ${{ steps.sdk.outputs.path }}
+
       - name: Checksum
         run: |
           set -eu
@@ -276,6 +297,7 @@ jobs:
           path: |
             bl-${{ inputs.artifact }}
             bl-${{ inputs.artifact }}.sha256
+            bl-${{ inputs.artifact }}.requirements.json
           # The payload is already gzip; re-zipping ~100 MB per leg buys nothing.
           compression-level: 0
           retention-days: 7
