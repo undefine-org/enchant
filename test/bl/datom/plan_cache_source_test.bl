@@ -1,0 +1,114 @@
+(ns datom.plan-cache-source-test
+ (:require [reload.generation :as g] [datom :as d] [datom.query.engine :as engine] [compiler :as c]))
+
+(def SOURCE
+ "(ns cache.source (:require [datom :as d] [datom.query.engine :as engine]))
+  (defn query [database query] (engine/q query database))
+  (defn mark [query] (engine/watch-rank-query! query))
+  (defn callback [f destination] (f destination :plan-cache-callback-effect))
+  (defn fill [database prefix total]
+   (loop [i 0]
+    (if (< i total)
+     (let [v (symbol (str prefix i))]
+      (engine/q [:find v :where ['_ :fixture/value v]] database)
+      (recur (inc i))) i)))")
+
+(defn fixture []
+ (let [graph (g/prepare!
+              {:application-id (str "source-plan-cache-" (erlang/unique_integer (list :positive)))
+               :stable-namespaces #{"datom" "datom.query.engine"}
+               :sources {"cache.source" SOURCE}})
+       connection (d/connect [{:db/ident :fixture/value :db/valueType :db.type/string}])]
+  (d/transact! connection [{:db/id -1 :fixture/value "accepted"}])
+  {:graph graph :connection connection :database (d/db connection)
+   :prefix (str "?source-cache-" (erlang/unique_integer (list :positive)) "-")}))
+
+(defn query [variable]
+ [:find (symbol variable) :where ['_ :fixture/value (symbol variable)]])
+(defn source-query [f q] (g/invoke! (:graph f) "cache.source/query" [(:database f) q]))
+(defn close! [f] (d/close! (:connection f)) (g/retire! (:graph f)))
+
+(deftest source-cannot-nominate-private-cache-operations
+ (let [before (engine/plan-cache-stats)
+       refusal (try
+                 (c/compile
+                  (BeamLisp.Reader/read_one
+                   "(datom.query.engine/update-plan-cache! :offer :forged (fn [] :executable) 1)")
+                  (c/new-env "cache.external"))
+                 nil (catch error (ex-message error)))]
+  (is (and (string? refusal) (String/contains? refusal "/update-plan-cache! is not public")))
+  (is (= before (engine/plan-cache-stats)))))
+
+(deftest unrelated-warm-plans-preserve-source-hits-misses-and-hints
+ (let [f (fixture) q (query (str (:prefix f) "read"))]
+  (try
+   (is (= #{["accepted"]} (source-query f q)))
+   (doseq [i (range 128)] (engine/q (query (str (:prefix f) i)) (:database f)))
+   (let [before (engine/plan-cache-stats)]
+    (is (= #{["accepted"]} (source-query f q)))
+    (is (= 1 (- (:hits (engine/plan-cache-stats)) (:hits before)))))
+   (is (= #{["accepted"]} (source-query f (query (str (:prefix f) "new")))))
+   (let [before (engine/plan-cache-stats)
+         message (try (source-query f [:where ['_ :fixture/value '?value]]) nil
+                   (catch error (ex-message error)))]
+    (is (= "invalid query" message))
+    (is (= before (engine/plan-cache-stats))))
+   (is (= :ok (g/invoke! (:graph f) "cache.source/mark" [q])))
+   (is (= #{["accepted"]} (source-query f q)))
+   (let [refusal (try
+                   (g/invoke! (:graph f) "cache.source/callback"
+                    [(erlang/make_fun :erlang :send 2) (erlang/self)])
+                   nil (catch error (:original error)))]
+    (is (= :source_native_target_refused refusal))
+    (is (= :none (receive :plan-cache-callback-effect :unexpected (after 0 :none)))))
+   ;; Enough actual scan work enables the result-cache hint's separate closed
+   ;; update. Its result and data visibility remain ordinary query behavior.
+   (d/transact! (:connection f)
+    (mapv (fn [i] {:db/id (- -100 i) :fixture/value (str "row-" i)}) (range 40)))
+   (let [latest (assoc f :database (d/db (:connection f)))]
+    (is (= 41 (count (source-query latest q))))
+    (is (= 41 (count (source-query latest q)))))
+   (finally (close! f)))))
+
+(deftest source-plan-admission-preserves-fifo-and-oversize-declines
+ (let [f (fixture) total (+ engine/PLAN-CACHE-MAX 1)
+       first-query (query (str (:prefix f) 0))
+       last-query (query (str (:prefix f) (dec total)))]
+  (try
+   (is (= total (g/invoke! (:graph f) "cache.source/fill" [(:database f) (:prefix f) total])))
+   (is (= engine/PLAN-CACHE-MAX (:size (engine/plan-cache-stats))))
+   (let [before (engine/plan-cache-stats)]
+    (is (= #{["accepted"]} (source-query f last-query)))
+    (is (= 1 (- (:hits (engine/plan-cache-stats)) (:hits before)))))
+   (let [before (engine/plan-cache-stats)]
+    (is (= #{["accepted"]} (source-query f first-query)))
+    (is (= 1 (- (:misses (engine/plan-cache-stats)) (:misses before)))))
+   (doseq [text [(binary/copy "x" 20000)
+                (binary/part (binary/copy "y" (* 1024 1024)) 0 1024)]]
+    (let [q [:find '?e :where ['?e :fixture/value text]] before (engine/plan-cache-stats)]
+     (is (= #{} (source-query f q)))
+     (is (= #{} (source-query f q)))
+     (let [after (engine/plan-cache-stats)]
+      (is (= (:size before) (:size after)))
+      (is (= (:hits before) (:hits after)))
+      (is (= 2 (- (:misses after) (:misses before))))
+      (is (= 2 (- (:declined after) (:declined before)))))))
+   (finally (close! f)))))
+
+(deftest concurrent-source-hits-and-offers-preserve-every-counter-update
+ (let [f (fixture) q (query (str (:prefix f) "hot"))]
+  (try
+   (source-query f q)
+   (let [before (engine/plan-cache-stats)
+         work (mapv (fn [worker]
+                      (future
+                       (doseq [i (range 8)]
+                        (source-query f q)
+                        (source-query f (query (str (:prefix f) "cold-" worker "-" i))))
+                       :completed)) (range 4))]
+    (doseq [task work] (is (= :completed @task)))
+    (let [after (engine/plan-cache-stats)]
+     (is (= 32 (- (:hits after) (:hits before))))
+     (is (= 32 (- (:misses after) (:misses before))))
+     (is (<= (:size after) engine/PLAN-CACHE-MAX))))
+   (finally (close! f)))))
