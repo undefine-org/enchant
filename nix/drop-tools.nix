@@ -1,10 +1,15 @@
 # One immutable stock launcher/codec producer for checkout and release builds.
-{ pkgs }:
+{ pkgs, root ? ../tooling/drop }:
 (import ./bounded-build.nix { inherit pkgs; }) (pkgs.rustPlatform.buildRustPackage {
   pname = "beam-lisp-drop-tools";
   version = "1";
-  src = pkgs.lib.fileset.toSource { root = ../tooling/drop; fileset = ../tooling/drop; };
-  cargoLock.lockFile = ../tooling/drop/Cargo.lock;
+  src = pkgs.lib.fileset.toSource {
+    inherit root;
+    fileset = pkgs.lib.fileset.unions [
+      (root + "/Cargo.toml") (root + "/Cargo.lock") (root + "/src")
+    ];
+  };
+  cargoLock.lockFile = root + "/Cargo.lock";
   cargoBuildFlags = [ "--bin" "drop-launcher" "--bin" "drop" ];
   doCheck = false;
   installPhase = ''

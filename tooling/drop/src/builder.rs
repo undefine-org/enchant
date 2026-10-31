@@ -16,7 +16,7 @@ use std::process::Stdio;
 
 /// The GitHub repository releases come from (`:repo` in the config).
 pub fn release_repo() -> String {
-    config_literal("repo").unwrap_or_else(|| "timinou/beam-lisp".to_string())
+    config_literal("repo").unwrap_or_else(|| "undefine-org/enchant".to_string())
 }
 
 /// This platform's release asset name, as `.github/workflows/release.yml`
