@@ -3,7 +3,7 @@
 
 Nix scans output bytes for store references. Preserve content identities while
 replacing physical store roots with opaque SHA-256 labels; the derivation also
-enforces allowedReferences = [], rather than suppressing reference scanning.
+enforces outputChecks.out.allowedReferences = [], rather than suppressing scanning.
 """
 import argparse
 import hashlib

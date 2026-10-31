@@ -18,7 +18,7 @@ pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
     ${pkgs.e2fsprogs}/bin/mkfs.ext4 -q -F "$diskImage"
     mountDisk=/dev/vda
   '';
-  builder = pkgs.writeShellScript "beam-lisp-bounded-worker" ''
+  builder = toString (pkgs.writeShellScript "beam-lisp-bounded-worker" ''
     set -euo pipefail
     memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
     swap_kib=$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)
@@ -55,5 +55,5 @@ pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
     ''}
     cd /build
     exec ${old.builder} "$@"
-  '';
+  '');
 }))
