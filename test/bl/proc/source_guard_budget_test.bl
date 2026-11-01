@@ -1,0 +1,60 @@
+(ns proc.source-guard-budget-test
+ (:require [proc.message-domain :as domain] [reload.generation :as g]))
+(def SOURCE
+ "(ns guard.budget)
+  (defn plain [m] (erlang/is_map m))
+  (defn old-map [m] (and (erlang/is_map m) (erlang/=:= 1 (maps/get :tag m 1))))
+  (defn identity-value [m] m)
+  (defn wrap [m] {:payload m})
+  (defn duplicate-guard [m] (do (maps/get :tag m m) (old-map m)))
+  (defn dormant [m] (or (erlang/is_map m) (erlang/=:= 1 (maps/get :tag m 1))))
+  (defn force-guard [m] (do (maps/get :tag m 1) (dormant m)))
+  (defn integer [m] (erlang/is_integer m))
+  (defn typed-map [m] (and (erlang/is_map m) (erlang/is_integer (maps/get :tag m 1))))
+  (defn project [m] {:tag (maps/get :tag m 1)})
+  (defn box [m] {:tag m})
+  (defn vector-box [m] [m])
+  (defn vector-integer [m] (and (vector? m) (= 1 (count m)) (erlang/is_integer (first m))))")
+(defn- with-proof [action]
+ (let [graph (g/prepare! {:application-id (str "source-budget-proof-" (erlang/unique_integer (list :positive)))
+                         :native-modules #{"erlang" "maps"} :sources {"guard.budget" SOURCE}})
+       callback (fn [name] (g/with! graph
+                   #(let [namespace (get (:mapping graph) "guard.budget")]
+                     {:function (BeamLisp.Env/fetch_exact! namespace name)
+                      :environment (BeamLisp.Env/capture_native_context!)})))]
+  (try (action callback) (finally (g/retire! graph)))))
+(deftest guarded-whole-map-wrapping-has-no-universal-source-budget-proof
+ (with-proof
+  (fn [f]
+   (let [a (f "old-map") b (f "wrap") c (f "old-map")
+         captured (domain/capture (:function a) (:environment a))]
+    (is (= :proved (:status captured)))
+    (is (pos? (count (:source-guards captured))))
+    (is (= :unknown (:status (domain/compare-callbacks a b c :bounded-first-order))))))))
+(deftest identity-guard-and-scalar-projective-conversions-remain-proved
+ (with-proof
+  (fn [f]
+   (doseq [[old conversion fresh] [["old-map" "identity-value" "old-map"]
+                                  ["integer" "box" "typed-map"]
+                                  ["typed-map" "project" "typed-map"]
+                                  ["integer" "vector-box" "vector-integer"]
+                                  ["plain" "wrap" "plain"]]]
+    (let [result (domain/compare-callbacks (f old) (f conversion) (f fresh) :bounded-first-order)]
+     (when-not (= :proved (:status result)) (println "SOURCE_GUARD_POSITIVE" old conversion fresh (pr-str (dissoc result :evidence))))
+     (is (= :proved (:status result))))))))
+(deftest whole-argv-keeps-duplicate-input-occurrences
+ (with-proof
+  (fn [f]
+   (let [r (f "duplicate-guard") capture (domain/capture (:function r) (:environment r))
+         arguments (:arguments (first (:source-guards capture)))]
+    (is (= :proved (:status capture)))
+    (is (= 3 (count arguments)))
+    (is (= (nth arguments 1) (nth arguments 2)))
+    (is (= :unknown (:status (domain/compare-callbacks (f "old-map") (f "identity-value") r :bounded-first-order))))))))
+(deftest skipped-old-guards-do-not-authorize-new-native-invocation
+ (with-proof
+  (fn [f]
+   (let [r (f "dormant") captured (domain/capture (:function r) (:environment r))]
+    (is (= :proved (:status captured)))
+    (is (seq (:when (first (:source-guards captured)))))
+    (is (= :unknown (:status (domain/compare-callbacks r (f "identity-value") (f "force-guard") :bounded-first-order))))))))
