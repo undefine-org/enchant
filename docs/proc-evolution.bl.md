@@ -12,6 +12,12 @@ do not prove future compatibility. Unsupported proofs refuse before conversion
 or publication. Commit rechecks the same identities and owner revision. A stale
 revision cannot publish an earlier state observation.
 
+The default upgrade call uses the same 31-second window as explicit preparation
+and commit. `:upgrade-ms` separately caps rehearsal; it does not include metadata
+analysis. An explicit caller timeout remains authoritative. A timeout after the
+receiver has claimed work is an uncertain outcome, not permission to replay
+conversion or publish another candidate.
+
 ## Messages and replies
 
 The message obligation is `old-accept(m) => new-accept(upcast(m))`, including
