@@ -1,10 +1,14 @@
-# Packaged fonts
+# Example fonts
 
-Downloaded from the primary Google Fonts source repository on 2026-10-24:
+These four font files carry the adjacent SIL Open Font License 1.1 texts.
+The font files retain their embedded family, copyright and license records.
 
-- https://github.com/google/fonts/tree/main/ofl/instrumentserif
-- https://github.com/google/fonts/tree/main/ofl/dmsans
-- https://github.com/google/fonts/tree/main/ofl/patrickhand
+| Font file | Family | License |
+| --- | --- | --- |
+| `DMSans.ttf` | DM Sans | `DMSans-OFL.txt` |
+| `InstrumentSerif-Regular.ttf` | Instrument Serif | `InstrumentSerif-OFL.txt` |
+| `InstrumentSerif-Italic.ttf` | Instrument Serif | `InstrumentSerif-OFL.txt` |
+| `PatrickHand-Regular.ttf` | Patrick Hand | `PatrickHand-OFL.txt` |
 
-The adjacent OFL files govern redistribution. These are font assets, not renderer
-code. The editorial build captures and hashes the exact bytes into each revision.
+Rendering records exact font hashes. The original font binaries and copyright
+notices accompany the examples; the renderer uses the original family names.
