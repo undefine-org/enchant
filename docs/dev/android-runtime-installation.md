@@ -21,6 +21,13 @@ when its current hash still equals the previous receipt's hash. Unrecorded
 files, changed obsolete files and directories remain. A legacy installation
 without a receipt supplies no pruning authority.
 
+If an obsolete recorded file has become a symlink or directory, pruning
+preserves it without following it and drops it from the new receipt. This
+includes launcher-owned `epmd`, `erl_child_setup`, `inet_gethost` and Exqlite
+`sqlite3_nif.so` links to APK native libraries, which the incoming runtime
+projection must omit.
+An incoming member at one of those symlink paths still refuses installation.
+
 An incoming path that contains an unrecorded or modified regular file is copied
 before replacement. Kotlin retains these copies under
 `files/.bl-runtime-backups/install-*`; the Source push receiver retains them in
