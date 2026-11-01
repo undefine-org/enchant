@@ -147,6 +147,42 @@ class RuntimeInstallerTests(unittest.TestCase):
         self.assertEqual(b'active or operator-owned', (lock / 'owner-data').read_bytes())
         self.assertFalse((self.otp / 'next.beam').exists())
 
+    def test_obsolete_launcher_links_are_preserved_and_drop_old_ownership(self):
+        helpers = ['erts-17.0/bin/' + name for name in
+                   ['erl_child_setup', 'inet_gethost', 'epmd']]
+        helpers += ['lib/exqlite-0.37.0/priv/sqlite3_nif.so']
+        old = {name: b'old runtime binary' for name in helpers}
+        self.write(RECEIPT, inventory(old))
+        targets = self.root / 'native-libraries'
+        targets.mkdir()
+        for i, name in enumerate(helpers):
+            target = targets / str(i)
+            target.write_bytes(b'actual APK native library')
+            link = self.otp / name
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target)
+        self.write('proof-data/token', b'keep inside runtime')
+        self.pack({'app/new.beam': b'new code'})
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        for name in helpers:
+            self.assertTrue((self.otp / name).is_symlink())
+            self.assertNotIn(name.encode(), (self.otp / RECEIPT).read_bytes())
+        self.assertEqual(b'keep inside runtime', (self.otp / 'proof-data/token').read_bytes())
+
+    def test_obsolete_member_under_changed_parent_is_not_followed(self):
+        self.write(RECEIPT, inventory({'replaced/old.beam': b'same bytes'}))
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'old.beam').write_bytes(b'same bytes')
+        (self.otp / 'replaced').symlink_to(outside, target_is_directory=True)
+        self.pack({'app/new.beam': b'new code'})
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(b'same bytes', (outside / 'old.beam').read_bytes())
+        self.assertTrue((self.otp / 'replaced').is_symlink())
+        self.assertNotIn(b'replaced/old.beam', (self.otp / RECEIPT).read_bytes())
+
 
 if __name__ == '__main__':
     unittest.main()
