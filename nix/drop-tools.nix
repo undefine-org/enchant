@@ -11,7 +11,8 @@
   };
   cargoLock.lockFile = root + "/Cargo.lock";
   cargoBuildFlags = [ "--bin" "drop-launcher" "--bin" "drop" ];
-  doCheck = false;
+  doCheck = true;
+  cargoTestFlags = [ "--bin" "drop-launcher" "checkout_tests::" ];
   installPhase = ''
     mkdir -p "$out/bin"
     for executable in drop-launcher drop; do

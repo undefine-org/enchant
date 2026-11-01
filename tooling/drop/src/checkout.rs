@@ -89,11 +89,11 @@ fn invocation_tree(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
 }
 
 fn checkout_transport(argv: &[String], tree: Option<&str>, config: Option<&str>) -> Transport {
-    // These commands publish the application image or provision its dependencies.
-    // Their compiler lifetime belongs to a fresh process.
+    // Provisioning changes this runtime. Managed build/self-build requests
+    // prepare immutable products on the build station and can reuse this client.
     if verb_of(argv)
         .as_deref()
-        .is_some_and(|v| ["build", "self-build", "seed", "deps"].contains(&v))
+        .is_some_and(|v| ["seed", "deps"].contains(&v))
     {
         return Transport::Cold;
     }
@@ -539,7 +539,12 @@ mod checkout_tests {
             checkout_transport(&[], Some(":warm \"attach\""), None),
             Transport::Attach
         );
-        for verb in ["build", "self-build", "seed", "deps"] {
+        for verb in ["build", "self-build"] {
+            assert_eq!(checkout_transport(&args(&[verb]), None, None), Transport::Require);
+            assert_eq!(checkout_transport(&args(&["--cold", verb]), None, None), Transport::Cold);
+            assert_eq!(checkout_transport(&args(&[verb]), Some(":warm \"off\""), None), Transport::Cold);
+        }
+        for verb in ["seed", "deps"] {
             assert_eq!(
                 checkout_transport(&args(&["--warm", verb]), None, None),
                 Transport::Cold

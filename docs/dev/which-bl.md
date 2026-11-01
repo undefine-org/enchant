@@ -44,9 +44,11 @@ systemd user runtime, automatic VMs have a 4 GiB memory limit and 512 MiB swap
 limit. Keep test daemons in private runtime directories and stop them in cleanup;
 `test/scripts/checkout_transport.py` exercises that lifecycle.
 
-`./bin/bl --cold ...` starts a fresh VM using the selected SDK. Image builds
-and dependency provisioning run cold. The `:warm` setting in `env.bl` or the user
-configuration overrides the checkout's default transport policy.
+`./bin/bl --cold ...` starts a fresh VM using the selected SDK. Dependency
+provisioning and compiler-floor maintenance run cold. Managed build and
+self-build commands reuse the command VM while their producers run through Nix
+on the build station. The `:warm` setting in `env.bl` or the user configuration
+overrides the checkout's default transport policy.
 
 ## Compiler floor and SDK
 
