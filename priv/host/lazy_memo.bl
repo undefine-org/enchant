@@ -261,7 +261,7 @@
 ;; immutable: the SAME heap object (`erts_debug:same/2`, an O(1) pointer test)
 ;; has the same contents, so a value once proven resource-free is resource-free
 ;; forever. So a large captured value is walked ALONE; when it holds nothing,
-;; it is remembered (by identity, per process, a bounded most-recent list) and
+;; it is remembered (by identity, per process, a bounded insertion queue) and
 ;; every later capture of the same object costs one identity test. A value
 ;; that DOES hold a resource is never remembered — its resources are reported
 ;; every time, exactly as before — so no edge is ever lost.
@@ -273,8 +273,8 @@
 
 (defn deps_clean_max
   "How many clean values one process remembers. Large enough that a render's
-   live working set (snapshot, world, its big sub-maps, ~20–100 values) never
-   thrashes; each entry is an identity the process is already holding."
+   live working set (snapshot, world, its big sub-maps, ~20–100 values) fits;
+   each new entry evicts at most one old value."
   [] 256)
 
 (defn deps_big?
@@ -321,19 +321,40 @@
     (erts_debug/same t (erlang/hd xs)) true
     :else (deps_clean_same? t (erlang/tl xs))))
 
+(defn deps_clean_remove
+  "INTERNAL: remove one exact heap identity from its bounded shape bucket."
+  [t xs]
+  (cond
+    (erlang/== xs ()) ()
+    (erts_debug/same t (erlang/hd xs)) (erlang/tl xs)
+    :else (erlang/++ (list (erlang/hd xs)) (deps_clean_remove t (erlang/tl xs)))))
+
 (defn deps_clean_remember!
-  "INTERNAL: remember `t` as resource-free. Bounded: when the table holds
-   `deps_clean_max` values it is cleared and restarted (a generation flip,
-   O(1) amortised) rather than evicted one by one."
+  "INTERNAL: remember `t` as resource-free, retaining at most `deps_clean_max`
+   values. Evict one oldest identity when full, so crossing the bound does not
+   invalidate a render's entire live working set. Never hash captured terms."
   [t]
-  (let [table (Process/get :bl_deps_clean_ix nil)
-        n (Process/get :bl_deps_clean_n 0)
-        fresh? (or (erlang/== table nil) (erlang/>= n (deps_clean_max)))
-        table (cond fresh? (maps/new) :else table)
-        h (deps_shape t)]
-    (Process/put :bl_deps_clean_ix (maps/put h (erlang/++ (list t) (maps/get h table ())) table))
-    (Process/put :bl_deps_clean_n (cond fresh? 1 :else (erlang/+ n 1)))
-    t))
+  (cond
+    (deps_clean_hit? t nil) t
+    :else
+    (let [table (Process/get :bl_deps_clean_ix (maps/new))
+          fifo (Process/get :bl_deps_clean_fifo (queue/new))
+          n (Process/get :bl_deps_clean_n 0)
+          full? (erlang/>= n (deps_clean_max))
+          evicted (cond full? (queue/out fifo) :else nil)
+          old (cond full? (erlang/element 2 (erlang/element 1 evicted)) :else nil)
+          old-shape (deps_shape old)
+          remaining (cond full? (deps_clean_remove old (maps/get old-shape table ())) :else ())
+          table (cond
+                  (erlang/== false full?) table
+                  (erlang/== remaining ()) (maps/remove old-shape table)
+                  :else (maps/put old-shape remaining table))
+          fifo (cond full? (erlang/element 2 evicted) :else fifo)
+          h (deps_shape t)]
+      (Process/put :bl_deps_clean_ix (maps/put h (erlang/++ (list t) (maps/get h table ())) table))
+      (Process/put :bl_deps_clean_fifo (queue/in t fifo))
+      (Process/put :bl_deps_clean_n (cond full? n :else (erlang/+ n 1)))
+      t)))
 
 (defn plain!
   "Verify `v` has no lazy dependencies, remember it for this process, and
