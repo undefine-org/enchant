@@ -21,8 +21,12 @@ test ! -L "otp/$receipt"
 if test -e "otp/$receipt"; then test -f "otp/$receipt"; fi
 mkdir -p otp
 
-safe_path() {
+lexical_path() {
     case "$1" in ''|/*|*//*|../*|*/../*|*/..|..|./*|*/./*|*/.|.|*\\*) return 1;; esac
+}
+
+safe_path() {
+    lexical_path "$1"
     remaining=$1
     parent=otp
     while :; do
@@ -33,13 +37,18 @@ safe_path() {
     done
 }
 
-valid_line() {
+parse_line() {
     hash=${1%%  *}
     path=${1#*  }
     test "$path" != "$1"
     test ${#hash} -eq 64
     case "$hash" in *[!0-9a-f]*) return 1;; esac
     test "$path" != "$receipt"
+    lexical_path "$path"
+}
+
+valid_line() {
+    parse_line "$1"
     safe_path "$path"
 }
 
@@ -77,7 +86,7 @@ while IFS= read -r line || test -n "$line"; do
     test "$(digest "$stage/otp/$path")" = "$hash"
 done < "$stage/otp/$receipt"
 if test -f "otp/$receipt"; then
-    while IFS= read -r line || test -n "$line"; do valid_line "$line"; done < "otp/$receipt"
+    while IFS= read -r line || test -n "$line"; do parse_line "$line"; done < "otp/$receipt"
 fi
 
 while IFS= read -r line || test -n "$line"; do
@@ -106,13 +115,15 @@ done < "$stage/otp/$receipt"
 
 if test -f "otp/$receipt"; then
     while IFS= read -r line || test -n "$line"; do
-        valid_line "$line"
+        parse_line "$line"
         if ! grep -F -x "$line" "$stage/otp/$receipt" >/dev/null; then
             # A retained path with new bytes is a replacement, not obsolete.
             if grep -F -x "$path" "$stage/paths" >/dev/null; then
                 continue
             fi
-            if test -f "otp/$path" && test "$(digest "otp/$path")" = "$hash"; then
+            # A changed kind or parent belongs to the running application now.
+            # Preserve it without following links and drop obsolete ownership.
+            if safe_path "$path" && test -f "otp/$path" && test "$(digest "otp/$path")" = "$hash"; then
                 rm -f "otp/$path"
                 parent=$(dirname "otp/$path")
                 while test "$parent" != otp && rmdir "$parent" 2>/dev/null; do parent=$(dirname "$parent"); done

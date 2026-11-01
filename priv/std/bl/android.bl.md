@@ -741,6 +741,19 @@ dependencies are missing.
 
 (defn compile-tree! [t out] (compile! "the tree" (:root t) (:paths t) out))
 
+(defn runtime-owned-file?
+  "Only shipped runtime files enter the projection receipt. Mob creates ERTS
+   helper and SQLite links to the actual APK native libraries at startup."
+  [path]
+  (let [parts (vec (String/split path "/"))]
+    (not (or (String/ends_with? path ".a") (String/ends_with? path ".o")
+      (and (= 4 (count parts)) (= "otp" (nth parts 0))
+           (String/starts_with? (nth parts 1) "erts-") (= "bin" (nth parts 2))
+           (contains? #{"beam.smp" "erl_child_setup" "inet_gethost" "epmd"} (nth parts 3)))
+      (and (= 5 (count parts)) (= "otp" (nth parts 0)) (= "lib" (nth parts 1))
+           (String/starts_with? (nth parts 2) "exqlite-") (= "priv" (nth parts 3))
+           (= "sqlite3_nif.so" (nth parts 4)))))))
+
 (defn stage! [t]
   (let [st (:stage t) cache (Path/join (:build t) "aot")
         otp (Path/join st "otp") lib (Path/join otp "lib")
@@ -805,9 +818,7 @@ dependencies are missing.
         resource (device-app-file! (Path/join (lib-dir :beam_lisp) "ebin/beam_lisp.app")
                                   (Path/join erl-out "beam_lisp.app") library-names)
         files (assoc files (str bl-prefix "/ebin/beam_lisp.app") resource)
-        files (into {} (remove (fn [[name _]]
-                         (or (String/ends_with? name ".a") (String/ends_with? name ".o")
-                             (Regex/match? #"^otp/erts-[^/]+/bin/beam\\.smp$" name))) files))]
+        files (into {} (filter (fn [[name _]] (runtime-owned-file? name)) files))]
     (println "  · synchronize runtime")
     (sync-files! st files (Path/join (:build t) "stage-files.term"))
     (let [names (vec (sort (keys files)))
