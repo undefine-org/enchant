@@ -164,6 +164,12 @@ let
   };
   worker = workerFor false;
   producerTools = [ erlang elixir pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
+  previousUnits = if previousMetadata == null then null else
+    builtins.storePath (previousMetadata.image or (toString previousSdk)) + "/unit-store";
+  previousUnitArchive = if previousUnits != null
+      && builtins.pathExists (previousUnits + "/unit-index.json")
+    then import ./sdk-unit-archive.nix { inherit pkgs; units = previousUnits; }
+    else null;
 
   dependencies = worker (pkgs.runCommand "beam-lisp-dependencies-1" {
     nativeBuildInputs = producerTools;
@@ -249,10 +255,12 @@ let
       export BL_PRODUCTION_DROP_OUTPUT=$TMPDIR/selfbuilt.drop
       export BL_PRODUCTION_PAYLOAD=$TMPDIR/payload
       export BL_PRODUCTION_UNIT_STORE=$TMPDIR/unit-store
-      ${lib.optionalString (previousSdk != null) ''
-        if test -f ${previousSdk}/unit-store/unit-index.json; then
-          export BL_PREVIOUS_UNIT_STORE=${previousSdk}/unit-store
-        fi
+      ${lib.optionalString (previousUnitArchive != null) ''
+        sdk_phase_start materialize-previous-units
+        mkdir -p "$TMPDIR/previous-units"
+        tar -xzf ${previousUnitArchive}/units.tar.gz -C "$TMPDIR/previous-units"
+        export BL_PREVIOUS_UNIT_STORE="$TMPDIR/previous-units"
+        sdk_phase_end
       ''}
       # Preparation, floor validation and assembly share one producer VM.
       sdk_phase_start producer
@@ -390,6 +398,7 @@ let
     terminal = toString ratatuiNif;
     toolchain = toString pkgs.path;
     recipe = builtins.readFile ./bl-drop.nix;
+    unitArchive = builtins.readFile ./sdk-unit-archive.nix;
     worker = builtins.readFile ./bounded-build.nix;
   });
   reuseAssembly = previousMetadata != null
