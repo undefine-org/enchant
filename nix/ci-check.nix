@@ -24,7 +24,8 @@ let
     let entry = prerequisites.${name} or {}; in (entry.all or []) ++ (entry.linux or [])
   ) selectedFiles);
   toolPackages = { cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools;
-    ssh = pkgs.openssh; ssh-keygen = pkgs.openssh; tesseract = pkgs.tesseract; };
+    ssh = pkgs.openssh; ssh-keygen = pkgs.openssh; tesseract = pkgs.tesseract;
+    rsvg-convert = pkgs.librsvg; ldd = pkgs.glibc.bin; };
   nativeFixture = builtins.elem "test/bl/execution_qualification_test.bl" selectedFiles;
   # E50 compiles two private Rustler variants with --offline. Retain the same
   # lock-addressed vendor input used by native-compile.nix, without compiling

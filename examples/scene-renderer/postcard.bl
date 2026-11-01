@@ -1,0 +1,54 @@
+(ns scene-demo.postcard-build
+  (:require [scene-demo.postcard :as postcard] [scene.core :as scene] [interop]))
+(defn digest [bytes] (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes))))
+(def sources ["examples/scene-renderer/postcard.bl" "examples/scene-renderer/scene_demo/postcard.bl"
+              "examples/scene-renderer/raster.py" "priv/lib/scene/text_worker.py" "priv/lib/scene/text.bl"
+              "priv/lib/scene/layout.bl" "priv/lib/scene/geometry.bl" "priv/lib/scene/motion.bl"
+              "priv/lib/scene/inspect.bl" "priv/lib/scene/styles/editorial.bl" "priv/lib/scene/core.bl"
+              "priv/lib/scene/material.bl" "priv/lib/scene/atelier.bl" "priv/lib/live/hiccup.bl"])
+(defn command! [args]
+  (let [result (System/cmd "python3" (to-list args) (list (tuple :stderr_to_stdout true)))]
+    (when (not= 0 (erlang/element 2 result)) (scene/fail "Postcard graphics failed" {:diagnostic (erlang/element 1 result)}))))
+(let [args (clojure.io/current-command-line-args)
+      out (Path/expand (or (first args) "/tmp/bl-postcard"))
+      mode (second args) film? (= "film" mode) count (if film? 144 1)
+      config (if (= "long" mode)
+        {:cards [{:id :compose :title "Compose the idea, then give it room to grow."
+                  :body "Change this sentence to a paragraph. Pango wraps the text, the card measures its contents, and each following card moves down automatically. No coordinates need repairing."}
+                 (nth (:cards postcard/defaults) 1) (nth (:cards postcard/defaults) 2)]}
+        (if (= "blueprint" mode) {:theme :blueprint} {}))
+      captured (mapv (fn [p] [p (File/read! p)]) sources)
+      font-bytes (mapv (fn [p] [p (File/read! (str "examples/scene-renderer/assets/fonts/" p))])
+                      ["DMSans.ttf" "InstrumentSerif-Regular.ttf" "InstrumentSerif-Italic.ttf" "PatrickHand-Regular.ttf"])
+      rsvg (or (System/get_env "SCENE_RSVG") "rsvg-convert")
+      backend (System/cmd rsvg (list "--version"))
+      identity {:sources (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) captured)
+                :fonts (mapv (fn [[p bytes]] {:path p :sha256 (digest bytes)}) font-bytes)
+                :config (merge postcard/defaults config) :backend (erlang/element 1 backend)
+                :frames count :fps [24 1] :quality "2x Lanczos / outlined Pango / paper tile v1"}
+      revision (digest (interop/->json identity))
+      final-dir (str out "/" revision) dir (str out "/.pending-" revision "-" (System/pid))]
+  (when (not (File/dir? final-dir))
+    (File/mkdir_p! (str dir "/font"))
+    (File/mkdir_p! (str dir "/sources"))
+    (doseq [[p bytes] font-bytes] (File/write! (str dir "/font/" p) bytes))
+    (doseq [[p bytes] captured] (File/write! (str dir "/sources/" (replace-str p "/" "__")) bytes))
+    (let [prepared (postcard/prepare config {:font-dir (str dir "/font") :worker (str dir "/sources/priv__lib__scene__text_worker.py")})]
+      (File/write! (str dir "/provenance.json") (interop/->json (assoc identity :shaping (:shaping prepared))))
+      (doseq [k (range count)]
+        (let [frame (postcard/frame prepared (if film? (scene/frame-time k 24 1) 2.5))]
+          (File/write! (str dir "/" k ".svg") (scene/svg (:scene frame)))
+          (when (= k (if film? 60 0)) (File/write! (str dir "/scene.json") (interop/->json (dissoc frame :scene)))))))
+    (command! [(str dir "/sources/examples__scene-renderer__raster.py") "raster" dir "--count" (str count)
+               "--font-dir" (str dir "/font") "--font" (str dir "/font/InstrumentSerif-Regular.ttf")
+               "--scale" "2" "--rsvg" rsvg])
+    (when (not= captured (mapv (fn [p] [p (File/read! p)]) sources))
+      (scene/fail "Sources changed during export; publication held" {}))
+    (File/rename! dir final-dir))
+  (File/write! (str out "/manifest.json.tmp")
+    (interop/->json {:revision revision :frames count :fps [24 1] :duration (/ count 24) :width 1080 :height 1080
+                    :backend (erlang/element 1 backend) :seed 41 :quality (:quality identity)}))
+  (File/rename! (str out "/manifest.json.tmp") (str out "/manifest.json"))
+  (when film? (command! [(str final-dir "/sources/examples__scene-renderer__raster.py") "export" out
+                       "--out" (str out "/living-postcard.mp4")]))
+  (println (str "Published " count " measured postcard frames: " final-dir)))

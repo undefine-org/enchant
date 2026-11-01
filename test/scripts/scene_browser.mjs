@@ -1,0 +1,20 @@
+// Requires a headless Chromium CDP listener on 9224 and the preview on 4048.
+import {writeFileSync} from 'node:fs';
+const tabs=await (await fetch('http://127.0.0.1:9224/json')).json();
+const ws=new WebSocket(tabs[0].webSocketDebuggerUrl);await new Promise(r=>ws.onopen=r);
+let id=0;const pending=new Map();ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);m.error?p.reject(m.error):p.resolve(m.result)}};
+const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
+const evaluate=async expression=>(await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true})).result.value;
+await call('Emulation.setDeviceMetricsOverride',{width:1100,height:900,deviceScaleFactor:1,mobile:false});
+await call('Page.navigate',{url:'http://127.0.0.1:4048/'});
+const wait=async expr=>{for(let i=0;i<100;i++){if(await evaluate(expr))return;await new Promise(r=>setTimeout(r,100))}throw Error('Timed out: '+expr)};
+await wait("document.getElementById('revision')?.textContent.length===64");
+await evaluate("seek(60)");await wait("document.getElementById('frame').src.endsWith('/60.png')");
+const shot=await call('Page.captureScreenshot',{format:'png'});writeFileSync('/tmp/bl-scene-preview.png',Buffer.from(shot.data,'base64'));
+await evaluate("document.getElementById('next').click()");await wait("document.getElementById('frame').src.endsWith('/61.png')");
+await evaluate("document.getElementById('back').click()");await wait("document.getElementById('frame').src.endsWith('/60.png')");
+await evaluate("document.querySelector('#scenes button:nth-child(2)').click()");await wait("document.getElementById('frame').src.endsWith('/120.png')");
+await evaluate("document.getElementById('play').click()");await new Promise(r=>setTimeout(r,500));
+if(!(await evaluate('requested>120')))throw Error('Playback did not advance');
+await evaluate("document.getElementById('play').click();for(let k=0;k<200;k++)seek(k)");await wait("document.getElementById('frame').src.endsWith('/199.png')");
+await call('Page.navigate',{url:'about:blank'});ws.close();console.log('Chromium: loaded, seek, step, scenes, playback, rapid scrubbing, and close passed');
