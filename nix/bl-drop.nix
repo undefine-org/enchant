@@ -216,8 +216,11 @@ let
       rm -rf "$XDG_CACHE_HOME/beam_lisp/ebin"
       cp -a --no-preserve=ownership ${dependencies}/ebin "$XDG_CACHE_HOME/beam_lisp/ebin"
       rm -rf priv/bootstrap/seed build .bl/lib/beam_lisp-0.1.0
-      mkdir -p priv/bootstrap/seed
+      mkdir -p priv/bootstrap/seed build
       cp -a --no-preserve=ownership ${compiler}/seed/. priv/bootstrap/seed/
+      # This worker already has the complete qualified floor. Host-only staging
+      # would leave boot namespaces absent and trigger a second boot compiler.
+      cp -a --no-preserve=ownership ${compiler}/seed/. build/
       ./bin/bl --cold run scripts/prepare-release.bl
       # Package the source-validated compiler floor. Compiler regeneration is
       # a bare-VM operation, independent of the runtime's retained SDK lease.
