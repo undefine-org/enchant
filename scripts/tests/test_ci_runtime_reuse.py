@@ -47,8 +47,11 @@ class ProducerConfigurationTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()
         producer, legacy_version = REUSE.producer_configuration(workflow)
         self.assertIsNone(legacy_version)
-        changed = workflow.replace('uses: ./.github/actions/nix-worker',
-                                   'uses: ./.github/actions/different-worker', 1)
+        prefix, marker, producer_and_consumers = workflow.partition('  prepare-linux:\n')
+        self.assertTrue(marker)
+        changed = prefix + marker + producer_and_consumers.replace(
+            'uses: ./.github/actions/nix-worker',
+            'uses: ./.github/actions/different-worker', 1)
         self.assertNotEqual((producer, legacy_version), REUSE.producer_configuration(changed))
 
     def test_orchestration_can_change_but_native_steps_and_version_cannot(self):
