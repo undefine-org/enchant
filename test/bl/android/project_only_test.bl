@@ -1,0 +1,106 @@
+(ns android.project-only-test (:require [reader-node :as rn]))
+(def ^:private active (atom nil))
+(defn- record! [event] (swap! (:events @active) conj event))
+(defn fixture-input [name] (record! [:input name]) (Path/join (:root @active) (str "inputs/" name)))
+(defn fixture-lock [t name] (record! [:lock name]) (Path/join (:root t) (str "inputs/" name)))
+(defn fixture-otp [abi] (record! [:otp abi]) (Path/join (:root @active) (str "inputs/otp-" abi)))
+(defn- write! [file value] (File/mkdir_p! (Path/dirname file)) (File/write! file value))
+(defn fixture-render [t _ out]
+ (record! :render)
+ (write! (Path/join out "android/gradlew")
+  (str "#!" (System/find_executable "sh") "\n"
+       "printf 'gradle called\\n' >> gradle-called\n"
+       "mkdir -p app/build/outputs/apk/debug\n"
+       "printf 'controlled Gradle output\\n' > app/build/outputs/apk/debug/app-debug.apk\n"))
+ (File/chmod! (Path/join out "android/gradlew") 493)
+ (write! (Path/join out "android/build.gradle.kts") "// controlled external template\n")
+ (write! (Path/join out (str "android/app/src/main/java/" (String/replace (:id t) "." "/") "/MainActivity.kt"))
+         "        nativeSetActivity(this)\n"))
+(defn fixture-layer [_ out] (record! :layer) (write! (Path/join out "android/fixture-layer") "layer"))
+(defn fixture-native [_ _ _ _ out] (record! :native) (write! (Path/join out "android/fixture-native-stage") "native stage"))
+(defn fixture-bundle [_ out] (record! :bundle) (write! (Path/join out "android/fixture-bundle-stage") "bundle stage"))
+(def ^:private replacements
+ (into {} (map (fn [form] [(rn/node-name (rn/node-form (second (rn/node-items form)))) form])
+  (BeamLisp.Reader/read_string
+   "(defn- locked-dir [t name] (android.project-only-test/fixture-lock t name))
+    (defn- ensure-input! [input] (android.project-only-test/fixture-input (:name input)))
+    (defn ensure-otp! [abi] (android.project-only-test/fixture-otp abi))
+    (defn render-templates! [t input out] (android.project-only-test/fixture-render t input out))
+    (defn layer! [t out] (android.project-only-test/fixture-layer t out))
+    (defn native! [t mob exqlite otp out] (android.project-only-test/fixture-native t mob exqlite otp out))
+    (defn bundle! [t out] (android.project-only-test/fixture-bundle t out))"))))
+(defn- define! [namespace forms]
+ (BeamLisp.Env/with_ns namespace
+  (fn []
+   (doseq [form forms] (BeamLisp.Compiler/eval_form form (BeamLisp.Compiler/new_env namespace)))
+   (BeamLisp.Link/settle))))
+(defn- head-name [form]
+ (let [raw (rn/node-form form)]
+  (when (= :list (rn/node-tag raw))
+   (let [head (rn/node-form (first (rn/node-items raw)))]
+    (when (= :symbol (rn/node-tag head)) (rn/node-name head))))))
+(defn- function-name [form]
+ (when (contains? #{"def" "defn" "defn-"} (head-name form))
+  (rn/node-name (rn/node-form (second (rn/node-items form))))))
+(defn- invoke [namespace function args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! namespace function) (to-list args)))
+(defn- with-components [action]
+ (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+       token (str (erlang/unique_integer (list :positive)))
+       cli (str "qualification.android-cli.p" token) android (str "qualification.android-project.p" token)
+       previous (BeamLisp.Env/current_ns)
+       parse (BeamLisp.Reader/read_string (String/replace (File/read! (Path/join root "priv/std/bl/cli.bl")) "(ns bl.cli" (str "(ns " cli)))
+       forms (BeamLisp.Reader/read_string (String/replace (BeamLisp.Loader/read_source (Path/join root "priv/std/bl/android.bl.md"))
+                                           "(ns bl.android" (str "(ns " android)))
+       patched (mapv (fn [form] (get replacements (function-name form) form)) forms)]
+  (try
+   (doseq [key ["build" "run" "apk!" "step!" "target" "abi-options" "sync-files!" "tree-files"]]
+    (is (= (first (filter #(= key (function-name %)) forms))
+           (first (filter #(= key (function-name %)) patched)))))
+   (define! cli (filter #(or (= "ns" (head-name %))
+                            (contains? #{"add-arg" "dd-arg" "parse-int" "VALUED-FLAGS" "verb-position" "parse-argv"} (function-name %))) parse))
+   (when-not (every? (fn [[key expected]]
+                      (= expected (first (filter #(= key (function-name %)) patched)))) replacements)
+    (throw :external-stage-isolation-failed))
+   (define! android patched)
+   (action cli android)
+   (finally (BeamLisp.Env/in_ns previous)))))
+(deftest project-only-is-command-local-and-reaches-real-public-build-without-gradle
+ (let [root (Path/join (System/tmp_dir!) (str "android-project-only-" (erlang/unique_integer (list :positive))))
+       events (atom []) previous-abi (System/get_env "BL_ANDROID_ABI")]
+  (File/mkdir_p! root)
+  (reset! active {:root root :events events})
+  (try
+   (System/delete_env "BL_ANDROID_ABI")
+   (write! (Path/join root "env.bl")
+     "{:name \"android-project-control\" :paths [] :android {:app \"project_control\" :id \"org.example.control\" :ns \"project.control\" :abi \"x86_64\"}}")
+   (with-components
+    (fn [cli android]
+     (let [before (invoke cli "parse-argv" [["android" "build" "--project-only" "--standalone" "--release"]])
+           after (invoke cli "parse-argv" [["android" "build" "--" "--project-only" "--standalone" "--release"]])
+           other (invoke cli "parse-argv" [["test" "--project-only"]])
+           build (Path/join root "_build/android/x86_64/android")]
+      (is (nil? (:unknown before)))
+      (is (= ["build" "--project-only" "--standalone" "--release"] (vec (:args before))))
+      (is (= ["build"] (vec (:args after))))
+      (is (= ["--project-only" "--standalone" "--release"] (vec (:dd after))))
+      (is (= "--project-only" (:unknown other)))
+      (is (= 0 (BeamLisp/with_cwd root #(invoke android "run" [(:args after) after]))))
+      (doseq [file ["build.gradle.kts" "fixture-layer" "fixture-native-stage" "fixture-bundle-stage"]]
+       (is (File/regular? (Path/join build file))))
+      (is (String/contains? (File/read! (Path/join build "app/src/main/java/org/example/control/MainActivity.kt")) "MOB_RELEASE"))
+      (is (= 1 (count (filter #{:bundle} @events))))
+      (is (not (File/exists? (Path/join build "gradle-called"))))
+      (is (not (File/exists? (Path/join build "app/build/outputs/apk/debug/app-debug.apk"))))
+      ;; Keep actual apk!, step! and System.cmd. A normal build must run the
+      ;; physical Gradle trap; it writes a controlled output, not a real APK.
+      (let [normal (invoke cli "parse-argv" [["android" "build"]])]
+       (is (= 0 (BeamLisp/with_cwd root #(invoke android "run" [(:args normal) normal])))))
+      (is (= "gradle called\n" (File/read! (Path/join build "gradle-called"))))
+      (is (= "controlled Gradle output\n" (File/read! (Path/join build "app/build/outputs/apk/debug/app-debug.apk"))))
+      (is (= 2 (count (filter #{:native} @events))))
+      (is (= 1 (count (filter #{:bundle} @events)))))))
+   (finally
+    (reset! active nil)
+    (if previous-abi (System/put_env "BL_ANDROID_ABI" previous-abi) (System/delete_env "BL_ANDROID_ABI"))
+    (File/rm_rf! root)))))
