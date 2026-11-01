@@ -554,10 +554,14 @@ not an app that silently lacks its bridge.
 
 ## push — what the BEAM on the phone loads
 
-The APK carries the native host and nothing else the BEAM reads. Everything
-the BEAM loads lives in the app's `files/otp/`, pushed there by `push`: the OTP
-runtime, beam-lisp, the tree's libraries, and the tree's own code, compiled on
-the desk. A push replaces all of it, so the phone never runs a mix of builds.
+The APK supplies the native host; a standalone APK also carries a verified
+runtime archive. The BEAM loads the selected OTP runtime, SDK, libraries and
+managed application product from the app's `files/otp/` directory. Push and
+standalone installation project those files through an ownership receipt.
+Unknown files and changed obsolete files are preserved, conflicting regular
+files are backed up, and only unchanged obsolete owned files are pruned.
+Stop the runtime and data writers before installation; file projection is not
+an atomic database migration.
 
 The staged beam-lisp `.app` names only applications the phone has: the desk's
 names desk-only ones (a web server, a dataframe library) that the phone
