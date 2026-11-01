@@ -24,7 +24,9 @@ let
     memoryMiB = 6144;
     diskMiB = 32768;
     cpuCount = 4;
-    commandManager = true;
+    # Artifact production and fresh-boot checks launch only their own bounded
+    # child VMs. They do not submit managed artifact jobs from inside a worker.
+    commandManager = false;
   };
   generation = label: predecessor: worker (pkgs.stdenv.mkDerivation {
     pname = "beam-lisp-compiler-generation-${label}";
