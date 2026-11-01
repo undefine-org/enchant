@@ -107,6 +107,9 @@ host target. Preparation P and reproductions B/C are separate retained Nix
 outputs. Each boots freshly; B/C must match byte for byte. Both reproduce changed
 units independently against the same prior qualified baseline. The compiler's
 producer identity lets library-only updates select the existing compiler output.
+Checkout jobs also freeze `.bl/sdks/previous-preparation` when available.
+Completed preparation records survive later failures and skip unchanged
+lowering after their inputs, emitter and prior qualified module bytes verify.
 
 Application builds use their previous verified product with the same exact SDK.
 Full builds prune removed units, scoped builds retain their declared remainder,
