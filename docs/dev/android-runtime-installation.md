@@ -66,3 +66,18 @@ policy. The Android command runs Zig's Mob/JNI bridge and Gradle's APK assembly
 in the local pinned toolchain, retaining their per-ABI caches. Device checks
 need an explicit disposable app/device and a bounded emulator; signing keys
 belong outside Nix outputs and Git.
+
+Runtime staging pairs Android's OTP and native runtime with the selected SDK's
+exact Elixir application files. Mixing Elixir patch versions changes the
+compiler cache identity and cannot establish valid application replay. The
+device `beam_lisp.app` resource is rendered into an owned cache before file
+synchronization, rather than modifying a copied read-only Nix file.
+
+The Android native product uses Bionic `flock` for nonblocking shared and
+exclusive cache locks. Rust 1.95's standard `File::try_lock` methods return
+`Unsupported` on Android before making a system call; see the
+[Rust implementation](https://github.com/rust-lang/rust/blob/1.95.0/library/std/src/sys/fs/unix.rs#L1562-L1641).
+The replacement retains the open file descriptor, owner monitor and
+close-to-release rules. Other platforms keep the standard implementation.
+Neither an unavailable lock nor a missing cache entry permits replay without
+its complete producer evidence.
