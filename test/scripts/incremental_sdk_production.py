@@ -93,6 +93,19 @@ def main():
         info = json.loads((product / 'artifact.json').read_text())
         assert {key: info[key] for key in ('compiler', 'dependencies')} == {
             key: metadata[key] for key in ('compiler', 'dependencies')}, info
+        prior = json.loads((previous / 'artifact.json').read_text())
+        if info['image'] == prior['image']:
+            # Reusing the actual producer output performs no assembly. Its old
+            # build log describes that earlier build, not this selection.
+            assert expected in (-1, 0), (name, expected)
+            for key in ('assemblyIdentity', 'release', 'source', 'compiler', 'dependencies'):
+                assert info[key] == prior[key], key
+            assert (product / 'unit-store').resolve(strict=True) == (previous / 'unit-store').resolve(strict=True)
+            report['stages'][-1].update(product=str(product), assembly_reused=True)
+            save()
+            if answer is not None:
+                receiver(name, product, answer, real_value)
+            return product
         drv = subprocess.check_output(['nix-store', '--query', '--deriver', info['image']], text=True).strip()
         log = subprocess.check_output(['nix', '--extra-experimental-features', 'nix-command', 'log', drv],
                                       text=True, stderr=subprocess.STDOUT, timeout=30)
@@ -123,6 +136,18 @@ def main():
         # Recipe/client edits made while the baseline was qualifying may
         # update a few library units. Establish the exact current producer.
         synchronized = build('synchronized', sdk, -1, None)
+        recipe = source / 'nix/artifact-selection.nix'
+        original_recipe = recipe.read_bytes()
+        recipe.write_bytes(original_recipe + b'\n# Provider-only selection control.\n')
+        try:
+            selected = build('provider-only', synchronized, 0, None)
+            before = json.loads((synchronized / 'artifact.json').read_text())
+            after = json.loads((selected / 'artifact.json').read_text())
+            assert after['image'] == before['image']
+            for key in ('coordinator', 'platform'):
+                assert after[key] != before[key], key
+        finally:
+            recipe.write_bytes(original_recipe)
         fixture = ROOT / 'test/fixtures/sdk-artifacts'
         for name in ('provider.bl', 'consumer.bl'):
             target = source / 'priv/std/sdk/artifact' / name
