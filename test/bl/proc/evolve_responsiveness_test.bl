@@ -1,0 +1,79 @@
+(ns proc.evolve-responsiveness-test
+ (:require [proc.evolve :as ev] [reload.generation :as g]
+           [test.support.evolve-reply-fixtures :as f]))
+(defn- queued? [owner operation]
+ (loop [left 1000]
+  (if (some (fn [message]
+              (and (tuple? message) (= 3 (erlang/tuple_size message))
+                   (= :"$gen_call" (elem message 0)) (= operation (first (elem message 2)))))
+            (elem (Process/info owner :messages) 1)) true
+   (if (pos? left) (do (Process/sleep 1) (recur (dec left))) false))))
+(defn- finish-child! [[pid monitor]]
+ (if (Process/alive? pid)
+  (do (Process/exit pid :kill)
+      (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 1000 nil)))
+  (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 0 nil))))
+(defn- normal-child? [monitor]
+ (= :normal (receive [:DOWN seen :process _ reason] :when (= seen monitor) reason (after 6500 :missing))))
+(deftest preparation-does-not-expire-an-old-client-and-stale-state-is-never-published
+ (f/with-owner "reply-responsive-prepare" [:old-request :new-request]
+  (fn [[_ fresh] owner]
+   (let [parent (erlang/self) children (atom [])]
+    (erlang/apply :sys :suspend (list owner))
+    (try
+     (let [publisher (spawn-monitor #(erlang/send parent [:prepared
+                        (g/with! fresh (fn [] (ev/prepare-upgrade! owner 1 (f/spec fresh 2))))]))]
+      (swap! children conj publisher)
+      (is (queued? owner :proc.evolve/automatic-prepare))
+      (let [client (spawn-monitor #(erlang/send parent [:old-reply (ev/request! owner 1 :write)]))]
+       (swap! children conj client)
+       ;; Real public calls are queued in order while the owner is paused.
+       ;; request! retains its production default five-second deadline.
+       (is (queued? owner :proc.evolve/request))
+       (erlang/apply :sys :resume (list owner))
+       (is (= true (receive [:old-reply reply] reply (after 6500 :missing))))
+       (is (normal-child? (second client)))
+       (let [prepared (receive [:prepared result] result (after 35000 nil))]
+        (is (= :prepared (:status prepared)))
+        (is (normal-child? (second publisher)))
+        ;; If preparation completed first, the queued write invalidated its
+        ;; revision. If analysis yielded to the write, it converted fresh state.
+        ;; Neither route may silently overwrite the accepted old write.
+        (let [result (g/with! fresh #(ev/commit-upgrade! owner (:ticket prepared)))]
+         (is (contains? #{:applied :refused} (:status result)))
+         (if (= :applied (:status result))
+          (do (is (= {:value 1} (ev/request! owner 2 {:operation :read})))
+              (is (= 1 (ev/request! owner 1 :read))))
+          (do (is (= :stale-preparation (:kind result)))
+              (is (= 1 (ev/request! owner 1 :read)))))))))
+     (finally
+      (try (erlang/apply :sys :resume (list owner)) (catch _ nil))
+      (doseq [child @children] (finish-child! child))))))))
+(deftest committed-publication-keeps-fifo-old-replies-within-the-original-request-deadline
+ (f/with-owner "reply-responsive-commit" [:old-request :new-request]
+  (fn [[_ fresh] owner]
+   (let [prepared (g/with! fresh #(ev/prepare-upgrade! owner 1 (f/spec fresh 2)))
+         parent (erlang/self) children (atom [])]
+    (is (= :prepared (:status prepared)))
+    (erlang/apply :sys :suspend (list owner))
+    (try
+     (let [publisher (spawn-monitor #(erlang/send parent [:committed
+                        (g/with! fresh (fn [] (ev/commit-upgrade! owner (:ticket prepared))))]))]
+      (swap! children conj publisher)
+      (is (queued? owner :proc.evolve/automatic-commit))
+      (let [client (spawn-monitor #(erlang/send parent [:old-reply (ev/request! owner 1 :write)]))]
+       (swap! children conj client)
+       (is (queued? owner :proc.evolve/request))
+       (erlang/apply :sys :resume (list owner))
+       (is (= true (receive [:old-reply reply] reply (after 6500 :missing))))
+       (is (normal-child? (second client)))
+       (let [result (receive [:committed value] value (after 35000 nil))]
+        (is (= :applied (:status result)))
+        (is (normal-child? (second publisher)))
+        (is (= owner (:pid (ev/status owner))))
+        (is (= 2 (:version (ev/status owner))))
+        (is (= {:value 1} (ev/request! owner 2 {:operation :read})))
+        (is (= 1 (ev/request! owner 1 :read))))))
+     (finally
+      (try (erlang/apply :sys :resume (list owner)) (catch _ nil))
+      (doseq [child @children] (finish-child! child))))))))
