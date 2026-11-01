@@ -9,7 +9,7 @@ reflection bridge that reaches every Android API.
 ```
 bl android doctor           what this machine has, and what it lacks
 bl android new NAME         a tree: env.bl, an app namespace, a first screen
-bl android build [--standalone] [--release]  native lib + APK, optionally self-contained
+bl android build [--standalone] [--release] [--project-only]  native project or APK
 bl android install          put the APK on the phone
 bl android push             beams + runtime onto the phone (no reinstall)
 bl android up               launch with distribution; ready for eval
@@ -36,6 +36,10 @@ Use `--abi x86_64` for an emulator or `--abi arm64-v8a` for a phone on build,
 push and install. `BL_ANDROID_ABI` supplies the same per-invocation selection;
 an empty value keeps the project's default. Each ABI retains its own build,
 Gradle and AOT state under `_build/android/<abi>/`.
+
+`--project-only` prepares the complete native project and optional standalone
+runtime without running Gradle. Build the generated `android/` directory on
+the build station with the pinned Android SDK and Gradle dependencies.
 
 Application compilation uses the normal Nix application producer and its
 previous product. The runtime bundle retains complete compiled units and their
@@ -547,9 +551,11 @@ not an app that silently lacks its bridge.
                  (Path/join out "project-files.term"))
     (native! t mob exqlite otp out)
     (when (:standalone? t) (bundle! t out))
-    (let [apk (apk! out (:release? t))]
-      (println (str "  ✓ " apk))
-      0)))
+    (if (:project-only? t)
+      (do (println (str "  ✓ project " (:android t))) 0)
+      (let [apk (apk! out (:release? t))]
+        (println (str "  ✓ " apk))
+        0))))
 ```
 
 ## push — what the BEAM on the phone loads
@@ -1048,10 +1054,11 @@ whole first frame as `data:`, so it is shown cut short.
           (if (:error t)
             (do (u/io-err (str "bl android: " (:error t))) 1)
             (cond
-              (= sub "build") (if (every? #{"--standalone" "--release"} more)
+              (= sub "build") (if (every? #{"--standalone" "--release" "--project-only"} more)
                                 (build (assoc t :standalone? (boolean (some #{"--standalone"} more))
+                                                :project-only? (boolean (some #{"--project-only"} more))
                                                 :release? (boolean (some #{"--release"} more))) st)
-                                (u/usage-error "usage: bl android build [--abi arm64-v8a|x86_64] [--standalone] [--release]"))
+                                (u/usage-error "usage: bl android build [--abi arm64-v8a|x86_64] [--standalone] [--release] [--project-only]"))
               (= sub "install") (install t st)
               (= sub "push") (push t st)
               (= sub "up") (up t st)
