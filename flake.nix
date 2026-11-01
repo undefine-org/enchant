@@ -25,7 +25,12 @@
       pkgs = nixpkgs.legacyPackages.${system};
       beam = import ./nix/beam.nix { inherit pkgs otp-src elixir-src; };
       rustPkgs = nixpkgs-rust.legacyPackages.${system};
-      drop = import ./nix/bl-drop.nix { inherit pkgs rustPkgs; inherit (beam) erlang elixir; };
+      drop = import ./nix/bl-drop.nix {
+        inherit pkgs rustPkgs;
+        inherit (beam) erlang elixir;
+        # The public SDK has the same native profile as checkout preparation.
+        includeDesktop = builtins.pathExists (self + "/native/wry_webview/Cargo.toml");
+      };
       nativeProducts = import ./nix/native-products.nix { inherit pkgs; root = self; };
     in
     {
