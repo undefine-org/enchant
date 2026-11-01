@@ -65,8 +65,28 @@ class SDKCacheSelectionTests(unittest.TestCase):
                         patch.object(CACHE, 'retained_source_fingerprint', return_value=self.record['engine_fingerprint']), \
                         patch.object(CACHE.subprocess, 'run'), patch.object(CACHE, 'retain') as retain:
                     with self.assertRaisesRegex(ValueError, 'no longer matches'):
-                        CACHE.restore(self.root, self.cache)
+                        CACHE.restore(self.root, self.cache, required=True)
                     retain.assert_not_called()
+
+    def test_optional_invalid_predecessor_allows_cold_production_but_exact_consumers_refuse(self):
+        for exact in ({'required': True}, {'expected': self.root}, {}):
+            with self.subTest(exact=exact):
+                self.write_hint()
+                for name in ('sdk-root', 'engine-root'):
+                    (self.cache / name).symlink_to(self.record['sdk'])
+                with patch.object(CACHE, 'verify_record', side_effect=ValueError('unsupported engine policy')), \
+                        patch.object(CACHE, 'retain') as retain:
+                    if exact:
+                        with self.assertRaisesRegex(ValueError, 'unsupported engine policy'):
+                            CACHE.restore(self.root, self.cache, **exact)
+                        self.assertTrue((self.cache / 'selection.json').is_file())
+                    else:
+                        self.assertEqual('', CACHE.restore(self.root, self.cache))
+                        self.assertEqual([], list(self.cache.iterdir()))
+                    retain.assert_not_called()
+                self.assertFalse((self.root / '.bl').exists())
+                for path in self.cache.iterdir():
+                    path.unlink()
 
     def test_capture_refuses_sdk_for_other_engine_without_relabeling_it(self):
         self.write_hint()

@@ -118,6 +118,11 @@ def replace_link(target, path):
         temporary.unlink(missing_ok=True)
 
 
+def discard_hint(cache):
+    for name in ('selection.json', 'sdk-root', 'engine-root'):
+        (cache / name).unlink(missing_ok=True)
+
+
 def retain(root, cache, record):
     sdk = record['sdk']
     # cache-nix-action merges the store/database, but intentionally does not
@@ -177,9 +182,7 @@ def capture_completed(root, cache, sdk=None):
             previous = verify_record(json.loads(prior.read_text()))
         except rejected as error:
             print('ci-sdk-cache: dropping invalid predecessor hint: ' + str(error), file=sys.stderr)
-            prior.unlink(missing_ok=True)
-            for name in ('sdk-root', 'engine-root'):
-                (cache / name).unlink(missing_ok=True)
+            discard_hint(cache)
     selected = ''
     if candidate:
         try:
@@ -205,8 +208,17 @@ def restore(root, cache, expected=None, required=False):
         if required or expected:
             raise ValueError('Required SDK cache expired or was not restored; rerun production')
         return ''
-    record = json.loads(path.read_text())
-    current = verify_record(record)
+    try:
+        current = verify_record(json.loads(path.read_text()))
+    except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as error:
+        if required or expected:
+            raise
+        # A predecessor is optional producer input. Reject its old policy or
+        # damaged receipt without preventing the ordinary cold production path.
+        # Exact downstream consumers above remain fail-closed.
+        print('ci-sdk-cache: dropping invalid predecessor hint: ' + str(error), file=sys.stderr)
+        discard_hint(cache)
+        return ''
     if expected and current['sdk'] != str(expected.resolve(strict=True)):
         raise ValueError('Restored SDK differs from this run\'s producer')
     # Keep the predecessor's actual fingerprint. A changed checkout must pass
