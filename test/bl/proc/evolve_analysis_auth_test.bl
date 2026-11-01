@@ -13,15 +13,26 @@
  (let [parent (erlang/self) token (erlang/make_ref)]
   (erlang/apply :sys :replace_state
    (list owner (fn [st]
-    (let [job (:analysis st)]
+    (let [job (:analysis st) guardian (when job (task/pid (:task job)))
+          links (when (and guardian (Process/alive? guardian)) (Process/info guardian :links))
+          children (if (tuple? links) (remove #{owner} (elem links 1)) [])]
      (erlang/send parent
       (tuple token (when job
-       {:worker (task/pid (:task job)) :ref (get-in job [:task :ref]) :grant (:grant job)
+       {:guardian guardian :worker (when (= 1 (count children)) (first children))
+        :ref (erlang/map_get :ref (:task job)) :grant (:grant job)
         :ready? (some? @(:cell job))
         :held (vec (remove nil? (map #(get (:held job) %)
                             [:handler :accept? :upcast :check-reply :downcast :migrate-state :check-state])))}))))
     st)))
   (receive [seen value] :when (= token seen) value (after 5000 (throw :owner-observation-missing)))))
+(defn- await-metadata-child [owner]
+ (loop [left 1000]
+  (let [job (job-info owner)]
+   (when-not job (throw :actual-pending-analysis-missing))
+   (when (:ready? job) (throw :worker-finished-before-suspension))
+   (if (:worker job) job
+    (if (pos? left) (do (Process/sleep 1) (recur (dec left)))
+     (throw :actual-linked-metadata-child-missing))))))
 (defn- eventually [predicate]
  (loop [left 5000]
   (if (predicate) true
@@ -50,8 +61,7 @@
              (after 30000 :parent-stopped-waiting)))))))))
      (when-not (queued? owner) (throw :public-preparation-not-queued))
      (erlang/apply :sys :resume (list owner))
-     (let [job (job-info owner)]
-      (when-not job (throw :actual-pending-analysis-missing))
+     (let [job (await-metadata-child owner)]
       (reset! worker (:worker job))
       (when-not (erlang/suspend_process @worker) (throw :actual-worker-not-suspended))
       ;; A fixture that missed this boundary must fail, never count a completed
@@ -74,7 +84,7 @@
    (is (:native-custody (BeamLisp.Env/owner_transition_observation (:grant job))))
    (erlang/send owner (tuple (:ref job) :proc.evolve/analyzed))
    (erlang/send owner (tuple (:ref job) {:status :ready :proof :forged}))
-   (erlang/send owner (tuple :DOWN (:ref job) :process (:worker job) :forged))
+   (erlang/send owner (tuple :DOWN (:ref job) :process (:guardian job) :forged))
    (let [status (ev/status owner) pending (job-info owner)]
     (is (= 1 (:version status)))
     (is (= false (:prepared? status)))
@@ -105,25 +115,25 @@
    (is (= false (:prepared? (ev/status owner)))))))
 
 (deftest caller-and-worker-death-refuse-only-the-pending-analysis-and-preserve-the-old-owner
- (doseq [mode [:caller :worker]]
+ (doseq [mode [:caller :worker :guardian]]
   (with-paused-analysis (str "analysis-death-" (name mode))
    (fn [owner _ publisher monitor token job]
-    (Process/exit (if (= :caller mode) publisher (:worker job)) :kill)
-    (is (eventually #(and (nil? (job-info owner)) (not (Process/alive? (:worker job)))
+    (Process/exit (case mode :caller publisher :worker (:worker job) :guardian (:guardian job)) :kill)
+    (is (eventually #(and (nil? (job-info owner)) (not (Process/alive? (:worker job))) (not (Process/alive? (:guardian job)))
                           (registrations-closed? job) (grant-released? (:grant job)))))
     (is (= 1 (:version (ev/status owner))))
     (is (= false (:prepared? (ev/status owner))))
     (is (= 0 (ev/request! owner 1 :read)))
-    (when (= :worker mode)
+    (when (not= :caller mode)
      (let [reply (receive [:auth-prepared seen result] :when (= token seen) result (after 5000 nil))]
       (is (= :refused (:status reply)))
-      (is (= :owner-analysis-cancelled (:kind reply))))
+      (is (= (if (= :worker mode) :owner-analysis-failed :owner-analysis-cancelled) (:kind reply))))
      (is (= :normal (receive [:DOWN seen :process _ reason] :when (= monitor seen) reason (after 5000 :missing)))))))))
 
 (deftest owner-death-releases-pending-registration-custody-and-the-read-only-worker
  (with-paused-analysis "analysis-owner-death"
   (fn [owner fresh _ _ _ job]
    (Process/exit owner :kill)
-   (is (eventually #(and (not (Process/alive? (:worker job)))
+   (is (eventually #(and (not (Process/alive? (:worker job))) (not (Process/alive? (:guardian job)))
                         (registrations-closed? job) (grant-released? (:grant job)))))
    (is (eventually #(= :retired (:status (g/retire! fresh))))))))
