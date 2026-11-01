@@ -1,0 +1,112 @@
+(ns proc.message-readiness-test
+ (:require [proc.message-domain :as domain] [reload.generation :as g] [env]
+           [datom :as d] [test.support.source-fixtures :as fixtures]))
+(fixtures/effects!)
+(def SOURCES
+ {"proof.ready-helper" "(ns proof.ready-helper) (defn integer [x] (erlang/is_integer x))"
+  "proof.ready" "(ns proof.ready (:require [proof.ready-helper :as helper] [datom.query.read-only :as observation]))
+   (defn accepts [x] (helper/integer x))
+   (defn effect [x] (do (helper/integer x) (SourceEffectObserverFixture/notify (erlang/self) :readiness-effect) true))
+   (defn recover [s]
+    (let [rows (observation/read! '[:find (count ?id) (sum ?cents) :with ?id
+                                  :where [?e :ready/id ?id] [?e :ready/cents ?cents]]
+                                (maps/get :store s nil))
+          row (or (first rows) [0 0])]
+     (maps/put :orders (nth row 0) (maps/put :gross-cents (nth row 1) s))))
+   (defn check-state [s] (and (erlang/is_map s) (erlang/is_integer (maps/get :orders s nil))
+                            (erlang/is_integer (maps/get :gross-cents s nil))))"})
+(defn- with-graph [action]
+ (let [graph (g/prepare! {:application-id (str "message-readiness-" (erlang/unique_integer (list :positive)))
+                         :native-modules #{"erlang" "maps" "SourceEffectObserverFixture"}
+                         :stable-namespaces #{"datom.query.read-only"} :sources SOURCES})]
+  (try
+   (action graph (fn [name] (g/with! graph
+      #(let [namespace (get (:mapping graph) "proof.ready")]
+        {:function (BeamLisp.Env/fetch_exact! namespace name) :environment (BeamLisp.Env/capture_native_context!)}))))
+   (finally (g/retire! graph)))))
+(defn- reason [action] (try (action) nil (catch error (:reason (ex-data error)))))
+(defn- ready-calls [namespace action]
+ (let [parent (erlang/self) token (erlang/make_ref)
+       tracer (spawn (fn [] (loop [count 0]
+        (receive
+         [:trace _ :call _ :ready-call] (recur (inc count))
+         [:finish seen] :when (= token seen) (erlang/send parent [:observed token count])
+         _ (recur count)))))
+       pattern (tuple :Elixir.BeamLisp.Loader :ensure_ready 1)]
+  (is (= 1 (erlang/trace_pattern pattern
+    (list (tuple (list namespace) (list) (list (tuple :message :ready-call)))) (list :local))))
+  (erlang/trace (erlang/self) true (list :call :arity :set_on_spawn (tuple :tracer tracer)))
+  (try
+   (let [result (action) barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= barrier seen) nil (after 5000 (throw :trace-timeout)))
+    (erlang/send tracer [:finish token])
+    {:result result :calls (receive [:observed seen count] :when (= token seen) count (after 5000 :trace-timeout))})
+   (finally
+    (erlang/trace (erlang/self) false (list :call :arity :set_on_spawn))
+    (erlang/trace_pattern pattern false (list :local))
+    (when (Process/alive? tracer) (Process/exit tracer :kill))))))
+(deftest exact-already-ready-prelude-is-observed-without-executing-the-loader-or-callback
+ (with-graph
+  (fn [graph callback]
+   (let [namespace (get (:mapping graph) "proof.ready-helper")
+         record (callback "accepts")
+         observed (ready-calls namespace #(domain/capture (:function record) (:environment record)))
+         proof (:result observed)]
+    (is (= :proved (:status proof)))
+    (is (= :graph (get (:readiness proof) namespace)))
+    (is (contains? (:modules proof) :Elixir.BeamLisp.Loader))
+    (is (= 0 (:calls observed)))
+    (is (domain/valid? proof))
+    (is (not (domain/valid? (assoc proof :readiness {"proc.message-domain" :graph}))))
+    ;; A real call exercises the same trace and must observe the actual prelude.
+    (let [control (ready-calls namespace #(g/invoke! graph "proof.ready/accepts" [1]))]
+     (is (= true (:result control))) (is (= 1 (:calls control))))
+    (let [effect (callback "effect") captured (domain/capture (:function effect) (:environment effect))]
+     (is (= :unknown (:status captured)))
+     (is (= :empty (receive :readiness-effect :unexpected (after 0 :empty)))))))))
+(deftest unready-dynamic-and-foreign-ready-targets-never-become-analysis-permission
+ (with-graph
+  (fn [graph _]
+   (let [namespace (get (:mapping graph) "proof.ready-helper")
+         state {:nodes 0 :modules {} :graph-namespaces (set (vals (:mapping graph)))}
+         readiness (BeamLisp.Env/fetch_exact! "proc.message-domain" "readiness-call")
+         call (BeamLisp.Env/fetch_exact! "proc.message-domain" "call")
+         literal {:tag :literal :value namespace}
+         scope (env/fork)]
+    (try
+     ;; This real sibling scope has never initialized the actual graph's names.
+     ;; No readiness row, graph handle or execution grant is manufactured.
+     (env/with-env scope
+      (fn []
+       (is (not (BeamLisp.Env/ns_ready? namespace)))
+       (is (= :unproved-message-readiness (reason #(readiness state [literal]))))
+       (is (not (BeamLisp.Env/ns_ready? namespace)))))
+     (finally (env/destroy scope)))
+    (g/with! graph
+     (fn []
+      (is (= :unproved-message-readiness (reason #(readiness state [{:tag :input}]))))
+      (is (= :unproved-message-readiness
+             (reason #(call state {"target" literal}
+                       {:op :remote :mod :Elixir.BeamLisp.Loader :fun :ensure_ready
+                        :args [{:op :var :name "target" :ann {}}] :ann {}}))))
+      (is (BeamLisp.Env/ns_ready? "proc.message-domain"))
+      (is (= :unproved-message-readiness
+             (reason #(readiness state [{:tag :literal :value "proc.message-domain"}]))))))))))
+(deftest current-live-store-recovery-with-literal-query-keeps-complete-read-only-evidence
+ (with-graph
+  (fn [_ callback]
+   (let [c (d/connect [{:db/ident :ready/id :db/valueType :db.type/string}
+                       {:db/ident :ready/cents :db/valueType :db.type/long}])]
+    (try
+     (d/transact! c [{:db/id -1 :ready/id "one" :ready/cents 1599}])
+     (let [migration (callback "recover") check (callback "check-state")
+           captured (domain/capture (:function migration) (:environment migration))
+           proof (domain/compare-current-state migration check {:store c :orders 0 :gross-cents 0})]
+      (when-not (= :proved (:status captured))
+       (println "READINESS_QUERY_CAPTURE" (pr-str (select-keys captured [:status :reason]))))
+      (is (= :proved (:status captured)))
+      (is (= 1 (count (:reads captured))))
+      (is (= :sdk-read-only (get (:readiness captured) "datom.query.read-only")))
+      (is (= :proved (:status proof)))
+      (is (every? domain/valid? (:evidence proof))))
+     (finally (d/close! c)))))))
