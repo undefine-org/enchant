@@ -1,0 +1,58 @@
+; Closed, bounded query reads for native owner-state conversion. No supplied
+; function, computed provider, rules, pull or query-namespace code is executed.
+(ns datom.query.read-only
+ (:require [datom :as d] [datom.conn :as conn] [datom.query.parse :as parse]
+           [datom.query.read-plan :as plan] [datom.query.functions :as functions]
+           [data.first-order :as data]))
+(defn plan!
+ "Validate the complete stored-attribute read fragment. This is data analysis,
+  never connection ownership or permission to run a supplied callback."
+ [query]
+ (data/check! query {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+ (functions/with-only {}
+  (fn []
+   (let [parsed (parse/parse query) attributes (plan/attributes parsed)]
+    (when-not (and attributes (empty? (parse/input-forms parsed)))
+     (throw (ex-info "Owner observation requires a closed stored-data query"
+                     {:kind :unproved-state-observation})))
+    {:query query :attributes attributes}))))
+(defn- native-connection! [connection]
+ (let [canonical (:connection (conn/creation-evidence! connection))
+       store (maps/get :store canonical nil)
+       tag (when (erlang/is_map store) (maps/get :__struct__ store nil))
+       info (when (and (erlang/is_atom tag) (BeamLisp.AOT/sdk_generated_class? tag)) (BeamLisp.Record/info tag))]
+  ;; A registered custom Store can run arbitrary protocol methods. This reader
+  ;; admits only actual SDK substrates, preserving native lifetime/custody;
+  ;; a caller-supplied class spelling or path is not implementation evidence.
+  (when-not (and (erlang/is_tuple info) (= 4 (erlang/tuple_size info)) (= :record (elem info 0))
+                 (contains? #{["datom.store-ets" "EtsStore"] ["datom.store-fjall" "FjallStore"]}
+                            [(elem info 1) (elem info 2)]))
+   (throw (ex-info "Owner observation requires a live native SDK connection"
+                   {:kind :unproved-state-observation}))) canonical))
+(defn- native-database! [connection]
+ (let [database (d/db connection) tag (when (erlang/is_map database) (maps/get :__struct__ database nil))
+       info (when (and (erlang/is_atom tag) (BeamLisp.AOT/sdk_generated_class? tag)) (BeamLisp.Record/info tag))]
+  ;; A live Conn's publication Atom is deliberately mutable. Check the actual
+  ;; observed Db before q's query-scope/protocol dispatch; the Atom's identity
+  ;; alone cannot prove that its current contents are a native read view.
+  (when-not (and (= info (tuple :record "datom.db" "Db" (list :store :schema :basis-t :filter-mode :since-t :blobs)))
+                 (= (set (maps/keys database)) #{:__struct__ :store :schema :basis-t :filter-mode :since-t :blobs})
+                 (erlang/=:= (maps/get :store database nil) (maps/get :store connection nil))
+                 (erlang/is_integer (maps/get :basis-t database nil))
+                 (= :current (maps/get :filter-mode database nil)) (nil? (maps/get :since-t database nil)))
+   (throw (ex-info "Owner observation requires the current native database view"
+                   {:kind :unproved-state-observation})))
+  (data/check! (maps/get :schema database nil))
+  database))
+(defn read!
+ "Read the actual connection through the fixed closed engine vocabulary.
+  Restriction encloses validation AND execution: a provider registered after
+  planning cannot become executable authority. Results are bounded eager data.
+  Normal Conn/Source ownership checks remain mandatory. Failure is not a write
+  receipt, business migration, retry permission or proof about future data."
+ [query connection]
+ (functions/with-only {}
+  (fn []
+   (plan! query)
+   (data/check! (d/q query (native-database! (native-connection! connection)))
+                {:max-nodes 32768 :max-bytes 1048576 :max-depth 64}))))

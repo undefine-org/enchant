@@ -98,9 +98,29 @@
  (when-not (= true (dc/observing #(invoke held :check-state [state])))
   (throw (ex-info "Evolution state invariant refused" {:kind :invalid-state})))
  state)
+(defn- external-message-data! [st message]
+ (when (= :bounded-first-order (:message-domain st))
+  (try (first-order/check! message {:max-nodes 16384 :max-bytes 65536 :max-depth 64})
+   (catch _ (throw (ex-info "Request is outside the owner's initial data domain" {:kind :message-domain-refused})))))
+ message)
+(defn- message-data! [st message]
+ (when (= :bounded-first-order (:message-domain st))
+  (try (first-order/check! message {:max-nodes 32768 :max-bytes 1048576 :max-depth 128})
+   (catch _ (throw (ex-info "Converted request is outside the retained data bound" {:kind :message-domain-refused})))))
+ message)
+(defn- external-reply-data! [st value]
+ (when (= :bounded-first-order (:message-domain st))
+  (try (first-order/check! value {:max-nodes 16384 :max-bytes 65536 :max-depth 64})
+   (catch _ (throw (ex-info "Reply is outside the owner's initial data domain" {:kind :reply-domain-refused})))))
+ value)
+(defn- reply-data! [value]
+ (try (first-order/check! value {:max-nodes 32768 :max-bytes 1048576 :max-depth 128})
+  (catch _ (throw (ex-info "Converted reply is outside the retained data bound" {:kind :reply-domain-refused}))))
+ value)
 
 (defn- adapt [st version message]
  (loop [v version msg message replies (list)]
+  (message-data! st msg)
   (cond
    (= v (get-in st [:current :version])) {:message msg :replies replies}
    (not (valid-version? v)) (throw (ex-info "Invalid message version" {:kind :unsupported-version}))
@@ -117,12 +137,15 @@
   (throw (ex-info "Reply outside client contract" {:kind :invalid-reply})))
  value)
 
-(defn- adapt-reply [edges reply]
+(defn- adapt-reply
+ ([edges reply] (adapt-reply edges reply false))
+ ([edges reply bounded?]
  (reduce (fn [value edge]
-           (checked-reply (:reply-check edge) (:reply-arity edge) (:request edge)
-            (if-let [f (:downcast edge)]
+           (let [converted (if-let [f (:downcast edge)]
              (try (dc/observing #(cb/invoke! f (if (= 2 (:downcast-arity edge)) [value (:request edge)] [value])))
-              (catch _ (throw (ex-info "Reply migration failed" {:kind :reply-migration-failed})))) value))) reply edges))
+              (catch _ (throw (ex-info "Reply migration failed" {:kind :reply-migration-failed})))) value)]
+            (checked-reply (:reply-check edge) (:reply-arity edge) (:request edge)
+                           (if bounded? (reply-data! converted) converted)))) reply edges)))
 
 (defn- release-edge! [edge]
  (doseq [k [:callback :downcast :reply-check :request-check]]
@@ -130,14 +153,17 @@
 
 (defn- dispatch-in-context [st version message]
  (try
-  (let [held (:current st) adapted (adapt st version message) msg (:message adapted)]
+  (let [_ (external-message-data! st message) held (:current st) adapted (adapt st version message) msg (:message adapted)]
    (when-not (= true (dc/observing #(invoke held :accept? [msg])))
     (throw (ex-info "Message outside current contract" {:kind :invalid-message})))
    (let [result (invoke held :handler [msg (:value st)])]
     (when-not (and (map? result) (contains? result :reply) (contains? result :state))
      (throw (ex-info "Handler must return reply and state" {:kind :invalid-result})))
     (valid-state! held (:state result))
-    [(adapt-reply (:replies adapted) (checked-reply (:check-reply held) (:reply-arity held) msg (:reply result)))
+    [(adapt-reply (:replies adapted)
+       (checked-reply (:check-reply held) (:reply-arity held) msg
+                      (external-reply-data! st (:reply result)))
+       (= :bounded-first-order (:message-domain st)))
      (assoc st :value (:state result) :revision (inc (:revision st 0)))]))
   (catch e [{:status :refused :kind (or (:kind (ex-data e)) :handler-failed)} st])))
 
@@ -178,9 +204,6 @@
                  (= (:digest graph) (:digest spec)) (= graph (:generation environment))
                  (= (:scope graph) (:env environment)))
    (throw (ex-info "Owner candidate has no native execution" {:kind :owner-transition-authority-required})))
-  (when (or (:check-reply (:current st)) (:check-reply spec) (:downcast spec))
-   (throw (ex-info "Reply migration needs a separate exact future-input proof"
-                  {:kind :unproved-reply-migration :scope :retained-old-owner})))
   (doseq [edge (vals (:adapters st))]
    (when-not (and (:message-proof edge)
                   (every? #(message-proof-api :valid? [%]) (:evidence (:message-proof (registration-meta (:message-proof edge))))))
@@ -188,17 +211,41 @@
                    {:kind :unproved-prior-message-migration :scope :retained-old-owner}))))
   (doseq [key [:handler :accept? :upcast :migrate-state :check-state :downcast :check-reply]]
    (when-let [function (get spec key)] (BeamLisp.Env/assert_managed_callback! graph function)))
-  (let [record (fn [key] (proof-record held key))
+  (let [record (fn [key] (proof-record held key)) domain (:message-domain st :unrestricted)
         proof (message-proof-api :compare-callbacks
-                [(proof-record (:current st) :accept?) (record :upcast) (record :accept?)])
-        state-proof (message-proof-api :capture-registration! [(:migrate-state held)])
-        check-proof (message-proof-api :capture-registration! [(:check-state held)])]
-   (when-not (and (= :proved (:status proof)) (= :proved (:status state-proof))
-                  (= :proved (:status check-proof)) (empty? (:obligations state-proof))
-                  (empty? (:obligations check-proof)))
-    (throw (ex-info "Future owner inputs require retained old execution"
+                [(proof-record (:current st) :accept?) (record :upcast) (record :accept?) domain])
+        reply-proof (message-proof-api :compare-replies
+                [(proof-record (:current st) :accept?) (record :upcast) (record :check-reply)
+                 (record :downcast) (proof-record (:current st) :check-reply) domain])
+        state-proof (message-proof-api :compare-current-state
+                [(record :migrate-state) (record :check-state) (:value st)])]
+   (when-not (= :proved (:status proof))
+    (throw (ex-info "Future owner inputs have no exact predicate/totality proof"
                    {:kind :unproved-message-migration :scope :retained-old-owner})))
-   {:domain proof :state state-proof :check check-proof})))
+   (when-not (= :proved (:status reply-proof))
+    (throw (ex-info "Future replies have no exact original-request conversion proof"
+                   {:kind :unproved-reply-migration :scope :retained-old-owner})))
+   (when-not (= :proved (:status state-proof))
+    (throw (ex-info "Current state conversion is outside the closed read-only fragment"
+                   {:kind :unproved-message-migration :scope :retained-old-owner})))
+   (let [bounds (when (= :bounded-first-order domain)
+                  {:message-output-bound (message-proof-api :conversion-bounds [(second (:evidence proof)) false])
+                   :reply-output-bound (if (:downcast held)
+                                         (message-proof-api :conversion-bounds [(message-proof-api :capture-registration! [(:downcast held)]) true])
+                                         {:status :proved :nodes 0 :bytes 0 :depth 0})})]
+    (when bounds
+     (doseq [key [:message-output-bound :reply-output-bound]]
+      (let [all (cons (get bounds key)
+                     (map #(get (:message-proof (registration-meta (:message-proof %))) key)
+                          (vals (:adapters st))))]
+       (when-not (and (every? #(= :proved (:status %)) all)
+                      (<= (reduce + 0 (map :nodes all)) 16384)
+                      (<= (reduce + 0 (map :bytes all)) 983040)
+                      (<= (reduce + 0 (map :depth all)) 64))
+        (throw (ex-info "Retained adapters cannot preserve the initial bounded data domain"
+                        {:kind :unproved-message-migration :scope :message-output-bounds}))))))
+    {:domain (merge proof bounds {:evidence (into (:evidence proof) (:evidence reply-proof))})
+     :state (first (:evidence state-proof)) :check (second (:evidence state-proof))}))))
 (defn- queued-samples! [st]
  (let [size (elem (Process/info (erlang/self) :message_queue_len) 1)]
   (when (> size 256) (throw (ex-info "Owner queue exceeds proof budget" {:kind :message-inventory-budget})))
@@ -455,6 +502,8 @@
 
 (defn- initial-state [opts]
   (validate! (:spec opts))
+  (when-not (contains? #{nil :unrestricted :bounded-first-order} (:message-domain opts))
+   (throw (ex-info "Unknown initial owner message domain" {:kind :invalid-evolution})))
   (let [limit (:history-limit opts 32) budget (:upgrade-ms opts 250)]
    (when-not (and (erlang/is_integer budget) (> budget 0) (<= budget 30000))
     (throw (ex-info "Evolution migration budget must be 1..30000ms" {:kind :invalid-evolution})))
@@ -479,7 +528,8 @@
       (ets/insert :beam_lisp_vars (tuple (tuple :bl-evolve-owner (erlang/self)) evidence))
       {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
        :owner-evidence evidence :inventory inventory :framework @adopted :revision 0
-       :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0})
+       :managed (:managed opts false) :message-domain (:message-domain opts :unrestricted)
+       :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0})
      (catch error
       (try (owners/unregister! @registered)
        (finally
@@ -574,7 +624,7 @@
   :proc.evolve/status
    [{:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
      :legacy-versions (vec (sort (keys (:adapters st)))) :revision (:revision st 0)
-     :reply-contract? (some? (get-in st [:current :check-reply]))
+     :reply-contract? (some? (get-in st [:current :check-reply])) :message-domain (:message-domain st :unrestricted)
      :prepared? (some? (:preparation st))
      :managed (:managed st) :clients (count (:clients st))
      :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
@@ -652,8 +702,8 @@
  ([spec state] (start! spec state {}))
  ([spec state opts]
   (validate! spec)
-  (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250) :managed (:managed opts false)}
-                    (dissoc opts :history-limit :upgrade-ms :managed))))
+  (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250) :managed (:managed opts false) :message-domain (:message-domain opts :unrestricted)}
+                    (dissoc opts :history-limit :upgrade-ms :managed :message-domain))))
 (defn call!
  "Version travels with the request, including queued calls from old clients."
  ([pid version message] (call! pid version message 5000))
