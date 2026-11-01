@@ -234,18 +234,18 @@ let
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
       export BL_PRODUCTION_LAUNCHER=${drop-tools}/bin/drop-launcher
+      export BL_PRODUCTION_PACKER=$TMPDIR/drop
       export BL_PRODUCTION_DROP_OUTPUT=$TMPDIR/selfbuilt.drop
+      export BL_PRODUCTION_PAYLOAD=$TMPDIR/payload
       export BL_PRODUCTION_UNIT_STORE=$TMPDIR/unit-store
       ${lib.optionalString (previousSdk != null) ''
         if test -f ${previousSdk}/unit-store/unit-index.json; then
           export BL_PREVIOUS_UNIT_STORE=${previousSdk}/unit-store
         fi
       ''}
-      # Preparation, floor validation and packaging share one producer VM.
+      # Preparation, floor validation and assembly share one producer VM.
       ./bin/bl --cold run scripts/produce-sdk.bl
 
-      # unpack, retarget every ELF at the FHS loader, repack with the same launcher
-      $TMPDIR/drop unpack $TMPDIR/selfbuilt.drop --dir $TMPDIR/payload
       chmod -R u+w $TMPDIR/payload
       # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
       # checks the existing sealed metadata and actual bytes at load time.
