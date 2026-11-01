@@ -74,6 +74,11 @@ in the local pinned toolchain, retaining their per-ABI caches. Device checks
 need an explicit disposable app/device and a bounded emulator; signing keys
 belong outside Nix outputs and Git.
 
+Use `bl android build --project-only` to prepare the complete project and
+optional `--standalone` bundle without starting Gradle. The generated project
+is `_build/android/<abi>/android`; a pinned Gradle derivation can consume that
+directory on the build station. Preserve the per-ABI directory between builds.
+
 Runtime staging pairs Android's OTP and native runtime with the selected SDK's
 exact Elixir application files. Mixing Elixir patch versions changes the
 compiler cache identity and cannot establish valid application replay. The
