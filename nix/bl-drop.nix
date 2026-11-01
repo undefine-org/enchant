@@ -155,13 +155,14 @@ let
       ${pkgs.python3}/bin/python3 nix/android-native-contract.py --root "$PWD" > priv/android/native-contract.json
 
   '';
-  worker = import ./bounded-build.nix {
-    inherit pkgs;
+  workerFor = trace: import ./bounded-build.nix {
+    inherit pkgs trace;
     memoryMiB = 6144;
     diskMiB = 32768;
     cpuCount = 4;
     commandManager = true;
   };
+  worker = workerFor false;
   producerTools = [ erlang elixir pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
 
   dependencies = worker (pkgs.runCommand "beam-lisp-dependencies-1" {
@@ -201,7 +202,7 @@ let
 
   # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
   # launcher come from the two derivations above.
-  bl-drop = worker (pkgs.stdenv.mkDerivation {
+  bl-drop = workerFor true (pkgs.stdenv.mkDerivation {
     pname = "bl-drop";
     version = "0.1.0";
     outputs = [ "out" "sdk" ];
