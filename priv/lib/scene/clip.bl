@@ -1,0 +1,69 @@
+(ns scene.clip (:require [scene.core :as s]))
+
+;; Temporal composition only. Content is data, never executed by sampling.
+;; Durations are seconds; activity is half-open. Tweens may separately hold.
+(defn checked [opts duration]
+  (let [id (:id opts)]
+    (when (not (and (string? id) (not (empty? id)) (not (includes? id "/"))))
+      (s/fail "Clip needs a nonempty local string id without /" {:id id}))
+    (when (not (and (s/finite? duration) (>= duration 0)))
+      (s/fail "Clip duration must be finite and nonnegative" {:id id :duration duration}))
+    (doseq [[cue t] (:cues opts)]
+      (when (not (and (string? cue) (not (empty? cue)) (not (includes? cue "/"))
+                      (s/finite? t) (<= 0 t) (<= t duration)))
+        (s/fail "Cue must name a time within its clip" {:id id :cue cue :time t})))
+    {:id id :duration duration :cues (get opts :cues {})}))
+(defn clip [opts content]
+  (assoc (checked opts (:duration opts)) :kind :clip :content content))
+(defn children! [children]
+  (when (not (vector? children)) (s/fail "Clip children must be an ordered vector" {}))
+  (when (not= (count children) (count (set (mapv :id children))))
+    (s/fail "Duplicate sibling clip id" {:ids (mapv :id children)}))
+  (doseq [child children]
+    (when (not (contains? #{:clip :sequence :parallel :delay :retime} (:kind child)))
+      (s/fail "Expected constructed clip" {:child child})))
+  children)
+(defn sequence [opts children]
+  (children! children)
+  (when (contains? opts :duration) (s/fail "Sequence duration is derived from children" {:id (:id opts)}))
+  (assoc (checked opts (reduce + 0 (mapv :duration children))) :kind :sequence :children children))
+(defn parallel [opts children]
+  (children! children)
+  (let [minimum (reduce max 0 (mapv :duration children)) duration (get opts :duration minimum)]
+    (when (not (and (s/finite? duration) (>= duration minimum)))
+      (s/fail "Parallel duration cannot truncate a child" {:id (:id opts) :minimum minimum :duration duration}))
+    (assoc (checked opts duration) :kind :parallel :children children)))
+(defn delay [opts child]
+  (children! [child])
+  (let [by (:by opts)]
+    (when (not (and (s/finite? by) (>= by 0))) (s/fail "Delay must be finite and nonnegative" {:id (:id opts)}))
+    (assoc (checked opts (+ by (:duration child))) :kind :delay :by by :children [child])))
+(defn retime [opts child]
+  (children! [child])
+  (let [base (checked opts (:duration opts))]
+    (when (not (and (> (:duration base) 0) (> (:duration child) 0)))
+      (s/fail "Retime needs positive source and target durations" {:id (:id opts)}))
+    (assoc base :kind :retime :rate (/ (:duration child) (:duration base)) :children [child])))
+
+(defn flatten-node [node parent start rate]
+  (let [path (if (empty? parent) (:id node) (str parent "/" (:id node)))
+        cues (into {} (mapv (fn [[id t]] [(str path "/" id) (+ start (/ t rate))]) (:cues node)))
+        children (:children node)
+        offsets (if (= :sequence (:kind node))
+                  (second (reduce (fn [[offset values] child]
+                                    [(+ offset (:duration child)) (conj values offset)]) [0 []] children))
+                  (mapv (fn [_] (if (= :delay (:kind node)) (:by node) 0)) children))
+        nested (mapv (fn [child offset]
+                  (flatten-node child path (+ start (/ offset rate))
+                    (* rate (if (= :retime (:kind node)) (:rate node) 1)))) children offsets)]
+    {:cues (reduce merge cues (mapv :cues nested))
+     :leaves (if (= :clip (:kind node))
+               [{:id path :start start :end (+ start (/ (:duration node) rate))
+                 :duration (:duration node) :rate rate :content (:content node)}]
+               (vec (mapcat :leaves nested)))}))
+(defn schedule [node]
+  (assoc (flatten-node node "" 0 1) :duration (:duration node) :version 1))
+(defn sample [schedule t]
+  (when (not (s/finite? t)) (s/fail "Clip sample time must be finite" {:time t}))
+  (mapv (fn [leaf] (assoc leaf :local-time (* (:rate leaf) (- t (:start leaf)))))
+    (filter (fn [leaf] (and (<= (:start leaf) t) (< t (:end leaf)))) (:leaves schedule))))
