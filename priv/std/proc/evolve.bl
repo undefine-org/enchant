@@ -409,6 +409,37 @@
   (catch error
    (reset! cell {:status :refused :kind (or (:kind (ex-data error)) :owner-analysis-failed)})))
  :proc.evolve/analyzed)
+(defn- guard-analysis! [registrations cell owner]
+ ;; The guardian is detached from the owner, but installs its owner monitor
+ ;; BEFORE creating the linked metadata child. Child failure is contained here;
+ ;; killing this guardian during owner cleanup also kills its linked child.
+ (Process/flag :trap_exit true)
+ (let [owner-ref (Process/monitor owner)
+       child (task/async (fn [] (warm-analysis! registrations cell)))
+       child-pid (task/pid child) child-ref (erlang/map_get :ref child)]
+  (try
+   (loop []
+    (receive
+     [:DOWN ref :process pid _]
+      (cond
+       (and (= ref owner-ref) (= pid owner) (not (Process/alive? owner)))
+        (do (when (Process/alive? child-pid) (task/shutdown child :brutal_kill)) :proc.evolve/analyzed)
+       (and (= ref child-ref) (= pid child-pid) (not (Process/alive? child-pid)))
+        (do (when (nil? @cell) (reset! cell {:status :refused :kind :owner-analysis-failed}))
+            :proc.evolve/analyzed)
+       :else (recur))
+     [ref :proc.evolve/analyzed]
+      (if (and (= ref child-ref) (some? @cell)) :proc.evolve/analyzed (recur))
+     [:EXIT pid _]
+      (if (and (= pid child-pid) (not (Process/alive? child-pid)))
+       (do (when (nil? @cell) (reset! cell {:status :refused :kind :owner-analysis-failed}))
+           :proc.evolve/analyzed)
+       (recur))
+     _ (recur)))
+   (finally
+    (Process/demonitor owner-ref (list :flush))
+    (when (Process/alive? child-pid) (task/shutdown child :brutal_kill))
+    (Process/demonitor child-ref (list :flush))))))
 (defn- begin-automatic-analysis [st grant expected spec samples]
  (let [held (atom nil)]
   (try
@@ -430,8 +461,8 @@
      ;; This pending-only native entry owns the actual candidate context even
      ;; if fresh admission has closed. It supplies no completion capability.
      (reset! held (retain! spec))
-     (let [cell (atom nil) registrations (analysis-registrations st @held)
-           worker (task/async-nolink (fn [] (warm-analysis! registrations cell)))]
+     (let [cell (atom nil) registrations (analysis-registrations st @held) owner (erlang/self)
+           worker (task/async-nolink (fn [] (guard-analysis! registrations cell owner)))]
       [{:status :analyzing}
        (assoc st :analysis {:grant grant :expected expected :spec spec :samples samples
                             :held @held :cell cell :task worker})])))
@@ -452,7 +483,7 @@
   (begin-automatic-analysis st grant expected spec samples)
   :else (complete-automatic-prepare st grant expected spec samples nil)))
 (defn- detach-analysis-monitors! [job]
- (when-let [ref (get-in job [:task :ref])] (Process/demonitor ref (list :flush)))
+ (when-let [child (:task job)] (Process/demonitor (erlang/map_get :ref child) (list :flush)))
  (when-let [ref (:caller-monitor job)] (Process/demonitor ref (list :flush)))
  :ok)
 (defn- discard-analysis! [job]
@@ -490,7 +521,7 @@
    :else nil)))
 (defn- analysis-ready [st ref]
  (let [job (:analysis st)]
-  (if-not (and job (= ref (get-in job [:task :ref]))) st
+  (if-not (and job (= ref (erlang/map_get :ref (:task job)))) st
    (if-let [result @(:cell job)]
     (if-let [refusal (if (= :ready (:status result))
                        (unproved-analysis-kind st job (:unproved result []))
@@ -514,7 +545,7 @@
 (defn- analysis-down [st ref pid]
  (let [job (:analysis st)]
   (if (and job (not (Process/alive? pid))
-           (or (and (= ref (get-in job [:task :ref])) (= pid (task/pid (:task job))))
+           (or (and (= ref (erlang/map_get :ref (:task job))) (= pid (task/pid (:task job))))
                (and (= ref (:caller-monitor job)) (= pid (:caller job)))))
    (refuse-analysis st job :owner-analysis-cancelled) st)))
 (defn- automatic-prepare [st grant expected payload samples]
