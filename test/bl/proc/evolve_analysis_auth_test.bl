@@ -1,42 +1,47 @@
 (ns proc.evolve-analysis-auth-test
- (:require [proc.evolve :as ev] [proc.task :as task] [reload.generation :as g]
+ (:require [proc.evolve :as ev] [reload.generation :as g]
            [test.support.evolve-reply-fixtures :as f]))
 (defn- queued? [owner]
- (loop [left 1000]
-  (if (some (fn [m] (and (tuple? m) (= 3 (erlang/tuple_size m)) (= :"$gen_call" (elem m 0))
-                         (= :proc.evolve/automatic-prepare (first (elem m 2)))))
-            (elem (Process/info owner :messages) 1)) true
-   (if (pos? left) (do (Process/sleep 1) (recur (dec left))) false))))
+ (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+  (loop []
+   (if (Enum/any? (elem (Process/info owner :messages) 1)
+         (fn [m] (and (tuple? m) (= 3 (erlang/tuple_size m)) (= :"$gen_call" (elem m 0))
+                       (= :proc.evolve/automatic-prepare (first (elem m 2)))))) true
+    (if (< (System/monotonic_time :millisecond) deadline)
+     (do (Process/sleep 10) (recur)) false)))))
 (defn- job-info [owner]
  ;; Native fixture observation only. The function returns the original state
  ;; unchanged and sends no Fn, context, owner value or private cell to the test.
  (let [parent (erlang/self) token (erlang/make_ref)]
   (erlang/apply :sys :replace_state
    (list owner (fn [st]
-    (let [job (:analysis st) guardian (when job (task/pid (:task job)))
-          links (when (and guardian (Process/alive? guardian)) (Process/info guardian :links))
-          children (if (tuple? links) (remove #{owner} (elem links 1)) [])]
+    (let [job (:analysis st) guardian (when job (erlang/map_get :pid (:task job)))]
      (erlang/send parent
       (tuple token (when job
-       {:guardian guardian :worker (when (= 1 (count children)) (first children))
+       {:guardian guardian
         :ref (erlang/map_get :ref (:task job)) :grant (:grant job)
         :ready? (some? @(:cell job))
         :held (vec (remove nil? (map #(get (:held job) %)
                             [:handler :accept? :upcast :check-reply :downcast :migrate-state :check-state])))}))))
     st)))
   (receive [seen value] :when (= token seen) value (after 5000 (throw :owner-observation-missing)))))
-(defn- await-metadata-child [owner]
- (loop [left 1000]
-  (let [job (job-info owner)]
-   (when-not job (throw :actual-pending-analysis-missing))
-   (when (:ready? job) (throw :worker-finished-before-suspension))
-   (if (:worker job) job
-    (if (pos? left) (do (Process/sleep 1) (recur (dec left)))
-     (throw :actual-linked-metadata-child-missing))))))
+(defn- analysis-entry []
+ ;; Attest the actual SDK entry once. Call events contain its arity only; no
+ ;; captured registrations, private cell or Source metadata enter the trace.
+ (let [entry (BeamLisp.Env/sdk_callable! "proc.evolve" "warm-analysis!" 2)]
+  (tuple (elem (erlang/fun_info entry :module) 1)
+         (elem (erlang/fun_info entry :name) 1) 2)))
+(defn- stop-entry-trace! [mfa pids]
+ (erlang/trace_pattern mfa false (list :local))
+ (doseq [pid pids]
+  (when (and pid (Process/alive? pid))
+   (erlang/trace pid false (list :call :arity :set_on_spawn)))))
 (defn- eventually [predicate]
- (loop [left 5000]
-  (if (predicate) true
-   (if (pos? left) (do (Process/sleep 1) (recur (dec left))) false))))
+ (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+  (loop []
+   (if (predicate) true
+    (if (< (System/monotonic_time :millisecond) deadline)
+     (do (Process/sleep 10) (recur)) false)))))
 (defn- grant-released? [grant]
  (try (not (:native-custody (BeamLisp.Env/owner_transition_observation grant))) (catch _ true)))
 (defn- registrations-closed? [job]
@@ -45,9 +50,14 @@
  (f/with-owner name [:old-request :new-request]
   (fn [[_ fresh] owner]
    (let [parent (erlang/self) token (erlang/make_ref) worker (atom nil)
-         spec (f/spec fresh 2) publisher (atom nil)]
+         spec (f/spec fresh 2) publisher (atom nil)
+         entry (analysis-entry) module (elem entry 0) function (elem entry 1)
+         traced (atom [owner])]
     (erlang/apply :sys :suspend (list owner))
     (try
+     (when-not (= 1 (erlang/trace_pattern entry true (list :local)))
+      (throw :actual-analysis-entry-unavailable))
+     (erlang/trace owner true (list :call :arity :set_on_spawn (tuple :tracer parent)))
      (reset! publisher
       (spawn-monitor
        (fn []
@@ -61,14 +71,35 @@
              (after 30000 :parent-stopped-waiting)))))))))
      (when-not (queued? owner) (throw :public-preparation-not-queued))
      (erlang/apply :sys :resume (list owner))
-     (let [job (await-metadata-child owner)]
-      (reset! worker (:worker job))
-      (when-not (erlang/suspend_process @worker) (throw :actual-worker-not-suspended))
-      ;; A fixture that missed this boundary must fail, never count a completed
-      ;; worker as evidence that an early/forged result was safely rejected.
-      (when (:ready? (job-info owner)) (throw :worker-finished-before-suspension))
-      (action owner fresh (first @publisher) (second @publisher) token job))
+     ;; Inherit the trace through the actual guardian into its linked metadata
+     ;; child. Pause at warm entry, before any metadata inspection or Native
+     ;; module lock, instead of repeatedly polling SDK-attested owner state.
+     (let [child (receive [:trace pid :call [m f a]]
+                  :when (and (= module m) (= function f) (= 2 a)) pid
+                  (after 10000
+                   (let [job (job-info owner) guardian (:guardian job)
+                         links (when (and guardian (Process/alive? guardian)) (Process/info guardian :links))]
+                    (throw (ex-info "Actual metadata entry was not observed"
+                      {:kind :actual-metadata-entry-missing :pending? (some? job)
+                       :guardian-live? (boolean links) :ready? (boolean (:ready? job))
+                       :link-count (if (tuple? links) (erlang/length (elem links 1)) 0)})))))]
+      (reset! worker child)
+      (when-not (erlang/suspend_process child) (throw :actual-worker-not-suspended))
+      (let [observed (job-info owner) guardian (:guardian observed)
+            links (when guardian (Process/info guardian :links))
+            linked? (and (tuple? links) (lists/member child (elem links 1)))
+            job (assoc observed :worker child)]
+       (reset! traced [owner guardian child])
+       (stop-entry-trace! entry @traced)
+       (when-not (and observed linked? (not (:ready? observed)))
+        (throw (ex-info "Actual pending metadata boundary was missed"
+                 {:kind :actual-pending-metadata-boundary-missing
+                  :pending? (some? observed) :linked? (boolean linked?)
+                  :link-count (if (tuple? links) (erlang/length (elem links 1)) 0)
+                  :ready? (boolean (:ready? observed))})))
+      (action owner fresh (first @publisher) (second @publisher) token job)))
      (finally
+      (stop-entry-trace! entry @traced)
       (try (erlang/apply :sys :resume (list owner)) (catch _ nil))
       (when (and @worker (Process/alive? @worker))
        (try (erlang/resume_process @worker) (catch _ nil))
