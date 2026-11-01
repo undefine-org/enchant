@@ -146,6 +146,17 @@ def main():
             assert after['image'] == before['image']
             for key in ('coordinator', 'platform'):
                 assert after[key] != before[key], key
+            expression = '''let
+              root = builtins.toPath %s;
+              lock = builtins.fromJSON (builtins.readFile (root + "/flake.lock"));
+              pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
+            in map (sdk: (import (root + "/nix/sdk-worker-filesystem.nix") {
+              inherit pkgs; sdk = builtins.storePath sdk;
+            }).outPath) [ %s %s ]''' % (json.dumps(str(source)), json.dumps(str(synchronized)), json.dumps(str(selected)))
+            filesystems = json.loads(command('provider-filesystem-identity', ['nix-instantiate',
+                '--eval', '--strict', '--json', '--expr', expression,
+                '--option', 'experimental-features', 'nix-command flakes']).strip())
+            assert len(set(filesystems)) == 1, filesystems
         finally:
             recipe.write_bytes(original_recipe)
         fixture = ROOT / 'test/fixtures/sdk-artifacts'
