@@ -162,7 +162,7 @@ pub(super) fn prepare_request(_tree: &Path, requested: &Value,
         let source = source.to_str().ok_or("native source address is not UTF-8")?;
         let snapshot_root = retained.join("source-retained");
         let mut snapshot_args = vec![
-            "build".into(), "--max-jobs".into(), "0".into(), "--impure".into(), "--file".into(),
+            "build".into(), "--impure".into(), "--file".into(),
             platform.join("nix/native-snapshot.nix").to_string_lossy().into_owned(),
             "--argstr".into(), "source".into(), source.into(),
             "--argstr".into(), "crate".into(), name.into(), "--json".into(),

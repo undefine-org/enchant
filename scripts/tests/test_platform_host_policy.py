@@ -1,4 +1,4 @@
-"""Platform preparation requires the station and preserves its CPU policy."""
+"""Platform preparation preserves the host's station or hosted worker policy."""
 import json
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PlatformHostPolicy(unittest.TestCase):
-    def test_preparation_requires_the_station_without_replacing_its_cpu_policy(self):
+    def test_preparation_preserves_station_and_hosted_worker_configuration(self):
         with tempfile.TemporaryDirectory(prefix='bl-platform-policy-') as temporary:
             project = Path(temporary) / 'source'
             for name in ('scripts', 'nix', 'native', 'tooling/drop', 'tools'):
@@ -38,15 +38,18 @@ target.mkdir(parents=True)
 ''')
             builder.chmod(0o755)
             capture = project / 'capture.json'
-            policy = 'max-jobs = 0\ncores = 4\n'
-            env = dict(os.environ, PATH=str(project / 'tools') + os.pathsep + os.environ['PATH'],
-                       PLATFORM_CAPTURE=str(capture), NIX_CONFIG=policy)
-            subprocess.run(['bash', str(project / 'scripts/prepare-checkout-platform')],
-                           env=env, check=True, capture_output=True, text=True)
-            actual = json.loads(capture.read_text())
-            self.assertNotIn('--cores', actual['argv'])
-            self.assertEqual('0', actual['argv'][actual['argv'].index('--max-jobs') + 1])
-            self.assertEqual(policy, actual['config'])
+            for jobs in (0, 1):
+                with self.subTest(jobs=jobs):
+                    shutil.rmtree(project / '.bl', ignore_errors=True)
+                    policy = f'max-jobs = {jobs}\ncores = 4\n'
+                    env = dict(os.environ, PATH=str(project / 'tools') + os.pathsep + os.environ['PATH'],
+                               PLATFORM_CAPTURE=str(capture), NIX_CONFIG=policy)
+                    subprocess.run(['bash', str(project / 'scripts/prepare-checkout-platform')],
+                                   env=env, check=True, capture_output=True, text=True)
+                    actual = json.loads(capture.read_text())
+                    self.assertNotIn('--cores', actual['argv'])
+                    self.assertNotIn('--max-jobs', actual['argv'])
+                    self.assertEqual(policy, actual['config'])
 
 
 if __name__ == '__main__':

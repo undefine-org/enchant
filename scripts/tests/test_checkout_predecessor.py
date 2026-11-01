@@ -67,7 +67,7 @@ pathlib.Path(argv[argv.index('--out-link') + 1]).symlink_to(os.environ['ENGINE']
                 self.assertEqual(69, result.returncode, result.stderr)
                 rows = [json.loads(line) for line in capture.read_text().splitlines()]
                 for row in rows:
-                    self.assertEqual('0', row[row.index('--max-jobs') + 1])
+                    self.assertNotIn('--max-jobs', row)
                 coordinator = rows[-1]
                 self.assertIn('coordinator', coordinator)
                 self.assertEqual(str(predecessors[0]), coordinator[coordinator.index('previous') + 1])
