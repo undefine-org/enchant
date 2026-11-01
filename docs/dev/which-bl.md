@@ -101,6 +101,13 @@ the compiler and dependency products. Editing a native crate preserves sibling
 native products. Cargo retains compiled dependencies separately from the chosen
 crate's Rust body; the real chosen crate always compiles from captured source.
 
+Compiler production reuses complete units from a previously qualified floor.
+Its cache keys bind the compiler, source and macro inputs, phase providers and
+host target. Preparation P and reproductions B/C are separate retained Nix
+outputs. Each boots freshly; B/C must match byte for byte. Both reproduce changed
+units independently against the same prior qualified baseline. The compiler's
+producer identity lets library-only updates select the existing compiler output.
+
 Application builds use their previous verified product with the same exact SDK.
 Full builds prune removed units, scoped builds retain their declared remainder,
 and `--force` recompiles. An identical full request selects the existing product.
