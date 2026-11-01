@@ -28,7 +28,9 @@
     '') nativeProducts.names}
     export BL_CHECKOUT_PLATFORM=${checkoutPlatform}
     export BL_ARTIFACT_PLATFORM=${checkoutPlatform}/artifact-platform
-    python3 scripts/qualify-artifact-generation --root "$PWD" --out "$TMPDIR/reproduction" --producer-timeout 600
+    # Bound compilation separately from runtime request/rehearsal deadlines.
+    # Each fresh generation must finish inside this finite worker allowance.
+    python3 scripts/qualify-artifact-generation --root "$PWD" --out "$TMPDIR/reproduction" --producer-timeout 1200
     ${pkgs.jq}/bin/jq -e \
       '.self_reproduction_qualified == true and .changed_files == [] and .preparation.generation == "P" and .preparation.produced == true and .preparation.fresh_boot_qualified == true and [.stages[].generation] == ["B", "C"] and (.stages | length) == 2 and all(.stages[]; .produced and .fresh_boot_qualified)' \
       "$TMPDIR/reproduction/result.json"
