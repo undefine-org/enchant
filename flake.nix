@@ -1,14 +1,12 @@
-# flake.nix — the self-contained `bl` drop, built entirely by nix.
-#
-# Why: a drop built on a rolling-release workstation links that machine's glibc
-# and may need a newer glibc than the server provides. Building the
-# drop with the TARGET HOST's nixpkgs makes the drop's glibc floor <= the host's.
-# docs/native-bundler.md "Nix-built server drop — glibc floor = host".
+# The self-contained `bl` drop and SDK, built with the pinned Nix toolchain.
+# The portable drop uses the host's FHS loader and runtime libraries. Its
+# measured glibc requirement is recorded in the release requirements receipt;
+# see docs/native-bundler.md. The SDK retains its pinned Nix runtime.
 #
 # nixpkgs is pinned to the SAME rev as ../foundry/infra/flake.lock.
 # Keep the two in step: `nix flake lock --override-input nixpkgs <rev>`.
 {
-  description = "beam-lisp: nix-built self-contained bl drop (glibc floor = host)";
+  description = "beam-lisp: incremental SDK and qualified Linux drop";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/6510408d147d8c5e6d76043e899e9251756f6a75";
@@ -75,7 +73,7 @@
       };
 
       # `nix flake check` — the gate (CI runs it too). Fails loudly when the build
-      # or its contract (runs; glibc floor <= the servers' 2.44) breaks.
+      # or its contract (runs with the pinned adapter; glibc floor <= 2.44) breaks.
       checks.${system} = {
         # Run the unchanged FHS-targeted artifact even in a strict Nix sandbox.
         drop-runs = import ./nix/drop-runs.nix { inherit pkgs; drop = drop.bl-drop; };
