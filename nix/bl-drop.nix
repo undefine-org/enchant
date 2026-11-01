@@ -19,6 +19,9 @@ let
   previousMetadata = if previousSdk == null then null else
     builtins.fromJSON (builtins.unsafeDiscardStringContext
       (builtins.readFile (previousSdk + "/artifact.json")));
+  previousPlatform = if previousMetadata == null then null else
+    builtins.fromJSON (builtins.unsafeDiscardStringContext
+      (builtins.readFile (builtins.storePath previousMetadata.platform + "/platform.json")));
 
   # ── hex libraries, exactly the digests bl.lock names ─────────────────────────
   lockLines = lib.filter (l: lib.hasPrefix "[:dep " l) (lib.splitString "\n" (builtins.readFile ../bl.lock));
@@ -189,6 +192,10 @@ let
     nativeProducts = compilerNatives;
     previousCompiler = if previousMetadata == null then null else builtins.storePath previousMetadata.compiler;
     previousSource = if previousMetadata == null then null else builtins.storePath previousMetadata.source;
+    cacheCompatible = previousPlatform != null
+      && previousPlatform.erlang == toString erlang
+      && previousPlatform.elixir == toString elixir
+      && previousMetadata.dependencies == toString dependencies;
   };
 
   # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the

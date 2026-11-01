@@ -1,7 +1,7 @@
 # Each generation is retained independently. Qualification assembles verified
 # outputs; retrying a later stage never discards an earlier successful stage.
 { pkgs, erlang, elixir, src, dependencies, checkoutPlatform, nativeProducts,
-  previousCompiler ? null, previousSource ? null }:
+  previousCompiler ? null, previousSource ? null, cacheCompatible ? true }:
 let
   identity = builtins.hashString "sha256" (builtins.toJSON {
     source = toString src;
@@ -19,6 +19,12 @@ let
     then (builtins.fromJSON (builtins.unsafeDiscardStringContext
       (builtins.readFile (previousCompiler + "/producer.json")))).identity
     else null;
+  emitterContext = builtins.hashString "sha256" (builtins.toJSON {
+    erlang = toString erlang;
+    elixir = toString elixir;
+    dependencies = toString dependencies;
+    natives = toString nativeProducts.bundle;
+  });
   worker = import ./bounded-build.nix {
     inherit pkgs;
     memoryMiB = 6144;
@@ -51,7 +57,8 @@ let
       '') nativeProducts.names}
       export BL_CHECKOUT_PLATFORM=${checkoutPlatform}
       export BL_ARTIFACT_PLATFORM=${checkoutPlatform}/artifact-platform
-      ${pkgs.lib.optionalString (previousCompiler != null && previousSource != null) ''
+      export BL_COMPILER_EMITTER_CONTEXT=${emitterContext}
+      ${pkgs.lib.optionalString (cacheCompatible && previousCompiler != null && previousSource != null) ''
         python3 scripts/compiler-unit-baseline.py --compiler ${previousCompiler} \
           --source ${previousSource} --current "$PWD" --out "$TMPDIR/baseline.json"
       ''}
@@ -61,9 +68,9 @@ let
         --generation ${label} --producer-timeout 1200 --stream \
         ${pkgs.lib.optionalString (predecessor != null) "--seed ${predecessor}"} \
         ${pkgs.lib.optionalString (planning != null) "--planning-units ${planning}/unit-store"} \
-        ${pkgs.lib.optionalString (previousCompiler != null && previousSource != null)
+        ${pkgs.lib.optionalString (cacheCompatible && previousCompiler != null && previousSource != null)
           ''--baseline "$TMPDIR/baseline.json"''} \
-        ${pkgs.lib.optionalString (previousCompiler != null) ''
+        ${pkgs.lib.optionalString (cacheCompatible && previousCompiler != null) ''
           ${pkgs.lib.optionalString (builtins.pathExists (previousCompiler + "/unit-store"))
             "--previous-units ${previousCompiler}/unit-store"}
         ''}
