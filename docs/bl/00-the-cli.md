@@ -949,6 +949,8 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BEAM_LISP_EBIN` | protocol | prebuilt compiler-image directory for bootstrap tools |
 | `BL_BOOTSTRAP_SEED` | protocol | explicit compiler-floor directory for bootstrap and recovery |
 | `BL_ANDROID_JAVA_HOME` | override | JDK home for Android builds (default `/usr/lib/jvm/java-21-openjdk`) |
+| `BL_ANDROID_ABI` | override | Android ABI for this invocation: `x86_64` or `arm64-v8a`; `--abi` wins, and blank uses the `env.bl` selection |
+| `BL_ANDROID_NATIVES` | override | immutable Android native-product bundle whose ABI, Source/API contract and library hash match the selected SDK |
 | `BL_ENV` | override | loading environment; `production` and `prod` select startup loading by default |
 | `BL_JS_CACHE` | override | `on`: enable the experimental checked JavaScript ANF cache |
 | `BL_DEMO_EXPORT` | override | `1`: export rendered scenario demo captures |
@@ -990,7 +992,8 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BL_PUBLICATION_TEST_DESTINATION` / `BL_PUBLICATION_TEST_HOLD_UNTIL` / `BL_PUBLICATION_TEST_RESULT` / `BL_PUBLICATION_TEST_SOURCE` | test | isolated publication fixture paths and synchronization |
 | `BL_Z3_TIMEOUT` / `BL_Z3_READ_TIMEOUT` | override | the z3 solver's time limits |
 
-`BL_VERSION` is not here: only the release workflow sets it, to stamp `env.bl :app :vsn`; nothing reads it at run time.
+`BL_VERSION` is not a runtime override. The release workflow derives it from the
+selected SDK for release metadata; a release label never changes compiler Source.
 
 ## Where a namespace is found
 
