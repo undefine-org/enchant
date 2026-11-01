@@ -1,0 +1,123 @@
+(ns android.ordinary-receiver-test (:require [build :as build]))
+
+;; Exercise the exact proposed ordinary library Source without replacing any
+;; installed SDK module or its sealed image. The unit producer is the current
+;; compiler's real finite artifact API; public Android compilation is tested in
+;; the separate real-Nix lane.
+(def source-root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(def prototype "qualification.android-ordinary-package")
+(def producer "qualification.android-produced-unit")
+(BeamLisp.Env/with_ns prototype
+ (fn [] (BeamLisp/eval
+  (String/replace (BeamLisp.Loader/read_source (Path/join source-root "priv/lib/application/package.bl"))
+    "(ns application.package" "(ns qualification.android-ordinary-package"))))
+(BeamLisp.Env/with_ns producer
+ (fn [] (BeamLisp/eval
+  (String/replace
+   (first (String/split (BeamLisp.Loader/read_source (Path/join source-root "nix/application-worker.bl"))
+                       "\n(let [request"))
+   "(ns artifact.application-worker" "(ns qualification.android-produced-unit"))))
+(defn invoke [name args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! prototype name) (to-list args)))
+(defn kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn restore [key value] (if value (System/put_env key value) (System/delete_env key)))
+(defn observe-compilation [action]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       tracer (erlang/spawn (fn [] (loop [calls 0]
+          (receive
+           [:trace _ :call [_ _ _]] (recur (inc calls))
+           [:finish seen] :when (= seen ticket) (erlang/send parent [:compiler-calls ticket calls])
+           _ (recur calls)))))
+       patterns [(tuple :Elixir.BeamLisp.Compiler :eval_string :_)
+                 (tuple :Elixir.BeamLisp.AOT :compile_source :_)]]
+  (doseq [pattern patterns] (erlang/trace_pattern pattern true (list :local)))
+  (erlang/trace :all true (list :call :set_on_spawn (tuple :tracer tracer)))
+  (try
+   (let [value (action) barrier (erlang/trace_delivered :all)]
+    (receive [:trace_delivered :all seen] :when (= seen barrier) :ready
+     (after 5000 (throw :compiler-trace-timeout)))
+    (erlang/send tracer [:finish ticket])
+    [value (receive [:compiler-calls seen calls] :when (= seen ticket) calls
+            (after 5000 (throw :compiler-trace-timeout)))])
+   (finally
+    (erlang/trace :all false (list :call :set_on_spawn))
+    (doseq [pattern patterns] (erlang/trace_pattern pattern false (list :local)))
+    (when (Process/alive? tracer) (erlang/exit tracer :kill))))))
+
+(deftest genuine-ordinary-units-refuse-drift-and-replay-canonical-callbacks-without-compilation
+ (let [root (Path/join (System/tmp_dir!) (str "android-receiver-" (erlang/unique_integer (list :positive))))
+       source (Path/join root "source") file (Path/join source "android/receiver/fixture.bl")
+       directory (Path/join root "units/android.receiver.fixture")
+       text "(ns android.receiver.fixture (:require [android.screen :refer [defscreen]])) (defscreen) (defn answer [] 42)"
+       old-cache (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+       old-on (System/get_env "BEAM_LISP_AOT_CACHE")
+       old-strict (System/get_env "BEAM_LISP_AOT_STRICT")
+       old-repair (System/get_env "BEAM_LISP_AOT_REPAIR")]
+  (try
+   (File/mkdir_p! (Path/dirname file)) (File/write! file text)
+   (let [ebin (Path/join root "ebin") compiler-env (BeamLisp.Env/fork)
+         result (try
+                  (BeamLisp.Env/with_env compiler-env
+                   (fn [] (build/produce! {:root root :sources [file] :out ebin})))
+                  (finally (BeamLisp.Env/destroy compiler-env)))
+         _ (when (seq (:errors result)) (throw (ex-info "Compiler fixture failed" result)))
+         workspace (BeamLisp.AOT/open_workspace
+                     {:version 1 :roots (list source)
+                      :sources (list {:namespace 'android.receiver.fixture :file file})} {})]
+    (try
+     (let [prepared (BeamLisp.AOT/prepare_unit workspace 'android.receiver.fixture)
+           record (get (:manifest result) file)
+           captured (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! producer "emit-produced-unit!")
+                       (list prepared record ebin directory))]
+      (is (BeamLisp.AOTCache/prepared_replay_complete? captured))
+      (doseq [[module bytes] (:beams captured)]
+       (is (= bytes (File/read! (Path/join ebin (str (Atom/to_string module) ".beam")))))
+       ;; Only these private fixture classes were loaded in the disposable
+       ;; compiler environment. The receiver starts with no app code loaded.
+       (code/purge module) (code/delete module)))
+     (finally (BeamLisp.AOT/close_workspace! workspace))))
+   (System/put_env "BEAM_LISP_AOT_CACHE_DIR" (Path/join root "cache"))
+   (System/put_env "BEAM_LISP_AOT_CACHE" "on")
+   (System/put_env "BEAM_LISP_AOT_STRICT" "1")
+   (System/put_env "BEAM_LISP_AOT_REPAIR" "off")
+   (let [target (invoke "ordinary-runtime-target" [])
+         unit (BeamLisp.AOT/verify_unit directory)
+         beam (Path/join directory (str (:module (first (get-in unit [:manifest :modules]))) ".beam"))
+         bytes (File/read! beam)]
+    (is (= :application-unit-target
+         (kind #(invoke "install-ordinary-units!" [root (assoc target :sdk {:inventory "foreign"})]))))
+    (is (= :application-unit-target
+         (kind #(invoke "install-ordinary-units!" [root (assoc target :floor "foreign")]))))
+    (is (= :application-unit-target
+         (kind #(invoke "install-ordinary-units!" [root (assoc-in target [:native "lazy_memo.so"] "foreign")]))))
+    (File/write! beam "altered compiled bytes")
+    (is (= :artifact-bytes-changed (kind #(invoke "install-ordinary-units!" [root target]))))
+    (File/write! beam bytes)
+    (File/rename! beam (str beam ".held"))
+    (is (= :artifact-membership-changed (kind #(invoke "install-ordinary-units!" [root target]))))
+    (File/rename! (str beam ".held") beam)
+    (File/write! file (str text "\n(def changed true)"))
+    (is (= :application-unit-source (kind #(invoke "install-ordinary-units!" [root target]))))
+    (File/write! file text)
+    (File/rename! file (str file ".held"))
+    (is (= :application-unit-ownership (kind #(invoke "install-ordinary-units!" [root target]))))
+    (File/rename! (str file ".held") file)
+    (is (not (BeamLisp.Env/loaded_ns? "android.receiver.fixture")))
+    (let [[answer calls]
+           (observe-compilation
+            (fn []
+             (let [installed (invoke "install-ordinary-units!" [root target])]
+              (is (= ["android.receiver.fixture"] installed)))
+             (invoke "with-source-root" [source
+               (fn []
+                (BeamLisp.Loader/ensure_loaded "android.receiver.fixture")
+                (erlang/apply :Elixir.BeamLisp.Ns.Android.Receiver.Fixture :answer (list)))])))]
+     (is (= 42 answer))
+     (is (= 0 calls))
+     (is (= (Path/join directory "Elixir.BeamLisp.Ns.Android.Receiver.Fixture.beam")
+            (erlang/list_to_binary (code/which :Elixir.BeamLisp.Ns.Android.Receiver.Fixture))))
+     (is (= 0 (erlang/apply :Elixir.BeamLisp.Ns.Android.Receiver.Fixture :__mob_vsn__ (list))))))
+   (finally
+    (restore "BEAM_LISP_AOT_CACHE_DIR" old-cache) (restore "BEAM_LISP_AOT_CACHE" old-on)
+    (restore "BEAM_LISP_AOT_STRICT" old-strict) (restore "BEAM_LISP_AOT_REPAIR" old-repair)
+    (File/rm_rf! root)))))
