@@ -1,0 +1,57 @@
+(ns reload.sdk-readiness-closure-test (:require [reload.sdk-readiness :as readiness]))
+
+(defn- with-cold-cache [action]
+ (let [cache (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "closures") before @cache]
+  ;; Dependency data only: clearing it must take the genuine verified walk.
+  ;; No provider bytes, SDK manifest or execution receipt is replaced.
+  (try (reset! cache {}) (action cache) (finally (reset! cache before)))))
+
+(defn- sdk-load-count [action]
+ (let [mfa (tuple :Elixir.BeamLisp.Env :load_sdk_library! 1)]
+  (erlang/trace_pattern mfa true (list :local :call_count))
+  (try
+   (let [result (action)] [result (elem (erlang/trace_info mfa :call_count) 1)])
+   (finally (erlang/trace_pattern mfa false (list :local :call_count))))))
+
+(deftest one-cold-walk-publishes-a-stable-closure-and-the-next-call-reuses-it
+ (with-cold-cache
+  (fn [cache]
+   (let [roots [[:binding "proc.message-domain" "capture-current!"]
+                [:binding "proc.message-domain" "cached-capture-current?"]]
+         before (BeamLisp.Env/definition_revision :global)
+         [ready cold] (sdk-load-count #(readiness/prepare! roots))
+         after (BeamLisp.Env/definition_revision :global)
+         entries @cache]
+    (println :readiness-cold-closure {:loads cold :publication-changed (not= before after) :entries (count entries)})
+    (is (= true ready))
+    (is (> cold 0))
+    (is (= 2 (count entries)))
+    (is (seq (:namespaces (first (vals entries)))))
+    (let [[again warm] (sdk-load-count #(readiness/prepare! roots))]
+     (is (= true again))
+     (is (= 0 warm))
+     (is (= entries @cache)))))))
+
+(deftest changed-descriptor-or-namespace-generation-cannot-certify-a-closure
+ (with-cold-cache
+  (fn [cache]
+   (let [roots [[:binding "clojure.string" "upper-case"]]
+         snapshot-current? (BeamLisp.Env/fetch_exact! "reload.sdk-readiness" "descriptor-inputs-current?")]
+    (is (= true (readiness/prepare! roots)))
+    (let [entry (first (vals @cache)) namespace (first (:namespaces entry))
+          snapshot {namespace {:definitions (Map/new (BeamLisp.Env/ns_defs namespace))
+                               :generation (BeamLisp.Env/sdk_namespace_generations (list namespace))}}]
+     (is (string? namespace))
+     (is (= true (snapshot-current? snapshot)))
+     (is (= false (snapshot-current? (assoc-in snapshot [namespace :definitions] {}))))
+     ;; Real Native publication with identical bindings. No mutable SDK bytes
+     ;; or executable rows are forged to simulate generation invalidation.
+     (BeamLisp.Env/with_env :global
+      #(BeamLisp.Env/with_publication namespace (fn [] :same-bindings)))
+     (is (= false (snapshot-current? snapshot)))
+     (let [[ready after-publication] (sdk-load-count #(readiness/prepare! roots))
+           [again warm] (sdk-load-count #(readiness/prepare! roots))]
+      (is (= true ready))
+      (is (> after-publication 0))
+      (is (= true again))
+      (is (= 0 warm))))))))
