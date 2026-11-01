@@ -50,10 +50,33 @@
  ;; admits an uninitialized provider, an arbitrary module prefix or mutable Var.
  (if (contains? (:kernels state #{}) module) state
   (do
-   (when-not (and (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Num :Elixir.BeamLisp.Set :Elixir.BeamLisp.Vector} module)
+   (when-not (and (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Num :Elixir.BeamLisp.Set :Elixir.BeamLisp.Vector :Elixir.BeamLisp.Loader} module)
                   (erlang/module_loaded module) (BeamLisp.AOT/seed_dependency! module))
     (refuse :unattested-message-kernel))
    (update (stamp state module) :kernels (fn [all] (conj (or all #{}) module))))))
+(defn- readiness-kind [namespace graph-namespaces]
+ (cond
+  (contains? graph-namespaces namespace) :graph
+  (and (= namespace "datom.query.read-only") (BeamLisp.AOT/sdk_library_unit? namespace)) :sdk-read-only
+  :else nil))
+(defn- readiness-call [state values]
+ ;; A compiler prelude may be observed only after ordinary preparation already
+ ;; completed its exact provider. Never invoke Loader or initialize application
+ ;; code from this reader, and never trust a caller-nominated ready namespace.
+ (when-not (and (= 1 (count values)) (literal? (first values))
+                (erlang/is_binary (:value (first values))))
+  (refuse :unproved-message-readiness))
+ (let [namespace (:value (first values))
+       kind (readiness-kind namespace (:graph-namespaces state #{}))]
+  (when-not (and kind (BeamLisp.Env/ns_ready? namespace))
+   (refuse :unproved-message-readiness))
+  [(assoc-in (kernel state :Elixir.BeamLisp.Loader) [:readiness namespace] kind) (lit :ok)]))
+(defn- readiness-valid? [readiness]
+ (let [namespaces (set (vals (:mapping (Process/get :bl_generation))))]
+  (and (or (empty? readiness) (BeamLisp.AOT/seed_dependency! :Elixir.BeamLisp.Loader))
+       (every? (fn [[namespace kind]]
+                 (and (= kind (readiness-kind namespace namespaces))
+                      (BeamLisp.Env/ns_ready? namespace))) readiness))))
 (defn- snapshot! [state namespace name]
  (let [key [namespace name]]
   (if-let [saved (get-in state [:definitions key])] [state saved]
@@ -320,6 +343,10 @@
         (if (= :map (:tag (first values))) state (require-domain state (first values) :plain-map)))
       (field (first values) (lit (:val target)) (if (= 2 (count values)) (second values) (lit nil)) :rt)]
     (= :global (:op target)) (global state target values (= :invoke (:mode site)))
+    (and (= :remote (:mode site)) (= :Elixir.BeamLisp.Loader (:mod site)) (= :ensure_ready (:fun site)))
+     (do (when-not (and (= 1 (:arity site)) (= :lit (:op (first (:args site)))))
+           (refuse :unproved-message-readiness))
+         (readiness-call state values))
     (= :remote (:mode site))
      (if-let [target (readonly-target (:mod site) (:fun site) (count values))] (readonly-call state target values)
      (if-let [home (first (filter #(= (:mod site) (BeamLisp.Emit/module_for %)) (:namespaces state)))]
@@ -415,7 +442,8 @@
    (let [native (native-function callback) graph (Process/get :bl_generation)
          namespaces (vec (distinct (concat (vals (:mapping graph)) [(BeamLisp.Env/current_ns) "core" "sugar"])))
          home (when native (first (filter #(and (string? %) (= (first native) (BeamLisp.Emit/module_for %))) namespaces)))
-         state {:nodes 0 :stack #{} :definitions {} :modules {} :bindings {} :obligations [] :namespaces namespaces}]
+         state {:nodes 0 :stack #{} :definitions {} :modules {} :bindings {} :obligations [] :namespaces namespaces
+                :graph-namespaces (set (vals (:mapping graph))) :readiness {}}]
     (when-not (and native (contains? #{1 2} (nth native 2))) (refuse :unpublished-message-callback))
     (let [epoch (BeamLisp.Env/publication_epoch)
           args (if (= 1 (nth native 2)) [{:tag :input}] [{:tag :input} {:tag :request}])
@@ -430,7 +458,7 @@
       (refuse :unstable-message-callback))
      {:status :proved :expression expression :definitions (:definitions after) :modules (:modules after)
       :bindings (:bindings after) :obligations (:obligations after) :source-guards (:source-guards after [])
-      :reads (:reads after []) :root native :arity (nth native 2)}))
+      :reads (:reads after []) :readiness (:readiness after {}) :root native :arity (nth native 2)}))
    (catch error
     (if-let [reason (:reason (ex-data error))]
      {:status :unknown :reason reason} (throw error)))))
@@ -663,6 +691,7 @@
    (with-environment (:environment proof)
   (fn []
    (and (= :proved (:status proof))
+        (readiness-valid? (:readiness proof {}))
         (every? publication/valid? (vals (:definitions proof)))
         (every? (fn [read]
                   (let [target (:target read)]
