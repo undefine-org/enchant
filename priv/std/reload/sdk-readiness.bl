@@ -39,11 +39,17 @@
     :else [:remote (:mod node) (:fun node) (count (:args node))])
   :else nil))
 
-(defn prepare!
+(defn- closure-current? [cached]
+ (and cached
+      (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) (:namespaces cached))
+      (= (:generations cached) (BeamLisp.Env/sdk_namespace_generations (to-list (:namespaces cached))))
+      (source-inputs-current? (:sources cached))))
+
+(defn- prepare-closure!
  "Initialize only fixed SDK namespaces reached by actual executable binding
   reads/calls, following their actual function descriptors transitively. This
   grants no invocation authority and never evaluates a candidate function."
- [roots]
+ [roots request-key]
  (BeamLisp.Env/assert_native_framework_execution!)
  (let [frame (tuple :sdk-readiness (erlang/make_ref))
        inventory (BeamLisp.AOT/sdk_inventory_input)
@@ -142,12 +148,7 @@
                   #(and (= :namespace (first %)) (contains? bound-namespaces (second %))) canonical))))
          key [(elem inventory 0) (BeamLisp.AOTCache/compiler_key) (or image-key :source-checkout) roots]
          cached (get @closures key)]
-    (if (and cached
-             (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) (:namespaces cached))
-             (= (:generations cached) (BeamLisp.Env/sdk_namespace_generations (to-list (:namespaces cached))))
-             ;; A stable image index does not freeze provider selection or
-             ;; mutable namespace definitions, including transitive providers.
-             (source-inputs-current? (:sources cached)))
+    (if (closure-current? cached)
      true
      (do
       (write! :pending roots)
@@ -193,6 +194,25 @@
        (when (and preparation-revision
                   (= preparation-revision (BeamLisp.Env/definition_revision :global)))
         (swap! closures
-         (fn [entries] (assoc (if (>= (count entries) 128) {} entries) key value)))))
+         (fn [entries]
+          (assoc (if (> (+ (count entries) 2) 128) {} entries) key value request-key value)))))
       true))))
    (finally (Process/delete frame)))))
+
+(defn prepare!
+ "Prepare genuine SDK dependencies, reusing the existing bounded closure only
+  after rechecking actual provider Source, namespace versions and readiness.
+  A repeated request need not rebuild the root's entire descriptor table just
+  to discover that its authenticated dependency closure remains unchanged."
+ [roots]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [inventory (BeamLisp.AOT/sdk_inventory_input)
+       compiler-key (BeamLisp.AOTCache/compiler_key)
+       image-key (when (elem inventory 1) (crypto/hash :sha256 (elem inventory 1)))
+       request-key [:request (elem inventory 0) compiler-key (or image-key :source-checkout) roots]
+       cached (get @closures request-key)]
+  (if (and (closure-current? cached)
+           (= inventory (BeamLisp.AOT/sdk_inventory_input))
+           (= compiler-key (BeamLisp.AOTCache/compiler_key)))
+   true
+   (prepare-closure! roots request-key))))

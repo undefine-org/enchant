@@ -319,8 +319,7 @@
         (update :reads (fn [all] (conj (or all []) read))))
     {:tag :eager-read :read read}])))
 (defn- global [state node values guarded?]
- (let [found (if (= :exact (:lookup node)) (BeamLisp.Env/fetch_exact (:ns node) (:name node))
-              (BeamLisp.Env/fetch (:ns node) (:name node)))
+ (let [found (BeamLisp.Env/peek_binding_initialized (:ns node) (:name node) (= :exact (:lookup node)))
        f (when (and (tuple? found) (= :ok (elem found 0))) (elem found 1))
        native (native-function (callable-arm f (count values)))]
   (when-not native (refuse :dynamic-message-helper))
@@ -453,7 +452,7 @@
           [after expression] (if direct? (primitive (source-arguments state args false) (first native) (second native) args)
                                (helper state home (erlang/atom_to_binary (second native) :utf8) args))
           saved (get (:definitions after) [home (erlang/atom_to_binary (second native) :utf8)])]
-     (when-not (and (or direct? (= (tuple :ok callback) (BeamLisp.Env/fetch_exact home (erlang/atom_to_binary (second native) :utf8))))
+     (when-not (and (or direct? (= (tuple :ok callback) (BeamLisp.Env/peek_binding_initialized home (erlang/atom_to_binary (second native) :utf8) true)))
                     (= epoch (BeamLisp.Env/publication_epoch)) (or direct? saved))
       (refuse :unstable-message-callback))
      {:status :proved :expression expression :definitions (:definitions after) :modules (:modules after)
@@ -704,10 +703,44 @@
                                [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
                                [:beam (erlang/apply module :module_info (list :md5))]))) (:modules proof))
         (every? (fn [[[ns name lookup] expected]]
-                  (let [found (if (= lookup :exact) (BeamLisp.Env/fetch_exact ns name) (BeamLisp.Env/fetch ns name))]
+                  (let [found (BeamLisp.Env/peek_binding_initialized ns name (= lookup :exact))]
                    (and (tuple? found) (= :ok (elem found 0)) (= expected (native-function (callable-arm (elem found 1) (nth expected 2)))))))
                 (:bindings proof))))))
    (catch _ false)))
+(defn- cached-capture-current?
+ "Native inspection alone supplies its own previous result after comparing
+  every raw publication/definition row under the actual borrowed context. This
+  private checker adds the remaining live inputs; it never accepts a caller's
+  proof or selects a supplied environment. Public valid? keeps recapturing."
+ [callback proof]
+ (try
+  (and (= :proved (:status proof)) (= (:root proof) (native-function callback))
+       (readiness-valid? (:readiness proof {}))
+       (every? (fn [saved]
+                 (let [found (BeamLisp.Env/peek_initialized (:namespace saved) (:name saved))]
+                  (and (tuple? found) (= :ok (elem found 0))
+                       (BeamLisp.AOT/published_callable_matches? (elem found 1) (:entries saved)
+                                                               (get-in saved [:shim :module])))))
+               (vals (:definitions proof)))
+       (every? (fn [read]
+                 (let [target (:target read)]
+                  (and (= target (readonly-target (:module target) (:name target) (:arity target)))
+                       (= (select-keys read [:query :attributes])
+                          (erlang/apply (BeamLisp.Env/sdk_callable! "datom.query.read-only" "plan!" 1)
+                            (list (:query read))))))) (:reads proof []))
+       (every? (fn [[module identity]]
+                 (= identity (if (= module :erlang)
+                              [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                              [:beam (erlang/apply module :module_info (list :md5))]))) (:modules proof))
+       (every? (fn [[[namespace name lookup] expected]]
+                 ;; A changed binding may be an initializer. Observe existing
+                 ;; values without loading a namespace or materializing it.
+                 ;; Re-exports/per-env descriptors conservatively miss here.
+                 (let [found (BeamLisp.Env/peek_binding_initialized namespace name (= lookup :exact))]
+                  (and (tuple? found) (= :ok (elem found 0))
+                       (= expected (native-function (callable-arm (elem found 1) (nth expected 2)))))))
+               (:bindings proof)))
+  (catch _ false)))
 (defn- plain-map-known? [value facts]
  (or (and (= :map (:tag value)) (or (nil? (:base value)) (plain-map-known? (:base value) facts)))
      (and (literal? value) (erlang/is_map (:value value)) (not (maps/is_key :__struct__ (:value value))))

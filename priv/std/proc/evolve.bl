@@ -1,7 +1,7 @@
 ; Stable process identity, versioned messages and atomic handler/state evolution.
 ; Upgrade callbacks are pure and short. External effects belong to durable jobs.
 (ns proc.evolve
- (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [proc.framework :as framework] [reload.execution :as execution] [data.first-order :as first-order] [datom.conn :as dc] [core]))
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [proc.framework :as framework] [proc.task :as task] [reload.execution :as execution] [data.first-order :as first-order] [datom.conn :as dc] [core]))
 
 (defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
 (defn- validate! [spec]
@@ -286,7 +286,7 @@
       ;; explicit client work remains retained/drain instead of being skipped.
       (throw (ex-info "Mailbox control requires retained execution" {:kind :unsupported-owner-mailbox}))))) messages)))))
 
-(defn- stage-upgrade [st expected spec samples]
+(defn- stage-selected-upgrade [st expected spec samples selected]
  (cond
   (not= expected (get-in st [:current :version])) [{:status :refused :kind :stale-version} st]
   (not (and (valid-version? (:version spec)) (> (:version spec) expected)))
@@ -296,10 +296,10 @@
              (every? #(and (map? %) (valid-version? (:version %)) (contains? % :message)) samples)))
    [{:status :refused :kind :invalid-message-samples} st]
   :else
-   (let [held (atom nil)]
+   (let [held (atom selected)]
     (try
      (validate-migrations! (:current st) spec)
-     (reset! held (retain! spec))
+     (when-not @held (reset! held (retain! spec)))
      ;; Prove the same registrations that conversion and future adapters own.
      ;; No temporary proof registration or new fresh-graph admission is needed.
      (when (:automatic spec)
@@ -320,7 +320,7 @@
                           (throw (ex-info "Observed message migration refused" {:kind :invalid-message})))))
                        (valid-state! @held (invoke @held :migrate-state [(:value st)])))))]
       (if-not (contains? result :ok)
-       (do (release! @held)
+       (do (when-not selected (release! @held))
            [{:status :refused :kind (if (:timeout result) :rehearsal-deadline :candidate-refused)} st])
        (let [ticket (erlang/make_ref)
              _ (when (:automatic spec)
@@ -333,8 +333,10 @@
           :revision (:revision st 0) :messages (count samples) :scope :sampled-owner-state}
          (assoc (forget-preparation st) :preparation preparation)])))
      (catch e
-      (when @held (release! @held))
+      (when (and @held (nil? selected)) (release! @held))
       [{:status :refused :kind (or (:kind (ex-data e)) :candidate-refused)} st])))))
+(defn- stage-upgrade [st expected spec samples]
+ (stage-selected-upgrade st expected spec samples nil))
 
 (defn- commit-upgrade [st ticket]
  (let [p (:preparation st) prior (:publication st)]
@@ -349,7 +351,7 @@
           receipt {:ticket ticket :version (get-in after [:current :version]) :revision (:revision after)}]
      [(assoc (dissoc receipt :ticket) :status :applied) (assoc after :publication receipt)]))))
 
-(defn- automatic-prepare-spec [st grant expected spec samples]
+(defn- complete-automatic-prepare [st grant expected spec samples selected]
  (try
   (BeamLisp.Env/with_owner_transition! grant :prepare
    (fn []
@@ -364,7 +366,7 @@
             _ (when (> (count samples) 256)
                 (throw (ex-info "Combined owner sample inventory exceeds budget" {:kind :message-inventory-budget})))
             _ (reset! conversion-entered true)
-            [reply after] (stage-upgrade st expected (assoc spec :automatic true) samples)]
+            [reply after] (stage-selected-upgrade st expected (assoc spec :automatic true) samples selected)]
        (if (= :prepared (:status reply))
         (do
          (BeamLisp.Env/owner_transition_prepared! grant (:ticket reply))
@@ -379,11 +381,149 @@
         (do (BeamLisp.Env/finish_owner_transition! grant nil :refused)
             [{:status :refused :kind (or (:kind (ex-data error)) :unproved-message-migration)} st])))))))
   (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
+
+(defn- standalone-analysis-owner? []
+ ;; A containing application's visible state is not private SDK custody. Nor
+ ;; may a Source callback running inside the SDK actor request this private job.
+ (and (not (BeamLisp.Env/source_data_decode_required?))
+      (= (tuple "proc.evolve" "owner")
+         (:declaration (BeamLisp.Env/framework_owner_evidence (erlang/self))))))
+(defn- analysis-registrations [st held]
+ (vec (distinct
+  (remove nil?
+   (concat [(get-in st [:current :accept?]) (get-in st [:current :check-reply])]
+           (map #(get held %) [:upcast :accept? :check-reply :downcast :migrate-state :check-state])
+           (map :registration
+            (mapcat (fn [edge]
+                      (:evidence (:message-proof (registration-meta (:message-proof edge)))))
+                    (vals (:adapters st)))))))))
+(defn- warm-analysis! [registrations cell]
+ ;; The native owned Task captures only opaque registrations and this private
+ ;; GC-owned cell. It never receives a candidate Fn, environment or owner value.
+ (try
+  (let [unproved (reduce (fn [out registration]
+                          (let [captured (message-proof-api :capture-registration! [registration])]
+                           (if (= :proved (:status captured)) out (conj out registration))))
+                        [] registrations)]
+   (reset! cell {:status :ready :unproved unproved}))
+  (catch error
+   (reset! cell {:status :refused :kind (or (:kind (ex-data error)) :owner-analysis-failed)})))
+ :proc.evolve/analyzed)
+(defn- begin-automatic-analysis [st grant expected spec samples]
+ (let [held (atom nil)]
+  (try
+   (BeamLisp.Env/with_owner_transition! grant :analysis
+    (fn []
+     (when (or (:preparation st) (:analysis st))
+      (throw (ex-info "Owner already has accepted preparation" {:kind :owner-preparation-pending})))
+     (when-not (= expected (get-in st [:current :version]))
+      (throw (ex-info "Owner version changed" {:kind :stale-version})))
+     (validate-migrations! (:current st) spec)
+     (when-not (> (:version spec) expected)
+      (throw (ex-info "Owner candidate is not a new version" {:kind :identity-conflict})))
+     (when (>= (count (:adapters st)) (:history-limit st))
+      (throw (ex-info "Owner history is full" {:kind :history-full})))
+     (first-order/check! samples {:max-nodes 32768 :max-bytes 1048576 :max-depth 64})
+     (when-not (and (vector? samples) (<= (count samples) 256)
+                    (every? #(and (map? %) (valid-version? (:version %)) (contains? % :message)) samples))
+      (throw (ex-info "Invalid explicit owner message samples" {:kind :invalid-message-samples})))
+     ;; This pending-only native entry owns the actual candidate context even
+     ;; if fresh admission has closed. It supplies no completion capability.
+     (reset! held (retain! spec))
+     (let [cell (atom nil) registrations (analysis-registrations st @held)
+           worker (task/async-nolink (fn [] (warm-analysis! registrations cell)))]
+      [{:status :analyzing}
+       (assoc st :analysis {:grant grant :expected expected :spec spec :samples samples
+                            :held @held :cell cell :task worker})])))
+   (catch error
+    (when @held (release! @held))
+    ;; Refusal is completed only through the existing authentic claim. An
+    ;; expired pending grant remains expired; metadata never manufactures one.
+    (try
+     (BeamLisp.Env/with_owner_transition! grant :prepare
+      (fn [] (BeamLisp.Env/finish_owner_transition! grant nil :refused)))
+     (catch _ nil))
+    [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st]))))
+(defn- automatic-prepare-spec [st grant expected spec samples]
+ (cond
+  (= grant (get-in st [:analysis :grant]))
+   [{:status :refused :kind :owner-preparation-pending} st]
+  (standalone-analysis-owner?)
+  (begin-automatic-analysis st grant expected spec samples)
+  :else (complete-automatic-prepare st grant expected spec samples nil)))
+(defn- detach-analysis-monitors! [job]
+ (when-let [ref (get-in job [:task :ref])] (Process/demonitor ref (list :flush)))
+ (when-let [ref (:caller-monitor job)] (Process/demonitor ref (list :flush)))
+ :ok)
+(defn- discard-analysis! [job]
+ (when job
+  (try
+   (when (Process/alive? (task/pid (:task job)))
+    ;; Only fixed, read-only metadata is stopped; no application callback runs
+    ;; in this Task and cancellation conveys no effect replay permission.
+    (task/shutdown (:task job) :brutal_kill))
+   (catch _ nil)
+   (finally
+    (detach-analysis-monitors! job)
+    (release! (:held job)))))
+ :ok)
+(defn- refuse-analysis [st job kind]
+ (discard-analysis! job)
+ (try
+  (BeamLisp.Env/with_owner_transition! (:grant job) :prepare
+   (fn [] (BeamLisp.Env/finish_owner_transition! (:grant job) nil :refused)))
+  (catch _ nil))
+ (when (:from job) (GenServer/reply (:from job) {:status :refused :kind kind}))
+ (dissoc st :analysis))
+(defn- unproved-analysis-kind [st job unproved]
+ (let [failed (set unproved) held (:held job)
+       failed? (fn [registrations] (some #(and % (contains? failed %)) registrations))
+       prior (map :registration (mapcat (fn [edge]
+                (:evidence (:message-proof (registration-meta (:message-proof edge))))) (vals (:adapters st))))]
+  ;; Only an actual SDK worker can write this cell. These observations can
+  ;; refuse a role, never prove one or supply a preparation proof to the owner.
+  (cond
+   (failed? prior) :unproved-prior-message-migration
+   (failed? [(get-in st [:current :accept?]) (:upcast held) (:accept? held)]) :unproved-message-migration
+   (failed? [(:check-reply held) (:downcast held) (get-in st [:current :check-reply])]) :unproved-reply-migration
+   (failed? [(:migrate-state held) (:check-state held)]) :unproved-message-migration
+   :else nil)))
+(defn- analysis-ready [st ref]
+ (let [job (:analysis st)]
+  (if-not (and job (= ref (get-in job [:task :ref]))) st
+   (if-let [result @(:cell job)]
+    (if-let [refusal (if (= :ready (:status result))
+                       (unproved-analysis-kind st job (:unproved result []))
+                       (:kind result :owner-analysis-failed))]
+     (refuse-analysis st job refusal)
+     (do
+      ;; Flush Task DOWN/caller observations before the unchanged mailbox
+      ;; inventory gate. The Task's result is only a wakeup, never proof data.
+      (detach-analysis-monitors! job)
+      (let [selected (:held job)
+            [reply after] (complete-automatic-prepare (dissoc st :analysis)
+                           (:grant job) (:expected job) (:spec job) (:samples job) selected)]
+       ;; This slot alone owns selected until the actual prepared state takes
+       ;; it. Early refusal, expired grant and rehearsal failure release once.
+       (when-not (= (:handler selected) (get-in after [:preparation :held :handler]))
+        (release! selected))
+       (GenServer/reply (:from job) reply)
+       after)))
+    ;; Forged/early completion cannot observe or publish a nil private cell.
+    st))))
+(defn- analysis-down [st ref pid]
+ (let [job (:analysis st)]
+  (if (and job (not (Process/alive? pid))
+           (or (and (= ref (get-in job [:task :ref])) (= pid (task/pid (:task job))))
+               (and (= ref (:caller-monitor job)) (= pid (:caller job)))))
+   (refuse-analysis st job :owner-analysis-cancelled) st)))
 (defn- automatic-prepare [st grant expected payload samples]
  (try (BeamLisp.Execution/invoke-bundle! payload grant 'proc.evolve/prepare [st expected samples])
   (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
 (defn- automatic-observation [st grant]
  (cond
+  (= grant (get-in st [:analysis :grant]))
+   {:status :pending :scope :owner-analysis :version (get-in st [:current :version])}
   (= grant (get-in st [:publication :automatic-grant]))
    {:status :applied :version (get-in st [:publication :version]) :revision (get-in st [:publication :revision])}
   (and (= grant (get-in st [:preparation :automatic-grant]))
@@ -662,6 +802,7 @@
 
 (defn close-state! [st]
  (try
+  (discard-analysis! (:analysis st))
   (forget-preparation st)
   (try (owners/unregister! (:inventory st))
    (finally
@@ -711,11 +852,16 @@
 
 (ps/defserver owner
  (init [opts] (ok (initial-state (assoc opts :standalone-sdk-owner true))))
- (handle-call message [_ st]
-  (let [[value after] (message-step st message)] (reply value after)))
+ (handle-call message [from st]
+  (let [[value after] (message-step st message)]
+   (if (and (nil? (:analysis st)) (:analysis after))
+    (noreply (update after :analysis #(assoc % :from from :caller (elem from 0)
+                                             :caller-monitor (Process/monitor (elem from 0)))))
+    (reply value after))))
+ (handle-info [ref :proc.evolve/analyzed] [st] (noreply (analysis-ready st ref)))
  (handle-info [:DOWN ref :process pid _] [st]
   (if (framework/initializer-down? (:framework st) ref pid)
-   (stop :normal st) (noreply st)))
+   (stop :normal st) (noreply (analysis-down st ref pid))))
  (handle-info _ [st] (noreply st))
  (terminate [_ st] (close-state! st)))
 
