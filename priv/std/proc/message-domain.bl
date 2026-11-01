@@ -4,7 +4,7 @@
 (ns proc.message-domain
  (:require [system.ir :as ir] [system.publication :as publication]
            [data.first-order :as data] [reload.source-producer :as producer]
-           [reload.native-call :as native-call]))
+           [reload.native-call :as native-call] [datom.query.read-only :as read-only]))
 (def MAX-NODES 32768)
 (def MAX-HELPERS 32)
 (def MAX-BRANCHES 32)
@@ -55,7 +55,7 @@
      (BeamLisp.CompilerData/constructor_data_cost! (dissoc saved :generation)
                                                  {:callables {} :recipes {} :recipe-frame nil})
      [(assoc-in state [:definitions key] saved) saved])))))
-(declare lift choose)
+(declare lift choose literal-has-type?)
 (defn- lift-case [state environment subject clauses]
  (when (empty? clauses) (refuse :partial-message-case))
  (let [clause (first clauses) pats (:pats clause) pat (first pats)]
@@ -146,9 +146,10 @@
   (= :choose (:tag value)) (choose (:test value) (vector-at (:then value) index default) (vector-at (:else value) index default))
   :else {:tag :vector-at :target value :index index :default default}))
 (defn- type-term [type value]
+ (if (literal? value) (lit (literal-has-type? (:value value) type))
  (if (= :choose (:tag value))
   (choose (:test value) (type-term type (:then value)) (type-term type (:else value)))
-  {:tag :type :type type :value value}))
+  {:tag :type :type type :value value})))
 (defn- key-term [value key]
  (cond
   (= :map (:tag value))
@@ -263,15 +264,19 @@
              (= :"$blfn" (elem value 0)) (erlang/is_map (elem value 1)))
    (maps/get arity (elem value 1) nil))))
 (defn- readonly-target [module function arity]
- (when (and (= 2 arity) (= :read! function)
-            (= module (BeamLisp.Emit/module_for "datom.query.read-only")))
-  (let [entry (erlang/make_fun module function arity)]
-   (BeamLisp.AOT/sdk_callable_evidence! entry)
-   {:namespace "datom.query.read-only" :function "read!" :module module :name function :arity arity})))
+ (when (and (= 2 arity) (= :read! function))
+  (let [entry (BeamLisp.Env/sdk_callable! "datom.query.read-only" "read!" 2)
+        binding (native-function entry)]
+   (when (or (= [module function arity] binding)
+             (= module (BeamLisp.Emit/module_for "datom.query.read-only")))
+    (BeamLisp.AOT/sdk_callable_evidence! entry)
+    (BeamLisp.AOT/sdk_callable_evidence! (erlang/make_fun module function arity))
+    {:namespace "datom.query.read-only" :function "read!" :module module :name function :arity arity :binding binding}))))
 (defn- readonly-call [state target values]
  (let [query (first values)]
   (when-not (literal? query) (refuse :dynamic-state-observation-query))
-  (let [plan (erlang/apply (BeamLisp.Env/sdk_callable! "datom.query.read-only" "plan!" 1) (list (:value query)))
+  (when (>= (count (:reads state [])) MAX-BRANCHES) (refuse :message-domain-budget))
+  (let [plan (read-only/plan! (:value query))
         read {:query (:query plan) :attributes (:attributes plan) :connection (second values) :target target}]
    [(-> (stamp state (:module target))
         (update :reads (fn [all] (conj (or all []) read))))
@@ -449,6 +454,18 @@
        (erlang/is_binary value) :binary (erlang/is_atom value) :atom
        (vector? value) :vector (erlang/is_map value) :raw-map
        :else :other))
+(defn- literal-has-type? [value required]
+ ;; These fixed raw/classification predicates invoke no caller/protocol code.
+ ;; In particular raw-map is not an assertion about a Record's lookup methods.
+ (case required
+  :integer (erlang/is_integer value) :bl-integer (erlang/is_integer value)
+  :float (erlang/is_float value) :binary (erlang/is_binary value) :bl-binary (erlang/is_binary value)
+  :number (erlang/is_number value) :atom (erlang/is_atom value)
+  :raw-map (erlang/is_map value)
+  :plain-map (and (erlang/is_map value) (not (maps/is_key :__struct__ value)))
+  :maplike (BeamLisp.Ns.Rt/map? value) :vector (BeamLisp.Ns.Rt/vector? value)
+  :keyword (BeamLisp.Ns.Rt/keyword? value) :bl-number (BeamLisp.Ns.Rt/number? value)
+  false))
 (defn- type-covers? [actual required]
  (or (= actual required) (and (contains? #{:number :bl-number} required) (contains? #{:integer :bl-integer :float} actual))
      (and (= required :integer) (= actual :bl-integer))
@@ -461,7 +478,7 @@
 (declare plain-map-known? first-order-known?)
 (defn- type-known? [value required facts]
  (cond
-  (literal? value) (type-covers? (literal-type (:value value)) required)
+  (literal? value) (literal-has-type? (:value value) required)
   (= :map (:tag value)) (or (= :raw-map required)
                            (and (contains? #{:plain-map :maplike} required)
                                 (or (nil? (:base value)) (plain-map-known? (:base value) facts))))
@@ -761,6 +778,7 @@
   :eager-read true
   :field (eager-read-value? (:target value))
   :number-op (every? #(or (and (literal? %) (scalar? (:value %))) (eager-read-value? %)) (:args value))
+  :choose (every? #(or (eager-read-value? %) (first-order-known? % [])) [(:then value) (:else value)])
   false))
 (defn- current-state-operations? [proof input]
  (every? (fn [obligation]
