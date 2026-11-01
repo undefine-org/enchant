@@ -7,6 +7,35 @@ use std::sync::Mutex;
 
 rustler::atoms! { ok, busy, child }
 
+// Rust 1.95's File locks report Unsupported on Android before making a
+// syscall. Bionic provides flock on our Android API floor. Keep the same
+// nonblocking, open-file-description custody and close-to-release semantics.
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn try_flock(file: &File, shared: bool) -> Result<(), TryLockError> {
+    use std::os::fd::AsRawFd;
+    let operation = (if shared { libc::LOCK_SH } else { libc::LOCK_EX }) | libc::LOCK_NB;
+    loop {
+        // SAFETY: the borrowed File keeps this descriptor live for the call;
+        // flock takes no pointers and does not take ownership of the descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Err(TryLockError::WouldBlock),
+            _ => return Err(TryLockError::Error(error)),
+        }
+    }
+}
+
+fn try_lock(file: &File, shared: bool) -> Result<(), TryLockError> {
+    #[cfg(target_os = "android")]
+    { try_flock(file, shared) }
+    #[cfg(not(target_os = "android"))]
+    { if shared { file.try_lock_shared() } else { file.try_lock() } }
+}
+
 struct Claim {
     path: std::path::PathBuf,
 }
@@ -47,7 +76,7 @@ fn acquire(env: Env<'_>, path: String, shared: bool, monitor_owner: bool)
     }
     let file = OpenOptions::new().read(true).write(true).create(true)
         .truncate(false).open(path).map_err(io_error)?;
-    let locked = if shared { file.try_lock_shared() } else { file.try_lock() };
+    let locked = try_lock(&file, shared);
     match locked {
         Ok(()) => {
             let resource = ResourceArc::new(FileLock {
@@ -96,13 +125,13 @@ fn claim(env: Env<'_>, anchor: String, path: String, what: String)
         OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
     };
     let writer = open(&anchor).map_err(io_error)?;
-    match writer.try_lock() {
+    match try_lock(&writer, false) {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Ok((busy(), None)),
         Err(TryLockError::Error(error)) => return Err(io_error(error)),
     }
     let followers = open(&format!("{anchor}.followers")).map_err(io_error)?;
-    match followers.try_lock() {
+    match try_lock(&followers, false) {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Ok((child(), None)),
         Err(TryLockError::Error(error)) => return Err(io_error(error)),
@@ -165,4 +194,41 @@ fn release(env: Env<'_>, resource: ResourceArc<FileLock>) -> NifResult<Atom> {
     }
     file.take();
     Ok(ok())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn android_flock_keeps_shared_exclusive_and_close_custody() {
+        let path = std::env::temp_dir().join(format!("bl-file-lock-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let open = || OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(&path).unwrap();
+        let first = open();
+        let second = open();
+        let writer = open();
+        try_flock(&first, true).unwrap();
+        try_flock(&second, true).unwrap();
+        assert!(matches!(try_flock(&writer, false), Err(TryLockError::WouldBlock)));
+        drop(first);
+        assert!(matches!(try_flock(&writer, false), Err(TryLockError::WouldBlock)));
+        drop(second);
+        try_flock(&writer, false).unwrap();
+
+        // Interoperate with the host's standard flock implementation. The
+        // replacement must protect the same kernel anchor, not a local mutex.
+        let reader = open();
+        assert!(matches!(try_lock(&reader, true), Err(TryLockError::WouldBlock)));
+        drop(writer);
+        try_lock(&reader, true).unwrap();
+        let writer = open();
+        assert!(matches!(try_flock(&writer, false), Err(TryLockError::WouldBlock)));
+        drop(reader);
+        try_flock(&writer, false).unwrap();
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
 }
