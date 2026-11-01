@@ -106,12 +106,7 @@
     (when-not (and (= (identity (get handle "directory")) (get handle "directory-identity")) (= (digest body) (get handle "operation-sha256")) (= stored handle))
       (refuse! "Artifact preparation handle no longer matches its accepted request" {}))) handle)
 
-(defn submit!
-  "Submit one durable fixed operation. Each requester supplies a distinct
-   private directory and owns its roots. Repeating the same directory/content
-   rejoins its Foundry job; Nix shares realization across different requesters.
-   Caller snapshots and retains mutable inputs before this handoff.
-   coordinator is the pinned runtime selected at startup, not project :env."
+(defn- record-operation!
   [coordinator directory operation]
   (let [coordinator (runtime! coordinator) directory (directory! directory true)
         _ (when-not (and (map? operation) (= 1 (get operation "version"))
@@ -132,12 +127,37 @@
           (when-not (= body (owned-file! path operation-limit))
             (refuse! "An artifact request directory cannot be reused for different input" {:directory directory})))
         (finally (File/rm temporary))))
-    (let [handle (call! coordinator directory "submit" [] 60000)]
-      (when-not (and (= coordinator (get handle "coordinator")) (= directory (get handle "directory"))
-                    (= (identity directory) (get handle "directory-identity"))
-                    (= (digest body) (get handle "operation-sha256")))
-        (refuse! "Coordinator accepted a different preparation request" {}))
-      (handle! handle))))
+    {:coordinator coordinator :directory directory :digest (digest body)}))
+
+(defn- accepted! [request handle]
+  (when-not (and (= (:coordinator request) (get handle "coordinator"))
+                (= (:directory request) (get handle "directory"))
+                (= (identity (:directory request)) (get handle "directory-identity"))
+                (= (:digest request) (get handle "operation-sha256")))
+    (refuse! "Coordinator accepted a different preparation request" {}))
+  (handle! handle))
+
+(defn submit!
+  "Submit one durable fixed operation. Each requester owns a private directory
+   and its roots. Repeating its content rejoins the same Foundry job; Nix shares
+   realization across requesters. Inputs are captured before this handoff."
+  [coordinator directory operation]
+  (let [request (record-operation! coordinator directory operation)]
+    (accepted! request (call! (:coordinator request) (:directory request) "submit" [] 60000))))
+
+(defn prepare!
+  "Submit and wait through one coordinator VM. Its durable worker survives a
+   caller deadline/disconnect. The result still needs product verification and
+   destination custody before publication."
+  [coordinator directory operation timeout-ms]
+  (when-not (and (int? timeout-ms) (<= 1000 timeout-ms 3600000))
+    (refuse! "Artifact await deadline must be between one second and one hour" {}))
+  (let [request (record-operation! coordinator directory operation)
+        result (call! (:coordinator request) (:directory request) "prepare" [(str timeout-ms)] (+ timeout-ms 70000))
+        handle (accepted! request (get result "handle"))]
+    (when-not (= (:digest request) (get result "operation-sha256"))
+      (refuse! "Coordinator completed a different preparation request" {}))
+    (assoc result "handle" handle)))
 
 (defn status! [handle]
   (let [handle (handle! handle)]
