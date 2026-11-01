@@ -1,43 +1,57 @@
-(ns android.managed-build-test)
+(ns android.managed-build-test (:require [bl.android :as android]))
 
-(def source-root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
-(def prototype "qualification.android-managed-build")
-(BeamLisp.Env/with_ns prototype
- (fn [] (BeamLisp/eval
-          (String/replace (BeamLisp.Loader/read_source
-                            (Path/join source-root "priv/std/bl/android.bl.md"))
-            "(ns bl.android" "(ns qualification.android-pipeline"))))
-(defn invoke [name args]
- (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! prototype name) (to-list args)))
+;; This file exercises the real selected SDK's public managed producer. The
+;; prerequisite inventory keeps it on a host with its actual Nix daemon.
 (defn scratch []
- (let [root (Path/join (System/tmp_dir!) (str "android-pipeline-" (erlang/unique_integer (list :positive))))]
+ (let [root (Path/join (System/tmp_dir!) (str "android-managed-" (erlang/unique_integer (list :positive))))]
   (File/mkdir_p! root) root))
-(defn old-time! [file]
- (File/touch! file (tuple (tuple 2000 1 1) (tuple 0 0 0)))
- (:mtime (File/stat! file)))
+(defn manifest [result namespace]
+ (File/read! (Path/join (:product result) (str "units/" namespace "/artifact-unit.term"))))
+(defn check-complete-units [result]
+ (is (seq (:artifact-units result)))
+ (doseq [directory (:artifact-units result)]
+  (let [captured (BeamLisp.AOT/verify_unit directory)]
+   (is (BeamLisp.AOTCache/prepared_replay_complete? captured))
+   (doseq [[module bytes] (:beams captured)]
+    (is (= bytes (File/read! (Path/join (:product result) (str "ebin/" (Atom/to_string module) ".beam")))))))))
 
-(deftest managed-application-units-reuse-the-identical-product-and-rebuild-only-edits
+(deftest managed-application-retains-real-runtime-units-and-invalidates-only-affected-inputs
  (let [root (scratch) source (Path/join root "src") output (Path/join root "ebin")
-       file (Path/join source "android_incremental_fixture.bl")]
+       provider (Path/join source "android/managed/values.bl")
+       main (Path/join source "android/managed/main.bl")
+       obsolete (Path/join source "android/managed/obsolete.bl")
+       program "(ns android.managed.main (:require [android.managed.values :as v] [android.screen :refer [defscreen]])) (defscreen) (defn answer [] (v/answer))"]
   (try
-   (File/mkdir_p! source)
-   (File/write! (Path/join root "env.bl") "{:name \"android-fixture\" :paths [\"src\"]}")
-   (File/write! file "(ns android-incremental-fixture) (defn answer [] 41)")
-   (let [first-build (invoke "compile!" ["initial app" root [source] output])
-         product (:product first-build)
-         units (:artifact-units first-build)
-         bytes (into {} (map (fn [unit] [unit (File/read! (Path/join unit "artifact-unit.term"))]) units))
-         unchanged (invoke "compile!" ["unchanged app" root [source] output])]
-    (is (String/starts_with? product "/nix/store/"))
-    (is (= product (:product unchanged)))
+   (File/mkdir_p! (Path/dirname provider))
+   (File/write! (Path/join root "env.bl") "{:name \"android-managed-fixture\" :paths [\"src\"]}")
+   (File/write! provider "(ns android.managed.values) (defmacro answer [] 41)")
+   (File/write! main program)
+   (File/write! obsolete "(ns android.managed.obsolete) (defn old [] :old)")
+   (let [initial (android/compile! "initial app" root [source] output)
+         unchanged (android/compile! "unchanged app" root [source] output)]
+    (is (String/starts_with? (:product initial) "/nix/store/"))
+    (is (= 3 (:compiled initial)))
+    (check-complete-units initial)
+    (is (= (:product initial) (:product unchanged)))
     (is (= 0 (:compiled unchanged)))
-    (is (seq units))
-    (doseq [[unit manifest] bytes]
-     (is (= manifest (File/read! (Path/join unit "artifact-unit.term"))))
-     (is (= "android-incremental-fixture" (get-in (BeamLisp.AOT/verify_unit unit) [:manifest :namespace]))))
-    (File/write! file "(ns android-incremental-fixture) (defn answer [] 42)")
-    (let [edited (invoke "compile!" ["edited app" root [source] output])]
-     (is (not= product (:product edited)))
+    (File/write! main (String/replace program "(v/answer)" "(erlang/+ (v/answer) 1)"))
+    (let [edited (android/compile! "edited app" root [source] output)]
      (is (= 1 (:compiled edited)))
-     (is (seq (:artifact-units edited)))))
+     (is (= (manifest initial "android.managed.values") (manifest edited "android.managed.values")))
+     (is (= (manifest initial "android.managed.obsolete") (manifest edited "android.managed.obsolete")))
+     (is (not= (manifest initial "android.managed.main") (manifest edited "android.managed.main")))
+     (check-complete-units edited)
+     (File/write! provider "(ns android.managed.values) (defmacro answer [] 42)")
+     (let [macro-edited (android/compile! "macro input edit" root [source] output)]
+      (is (= 2 (:compiled macro-edited)))
+      (is (not= (manifest edited "android.managed.main") (manifest macro-edited "android.managed.main")))
+      (check-complete-units macro-edited)
+      (File/rm! obsolete)
+      (let [removed (android/compile! "removed namespace" root [source] output)]
+       (is (= 0 (:compiled removed)))
+       (is (= 2 (count (:artifact-units removed))))
+       (is (not (File/exists? (Path/join (:product removed) "units/android.managed.obsolete"))))
+       (is (empty? (Path/wildcard (Path/join (:product removed) "ebin/*Obsolete*"))))
+       (is (= (manifest macro-edited "android.managed.main") (manifest removed "android.managed.main")))
+       (check-complete-units removed)))))
    (finally (File/rm_rf! root)))))
