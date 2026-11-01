@@ -4,6 +4,40 @@
   (:require [build :as build] [build-plan :as plan] [build-log :as blog]
             [bl.env :as env] [vm.osenv :as osenv] [app-resource :as app]))
 
+(defn emit-produced-unit!
+ "Retain the complete runtime unit the one compiler already produced. The
+  constructor's read inventory is provenance; it must not recompile staged
+  descriptors or invent the runtime forwarder's replay coverage."
+ [prepared record ebin directory]
+ (let [key (:compiler-key prepared) modules (blog/module-names (:modules record))
+       digests (into {} (:digests record))
+       inputs (Enum/map (Enum/sort (Map/to_list (:inputs prepared)))
+                (fn [[n input]]
+                 (when-not (= (:digest input) (crypto/hash :sha256 (BeamLisp.Loader/read_source (:file input))))
+                  (throw (ex-info "Application constructor input changed" {:namespace n})))
+                 {:namespace n :sha256 (:digest input)}))]
+  (when-not (and (= key (:key record)) (seq modules) (= modules (distinct modules)))
+   (throw (ex-info "Application unit lacks its original producer module inventory" {})))
+  (File/mkdir_p! directory)
+  (let [members (Enum/map modules
+                 (fn [name]
+                  (when-not (= name (Path/basename name))
+                   (throw (ex-info "Invalid produced application module" {:module name})))
+                  (let [file (Path/join ebin (str name ".beam"))
+                        bytes (File/read! file) sha (crypto/hash :sha256 bytes)]
+                   (when-not (and (= (get digests name) (String/downcase (Base/encode16 sha)))
+                                  (BeamLisp.AOTCache/beam_provenance_matches? file key (:hash record)))
+                    (throw (ex-info "Produced application bytes changed" {:module name})))
+                   (File/write! (Path/join directory (str name ".beam")) bytes)
+                   {:module name :sha256 sha})))]
+   (File/write! (Path/join directory "artifact-unit.term")
+    (erlang/term_to_binary {:version 1 :namespace (:namespace prepared) :compiler-key key
+                           :inputs inputs :modules members :coverage (:coverage prepared)}))
+   ;; Coverage stays exactly what the real runtime compiler emitted. A strict
+   ;; compiled-only receiver refuses an incomplete unit; ordinary build callers
+   ;; retain their existing Source-effect contract.
+   (BeamLisp.AOT/verify_unit directory))))
+
 (let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
       base (System/get_env "BL_APPLICATION_BASE")
       previous (when base (Jason/decode! (File/read! (Path/join base "result.json"))))
@@ -70,7 +104,15 @@
                             (throw (ex-info "Invalid application namespace output path" {:namespace name})))
                         prior (when (and base (not (:force? options)) (File/regular? (Path/join directory "artifact-unit.term")))
                                 (BeamLisp.AOT/verify_unit directory))
+                        record (get (:manifest result) (:file source))
+                        produced-digests (into {} (:digests record))
                         reusable? (and prior (= name (get-in prior [:manifest :namespace]))
+                          (= (sort (blog/module-names (:modules record)))
+                             (sort (Enum/map (get-in prior [:manifest :modules]) :module)))
+                          (every? (fn [member]
+                            (= (get produced-digests (:module member))
+                               (String/downcase (Base/encode16 (:sha256 member)))))
+                            (get-in prior [:manifest :modules]))
                           (seq (get-in prior [:manifest :inputs]))
                           (every? (fn [input]
                             (when-let [path (BeamLisp.Loader/source_path (:namespace input))]
@@ -80,8 +122,7 @@
                         verified (if reusable? prior
                           (let [prepared (BeamLisp.AOT/prepare_unit workspace namespace)]
                             (when (File/exists? directory) (File/rm_rf! directory))
-                            (BeamLisp.AOT/emit_unit prepared directory)
-                            (BeamLisp.AOT/verify_unit directory)))]
+                            (emit-produced-unit! prepared record (Path/join out "ebin") directory)))]
                     {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))
               (finally (when workspace (BeamLisp.AOT/close_workspace! workspace))))))
         incoming (when planning

@@ -174,6 +174,108 @@
              action (butlast dirs))]
   (BeamLisp.Loader/with_search_dir (last dirs) run)))
 
+(defn ordinary-runtime-target
+ "Bind ordinary portable BEAM units to the actual SDK/floor and target native
+  bytes. Cross packagers replace native hashes only with their verified target
+  products; this observation grants no SDK or Source execution authority."
+ []
+ (let [inventory (BeamLisp.AOT/sdk_inventory_input)]
+  (when-not (elem inventory 1)
+   (throw (ex-info "Ordinary compiled deployment requires the actual sealed SDK"
+            {:kind :application-unit-sdk})))
+  {:sdk {:inventory (digest (elem inventory 1))}
+   :floor (digest (File/read! (Path/join (BeamLisp.Bootstrap/seed_dir) "manifest.term")))
+   :native (native-identity)}))
+
+(defn install-ordinary-units!
+ "Verify complete ordinary units and their immutable Source witnesses before
+  making compiled replay available. This is not a contextual factory receiver
+  or a compiler fallback. Deployment supplies authenticity, as for install!."
+ [root target]
+ (let [root (Path/expand root) source (Path/join root "source")
+       directories (Path/join root "units")
+       _ (when-not (= target (ordinary-runtime-target))
+           (throw (ex-info "Ordinary application target differs from its SDK, floor or native products"
+                    {:kind :application-unit-target})))
+       _ (when-not (and (File/dir? source) (File/dir? directories))
+           (throw (ex-info "Ordinary application units and Source witnesses are required"
+                    {:kind :application-unit-missing})))
+       names (vec (sort (File/ls! directories)))
+       _ (when-not (and (seq names) (<= (count names) 256) (every? namespace? names))
+           (throw (ex-info "Invalid ordinary application unit selection" {:kind :application-unit-selection})))
+       units (mapv (fn [n]
+                (let [directory (Path/join directories n)
+                      captured (BeamLisp.AOT/verify_unit directory)
+                      witness (Path/join source (str (String/replace n "." "/") ".bl"))
+                      classification (BeamLisp.AOT/sdk_namespace_classification n)
+                      declaration (when (File/regular? witness)
+                                    (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source witness)))
+                      replay? (BeamLisp.AOTCache/prepared_replay_complete? captured)]
+                 (when-not (and (= n (get-in captured [:manifest :namespace]))
+                                (= :ordinary classification) (= n declaration) replay?)
+                  (throw (ex-info "Ordinary application unit is missing its compiled replay or Source ownership"
+                           {:kind :application-unit-ownership :namespace n :classification classification
+                            :declaration declaration :replay-complete? replay?})))
+                 {:namespace n :directory directory :witness witness :captured captured})) names)]
+  (with-source-root source
+   (fn []
+    ;; Every input and complete unit is checked before changing any code path.
+    ;; A project artifact can never substitute a member of the actual SDK.
+    (doseq [unit units]
+     (let [captured (:captured unit) n (:namespace unit)
+           inputs (get-in captured [:manifest :inputs])
+           own (first (filter #(= n (:namespace %)) inputs))]
+      (when-not (and (seq inputs) own
+                     (= (:sha256 own) (crypto/hash :sha256 (BeamLisp.Loader/read_source (:witness unit)))))
+       (throw (ex-info "Ordinary application Source witness changed" {:kind :application-unit-source :namespace n})))
+      (doseq [input inputs]
+       (let [bytes (BeamLisp.Loader/source_content (:namespace input))]
+        (when-not (and bytes (= (:sha256 input) (crypto/hash :sha256 bytes)))
+         (throw (ex-info "Ordinary application input changed"
+                  {:kind :application-unit-source :namespace (:namespace input)})))))
+      (doseq [[module bytes] (:beams captured)]
+       (let [inventory (BeamLisp.AOT/sdk_inventory_input)]
+        (when (or (BeamLisp.Bootstrap/packaged_member? module)
+                  (and (elem inventory 1)
+                       (BeamLisp.Env/sdk_inventory_metadata! (elem inventory 1) (Atom/to_string module))))
+         (throw (ex-info "Ordinary application contains an SDK module"
+                  {:kind :application-unit-sdk :module module})))))))
+    ;; Revalidate the immutable selection before publication. The cache receives
+    ;; real compiler bytes, never an invented SDK inventory or replay receipt.
+    (doseq [unit units]
+     (when-not (= (:captured unit) (BeamLisp.AOT/verify_unit (:directory unit)))
+      (throw (ex-info "Ordinary application unit changed during capture" {:kind :application-unit-changed}))))
+    (when-not (= target (ordinary-runtime-target))
+     (throw (ex-info "Ordinary application target changed during capture" {:kind :application-unit-target})))
+    (doseq [unit units]
+     (let [n (:namespace unit) key (BeamLisp.AOTCache/compiler_key)
+           closure (BeamLisp.AOT/ns_closure_hash n (:witness unit))
+           modules (Enum/map (get-in unit [:captured :beams]) (fn [beam] (elem beam 0)))
+           previous (when closure (BeamLisp.AOTCache/prepare_fetch key closure))]
+      (when-not closure
+       (throw (ex-info "Ordinary application closure is unavailable" {:kind :application-unit-source :namespace n})))
+      (when-not (and previous (BeamLisp.AOTCache/prepared_replay_complete? previous))
+       (BeamLisp.AOTCache/store key closure (:directory unit) modules))
+      (let [prepared (BeamLisp.AOTCache/prepare_fetch key closure)]
+       (when-not (and prepared (BeamLisp.AOTCache/prepared_replay_complete? prepared)
+                      (= (sort (:beams prepared)) (sort (get-in unit [:captured :beams]))))
+        (throw (ex-info "Ordinary application has no exact compiled replay"
+                 {:kind :application-unit-replay :namespace n :compiler key :closure closure
+                  :cache-present? (not (nil? prepared))
+                  :coverage? (when prepared (BeamLisp.AOTCache/prepared_replay_complete? prepared))
+                  :provenance? (every? #(BeamLisp.AOTCache/beam_provenance_matches?
+                                         (Path/join (:directory unit) (str (Atom/to_string %) ".beam")) key closure) modules)
+                  :same-bytes? (when prepared (= (sort (:beams prepared)) (sort (get-in unit [:captured :beams]))))}))))))
+    (doseq [unit units]
+     (doseq [input (get-in unit [:captured :manifest :inputs])]
+      (let [bytes (BeamLisp.Loader/source_content (:namespace input))]
+       (when-not (and bytes (= (:sha256 input) (crypto/hash :sha256 bytes)))
+        (throw (ex-info "Ordinary application input changed during capture"
+                 {:kind :application-unit-source :namespace (:namespace input)})))))
+     (when-not (Code/prepend_path (:directory unit))
+      (throw (ex-info "Ordinary application code directory unavailable" {:kind :application-unit-missing}))))))
+  names))
+
 (defn- build-unit!
  "Create a new immutable package directory. Compile supported library units;
   retain sources for all units so unsupported top-level effects replay normally.
