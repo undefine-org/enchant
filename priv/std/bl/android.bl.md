@@ -176,14 +176,16 @@ naming the step and the tail of its output — never a stack trace through here.
         identity (crypto/hash :sha256
                    (erlang/term_to_binary [(File/read! src) (erlang/system_info :version)]))]
     (File/mkdir_p! outdir)
-    (when-not (and (File/regular? beam) (File/regular? stamp) (= identity (File/read! stamp)))
+    (when-not (and (File/regular? beam) (File/regular? stamp)
+                   (= (erlang/term_to_binary [identity (crypto/hash :sha256 (File/read! beam))])
+                      (File/read! stamp)))
       (println (str "  · " label))
       (let [result (erlang/apply :compile :file
                      (list (erlang/binary_to_list src)
                        (list (tuple :outdir (erlang/binary_to_list outdir)) :return_errors :return_warnings)))]
         (when-not (and (tuple? result) (= :ok (elem result 0)))
           (throw (ex-info (str label ": " (pr-str result)) {:step label})))
-        (File/write! stamp identity)))
+        (File/write! stamp (erlang/term_to_binary [identity (crypto/hash :sha256 (File/read! beam))]))))
     beam))
 
 (defn adb!
@@ -469,7 +471,7 @@ not an app that silently lacks its bridge.
             (str "-Dplugin_c_nifs=" (Path/join (priv) "android/jni/bl_android_nif.c"))]
            {:cd (Path/join out "android")})))
 
-(declare stage!)
+(declare stage! tree-files sync-files!)
 
 (defn bundle! [t out]
   (let [st (stage! t)
@@ -510,16 +512,21 @@ not an app that silently lacks its bridge.
         mob-new (ensure-input! (first build-inputs))
         exqlite (ensure-input! (second build-inputs))
         otp (ensure-otp! (:abi t))
-        out (:build t)]
-    (File/rm_rf! (:android t))
+        out (:build t)
+        generated (Path/join out "project-inputs")]
+    ;; Render the small source projection separately; syncing final bytes keeps
+    ;; Gradle/zig outputs and unchanged Kotlin inputs across builds.
+    (File/rm_rf! generated)
     (println "  · project from mob_new templates")
-    (render-templates! t mob-new out)
-    (layer! t out)
+    (render-templates! t mob-new generated)
+    (layer! t generated)
     (when (:release? t)
-      (edit! (Path/join (list out "android/app/src/main/java"
+      (edit! (Path/join (list generated "android/app/src/main/java"
                             (join "/" (vec (split (:id t) "."))) "MainActivity.kt"))
              "        nativeSetActivity(this)\n"
              "        android.system.Os.setenv(\"MOB_RELEASE\", \"1\", true)\n        nativeSetActivity(this)\n"))
+    (sync-files! (:android t) (tree-files (Path/join generated "android") "")
+                 (Path/join out "project-files.term"))
     (native! t mob exqlite otp out)
     (when (:standalone? t) (bundle! t out))
     (let [apk (apk! out (:release? t))]
@@ -640,6 +647,10 @@ dependencies are missing.
     (when-not (and (= 1 (get contract "version")) (= "android-native-contract" (get contract "kind"))
                    (= 1 (get artifact "version")) (= "android-native-library" (get artifact "kind"))
                    (= "lazy_memo" (get artifact "crate")) (= "lazy_memo" (get contract "crate"))
+                   (string? (get contract "source_sha256"))
+                   (Regex/match? #"^[0-9a-f]{64}$" (get contract "source_sha256"))
+                   (map? (get contract "source_files")) (seq (get contract "source_files"))
+                   (erlang/is_list (get contract "nifs")) (seq (get contract "nifs"))
                    (= abi (get artifact "abi")) (= target (get artifact "target"))
                    (= "liblazy_memo.so" (get artifact "library")) (= sha (get artifact "sha256"))
                    (= (get contract "source_sha256") (get artifact "source_sha256"))
@@ -677,6 +688,7 @@ dependencies are missing.
         app-out (Path/join cache "app")
         erl-out (Path/join cache "erl")
         bl-name "beam_lisp-0.1.0" bl-prefix (str "otp/lib/" bl-name)
+        native (native-lazy-memo (:abi t))
         _ (File/mkdir_p! cache) _ (File/mkdir_p! erl-out)
         _ (compile-tree! t app-out)
         _ (boot-module! t erl-out)
@@ -705,7 +717,7 @@ dependencies are missing.
                      (beams app-out (str "otp/" (:app t)))
                      {(str "otp/" (:app t) "/" (:app t) ".beam") (Path/join erl-out (str (:app t) ".beam"))
                       (str bl-prefix "/ebin/bl_android_nif.beam") (Path/join erl-out "bl_android_nif.beam")
-                      (str bl-prefix "/priv/native/lazy_memo.so") (native-lazy-memo (:abi t))})]
+                      (str bl-prefix "/priv/native/lazy_memo.so") native})]
     (println "  · synchronize runtime")
     (sync-files! st files (Path/join (:build t) "stage-files.term"))
     (device-app-file! (Path/join (list st bl-prefix "ebin/beam_lisp.app"))
