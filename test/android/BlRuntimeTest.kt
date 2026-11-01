@@ -129,6 +129,98 @@ class BlRuntimeTest {
             assertFalse(receipt(root).readText().contains("old.beam"))
         } finally { root.deleteRecursively() }
     }
+    @Test fun launcherOwnedHelpersSurviveUpgradeAndLoseReceiptOwnership() {
+        val root = Files.createTempDirectory("runtime-launcher-helpers").toFile()
+        val helpers = listOf("epmd", "erl_child_setup", "inet_gethost", "sqlite3_nif")
+        val relative = helpers.take(3).map { "erts-16.0/bin/$it" } +
+            "lib/exqlite-0.35.0/priv/sqlite3_nif.so"
+        try {
+            install(root, archive(app to "v1", *relative.map { "otp/$it" to "bundled helper" }.toTypedArray()))
+            for ((index, path) in relative.withIndex()) {
+                val library = root.resolve("native-libs/lib${helpers[index]}.so")
+                write(root, "native-libs/${library.name}", "APK executable ${helpers[index]}")
+                assertTrue(root.resolve("otp/$path").delete())
+                Files.createSymbolicLink(root.resolve("otp/$path").toPath(), library.toPath())
+            }
+            val bytes = archive(app to "v2", "otp/pocket/new.beam" to "new code")
+            install(root, bytes)
+            assertEquals("v2", root.resolve(app).readText())
+            assertEquals(digest(bytes), root.resolve(".bl-runtime").readText())
+            for ((index, path) in relative.withIndex()) {
+                val helper = root.resolve("otp/$path")
+                val library = root.resolve("native-libs/lib${helpers[index]}.so")
+                assertTrue(Files.isSymbolicLink(helper.toPath()))
+                assertEquals(library.toPath(), Files.readSymbolicLink(helper.toPath()))
+                assertEquals("APK executable ${helpers[index]}", library.readText())
+                assertFalse(receipt(root).readLines().any { it.endsWith("  $path") })
+            }
+            BlRuntime.install(root, digest(bytes)) { error("Upgraded runtime must relaunch without reopening ZIP") }
+            install(root, archive(app to "v3"))
+            assertTrue(relative.all { Files.isSymbolicLink(root.resolve("otp/$it").toPath()) })
+        } finally { root.deleteRecursively() }
+    }
+    @Test fun obsoleteDanglingHelperIsPreservedWithoutFollowingOrReclaimingIt() {
+        val root = Files.createTempDirectory("runtime-dangling-helper").toFile()
+        val path = "erts-16.0/bin/epmd"
+        try {
+            install(root, archive(app to "v1", "otp/$path" to "old helper"))
+            val helper = root.resolve("otp/$path")
+            val missing = root.resolve("native-libs/not-yet-present.so")
+            assertTrue(helper.delete())
+            Files.createSymbolicLink(helper.toPath(), missing.toPath())
+            val bytes = archive(app to "v2")
+            install(root, bytes)
+            assertTrue(Files.isSymbolicLink(helper.toPath()))
+            assertEquals(missing.toPath(), Files.readSymbolicLink(helper.toPath()))
+            assertFalse(missing.exists())
+            assertFalse(receipt(root).readLines().any { it.endsWith("  $path") })
+            assertEquals(digest(bytes), root.resolve(".bl-runtime").readText())
+        } finally { root.deleteRecursively() }
+    }
+    @Test fun obsoleteSymlinkAncestorCannotPruneMatchingForeignBytes() {
+        val root = Files.createTempDirectory("runtime-obsolete-ancestor").toFile()
+        val path = "lib/retired/member"
+        try {
+            install(root, archive(app to "v1", "otp/$path" to "same bytes"))
+            val ancestor = root.resolve("otp/lib/retired")
+            assertTrue(ancestor.resolve("member").delete())
+            assertTrue(ancestor.delete())
+            write(root, "foreign/member", "same bytes")
+            val foreign = root.resolve("foreign")
+            Files.createSymbolicLink(ancestor.toPath(), foreign.toPath())
+            val bytes = archive(app to "v2")
+            install(root, bytes)
+            assertTrue(Files.isSymbolicLink(ancestor.toPath()))
+            assertEquals(foreign.toPath(), Files.readSymbolicLink(ancestor.toPath()))
+            assertEquals("same bytes", foreign.resolve("member").readText())
+            assertFalse(receipt(root).readLines().any { it.endsWith("  $path") })
+            assertEquals(digest(bytes), root.resolve(".bl-runtime").readText())
+        } finally { root.deleteRecursively() }
+    }
+    @Test fun incomingLauncherHelperLinksStillRefuseBeforeChangingRuntime() {
+        for (dangling in listOf(false, true)) {
+            val root = Files.createTempDirectory("runtime-incoming-helper").toFile()
+            val path = "erts-16.0/bin/erl_child_setup"
+            try {
+                val old = archive(app to "v1", "otp/$path" to "old helper")
+                install(root, old)
+                val helper = root.resolve("otp/$path")
+                val library = root.resolve("native-libs/libchild_setup.so")
+                if (!dangling) write(root, "native-libs/libchild_setup.so", "APK executable")
+                assertTrue(helper.delete())
+                Files.createSymbolicLink(helper.toPath(), library.toPath())
+                val previousReceipt = receipt(root).readText()
+                fails { install(root, archive(app to "v2", "otp/$path" to "new helper")) }
+                assertEquals("v1", root.resolve(app).readText())
+                assertEquals(digest(old), root.resolve(".bl-runtime").readText())
+                assertEquals(previousReceipt, receipt(root).readText())
+                assertTrue(Files.isSymbolicLink(helper.toPath()))
+                assertEquals(library.toPath(), Files.readSymbolicLink(helper.toPath()))
+                if (dangling) assertFalse(library.exists())
+                else assertEquals("APK executable", library.readText())
+            } finally { root.deleteRecursively() }
+        }
+    }
     @Test fun collisionsBackUpUnownedAndModifiedFiles() {
         val root = Files.createTempDirectory("runtime-collision").toFile()
         try {
@@ -250,8 +342,11 @@ class BlRuntimeTest {
             install(root, archive(app to "old", "otp/old" to "code"))
             root.resolve("otp/old").delete()
             write(root, "otp/old/user.db", "directory database")
-            install(root, archive(app to "new"))
+            val bytes = archive(app to "new")
+            install(root, bytes)
             assertEquals("directory database", root.resolve("otp/old/user.db").readText())
+            assertFalse(receipt(root).readLines().any { it.endsWith("  old") })
+            assertEquals(digest(bytes), root.resolve(".bl-runtime").readText())
         } finally { root.deleteRecursively() }
     }
     @Test fun rejectsNonCanonicalZipPathsAndDirectoryPayloads() {
