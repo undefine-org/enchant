@@ -810,30 +810,35 @@
                  (source-guards-under? upcast input {:tag :request} facts [[old input {:tag :request}]])
                  (source-guards-under? candidate converted {:tag :request} facts [[old input {:tag :request}]]))))
          (true-cases (:expression old))))
+(defn- compare-captured-callbacks [a b c domain]
+ (if-not (every? #(and (= :proved (:status %)) (= 1 (:arity %)) (empty? (:reads %))) [a b c])
+  {:status :unknown :scope :message-predicate-preservation
+   :reason (or (:reason (first (filter #(not= :proved (:status %)) [a b c]))) :message-proof-unavailable)}
+  (try
+   (let [decision (compare-expressions (:expression a) (:expression b) (:expression c) domain)]
+    (if (and (= :proved (:status decision)) (total-migration? a b c domain))
+     (assoc decision :evidence [a b c])
+     (assoc decision :status :unknown :reason (:reason decision :unproved-message-totality-or-identity))))
+   (catch error {:status :unknown :scope :message-predicate-preservation
+                 :reason (or (:reason (ex-data error)) :message-proof-unavailable)}))))
+(defn- stale-relation [decision]
+ (if (= :proved (:status decision))
+  (dissoc (assoc decision :status :unknown :reason :stale-callback-evidence) :evidence)
+  decision))
+(defn- fresh-relation [decision evidence]
+ (if (and (= :proved (:status decision)) (not (every? valid? (distinct evidence))))
+  (stale-relation decision) decision))
 (defn- compare-callbacks-once
- "Three actual privately retained callback records {:function :environment}.
-  Totality also covers actual Source argument-budget guards, using closed
-  bounds or guards reached on the old accepted path. A first-order type alone
-  is not a native argv size bound. No supplied expression grants adoption."
+ "Actual privately retained callback records only. Public comparisons capture
+  and freshly validate each proof; no supplied captured evidence is accepted."
  [old upcast candidate domain]
- (let [a (capture-record old)
-       b (capture-record upcast)
-       c (capture-record candidate)]
-  (if-not (every? #(and (= :proved (:status %)) (= 1 (:arity %)) (empty? (:reads %))) [a b c])
-   {:status :unknown :scope :message-predicate-preservation
-    :reason (or (:reason (first (filter #(not= :proved (:status %)) [a b c]))) :message-proof-unavailable)}
-   (try
-    (let [decision (compare-expressions (:expression a) (:expression b) (:expression c) domain)]
-     (if (and (= :proved (:status decision)) (total-migration? a b c domain) (every? valid? [a b c]))
-      (assoc decision :evidence [a b c])
-      (assoc decision :status :unknown :reason (:reason decision :unproved-message-totality-or-identity))))
-    (catch error {:status :unknown :scope :message-predicate-preservation
-                  :reason (or (:reason (ex-data error)) :message-proof-unavailable)})))))
+ (let [a (capture-record old) b (capture-record upcast) c (capture-record candidate)]
+  (fresh-relation (compare-captured-callbacks a b c domain) [a b c])))
 (defn compare-callbacks
  ([old upcast candidate] (compare-callbacks old upcast candidate :unrestricted))
  ([old upcast candidate domain] (decision! #(compare-callbacks-once old upcast candidate domain))))
 
-(defn- compare-replies-once
+(defn- compare-captured-replies
  "Exact relational future-input proof. For every old accepted request and
   every reply satisfying the candidate contract at its upcast request, prove
   that downcast(reply, ORIGINAL request) satisfies the old reply contract.
@@ -841,11 +846,8 @@
   invoked here, and all non-absent inputs use actual retained registrations.
   Shared argument budgets include both reply and original request; only guards
   reached by successful predicates can supply Source budget assumptions."
- [old-accept upcast candidate-reply downcast old-reply domain]
- (let [records [old-accept upcast candidate-reply downcast old-reply]
-       captured (mapv #(when % (capture-record %)) records)
-       [a b c d e] captured
-       evidence (vec (filter some? captured))]
+ [a b c d e domain]
+ (let [evidence (vec (filter some? [a b c d e]))]
   (if-not (and a b (every? #(and (= :proved (:status %)) (empty? (:reads %))) evidence)
                (= 1 (:arity a)) (= 1 (:arity b))
                (every? #(contains? #{1 2} (:arity %)) (filter some? [c d e])))
@@ -881,12 +883,15 @@
                                       (or (nil? e) (source-guards-under? e result request facts
                                                      (cond-> [[a request request]] c (conj [c reply converted]))))))})) reply-cases)))) cases)
           proved (every? #(and (:predicate %) (:totality %)) (mapcat identity decisions))]
-     (if (and proved (every? valid? evidence))
+     (if proved
       {:status :proved :scope :reply-predicate-preservation :cases (count cases) :evidence evidence}
       {:status :unknown :scope :reply-predicate-preservation :reason :reply-domain-not-preserved
        :decisions decisions}))
     (catch error {:status :unknown :scope :reply-predicate-preservation
                   :reason (or (:reason (ex-data error)) :reply-proof-unavailable)})))))
+(defn- compare-replies-once [old-accept upcast candidate-reply downcast old-reply domain]
+ (let [[a b c d e] (mapv #(when % (capture-record %)) [old-accept upcast candidate-reply downcast old-reply])]
+  (fresh-relation (compare-captured-replies a b c d e domain) (filter some? [a b c d e]))))
 (defn compare-replies
  ([old-accept upcast candidate-reply downcast old-reply]
   (compare-replies old-accept upcast candidate-reply downcast old-reply :unrestricted))
@@ -913,29 +918,26 @@
                 (eager-read-value? target)
                 (total-under? (assoc proof :obligations [obligation]) input facts))))
          (:obligations proof)))
+(defn- compare-captured-state [a b value]
+ (try
+  (if (and (every? #(and (= :proved (:status %)) (= 1 (:arity %))) [a b])
+           (current-state-operations? a (lit value))
+           ;; Current-state operations can still refuse in bounded rehearsal;
+           ;; they cannot execute unknown code or a computed query provider.
+           (empty? (:reads b))
+           (current-state-operations? b (substitute (:expression a) (lit value) [])))
+   {:status :proved :scope :read-only-current-state :evidence [a b]}
+   {:status :unknown :scope :read-only-current-state :reason :unproved-current-state-operations})
+  (catch error {:status :unknown :scope :read-only-current-state
+                :reason (or (:reason (ex-data error)) :state-proof-unavailable)})))
 (defn compare-current-state
- "Read-only CURRENT-state conversion evidence, distinct from a universal
-  future-message/reply proof. Every operation is closed and actual retained
-  byte identity is checked. Live reads require the exact SDK stored-query
-  reader. Conversion/checks still execute once under observing + deadline;
-  runtime value validation and the owner revision CAS remain mandatory."
+ "Read-only CURRENT-state evidence with fresh capture/identity validation.
+  Conversion and invariant still run once under observing plus deadline;
+  runtime value validation and owner revision CAS remain mandatory."
  [migration check value]
- (decision!
-  (fn []
-   (let [a (capture-record migration) b (capture-record check)]
-    (try
-     (if (and (every? #(and (= :proved (:status %)) (= 1 (:arity %))) [a b])
-              (current-state-operations? a (lit value))
-              ;; The candidate invariant checks the converted value at runtime.
-              ;; Its primitive obligations may fail, but cannot call unknown
-              ;; code; plain-map dispatch remains guarded by the actual value.
-              (empty? (:reads b))
-              (current-state-operations? b (substitute (:expression a) (lit value) []))
-              (every? valid? [a b]))
-      {:status :proved :scope :read-only-current-state :evidence [a b]}
-      {:status :unknown :scope :read-only-current-state :reason :unproved-current-state-operations})
-     (catch error {:status :unknown :scope :read-only-current-state
-                   :reason (or (:reason (ex-data error)) :state-proof-unavailable)}))))))
+ (decision! (fn []
+  (let [a (capture-record migration) b (capture-record check)]
+   (fresh-relation (compare-captured-state a b value) [a b])))))
 
 (defn- value-path [term]
  (case (:tag term)
@@ -997,3 +999,36 @@
       :depth (reduce max 0 (map :depth costs))})
     (catch error {:status :unknown :scope :affine-first-order-output
                   :reason (or (:reason (ex-data error)) :message-output-bound-unavailable)})))))
+
+
+(defn- callback-record-key [record]
+ ;; Opaque registrations identify actual native retention, not just an MFA or
+ ;; an environment-shaped value. Unregistered comparisons retain exact record
+ ;; identity and the existing authentic capture path.
+ (if (:registration record) (tuple :registration (:registration record)) (tuple :record record)))
+(defn compare-transition
+ "Inspect one owner's actual callback records once, evaluate the three closed
+  relations privately, and freshly validate every unique proved capture once.
+  Inputs are actual callback records, never supplied proofs or a cache flag.
+  Commit independently repeats fresh validation of the returned identities."
+ [old-accept upcast candidate-accept candidate-reply downcast old-reply migration check value domain]
+ (let [records [old-accept upcast candidate-accept candidate-reply downcast old-reply migration check]
+       captures (reduce (fn [out record]
+                   (if-not record out
+                    (let [key (callback-record-key record)]
+                     (if (maps/is_key key out) out (maps/put key (capture-record record) out))))) (maps/new) records)
+       [a b c r d e m k] (mapv #(when % (maps/get (callback-record-key %) captures nil)) records)
+       message (decision! #(compare-captured-callbacks a b c domain))
+       reply (decision! #(compare-captured-replies a b r d e domain))
+       state (decision! #(compare-captured-state m k value))
+       bounds (when (= :bounded-first-order domain)
+                {:message-output-bound (conversion-bounds b false)
+                 :reply-output-bound (if d (conversion-bounds d true)
+                                      {:status :proved :nodes 0 :bytes 0 :depth 0})})
+       evidence (vec (distinct (filter #(= :proved (:status %)) (maps/values captures))))
+       fresh? (or (not-any? #(= :proved (:status %)) [message reply state])
+                  (every? valid? evidence))]
+  (if fresh?
+   {:message message :reply reply :state state :bounds bounds :downcast-proof d}
+   {:message (stale-relation message) :reply (stale-relation reply) :state (stale-relation state)
+    :bounds nil :downcast-proof nil})))
