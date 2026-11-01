@@ -2,6 +2,12 @@
 ;; the constructor read, not the inventory of the containing SDK/workspace.
 (ns unit-store (:require [build-log :as blog]))
 
+(defn- measure [timings stage run]
+  (let [started (erlang/monotonic_time :microsecond)]
+    (try (run)
+      (finally (swap! timings update stage (fn [elapsed]
+        (+ (or elapsed 0) (- (erlang/monotonic_time :microsecond) started))))))))
+
 (defn- hex [bytes] (Base/encode16 bytes (list (tuple :case :lower))))
 (defn- digest [text] (hex (crypto/hash :sha256 text)))
 (defn- read-index [directory]
@@ -160,7 +166,8 @@
   [opts]
   (when-not (contains? #{nil :full} (:scope opts))
     (throw (ex-info "SDK unit production requires its complete source selection" {})))
-  (let [out (:out opts) root (BeamLisp.AOT/physical_sdk_path (:root opts))
+  (let [started (erlang/monotonic_time :microsecond) timings (atom {})
+        out (:out opts) root (BeamLisp.AOT/physical_sdk_path (:root opts))
         sdk (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
         _ (when-not (and root (= root sdk))
             (throw (ex-info "SDK unit production requires the actual SDK source root" {})))
@@ -187,18 +194,18 @@
         (BeamLisp.AOT/with_source_snapshot
          (fn [] (reduce (fn [acc path]
           (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
-                unit-key (BeamLisp.AOTCache/key_for_source path)
+                unit-key (measure timings :unit-keys (fn [] (BeamLisp.AOTCache/key_for_source path)))
                 prior (get old namespace)
                 directory (Path/join (Path/join out ".units") namespace)
                 reusable (and (not (:force? opts)) prior (= unit-key (get prior "key"))
-                              (inputs-current? (get prior "inputs") root selected))
+                              (measure timings :reuse-inputs (fn [] (inputs-current? (get prior "inputs") root selected))))
                 [verified inputs compiled?]
                 (if reusable
                   (let [source (Path/join (Path/join previous ".units") namespace)
-                        verified (BeamLisp.AOT/verify_unit source)]
+                        verified (measure timings :verify-restored (fn [] (BeamLisp.AOT/verify_unit source)))]
                     (verify-inputs! verified (get prior "inputs") namespace)
                     (when (not= source directory)
-                      (File/rm_rf! directory) (File/cp_r! source directory))
+                      (measure timings :copy-restored (fn [] (File/rm_rf! directory) (File/cp_r! source directory))))
                     [verified (get prior "inputs") false])
                   (let [workspace (BeamLisp.AOT/open_workspace
                           {:version 2 :phase-imports (list 'core 'sugar) :roots (list root)
@@ -218,11 +225,11 @@
                          (= (tuple :ok bytes) (File/read (Path/join out (str (Atom/to_string module) ".beam")))))
                          (:beams verified)))
                 modules (vec (map first (:beams verified)))
-                _ (doseq [[module bytes] (:beams verified)]
-                    (File/write! (Path/join out (str (Atom/to_string module) ".beam")) bytes))
-                entry {:hash (BeamLisp.AOT/ns_closure_hash namespace)
+                _ (measure timings :write-flat (fn [] (doseq [[module bytes] (:beams verified)]
+                    (File/write! (Path/join out (str (Atom/to_string module) ".beam")) bytes))))
+                entry {:hash (measure timings :closure-hash (fn [] (BeamLisp.AOT/ns_closure_hash namespace)))
                        :key unit-key :modules modules
-                       :digests (blog/artifact-digests out modules)
+                       :digests (measure timings :output-digests (fn [] (blog/artifact-digests out modules)))
                        :preparation-key (digest (Jason/encode! inputs))}]
             (when-let [log (:log opts)]
               (when-not same? (log (str (if compiled? "compile " "restore ") namespace))))
@@ -233,9 +240,9 @@
               (assoc-in [:units namespace] {"file" (Path/relative_to path root) "key" unit-key "inputs" inputs}))))
           {:built 0 :compiled 0 :cached 0 :errors [] :manifest {} :units {} :ex-built 0
            :lock-wait-us 0 :native {:built 0 :cached 0 :artifacts [] :errors []}} paths)))]
-    (doseq [[namespace row] (:units result)]
+    (measure timings :final-inputs (fn [] (doseq [[namespace row] (:units result)]
       (when-not (inputs-current? (get row "inputs") root selected)
-        (throw (ex-info "Unit inputs changed during production" {:namespace namespace}))))
+        (throw (ex-info "Unit inputs changed during production" {:namespace namespace}))))))
     ;; Full production owns removal. No old beam can survive outside the new
     ;; manifest; partial/scoped production preserves its explicit predecessor.
     (doseq [namespace (keys old)]
@@ -250,4 +257,7 @@
     (when-let [manifest (:manifest opts)] (File/write! manifest (erlang/term_to_binary (:manifest result))))
     (when-let [log (:log-path opts)]
       (blog/write! log (blog/facts-of (blog/state-of-manifest (:manifest result)))))
+    (println (str "SDK-UNIT-PHASES " (Jason/encode!
+      {:elapsed-us (- (erlang/monotonic_time :microsecond) started)
+       :phases-us @timings :compiled (:compiled result) :cached (:cached result)})))
     (dissoc result :units)))

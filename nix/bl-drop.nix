@@ -211,7 +211,18 @@ let
     dontConfigure = true;
     dontFixup = true; # the drop is one opaque file
 
-    buildPhase = setupTree + ''
+    buildPhase = ''
+      sdk_phase_start() {
+        sdk_phase_label=$1
+        sdk_phase_started=$(date +%s%N)
+      }
+      sdk_phase_end() {
+        local elapsed=$(( ($(date +%s%N) - sdk_phase_started) / 1000 ))
+        printf 'SDK-SHELL-PHASE {"stage":"%s","elapsed-us":%s}\n' "$sdk_phase_label" "$elapsed"
+      }
+      sdk_phase_start setup
+    '' + setupTree + ''
+      sdk_phase_end
       runHook preBuild
       rm -rf "$XDG_CACHE_HOME/beam_lisp/ebin"
       cp -a --no-preserve=ownership ${dependencies}/ebin "$XDG_CACHE_HOME/beam_lisp/ebin"
@@ -244,8 +255,11 @@ let
         fi
       ''}
       # Preparation, floor validation and assembly share one producer VM.
+      sdk_phase_start producer
       ./bin/bl --cold run scripts/produce-sdk.bl
+      sdk_phase_end
 
+      sdk_phase_start copy-sdk-image
       chmod -R u+w $TMPDIR/payload
       # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
       # checks the existing sealed metadata and actual bytes at load time.
@@ -294,6 +308,8 @@ let
       ${pkgs.jq}/bin/jq --arg release "$out" --arg source "$src" \
         '. + {release: $release, source: $source}' "$sdk/artifact.json" > "$sdk/artifact.tmp"
       mv "$sdk/artifact.tmp" "$sdk/artifact.json"
+      sdk_phase_end
+      sdk_phase_start portable-retarget
       # A portable drop carries bytes rather than references to its build store.
       for native in $TMPDIR/payload/lib/beam_lisp-*/priv/native/*.so; do
         if [ -L "$native" ]; then
@@ -333,7 +349,10 @@ let
               counts['interpreters'] += 1
       print('PORTABLE-PAYLOAD ' + json.dumps(counts), flush=True)
       PORTABLE
+      sdk_phase_end
+      sdk_phase_start pack-portable
       $TMPDIR/drop pack --release $TMPDIR/payload --launcher $TMPDIR/launcher --out $TMPDIR/bl.drop
+      sdk_phase_end
       runHook postBuild
     '';
 
