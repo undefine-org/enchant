@@ -13,6 +13,7 @@ let
     && builtins.all (part: part != ".." && part != "") (pkgs.lib.splitString "/" value);
   source = builtins.storePath request.source;
   image = builtins.storePath sdk;
+  workerFilesystem = import ./sdk-worker-filesystem.nix { inherit pkgs; sdk = image; };
   descriptor = builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile (image + "/artifact.json")));
   platform = builtins.storePath descriptor.platform;
   nativeDirectory = source + "/native";
@@ -62,6 +63,19 @@ let
     BeamLisp.AOT.boot()
     BeamLisp.run_file("${./application-worker.bl}")
   '';
+  bounded = import ./bounded-build.nix {
+    inherit pkgs;
+    memoryMiB = 6144;
+    diskMiB = 32768;
+    cpuCount = 4;
+    commandManager = true;
+  };
+  worker = drv: pkgs.lib.overrideDerivation (bounded drv) (old: {
+    env = old.env // {
+      QEMU_OPTS = old.env.QEMU_OPTS
+        + " -drive file=${workerFilesystem}/lib.ext4,format=raw,if=virtio,readonly=on";
+    };
+  });
 in
 assert (requestJson == null) != (requestPath == null);
 assert (request.version == 1 && builtins.attrNames request == [ "ex" "exclude" "jobs" "native" "source" "sources" "version" "world" ])
@@ -93,13 +107,7 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
 if unchanged then import ./application-artifact.nix {
   inherit sdk;
   requestJson = builtins.readFile (base + "/production-request.json");
-} else (import ./bounded-build.nix {
-  inherit pkgs;
-  memoryMiB = 6144;
-  diskMiB = 32768;
-  cpuCount = 4;
-  commandManager = true;
-}) (pkgs.runCommand "beam-lisp-application" {
+} else worker (pkgs.runCommand "beam-lisp-application" {
   nativeBuildInputs = [ pkgs.python3 ];
 } ''
   mkdir -p /build/project "$out"
@@ -116,14 +124,10 @@ if unchanged then import ./application-artifact.nix {
   export HOME=/build/home XDG_CACHE_HOME=/build/home/.cache BL_DAEMON=off
   export PATH=${platform}/bin:$PATH
   export LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1"
-  # SDK admission repeatedly reads and stats the compiler, sources and unit
-  # inventory. Keep those reads on the guest disk instead of crossing virtiofs
-  # for every check. This is a read-only, byte-preserving relocation of the
-  # selected SDK; its identity and every producer/receiver check stay intact.
+  # The selected SDK's immutable filesystem is shared across requests. Its
+  # bytes remain local and read-only without recopying the SDK for every guest.
   mkdir -p /build/sdk/lib
-  cp -a --no-preserve=ownership ${image}/lib/. /build/sdk/lib/
-  ${pkgs.util-linux}/bin/mount --bind /build/sdk/lib /build/sdk/lib
-  ${pkgs.util-linux}/bin/mount -o remount,bind,ro /build/sdk/lib
+  ${pkgs.util-linux}/bin/mount -t ext4 -o ro,noload /dev/vdb /build/sdk/lib
   export BL_ROOT="/build/sdk/lib/$(basename "$(readlink -f ${image}/image)")" BL_BIN=${image}/bl
   export BL_ARTIFACT_PLATFORM=${platform}/artifact-platform
   ${pkgs.lib.optionalString (nativeSet != null) "export BL_PREPARED_NATIVES=${nativeSet}"}
