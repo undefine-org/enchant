@@ -109,6 +109,7 @@ let
       ../scripts/demo-artifact-production
       ../scripts/check-source-floor
       ../scripts/check-execution-history
+      ../nix/android-native-contract.py
       ../test/scripts/artifact-generation.bl
       (lib.fileset.unions (map (crate:
         cleanDirectory (../native + "/${crate}") [ "target" ".git" ".bl" ]) nativeCrates))
@@ -144,6 +145,8 @@ let
       for crate in ${toString nativeCrates}; do
         install -m755 ${natives}/$crate.so priv/native/$crate.so
       done
+      mkdir -p priv/android
+      ${pkgs.python3}/bin/python3 nix/android-native-contract.py --root "$PWD" > priv/android/native-contract.json
 
   '';
   worker = import ./bounded-build.nix {
