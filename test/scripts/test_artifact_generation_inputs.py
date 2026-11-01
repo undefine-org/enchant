@@ -150,6 +150,16 @@ class ArtifactGenerationInputsTest(unittest.TestCase):
         self.assertNotEqual(report["preparation"]["files"], report["stages"][0]["files"])
         self.assertTrue(report["self_reproduction_qualified"])
 
+    def test_one_retained_generation_stops_before_other_generations(self):
+        self.arguments += ['--generation', 'P']
+        result, report, calls, _ = self.run_staged_fixture()
+        self.assertEqual(0, result)
+        self.assertEqual([('produce', 'P'), ('boot', 'P')], calls)
+        self.assertEqual('artifact-generation-stage', report['kind'])
+        self.assertTrue(report['generation']['fresh_boot_qualified'])
+        self.assertFalse(report['self_reproduction_qualified'])
+        self.assertEqual([], report['stages'])
+
     def test_preparation_does_not_excuse_a_b_c_difference(self):
         result, report, _, diagnostic = self.run_staged_fixture(mismatch=True)
         self.assertEqual(1, result)

@@ -1,0 +1,71 @@
+(ns compiler-unit-store-test)
+
+;; Exercise the current helper with the retained immutable compiler. This
+;; private namespace never replaces the selected SDK's build/runtime modules.
+(let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+      source (File/read! (Path/join root "priv/build/unit-store.bl"))]
+ (BeamLisp/eval (String/replace source "(ns unit-store " "(ns compiler-unit-store-under-test ")))
+
+(ns compiler-unit-store-test)
+
+(defn- artifact! [prepared directory previous]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "compiler-unit-store-under-test" "artifact!")
+                       (list prepared directory previous)))
+
+(defn- prepare [file module action]
+ (let [handle (BeamLisp.AOT/open_workspace
+               {:version 2 :phase-imports (list 'core 'sugar)
+                :sources (list {:namespace 'compiler.cache.fixture :file file})} {})]
+  (try (action (BeamLisp.AOT/prepare_host_unit handle {:namespace 'compiler.cache.fixture :module module}))
+       (finally (BeamLisp.AOT/close_workspace! handle)))))
+
+(deftest complete-units-reuse-without-publication-and-input-or-target-changes-miss
+ (let [root (Path/join (System/tmp_dir!) (str "compiler-unit-cache-" (System/unique_integer (list :positive))))
+       file (Path/join root "fixture.bl")
+       a (Path/join root "a") b (Path/join root "b") c (Path/join root "c") d (Path/join root "d")
+       module :Elixir.BeamLisp.CompilerCacheFixture]
+  (File/mkdir_p! root)
+  (try
+   (File/write! file "(ns compiler.cache.fixture) (defn answer [] 42)")
+   (prepare file module
+    (fn [prepared]
+     (let [first (artifact! prepared a nil)
+           again (artifact! prepared b a)]
+      (is (= true (:compiled first)))
+      (is (= false (:compiled again)))
+      (is (= (:key first) (:key again)))
+      (is (= (get-in first [:verified :beams]) (get-in again [:verified :beams])))
+      (is (= false (erlang/module_loaded module)))
+      (is (= false (get-in again [:verified :native-admission])))
+      ;; A real independent compilation remains available to the reproduction
+      ;; stage; it must not consult the preceding stage's new cache entries.
+      (let [fresh (artifact! prepared c nil)]
+       (is (= true (:compiled fresh)))
+       (is (= (get-in first [:verified :beams]) (get-in fresh [:verified :beams])))))))
+   (File/write! file "(ns compiler.cache.fixture) (defn answer [] 99)")
+   (prepare file module
+    (fn [prepared]
+     (let [changed (artifact! prepared d a)]
+      (is (= true (:compiled changed)))
+      (is (= false (erlang/module_loaded module))))))
+   (prepare file :Elixir.BeamLisp.CompilerCacheOtherFixture
+    (fn [prepared]
+     (is (= true (:compiled (artifact! prepared (Path/join root "other") d))))))
+   (finally (File/rm_rf! root)))))
+
+(deftest corrupt-complete-unit-is-rejected-before-it-can-be-restored
+ (let [root (Path/join (System/tmp_dir!) (str "compiler-unit-corrupt-" (System/unique_integer (list :positive))))
+       file (Path/join root "fixture.bl") a (Path/join root "a") b (Path/join root "b")]
+  (File/mkdir_p! root)
+  (try
+   (File/write! file "(ns compiler.cache.fixture) (defn answer [] 42)")
+   (prepare file :Elixir.BeamLisp.CompilerCacheCorruptionFixture
+    (fn [prepared]
+     (let [result (artifact! prepared a nil)
+           unit (Path/join a (:key result))
+           beam (first (remove #(= "artifact-unit.term" %) (File/ls! unit)))]
+      (File/write! (Path/join unit beam) "corrupted")
+      (is (= :artifact-bytes-changed
+             (try (artifact! prepared b a) nil (catch error (:kind (ex-data error))))))
+      (is (= false (File/exists? b))))))
+   (finally (File/rm_rf! root)))))

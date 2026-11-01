@@ -1369,7 +1369,50 @@
   {:namespace (tuple :symbol namespace) :file file :digest (crypto/hash :sha256 source)
    :host-spec (when host (assoc (dissoc host :source) :namespace (tuple :symbol namespace)))}))
 
-(defn- generation-unit! [selection directory]
+(defn- generation-import! [prepared baseline directory]
+ ;; A one-time bridge from the already qualified flat floor to complete units.
+ ;; The Python gate verified the immutable P/B/C product and its Source record.
+ ;; Match the exact host ABI declaration prefix as well as every source read;
+ ;; never infer a unit from filename prefixes or relabel a foreign compiler.
+ (when (and baseline (= 1 (get baseline "version"))
+             (= (:compiler-key prepared) (get baseline "compiler_key")))
+  (let [root (BeamLisp.Tiers/priv_root)
+        hex (fn [bytes] (Base/encode16 bytes (list (tuple :case :lower))))
+        prefix (first (String/split (File/read! (Path/join root "build/seed.bl"))
+                         ";; Artifact production owns preparation"))
+        inputs (:inputs prepared)
+        matching (and (= (get baseline "abi_prefix_sha256") (hex (crypto/hash :sha256 prefix)))
+                  (every? (fn [input]
+                    (let [file (Path/relative_to (:file input) root)]
+                     (and (not (String/starts_with? file "../"))
+                          (= (hex (:digest input)) (get-in baseline ["inputs" (str "priv/" file)])))))
+                    (vals inputs)))]
+   (when matching
+    (let [floor (get baseline "floor")
+          host (:host-spec prepared)
+          input (get inputs (:namespace prepared))
+          objects (if host
+                    (let [name (str (Atom/to_string (:module host)) ".beam")
+                          path (Path/join floor name)]
+                     (when (= (hex (:digest input)) (:ok (host-provenance path)))
+                      [{:name name :bytes (File/read! path)}]))
+                    (let [ns (Macro/camelize (Path/basename (:file input) ".bl"))
+                          inventory (boot-inventory (list ns) floor)]
+                     (when (empty? (:errors inventory)) (:objects inventory))))]
+     (when (seq objects)
+      (File/mkdir! directory)
+      (doseq [object objects] (File/write! (Path/join directory (:name object)) (:bytes object)))
+      (File/write! (Path/join directory "artifact-unit.term")
+       (erlang/term_to_binary
+        {:version 1 :namespace (:namespace prepared) :compiler-key (:compiler-key prepared)
+         :inputs (Enum/map (Enum/sort (Map/to_list inputs))
+                   (fn [pair] {:namespace (elem pair 0) :sha256 (:digest (elem pair 1))}))
+         :modules (mapv (fn [object] {:module (Path/basename (:name object) ".beam")
+                                     :sha256 (crypto/hash :sha256 (:bytes object))}) objects)
+         :coverage (:coverage prepared)}))
+      true))))))
+
+(defn- generation-unit! [selection directory store previous baseline]
  (let [workspace (BeamLisp.AOT/open_workspace
                   {:version 2 :phase-imports (list 'core 'sugar)
                    :sources (list (Map/take selection (list :namespace :file)))} {})]
@@ -1377,8 +1420,20 @@
    (let [prepared (if (:host-spec selection)
                     (BeamLisp.AOT/prepare_host_unit workspace (:host-spec selection))
                     (BeamLisp.AOT/prepare_unit workspace (:namespace selection)))
-         emitted (BeamLisp.AOT/emit_unit prepared directory)
-         verified (BeamLisp.AOT/verify_unit directory)
+         captured (if store
+                    (do (BeamLisp.Loader/ensure_loaded "unit-store")
+                        (let [key (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "unit-store" "artifact-key") (list prepared))
+                              imported (str directory "-import")
+                              _ (File/mkdir_p! imported)
+                              prior (if (and previous (File/regular? (Path/join (Path/join previous key) "artifact-unit.term")))
+                                      previous
+                                      (when (generation-import! prepared baseline (Path/join imported key)) imported))]
+                         (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "unit-store" "artifact!")
+                           (list prepared store prior))))
+                    (do (BeamLisp.AOT/emit_unit prepared directory)
+                        {:verified (BeamLisp.AOT/verify_unit directory) :compiled true}))
+         verified (:verified captured)
+         emitted (:manifest verified)
          input (Map/get (:inputs prepared) (:namespace emitted))]
     (when-not (and (= emitted (:manifest verified)) (= (:digest selection) (:digest input))
                    (= (:host-spec selection) (:host-spec prepared)))
@@ -1387,7 +1442,7 @@
                 (not= (list (Atom/to_string (:module (:host-spec selection))))
                       (Enum/map (:modules emitted) (fn [row] (:module row)))))
      (generation-refuse! :artifact-generation-host-members {:namespace (:namespace emitted)}))
-    {:beams (:beams verified) :inputs (:inputs prepared)
+    {:beams (:beams verified) :inputs (:inputs prepared) :compiled (:compiled captured)
      :receipt {:namespace (:namespace emitted) :target (:host-spec prepared)
                :world (:id (:world prepared)) :phase-world (:id (:phase-world prepared))
                :modules (:modules emitted)}})
@@ -1417,11 +1472,14 @@
   receipt is Source data; fresh boot/reproduction and installation are separate."
  [opts]
  (when-not (and (erlang/is_map opts)
-                (every? #(contains? #{:out :root} %) (keys opts))
+                (every? #(contains? #{:out :root :unit-store :previous-units :baseline} %) (keys opts))
                 (erlang/is_binary (:out opts)) (not= "" (:out opts))
                 (or (nil? (:root opts))
                     (and (erlang/is_binary (:root opts)) (not= "" (:root opts)))))
-  (generation-refuse! :artifact-generation-options {}))
+   (generation-refuse! :artifact-generation-options {}))
+ (doseq [key [:unit-store :previous-units]]
+  (when (and (contains? opts key) (not (erlang/is_binary (get opts key))))
+   (generation-refuse! :artifact-generation-options {:option key})))
  (let [physical-root (Path/expand (or (erlang/apply :Elixir.System :get_env (list "BL_ROOT")) (BeamLisp/cwd)))
        root (Path/expand (or (:root opts) physical-root))
        out (Path/expand (under root (:out opts)))
@@ -1453,12 +1511,16 @@
      (generation-refuse! :artifact-generation-output-exists {:out out}))
     (with-generation-stage! scratch (fn []
     (File/mkdir! generation)
-    (let [units (mapv (fn [pair]
+    (let [units (BeamLisp.AOT/with_source_snapshot (fn [] (mapv (fn [pair]
                         (let [selection (elem pair 0)
-                              unit (generation-unit! selection (str scratch "/unit-" (elem pair 1)))]
+                              started (erlang/monotonic_time :millisecond)
+                              _ (println {:artifact-start (:namespace selection)})
+                              unit (generation-unit! selection (str scratch "/unit-" (elem pair 1))
+                                     (:unit-store opts) (:previous-units opts) (:baseline opts))]
                          (println {:artifact-unit (get-in unit [:receipt :namespace])
-                                   :modules (count (:beams unit))})
-                         unit)) (Enum/with_index selections))
+                                   :modules (count (:beams unit)) :compiled (:compiled unit)
+                                   :milliseconds (- (erlang/monotonic_time :millisecond) started)})
+                         unit)) (Enum/with_index selections))))
           beams (vec (mapcat :beams units))
           names (mapv #(artifact-name! (elem % 0)) beams)
           inputs (vec (concat (map #(select-keys % [:file :digest]) selections)
@@ -1493,7 +1555,9 @@
        (generation-refuse! :artifact-generation-output-exists {:out out}))
       (File/rename! generation out)
       {:version 1 :kind :artifact-generation :out out :compiler-key compiler-key :build-key build-key
-       :modules (count beams) :units (mapv :receipt units) :native-admission false
+       :modules (count beams) :units (mapv :receipt units)
+       :compiled (count (filter :compiled units)) :cached (count (remove :compiled units))
+       :native-admission false
        :fresh-boot-qualified false :self-reproduction-qualified false}))))
     (finally
      (File/rmdir! lock))))))

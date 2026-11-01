@@ -11,10 +11,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 
 
 # A producer may start from an authenticated PREVIOUS compiler generation.
@@ -63,6 +65,32 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def run_producer(command, *, cwd, env, timeout, stream):
+    if not stream:
+        return subprocess.run(command, cwd=cwd, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    # Keep causal per-unit progress visible while retaining the exact receipt.
+    # Cancellation owns the entire producer process group, including children.
+    lines = []
+    with subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, start_new_session=True) as process:
+        def forward():
+            for line in process.stdout:
+                lines.append(line)
+                print(line, end='', flush=True)
+        reader = threading.Thread(target=forward, daemon=True)
+        reader.start()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            reader.join(timeout=5)
+            raise subprocess.TimeoutExpired(command, timeout, output=''.join(lines))
+        reader.join(timeout=5)
+        return subprocess.CompletedProcess(command, process.returncode, ''.join(lines))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -71,6 +99,12 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--producer-timeout", type=int, default=240,
                         help="bounded seconds per producer generation (maximum 1200)")
+    parser.add_argument("--generation", choices=list("PBC"),
+                        help="produce and fresh-boot one independently retained Nix stage")
+    parser.add_argument("--previous-units", type=Path,
+                        help="units from a previously qualified compiler, never the current B output")
+    parser.add_argument("--baseline", type=Path, help="verified legacy compiler unit index")
+    parser.add_argument("--stream", action="store_true", help="stream current unit progress to the build log")
     args = parser.parse_args()
     if not 1 <= args.producer_timeout <= 1200:
         parser.error("--producer-timeout must be between 1 and 1200 seconds")
@@ -95,7 +129,9 @@ def main():
                         if p.is_file() and p.suffix in (".so", ".dylib", ".dll")),
                       *[p for p in (root / "priv").rglob("*.bl")],
                       *[p for p in (root / "priv/bootstrap/seed").iterdir() if p.is_file()]})
-    inputs = {str(p.relative_to(root)): sha(p) for p in watched}
+    inputs = {str(p.relative_to(root)): sha(p) for p in watched
+              if not p.is_relative_to(root / "priv/bootstrap/seed")}
+    inputs.update({"priv/bootstrap/seed/" + name: value for name, value in initial_seed_files.items()})
     (output / "inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
     deps = sorted((root / "deps").glob("*/ebin"))
     deps += sorted((root / "_build").glob("*/lib/*/ebin"))
@@ -110,7 +146,7 @@ def main():
 
     def unchanged():
         for path, digest in inputs.items():
-            if sha(root / path) != digest:
+            if not path.startswith("priv/bootstrap/seed/") and sha(root / path) != digest:
                 raise RuntimeError(f"qualification input changed: {path}")
         if initial_seed_files != {p.name: sha(p) for p in sorted(initial_seed.iterdir())
                                   if p.is_file() and not p.is_symlink()} or any(
@@ -124,7 +160,7 @@ def main():
         # The predecessor's optimizer/backend may differ from current Source.
         # P crosses that compiler boundary; only B/C establish reproduction.
         # Every generation uses the same producer and strict fresh-boot gate.
-        for label in ("P", "B", "C"):
+        for label in ([args.generation] if args.generation else ("P", "B", "C")):
             target = output / label
             stage = {"generation": label, "producer_floor": str(source), "produced": False,
                      "fresh_boot_qualified": False}
@@ -154,6 +190,16 @@ def main():
                        "BL_GENERATION_OUTPUT": str(target), "XDG_CACHE_HOME": str(image / "cache"),
                        "BL_GENERATION_BOOTSTRAP_RECEIPT": str(output / f"{label}.bootstrap.json"),
                        "ELIXIR_ERL_OPTIONS": "+S 4:4 +SDcpu 2:2 +SDio 1:1"}
+                # Every stage consults the SAME previously qualified baseline.
+                # B and C must independently emit every changed unit; letting C
+                # fetch B's new outputs would make reproduction circular.
+                env.pop("BL_GENERATION_PREVIOUS_UNITS", None)
+                env.pop("BL_GENERATION_BASELINE", None)
+                env["BL_GENERATION_UNIT_STORE"] = str(output / "unit-store")
+                if args.previous_units:
+                    env["BL_GENERATION_PREVIOUS_UNITS"] = str(args.previous_units.resolve(strict=True))
+                if args.baseline:
+                    env["BL_GENERATION_BASELINE"] = str(args.baseline.resolve(strict=True))
                 # Refuse drift before starting code, as well as after it exits.
                 # Check the bytes actually copied into both compiler locations;
                 # a source that changes and changes back during cp is not a
@@ -170,9 +216,8 @@ def main():
                 unchanged()
                 started = time.monotonic()
                 try:
-                    result = subprocess.run(command, cwd=image, env=env, text=True,
-                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            timeout=args.producer_timeout)
+                    result = run_producer(command, cwd=image, env=env,
+                                          timeout=args.producer_timeout, stream=args.stream)
                 except subprocess.TimeoutExpired as error:
                     partial = error.stdout or ""
                     if isinstance(partial, bytes):
@@ -206,6 +251,10 @@ def main():
             save()
             source = target
             previous_files = stage["files"]
+        if args.generation:
+            report["kind"] = "artifact-generation-stage"
+            report["generation"] = stage
+            return 0
         first, second = report["stages"]
         changed = sorted(name for name in first["files"].keys() | second["files"].keys()
                          if first["files"].get(name) != second["files"].get(name))

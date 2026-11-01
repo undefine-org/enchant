@@ -17,6 +17,8 @@ in {
     "priv/std/proc/owner-registry.bl" "priv/std/vm/native.bl"
     "env.bl" "bl.lock" "bin/bl-producer" "bin/bl-stage-hosts"
     "scripts/qualify-artifact-generation" "scripts/check-source-floor"
+    "scripts/assemble-compiler-generations.py" "scripts/check-produced-compiler.py"
+    "scripts/compiler-unit-baseline.py"
     "scripts/demo-artifact-production" "scripts/check-execution-history"
     "test/scripts/artifact-generation.bl"
   ];

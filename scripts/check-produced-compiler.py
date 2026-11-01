@@ -147,8 +147,23 @@ def verify_proof(compiler, image_floor):
                 f'Generation {label} has an invalid fresh-boot receipt')
         boot_seeds.append(Path(boot['seed']))
         boot_runtimes.append(boot['runtime'])
-    require(len(set(boot_runtimes)) == 1 and len({path.parent for path in boot_seeds}) == 1,
-            'Generation fresh-boot receipts use different runtimes or output roots')
+    require(len(set(boot_runtimes)) == 1,
+            'Generation fresh-boot receipts use different runtimes')
+    products = report.get('generation_products')
+    if products is None:
+        require(len({path.parent for path in boot_seeds}) == 1,
+                'Generation fresh-boot receipts use different output roots')
+    else:
+        require(isinstance(products, dict) and set(products) == set('PBC'),
+                'Invalid retained generation products')
+        for label, boot_seed, generation in zip('PBC', boot_seeds, generations):
+            product = Path(products[label])
+            require(STORE.fullmatch(str(product)) and boot_seed == product / label,
+                    'Retained generation product differs from fresh-boot receipt')
+            require((compiler / 'generations' / label).resolve(strict=True) == product,
+                    'Retained generation product link differs')
+            require(actual_inventory(product / label) == generation['files'],
+                    'Retained generation product bytes differ')
     require(generations[0].get('producer_floor') == report.get('initial_seed')
             and isinstance(report.get('initial_seed'), str)
             and Path(report['initial_seed']).is_absolute()
