@@ -59,3 +59,10 @@ systemd-run --user --collect --wait --pipe --working-directory="$PWD" \
 Inspect the output's `result.json` and require `status: passed`. This finite
 JVM check compiles only the installer and its tests; it produces no SDK and
 writes only disposable JVM test fixtures.
+
+Beam Lisp application compilation uses the managed Nix application producer.
+The Android Rust products also build through Nix with the configured worker
+policy. The Android command runs Zig's Mob/JNI bridge and Gradle's APK assembly
+in the local pinned toolchain, retaining their per-ABI caches. Device checks
+need an explicit disposable app/device and a bounded emulator; signing keys
+belong outside Nix outputs and Git.
