@@ -25,7 +25,11 @@
  ;; Presenter pacing occurs OUTSIDE the serving actor and store writer.
  (Process/sleep (:pace-ms h)))
 (defn- candidate [h version]
- (generation/invoke! (get (:generations h) version) "continuity.orders/definition" []))
+ (let [graph (get (:generations h) version)]
+  (generation/invoke! graph "continuity.orders/definition" [(:digest graph)])))
+(defn- fault-candidate [h kind]
+ (let [graph (get (:generations h) 2)]
+  (generation/invoke! graph "continuity.orders/definition-with-fault" [(:digest graph) kind])))
 (defn- job-handler [g]
  (let [perform (generation/invoke! g "continuity.orders/job-handler" [])]
   (generation/with! g
@@ -33,17 +37,21 @@
       {:declaration {:of :continuity/receipt :protocol 1 :unique [:demo/id]} :perform perform}))))
 (defn- activate-jobs! [h version]
  (let [current (:generation (runtime/status (:job-server h)))
-       result (runtime/activate! (:job-server h) current (job-handler (get (:generations h) version)))]
+       graph (get (:generations h) version)
+       result (generation/with! graph #(runtime/activate! (:job-server h) current (job-handler graph)))]
   (when-not (contains? #{:applied :already-applied} (:status result))
    (throw (ex-info "Queue handler refused" {:kind :queue-activation-refused})))))
 (defn- publish! [h spec]
- (loop [remaining 20]
-  (let [current (:version (evolve/status (:owner h)))
-        prepared (evolve/prepare-upgrade! (:owner h) current spec
-                    [{:version 1 :message [:order "compatibility-sample" 1599]}])]
-   (if-not (= :prepared (:status prepared)) prepared
-    (let [result (evolve/commit-upgrade! (:owner h) (:ticket prepared))]
-     (if (and (= :stale-preparation (:kind result)) (pos? remaining)) (recur (dec remaining)) result))))))
+ (generation/with! (get (:generations h) (:version spec))
+  (fn []
+   (loop [remaining 20]
+    (let [current (:version (evolve/status (:owner h)))
+          prepared (evolve/prepare-upgrade! (:owner h) current spec
+                      [{:version 1 :message [:order "compatibility-sample" 1599]}])]
+     (if-not (= :prepared (:status prepared)) prepared
+      (let [result (evolve/commit-upgrade! (:owner h) (:ticket prepared))]
+       (if (and (= :stale-preparation (:kind result)) (pos? remaining))
+        (recur (dec remaining)) result))))))))
 (defn- health? [h]
  (let [version (:version (evolve/status (:owner h)))
        client (:token (evolve/acquire-client! (:owner h) version))]
@@ -63,14 +71,16 @@
     (case action
      "bad-message"
       (do (ensure-version! h 1) (step! h :prepare "Message migration")
-       (let [result (evolve/prepare-upgrade! (:owner h) 1 (assoc (candidate h 2) :upcast (fn [_] {:op :order :cents "wrong"}))
-                      [{:version 1 :message [:order "sample" 1599]}])]
+       (let [result (generation/with! (get (:generations h) 2)
+                       #(evolve/prepare-upgrade! (:owner h) 1 (fault-candidate h :message)
+                         [{:version 1 :message [:order "sample" 1599]}]))]
         (when-not (= :refused (:status result)) (throw (ex-info "Expected message refusal" {:kind :unexpected-admission})))
         (swap! (:view h) assoc :message-check :blocked)
         (event! h :prepare :blocked "Message migration refused") result))
      "bad-state"
       (do (ensure-version! h 1) (step! h :prepare "State migration")
-       (let [result (evolve/prepare-upgrade! (:owner h) 1 (assoc (candidate h 2) :migrate-state (fn [_] {:orders -1 :gross-cents "wrong"})))]
+       (let [result (generation/with! (get (:generations h) 2)
+                       #(evolve/prepare-upgrade! (:owner h) 1 (fault-candidate h :state)))]
         (when-not (= :refused (:status result)) (throw (ex-info "Expected state refusal" {:kind :unexpected-admission})))
         (swap! (:view h) assoc :state-check :blocked)
         (event! h :prepare :blocked "State migration refused") result))
@@ -231,10 +241,16 @@
                         [v (generation/prepare! {:application-id app-id
                           :sources {"continuity.orders" (File/read! (str (:source-root opts) "/versions/v" v ".bl"))
                                     "continuity.receipts" (File/read! (str (:source-root opts) "/receipts.bl"))}
+                          :native-modules #{"erlang" "maps"}
                           :protocols {:receipt-jobs 1}
-                          :stable-namespaces #{"proc.evolve" "datom" "datom.conn"}})]) [1 2 3 4]))
-        spec (generation/invoke! (get generations 1) "continuity.orders/definition" [])
-        t (totals c) owner (evolve/start! spec {:store c :orders (:orders t) :cents (:cents t)} {:managed true})
+                          :stable-namespaces #{"proc.evolve" "datom" "datom.conn" "datom.query.read-only"}})]) [1 2 3 4]))
+        old (get generations 1)
+        _ (generation/with! old #(generation/bind-runtime! {:store c}))
+        _ (doseq [[version fresh] generations] (when (not= 1 version) (generation/inherit-runtime! fresh old)))
+        spec (generation/invoke! old "continuity.orders/definition" [(:digest old)])
+        t (totals c) owner (generation/with! old
+                            #(evolve/start! spec {:store c :orders (:orders t) :cents (:cents t)}
+                                            {:managed true :message-domain :bounded-first-order}))
         client (evolve/acquire-client! owner 1)
         handler (job-handler (get generations 1))
         _ (queue/attach-store! (:server handler) c) _ (runtime/start! handler)
