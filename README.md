@@ -66,7 +66,9 @@ Use it to build generative applications. beyond chats and agents. Make interface
 
 ## Getting started
 
-Download the latest `bl` release from your platform and put it in an executable place. Run `bl doctor` to check that all works well. Then use `bl run ...` for running files (try the examples), or `bl`, or point your agent to this repo and the binary, and let it run wild.
+Download `bl` from the [releases page](https://github.com/undefine-org/enchant/releases). Each tagged release includes its changelog, checksum and host requirements receipt. The currently qualified binary is Linux x86_64; check its measured glibc and shared-library requirements before installing. The Nix SDK includes its pinned runtime: `nix shell github:undefine-org/enchant#sdk --command bl version`.
+
+Put the downloaded binary in an executable place. Run `bl doctor` to check that all works well. Then use `bl run ...` for running files (try the examples), or `bl`, or point your agent to this repo and the binary, and let it run wild.
 
 Also you can use `bl repl` if you want to get your hands dirty.
 
