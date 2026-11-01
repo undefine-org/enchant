@@ -256,6 +256,30 @@
           30000 268435456 (Path/join directory "result.json")))
       (finally (File/rm_rf! directory)))))
 
+(defn- existing-product! [platform kind sdk request directory run]
+  ;; Evaluate the pinned producer, never a receipt's claim about its identity.
+  ;; IFD is disabled: misses remain the durable worker's responsibility.
+  (when-not (get request "force")
+    (let [selected (try (Jason/decode!
+                         (run "selection" (process/tool "nix-instantiate")
+                           ["--eval" "--strict" "--json" (Path/join platform "nix/artifact-selection.nix")
+                            "--argstr" "kind" kind "--argstr" "sdk" (or sdk "")
+                            "--argstr" "requestJson" (Jason/encode! request)
+                            "--option" "allow-import-from-derivation" "false" "--option" "max-jobs" "0"
+                            "--extra-experimental-features" "nix-command flakes"]))
+                       (catch _ nil))
+          output (get selected "output")]
+      (when (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output)
+                 (File/dir? output))
+        (try
+          ;; Only an existing output directory is passed, never a derivation.
+          ;; Nix can retain/substitute this object but cannot invoke its builder.
+          (run "cached-retention" (process/tool "nix-store")
+            ["--add-root" (Path/join directory "retained") "--indirect" "--realise" output])
+          (assoc selected "cached" true "retention-root" (Path/join directory "retained"))
+          ;; A collection race is a cache miss, not a failed preparation.
+          (catch _ nil))))))
+
 (defn prepare-application!
   "Realize an application through the trusted recipe and an exact SDK. Source
    roots are explicit project-relative input declarations, including supporting
@@ -309,12 +333,14 @@
             (run "base-retention" store
               ["--add-root" (Path/join directory "base-retained") "--indirect" "--realise"
                (immutable-directory! (:base options))]))
-        prepared (prepare-job! directory {"version" 1 "kind" "application" "sdk" sdk "request" request} timeout)
+        prepared (or (existing-product! platform "application" sdk request directory run)
+                     (prepare-job! directory {"version" 1 "kind" "application" "sdk" sdk "request" request} timeout))
         output (immutable-directory! (get prepared "output"))
         result (Jason/decode!
                  (run "verification" (Path/join platform "bin/python3")
                    [(Path/join platform "nix/application-inventory.py") "verify" output sdk snapshot]))
         receipt {:output output :sdk sdk :source snapshot :request request :result result
+                 :cached? (get prepared "cached" false)
                  :job (get prepared "handle") :derivation (get prepared "derivation")
                  :retention-root (get prepared "retention-root")}]
     (when-not (= (tuple :ok output) (File/read_link (:retention-root receipt)))
@@ -362,13 +388,18 @@
                                (= (tuple :ok snapshot) (File/read_link (Path/join directory "source-retained"))))
                   (refuse "Native source snapshot lacks its requester root" {}))
               expected (assoc expected "source" snapshot)
-              prepared (prepare-job! directory {"version" 1 "kind" "native" "request" expected} timeout)
+              prepared (or (existing-product! platform "native" nil expected directory
+                             (fn [label executable argv]
+                               (managed! platform executable argv timeout memory
+                                 (Path/join directory (str label ".json")))))
+                           (prepare-job! directory {"version" 1 "kind" "native" "request" expected} timeout))
               root (get prepared "retention-root")]
           (let [output (get prepared "output")
                 product (verify! output expected)]
             (when-not (= (tuple :ok output) (File/read_link root))
               (refuse "Artifact retention does not name its product" {}))
             (let [receipt (assoc product :request expected :retention-root root
+                                :cached? (get prepared "cached" false)
                                 :job (get prepared "handle") :derivation (get prepared "derivation"))]
               (File/write! (Path/join directory "receipt.json") (Jason/encode! receipt))
               receipt)))

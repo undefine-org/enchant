@@ -55,12 +55,21 @@ let
   '';
   # Retain lock bytes as their own input. The enclosing source store address
   # must not change dependency compilation or vendoring when a body changes.
-  lock = pkgs.writeText "native-Cargo.lock"
-    (builtins.unsafeDiscardStringContext (builtins.readFile (source + "/Cargo.lock")));
+  lockContents = builtins.unsafeDiscardStringContext (builtins.readFile (source + "/Cargo.lock"));
+  lock = pkgs.writeText "native-Cargo.lock" lockContents;
+  # Parse the captured bytes without realizing the writeText derivation during
+  # evaluation. Keep that same lock-file input in the vendor derivation, so its
+  # existing identity and compiled dependency cache remain unchanged.
+  cargoDeps = (pkgs.rustPlatform.importCargoLock.override {
+    lib = lib // {
+      readFile = path: if toString path == toString lock then lockContents else lib.readFile path;
+    };
+  }) { lockFile = lock; };
   common = {
     pname = "bl-native-code-${package}";
     inherit version;
     cargoLock.lockFile = lock;
+    inherit cargoDeps;
     CARGO_TARGET_DIR = "target";
     doCheck = false;
     strictDeps = true;

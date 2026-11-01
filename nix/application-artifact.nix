@@ -49,9 +49,13 @@ let
   }) [ "version" "base" "force" "attempt" ];
   prior = if base == null || !(builtins.pathExists (base + "/request-identity.json")) then null
     else builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile (base + "/request-identity.json")));
+  priorRequest = if base == null || !(builtins.pathExists (base + "/production-request.json")) then null
+    else builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile (base + "/production-request.json")));
+  requestCore = value: builtins.removeAttrs (value // { scope = value.scope or "full"; })
+    [ "base" "force" "attempt" ];
   unchanged = base != null && !scoped && !(request.force or false)
     && prior == { inherit sdk identity; }
-    && builtins.pathExists (base + "/production-request.json");
+    && priorRequest != null && requestCore priorRequest == requestCore request;
   requestFile = pkgs.writeText "beam-lisp-application-request.json" (builtins.toJSON request);
   boot = pkgs.writeText "beam-lisp-application-producer.exs" ''
     root = System.fetch_env!("BL_ROOT")

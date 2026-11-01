@@ -138,6 +138,12 @@ def main():
 
         bl('ordinary-cli-unchanged', ['build', '--out', str(ordinary)], project)
         assert (ordinary / '.nix-product').resolve(strict=True) == ordinary_product
+        receipts = list((output / 'cache/ordinary-cli-unchanged/beam_lisp/artifacts').glob('application-*/receipt.json'))
+        assert len(receipts) == 1, receipts
+        cached = json.loads(receipts[0].read_text())
+        assert cached['cached?'] is True and cached['job'] is None, cached
+        assert not (receipts[0].parent / 'job').exists(), 'cache hit started a durable worker'
+        assert Path(cached['retention-root']).resolve(strict=True) == ordinary_product
         unrelated = project / 'src/artifact/demo/unrelated.bl'
         unrelated.write_text('(ns artifact.demo.unrelated) (defn answer [] 7)\n')
         values = project / 'src/artifact/demo/values.bl'
