@@ -1,6 +1,6 @@
 (ns proc.reply-domain-test
  (:require [reload.generation :as g] [proc.message-domain :as domain]
-           [test.support.source-fixtures :as fixtures]))
+           [test.support.source-fixtures :as fixtures] [veritas.model :as model]))
 (fixtures/effects!)
 (def SOURCE
  "(ns proof.reply)
@@ -139,3 +139,35 @@
     (is (arithmetic-error? #(erlang/+ 1.0e308 1.0e308)))
     (is (arithmetic-error? #(g/with! (:generation (BeamLisp.Env/resolve_native_context! (:environment record)))
                              (fn [] ((:function record) 1.0e308)))))))))
+
+(deftest native-cost-witnesses-check-the-structural-bound-on-small-metadata-and-near-limit-messages
+ (let [graph (g/prepare! {:application-id "reply-output-bound-witnesses"
+                         :native-modules #{"erlang" "maps" "SourceEffectObserverFixture"}
+                         :sources {"proof.reply" SOURCE}})]
+  (try
+   (let [old (callback graph "vector-input") convert (callback graph "message-upcast") fresh (callback graph "message-map")
+         capture (domain/capture (:function convert) (:environment convert)) bound (domain/conversion-bounds capture false)
+         machine (model/model "actual-native-message-output-cost"
+          {:state nil :init (fn [] (atom {:valid true :n 0}))
+           :commands (into {} (map (fn [mode]
+             [mode {:run (fn [system _]
+                       (let [n (:n @system)
+                             message (case mode :small [:order (str n) 1599]
+                                      :metadata (with-meta [:order (str n) 1599] {:note "ordinary data"})
+                                      :near-limit [:order (String/duplicate "x" 65000) 1599])
+                             before (BeamLisp.CompilerData/first_order_cost! message {:max-nodes 16384 :max-bytes 65536 :max-depth 64})
+                             converted (g/with! graph #((:function convert) message))
+                             after (BeamLisp.CompilerData/first_order_cost! converted {:max-nodes 32768 :max-bytes 1048576 :max-depth 128})
+                             valid (g/with! graph #(and (= true ((:function old) message)) (= true ((:function fresh) converted))))]
+                        (swap! system assoc :n (inc n)
+                         :valid (and (:valid @system) valid
+                                     (<= (:nodes after) (+ (:nodes before) (:nodes bound)))
+                                     (<= (:bytes after) (+ (:bytes before) (:bytes bound)))))))}])
+            [:small :metadata :near-limit]))
+           :invariants {:real-code-and-native-cost-bound (fn [_ system] (:valid @system))}})
+         result (model/check machine {:seed 37 :histories 64 :max-len 6})]
+    (is (= :proved (:status bound)))
+    (is (= :witnessed (:modality result)))
+    (is (= 64 (:tried result)))
+    (is (empty? (:unexercised result))))
+   (finally (g/retire! graph)))))
