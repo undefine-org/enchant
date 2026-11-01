@@ -46,7 +46,9 @@
  (try (not (:native-custody (BeamLisp.Env/owner_transition_observation grant))) (catch _ true)))
 (defn- registrations-closed? [job]
  (every? #(not= :active (:status (BeamLisp.Execution/observe %))) (:held job)))
-(defn- with-paused-analysis [name action]
+(defn- with-paused-analysis
+ ([name action] (with-paused-analysis name nil action))
+ ([name before-resume action]
  (f/with-owner name [:old-request :new-request]
   (fn [[_ fresh] owner]
    (let [parent (erlang/self) token (erlang/make_ref) worker (atom nil)
@@ -70,10 +72,12 @@
              (erlang/send parent [:auth-committed token (ev/commit-upgrade! owner (:ticket prepared))])
              (after 30000 :parent-stopped-waiting)))))))))
      (when-not (queued? owner) (throw :public-preparation-not-queued))
+     ;; The actual public bundle/grant already retains candidate code. The owner
+     ;; has not consumed it, and no metadata child can hold a lock yet.
+     (when before-resume (before-resume fresh))
      (erlang/apply :sys :resume (list owner))
-     ;; Inherit the trace through the actual guardian into its linked metadata
-     ;; child. Pause at warm entry, before any metadata inspection or Native
-     ;; module lock, instead of repeatedly polling SDK-attested owner state.
+     ;; The arity-only trace identifies the actual metadata child; delivery is
+     ;; asynchronous, so a call event alone does not prove its current location.
      (let [child (receive [:trace pid :call [m f a]]
                   :when (and (= module m) (= function f) (= 2 a)) pid
                   (after 10000
@@ -85,10 +89,11 @@
                        :link-count (if (tuple? links) (erlang/length (elem links 1)) 0)})))))]
       (reset! worker child)
       (when-not (erlang/suspend_process child) (throw :actual-worker-not-suspended))
-      (let [observed (job-info owner) guardian (:guardian observed)
+      (let [paused-at (System/monotonic_time :millisecond)
+            observed (job-info owner) guardian (:guardian observed)
             links (when guardian (Process/info guardian :links))
             linked? (and (tuple? links) (lists/member child (elem links 1)))
-            job (assoc observed :worker child)]
+            job (assoc observed :worker child :paused-at paused-at)]
        (reset! traced [owner guardian child])
        (stop-entry-trace! entry @traced)
        (when-not (and observed linked? (not (:ready? observed)))
@@ -107,21 +112,45 @@
       (when @publisher
        (when (Process/alive? (first @publisher)) (Process/exit (first @publisher) :kill))
        (let [monitor (second @publisher)]
-        (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 0 nil))))))))))
+        (receive [:DOWN seen :process _ _] :when (= seen monitor) nil (after 0 nil)))))))))))
 
 (deftest forged-task-wakeups-cannot-publish-and-real-pending-custody-survives-retirement
  ;; Authenticate the Source refusal before starting the real public preparation
  ;; deadline. A source compiler check must not consume a paused worker's window.
- (let [prepared (atom nil)]
-  (is (= :dynamic-code-dependency
-    (try
-     (reset! prepared (g/prepare! {:application-id "analysis-forbidden-sys" :fixed-runtime true
-                       :native-modules #{"sys"}
-                       :sources {"analysis.forbidden" "(ns analysis.forbidden) (defn state [pid] (sys/get_state pid))"}}))
-     nil (catch error (:kind (ex-data error)))
-     (finally (when @prepared (g/retire! @prepared)))))))
+ (let [prepared (atom nil)
+       refused (try
+         (reset! prepared (g/prepare! {:application-id "analysis-forbidden-sys" :fixed-runtime true
+                           :native-modules #{"sys"}
+                           :sources {"analysis.forbidden" "(ns analysis.forbidden) (defn state [pid] (sys/get_state pid))"}}))
+         nil (catch error (select-keys (ex-data error) [:kind :module :function]))
+         (finally (when @prepared (g/retire! @prepared))))]
+  ;; compile-exact's native hazard gate names the actual critical target.
+  (is (= {:kind :unmanaged-compiled-producer :module :sys :function :get_state} refused)))
  (with-paused-analysis "analysis-authentic-pending"
-  (fn [owner fresh publisher monitor token job]
+  (fn [fresh]
+   ;; This genuine Native boundary closes the queued call's exact candidate
+   ;; admissions while its original public bundle prevents physical purge.
+   (is (= false (BeamLisp.Env/retire_generation_modules! fresh)))
+   (let [parent (erlang/self) nonce (erlang/make_ref)
+         probe (erlang/spawn_monitor (fn []
+           (erlang/send parent
+            (tuple nonce
+             {:already-admitted? (BeamLisp.Env/executing_generation? fresh)
+              :refused? (try (g/with! fresh (fn [] :fresh-admission)) false (catch _ true))}))))
+         monitor (elem probe 1)]
+    (try
+     (let [result (receive [seen result] :when (= seen nonce) result (after 5000 nil))]
+      (is (= false (:already-admitted? result)))
+      (is (= true (:refused? result))))
+     (finally
+      (when (Process/alive? (elem probe 0)) (Process/exit (elem probe 0) :kill))
+      (Process/demonitor monitor (list :flush))))))
+  (fn [owner _ publisher monitor token job]
+   (println "AUTH_PAUSED_MFA"
+    (pr-str (Enum/map (elem (Process/info (:worker job) :current_stacktrace) 1)
+      (fn [frame] (tuple (elem frame 0) (elem frame 1)
+                         (if (erlang/is_integer (elem frame 2)) (elem frame 2) :arity-redacted))))))
+   (println "AUTH_PAUSED_PHASE" :observed (- (System/monotonic_time :millisecond) (:paused-at job)))
    (is (= :pending (:phase (BeamLisp.Env/owner_transition_observation (:grant job)))))
    (is (:native-custody (BeamLisp.Env/owner_transition_observation (:grant job))))
    (erlang/send owner (tuple (:ref job) :proc.evolve/analyzed))
@@ -136,14 +165,12 @@
    ;; system interface. Explicitly declaring sys does not grant that target.
    (is (= :refuse (BeamLisp.Env/source_target_declaration! :sys :get_state 1)))
    (is (= true (ev/request! owner 1 :write)))
-   ;; High-level retire! intentionally returns early for retained registrations.
-   ;; The genuine Native retirement boundary closes this exact graph's new
-   ;; admissions while its real pending registrations prevent physical purge.
-   (is (= false (BeamLisp.Env/retire_generation_modules! fresh)))
-   (is (thrown? (g/with! fresh (fn [] :fresh-admission))))
+   (println "AUTH_PAUSED_PHASE" :after-old-write (- (System/monotonic_time :millisecond) (:paused-at job)))
    (is (= :pending (:phase (BeamLisp.Env/owner_transition_observation (:grant job)))))
+   (println "AUTH_PAUSED_PHASE" :resuming (- (System/monotonic_time :millisecond) (:paused-at job)))
    (erlang/resume_process (:worker job))
    (let [prepared (receive [:auth-prepared seen result] :when (= token seen) result (after 35000 nil))]
+    (println "AUTH_PAUSED_PHASE" :prepared (:status prepared) (- (System/monotonic_time :millisecond) (:paused-at job)))
     (is (= :prepared (:status prepared))))
    (erlang/send publisher [:auth-commit token])
    (is (= :applied (:status (receive [:auth-committed seen result] :when (= token seen) result (after 35000 nil)))))
