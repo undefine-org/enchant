@@ -1,18 +1,19 @@
 # Resource ownership stays with the Nix realization even when a client exits.
 # KVM-backed RAM and a finite scratch disk bound the whole guest process tree;
 # they do not depend on an unprivileged client changing daemon settings.
-{ pkgs, memoryMiB ? 3072, diskMiB ? 12288, commandManager ? false, cpuCount ? 1 }:
+{ pkgs, memoryMiB ? 3072, diskMiB ? 12288, commandManager ? false, cpuCount ? 1, trace ? false }:
 drv:
 assert builtins.isInt memoryMiB && memoryMiB >= 256 && memoryMiB <= 8192;
 assert builtins.isInt diskMiB && diskMiB >= 1024 && diskMiB <= 65536;
 assert builtins.isBool commandManager;
+assert builtins.isBool trace;
 assert builtins.isInt cpuCount && cpuCount >= 1 && cpuCount <= 8;
 pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
   memSize = memoryMiB;
   enableParallelBuilding = false;
   QEMU_OPTS = pkgs.lib.optionalString (cpuCount != 1) "-smp cpus=${toString cpuCount}";
   preVM = ''
-    ${pkgs.lib.optionalString commandManager "trap 'test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT"}
+    ${pkgs.lib.optionalString (commandManager || trace) "trap 'test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT"}
     diskImage="$PWD/worker.ext4"
     truncate -s ${toString diskMiB}M "$diskImage"
     ${pkgs.e2fsprogs}/bin/mkfs.ext4 -q -F "$diskImage"
@@ -27,7 +28,7 @@ pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
     mkdir -p /build
     export NIX_BUILD_TOP=/build TMPDIR=/build
     export BL_WORKER_MEMORY_KIB="$memory_kib" BL_WORKER_SWAP_KIB="$swap_kib"
-    ${pkgs.lib.optionalString commandManager ''
+    ${pkgs.lib.optionalString (trace && !commandManager) "exec > /tmp/xchg/worker-debug 2>&1"}${pkgs.lib.optionalString commandManager ''
       exec > /tmp/xchg/worker-debug 2>&1
       # Use the existing command-domain implementation inside the private
       # worker too. It retains real filesystem loans in a real service manager.

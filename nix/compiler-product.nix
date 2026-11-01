@@ -27,6 +27,7 @@ let
     # Artifact production and fresh-boot checks launch only their own bounded
     # child VMs. They do not submit managed artifact jobs from inside a worker.
     commandManager = false;
+    trace = true;
   };
   generation = label: predecessor: worker (pkgs.stdenv.mkDerivation {
     pname = "beam-lisp-compiler-generation-${label}";
