@@ -16,7 +16,8 @@ let
   });
   previousIdentity = if previousCompiler != null
       && builtins.pathExists (previousCompiler + "/producer.json")
-    then (builtins.fromJSON (builtins.readFile (previousCompiler + "/producer.json"))).identity
+    then (builtins.fromJSON (builtins.unsafeDiscardStringContext
+      (builtins.readFile (previousCompiler + "/producer.json")))).identity
     else null;
   worker = import ./bounded-build.nix {
     inherit pkgs;

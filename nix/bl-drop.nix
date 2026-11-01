@@ -185,9 +185,11 @@ let
     checkoutPlatform = compilerPlatform;
     nativeProducts = compilerNatives;
     previousCompiler = if previousSdk == null then null else
-      builtins.storePath (builtins.fromJSON (builtins.readFile (previousSdk + "/artifact.json"))).compiler;
+      builtins.storePath (builtins.fromJSON (builtins.unsafeDiscardStringContext
+        (builtins.readFile (previousSdk + "/artifact.json")))).compiler;
     previousSource = if previousSdk == null then null else
-      builtins.storePath (builtins.fromJSON (builtins.readFile (previousSdk + "/artifact.json"))).source;
+      builtins.storePath (builtins.fromJSON (builtins.unsafeDiscardStringContext
+        (builtins.readFile (previousSdk + "/artifact.json")))).source;
   };
 
   # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
