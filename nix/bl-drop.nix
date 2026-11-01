@@ -356,7 +356,27 @@ let
       runHook postInstall
     '';
   });
-  portable = bl-drop;
+  # SDK bytes depend on their producer inputs; command/coordinator recipes are
+  # selection data. Provider-only edits can select the same qualified payload.
+  assemblyIdentity = builtins.hashString "sha256" (builtins.toJSON {
+    source = toString src;
+    compiler = toString compiler;
+    dependencies = toString dependencies;
+    natives = toString natives;
+    executor = toString drop-tools;
+    erlang = toString erlang;
+    elixir = toString elixir;
+    z3 = toString z3Runtime;
+    explorer = toString explorerNif;
+    terminal = toString ratatuiNif;
+    toolchain = toString pkgs.path;
+    recipe = builtins.readFile ./bl-drop.nix;
+    worker = builtins.readFile ./bounded-build.nix;
+  });
+  reuseAssembly = previousMetadata != null
+    && (previousMetadata.assemblyIdentity or null) == assemblyIdentity;
+  image = if reuseAssembly then builtins.storePath previousMetadata.image else bl-drop.sdk;
+  portable = if reuseAssembly then builtins.storePath previousMetadata.release else bl-drop;
   coordinator = import ./coordinator-runtime.nix {
     inherit pkgs;
     # The control plane boots a matching, already qualified runtime. Submitting
@@ -367,8 +387,7 @@ let
     platform = buildCheckout;
   };
   selection = import ./sdk-selection.nix {
-    inherit pkgs coordinator;
-    image = bl-drop.sdk;
+    inherit pkgs coordinator image assemblyIdentity;
     release = portable;
     platform = buildCheckout;
   };
@@ -376,5 +395,5 @@ in
 { inherit drop-tools natives dependencies compiler coordinator;
   bl-drop = portable;
   sdk = selection;
-  sdk-image = bl-drop.sdk;
+  sdk-image = image;
 }
