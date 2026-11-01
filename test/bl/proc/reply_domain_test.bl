@@ -1,0 +1,71 @@
+(ns proc.reply-domain-test
+ (:require [reload.generation :as g] [proc.message-domain :as domain]
+           [test.support.source-fixtures :as fixtures]))
+(fixtures/effects!)
+(def SOURCE
+ "(ns proof.reply)
+ (defn integer-input [x] (erlang/is_integer x))
+ (defn any [x] true)
+ (defn unchanged [x] x)
+ (defn map-input [x] (and (erlang/is_map x) (erlang/is_integer (maps/get :value x nil))))
+ (defn boxed [x] {:value x})
+ (defn unbox [x] (maps/get :value x nil))
+ (defn vector-input [x] (and (vector? x) (= 3 (count x)) (= :order (first x)) (string? (nth x 1)) (int? (nth x 2)) (pos? (nth x 2))))
+ (defn message-map [x] (and (erlang/is_map x) (= :order (maps/get :op x nil)) (erlang/is_binary (maps/get :id x nil)) (erlang/is_integer (maps/get :cents x nil)) (> (maps/get :cents x nil) 0)))
+ (defn message-upcast [x] {:op :order :id (nth x 1) :cents (nth x 2)})
+ (defn wrong-upcast [x] {:op :order :id (nth x 1) :cents \"wrong\"})
+ (defn unchecked-nth [x] (nth x 1))
+ (defn vector-reply [x] (and (vector? x) (= 1 (count x)) (erlang/is_integer (first x))))
+ (defn vector-unbox [x] {:value (first x)})
+ (defn vector-box [x] [x])
+ (defn request-input [x] (erlang/is_atom x))
+ (defn request-box [x] {:operation x})
+ (defn old-request-reply [r request] (if (= request :read) (erlang/is_integer r) (= true r)))
+ (defn new-request-reply [r request] (and (erlang/is_map r) (erlang/is_map request) (erlang/is_integer (maps/get :value r nil))))
+ (defn request-downcast [r request] (if (= request :read) (maps/get :value r nil) true))
+ (defn wrong-request-downcast [r request] (if (= request :write) (maps/get :value r nil) true))
+ (defn wrong-downcast [r] \"wrong\")
+ (defn effect-downcast [r] (do (SourceEffectObserverFixture/notify (erlang/self) :reply-proof-effect) (maps/get :value r nil)))
+ (defn discarded-partial [r] (do (maps/get :discarded r nil) r))
+ (defn map-protocol [r] (and (map? r) (int? (:value r))))")
+(defn- callback [graph name]
+ (g/with! graph
+  #(let [namespace (get (:mapping graph) "proof.reply")]
+    {:function (BeamLisp.Env/fetch_exact! namespace name) :environment (BeamLisp.Env/capture_native_context!)})))
+(defn- with-proof [app action]
+ (let [graph (g/prepare! {:application-id app :native-modules #{"erlang" "maps" "SourceEffectObserverFixture"}
+                         :sources {"proof.reply" SOURCE}})]
+  (try (action #(callback graph %)) (finally (g/retire! graph)))))
+(deftest exact-eager-vector-projections-preserve-all-future-messages
+ (with-proof "vector-future-input-proof"
+  (fn [f]
+   (let [proof (domain/compare-callbacks (f "vector-input") (f "message-upcast") (f "message-map"))]
+    (when-not (= :proved (:status proof)) (println "PROOF_REFUSAL" (pr-str (dissoc proof :evidence))))
+    (is (= :proved (:status proof)))
+    (is (= :message-predicate-preservation (:scope proof)))
+    (is (every? domain/valid? (:evidence proof))))
+   (is (= :unknown (:status (domain/compare-callbacks (f "vector-input") (f "wrong-upcast") (f "message-map")))))
+   (is (= :unknown (:status (domain/compare-callbacks (f "any") (f "unchecked-nth") (f "any")))))
+   (is (= :unknown (:status (domain/compare-callbacks (f "integer-input") (f "discarded-partial") (f "integer-input"))))))))
+(deftest exact-reply-predicates-and-downcasts-compose-without-running-code
+ (with-proof "reply-future-input-proof"
+  (fn [f]
+   (let [proof (domain/compare-replies (f "integer-input") (f "unchanged") (f "map-input") (f "unbox") (f "integer-input"))]
+    (when-not (= :proved (:status proof)) (println "PROOF_REFUSAL" (pr-str (dissoc proof :evidence))))
+    (is (= :proved (:status proof)))
+    (is (= :reply-predicate-preservation (:scope proof)))
+    (is (every? domain/valid? (:evidence proof))))
+   (is (= :proved (:status (domain/compare-replies (f "integer-input") (f "unchanged") (f "vector-reply") (f "vector-unbox") (f "map-input")))))
+   (is (= :unknown (:status (domain/compare-replies (f "integer-input") (f "unchanged") (f "map-input") (f "wrong-downcast") (f "integer-input")))))
+   (is (= :unknown (:status (domain/compare-replies (f "integer-input") (f "unchanged") (f "map-input") (f "effect-downcast") (f "integer-input")))))
+   (is (= :empty (receive :reply-proof-effect :unexpected (after 0 :empty)))))))
+(deftest reply-relations-use-the-original-request-and-exact-upcast
+ (with-proof "reply-original-request-proof"
+  (fn [f]
+   (let [proof (domain/compare-replies (f "request-input") (f "request-box") (f "new-request-reply") (f "request-downcast") (f "old-request-reply"))]
+    (when-not (= :proved (:status proof)) (println "REQUEST_PROOF_REFUSAL" (pr-str (dissoc proof :evidence))))
+    (is (= :proved (:status proof))))
+   (is (= :unknown (:status (domain/compare-replies (f "request-input") (f "request-box") (f "new-request-reply") (f "wrong-request-downcast") (f "old-request-reply")))))
+   ;; map? includes records and SortedMap. Its dispatching lookup remains
+   ;; unproved; a normal map result is not a proof about every such reply.
+   (is (= :unknown (:status (domain/compare-replies (f "integer-input") (f "unchanged") (f "map-protocol") (f "unbox") (f "integer-input"))))))))
