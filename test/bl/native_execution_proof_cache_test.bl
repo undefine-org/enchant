@@ -1,0 +1,185 @@
+(ns native-execution-proof-cache-test
+ (:require [proc.message-domain :as domain] [proc.callback :as callback]
+           [reload.generation :as generation] [env]
+           [test.support.source-fixtures :as fixtures]))
+(fixtures/effects!)
+(def SOURCE
+ "(ns proof.cache (:require [proof.cache-helper :as helper]))
+  (defn integer [value] (erlang/is_integer value))
+  (defn binary [value] (erlang/is_binary value))
+  (defn ready [value] (helper/integer value))
+  (defn effect [value] (do (SourceEffectObserverFixture/notify (erlang/self) :proof-cache-effect) value))")
+(defn- with-graph [action]
+ (let [graph (generation/prepare!
+              {:application-id (str "proof-cache-" (erlang/unique_integer (list :positive)))
+               :native-modules #{"erlang" "SourceEffectObserverFixture"}
+               :sources {"proof.cache" SOURCE "proof.cache-helper" "(ns proof.cache-helper) (defn integer [x] (erlang/is_integer x))"}})
+       held (atom [])]
+  (try
+   (action graph (fn [name]
+                   (let [registration (generation/with! graph
+                          #(callback/register! (BeamLisp.Env/fetch_exact! (get (:mapping graph) "proof.cache") name)))]
+                    (swap! held conj registration) registration)))
+   (finally (doseq [registration @held] (callback/unregister! registration)) (generation/retire! graph)))))
+(defn- with-captures [action]
+ (let [entry (BeamLisp.Env/sdk_callable! "proc.message-domain" "capture-current!" 1)
+       mfa (tuple (elem (erlang/fun_info entry :module) 1) (elem (erlang/fun_info entry :name) 1) 1)]
+  (when-not (= 1 (erlang/trace_pattern mfa true (list :call_count))) (throw :capture-counter-unavailable))
+  (try (action #(elem (erlang/trace_info mfa :call_count) 1))
+   (finally (erlang/trace_pattern mfa false (list :call_count))))))
+(defn- proved? [action] (try (= :proved (:status (action))) (catch _ false)))
+(defn- row [key]
+ (let [rows (ets/lookup :beam_lisp_vars key)]
+  (when-not (= 1 (erlang/length rows)) (throw :fixture-row-unavailable))
+  (first rows)))
+(defn- with-raw-row [key changed action]
+ (let [original (row key) epoch (BeamLisp.Env/publication_epoch)]
+  (try
+   ;; Direct writes are adversarial fixture input. They deliberately bypass
+   ;; the normal publication counter; only this graph's own rows are changed.
+   (ets/insert :beam_lisp_vars (tuple key changed))
+   (is (= epoch (BeamLisp.Env/publication_epoch)))
+   (action)
+   (finally (ets/insert :beam_lisp_vars original)))))
+
+(deftest native-cache-reuses-only-actual-capture-and-never-trusts-a-returned-proof
+ (with-graph
+  (fn [_ register]
+   (let [registration (register "integer") effect (register "effect")]
+    (with-captures
+     (fn [calls]
+      (let [proof (domain/capture-registration! registration) before (calls)]
+       (is (= :proved (:status proof)))
+       (is (= 1 before))
+       (is (= proof (domain/capture-registration! registration)))
+       (is (= before (calls)))
+       (is (domain/valid? proof))
+       (is (= before (calls)))
+       (is (not (domain/valid? (assoc proof :expression {:tag :literal :value false}))))
+       (is (not (domain/valid? (assoc proof :definitions {}))))
+       (is (not (domain/valid? (assoc proof :registration effect))))
+       ;; Owner metadata is ordinary control data, not the Native cache slot.
+       (BeamLisp.Execution/put-metadata! effect {:analysis-cache {:value proof}})
+       (is (not (proved? #(domain/capture-registration! effect))))
+       (is (= :empty (receive :proof-cache-effect :unexpected (after 0 :empty)))))))))))
+
+(deftest raw-publication-definition-and-var-writes-invalidate-a-primed-cache-without-an-epoch
+ (with-graph
+  (fn [graph register]
+   (let [registration (register "integer") scope (:scope graph) namespace (get (:mapping graph) "proof.cache")
+         proof (domain/capture-registration! registration)
+         publication-key (BeamLisp.Env/pfx scope (tuple :emitted_publication namespace))
+         definition-key (BeamLisp.Env/pfx scope (tuple :emitted_definition namespace "integer"))
+         var-key (BeamLisp.Env/pfx scope (tuple namespace "integer"))
+         descriptor (elem (row (BeamLisp.Env/pfx scope (tuple :ns_defs namespace))) 1)
+         effects (atom 0)]
+    (is (= :proved (:status proof)))
+    ;; Managed Source uses the live table produced by Link.defvar; the cache
+    ;; must actually support this real producer, rather than miss on every use.
+    (is (= :"$definitions" (elem descriptor 0)))
+    (with-raw-row publication-key (assoc (elem (row publication-key) 1) :md5 (erlang/term_to_binary :changed))
+     #(do (is (not (proved? (fn [] (domain/capture-registration! registration))))) (is (not (domain/valid? proof)))))
+    (is (= proof (domain/capture-registration! registration)))
+    (with-raw-row definition-key (assoc (elem (row definition-key) 1) :untrusted (fn [] (swap! effects inc)))
+     #(do (is (not (proved? (fn [] (domain/capture-registration! registration))))) (is (not (domain/valid? proof)))))
+    (is (= 0 @effects))
+    (is (= proof (domain/capture-registration! registration)))
+    (let [other (generation/with! graph #(BeamLisp.Env/fetch_exact! namespace "binary"))]
+     (with-raw-row var-key other
+      #(do (is (not (proved? (fn [] (domain/capture-registration! registration))))) (is (not (domain/valid? proof))))))
+    (is (= proof (domain/capture-registration! registration)))))))
+
+(deftest missing-readiness-refuses-cached-proof-without-initializing-the-provider
+ (with-graph
+  (fn [graph register]
+   (let [registration (register "ready") namespace (get (:mapping graph) "proof.cache-helper")
+         key (BeamLisp.Env/pfx (:scope graph) (tuple :ns_ready namespace)) original (row key)
+         proof (domain/capture-registration! registration) epoch (BeamLisp.Env/publication_epoch)]
+    (is (= :proved (:status proof)))
+    (is (= :graph (get (:readiness proof) namespace)))
+    (try
+     (ets/delete :beam_lisp_vars key)
+     (is (= epoch (BeamLisp.Env/publication_epoch)))
+     (is (not (proved? #(domain/capture-registration! registration))))
+     (is (not (domain/valid? proof)))
+     (is (empty? (ets/lookup :beam_lisp_vars key)))
+     (finally (ets/insert :beam_lisp_vars original)))
+    (is (= proof (domain/capture-registration! registration)))))))
+
+(deftest raw-global-alias-changes-cannot-reuse-an-epoch-memo-as-fresh-binding-evidence
+ (let [scope (env/fork) namespace (str "proof.cache-binding.p" (erlang/unique_integer (list :positive)))
+       held (atom nil)]
+  (try
+   (env/with-env scope
+    (fn []
+     (env/eval (str "(ns " namespace ") (defn integer [x] (erlang/is_integer x))"
+                    " (defn binary [x] (erlang/is_binary x)) (def alias integer) (defn accepts [x] (alias x))"))
+     (reset! held (BeamLisp.Env/with_ns namespace #(callback/register! (BeamLisp.Env/fetch_exact! namespace "accepts"))))
+     (let [proof (domain/capture-registration! @held) key (BeamLisp.Env/pfx scope (tuple namespace "alias"))
+           other (BeamLisp.Env/fetch_exact! namespace "binary")]
+      (is (= :proved (:status proof)))
+      (is (seq (:bindings proof)))
+      (with-raw-row key other
+       #(is (not (domain/valid? proof))))
+      (is (= proof (domain/capture-registration! @held))))))
+   (finally (when @held (callback/unregister! @held)) (env/destroy scope)))))
+
+(deftest cached-proof-follows-genuine-transfer-and-dies-with-its-registration
+ (with-graph
+  (fn [graph register]
+   (let [source (register "integer") transfer (atom nil)]
+    (try
+     (with-captures
+      (fn [calls]
+       (let [proof (domain/capture-registration! source) before (calls)]
+        (is (= :proved (:status proof)))
+        (reset! transfer (BeamLisp.Execution/prepare-handoff! source (erlang/self)))
+        (let [accepted (BeamLisp.Execution/accept-handoff! @transfer) target (:registration accepted)]
+         (is (= :accepted (:status accepted)))
+         (is (= :unknown (:status (domain/capture-registration! source))))
+         (is (not (domain/valid? proof)))
+         (is (= :waiting (:status (generation/retire! graph))))
+         (let [fresh (domain/capture-registration! target)]
+          (is (= :proved (:status fresh)))
+          (is (= target (:registration fresh)))
+          (is (not (contains? fresh :environment)))
+          (is (= before (calls)))
+          (is (domain/valid? fresh))
+          (BeamLisp.Execution/close! target)
+          (is (= :unknown (:status (domain/capture-registration! target))))
+          (is (not (domain/valid? fresh)))
+          (is (= before (calls))))))))
+     (finally (when @transfer (BeamLisp.Execution/close! (:accepted @transfer)))))))))
+
+(deftest private-project-body-byte-replacement-invalidates-cache-and-restoration-recovers
+ (let [scope (env/fork) namespace (str "proof.cache-bytes.p" (erlang/unique_integer (list :positive)))
+       held (atom nil)]
+  (try
+   (env/with-env scope
+    (fn []
+     (env/eval (str "(ns " namespace ") (defn integer [x] (erlang/is_integer x))"))
+     (reset! held (BeamLisp.Env/with_ns namespace #(callback/register! (BeamLisp.Env/fetch_exact! namespace "integer"))))
+     (let [proof (domain/capture-registration! @held)
+           entry (first (BeamLisp.Env/ns_definition namespace "integer"))
+           body (elem entry 4) clause (elem entry 3)
+           original (BeamLisp.Emit/compile_descriptor (BeamLisp.Emit/descriptor_for body (list clause)))
+           changed (BeamLisp.Emit/compile_descriptor
+                     (BeamLisp.Emit/descriptor_for body (list (assoc clause :body (BeamLisp.Emit/lit false)))))
+           expected (erlang/apply body :module_info (list :md5))
+           compiled-md5 (elem (elem (beam_lib/md5 (elem original 1)) 1) 1)]
+      (is (= :proved (:status proof)))
+      ;; This fixture owns the fresh project body. No SDK/floor code is loaded
+      ;; at a production atom; restoration must reproduce the exact old code.
+      (when-not (= expected compiled-md5) (throw :fixture-original-body-not-reproduced))
+      (try
+       (is (= (tuple :module body) (code/load_binary body (String/to_charlist "proof-cache-byte-mutation") (elem changed 1))))
+       (is (not= expected (erlang/apply body :module_info (list :md5))))
+       (is (not (proved? #(domain/capture-registration! @held))))
+       (is (not (domain/valid? proof)))
+       (finally
+        (when-not (code/soft_purge body) (throw :fixture-body-still-executing))
+        (when-not (= (tuple :module body) (code/load_binary body (String/to_charlist "proof-cache-byte-restored") (elem original 1)))
+         (throw :fixture-body-restore-failed))))
+      (is (= expected (erlang/apply body :module_info (list :md5))))
+      (is (= proof (domain/capture-registration! @held))))))
+   (finally (when @held (callback/unregister! @held)) (env/destroy scope)))))
