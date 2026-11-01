@@ -28,6 +28,18 @@
   (try (action #(elem (erlang/trace_info mfa :call_count) 1))
    (finally (erlang/trace_pattern mfa false (list :call_count))))))
 (defn- proved? [action] (try (= :proved (:status (action))) (catch _ false)))
+(defn- admission-cache-size [registration]
+ ;; Observe sizes/booleans in the real private owner. No function, captured
+ ;; context, proof or token is returned to the fixture from native custody.
+ (Agent/get :Elixir.BeamLisp.Env
+  (fn [_]
+   (let [key (tuple (elem registration 1) (tuple :code_callback (elem registration 2)))
+         payloads (ets/lookup :beam_lisp_source_lease_domains key)
+         payload (when (seq payloads) (elem (first payloads) 1))
+         cached (when (not= :undefined (ets/whereis :beam_lisp_callback_analysis_cache))
+                  (ets/lookup :beam_lisp_callback_analysis_cache key))]
+    {:payload-bytes (erlang/external_size payload)
+     :cache? (boolean (seq cached))}))))
 (defn- row [key]
  (let [rows (ets/lookup :beam_lisp_vars key)]
   (when-not (= 1 (erlang/length rows)) (throw :fixture-row-unavailable))
@@ -62,6 +74,22 @@
        (BeamLisp.Execution/put-metadata! effect {:analysis-cache {:value proof}})
        (is (not (proved? #(domain/capture-registration! effect))))
        (is (= :empty (receive :proof-cache-effect :unexpected (after 0 :empty)))))))))))
+
+(deftest ordinary-admission-does-not-copy-a-primed-analysis-proof
+ (with-graph
+  (fn [_ register]
+   (let [registration (register "integer") before (admission-cache-size registration)
+         proof (domain/capture-registration! registration) after (admission-cache-size registration)]
+    (is (= false (:cache? before)))
+    (is (= :proved (:status proof)))
+    (is (= true (:cache? after)))
+    ;; Priming an actual proof must not grow the row copied by ordinary ticket,
+    ;; borrow and callback admission. The old embedded cache violates this.
+    (is (= (:payload-bytes before) (:payload-bytes after)))
+    (is (= true (callback/invoke! registration [1])))
+    (is (= after (admission-cache-size registration)))
+    (callback/unregister! registration)
+    (is (= false (:cache? (admission-cache-size registration))))))))
 
 (deftest raw-publication-definition-and-var-writes-invalidate-a-primed-cache-without-an-epoch
  (with-graph
@@ -136,6 +164,8 @@
         (reset! transfer (BeamLisp.Execution/prepare-handoff! source (erlang/self)))
         (let [accepted (BeamLisp.Execution/accept-handoff! @transfer) target (:registration accepted)]
          (is (= :accepted (:status accepted)))
+         (is (= false (:cache? (admission-cache-size source))))
+         (is (= true (:cache? (admission-cache-size target))))
          (is (= :unknown (:status (domain/capture-registration! source))))
          (is (not (domain/valid? proof)))
          (is (= :waiting (:status (generation/retire! graph))))
@@ -146,10 +176,35 @@
           (is (= before (calls)))
           (is (domain/valid? fresh))
           (BeamLisp.Execution/close! target)
+          (is (= false (:cache? (admission-cache-size target))))
           (is (= :unknown (:status (domain/capture-registration! target))))
           (is (not (domain/valid? fresh)))
           (is (= before (calls))))))))
      (finally (when @transfer (BeamLisp.Execution/close! (:accepted @transfer)))))))))
+
+(deftest owner-death-removes-its-authentic-analysis-cache
+ (with-graph
+  (fn [_ register]
+   (let [parent (erlang/self) token (erlang/make_ref)
+         [child monitor] (spawn-monitor
+          (fn []
+           (let [registration (register "integer") proof (domain/capture-registration! registration)]
+            (erlang/send parent [token registration (:status proof)])
+            (receive :finish :finished))))]
+    (try
+     (let [[registration status] (receive [seen registration status] :when (= token seen) [registration status]
+                                  (after 30000 (throw :actual-cache-owner-not-ready)))]
+      (is (= :proved status))
+      (is (= true (:cache? (admission-cache-size registration))))
+      (Process/exit child :kill)
+      (is (= :killed (receive [:DOWN seen :process pid reason]
+                      :when (and (= monitor seen) (= child pid)) reason (after 5000 :timeout))))
+      (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+       (is (loop []
+            (if-not (:cache? (admission-cache-size registration)) true
+             (if (< (System/monotonic_time :millisecond) deadline)
+              (do (Process/sleep 10) (recur)) false))))))
+     (finally (when (Process/alive? child) (Process/exit child :kill))))))))
 
 (deftest private-project-body-byte-replacement-invalidates-cache-and-restoration-recovers
  (let [scope (env/fork) namespace (str "proof.cache-bytes.p" (erlang/unique_integer (list :positive)))
