@@ -16,6 +16,9 @@ let
   inherit (pkgs) lib;
 
   sources = import ./producer-sources.nix { inherit lib; };
+  previousMetadata = if previousSdk == null then null else
+    builtins.fromJSON (builtins.unsafeDiscardStringContext
+      (builtins.readFile (previousSdk + "/artifact.json")));
 
   # ── hex libraries, exactly the digests bl.lock names ─────────────────────────
   lockLines = lib.filter (l: lib.hasPrefix "[:dep " l) (lib.splitString "\n" (builtins.readFile ../bl.lock));
@@ -184,12 +187,8 @@ let
     src = sources.compiler;
     checkoutPlatform = compilerPlatform;
     nativeProducts = compilerNatives;
-    previousCompiler = if previousSdk == null then null else
-      builtins.storePath (builtins.fromJSON (builtins.unsafeDiscardStringContext
-        (builtins.readFile (previousSdk + "/artifact.json")))).compiler;
-    previousSource = if previousSdk == null then null else
-      builtins.storePath (builtins.fromJSON (builtins.unsafeDiscardStringContext
-        (builtins.readFile (previousSdk + "/artifact.json")))).source;
+    previousCompiler = if previousMetadata == null then null else builtins.storePath previousMetadata.compiler;
+    previousSource = if previousMetadata == null then null else builtins.storePath previousMetadata.source;
   };
 
   # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
@@ -332,8 +331,12 @@ let
     tools = drop-tools;
   };
   coordinator = import ./coordinator-runtime.nix {
-    inherit pkgs compiler dependencies;
-    source = src;
+    inherit pkgs;
+    # The control plane boots a matching, already qualified runtime. Submitting
+    # a target compiler build must never require building that target first.
+    compiler = if previousMetadata == null then compiler else builtins.storePath previousMetadata.compiler;
+    dependencies = if previousMetadata == null then dependencies else builtins.storePath previousMetadata.dependencies;
+    source = if previousMetadata == null then src else builtins.storePath previousMetadata.source;
     platform = buildCheckout;
   };
   selection = import ./sdk-selection.nix {
