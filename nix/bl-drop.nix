@@ -301,15 +301,38 @@ let
           mv "$native.materialized" "$native"
         fi
       done
-      find $TMPDIR/payload -type f | while read -r f; do
-        if [ "$(head -c4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ]; then
-          if patchelf --print-interpreter "$f" >/dev/null 2>&1; then
-            patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$f"
-          else
-            patchelf --remove-rpath "$f" 2>/dev/null || true
-          fi
-        fi
-      done
+      ${pkgs.python3}/bin/python3 - <<'PORTABLE'
+      import json, os
+      from pathlib import Path
+      import subprocess
+      patcher = '${pkgs.patchelf}/bin/patchelf'
+      counts = dict(files=0, elf=0, interpreters=0)
+      for path in (Path(os.environ['TMPDIR']) / 'payload').rglob('*'):
+          if path.is_symlink() or not path.is_file():
+              continue
+          counts['files'] += 1
+          with path.open('rb') as stream:
+              marker = stream.read(4)
+              first = marker + stream.readline(4092) if marker.startswith(b'#!') else marker
+          if marker == b'\x7fELF':
+              counts['elf'] += 1
+              dynamic = subprocess.run([patcher, '--print-interpreter', path],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+              if dynamic:
+                  subprocess.run([patcher, '--set-interpreter', '/lib64/ld-linux-x86-64.so.2',
+                                  '--remove-rpath', path], check=True)
+              else:
+                  subprocess.run([patcher, '--remove-rpath', path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          elif first.startswith(b'#!') and b'/nix/store/' in first:
+              interpreter = first.strip().split()[0].rsplit(b'/', 1)[-1]
+              if interpreter not in (b'sh', b'bash', b'dash'):
+                  raise SystemExit(f'undeclared portable interpreter: {path}: {first!r}')
+              replacement = b'#!/bin/bash\n' if interpreter == b'bash' else b'#!/bin/sh\n'
+              path.write_bytes(replacement + path.read_bytes()[len(first):])
+              counts['interpreters'] += 1
+      print('PORTABLE-PAYLOAD ' + json.dumps(counts), flush=True)
+      PORTABLE
       $TMPDIR/drop pack --release $TMPDIR/payload --launcher $TMPDIR/launcher --out $TMPDIR/bl.drop
       runHook postBuild
     '';
@@ -322,6 +345,7 @@ let
       printf '%s\n' '${builtins.toJSON {
         version = 1;
         kind = "release";
+        packaging = "portable-shell-v1";
         target = "x86_64-linux";
         compiler = toString compiler;
         file = "bl.drop";
@@ -332,12 +356,7 @@ let
       runHook postInstall
     '';
   });
-  portable = import ./portable-drop.nix {
-    inherit pkgs;
-    product = bl-drop;
-    sdk = bl-drop.sdk;
-    tools = drop-tools;
-  };
+  portable = bl-drop;
   coordinator = import ./coordinator-runtime.nix {
     inherit pkgs;
     # The control plane boots a matching, already qualified runtime. Submitting
