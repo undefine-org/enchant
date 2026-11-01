@@ -4,19 +4,35 @@
   (:require [build :as build] [build-plan :as plan] [build-log :as blog]
             [bl.env :as env] [vm.osenv :as osenv] [app-resource :as app]))
 
+(defn producer-inputs
+ "Capture the normal producer's resolved dependency closure. This is a
+  conservative input selection, not a second constructor or a replay witness."
+ [namespace]
+ (let [nodes (mapcat
+               (fn [name]
+                 (BeamLisp.BuildPlan/nodes_from_resolver name
+                   (fn [dependency]
+                     (when-let [file (BeamLisp.Loader/source_path dependency)]
+                       (plan/memo-node dependency (BeamLisp.Loader/read_source file))))))
+               [namespace "core" "sugar"])
+       names (sort (distinct (map :ns nodes)))]
+   (when-not (and (some #(= namespace %) names) (<= (count names) 256))
+     (throw (ex-info "Application producer input selection is invalid" {:namespace namespace})))
+   (to-list (Enum/map names
+     (fn [name]
+       (let [file (BeamLisp.Loader/source_path name)
+             source (BeamLisp.Loader/read_source file)]
+         {:namespace name :sha256 (crypto/hash :sha256 source)}))))))
+
 (defn emit-produced-unit!
- "Retain the complete runtime unit the one compiler already produced. The
-  constructor's read inventory is provenance; it must not recompile staged
-  descriptors or invent the runtime forwarder's replay coverage."
- [prepared record ebin directory]
- (let [key (:compiler-key prepared) modules (blog/module-names (:modules record))
-       digests (into {} (:digests record))
-       inputs (Enum/map (Enum/sort (Map/to_list (:inputs prepared)))
-                (fn [[n input]]
-                 (when-not (= (:digest input) (crypto/hash :sha256 (BeamLisp.Loader/read_source (:file input))))
-                  (throw (ex-info "Application constructor input changed" {:namespace n})))
-                 {:namespace n :sha256 (:digest input)}))]
-  (when-not (and (= key (:key record)) (seq modules) (= modules (distinct modules)))
+ "Retain the exact runtime modules and source selection from normal production.
+  The artifact records membership; replay coverage stays in the actual beams."
+ [namespace inputs record ebin directory]
+ (let [key (BeamLisp.AOTCache/compiler_key) modules (blog/module-names (:modules record))
+       digests (into {} (:digests record))]
+  (when-not (and (= key (:key record)) (seq modules) (= modules (distinct modules))
+                (= inputs (producer-inputs namespace))
+                (= (:hash record) (BeamLisp.AOT/ns_closure_hash namespace)))
    (throw (ex-info "Application unit lacks its original producer module inventory" {})))
   (File/mkdir_p! directory)
   (let [members (Enum/map modules
@@ -31,11 +47,12 @@
                    (File/write! (Path/join directory (str name ".beam")) bytes)
                    {:module name :sha256 sha})))]
    (File/write! (Path/join directory "artifact-unit.term")
-    (erlang/term_to_binary {:version 1 :namespace (:namespace prepared) :compiler-key key
-                           :inputs inputs :modules members :coverage (:coverage prepared)}))
-   ;; Coverage stays exactly what the real runtime compiler emitted. A strict
-   ;; compiled-only receiver refuses an incomplete unit; ordinary build callers
-   ;; retain their existing Source-effect contract.
+    (erlang/term_to_binary {:version 1 :namespace namespace :compiler-key key
+                           :inputs inputs :modules members
+                           :coverage {:scope :artifact-membership :source-staged true
+                                      :execution-entry-inventory-complete false}}))
+   ;; Membership adds no complete replay claim. The receiver checks the real
+   ;; runtime beams; ordinary callers retain their Source-effect contract.
    (BeamLisp.AOT/verify_unit directory))))
 
 (let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
@@ -76,29 +93,13 @@
                      (throw (ex-info "Application producer did not return its source plan" {}))))
         units
         (when-not (get request "world")
-          (let [sources (Enum/map (Enum/map (:order planning) #(:path %))
-                          (fn [file]
-                            (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source file))]
-                              (when-not namespace
-                                (throw (ex-info "Application artifact source requires a namespace" {:file file})))
-                              {:namespace (symbol namespace) :file file})))
-                closure (distinct (mapcat
-                          (fn [source]
-                            (BeamLisp.BuildPlan/nodes_from_resolver (str (:namespace source))
-                              (fn [name]
-                                (when-let [path (BeamLisp.Loader/source_path name)]
-                                  (when (String/starts_with? (Path/expand path) (str root "/"))
-                                    (plan/memo-node name (BeamLisp.Loader/read_source path))))))) sources))
-                workspace-sources (Enum/map closure
-                                    (fn [node] {:namespace (symbol (:ns node))
-                                                :file (BeamLisp.Loader/source_path (:ns node))}))
-                workspace (when (seq sources)
-                            (BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources workspace-sources} {}))]
-            (try
+          (let [sources (Enum/map (:order planning)
+                          (fn [node] {:namespace (:ns node) :file (:path node)}))]
               (Enum/map sources
                 (fn [source]
                   (let [namespace (:namespace source)
                         name (str namespace)
+                        inputs (producer-inputs name)
                         relative (str "units/" name)
                         directory (Path/join out relative)
                         _ (when (some #(contains? #{"" "." ".."} %) (String/split name "/"))
@@ -114,18 +115,14 @@
                             (= (get produced-digests (:module member))
                                (String/downcase (Base/encode16 (:sha256 member)))))
                             (get-in prior [:manifest :modules]))
-                          (seq (get-in prior [:manifest :inputs]))
-                          (every? (fn [input]
-                            (when-let [path (BeamLisp.Loader/source_path (:namespace input))]
-                              (= (:sha256 input) (crypto/hash :sha256 (BeamLisp.Loader/read_source path)))))
-                            (get-in prior [:manifest :inputs])))
+                          (= inputs (get-in prior [:manifest :inputs])))
                         _ (swap! unit-counts update (if reusable? :restored :compiled) inc)
                         verified (if reusable? prior
-                          (let [prepared (BeamLisp.AOT/prepare_unit workspace namespace)]
+                          (do
                             (when (File/exists? directory) (File/rm_rf! directory))
-                            (emit-produced-unit! prepared record (Path/join out "ebin") directory)))]
+                            (emit-produced-unit! name inputs record (Path/join out "ebin") directory)))]
                     {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))
-              (finally (when workspace (BeamLisp.AOT/close_workspace! workspace))))))
+              ))
         incoming (when planning
                    (Enum/map (:order planning)
                      (fn [node]
