@@ -39,6 +39,15 @@ foreign constructors, recursive helpers and unchecked protocol dispatch decline.
 Universal arithmetic currently requires integer operands; finite floats can
 overflow and need separate range evidence.
 
+Source argument admission has its own shared node and depth budgets. The prover
+records actual guarded argument lists and the branches that reach them. Each new
+guard must have a closed size bound or match a guard reached on the old accepted
+path, with every new argument proved callable-free. Equal size does not grant
+cross-generation callable custody. Argument multiplicity counts: a default argument can repeat a whole map
+even when that default is never returned. A first-order input quota alone does
+not prove this operational bound. Identity edges and small scalar projections
+can preserve the bound; wrapping an arbitrary whole map may require refusal.
+
 ## An initial bounded data contract
 
 Existing owners default to `:unrestricted`. Their accepted capability and opaque

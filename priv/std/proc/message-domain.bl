@@ -32,6 +32,13 @@
  ;; the accumulated state would also retain every published definition.
  (let [obligation {:value value :domain domain :when (:conditions state [])}]
   (update state :obligations (fn [all] (conj (or all []) obligation)))))
+(defn- source-arguments
+ ([state arguments] (source-arguments state arguments true))
+ ([state arguments assumption?]
+ ;; The complete proper argv shares one native budget. Keep duplicates and
+ ;; the exact reached branch; a guard in a skipped branch proves nothing.
+ (let [guard {:arguments arguments :when (:conditions state []) :assumption? assumption?}]
+  (update state :source-guards (fn [all] (conj (or all []) guard))))))
 (defn- stamp [state module]
  (if (contains? (:modules state) module) state
   (let [identity (if (= module :erlang)
@@ -67,9 +74,11 @@
    :pvar (lift state (assoc environment (:name pat) subject) (:body clause))
    :plit (do
            (when-not (scalar? (:val pat)) (refuse :complex-message-case))
-           (let [[state then] (lift state environment (:body clause))
-                 [state else] (lift-case state environment subject (rest clauses))]
-            [state {:tag :choose :test {:tag :strict-eq :left subject :right (lit (:val pat))}
+           (let [test {:tag :strict-eq :left subject :right (lit (:val pat))}
+                 conditions (:conditions state [])
+                 [state then] (lift (assoc state :conditions (conj conditions test)) environment (:body clause))
+                 [state else] (lift-case (assoc state :conditions (conj conditions {:tag :not :value test})) environment subject (rest clauses))]
+            [(assoc state :conditions conditions) {:tag :choose :test test
                     :then then :else else}]))
    (refuse :complex-message-case))))
 (defn- lift-all [state environment nodes]
@@ -286,7 +295,7 @@
    [(-> (stamp state (:module target))
         (update :reads (fn [all] (conj (or all []) read))))
     {:tag :eager-read :read read}])))
-(defn- global [state node values]
+(defn- global [state node values guarded?]
  (let [found (if (= :exact (:lookup node)) (BeamLisp.Env/fetch_exact (:ns node) (:name node))
               (BeamLisp.Env/fetch (:ns node) (:name node)))
        f (when (and (tuple? found) (= :ok (elem found 0))) (elem found 1))
@@ -296,20 +305,21 @@
   (let [state (assoc-in state [:bindings [(:ns node) (:name node) (:lookup node)]] native)
         module (first native) function (second native)]
    (if-let [target (readonly-target module function (count values))] (readonly-call state target values)
-   (if (= module :Elixir.BeamLisp.Ns.Rt) (primitive state module function values)
+   (if (= module :Elixir.BeamLisp.Ns.Rt) (primitive (if guarded? (source-arguments state values (:source-ingress state false)) state) module function values)
     (let [home (first (filter #(= module (BeamLisp.Emit/module_for %)) (:namespaces state)))]
      (when-not home (refuse :unknown-message-helper-provider))
      (helper state home (erlang/atom_to_binary function :utf8) values)))))))
 (defn- call [state environment node]
  (let [site (ir/call-site node)]
   (when-not (and site (some? (:arity site))) (refuse :dynamic-message-call))
-  (let [[state values] (lift-all state environment (:args site)) target (:callee site)]
+  (let [[state values] (lift-all state environment (:args site)) target (:callee site)
+        state (if (:source-argument-guard node) (source-arguments state values) state)]
    (cond
     (and (= :lit (:op target)) (keyword? (:val target)) (contains? #{1 2} (count values)))
      [(let [state (kernel state :Elixir.BeamLisp.Ns.Rt)]
         (if (= :map (:tag (first values))) state (require-domain state (first values) :plain-map)))
       (field (first values) (lit (:val target)) (if (= 2 (count values)) (second values) (lit nil)) :rt)]
-    (= :global (:op target)) (global state target values)
+    (= :global (:op target)) (global state target values (= :invoke (:mode site)))
     (= :remote (:mode site))
      (if-let [target (readonly-target (:mod site) (:fun site) (count values))] (readonly-call state target values)
      (if-let [home (first (filter #(= (:mod site) (BeamLisp.Emit/module_for %)) (:namespaces state)))]
@@ -321,9 +331,14 @@
        ;; Snapshot/callback provenance is checked before lifting. Analyze the
        ;; actual executable call beneath compiler-owned Source restrictions;
        ;; this proof still grants no execution, callback or native authority.
-       node (producer/analysis-node node)]
+       original (producer/initialization-body node)
+       previous-ingress (:source-ingress state false)
+       ingress? (not= original node)
+       state (if ingress? (assoc state :source-ingress true) state)
+       guarded (native-call/original-source-call original)
+       node (if guarded (assoc guarded :source-argument-guard true) (producer/analysis-node node))]
   (when-not (ir/node? node) (refuse :unknown-message-ir))
-  (case (:op node)
+  (let [[after value] (case (:op node)
    :lit (do (data/check! (:val node) {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
             [state (lit (:val node))])
    :enil [state (lit ())]
@@ -370,8 +385,10 @@
    :arith (let [[after values] (lift-all state environment (:args node))]
             (primitive after :Elixir.BeamLisp.Num (:fun node) values))
    :remote (call state environment node)
+   :invoke (call state environment node)
    :apply (call state environment node)
-   (refuse :unsupported-message-ir))))
+   (refuse :unsupported-message-ir))]
+   [(if ingress? (assoc after :source-ingress previous-ingress) after) value])))
 (defn- with-environment [environment action]
  (let [environment (BeamLisp.Env/resolve_native_context! environment)]
  ;; A captured public context is not executable custody. Even readonly proof
@@ -405,14 +422,15 @@
           direct? (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Num} (first native))
           _ (when (and (not direct?) (nil? home)) (refuse :unpublished-message-callback))
           _ (when direct? (BeamLisp.AOT/sdk_callable_evidence! callback))
-          [after expression] (if direct? (primitive state (first native) (second native) args)
+          [after expression] (if direct? (primitive (source-arguments state args false) (first native) (second native) args)
                                (helper state home (erlang/atom_to_binary (second native) :utf8) args))
           saved (get (:definitions after) [home (erlang/atom_to_binary (second native) :utf8)])]
      (when-not (and (or direct? (= (tuple :ok callback) (BeamLisp.Env/fetch_exact home (erlang/atom_to_binary (second native) :utf8))))
                     (= epoch (BeamLisp.Env/publication_epoch)) (or direct? saved))
       (refuse :unstable-message-callback))
      {:status :proved :expression expression :definitions (:definitions after) :modules (:modules after)
-      :bindings (:bindings after) :obligations (:obligations after) :reads (:reads after []) :root native :arity (nth native 2)}))
+      :bindings (:bindings after) :obligations (:obligations after) :source-guards (:source-guards after [])
+      :reads (:reads after []) :root native :arity (nth native 2)}))
    (catch error
     (if-let [reason (:reason (ex-data error))]
      {:status :unknown :reason reason} (throw error)))))
@@ -700,17 +718,103 @@
              :plain-map (plain-map-known? value facts)
              :vector (and (type-known? value :vector facts) (first-order-known? value facts))
              false)))) (:obligations proof))))
+
+(defn- source-raw-cost [value]
+ ;; Exact native traversal cost for already validated literal data. The
+ ;; Source walker counts a proper list once, not once per cons cell, and
+ ;; traverses every raw field of collection representations.
+ (decision-step!)
+ (let [children (cond (erlang/is_tuple value) (erlang/tuple_to_list value)
+                      (erlang/is_list value) value
+                      (erlang/is_map value) (mapcat (fn [pair] [(elem pair 0) (elem pair 1)]) (maps/to_list value))
+                      :else [])
+       costs (mapv source-raw-cost children)]
+  {:nodes (inc (reduce + 0 (map :nodes costs)))
+   :depth (if (seq costs) (inc (reduce max 0 (map :depth costs))) 0)}))
+(declare source-shape)
+(defn- source-shape [value facts]
+ (decision-step!)
+ (cond
+  (or (boolean-term? value)
+      (some #(type-known? value % facts) [:integer :float :binary :atom])) [:closed 1 0]
+  (literal? value) (let [cost (source-raw-cost (:value value))] [:closed (:nodes cost) (:depth cost)])
+  (and (= :map (:tag value)) (nil? (:base value)))
+   [:map (into {} (map (fn [[key item]] [key (source-shape item facts)]) (:fields value)))]
+  (= :vector (:tag value)) [:vector (mapv #(source-shape % facts) (:items value))]
+  (= :vector-count (:tag value)) [:closed 1 0]
+  (= :choose (:tag value))
+   [:choose (:test value)
+    (source-shape (:then value) (conj facts (:test value)))
+    (source-shape (:else value) (conj facts {:tag :not :value (:test value)}))]
+  ;; No assumed size for an aggregate merely because it is first-order or
+  ;; has one typed field. Preserve its full symbolic identity and occurrence.
+  :else [:borrow value]))
+(defn- source-shape-cost [shape]
+ (decision-step!)
+ (case (first shape)
+  :closed {:nodes (second shape) :depth (nth shape 2)}
+  :map (let [costs (mapv source-shape-cost (vals (second shape)))]
+         (when (every? some? costs)
+          {:nodes (+ 1 (count costs) (reduce + 0 (map :nodes costs)))
+           :depth (if (seq costs) (inc (reduce max 0 (map :depth costs))) 0)}))
+  ;; The canonical eager constructor has at most the three raw map fields,
+  ;; class tag, nil metadata and dense tuple storage. This is an upper bound,
+  ;; never the smaller first-order logical cost of the elements alone.
+  :vector (let [costs (mapv source-shape-cost (second shape))]
+            (when (every? some? costs)
+             {:nodes (+ 7 (reduce + 0 (map :nodes costs)))
+              :depth (+ 2 (reduce max 0 (map :depth costs)))}))
+  :choose (let [a (source-shape-cost (nth shape 2)) b (source-shape-cost (nth shape 3))]
+            (when (and a b) {:nodes (max (:nodes a) (:nodes b)) :depth (max (:depth a) (:depth b))}))
+  nil))
+(defn- source-argv-bounded? [shape]
+ (let [costs (mapv source-shape-cost shape)]
+  (and (every? some? costs)
+       (<= (inc (reduce + 0 (map :nodes costs))) 16384)
+       (<= (if (seq costs) (inc (reduce max 0 (map :depth costs))) 0) 64))))
+(defn- source-guard-conditions [guard input request facts]
+ (mapv #(substitute % input request facts) (:when guard [])))
+(defn- source-guard-shape [guard input request facts]
+ (mapv #(source-shape (substitute % input request facts) facts) (:arguments guard)))
+(defn- source-guards-under? [proof input request facts assumptions]
+ (and (contains? proof :source-guards)
+  (every? (fn [guard]
+   (let [conditions (source-guard-conditions guard input request facts)
+         conditional-facts (into facts conditions)]
+    (or (some #(disprove % conditional-facts) conditions)
+        (let [shape (source-guard-shape guard input request conditional-facts)]
+         (or (source-argv-bounded? shape)
+             ;; Equal footprint does not preserve callable custody across
+             ;; different Source graphs. Borrowed-size dominance is only for
+             ;; arguments proved passive; unrestricted capability values keep
+             ;; their runtime contract, but receive no invented upgrade proof.
+             (and (every? #(first-order-known? (substitute % input request conditional-facts) conditional-facts)
+                           (:arguments guard))
+              (some (fn [[old old-input old-request]]
+               (some (fn [previous]
+                 ;; An old predicate's successful true path implies only
+                 ;; guards actually reached on that same path.
+                 (and (= true (:assumption? previous))
+                      (every? #(prove % conditional-facts)
+                        (source-guard-conditions previous old-input old-request conditional-facts))
+                      (= shape (source-guard-shape previous old-input old-request conditional-facts))))
+                (:source-guards old []))) assumptions))))))) (:source-guards proof))))
 (defn- total-migration? [old upcast candidate domain]
  (every? (fn [facts]
            (let [input {:tag :input} facts (into facts (domain-facts input domain))
                  converted (substitute (:expression upcast) input facts)]
             (and (or (not= :bounded-first-order domain) (first-order-known? converted facts))
                  (total-under? old input facts) (total-under? upcast input facts)
-                 (total-under? candidate converted facts))))
+                 (total-under? candidate converted facts)
+                 (contains? old :source-guards)
+                 (source-guards-under? upcast input {:tag :request} facts [[old input {:tag :request}]])
+                 (source-guards-under? candidate converted {:tag :request} facts [[old input {:tag :request}]]))))
          (true-cases (:expression old))))
 (defn- compare-callbacks-once
  "Three actual privately retained callback records {:function :environment}.
-  No caller-authored expression or Boolean can authorize a native upgrade."
+  Totality also covers actual Source argument-budget guards, using closed
+  bounds or guards reached on the old accepted path. A first-order type alone
+  is not a native argv size bound. No supplied expression grants adoption."
  [old upcast candidate domain]
  (let [a (capture-record old)
        b (capture-record upcast)
@@ -734,7 +838,9 @@
   every reply satisfying the candidate contract at its upcast request, prove
   that downcast(reply, ORIGINAL request) satisfies the old reply contract.
   Handler effects/results are independent runtime obligations. No callback is
-  invoked here, and all non-absent inputs use actual retained registrations."
+  invoked here, and all non-absent inputs use actual retained registrations.
+  Shared argument budgets include both reply and original request; only guards
+  reached by successful predicates can supply Source budget assumptions."
  [old-accept upcast candidate-reply downcast old-reply domain]
  (let [records [old-accept upcast candidate-reply downcast old-reply]
        captured (mapv #(when % (capture-record %)) records)
@@ -766,7 +872,14 @@
                                       (total-under? b request request facts)
                                       (or (nil? c) (total-under? c reply converted facts))
                                       (or (nil? d) (total-under? d reply request facts))
-                                      (or (nil? e) (total-under? e result request facts))))})) reply-cases)))) cases)
+                                      (or (nil? e) (total-under? e result request facts))
+                                      (contains? a :source-guards)
+                                      (or (nil? c) (contains? c :source-guards))
+                                      (source-guards-under? b request request facts [[a request request]])
+                                      (or (nil? d) (source-guards-under? d reply request facts
+                                                     (cond-> [[a request request]] c (conj [c reply converted]))))
+                                      (or (nil? e) (source-guards-under? e result request facts
+                                                     (cond-> [[a request request]] c (conj [c reply converted]))))))})) reply-cases)))) cases)
           proved (every? #(and (:predicate %) (:totality %)) (mapcat identity decisions))]
      (if (and proved (every? valid? evidence))
       {:status :proved :scope :reply-predicate-preservation :cases (count cases) :evidence evidence}
