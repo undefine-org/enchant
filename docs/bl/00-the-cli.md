@@ -981,6 +981,7 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BL_BIN` / `BL_ROOT` / `BL_BUILD_ID` / `BL_BOOT_REEXECED` / `BL_EBIN` | protocol | the launcher's handoff to the VM: which launcher, which tree, which build. Do not set these |
 | `BL_SDK_PRODUCT` / `BL_ARTIFACT_PLATFORM` / `BL_CHECKOUT_PLATFORM` / `BL_CHECKOUT_SDK_INPUTS` | protocol | immutable SDK selection, its platform and captured checkout inputs, supplied by the Nix launcher |
 | `BL_PREPARATION_COORDINATOR` / `BL_PREPARED_NATIVES` / `BL_PREVIOUS_UNIT_STORE` | protocol | retained preparation coordinator, native products and prior qualified AOT units used by the producer |
+| `BL_COMPILER_EMITTER_CONTEXT` | protocol | Nix-owned identity of the exact OTP, Elixir, dependencies and native products used for compiler-unit reuse |
 | `BL_INTERNAL_PRODUCER` / `BL_ARTIFACT_TOOL_PATH` | protocol | trusted Nix worker entry and its declared executable search path |
 | `BL_NATIVE_PROVIDER` | protocol | native production provider; the accepted value is `nix` |
 | `BEAM_LISP_CUSTODY_COMMAND_V1` | protocol | serialized native custody request passed to an isolated command process |
