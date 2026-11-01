@@ -26,7 +26,7 @@ lexical_path() {
 }
 
 safe_path() {
-    lexical_path "$1"
+    lexical_path "$1" || return 1
     remaining=$1
     parent=otp
     while :; do
