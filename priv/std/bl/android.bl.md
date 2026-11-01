@@ -639,7 +639,7 @@ dependencies are missing.
   "The Erlang entry mob's launcher runs (`-eval '<app>:start().'`)."
   [t dir target]
   (let [src (Path/join dir (str (:app t) ".erl"))
-        binary-literal (fn [bytes] (str "<<" (Enum/map_join (erlang/binary_to_list bytes) "," str) ">>"))
+        binary-literal (fn [bytes] (str "<<" (Enum/map_join (erlang/binary_to_list bytes) "," (fn [byte] (str byte))) ">>"))
         expected (binary-literal (erlang/term_to_binary target))
         native (get-in target [:native "lazy_memo.so"])]
     (File/write! src
@@ -787,7 +787,7 @@ dependencies are missing.
                (str (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! (Path/join st name)))))
                     "  " (String/replace_prefix name "otp/" "")))) "\n"))
       (File/write! (Path/join (:build t) "runtime-files.txt")
-        (str (Enum/map_join (conj names "otp/.bl-runtime-files") "\n" str) "\n")))
+        (str (Enum/map_join (conj names "otp/.bl-runtime-files") "\n" (fn [name] name)) "\n")))
     st))
 ```
 
