@@ -1,7 +1,7 @@
 # Each generation is retained independently. Qualification assembles verified
 # outputs; retrying a later stage never discards an earlier successful stage.
 { pkgs, erlang, elixir, src, dependencies, checkoutPlatform, nativeProducts,
-  previousCompiler ? null, previousSource ? null, cacheCompatible ? true }:
+  previousCompiler ? null, previousSource ? null, cacheCompatible ? true, previousPreparation ? null }:
 let
   identity = builtins.hashString "sha256" (builtins.toJSON {
     source = toString src;
@@ -76,7 +76,7 @@ let
         ''}
     '';
   });
-  p = generation "P" (if previousCompiler == null then null else previousCompiler + "/seed") null;
+  p = generation "P" (if previousCompiler == null then null else previousCompiler + "/seed") previousPreparation;
   b = generation "B" (p + "/P") p;
   c = generation "C" (b + "/B") p;
 in if previousIdentity == identity then previousCompiler else

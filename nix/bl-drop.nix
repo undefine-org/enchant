@@ -11,7 +11,7 @@
 # with no RUNPATH, so the drop does not depend on /nix/store paths existing on
 # the target. On NixOS that loader is nix-ld's, which resolves libc from the HOST:
 # the host's glibc must therefore be >= the drop's symbol floor, which is the point.
-{ pkgs, rustPkgs, erlang, elixir, includeDesktop ? false, previousSdk ? null }:
+{ pkgs, rustPkgs, erlang, elixir, includeDesktop ? false, previousSdk ? null, previousPreparation ? null }:
 let
   inherit (pkgs) lib;
 
@@ -186,6 +186,7 @@ let
     cp -aL --no-preserve=ownership "$XDG_CACHE_HOME/beam_lisp/ebin" "$out/ebin"
   '');
   compiler = import ./compiler-product.nix {
+    inherit previousPreparation;
     inherit pkgs erlang elixir dependencies;
     src = sources.compiler;
     checkoutPlatform = compilerPlatform;
