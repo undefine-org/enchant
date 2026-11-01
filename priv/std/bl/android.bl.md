@@ -618,10 +618,30 @@ dependencies are missing.
   [dir-name]
   (let [i (index-of dir-name "-")] (if (nil? i) dir-name (subs dir-name 0 i))))
 
+(def sdk-elixir-apps [:elixir :eex :iex :logger :mix])
+
+(defn sdk-elixir-files
+  "The selected SDK's pure Elixir runtime, independent of the Android OTP's
+   bundled Elixir patch version. Native OTP artifacts remain the Android ones."
+  []
+  (BeamLisp.Loader/ensure_loaded "artifact")
+  (let [sdk (:sdk ((BeamLisp.Env/fetch! "artifact" "framework-context")))
+        _ (when-not sdk (throw (ex-info "Android needs the selected managed SDK" {:kind :android-sdk-required})))
+        metadata (erlang/apply :json :decode (list (File/read! (Path/join sdk "artifact.json"))))
+        executable (BeamLisp.AOT/physical_sdk_path (Path/join (get metadata "platform") "bin/elixir"))
+        distribution (Path/join (Path/dirname (Path/dirname executable)) "lib/elixir/lib")]
+  (reduce (fn [files app]
+            (let [root (Path/join distribution (name app)) prefix (str "otp/lib/" (name app))]
+              (merge files (tree-files (Path/join root "ebin") (str prefix "/ebin"))
+                (if (File/dir? (Path/join root "priv"))
+                  (tree-files (Path/join root "priv") (str prefix "/priv")) {}))))
+          {} sdk-elixir-apps)))
+
 (defn- device-app-file!
-  "beam-lisp's .app with `applications` cut to what `lib` holds."
-  [src dst lib]
-  (let [present (set (map app-name-of (File/ls! lib)))
+  "Render the SDK resource into an owned cache, retaining unchanged bytes and
+   mtimes. `libraries` names the actual projected library directories."
+  [src dst libraries]
+  (let [present (set (map app-name-of libraries))
         r (erlang/apply :file :consult (list (erlang/binary_to_list src)))
         term (erlang/hd (erlang/element 2 r))
         nm (erlang/element 2 term)
@@ -632,8 +652,13 @@ dependencies are missing.
                       props)
         props (apply list (concat [(tuple :applications (keep :applications))
                                    (tuple :optional_applications (keep :optional_applications))]
-                                  rest-))]
-    (File/write! dst (erlang/iolist_to_binary (io_lib/format "~tp.~n" (list (tuple :application nm props)))))))
+                                  rest-))
+        bytes (erlang/iolist_to_binary (io_lib/format "~tp.~n" (list (tuple :application nm props))))]
+    (when-not (and (File/regular? dst) (= bytes (File/read! dst)))
+      (File/mkdir_p! (Path/dirname dst))
+      (when (File/exists? dst) (File/chmod! dst 420))
+      (File/write! dst bytes))
+    dst))
 
 (defn- boot-module!
   "The Erlang entry mob's launcher runs (`-eval '<app>:start().'`)."
@@ -759,7 +784,12 @@ dependencies are missing.
                          (if (File/dir? (Path/join source "priv"))
                            (tree-files (Path/join source "priv") (str prefix "/priv")) {}))))
                    {} dependencies)
-        files (merge (tree-files (ensure-otp! (:abi t)) "otp")
+        otp-files (into {} (remove (fn [[path _]]
+                         (let [parts (String/split path "/")]
+                           (and (>= (count parts) 4) (= "lib" (nth parts 1))
+                             (contains? (set (map name sdk-elixir-apps)) (app-name-of (nth parts 2))))))
+                       (tree-files (ensure-otp! (:abi t)) "otp")))
+        files (merge otp-files (sdk-elixir-files)
                      ;; Keep the selected SDK's actual floor, sealed inventory
                      ;; and Source ownership metadata together with its beams.
                      (tree-files (lib-dir :beam_lisp) bl-prefix)
@@ -769,25 +799,30 @@ dependencies are missing.
                      {(str "otp/" (:app t) "/" (:app t) ".beam") (Path/join erl-out (str (:app t) ".beam"))
                       (str bl-prefix "/ebin/bl_android_nif.beam") (Path/join erl-out "bl_android_nif.beam")
                       (str bl-prefix "/priv/native/lazy_memo.so") native})
+        library-names (vec (distinct (keep (fn [path]
+                         (let [parts (String/split path "/")]
+                           (when (and (>= (count parts) 4) (= "lib" (nth parts 1))) (nth parts 2)))) (keys files))))
+        resource (device-app-file! (Path/join (lib-dir :beam_lisp) "ebin/beam_lisp.app")
+                                  (Path/join erl-out "beam_lisp.app") library-names)
+        files (assoc files (str bl-prefix "/ebin/beam_lisp.app") resource)
         files (into {} (remove (fn [[name _]]
                          (or (String/ends_with? name ".a") (String/ends_with? name ".o")
                              (Regex/match? #"^otp/erts-[^/]+/bin/beam\\.smp$" name))) files))]
     (println "  · synchronize runtime")
     (sync-files! st files (Path/join (:build t) "stage-files.term"))
-    (device-app-file! (Path/join (list st bl-prefix "ebin/beam_lisp.app"))
-                     (Path/join (list st bl-prefix "ebin/beam_lisp.app")) lib)
     (let [names (vec (sort (keys files)))
           receipt (Path/join st "otp/.bl-runtime-files")]
       (doseq [name names]
         (when (or (not (String/starts_with? name "otp/"))
                   (String/contains? name "\n") (String/contains? name "\r"))
           (throw (ex-info "Invalid Android runtime member" {:kind :android-stage-inventory}))))
-      (File/write! receipt
-        (str (Enum/map_join names "\n" (fn [name]
+      (let [bytes (str (Enum/map_join names "\n" (fn [name]
                (str (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! (Path/join st name)))))
-                    "  " (String/replace_prefix name "otp/" "")))) "\n"))
-      (File/write! (Path/join (:build t) "runtime-files.txt")
-        (str (Enum/map_join (conj names "otp/.bl-runtime-files") "\n" (fn [name] name)) "\n")))
+                    "  " (String/replace_prefix name "otp/" "")))) "\n")
+            listing (Path/join (:build t) "runtime-files.txt")
+            listed (str (Enum/map_join (conj names "otp/.bl-runtime-files") "\n" (fn [name] name)) "\n")]
+        (when-not (and (File/regular? receipt) (= bytes (File/read! receipt))) (File/write! receipt bytes))
+        (when-not (and (File/regular? listing) (= listed (File/read! listing))) (File/write! listing listed))))
     st))
 ```
 
