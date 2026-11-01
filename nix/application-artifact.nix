@@ -53,8 +53,9 @@ let
     && builtins.pathExists (base + "/production-request.json");
   requestFile = pkgs.writeText "beam-lisp-application-request.json" (builtins.toJSON request);
   boot = pkgs.writeText "beam-lisp-application-producer.exs" ''
-    for path <- Path.wildcard("${image}/lib/*/ebin"), do: Code.prepend_path(path)
-    Code.prepend_path("${image}/image/ebin")
+    root = System.fetch_env!("BL_ROOT")
+    for path <- Path.wildcard(Path.dirname(root) <> "/*/ebin"), do: Code.prepend_path(path)
+    Code.prepend_path(root <> "/ebin")
     Application.load(:beam_lisp)
     for app <- Application.spec(:beam_lisp, :applications) || [], do: {:ok, _} = Application.ensure_all_started(app)
     :ok = BeamLisp.LazyMemo.ensure_loaded!()
@@ -115,7 +116,15 @@ if unchanged then import ./application-artifact.nix {
   export HOME=/build/home XDG_CACHE_HOME=/build/home/.cache BL_DAEMON=off
   export PATH=${platform}/bin:$PATH
   export LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu +S 4:4 +SDcpu 2:2 +SDio 1:1"
-  export BL_ROOT=${image}/image BL_BIN=${image}/bl
+  # SDK admission repeatedly reads and stats the compiler, sources and unit
+  # inventory. Keep those reads on the guest disk instead of crossing virtiofs
+  # for every check. This is a read-only, byte-preserving relocation of the
+  # selected SDK; its identity and every producer/receiver check stay intact.
+  mkdir -p /build/sdk/lib
+  cp -a --no-preserve=ownership ${image}/lib/. /build/sdk/lib/
+  ${pkgs.util-linux}/bin/mount --bind /build/sdk/lib /build/sdk/lib
+  ${pkgs.util-linux}/bin/mount -o remount,bind,ro /build/sdk/lib
+  export BL_ROOT="/build/sdk/lib/$(basename "$(readlink -f ${image}/image)")" BL_BIN=${image}/bl
   export BL_ARTIFACT_PLATFORM=${platform}/artifact-platform
   ${pkgs.lib.optionalString (nativeSet != null) "export BL_PREPARED_NATIVES=${nativeSet}"}
   ${pkgs.lib.optionalString (base != null) "export BL_APPLICATION_BASE=${base}"}
