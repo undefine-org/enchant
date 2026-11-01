@@ -53,6 +53,33 @@ class ExecutionLaneTests(unittest.TestCase):
             self.assertFalse(out.exists())
             self.assertFalse(marker.exists())
 
+    def test_invalid_file_requests_refuse_before_capture_or_nix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            tools = directory / 'tools'
+            tools.mkdir()
+            marker = directory / 'unexpected-nix-job'
+            executable = tools / 'nix-build'
+            executable.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 99\n')
+            executable.chmod(0o755)
+            cases = [
+                ['test/scripts/artifact-provider-driver.bl'],
+                ['test/bl/no_such_test.bl'],
+                ['test/bl/native_test.bl', 'test/bl/native_test.bl'],
+                [str(ROOT / 'test/bl/native_test.bl')],
+                ['../outside_test.bl'],
+            ]
+            for index, files in enumerate(cases):
+                with self.subTest(files=files):
+                    out = directory / str(index) / 'receipt'
+                    result = subprocess.run(
+                        [str(ROOT / 'scripts/ci-check'), '--out', str(out), *files],
+                        env=dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']),
+                        text=True, capture_output=True)
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertFalse(out.parent.exists())
+                    self.assertFalse(marker.exists())
+
     def test_loader_prefix_executes_inside_the_actual_manager_unit(self):
         host = load('ci-host-nix-check')
         root = Path('/frozen/source')
