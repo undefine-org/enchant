@@ -1,4 +1,4 @@
-"""The real platform entry preserves the host's configured CPU allocation."""
+"""Platform preparation requires the station and preserves its CPU policy."""
 import json
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PlatformHostPolicy(unittest.TestCase):
-    def test_preparation_does_not_replace_the_configured_cpu_policy(self):
+    def test_preparation_requires_the_station_without_replacing_its_cpu_policy(self):
         with tempfile.TemporaryDirectory(prefix='bl-platform-policy-') as temporary:
             project = Path(temporary) / 'source'
             for name in ('scripts', 'nix', 'native', 'tooling/drop', 'tools'):
@@ -45,7 +45,7 @@ target.mkdir(parents=True)
                            env=env, check=True, capture_output=True, text=True)
             actual = json.loads(capture.read_text())
             self.assertNotIn('--cores', actual['argv'])
-            self.assertNotIn('--max-jobs', actual['argv'])
+            self.assertEqual('0', actual['argv'][actual['argv'].index('--max-jobs') + 1])
             self.assertEqual(policy, actual['config'])
 
 
