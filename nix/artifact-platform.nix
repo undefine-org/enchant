@@ -24,6 +24,7 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   cp ${./bounded-build.nix} "$out/nix/bounded-build.nix"
   cp ${./application-artifact.nix} "$out/nix/application-artifact.nix"
   cp ${./artifact-selection.nix} "$out/nix/artifact-selection.nix"
+  cp ${./application-selection.nix} "$out/nix/application-selection.nix"
   cp ${./sdk-worker-filesystem.nix} "$out/nix/sdk-worker-filesystem.nix"
   cp ${./application-worker.bl} "$out/nix/application-worker.bl"
   cp ${./application-inventory.py} "$out/nix/application-inventory.py"

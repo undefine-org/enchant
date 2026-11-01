@@ -256,6 +256,17 @@
           30000 268435456 (Path/join directory "result.json")))
       (finally (File/rm_rf! directory)))))
 
+(defn- retain-product! [selected directory run]
+  (let [output (get selected "output")]
+    (when (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output)
+               (File/dir? output))
+      (try
+        ;; Only output paths can be retained here; this cannot invoke a builder.
+        (run "cached-retention" (process/tool "nix-store")
+          ["--add-root" (Path/join directory "retained") "--indirect" "--realise" output])
+        (assoc selected "cached" true "retention-root" (Path/join directory "retained"))
+        (catch _ nil)))))
+
 (defn- existing-product! [platform kind sdk request directory run]
   ;; Evaluate the pinned producer, never a receipt's claim about its identity.
   ;; IFD is disabled: misses remain the durable worker's responsibility.
@@ -267,18 +278,8 @@
                             "--argstr" "requestJson" (Jason/encode! request)
                             "--option" "allow-import-from-derivation" "false" "--option" "max-jobs" "0"
                             "--extra-experimental-features" "nix-command flakes"]))
-                       (catch _ nil))
-          output (get selected "output")]
-      (when (and (string? output) (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" output)
-                 (File/dir? output))
-        (try
-          ;; Only an existing output directory is passed, never a derivation.
-          ;; Nix can retain/substitute this object but cannot invoke its builder.
-          (run "cached-retention" (process/tool "nix-store")
-            ["--add-root" (Path/join directory "retained") "--indirect" "--realise" output])
-          (assoc selected "cached" true "retention-root" (Path/join directory "retained"))
-          ;; A collection race is a cache miss, not a failed preparation.
-          (catch _ nil))))))
+                       (catch _ nil))]
+      (retain-product! selected directory run))))
 
 (defn prepare-application!
   "Realize an application through the trusted recipe and an exact SDK. Source
@@ -306,15 +307,7 @@
               (managed! platform executable argv timeout memory (Path/join directory (str label ".json"))))
         _ (run "sdk-retention" store
                ["--add-root" (Path/join directory "sdk-retained") "--indirect" "--realise" sdk])
-        snapshot-rows (Jason/decode!
-                        (run "source" nix
-                          ["build" "--impure" "--file" (Path/join platform "nix/project-snapshot.nix")
-                           "--argstr" "source" source "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
-                           "--argstr" "excludedJson" (Jason/encode! (Enum/map (or (:excluded-roots options) []) identity))
-                           "--json" "--out-link" (Path/join directory "source-retained")]))
-        _ (when-not (= 1 (count snapshot-rows)) (refuse "Expected one project snapshot" {}))
-        snapshot (immutable-directory! (get-in (first snapshot-rows) ["outputs" "out"]))
-        request {"version" 1 "source" snapshot "sources" (Enum/map (or (:sources options) []) identity)
+        request {"version" 1 "source" source "sources" (Enum/map (or (:sources options) []) identity)
                  "world" (:world options) "exclude" (Enum/map (or (:exclude options) []) identity)
                  "ex" (when-let [ex (:ex options)] {"root" (:root ex) "exclude" (Enum/map (or (:exclude ex) []) identity)})
                  "native" (boolean (:native options)) "jobs" (or (:jobs options) 1)}
@@ -333,7 +326,40 @@
             (run "base-retention" store
               ["--add-root" (Path/join directory "base-retained") "--indirect" "--realise"
                (immutable-directory! (:base options))]))
-        prepared (or (existing-product! platform "application" sdk request directory run)
+        selected (when-not (:force? options)
+                   (try (Jason/decode!
+                     (run "selection" (process/tool "nix-instantiate")
+                       ["--eval" "--strict" "--json" (Path/join platform "nix/application-selection.nix")
+                        "--argstr" "source" source "--argstr" "sdk" sdk
+                        "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
+                        "--argstr" "excludedJson" (Jason/encode! (Enum/map (or (:excluded-roots options) []) identity))
+                        "--argstr" "requestJson" (Jason/encode! request)
+                        "--option" "allow-import-from-derivation" "false" "--option" "max-jobs" "0"
+                        "--extra-experimental-features" "nix-command flakes"]))
+                     (catch _ nil)))
+        hinted (get selected "source")
+        retained-source (when (and (string? hinted)
+                                  (Regex/match? #"^/nix/store/[0-9a-z]{32}-[^/]+$" hinted)
+                                  (File/dir? hinted))
+                          (try
+                            (run "source" store ["--add-root" (Path/join directory "source-retained")
+                                                 "--indirect" "--realise" hinted])
+                            hinted
+                            (catch _ nil)))
+        snapshot (or retained-source
+                   (let [rows (Jason/decode!
+                                (run "source" nix
+                                  ["build" "--impure" "--file" (Path/join platform "nix/project-snapshot.nix")
+                                   "--argstr" "source" source "--argstr" "rootsJson" (Jason/encode! (Enum/map roots identity))
+                                   "--argstr" "excludedJson" (Jason/encode! (Enum/map (or (:excluded-roots options) []) identity))
+                                   "--json" "--out-link" (Path/join directory "source-retained")]))]
+                     (when-not (= 1 (count rows)) (refuse "Expected one project snapshot" {}))
+                     (immutable-directory! (get-in (first rows) ["outputs" "out"]))))
+        _ (when-not (= (tuple :ok snapshot) (File/read_link (Path/join directory "source-retained")))
+            (refuse "Application source snapshot lacks its requester root" {}))
+        request (assoc request "source" snapshot)
+        prepared (or (when (= snapshot hinted) (retain-product! selected directory run))
+                     (when (nil? selected) (existing-product! platform "application" sdk request directory run))
                      (prepare-job! directory {"version" 1 "kind" "application" "sdk" sdk "request" request} timeout))
         output (immutable-directory! (get prepared "output"))
         result (Jason/decode!
