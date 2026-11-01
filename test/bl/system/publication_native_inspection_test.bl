@@ -1,0 +1,119 @@
+(ns system.publication-native-inspection-test
+ (:require [system.publication :as publication] [proc.message-domain :as domain]
+           [proc.callback :as callback] [reload.generation :as generation] [env]
+           [test.support.source-fixtures :as fixtures]))
+
+(fixtures/effects!)
+
+(defn- metadata-depth [value]
+ ;; Match the native walk's container depth without invoking value protocols.
+ (cond
+  (erlang/is_tuple value)
+   (inc (reduce max 0 (map metadata-depth (erlang/tuple_to_list value))))
+  (erlang/is_list value) (inc (reduce max 0 (map metadata-depth value)))
+  (erlang/is_map value)
+   (inc (reduce max 0 (map (fn [pair]
+                            (max (metadata-depth (elem pair 0))
+                                 (metadata-depth (elem pair 1)))) (maps/to_list value))))
+  :else 0))
+
+(defn- original [error]
+ (if (erlang/is_map error) (maps/get :original error error) error))
+
+(deftest fixed-inspection-reads-deep-source-metadata-without-executing-a-callback
+ (let [graph (generation/prepare!
+              {:application-id (str "deep-publication-inspection-" (erlang/unique_integer (list :positive)))
+               :native-modules #{"erlang" "SourceEffectObserverFixture"}
+               :sources
+               {"publication.deep.callback"
+                "(ns publication.deep.callback (:require [publication.deep.helper :as helper]))
+                 (defn accepts [m]
+                  (and (vector? m) (= 3 (count m)) (= :order (first m))
+                       (erlang/is_binary (nth m 1)) (erlang/is_integer (nth m 2)) (> (nth m 2) 0)))
+                 (defn effect [value]
+                  (SourceEffectObserverFixture/put :publication-inspection-effect value))"
+                "publication.deep.helper" "(ns publication.deep.helper) (defn identity-value [x] x)"}})
+       register (fn [name]
+                  (generation/with! graph
+                   #(let [registration (callback/register!
+                                        (BeamLisp.Env/fetch_exact!
+                                         (get (:mapping graph) "publication.deep.callback") name))]
+                     (BeamLisp.Execution/restrict! registration)
+                     registration)))
+       predicate (register "accepts") effect (register "effect")
+       before (BeamLisp.Env/capture)]
+  (try
+   (SourceEffectObserverFixture/delete :publication-inspection-effect)
+   (is (= :waiting (:status (generation/retire! graph))))
+   (is (thrown? (generation/with! graph (fn [] :fresh-admission))))
+   (let [proof (domain/capture-registration! predicate)]
+    (is (= :proved (:status proof)))
+    ;; The actual complete proof is deeper than Source callback admission,
+    ;; rather than an artificially inflated fixture or raised runtime budget.
+    (is (> (metadata-depth (:definitions proof)) 64))
+    (is (= predicate (:registration proof)))
+    (is (not (contains? proof :environment)))
+    (is (domain/valid? proof)))
+   (is (= true (callback/invoke! predicate [[:order "receipt" 1599]])))
+   (is (= :unknown (:status (domain/capture-registration! effect))))
+   (is (= nil (SourceEffectObserverFixture/get :publication-inspection-effect)))
+   (is (thrown? (BeamLisp.Execution/inspect! predicate 'arbitrary/evaluator)))
+   ;; Only the fixed nonexecuting reader is native. The real application
+   ;; callback's ordinary native-call argument budget still refuses pre-effect.
+   (let [deep (loop [left 70 value 0]
+               (if (zero? left) value (recur (dec left) {:nested value})))
+         error (try (callback/invoke! effect [deep]) nil (catch error error))]
+    (is (= :source_callable_budget (original error)))
+    (is (= nil (SourceEffectObserverFixture/get :publication-inspection-effect))))
+   (is (= before (BeamLisp.Env/capture)))
+   (finally
+    (callback/unregister! predicate)
+    (callback/unregister! effect)
+    (generation/retire! graph)
+    (SourceEffectObserverFixture/delete :publication-inspection-effect)))))
+
+(defn- ordinary-fixture []
+ (let [namespace (str "publication.inert.p" (erlang/unique_integer (list :positive)))]
+  (env/eval (str "(ns " namespace ") (defn identity-value [value] value)"))
+  namespace))
+
+(defn- raw-refusal [namespace]
+ (let [result (publication/snapshot-result namespace "identity-value")]
+  (is (= :error (:status result)))
+  (is (= :publication-analysis-error (:kind result)))
+  (is (= :unsafe-first-order-data (:cause result)))
+  (is (= false (:native-admission result)))))
+
+(deftest mutable-publication-rows-refuse-callables-and-foreign-structs
+ (let [namespace (ordinary-fixture)
+       publication-key (tuple :emitted_publication namespace)
+       definition-key (tuple :emitted_definition namespace "identity-value")
+       publication-row (elem (BeamLisp.Env/lookup publication-key) 1)
+       definition-row (elem (BeamLisp.Env/lookup definition-key) 1)
+       touched (atom 0)
+       callback (fn [] (swap! touched inc))
+       foreign {:__struct__ :UntrustedPublicationMetadata :callback callback}]
+  (try
+   (BeamLisp.Env/put_key publication-key (assoc publication-row :untrusted callback))
+   (raw-refusal namespace)
+   (BeamLisp.Env/put_key publication-key publication-row)
+   (BeamLisp.Env/put_key definition-key (assoc definition-row :untrusted foreign))
+   (raw-refusal namespace)
+   (is (= 0 @touched))
+   (finally
+    (BeamLisp.Env/put_key publication-key publication-row)
+    (BeamLisp.Env/put_key definition-key definition-row)))
+  (is (= :proved (:status (publication/snapshot-result namespace "identity-value"))))))
+
+(deftest raw-entry-validation-precedes-lazy-parameter-traversal
+ (let [namespace (ordinary-fixture)
+       entries (BeamLisp.Env/ns_definition namespace "identity-value")
+       entry (first entries) touched (atom 0)
+       delayed (lazy-seq (do (swap! touched inc) (list {:pop :pvar :name "value"})))
+       changed (erlang/setelement 4 entry (assoc (elem entry 3) :params delayed))]
+  (try
+   (BeamLisp.Env/put_ns_definition namespace "identity-value" (list changed))
+   (raw-refusal namespace)
+   (is (= 0 @touched))
+   (finally (BeamLisp.Env/put_ns_definition namespace "identity-value" entries)))
+  (is (= :proved (:status (publication/snapshot-result namespace "identity-value"))))))
