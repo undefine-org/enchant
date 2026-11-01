@@ -117,3 +117,39 @@
     (is (not= (:namespace core) (:namespace sugar)))
     (is (not= (key core) (key sugar))))
    (finally (BeamLisp.AOT/close_workspace! handle)))))
+
+(deftest captured-input-reuse-skips-preparation-and-keeps-independent-reproduction
+ (let [directory (Path/join (System/tmp_dir!) (str "compiler-input-cache-" (System/unique_integer (list :positive))))
+       root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+       file (Path/join root "host/compiler_data.bl")
+       a (Path/join directory "a") b (Path/join directory "b")
+       phase (str (String/duplicate "a" 64))
+       spec {:namespace 'host.compiler-data :module :Elixir.BeamLisp.CompilerData}
+       selection {:namespace 'host.compiler-data :file file :host-spec spec}
+       handle (BeamLisp.AOT/open_workspace
+                {:version 2 :phase-imports (list 'core 'sugar)
+                 :sources (list {:namespace 'host.compiler-data :file file})} {})
+       invoke (fn [name args] (BeamLisp.Ns.Rt/invoke
+                               (BeamLisp.Env/fetch_exact! "compiler-unit-store-under-test" name) args))
+       before (BeamLisp.CompilerData/module_info :md5)]
+  (try
+   (let [prepared (BeamLisp.AOT/prepare_host_unit handle spec)
+         captured (artifact! prepared a nil)
+         baseline {"modules" (into {} (map (fn [[module bytes]]
+                      [(str (Atom/to_string module) ".beam")
+                       (Base/encode16 (crypto/hash :sha256 bytes) (list (tuple :case :lower)))])
+                      (get-in captured [:verified :beams])))}
+         _ (invoke "record-compiler-unit!" (list prepared (assoc captured :compiled false) a phase))
+         restore (fn [out seen-phase old]
+                   (invoke "restore-compiler-unit!" (list selection out a seen-phase true old)))
+         reused (restore b phase baseline)]
+    (is (= false (:compiled reused)))
+    (is (= (get-in captured [:verified :beams]) (:beams reused)))
+    (is (nil? (restore (Path/join directory "wrong-phase") "different" baseline)))
+    (is (nil? (restore (Path/join directory "wrong-floor") phase {"modules" {}})))
+    ;; Even matching bytes must not let a planning stage claim its own newly
+    ;; emitted unit as independently reproduced output.
+    (invoke "record-compiler-unit!" (list prepared captured a phase))
+    (is (nil? (restore (Path/join directory "new-output") phase baseline)))
+    (is (= before (BeamLisp.CompilerData/module_info :md5))))
+   (finally (BeamLisp.AOT/close_workspace! handle) (File/rm_rf! directory)))))

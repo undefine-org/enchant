@@ -34,7 +34,8 @@ def baseline(compiler, source, current):
         return None
     return {'version': 1, 'compiler': str(compiler), 'floor': str(compiler / 'seed'),
             'compiler_key': proof.manifest_keys(compiler / 'seed/manifest.term')['compiler_key'],
-            'abi_prefix_sha256': hashlib.sha256(prefix).hexdigest(), 'inputs': inputs}
+            'abi_prefix_sha256': hashlib.sha256(prefix).hexdigest(), 'inputs': inputs,
+            'modules': proof.actual_inventory(compiler / 'seed')}
 
 
 if __name__ == '__main__':

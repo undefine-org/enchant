@@ -70,6 +70,69 @@
       (File/cp_r! prior out))
     {:verified verified :compiled (not reusable) :key key}))
 
+(defn- compiler-record-path [directory namespace]
+ (Path/join directory (str (digest namespace) ".json")))
+
+(defn record-compiler-unit! [prepared captured directory phase]
+ (let [root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+       row {"version" 1 "key" (:key captured) "namespace" (:namespace prepared)
+            "compiler" (:compiler-key prepared) "phase" phase
+            "target" (digest (erlang/term_to_binary (:host-spec prepared) (list :deterministic)))
+            "compiled" (:compiled captured)
+            "world" (hex (get-in prepared [:world :id]))
+            "phase-world" (hex (get-in prepared [:phase-world :id]))
+            "inputs" (Enum/map (vals (:inputs prepared)) (fn [input] (relative-input input root)))}]
+  (File/write! (compiler-record-path directory (:namespace prepared)) (Jason/encode! row))))
+
+(defn restore-compiler-unit!
+ "Reuse a previously captured constructor input set before lowering Source.
+  Phase provider bytes and exact target/source resolution remain live checks.
+  A planning stage may supply only unchanged units from the qualified floor."
+ [selection directory previous phase planning? baseline]
+ (when previous
+  (let [namespace (elem (:namespace selection) 1)
+        path (compiler-record-path previous namespace)
+        row (when (and (File/regular? path) (<= (:size (File/stat! path)) 1048576))
+              (Jason/decode! (File/read! path)))
+        key (get row "key")
+        root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+        selected {namespace (:file selection)}
+        reusable (and (= 1 (get row "version")) (= namespace (get row "namespace"))
+                    (= (BeamLisp.AOTCache/current_compiler_key) (get row "compiler"))
+                    (= phase (get row "phase"))
+                    (= (digest (erlang/term_to_binary (:host-spec selection) (list :deterministic)))
+                       (get row "target"))
+                    (or (not planning?) (= false (get row "compiled")))
+                    (string? key) (Regex/match? #"^[0-9a-f]{64}$" key)
+                    (inputs-current? (get row "inputs") root selected))]
+   (when reusable
+    (let [source (Path/join previous key)
+          verified (BeamLisp.AOT/verify_unit source)
+          _ (verify-inputs! verified (get row "inputs") namespace)
+          ;; Planning metadata cannot turn this generation's new code into
+          ;; independent reproduction. Match every byte to the OLD floor.
+          old? (or (not planning?)
+                 (and baseline
+                   (every? (fn [[module bytes]]
+                     (= (digest bytes) (get-in baseline ["modules" (str (Atom/to_string module) ".beam")])))
+                     (:beams verified))))]
+     (when old?
+      (File/mkdir_p! directory)
+      (File/cp_r! source (Path/join directory key))
+      (let [inputs (into {} (map (fn [input]
+                      (let [name (get input "namespace")
+                            file (or (get selected name) (BeamLisp.Loader/source_path name))]
+                       [name {:namespace name :file (BeamLisp.AOT/physical_sdk_path file)
+                              :digest (Base/decode16! (String/upcase (get input "sha256")))}]))
+                      (get row "inputs")))
+            _ (File/write! (compiler-record-path directory namespace)
+                 (Jason/encode! (assoc row "compiled" false)))]
+       {:beams (:beams verified) :inputs inputs :compiled false
+        :receipt {:namespace namespace :target (:host-spec selection)
+                  :world (Base/decode16! (String/upcase (get row "world")))
+                  :phase-world (Base/decode16! (String/upcase (get row "phase-world")))
+                  :modules (get-in verified [:manifest :modules])}})))))))
+
 (defn produce!
   "Produce complete units under the caller's output custody. Prior products
    are data: verification and source re-resolution precede every restoration."

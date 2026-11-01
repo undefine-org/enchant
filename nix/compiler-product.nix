@@ -29,7 +29,7 @@ let
     commandManager = false;
     trace = true;
   };
-  generation = label: predecessor: worker (pkgs.stdenv.mkDerivation {
+  generation = label: predecessor: planning: worker (pkgs.stdenv.mkDerivation {
     pname = "beam-lisp-compiler-generation-${label}";
     version = "1";
     inherit src;
@@ -60,6 +60,7 @@ let
       python3 scripts/qualify-artifact-generation --root "$PWD" --out "$out" \
         --generation ${label} --producer-timeout 1200 --stream \
         ${pkgs.lib.optionalString (predecessor != null) "--seed ${predecessor}"} \
+        ${pkgs.lib.optionalString (planning != null) "--planning-units ${planning}/unit-store"} \
         ${pkgs.lib.optionalString (previousCompiler != null && previousSource != null)
           ''--baseline "$TMPDIR/baseline.json"''} \
         ${pkgs.lib.optionalString (previousCompiler != null) ''
@@ -68,9 +69,9 @@ let
         ''}
     '';
   });
-  p = generation "P" (if previousCompiler == null then null else previousCompiler + "/seed");
-  b = generation "B" (p + "/P");
-  c = generation "C" (b + "/B");
+  p = generation "P" (if previousCompiler == null then null else previousCompiler + "/seed") null;
+  b = generation "B" (p + "/P") p;
+  c = generation "C" (b + "/B") p;
 in if previousIdentity == identity then previousCompiler else
 pkgs.runCommand "beam-lisp-compiler-1" { nativeBuildInputs = [ pkgs.python3 ]; } ''
   python3 ${src}/scripts/assemble-compiler-generations.py --products ${p} ${b} ${c} --out "$out"

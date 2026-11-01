@@ -13,7 +13,12 @@ pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
   enableParallelBuilding = false;
   QEMU_OPTS = pkgs.lib.optionalString (cpuCount != 1) "-smp cpus=${toString cpuCount}";
   preVM = ''
-    ${pkgs.lib.optionalString (commandManager || trace) "trap 'test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT"}
+    ${pkgs.lib.optionalString (commandManager || trace) (if trace then ''
+      touch xchg/worker-debug
+      ${pkgs.coreutils}/bin/tail -n +1 --follow=name --retry --sleep-interval=0.1 xchg/worker-debug &
+      compiler_trace_pid=$!
+      trap 'kill "$compiler_trace_pid" 2>/dev/null || true; wait "$compiler_trace_pid" 2>/dev/null || true; test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT
+    '' else "trap 'test ! -f xchg/worker-debug || cat xchg/worker-debug' EXIT")}
     diskImage="$PWD/worker.ext4"
     truncate -s ${toString diskMiB}M "$diskImage"
     ${pkgs.e2fsprogs}/bin/mkfs.ext4 -q -F "$diskImage"
