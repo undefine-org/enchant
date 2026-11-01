@@ -221,11 +221,6 @@ let
       # This worker already has the complete qualified floor. Host-only staging
       # would leave boot namespaces absent and trigger a second boot compiler.
       cp -a --no-preserve=ownership ${compiler}/seed/. build/
-      ./bin/bl --cold run scripts/prepare-release.bl
-      # Package the source-validated compiler floor. Compiler regeneration is
-      # a bare-VM operation, independent of the runtime's retained SDK lease.
-      ./bin/bl --cold seed --check
-
       # pinned z3, laid out as `bl install z3` leaves it
       mkdir -p priv/z3/bin
       cp ${z3Runtime}/bin/z3 ${z3Runtime}/bin/libz3.so priv/z3/bin/
@@ -246,6 +241,7 @@ let
           export BL_PREVIOUS_UNIT_STORE=${previousSdk}/unit-store
         fi
       ''}
+      # Preparation, floor validation and packaging share one producer VM.
       ./bin/bl --cold run scripts/produce-sdk.bl
 
       # unpack, retarget every ELF at the FHS loader, repack with the same launcher
