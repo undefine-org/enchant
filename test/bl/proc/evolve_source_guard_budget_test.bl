@@ -1,0 +1,56 @@
+(ns proc.evolve-source-guard-budget-test
+ (:require [proc.evolve :as ev] [reload.generation :as g]
+           [proc.message-domain :as domain] [test.support.evolve-fixtures :as f]))
+(defn- source [guarded? wrap?]
+ (str "(ns evolution.fixture)
+  (defn accepts [m] " (if guarded? "(and (erlang/is_map m) (erlang/=:= 1 (maps/get :tag m 1)))" "(erlang/is_map m)") ")
+  (defn valid-state [s] (erlang/is_integer s))
+  (defn migrate [s] s)
+  (defn upcast [m] " (if wrap? "{:payload m}" "m") ")
+  (defn check-reply [r] (erlang/is_integer r))
+  (defn downcast [r] r)
+  (defn handler [m s] {:reply 7 :state s})
+  (defn spec [version digest]
+   {:version version :digest digest :accept? accepts :check-state valid-state
+    :migrate-state migrate :upcast upcast :check-reply check-reply :downcast downcast :handler handler})"))
+(defn- nested-map [depth]
+ (loop [left depth value 0]
+  (if (zero? left) value (recur (dec left) {:unused value}))))
+(defn- callback [graph name]
+ (g/with! graph #(let [namespace (get (:mapping graph) "evolution.fixture")]
+  {:function (BeamLisp.Env/fetch_exact! namespace name) :environment (BeamLisp.Env/capture_native_context!)})))
+(deftest source-native-budget-counterexample-refuses-before-publication
+ (f/with-owner "source-native-budget-refusal" [(source true false) (source true true)] 0
+  {:managed true :message-domain :bounded-first-order}
+  (fn [[old fresh] p]
+   (let [near (nested-map 62) boundary (nested-map 63)
+         _ (is (= boundary (BeamLisp.CompilerData/check_first_order! boundary {:max-nodes 16384 :max-bytes 65536 :max-depth 64})))
+         _ (is (= 7 (ev/request! p 1 near))) _ (is (= 7 (ev/request! p 1 boundary)))
+         before (ev/status p)
+         proof (domain/compare-callbacks (callback old "accepts") (callback fresh "upcast") (callback fresh "accepts") :bounded-first-order)
+         publication (g/with! fresh #(ev/upgrade! p 1 (f/spec fresh 2)))
+         raw-boundary (try (g/invoke! fresh "evolution.fixture/accepts" [{:payload boundary}]) nil
+                        (catch error (maps/get :original error nil)))]
+    (is (= :unknown (:status proof)))
+    (is (= :refused (:status publication)))
+    (is (= :unproved-message-migration (:kind publication)))
+    (is (= before (ev/status p)))
+    (is (= 7 (ev/request! p 1 near)))
+    (is (= 7 (ev/request! p 1 boundary)))
+    (is (= :source_callable_budget raw-boundary))))))
+(deftest unchanged-source-guards-preserve-identity-map-edges-at-the-boundary
+ (f/with-owner "source-native-budget-identity" [(source true false) (source true false)] 0
+  {:managed true :message-domain :bounded-first-order}
+  (fn [[_ fresh] p]
+   (let [boundary (nested-map 63)]
+    (is (= 7 (ev/request! p 1 boundary)))
+    (is (= :applied (:status (g/with! fresh #(ev/upgrade! p 1 (f/spec fresh 2))))))
+    (is (= 7 (ev/request! p 1 boundary)))))))
+(deftest direct-safe-bifs-do-not-invent-a-native-argument-guard
+ (f/with-owner "source-safe-bif-wrapping" [(source false false) (source false true)] 0
+  {:managed true :message-domain :bounded-first-order}
+  (fn [[_ fresh] p]
+   (let [boundary (nested-map 63)]
+    (is (= 7 (ev/request! p 1 boundary)))
+    (is (= :applied (:status (g/with! fresh #(ev/upgrade! p 1 (f/spec fresh 2))))))
+    (is (= 7 (ev/request! p 1 boundary)))))))
