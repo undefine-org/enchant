@@ -1,0 +1,67 @@
+(ns android.build-pipeline-test)
+
+(def source-root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd)))
+(def prototype "qualification.android-pipeline")
+(BeamLisp.Env/with_ns prototype
+ (fn [] (BeamLisp/eval
+          (String/replace (BeamLisp.Loader/read_source
+                            (Path/join source-root "priv/std/bl/android.bl.md"))
+            "(ns bl.android" "(ns qualification.android-pipeline"))))
+(defn invoke [name args]
+ (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! prototype name) (to-list args)))
+(defn scratch []
+ (let [root (Path/join (System/tmp_dir!) (str "android-pipeline-" (erlang/unique_integer (list :positive))))]
+  (File/mkdir_p! root) root))
+(defn old-time! [file]
+ (File/touch! file (tuple (tuple 2000 1 1) (tuple 0 0 0)))
+ (:mtime (File/stat! file)))
+
+(deftest erlang-compilation-uses-the-selected-vm-and-reuses-valid-output
+ (let [root (scratch) source (Path/join root "android_pipeline_probe.erl")
+       output (Path/join root "ebin") trap (Path/join root "erlc")
+       marker (Path/join root "external-erlc-called") previous (System/get_env "PATH")]
+  (try
+   (File/write! trap (str "#!/bin/sh\ntouch '" marker "'\nexit 99\n"))
+   (File/chmod! trap 493)
+   (System/put_env "PATH" (str root ":" previous))
+   (File/write! source "-module(android_pipeline_probe).\n-export([answer/0]).\nanswer() -> 41.\n")
+   (let [beam (invoke "erl-compile!" ["test stub" source output]) before (old-time! beam)]
+    (is (File/regular? beam))
+    (is (not (File/exists? marker)))
+    (invoke "erl-compile!" ["unchanged stub" source output])
+    (is (= before (:mtime (File/stat! beam))))
+    (File/write! source "-module(android_pipeline_probe).\n-export([answer/0]).\nanswer() -> 42.\n")
+    (invoke "erl-compile!" ["changed stub" source output])
+    (code/load_binary :android_pipeline_probe (String/to_charlist beam) (File/read! beam))
+    (is (= 42 (erlang/apply :android_pipeline_probe :answer (list))))
+    (is (not (File/exists? marker))))
+   (finally
+    (System/put_env "PATH" previous)
+    (code/purge :android_pipeline_probe) (code/delete :android_pipeline_probe)
+    (File/rm_rf! root)))))
+
+(deftest staging-reuses-unchanged-files-and-prunes-only-its-owned-projection
+ (let [root (scratch) source (Path/join root "source") target (Path/join root "stage")
+       manifest (Path/join root "owned.term")]
+  (try
+   (File/write! source "one")
+   (File/mkdir_p! target)
+   (File/write! (Path/join target "foreign") "keep")
+   (invoke "sync-files!" [target {"app/first.beam" source} manifest])
+   (let [before (old-time! (Path/join target "app/first.beam"))]
+    (invoke "sync-files!" [target {"app/first.beam" source} manifest])
+    (is (= before (:mtime (File/stat! (Path/join target "app/first.beam"))))))
+   (File/write! source "two")
+   (invoke "sync-files!" [target {"app/second.beam" source} manifest])
+   (is (not (File/exists? (Path/join target "app/first.beam"))))
+   (is (= "two" (File/read! (Path/join target "app/second.beam"))))
+   (is (= "keep" (File/read! (Path/join target "foreign"))))
+   (finally (File/rm_rf! root)))))
+
+(deftest abi-selection-is-command-local-and-keeps-other-build-flags
+ (is (= {:abi "arm64-v8a" :args ["--standalone" "--release"]}
+        (invoke "abi-options" [["--standalone" "--abi" "arm64-v8a" "--release"]])))
+ (is (= {:abi "x86_64" :args []} (invoke "abi-options" [["--abi" "x86_64"]])))
+ (doseq [args [["--abi"] ["--abi" "unknown"] ["--abi" "x86_64" "--abi" "arm64-v8a"]]]
+  (is (= :invalid-android-abi
+       (try (invoke "abi-options" [args]) nil (catch error (:kind (ex-data error))))))))

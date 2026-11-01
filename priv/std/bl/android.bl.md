@@ -98,8 +98,9 @@ every verb says so the same way.
                                     (split s "_")))))
 
 (defn target
-  "The app this tree declares, or `{:error msg}`."
-  [dir]
+  "The app this tree declares, with an optional per-command ABI."
+  ([dir] (target dir nil))
+  ([dir selected-abi]
   (let [p (env/project dir)
         a (:android p)]
     (cond
@@ -109,19 +110,22 @@ every verb says so the same way.
       :else
       (let [app (:app a)
             id (:id a)
-            b (Path/join (:root p) "_build/android")]
+            abi (or selected-abi (System/get_env "BL_ANDROID_ABI") (:abi a))
+            _ (when-not (contains? #{"arm64-v8a" "x86_64"} abi)
+                (throw (ex-info (str "unsupported Android ABI " abi) {:kind :invalid-android-abi})))
+            b (Path/join (list (:root p) "_build/android" abi))]
         {:root (:root p)
          :paths (:paths p)
          :app app
          :ns (:ns a)
          :id id
          :label (or (:label a) (camel app))
-         :abi (:abi a)
+         :abi abi
          :module (camel app)
          :jni (join "_" (vec (split (join "_1" (vec (split id "_"))) ".")))
          :build b
          :android (Path/join b "android")
-         :stage (Path/join b "stage")}))))
+         :stage (Path/join b "stage")})))))
 ```
 
 `:android` is an `env.bl` key like `:deps` (see [env](env.bl.md)): its
@@ -163,6 +167,24 @@ naming the step and the tail of its output — never a stack trace through here.
       (throw (ex-info (str label " failed (" (:status r) ")\n  $ " (:cmd r) "\n" (tail (:out r) 25))
                       {:step label})))
     r))
+
+(defn erl-compile!
+  "Compile Erlang with this selected VM; a packaged runtime need not ship erlc boot scripts."
+  [label src outdir]
+  (let [beam (Path/join outdir (str (Path/basename (Path/rootname src)) ".beam"))
+        stamp (str beam ".input")
+        identity (crypto/hash :sha256
+                   (erlang/term_to_binary [(File/read! src) (erlang/system_info :version)]))]
+    (File/mkdir_p! outdir)
+    (when-not (and (File/regular? beam) (File/regular? stamp) (= identity (File/read! stamp)))
+      (println (str "  · " label))
+      (let [result (erlang/apply :compile :file
+                     (list (erlang/binary_to_list src)
+                       (list (tuple :outdir (erlang/binary_to_list outdir)) :return_errors :return_warnings)))]
+        (when-not (and (tuple? result) (= :ok (elem result 0)))
+          (throw (ex-info (str label ": " (pr-str result)) {:step label})))
+        (File/write! stamp identity)))
+    beam))
 
 (defn adb!
   "adb against the one device (or `ANDROID_SERIAL`)."
@@ -520,12 +542,51 @@ dependencies are missing.
 ```beam-lisp
 (defn- lib-dir [app] (erlang/list_to_binary (code/lib_dir app)))
 
-(defn- copy-tree!
-  "Copy directory `from`'s contents into `to`, FOLLOWING symlinks: a checkout's
-   beam-lisp ebin is a link to its build dir, and the phone needs the files."
-  [from to]
-  (File/mkdir_p! to)
-  (step! (str "copy " (Path/basename from)) "cp" ["-rL" (str from "/.") to] {}))
+(defn- tree-files
+  "Materialize a source tree as destination-relative regular files, following library links."
+  [source prefix]
+  (if (File/dir? source)
+    (reduce merge {} (map (fn [name]
+                            (tree-files (Path/join source name)
+                              (if (empty? prefix) name (Path/join prefix name))))
+                          (File/ls! source)))
+    {prefix source}))
+
+(defn- copy-file-if-changed! [source destination]
+  (let [bytes (File/read! source)]
+    (when-not (and (File/regular? destination) (= bytes (File/read! destination)))
+      (File/mkdir_p! (Path/dirname destination))
+      (when (File/exists? destination) (File/chmod! destination 420))
+      (File/cp! source destination))))
+
+(defn sync-files!
+  "Synchronize one generated projection. Its manifest owns only its prior files;
+   Gradle caches and other projections are preserved. Unchanged files retain mtimes."
+  [destination files manifest]
+  (File/mkdir_p! destination)
+  (let [old (if (File/regular? manifest)
+              (erlang/binary_to_term (File/read! manifest) (list :safe)) [])
+        names (vec (sort (keys files)))]
+    (doseq [name old]
+      (when-not (and (string? name) (not= :absolute (Path/type name))
+                     (not (some #{".."} (String/split name "/"))))
+        (throw (ex-info "Invalid Android staging inventory" {:kind :android-stage-inventory})))
+      (when-not (contains? files name)
+        (let [path (Path/join destination name)]
+          (when (File/exists? path) (File/chmod! path 420) (File/rm! path))
+          (loop [parent (Path/dirname path)]
+            (when (and (not= parent destination) (File/dir? parent) (empty? (File/ls! parent)))
+              (File/rmdir! parent)
+              (recur (Path/dirname parent)))))))
+    (doseq [[name source] files] (copy-file-if-changed! source (Path/join destination name)))
+    (let [bytes (erlang/term_to_binary names)]
+      (when-not (and (File/regular? manifest) (= bytes (File/read! manifest)))
+        (File/write! manifest bytes))))
+  destination)
+
+(defn- copy-tree! [from to]
+  (doseq [[name source] (tree-files from "")]
+    (copy-file-if-changed! source (Path/join to name))))
 
 (defn- app-name-of
   "`kernel-11.0` → \"kernel\"; `elixir` → \"elixir\" (mob ships some unversioned)."
@@ -564,19 +625,37 @@ dependencies are missing.
            "    '" mod "':'__bl_init__'(),\n"
            "    'Elixir.BeamLisp.Ns.Android.App':'start!'('" (:ns t) "', " (:app t) "),\n"
            "    timer:sleep(infinity).\n"))
-    (step! "boot module" "erlc" ["-o" dir src] {})
+    (erl-compile! "boot module" src dir)
     (File/rm! src)))
 
-(defn native-lazy-memo
-  "beam-lisp's one required native, built for the phone's ABI. Cargo builds it
-   with the NDK linker; see docs/android."
-  [abi]
-  (let [p (Path/join (list (env-or "CARGO_TARGET_DIR" (Path/join (home) ".cache/cargo-target"))
-                           (str (if (= abi "arm64-v8a") "aarch64" abi) "-linux-android") "release/liblazy_memo.so"))]
-    (when-not (File/exists? p)
-      (throw (ex-info (str "no lazy_memo for " abi " at " p
-                           " — cargo build --release --target " abi "-linux-android -p lazy_memo") {})))
-    p))
+(defn validate-native!
+  "Verify the selected SDK's native Source/API contract against one Android product."
+  [abi bundle contract-file]
+  (let [read-json (fn [file] (erlang/apply :json :decode (list (File/read! file))))
+        contract (read-json contract-file)
+        directory (Path/join bundle abi) library (Path/join directory "liblazy_memo.so")
+        artifact (read-json (Path/join directory "artifact.json"))
+        target (if (= abi "arm64-v8a") "aarch64-linux-android" "x86_64-linux-android")
+        sha (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! library))))]
+    (when-not (and (= 1 (get contract "version")) (= "android-native-contract" (get contract "kind"))
+                   (= 1 (get artifact "version")) (= "android-native-library" (get artifact "kind"))
+                   (= "lazy_memo" (get artifact "crate")) (= "lazy_memo" (get contract "crate"))
+                   (= abi (get artifact "abi")) (= target (get artifact "target"))
+                   (= "liblazy_memo.so" (get artifact "library")) (= sha (get artifact "sha256"))
+                   (= (get contract "source_sha256") (get artifact "source_sha256"))
+                   (= (get contract "source_files") (get artifact "source_files"))
+                   (= (get contract "nifs") (get artifact "nifs")))
+      (throw (ex-info "Android native product differs from the selected SDK or ABI"
+                      {:kind :android-native-mismatch :abi abi})))
+    library))
+
+(defn native-lazy-memo [abi]
+  (let [bundle (System/get_env "BL_ANDROID_NATIVES")
+        contract (Path/join (priv) "android/native-contract.json")]
+    (when-not (and (string? bundle) (not (empty? bundle)) (File/regular? contract))
+      (throw (ex-info "Android requires the selected SDK's native contract and BL_ANDROID_NATIVES product"
+                      {:kind :android-native-product-required})))
+    (validate-native! abi bundle contract)))
 
 (defn compile!
   "AOT-compile the `.bl` under `roots` on the desk into `out`. The phone carries
@@ -585,7 +664,7 @@ dependencies are missing.
   (println (str "  · compile " label))
   (BeamLisp.Loader/ensure_loaded "build")
   (let [sources (vec (mapcat u/expand-targets roots))
-        r ((BeamLisp.Env/fetch! "build" "run") {:sources sources :out out :force? true})]
+        r ((BeamLisp.Env/fetch! "build" "produce!") {:sources sources :out out})]
     (when (seq (:errors r))
       (throw (ex-info (str label ": compile failed: " (pr-str (first (:errors r)))) {})))
     out))
@@ -593,49 +672,44 @@ dependencies are missing.
 (defn compile-tree! [t out] (compile! "the tree" (:paths t) out))
 
 (defn stage! [t]
-  (let [st (:stage t)
-        otp (Path/join st "otp")
-        lib (Path/join otp "lib")
-        appd (Path/join otp (:app t))
-        bl (Path/join lib "beam_lisp-0.1.0")]
-    (File/rm_rf! st)
-    (println "  · runtime")
-    (copy-tree! (ensure-otp! (:abi t)) otp)
-    (println "  · beam-lisp")
-    (copy-tree! (Path/join (lib-dir :beam_lisp) "ebin") (Path/join bl "ebin"))
-    (File/mkdir_p! (Path/join bl "priv/native"))
-    (File/cp! (native-lazy-memo (:abi t)) (Path/join bl "priv/native/lazy_memo.so"))
-    ; android.* — the device library — compiled here, from the priv/ that also
-    ; supplied the Kotlin and the NIF, so the three always come from one tree.
-    ; Into a directory of its own, then merged: `build/run` OWNS its output
-    ; directory and prunes what it did not build — pointed at beam-lisp's
-    ; ebin, it deleted 765 of 865 beams (measured) and the phone booted without
-    ; the runtime.
-    (let [ad (Path/join (:build t) "android-lib")]
-      (File/rm_rf! ad)
-      (compile! "device runtime" [(Path/join (priv) "lib/android")
-                                   (Path/join (priv) "std/proc/owner-registry.bl")] ad)
-      (doseq [f (Path/wildcard (Path/join ad "*.beam"))]
-        (File/cp! f (Path/join (list bl "ebin" (Path/basename f))))))
-    (step! "bl_android_nif stub" "erlc" ["-o" (Path/join bl "ebin") (Path/join (priv) "android/erl/bl_android_nif.erl")] {})
-    (println "  · libraries")
-    (BeamLisp.Loader/ensure_loaded "deps-compile")
-    (doseq [d ((BeamLisp.Env/fetch! "deps-compile" "search-paths"))]
-      (let [app-dir (Path/dirname d)
-            nm (first (split (Path/basename app-dir) "-"))
-            vsn (second (split (Path/basename app-dir) "-"))]
-        (when (contains? (set (map :name (:deps ((BeamLisp.Env/fetch! "deps" "read-lock") (:root t))))) nm)
-          (copy-tree! d (Path/join lib (str nm "-" vsn "/ebin")))
-          (when (File/dir? (Path/join app-dir "priv"))
-            (copy-tree! (Path/join app-dir "priv") (Path/join lib (str nm "-" vsn "/priv")))))))
-    (doseq [d (:deps ((BeamLisp.Env/fetch! "deps" "read-lock") (:root t)))]
-      (when-not (File/dir? (Path/join lib (str (:name d) "-" (:vsn d) "/ebin")))
-        (throw (ex-info (str "missing compiled dependency " (:name d) " — run bl deps compile") {}))))
-    (device-app-file! (Path/join bl "ebin/beam_lisp.app") (Path/join bl "ebin/beam_lisp.app") lib)
-    (println "  · this tree")
-    (File/mkdir_p! appd)
-    (compile-tree! t appd)
-    (boot-module! t appd)
+  (let [st (:stage t) cache (Path/join (:build t) "aot")
+        otp (Path/join st "otp") lib (Path/join otp "lib")
+        app-out (Path/join cache "app")
+        erl-out (Path/join cache "erl")
+        bl-name "beam_lisp-0.1.0" bl-prefix (str "otp/lib/" bl-name)
+        _ (File/mkdir_p! cache) _ (File/mkdir_p! erl-out)
+        _ (compile-tree! t app-out)
+        _ (boot-module! t erl-out)
+        _ (erl-compile! "bl_android_nif stub" (Path/join (priv) "android/erl/bl_android_nif.erl") erl-out)
+        _ (BeamLisp.Loader/ensure_loaded "deps-compile")
+        _ (BeamLisp.Loader/ensure_loaded "deps")
+        dependencies (:deps ((BeamLisp.Env/fetch! "deps" "read-lock") (:root t)))
+        libraries (reduce (fn [files entry]
+                     (when-not ((BeamLisp.Env/fetch! "deps-compile" "compiled?") entry)
+                       (throw (ex-info (str "missing exact compiled dependency " (:name entry) " " (:vsn entry)
+                                           " — run bl deps compile") {:dependency entry})))
+                     (let [source ((BeamLisp.Env/fetch! "deps-compile" "app-dir") entry)
+                           prefix (str "otp/lib/" (:name entry) "-" (:vsn entry))]
+                       (merge files (tree-files (Path/join source "ebin") (str prefix "/ebin"))
+                         (if (File/dir? (Path/join source "priv"))
+                           (tree-files (Path/join source "priv") (str prefix "/priv")) {}))))
+                   {} dependencies)
+        beams (fn [directory prefix]
+                (into {} (map (fn [file] [(Path/join prefix (Path/basename file)) file])
+                           (Path/wildcard (Path/join directory "*.beam")))))
+        files (merge (tree-files (ensure-otp! (:abi t)) "otp")
+                     ;; Keep the selected SDK's actual floor, sealed inventory
+                     ;; and Source ownership metadata together with its beams.
+                     (tree-files (lib-dir :beam_lisp) bl-prefix)
+                     libraries
+                     (beams app-out (str "otp/" (:app t)))
+                     {(str "otp/" (:app t) "/" (:app t) ".beam") (Path/join erl-out (str (:app t) ".beam"))
+                      (str bl-prefix "/ebin/bl_android_nif.beam") (Path/join erl-out "bl_android_nif.beam")
+                      (str bl-prefix "/priv/native/lazy_memo.so") (native-lazy-memo (:abi t))})]
+    (println "  · synchronize runtime")
+    (sync-files! st files (Path/join (:build t) "stage-files.term"))
+    (device-app-file! (Path/join (list st bl-prefix "ebin/beam_lisp.app"))
+                     (Path/join (list st bl-prefix "ebin/beam_lisp.app")) lib)
     st))
 ```
 
@@ -809,6 +883,19 @@ whole first frame as `data:`, so it is shown cut short.
 (def usage
   "usage: bl android doctor|new NAME|build|install|push|up|eval EXPR|grant [WHAT…]|shot [FILE]|logs|stop|devtools [PORT]")
 
+(defn abi-options
+  "Read the Android command's ABI selector; all other arguments stay command-local."
+  [args]
+  (loop [remaining args abi nil out []]
+    (cond
+      (empty? remaining) {:abi abi :args out}
+      (= "--abi" (first remaining))
+        (let [value (second remaining)]
+          (when-not (and (nil? abi) (contains? #{"arm64-v8a" "x86_64"} value))
+            (throw (ex-info "--abi requires arm64-v8a or x86_64, once" {:kind :invalid-android-abi})))
+          (recur (drop 2 remaining) value out))
+      :else (recur (rest remaining) abi (conj out (first remaining))))))
+
 (defn run [args st]
   (u/register-paths st)
   (let [sub (first args)
@@ -822,14 +909,16 @@ whole first frame as `data:`, so it is shown cut short.
                         (new-tree (u/resolve (first more)) (Path/basename (first more))))
         (nil? sub) (u/usage-error usage)
         :else
-        (let [t (target cwd)]
+        (let [selection (if (contains? #{"build" "push" "install"} sub) (abi-options more) {:args more})
+              more (:args selection)
+              t (target cwd (:abi selection))]
           (if (:error t)
             (do (u/io-err (str "bl android: " (:error t))) 1)
             (cond
               (= sub "build") (if (every? #{"--standalone" "--release"} more)
                                 (build (assoc t :standalone? (boolean (some #{"--standalone"} more))
                                                 :release? (boolean (some #{"--release"} more))) st)
-                                (u/usage-error "usage: bl android build [--standalone] [--release]"))
+                                (u/usage-error "usage: bl android build [--abi arm64-v8a|x86_64] [--standalone] [--release]"))
               (= sub "install") (install t st)
               (= sub "push") (push t st)
               (= sub "up") (up t st)
