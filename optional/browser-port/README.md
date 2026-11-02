@@ -134,8 +134,10 @@ flattened target/session ID on the owned page. Close each page in `finally`.
 for a film's cursor track. These namespaces are opt-in, like `browser.port`.
 
 `browser.film/world` adapts one already-owned page to `scenario/run-world`.
-Acts are `[:navigate url]`, `[:click selector]`, `[:fill selector text]`,
-`[:eval script]` and `[:wait predicate]`. Claims receive `(page, ctx)` and
+Acts are `[:navigate url]`, `[:click selector]`, `[:hover selector]`,
+`[:key name]`, `[:fill selector text]`, `[:drag from to ms]`,
+`[:files selector [path …]]` (a file input given files as through the system
+dialog, `page/set-files!`), `[:eval script]`, `[:wait predicate]` and `[:pause ms]`. Claims receive `(page, ctx)` and
 produce witnessed/refuted verdicts; each basis records a real PNG and its last
 click. Feed the result to `scenario.runner.adapt` and author a presentation with
 `scenario.film` (see `docs/scenarios/demo-films.md`). The world captures state
