@@ -59,7 +59,7 @@ def main():
     argv += ['-pa', image / 'ebin', program]
     env.update(BL_ROOT=str(image), BL_EBIN=str(image / 'ebin'), BL_BIN=str(platform / 'bin/drop-launcher'),
                BL_ARTIFACT_PLATFORM=str(platform / 'artifact-platform'), BL_PREPARED_NATIVES=str(platform / 'native-products'),
-               BL_PRODUCTION_CACHE=str(capsule), BL_PRODUCER_RESTORE=str(ROOT / 'scripts/restore-producer.exs'), BEAM_LISP_DEV='0')
+               BL_PRODUCTION_CACHE=str(capsule), XDG_CACHE_HOME=str(out / "receiver-cache"), BL_PRODUCER_RESTORE=str(ROOT / 'scripts/restore-producer.exs'), BEAM_LISP_DEV='0')
     run('receive', argv, cwd=out)
     (out / 'result.json').write_text(json.dumps(dict(status='passed', sdk=str(sdk), checks=[
         'normal-launcher-zero-producer-compilation', 'qualified-floor-byte-identity',

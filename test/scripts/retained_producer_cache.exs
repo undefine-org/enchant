@@ -10,6 +10,7 @@ index = Jason.decode!(original_index)
 clean = fn ->
   for path <- Path.wildcard(Path.join(ebin, "*.beam")), not Map.has_key?(floor, Path.basename(path)), do: File.rm!(path)
   File.rm(Path.join(root, "precompiled.term"))
+  File.rm_rf!(BeamLisp.AOTCache.dir())
 end
 run = fn ->
   {result, _} = Code.eval_file(restore)
@@ -56,7 +57,9 @@ File.write!(index_path, original_index)
 clean.()
 
 %{eligible: true, modules: restored} = run.()
-if restored == 0, do: raise("empty restored producer")
+if restored <= changed.modules, do: raise("changed input did not reduce cache reuse")
+unless Enum.all?(Path.wildcard(Path.join(ebin, "*.beam")), &Map.has_key?(floor, Path.basename(&1))),
+  do: raise("cache bytes were copied onto the executable path")
 tracer = spawn_link(fn ->
   loop = fn loop ->
     receive do
