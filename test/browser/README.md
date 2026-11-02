@@ -79,6 +79,11 @@ driving a real Chromium with Playwright against the JS client.
    when there is none — never after the app's own sheet, which used to lose to
    live's base reset on source order.
 
+8. **`connect.spec.js` › a refusal is a DOM event** — `["denied", why]` used
+   to reach only `opts.onDenied`, so a shell that passed none (live.app's
+   default) swallowed refusals. It is now also `live:denied` `{why}` on
+   `document`, beside the callback.
+
 ## Run it
 
 ```sh
