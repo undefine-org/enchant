@@ -1,30 +1,73 @@
 ; All transitions use actual managed Source candidates and the single native
 ; grant/bundle protocol. A prepared spec or a raw actor message is not authority.
 (ns proc.evolve-test
- (:require [proc.evolve :as ev] [reload.generation :as g] [test.support.evolve-counter-fixtures :as f]))
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+
+(defn- source [mode]
+ (let [old? (= :integer mode)
+       migration (case mode
+                   :integer "value"
+                   :map "{:count value}"
+                   :invalid "-1"
+                   :effectful "(do (Process/sleep 100) {:count value})"
+                   :identity "value")]
+  (str "(ns counter.business)
+        (defn accepts [message] (erlang/is_binary message))
+        (defn state-valid [value] " (if old? "(erlang/is_integer value)" "(erlang/is_map value)") ")
+        (defn migrate [value] " migration ")
+        (defn upcast [message] message)
+        (defn handler [message value]
+          (let [delta (cond (= message \"inc\") 1 (= message \"five\") 5 :else 0)
+                next (+ " (if old? "value" "(:count value)") " delta)]
+           {:reply next :state " (if old? "next" "{:count next}") "}))
+        (defn spec [version digest]
+          {:version version :digest digest :accept? accepts :check-state state-valid
+           :handler handler :migrate-state migrate :upcast upcast})")))
+
+(defn- graph [application version mode]
+ (g/prepare! {:application-id application :fixed-runtime true
+              :native-modules #{"erlang" "Process"}
+              :resources {:fixture-version version :fixture-mode mode}
+              :sources {"counter.business" (source mode)}}))
+(defn- spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "counter.business/spec" [version (:digest graph)]))))
+(defn- upgrade [graph pid expected version]
+ (g/with! graph #(ev/upgrade! pid expected (spec graph version))))
+(defn- with-owner [application releases initial options action]
+ (let [graphs (mapv (fn [[version mode]] (graph application version mode)) releases)
+       old (first graphs) pid (atom nil)]
+  (try
+   (g/with! old #(state/bind! {}))
+   (doseq [fresh (rest graphs)] (g/inherit-runtime! fresh old))
+   (reset! pid (g/with! old #(ev/start! (spec old 1) initial options)))
+   (action graphs @pid)
+   (finally
+    (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+    (doseq [graph (reverse graphs)] (g/retire! graph))))))
+
 
 (deftest stable-pid-state-and-late-old-messages
- (f/with-owner "evolve-basic-stable" [[1 :integer] [2 :map] [3 :identity]] 0 {:managed true}
+ (with-owner "evolve-basic-stable" [[1 :integer] [2 :map] [3 :identity]] 0 {:managed true}
   (fn [[_ fresh third] p]
    (is (= 1 (ev/request! p 1 "inc")))
-   (is (= :applied (:status (f/upgrade fresh p 1 2))))
+   (is (= :applied (:status (upgrade fresh p 1 2))))
    (is (= p (:pid (ev/status p))))
    (is (= 2 (:version (ev/status p))))
    (is (= 2 (ev/request! p 1 "inc")))
    (is (= 7 (ev/request! p 2 "five")))
    (is (= [1] (:legacy-versions (ev/status p))))
-   (is (= :already-applied (:status (f/upgrade fresh p 1 2))))
-   (is (= :stale-version (:kind (f/upgrade third p 1 3))))
+   (is (= :already-applied (:status (upgrade fresh p 1 2))))
+   (is (= :stale-version (:kind (upgrade third p 1 3))))
    (is (= :identity-conflict
-          (:kind (g/with! fresh #(ev/upgrade! p 2 (assoc (f/spec fresh 2) :digest "changed"))))))
+          (:kind (g/with! fresh #(ev/upgrade! p 2 (assoc (spec fresh 2) :digest "changed"))))))
    (is (= 7 (ev/request! p 1 "read"))))))
 
 (deftest refused-upgrade-and-invalid-message-preserve-owner
- (f/with-owner "evolve-basic-refusals" [[1 :integer] [2 :map] [2 :invalid]] 4 {:managed true}
+ (with-owner "evolve-basic-refusals" [[1 :integer] [2 :map] [2 :invalid]] 4 {:managed true}
   (fn [[_ fresh invalid] p]
    (is (= :refused
-          (:status (g/with! fresh #(ev/upgrade! p 1 (dissoc (f/spec fresh 2) :upcast))))))
-   (is (= :refused (:status (f/upgrade invalid p 1 2))))
+          (:status (g/with! fresh #(ev/upgrade! p 1 (dissoc (spec fresh 2) :upcast))))))
+   (is (= :refused (:status (upgrade invalid p 1 2))))
    (is (= false (:prepared? (ev/status p))))
    (is (= 1 (:version (ev/status p))))
    (is (= 4 (ev/request! p 1 "read")))
@@ -33,13 +76,13 @@
    (is (= 5 (ev/request! p 1 "inc"))))))
 
 (deftest queued-old-calls-upcast-after-upgrade-without-rewriting-mailbox
- (f/with-owner "evolve-basic-queued" [[1 :integer] [2 :map]] 0 {:managed true}
+ (with-owner "evolve-basic-queued" [[1 :integer] [2 :map]] 0 {:managed true}
   (fn [[_ fresh] p]
    (let [parent (erlang/self) upgrade-alias (erlang/alias) call-alias (erlang/alias)]
     (try
      (g/with! fresh
       (fn []
-       (let [prepared (ev/prepare-upgrade! p 1 (f/spec fresh 2))
+       (let [prepared (ev/prepare-upgrade! p 1 (spec fresh 2))
              grant (BeamLisp.Env/begin_owner_transition! p)]
         (is (= :prepared (:status prepared)))
         (is (= (:ticket prepared) (elem grant 2)))
@@ -59,27 +102,27 @@
      (finally (erlang/unalias upgrade-alias) (erlang/unalias call-alias)))))))
 
 (deftest slow-migration-is-bounded-and-history-is-bounded
- (f/with-owner "evolve-basic-bounds" [[1 :integer] [2 :effectful] [2 :map] [3 :identity]]
+ (with-owner "evolve-basic-bounds" [[1 :integer] [2 :effectful] [2 :map] [3 :identity]]
              1 {:managed true :upgrade-ms 1000 :history-limit 1}
   (fn [[_ effectful fresh third] p]
    ;; Sleeping conversion is outside the supported pure future-input proof.
    ;; Its refusal is before conversion, not a claimed execution timeout proof.
-   (let [migration (:migrate-state (f/spec effectful 2))
+   (let [migration (:migrate-state (spec effectful 2))
          mfa (tuple (elem (erlang/fun_info migration :module) 1)
                     (elem (erlang/fun_info migration :name) 1) 1)]
     (try
      (is (= 1 (erlang/trace_pattern mfa true (list :call_count))))
-     (is (= :unproved-message-migration (:kind (f/upgrade effectful p 1 2))))
+     (is (= :unproved-message-migration (:kind (upgrade effectful p 1 2))))
      (is (= 0 (elem (erlang/trace_info mfa :call_count) 1)))
      (finally (erlang/trace_pattern mfa false (list :call_count)))))
    (is (= false (:prepared? (ev/status p))))
    (is (= 1 (ev/request! p 1 "read")))
-   (is (= :applied (:status (f/upgrade fresh p 1 2))))
-   (is (= :history-full (:kind (f/upgrade third p 2 3))))
+   (is (= :applied (:status (upgrade fresh p 1 2))))
+   (is (= :history-full (:kind (upgrade third p 2 3))))
    (is (= 2 (ev/request! p 1 "inc"))))))
 
 (deftest managed-retirement-fences-admissions-and-waits-for-real-clients
- (f/with-owner "evolve-basic-managed-retirement" [[1 :integer] [2 :map] [3 :identity]]
+ (with-owner "evolve-basic-managed-retirement" [[1 :integer] [2 :map] [3 :identity]]
              0 {:managed true :history-limit 1}
   (fn [[_ fresh third] p]
    (let [acquired (ev/acquire-client! p 1) token (:token acquired)]
@@ -87,7 +130,7 @@
      (is (= :acquired (:status acquired)))
      (is (= :managed-client-required (:kind (ev/call! p 1 "inc"))))
      (is (= 1 (ev/call-client! p token "inc")))
-     (is (= :applied (:status (f/upgrade fresh p 1 2))))
+     (is (= :applied (:status (upgrade fresh p 1 2))))
      (is (= :waiting (:status (ev/retire! p 2 1))))
      (is (= :version-fenced (:kind (ev/acquire-client! p 1))))
      (is (= 2 (ev/call-client! p token "inc")))
@@ -95,13 +138,13 @@
      (is (= :unknown-client (:kind (ev/call-client! p token "inc"))))
      (is (= :retired (:status (ev/retire! p 2 1))))
      (is (= [] (:legacy-versions (ev/status p))))
-     (is (= :applied (:status (f/upgrade third p 2 3))))
+     (is (= :applied (:status (upgrade third p 2 3))))
      (finally (ev/release-client! p token)))))))
 
 (deftest unmanaged-owners-cannot-authorize-adapter-collection
- (f/with-owner "evolve-basic-unmanaged-retirement" [[1 :integer] [2 :map]] 0 {:managed false}
+ (with-owner "evolve-basic-unmanaged-retirement" [[1 :integer] [2 :map]] 0 {:managed false}
   (fn [[_ fresh] p]
-   (is (= :owner-transition-authority-required (:kind (f/upgrade fresh p 1 2))))
+   (is (= :owner-transition-authority-required (:kind (upgrade fresh p 1 2))))
    (is (= :unmanaged-owner (:kind (ev/retire! p 1 1))))
    (is (= [] (:legacy-versions (ev/status p))))
    (is (= 1 (:version (ev/status p))))
