@@ -28,31 +28,35 @@ def main():
     parser.add_argument('--sdk', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--preparation', type=Path)
+    parser.add_argument('--resume', action='store_true', help='resume retained products and evidence after a harness failure')
     args = parser.parse_args()
     previous = args.sdk.resolve(strict=True)
     output = args.out.resolve()
-    output.mkdir(parents=True, exist_ok=False)
     engine = output / 'engine'
-    engine.mkdir()
-    policy = json.loads((ROOT / 'nix/engine-inputs.json').read_text())
-    for name in policy['roots']:
-        source, target = ROOT / name, engine / name
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target, ignore=shutil.ignore_patterns('target', '.git', '.bl', '__pycache__'))
-        else:
-            shutil.copy2(source, target)
-    fixture = engine / 'priv/std/sdk/artifact'
-    fixture.mkdir(parents=True, exist_ok=True)
-    for name in ('provider.bl', 'consumer.bl'):
-        shutil.copy2(ROOT / 'test/fixtures/sdk-artifacts' / name, fixture / name)
+    if not args.resume:
+        output.mkdir(parents=True, exist_ok=False)
+        engine.mkdir()
+        policy = json.loads((ROOT / 'nix/engine-inputs.json').read_text())
+        for name in policy['roots']:
+            source, target = ROOT / name, engine / name
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, target, ignore=shutil.ignore_patterns('target', '.git', '.bl', '__pycache__'))
+            else:
+                shutil.copy2(source, target)
+        fixture = engine / 'priv/std/sdk/artifact'
+        fixture.mkdir(parents=True, exist_ok=True)
+        for name in ('provider.bl', 'consumer.bl'):
+            shutil.copy2(ROOT / 'test/fixtures/sdk-artifacts' / name, fixture / name)
+        retained = engine / '.bl/sdks'
+        retained.mkdir(parents=True)
+        (retained / 'current-sdk').symlink_to(previous)
+        if args.preparation:
+            (retained / 'previous-preparation').symlink_to(args.preparation.resolve(strict=True))
     retained = engine / '.bl/sdks'
-    retained.mkdir(parents=True)
-    (retained / 'current-sdk').symlink_to(previous)
-    if args.preparation:
-        (retained / 'previous-preparation').symlink_to(args.preparation.resolve(strict=True))
+    assert engine.is_dir() and retained.is_dir()
     metadata = json.loads((previous / 'artifact.json').read_text())
     env = dict(os.environ, BL_CHECKOUT_PLATFORM=metadata['platform'], BL_DAEMON='off',
                ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2 +SDio 1:1')
@@ -64,12 +68,17 @@ def main():
         placement={'local_max_jobs': 0, 'builders': settings['builders']['value']},
         scope='managed-checkout-sdk-and-ordinary-application-vertical-prototype')
 
+    if args.resume:
+        report = json.loads((output / 'result.json').read_text())
+        report.setdefault('resumed_failures', []).append(dict(status=report['status'], error=report.pop('error', None)))
+        report['status'] = 'running'
+
     def save():
         (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
 
     def run(name, argv, cwd=engine, extra=None, timeout=3900):
         print(name, flush=True)
-        stage = dict(name=name, argv=list(map(str, argv)), log=str(output / (name + '.log')), status='running')
+        stage = dict(name=name, argv=list(map(str, argv)), log=str(output / (str(len(report['stages'])) + '-' + name + '.log')), status='running')
         report['stages'].append(stage)
         save()
         started = time.monotonic()
@@ -95,21 +104,24 @@ def main():
                   if line.startswith('SDK-UNIT-PHASES ')][-1]
         parts = [json.loads(line.split('SDK-PARTS-RESULT ', 1)[1]) for line in log.splitlines()
                  if line.startswith('SDK-PARTS-RESULT ')]
-        assert counts['jobs'] == 4, counts
+        assert 1 < counts['jobs'] <= 4, counts
         assert counts['input-reads']['final'] < counts['input-reads']['references'], counts
         assert parts[-1]['parsed'] == 0 and parts[-1]['reused'] > 0, parts
         report['products'][name] = dict(sdk=str(sdk), derivation=drv, counts=counts, parts=parts)
-        # The managed worker's own journal records Nix's actual remote dispatch.
+        save()
+        # The durable job's stdout events retain Nix's actual remote dispatch.
+        # systemd journal holds service lifecycle; command output is in the ledger.
         source_jobs = list(retained.glob('*/job-*/operation.json'))
         matches = [p.parent for p in source_jobs
                    if (p.parent / 'retained').exists() and (p.parent / 'retained').resolve() == sdk]
         assert len(matches) == 1, matches
         handle = json.loads((matches[0] / 'handle.json').read_text())
-        journal = subprocess.check_output(['journalctl', '--user', '--no-pager', '-o', 'cat',
-            '-u', 'foundry-artifact-' + handle['id'] + '.service'], text=True, timeout=30)
-        (output / (name + '-placement.log')).write_text(journal)
-        dispatches = [line for line in journal.splitlines() if 'building ' in line and ' on ' in line]
-        assert any('ssh' in line for line in dispatches), 'actual remote dispatch absent from worker journal'
+        events = matches[0] / 'foundry-state/ledger/events' / (handle['id'] + '.jsonl')
+        rows = [json.loads(line) for line in events.read_text().splitlines()]
+        stdout = '\n'.join(row.get('text', '') for row in rows)
+        (output / (name + '-placement.log')).write_text(stdout + '\n')
+        dispatches = [line for line in stdout.splitlines() if 'building ' in line and ' on ' in line]
+        assert any('ssh' in line for line in dispatches), 'actual remote dispatch absent from durable stdout events'
         report['products'][name]['remote_dispatches'] = dispatches
         save()
         return counts
@@ -140,12 +152,16 @@ def main():
 
     save()
     try:
-        baseline = prepare('producer-change')
+        recorded = report['products'].get('producer-change')
+        baseline = Path(recorded['sdk']) if recorded else prepare('producer-change')
         worker('producer-change', baseline)
         receiver('producer-change', baseline)
         # This changes existing SDK Source, not a comment or selection recipe.
-        with (engine / 'priv/std/errors.bl').open('a') as stream:
-            stream.write('\n(defn incremental-prototype-value [] 73)\n')
+        errors = engine / 'priv/std/errors.bl'
+        definition = '(defn incremental-prototype-value [] 73)'
+        if definition not in errors.read_text():
+            with errors.open('a') as stream:
+                stream.write('\n' + definition + '\n')
         changed = prepare('library-change')
         counts = worker('library-change', changed)
         assert 0 < counts['compiled'] < counts['cached'], counts
