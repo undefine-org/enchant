@@ -175,8 +175,21 @@
     const el = document.createElementNS(inSvg ? SVG_NS : HTML_NS, bare);
     // shorthand id/classes on the tag (e.g. "li.task")
     applyShorthand(el, String(tag));
+    // then the attrs map, merged with the shorthand the way the server
+    // renderer (live/hiccup render-attrs) merges it: classes CONCATENATE
+    // (shorthand first, then :class) and an explicit :id wins. A plain
+    // setAttr here REPLACED the shorthand: `["span.x", {"class": "y"}]`
+    // painted class="y" in an inserted subtree where the first paint had "x y".
     for (const k in attrs) {
-      setAttr(el, k, attrs[k]);
+      const v = attrs[k];
+      const absent = v === null || v === undefined || v === false;
+      if (k === "class" && el.hasAttribute("class")) {
+        if (!absent) el.setAttribute("class", el.getAttribute("class") + " " + String(v));
+      } else if (k === "id" && absent && el.hasAttribute("id")) {
+        // a nil :id falls back to the shorthand's, as on the server
+      } else {
+        setAttr(el, k, v);
+      }
     }
     // a nested array of children (a spliced seq) flattens — at ANY depth, as
     // hiccup->html and diff's splice-children do: a seq of seqs (a `& body`

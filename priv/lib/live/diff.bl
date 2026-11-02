@@ -36,7 +36,7 @@
 ; trees. So the ops are not merely "plausible" — applying them to the old
 ; tree reconstructs the new one exactly.
 
-(ns live.diff)
+(ns live.diff (:require [live.hiccup :as hiccup]))
 
 ;; ── node accessors (a node is [:tag attrs? child*]) ─────────────────
 
@@ -92,10 +92,40 @@
 ;; `:key` is identity, not a DOM attribute, so it is excluded from the attr
 ;; diff (it never renders — live/hiccup strips it). Every other key is
 ;; compared: present-and-changed → :set-attr; gone → :remove-attr.
+;;
+;; The comparison is over the attributes AS THE DOM HOLDS THEM. The tag
+;; shorthand is part of the element's attributes: `[:span.x {:class "y"}]`
+;; renders class="x y" (live.hiccup/render-attrs puts the shorthand's classes
+;; ahead of :class, and an explicit :id ahead of the shorthand's). A :set-attr
+;; replaces the DOM attribute wholesale, so it has to carry that merged value:
+;; diffing the bare :class shipped "z" for a toggle and wiped the tag's `x`,
+;; and dropping :class shipped a :remove-attr that took `x` with it.
+
+(defn- shorthand? [tag]
+  (let [s (name tag)] (or (some? (index-of s ".")) (some? (index-of s "#")))))
+
+(defn- bare-tag
+  "The element name alone: `:span.x#a` → `:span`."
+  [tag]
+  (if (shorthand? tag) (keyword (:tag (hiccup/parse-tag tag))) tag))
+
+(defn- dom-attrs
+  "`attrs` with the tag shorthand folded in exactly as the renderer folds it:
+   classes concatenate (shorthand first, then :class), an explicit :id wins.
+   A tag without shorthand returns `attrs` itself."
+  [tag attrs]
+  (if (not (shorthand? tag))
+    attrs
+    (let [sh (hiccup/parse-tag tag)
+          c (get attrs :class)
+          cls (join " " (concat (:classes sh) (if (nil? c) [] [c])))
+          id (or (get attrs :id) (:id sh))
+          a (if (= cls "") (dissoc attrs :class) (assoc attrs :class cls))]
+      (if (nil? id) (dissoc a :id) (assoc a :id id)))))
 
 (defn- attr-ops
-  [path old-attrs new-attrs]
-  (let [oa (dissoc old-attrs :key) na (dissoc new-attrs :key)
+  [path tag old-attrs new-attrs]
+  (let [oa (dom-attrs tag (dissoc old-attrs :key)) na (dom-attrs tag (dissoc new-attrs :key))
         changed (reduce (fn [out kv]
                           (let [k (first kv) v (second kv)]
                             (if (= (get oa k :live.diff/absent) v) out
@@ -277,7 +307,9 @@
              child-ops (if keyed
                          (keyed-child-ops path oc nc diff)
                          (positional-child-ops path oc nc diff))]
-         (into (attr-ops path (attrs-of old) (attrs-of new)) child-ops)))))
+         (into (if (= (attrs-of old) (attrs-of new)) []
+                 (attr-ops path (tag-of old) (attrs-of old) (attrs-of new)))
+               child-ops)))))
 
 ;; ── apply-ops: the REFERENCE semantics (mirrored by the JS client) ──
 ;;
@@ -354,12 +386,30 @@
    normalized to normalized — structural equality, not the incidental
    presence of an empty `{}`. Text/number nodes pass through.
 
+   The tag shorthand is folded into the attrs the way the DOM holds it
+   (`[:span.x {:class \"y\"}]` → `[:span {:class \"x y\"}]`): attr ops carry
+   DOM values (see `dom-attrs`), so the comparison is over what a browser
+   would show, not over which spelling the view chose.
+
    `:key` is excluded from the comparison: it is IDENTITY, not content —
    the differ may legitimately attach a key attr to an inserted subtree
    (see keyed-child-ops) without that counting as a difference."
   [node]
   (if (element? node)
-    (into [(tag-of node) (dissoc (attrs-of node) :key)] (map normalize (children-of node)))
+    (into [(bare-tag (tag-of node)) (dissoc (dom-attrs (tag-of node) (attrs-of node)) :key)]
+          (map normalize (children-of node)))
+    node))
+
+(defn- dom-form
+  "`normalize`, but KEEPING identity (an attr or metadata key becomes a :key
+   attr): the shape `apply-ops` patches, so a :set-attr's DOM value lands on
+   DOM attrs and a keyed op still finds its child."
+  [node]
+  (if (element? node)
+    (let [k (node-key node)
+          a (dom-attrs (tag-of node) (attrs-of node))]
+      (into [(bare-tag (tag-of node)) (if (nil? k) a (assoc a :key k))]
+            (map dom-form (children-of node))))
     node))
 
 ;; Structural (child-order) vs deep (in-place) op kinds. Structural ops
@@ -456,6 +506,6 @@
   [ops tree]
   (let [structural (filterv structural-op? ops)
         deep (filterv (fn [op] (not (structural-op? op))) ops)
-        reordered (apply-structural tree structural)
+        reordered (apply-structural (dom-form tree) structural)
         patched (reduce apply-op reordered deep)]
     (normalize patched)))
