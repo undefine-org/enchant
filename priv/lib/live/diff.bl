@@ -130,6 +130,37 @@
                 (if (contains? na k) out (conj out [:remove-attr path (name k)]))))
             changed (seq oa))))
 
+;; ── the wire form of a subtree ──────────────────────────────────────
+;;
+;; An [:insert]/[:replace] ships a whole subtree, and the client renders it
+;; from JSON, where a seq and an element are both arrays and a keyword tag and
+;; a text are both strings. A child group that leads with TEXT —
+;; `[:p (list "a" [:b "c"])]` — therefore arrived as ["p",["a",["b","c"]]], and
+;; its group reads as an element named "a" (InvalidCharacterError for any text
+;; with a space: the patch is lost and the page goes blank). Metadata does not
+;; cross JSON either, so a `^{:key …}` row inside the subtree lost its identity
+;; and every later keyed op on it named nothing. The first paint never had
+;; either problem because hiccup->html splices and renders meta keys. `wire`
+;; hands the client the same tree the renderer saw: groups spliced at every
+;; depth, nils dropped, a metadata key moved into the attrs, and a leaf that
+;; JSON would not render as its text (a keyword, a boolean) stringified as
+;; hiccup->html stringifies it.
+
+(defn wire
+  "A subtree in the shape it crosses the wire: every child group spliced,
+   nils dropped, metadata keys written as `:key` attrs, odd leaves as text."
+  [n]
+  (cond
+    (element? n)
+      (let [a (attrs-of n)
+            k (if (contains? a :key) nil (get (meta n) :key))
+            head (cond (some? k) [(tag-of n) (assoc a :key k)]
+                       (has-attrs? n) [(tag-of n) a]
+                       :else [(tag-of n)])]
+        (into head (map wire (children-of n))))
+    (or (nil? n) (string? n) (number? n) (vector? n)) n
+    :else (str n)))
+
 ;; ── keyed child reconcile ───────────────────────────────────────────
 ;;
 ;; Match children by key. A key present only in NEW is an insert; only in
@@ -180,10 +211,6 @@
                           (let [k (node-key n)]
                             (if (contains? new-idx k) out (conj out [:remove path k]))))
                         [] old-children)
-        ;; Metadata does not cross JSON: inserted nodes need identity in attrs.
-        attach-key (fn [n k]
-                     (if (and (has-attrs? n) (not (contains? (attrs-of n) :key)))
-                       (assoc n 1 (assoc (attrs-of n) :key k)) n))
         kept-old-indices (reduce (fn [out n]
                                   (let [k (node-key n)]
                                     (if (contains? old-idx k) (conj out (get old-idx k)) out)))
@@ -199,7 +226,9 @@
                   inner (diff-fn (conj path i) (nth old-children oi) n)
                   next (into out inner)]
               (recur (+ i 1) (if (contains? anchors oi) next (conj next [:move path k i]))))
-            (recur (+ i 1) (conj out [:insert path k i (attach-key n k)]))))))))
+            ;; `wire` writes a metadata key into the attrs: identity must
+            ;; survive JSON, or a later keyed op on this node names nothing
+            (recur (+ i 1) (conj out [:insert path k i (wire n)]))))))))
 
 ;; ── positional child reconcile (no keys) ────────────────────────────
 
@@ -220,7 +249,7 @@
                                                     (nth old-children i) (nth new-children i))))))
         inserts (loop [i overlap out paired]
                   (if (= i nc) out
-                    (recur (+ i 1) (conj out [:insert path nil i (nth new-children i)]))))]
+                    (recur (+ i 1) (conj out [:insert path nil i (wire (nth new-children i))]))))]
     ;; High indices first keep lower removal targets valid in the DOM.
     (loop [i (- oc 1) out inserts]
       (if (< i overlap) out
@@ -275,7 +304,7 @@
      ;; kind changed (text↔element, or different tag): a full replace
      (or (not (element? old)) (not (element? new))
          (not= (tag-of old) (tag-of new)))
-       [[:replace path new]]
+       [[:replace path (wire new)]]
      ;; same tag: diff attrs, then children. `into []` REALIZES the op seq:
      ;; `concat`/`mapcat` are lazy, and a lazy seq that reaches the wire
      ;; (interop/->json) has no Jason encoder — the ops must be a plain
