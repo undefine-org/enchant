@@ -575,8 +575,23 @@
           // the head sheet holds what the warm reached; a socket that renders
           // a class the warm never did ships its rule first (see socket.bl
           // ship-css!). Append, never replace: the warm rules stay.
+          //
+          // WHERE the rules go is the page's call, not ours. The SSR shell's
+          // sheet is <style id="live-style"> (live.app render-page), placed
+          // wherever the app's :shell put its `style` argument — so appending
+          // INTO it keeps live's rules at that point of the cascade. A page
+          // with no such sheet gets one inserted BEFORE its first stylesheet,
+          // never after: appended at the end of <head>, live's base reset
+          // (body background and ink) overrode the app's own sheet, whose
+          // equal-specificity rules then lost on source order. An app that
+          // wants live's rules elsewhere declares an empty
+          // <style id="live-style"> there.
           let tag = document.getElementById("live-style");
-          if (!tag) { tag = document.createElement("style"); tag.id = "live-style"; document.head.appendChild(tag); }
+          if (!tag) {
+            tag = document.createElement("style"); tag.id = "live-style";
+            document.head.insertBefore(tag,
+              document.head.querySelector('link[rel~="stylesheet"], style'));
+          }
           tag.appendChild(document.createTextNode(a + "\n"));
         } else if (kind === "patch") {
           applyPatch(root, a);

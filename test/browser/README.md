@@ -73,7 +73,11 @@ driving a real Chromium with Playwright against the JS client.
    options picked, the focused field and its caret survive it (matched by id,
    else name, else child path); a restored field the view binds re-sends its
    value so the session agrees; `<html data-mounted="1">` marks the mount.
-   Against the pre-fix client the typed values come back empty.
+   Against the pre-fix client the typed values come back empty. And live's
+   `["style"]` rules go INTO the page's `<style id="live-style">` (the SSR
+   sheet, where the app's `:shell` placed it), or before the first stylesheet
+   when there is none — never after the app's own sheet, which used to lose to
+   live's base reset on source order.
 
 ## Run it
 
