@@ -115,7 +115,7 @@
        (or (= n 3) (and (= n 4) (string? (rn/node-form (get items 2)))))
        (literal-node? (last items) false))))
 
-; Exact firstparty bypass entrypoints. Harmless reads/codecs/sync stay usable.
+; Exact firstparty bypass entrypoints. Reads/codecs/sync use fixed SDK adapters.
 (def ^:private STORE-PRODUCERS
  {"foundry.upgrade.schema-reconstruction" #{"install!" "record-before-expand!" "consume-publication!" "reconstruct!" "startup!"}
   "datom.conn" #{"native-journal-evidence!" "write-control-journal!" "write-initialization-journal!" "install-schema-reconstruction-journal!" "write-schema-reconstruction-journal!"
@@ -684,20 +684,40 @@
        ;; Unknown fallback authority cannot be certified from a spelling.
        (= :error (BeamLisp.Env/lookup (tuple namespace (:name node)))))))))))
 
+(defn- unmanaged-store-name? [namespace name]
+ (or (contains? (get STORE-PRODUCERS namespace #{}) name)
+     ;; This fixed SDK namespace reserves these families for its raw native
+     ;; backend. Source uses its checked Store methods, including for reads.
+     (and (= namespace "datom.store-fjall")
+          (or (String/starts_with? name "fjall-")
+              (String/starts_with? name "keycodec-")))))
+
+(defn- referred-store-binding? [namespace name]
+ ;; Native Vars need not have function link rows. Follow actual explicit
+ ;; refers without initializing a provider, respecting a real local shadow.
+ (loop [provider namespace seen #{}]
+  (cond
+   (unmanaged-store-name? provider name) true
+   (or (contains? seen provider) (>= (count seen) 32)) true
+   (BeamLisp.Env/local_var? provider name) false
+   :else (if-let [next (BeamLisp.Env/refer_source provider name)]
+           (recur next (conj seen provider)) false))))
+
 (defn- unmanaged-store-binding? [node]
  (cond
   (= :global (:op node))
-   (or (contains? (get STORE-PRODUCERS (:ns node) #{}) (:name node))
+   (or (unmanaged-store-name? (:ns node) (:name node))
        (when-not (= :exact (:lookup node))
-        (let [owner (BeamLisp.Env/link_owner (:ns node) (:name node))]
-         (and (tuple? owner) (= :ok (elem owner 0))
-              (contains? (get STORE-PRODUCERS (elem owner 1) #{}) (:name node))))))
+        (or (referred-store-binding? (:ns node) (:name node))
+            (let [owner (BeamLisp.Env/link_owner (:ns node) (:name node))]
+             (and (tuple? owner) (= :ok (elem owner 0))
+                  (unmanaged-store-name? (elem owner 1) (:name node)))))))
   (= :remote (:op node))
    ;; Exact actual named definitions, including stable body modules. Namespace
    ;; names/prefixes alone never exempt or authenticate a borrowed producer.
    (let [name (erlang/atom_to_binary (:fun node) :utf8)]
     (boolean (some (fn [[namespace names]]
-     (and (contains? names name)
+     (and (unmanaged-store-name? namespace name)
           (or (= (:mod node) (BeamLisp.Emit/module_for namespace))
               (some (fn [entry]
                (and (> (erlang/tuple_size entry) 4) (= (:mod node) (elem entry 4))
