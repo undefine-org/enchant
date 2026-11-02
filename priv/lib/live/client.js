@@ -16,6 +16,8 @@
 //                                                 that keeps an idle socket
 //                                                 under the server's idle
 //                                                 timeout (no reply expected)
+//                     ["remount"]                 a patch op did not apply:
+//                                                 send a fresh ["mount"]
 //
 // Op set (mirrors diff.bl):
 //   ["set-attr",    path, k, v]
@@ -36,6 +38,8 @@
 //   live:pending  {count}        un-acked durable gestures · html[data-live-pending]
 //   live:mount    {root}         a ["mount"] repainted root · html[data-mounted="1"]
 //   live:patch    {root, ops}    a ["patch"] was applied
+//   live:patch-error {failed}    ops of that patch did not apply ({op, error}
+//                                each; the rest did); a ["remount"] is asked
 //   live:denied   {why}          the server refused an intent (["denied", why]);
 //                                also opts.onDenied(why) when the shell passed one
 //   live:tap      {t, basis}     a tapped socket's frame id (dev tools)
@@ -299,10 +303,21 @@
   // indexes that list's NEW children, so an inner parent is addressable only
   // after its outer list is rebuilt (deepest-first patched the row one late).
   // Within a parent, wire order already is removes → placements (anchor-fill).
+  //
+  // Every op is GUARDED. One op that throws (a path into a DOM the model does
+  // not describe — e.g. a parser-inserted element) used to abort the loop, and
+  // every later op of the patch was lost in silence. The rest of the patch now
+  // still lands; the failures are returned so the socket can report them and
+  // ask for a fresh mount (see connect()).
   const STRUCTURAL = { remove: 1, "remove-at": 1, insert: 1, move: 1 };
   function applyPatch(root, ops) {
     const structural = [];
     const deep = [];
+    const failed = [];
+    const run = (op) => {
+      try { applyOp(root, op); }
+      catch (e) { failed.push({ op: op, error: String(e && e.message || e) }); }
+    };
     for (const op of ops) (STRUCTURAL[op[0]] ? structural : deep).push(op);
     const byPath = new Map();
     for (const op of structural) {
@@ -312,9 +327,10 @@
     }
     const paths = Array.from(byPath.keys()).sort(
       (a, b) => JSON.parse(a).length - JSON.parse(b).length);
-    for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
-    for (const op of deep) applyOp(root, op);
+    for (const p of paths) for (const op of byPath.get(p)) run(op);
+    for (const op of deep) run(op);
     syncInputs(root);
+    return failed;
   }
 
   function applyOp(root, op) {
@@ -459,6 +475,8 @@
     // route is remembered here and flushed on (re)open. Last-wins — only the
     // final route matters, so a newer navigate replaces an older pending one.
     var pendingNav = null;
+    // a ["remount"] is in flight (a patch op failed); cleared by the mount
+    var remountAsked = false;
 
     // send a raw JSON frame string: straight through when OPEN, buffered while
     // CONNECTING, dropped when there is no socket (the outbox holds the durable
@@ -573,6 +591,7 @@
           // field bound to the server re-sends its value so the session's
           // state agrees with what the reader sees.
           const kept = keepFields(root);
+          remountAsked = false;
           discardInputs();
           root.__liveInputAck = !!(b && b["input-ack"]);
           root.innerHTML = a;
@@ -604,8 +623,17 @@
           }
           tag.appendChild(document.createTextNode(a + "\n"));
         } else if (kind === "patch") {
-          applyPatch(root, a);
+          const failed = applyPatch(root, a);
           announce("live:patch", { root: root, ops: a });
+          if (failed.length) {
+            // the page no longer matches the tree the server diffs against, so
+            // every later patch would be computed for a page we do not have:
+            // say so, and ask for a fresh mount — once, until it arrives
+            try { console.error("live: " + failed.length + " patch op(s) did not apply", failed); }
+            catch (_e) {}
+            announce("live:patch-error", { failed: failed });
+            if (!remountAsked) { remountAsked = true; sendFrame(JSON.stringify(["remount"])); }
+          }
         } else if (kind === "tap") {
           announce("live:tap", { t: a, basis: b });
         } else if (kind === "denied") {

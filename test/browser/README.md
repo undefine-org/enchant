@@ -84,6 +84,13 @@ driving a real Chromium with Playwright against the JS client.
    default) swallowed refusals. It is now also `live:denied` `{why}` on
    `document`, beside the callback.
 
+9. **`connect.spec.js` › one bad op does not sink a patch** — an op that
+   throws used to abort `applyPatch`, losing every later op in silence. Each
+   op is guarded: the rest lands, `live:patch-error` reports the failures, and
+   the client sends `["remount"]` (once, until the mount arrives) so the page
+   converges. (`client.spec.js` › the tbody-less table is the case that made
+   ops throw: the parser's `<tbody>` is now part of the model.)
+
 ## Run it
 
 ```sh
