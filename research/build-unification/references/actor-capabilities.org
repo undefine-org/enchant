@@ -1,0 +1,710 @@
+#+TITLE: Agreements that survive a running program
+#+SUBTITLE: Beam Lisp, actor capabilities, reload, and Ward
+#+STARTUP: showall
+#+PROPERTY: header-args :eval never
+
+* The experience we want
+
+A value should tell you what you can do next. The compiler should explain an
+invalid step where you write it. The runtime should enforce the agreement when
+processes race, code changes, or a worker dies. The test runner should show the
+same story with a small example you can replay.
+
+Imagine an upload. You can send chunks, hand the work to another process, and
+finish once. A reader can inspect progress. A deployment can serve new uploads
+while an existing upload finishes with the code it started with. A lost response
+from storage leads to reconciliation. Each of those actions has a clear owner.
+
+This document proposes that experience. It specifies a first vertical prototype
+and the path from that prototype to the language and standard library. Prototype
+APIs, diagnostic text, and demo outcomes below are design targets. Their
+acceptance gates define the evidence needed to implement them.
+
+Reading convention: =beam-lisp= source blocks use existing APIs. =clojure=
+blocks show proposed Beam Lisp code, with familiar Lisp highlighting; the
+livebook loader treats them as explanatory text. Example blocks show diagrams
+or expected output. There are no recorded execution results in this document.
+
+* A map of Beam Lisp
+
+Think of the system as a workshop with a compiler, a running image, and a test
+bench. Each has access to descriptions of the same program, with different
+responsibilities.
+
+#+begin_example
+                           AUTHOR'S SOURCE
+                                  |
+                         reader / expansion
+                                  |
+                          canonical compiler IR
+                                  |
+                 +----------------+----------------+
+                 |                                 |
+          ANALYSIS AND EVIDENCE              EMITTED EXECUTABLES
+          shapes, effects, calls             bodies, entries, dependencies
+          ownership, transitions             exact code identities
+                 |                                 |
+                 +-------- publication ------------+
+                                  |
+                       NATIVE EXECUTION OWNER
+                       context / custody / admission
+                                  |
+                       RUNNING SERVICE INSTANCES
+                     state / mailboxes / durable work
+
+       reload: prepare change, check it, publish, drain, retire
+       Ward:   run examples in owned scopes, report evidence and failures
+#+end_example
+
+An analysis report describes what its analysis established. An executable
+registration grants access through native admission. Keeping those roles
+separate makes reports useful without letting a report manufacture authority.
+
+** Source edits and immutable generations
+
+[[file:../priv/std/reload.bl][reload]] stages whole namespace sources in a bundle.
+[[file:../priv/std/reload/check.bl][reload.check]] checks coherence using existing
+name, type, and require-graph machinery. A coherent bundle can be evaluated
+through the configured commit target. Publication happens per definition;
+runtime form errors can leave partial effects. Treat this as the source editing
+path with its own guarantee boundary.
+
+[[file:../priv/std/reload/generation.bl][reload.generation]] prepares immutable
+executable graphs. =publish!= compares and replaces one serving slot against an
+expected digest. That operation covers one slot. A coordinator must handle a
+change spanning several owners and any durable activation intent.
+
+[[file:../priv/std/reload/execution.bl][reload.execution]] owns preparation state
+and the adapters into native execution. Accepted work can retain the code it
+needs. =retire!= checks actual native retirement and performs retryable resource
+cleanup. Outstanding serving slots, registrations, executing code, or resource
+obligations can keep retirement waiting.
+
+#+begin_example
+time --------------------------------------------------------------->
+
+serving slot     [ G1 ]--------------[ G2 ]----------------------------
+upload A            [ execute with retained G1 ................ done ]
+upload B                                  [ execute with G2 ... done ]
+G1 retirement                        waiting ................ release
+#+end_example
+
+Application identity, process incarnation, and code generation answer different
+questions. An application name scopes a service. An incarnation identifies one
+actual lifetime. A generation identifies code. A restart must establish fresh
+authority for the new incarnation; finding the same logical name is insufficient.
+[[file:../priv/std/proc/instance.bl][proc.instance]] already separates logical
+process identity from source generations.
+
+** What Ward contributes
+
+[[file:../priv/std/reload/ward.bl][reload.ward]] reads test source, creates a warm
+base, forks a scope per file, and runs each file in an owned monitored worker.
+The caller correlates results with that worker, handles death and timeout, and
+destroys the scope in cleanup. File events support progress displays.
+
+The implementation's =evaluate-file= records coherence findings as advisory
+warnings and proceeds to execute the tests. A strict protocol gate therefore
+needs an explicit verdict; a quiet warning list is insufficient.
+
+Environment forks isolate environment state. Native modules, OS environment,
+external stores, and arbitrary processes have separate lifetimes. The sequential
+runner restores OS environment changes around files. =run-sandboxed= gives each
+run a namespace prefix through source rewriting; use dedicated fixtures to
+qualify cross-file references, quoted text, and namespace isolation. Environment
+forks alone do not establish those properties.
+
+[[file:../priv/std/reload/upgrade.bl][reload.upgrade/verify-upgrade]] checks a
+supported process's declared invariant through its modeled transitions. Its
+=:safe= result has that scope: state migration, outstanding client conversations,
+native custody, and publication are additional questions. =assert-safe-upgrade=
+records an error when verification is unknown.
+
+Ward's [[file:../priv/std/reload/ward-diagnosis.bl][process diagnosis]] can offer
+repair evidence for supported invariant failures. Its
+[[file:../priv/std/reload/ward_diag.bl][contamination ledger]] observes selected
+mailbox, OS environment, and memo surfaces. Those are distinct observations and
+should keep distinct labels in the report.
+
+** The other pieces of the workshop
+
+| Existing home | Useful responsibility |
+|---------------+-----------------------|
+| [[file:../priv/std/proc/contract.bl][proc.contract]] | Check compiled callback patterns and pure guards for supplied inputs and state. |
+| [[file:../priv/std/proc/input-domain.bl][proc.input-domain]] | Establish bounded argument requirements over actual compiler IR. |
+| [[file:../priv/lib/system/ownership.bl][system.ownership]] | Track finite resource lifecycles, aliases, transfer, exceptional exits, and cleanup relative to explicit contracts. |
+| [[file:../priv/lib/system/publication.bl][system.publication]] | Bind evidence to actual published values, bodies, dispatch, and generation. |
+| [[file:../priv/lib/system/footprint.bl][system.footprint]] | Describe effect structure, including unknown operations. |
+| [[file:../priv/lib/system/model.bl][system.model]], [[file:../priv/lib/system/gfp.bl][system.gfp]], [[file:../priv/lib/system/core.bl][system.core]] | Describe transitions and check supported safety, progress, and arithmetic properties. |
+| [[file:../priv/lib/system/knowledge.bl][system.knowledge]] | Query process facts; current send coverage uses labels and caller-supplied wiring. |
+| [[file:../priv/std/proc/evolve.bl][proc.evolve]], [[file:../priv/std/proc/transition.bl][proc.transition]] | Prepare and coordinate supported owner and code transitions. |
+| [[file:../priv/std/proc/callback.bl][proc.callback]], [[file:../priv/host/execution.bl][host.execution]] | Register, invoke, hand off, and close executables through native custody. |
+| [[file:../priv/std/proc/queue.bl][proc.queue]] | Fence claimed work, record effect intent, and reconcile uncertain provider outcomes. |
+| [[file:../priv/std/proc/flow.bl][proc.flow]], [[file:../priv/std/proc/capacity.bl][proc.capacity]] | Account for demand and supported shared capacity. |
+
+* Gordon's contribution, in a small picture
+
+Colin S. Gordon's full [[https://arxiv.org/html/2502.07958v2][Actor Capabilities for
+Message Ordering]] assigns each actor reference a language of permitted message
+sequences. Sending consumes permission. Splitting a reference is allowed when
+every interleaving of the resulting permissions fits the original permission.
+
+#+begin_example
+permission:   inspect* interleaved with (write* then finish)
+                              |
+                          safe split
+                   +----------+----------+
+                   |                     |
+reader:        inspect*           writer: write* then finish
+
+An independent second writer cannot acquire another finish permission.
+#+end_example
+
+Different aliases can therefore carry different rights to the same actor.
+Retrieving a fresh self-reference creates a new capability. An effect system
+tracks the corresponding future handling obligations, keeping the actor's next
+behavior compatible with permissions already issued. Checks can be local to
+components rather than requiring a complete global conversation description.
+
+The calculus assumes ordered delivery between each sender/receiver pair and
+allows interleaving between senders. Selective receive needs additional care.
+The paper leaves fault handling for future work. The
+[[https://icfp26.sigplan.org/details/erlang-2026-papers/1/Actor-Capabilities-for-Controlled-Actor-Interactions-Keynote-][2026 keynote]] describes efforts toward Elixir and explicitly raises system
+messages, supervision, restarts, and migration.
+
+The Beam Lisp proposal below adds executable identity, live lifecycle, durable
+recovery, and quantitative demand. Those additions are design work for this
+system; the paper does not establish their correctness.
+
+* One agreement, several responsibilities
+
+A service agreement connects a client's permission with a receiver's obligation.
+Its public view is ordinary bounded data. Its executable authority stays with
+the existing native owners.
+
+#+begin_example
+CLIENT                          AGREEMENT                       SERVICE
+
+what may I do?          remaining messages / reply shapes    what must I accept?
+who may use this?       owner / incarnation / transfer       who owns the work?
+how much may I send?    credits / reservations               what can I absorb?
+which code applies?    protocol identity / code evidence    what can I retire?
+what if it fails?      close / drain / recovery policy      what remains owed?
+#+end_example
+
+Keep these as cooperating checks. A message-shape proof, a native admission
+decision, and a durable recovery record retain their own scope and owner.
+
+** The contract comes from the program
+
+The compiler derives message shapes, guards, reply evidence where supported,
+and binding identities from actual clauses and compiler IR. The author declares
+sequencing, terminal operations, delegation policy, and recovery policy when
+they express intent the implementation cannot reveal reliably.
+
+For example, =write*= means any finite number of writes. =finish | abort= means
+one of those terminal actions. Here is a proposed finite descriptor, using
+session stages rather than a new general-purpose type language:
+
+#+begin_src clojure
+{:id 'upload/session
+ :version 1
+ :initial :writing
+ :stages {:writing {:write :writing, :watch :writing,
+                    :finish :finished, :abort :aborted}
+          :finished {}, :aborted {}}
+ :observations #{:inspect}
+ :creates {:watch #{:inspect}}
+ :terminal #{:finished :aborted}
+ :ownership :transferable
+ :recovery :reconcile-before-resubmit}
+#+end_src
+
+Every action must resolve to actual compiled clauses. Stage edges have witnesses
+to their implementation and reply behavior in the supported fragment. Guards
+depending on changing state remain runtime conditions unless a stronger proof
+or reservation establishes their stability. Looking at state and later sending
+a message is a race unless acceptance reserves the relevant right.
+
+** Checking and execution meet at the receiver
+
+#+begin_example
+source call
+    |
+    v
+static checker -----------------> diagnostic at the invalid operation
+    | known sequence and ownership
+    v
+SDK call with opaque handle
+    |
+    v
+serialized receiver admission ---> refused before body entry
+    | current owner, epoch, stage, credit, deadline, code
+    v
+accepted operation --------------> complete / fail / uncertain
+    |
+    v
+reply + retained obligations + bounded observation event
+#+end_example
+
+The supported SDK boundary is part of the design. A raw PID, copied description,
+or ordinary map cannot construct a managed session. Direct foreign/native sends
+need an explicit ingress adapter or a clearly limited unverified boundary.
+Capabilities cannot intercept arbitrary BEAM sends by declaration alone.
+
+The receiver consumes a right and admits the associated work at one serialized
+boundary. A rejected pre-entry call can leave a right available. A call accepted
+before a reply is lost must have a recoverable operation identity. Exception
+paths cannot automatically rewind accepted effects.
+
+Static send order also needs a handoff rule: transferring the remaining right
+to another sender must fence earlier accepted operations. The receiver records
+that cut before activating the new owner's epoch. The prototype uses
+acknowledged SDK operations, so an asynchronous handoff cannot overtake an
+earlier write. General asynchronous sends require a later ordering design.
+
+** Good client code stays ordinary
+
+Proposed surface:
+
+#+begin_src clojure
+(defn upload! [service chunks]
+  (proc/with-session [upload (files/begin-upload! service)]
+    (doseq [chunk chunks]
+      (files/write-chunk! upload chunk))
+    (files/finish-upload! upload)))
+#+end_src
+
+The session scope owns unfinished local cleanup. Successful finish discharges
+that responsibility. After an accepted operation becomes uncertain, cleanup
+retains a recovery obligation; it cannot report a successful abort by unwinding
+the stack. Runtime owner death follows the same lifecycle rules.
+
+The editor can offer the operations available at this point and identify where
+a consumed right went. Libraries can export inferred summaries, so callers
+usually write functions and let the checker follow them.
+
+* Prototype 0: the whole story in one upload service
+
+The first prototype is a contained implementation of one agreement. Its vertical
+slice includes real compiler evidence, real native ownership, a live generation
+change, a persistent effect journal, and Ward demonstrations. A state-machine
+simulation is useful reference code; acceptance also requires the running system
+to follow the reference model.
+
+** The boundary
+
+Keep research implementation under =research/actor-capabilities/=, with a small
+driver in =examples/actor-capabilities/=. Use one service family, one application
+instance, one queue, and one local persistent provider fixture. Bound the number
+of sessions, generations, protocol states, and explored histories.
+
+Existing SDK owners handle executable registration, graph retention, process
+lifetimes, queue claims, and persistence. The prototype's service owns its
+business session state and credits. A narrow compiler or native hook is allowed
+when the existing SDK cannot express a required operation; document that hook
+and qualify it with a focused control before using it in the demo.
+
+An isolated research adapter may select an existing trusted SDK operation. It
+must not replace custody with a second callback registry, an environment marker,
+or a caller-supplied execution context. The descriptor identifies permissions;
+native admission remains authoritative.
+
+** The cast
+
+#+begin_example
+             +---------------- WARD RUN ------------------+
+             | exact candidate and fixture identities     |
+             |                                           |
+             | client ---- transfer ----> upload worker   |
+             |    \                         |             |
+             |     inspector                | chunks      |
+             |         \                    v             |
+             |          +----------> upload owner         |
+             |                       | session stages     |
+             |                       | credit = 2         |
+             |                       v                    |
+             |                 queue effect journal       |
+             |                       |                    |
+             |                       v                    |
+             |                local provider fixture      |
+             |               durable receipt by effect ID |
+             +--------------------------------------------+
+
+             serving slot: G1 -> G2
+             active session: G1 until its obligations discharge
+#+end_example
+
+The inspector receives repeatable =inspect= permission. The writer can write or
+request a watcher repeatedly, then finish or abort. Observations remain supported in terminal states
+until the inspector closes or its explicitly agreed lease expires. Such a lease
+is part of the API's failure semantics. Issuing it creates a real handling and
+retention obligation.
+
+** The pieces to implement together
+
+| Proposed file | Responsibility | Reused owner |
+|---------------+----------------+--------------|
+| =protocol.bl= | Validate finite descriptors; derivative, shuffle, inclusion; explain failed inclusion. | Canonical bounded data; existing IR identity. |
+| =check.bl= | Track permitted operations through the supported client IR; account for capability creation, transfer, and terminal paths. | =system.ir=, =system.ownership=, =system.gfp=, compiler-resolved bindings. |
+| =upload.bl= | Declared clauses and session-stage implementation for two versions. | =proc.server=, =proc.contract=, =proc.evolve=. |
+| =boundary.bl= | Resolve checked operations to existing SDK entry/admission and scope cleanup. | =proc.callback=, =host.execution=, =reload.execution=. |
+| =provider.bl= | Persist a result by stable effect ID; expose controlled lost-reply and recovery barriers. | Existing durable store interfaces. |
+| =showcase.bl= | Coordinate a deterministic run and emit bounded data events. | =reload.generation=, =proc.queue=, runtime observations. |
+| =gate_test.bl= | Assertions and model/implementation comparison under Ward. | =reload.ward=, existing test runtime. |
+
+Names in this table are proposed research files. Keep them free of independent
+loader, scheduler, execution-owner, journal, or solver implementations.
+
+The finite protocol engine supports choice, sequence, repetition, and shuffle
+over a finite alphabet. Give inclusion a concrete implementation: search the
+product of the derived automata for a reachable accepting/nonaccepting mismatch,
+and return its shortest message trace. State/step exhaustion returns =:unknown=.
+Use tiny protocol fixtures to compare the automata against enumerated words.
+
+The first client checker supports exact resolved calls, lexical aliases,
+sequencing, conditionals, scope cleanup, and the one bounded chunk loop used by
+the demo. Calls whose summaries are unavailable stay unknown. Higher-order
+capture requires a supported summary or an unknown result. A map containing a
+handle must preserve its resource identity or leave coverage explicit.
+
+Code evidence binds the descriptor and client result to actual compiled bodies,
+operation bindings, compiler version, and analysis budget/policy. Rebinding a
+helper invalidates the evidence. A successful check cannot rely on a function
+name spelling or a hand-written claim that an adapter has the desired behavior.
+
+** A compact public walkthrough
+
+This proposed driver is the desired application experience. It deliberately
+uses domain verbs; implementation ownership details belong behind the SDK.
+
+#+begin_src clojure
+(demo/with-system [system {:credits 2}]
+  (let [session (upload/open! system)
+        [reader writer] (upload/split! session #{:inspect}
+                                              #{:write :watch :finish :abort})]
+    (upload/write! writer "first chunk")
+    (demo/publish! system :compatible-v2)
+    (demo/with-worker [worker system]
+      (upload/handoff! writer worker)
+      (demo/finish-in-worker! worker))
+    (upload/inspect! reader)
+    (upload/close! reader)
+    (demo/await-retirement! system :v1)))
+#+end_src
+
+The worker scope indexes pending/accepted ownership before acceptance and owns
+target cleanup. A lost transfer reply closes the source epoch only. The receiver
+and native handoff status decide whether the target was accepted. A second
+acceptance observes that decision instead of creating another writer.
+
+The simplified split syntax denotes a validated partition of an existing right.
+The prototype checks all admitted interleavings; distributing two identical
+writer rights must fail. Runtime aliases share the same receiver-owned budget,
+so copying an opaque handle cannot mint another finish operation.
+
+** Seven scenes make the vision inspectable
+
+Every scene has a deterministic driver, visible output, and an assertion. A
+terminal transcript is sufficient for Prototype 0; the same data events can
+later feed an editor panel. Diagrams and reports must render from those events,
+so screenshots and the implementation describe the same run.
+
+| Scene | What the viewer does | What the viewer sees | Acceptance observation |
+|-------+----------------------+----------------------+------------------------|
+| 1. The agreement | Open an upload; inspect the two rights after splitting. | An inspector and a writer, with their remaining operations. | Every issued right has one session, owner/epoch, protocol identity, and retention responsibility. |
+| 2. An invalid client | Write client code that finishes and then writes again. | A diagnostic at the write, pointing back to finish. | Static refusal in the supported fragment; the invalid body never executes. |
+| 3. Sharing and handoff | Try two finish rights; then transfer one writer to a worker. | Invalid split trace; valid transfer; source right consumed. | All permitted split interleavings are checked; target acceptance and owner-death cleanup use real native ownership. |
+| 4. Capacity | Hold completion of two accepted chunks; submit a third. | Two occupied credits; the third call waits or refuses according to the declared policy. | No third body enters; completion returns one credit once. |
+| 5. Live change | Publish compatible G2 while a G1 upload is active. | New uploads use G2; the active upload reports G1; retirement names outstanding obligations. | Exact executed code identities agree with the report; G1 retires after final readers, work, and registrations release. |
+| 6. Incompatible change | Remove a terminal action that an active right permits. | A held transition with a short protocol witness and the affected sessions. | Serving identity and native adoption remain unchanged by refusal. |
+| 7. Failure and recovery | Lose a provider reply after applying the effect; restart the worker/owner. | An uncertain intent, a reconciliation, and the existing provider receipt. | Persistent reopen plus provider lookup resolves the operation; provider application count remains one in this fixture. |
+
+Scene 4 uses an explicit two-credit finite model. Admission acknowledges the
+operation identity; completion returns credit. A test barrier holds completion
+without sleeping. The receiver enforces per-session execution order and records
+a handoff watermark for prior accepted operations. New-owner work cannot pass
+that watermark until those operations settle.
+
+Scene 1 also calls =upload/watch!= after a write. Its handler creates a fresh
+inspect-only self-capability, recorded as a creation effect. The next behavior
+must preserve this new reader's inspection right even after finish. Close that
+reader independently. This demonstrates obligations growing during execution,
+as well as rights splitting at session creation. Bound outstanding watchers to
+eight; capacity refusal issues no new permission or retention obligation.
+
+Scene 5 publishes one serving slot and uses a supported retained session; it
+does not require migrating that session's state. Scene 6 attempts a session
+adoption that would violate an outstanding promise. Publishing G2 for unrelated
+new sessions can remain valid. Publication, adoption, and retirement each need
+their own verdict.
+
+The compatible case preserves the whole remaining language and supported reply
+shapes. Prototype 0 uses identity message adaptation and a simple explicit state
+relation. Rich upcasting is a later milestone. Its check must eventually cover
+the adapted trace and receiver state relation, not just each message in isolation.
+
+For Scene 7, the queue journal and provider fixture persist independently in
+temporary directories. Record and sync intent, apply and persist the provider
+effect, then stop the worker at a controlled barrier before recording success.
+Reopen stores through the supported lifecycle and recover with fresh native
+authority. Public descriptions and persisted data cannot revive opaque handles
+from a dead incarnation.
+
+The provider fixture uses the stable effect ID for idempotency and lookup. Its
+single-application assertion describes that fixture and tested history. Real
+provider behavior remains an explicit external assumption. Run startup and
+cross-process recovery controls before claiming machine-restart durability.
+
+Expected presentation, generated from a successful implementation:
+
+#+begin_example
+upload A   code G1   writer -> worker   chunks 2/2 accepted
+upload A   write refused               credit exhausted
+slot       G1 -> G2                    fresh uploads use G2
+retire G1  waiting                     upload A; inspector; accepted work
+adopt A    held                        remaining finish has no candidate handler
+provider   response lost               intent E17 remains uncertain
+recover A  lookup E17                  existing receipt found
+upload A   finished                    final reader closed
+retire G1  complete                    native retirement confirmed
+Ward       required checks complete   no unresolved protocol obligation
+#+end_example
+
+Present code identities as short labels with the exact receipt available on
+inspection. A human needs to understand the story before reading a digest.
+
+** Ward is the executable explanation
+
+An existing-API smoke example shows the shape of the runner. This example checks
+the test bench itself; the seven scenes require the research implementation.
+Run it explicitly through the livebook tooling or copy the forms into a small
+driver when checking the runner.
+
+#+begin_src beam-lisp :id ward-smoke
+(ns capability-book.smoke
+  (:require [reload.ward :as ward]))
+
+(def smoke
+  {:path "capability-smoke.bl"
+   :src "(ns capability.smoke)\n(deftest arithmetic (is (= 4 (+ 2 2))))\n"})
+
+(def smoke-result (ward/run [smoke]))
+(assert (:ok? smoke-result))
+(ward/report smoke-result)
+#+end_src
+
+The prototype gate runs a driver test against prepared candidate graphs.
+Assertions execute through the selected graph's supported entries. Ward's test
+source identity and the candidate code identity are both captured; reading the
+latest test source alone does not identify every dependency that executes.
+
+Use Ward's file events to display progress. Add a bounded protocol-report
+payload beside ordinary assertion totals, through one explicit adapter. Keep
+diagnostics in the existing diagnostic vocabulary and put structured traces and
+receipts in the enclosing report.
+
+Proposed report envelope:
+
+#+begin_src clojure
+{:candidate {:source-id "..." :artifact-id "..." :compiler-id "..."}
+ :scope :upload-prototype-v1
+ :tests {:status :passed :histories 24}
+ :protocol {:status :proved
+            :fragment :finite-upload-v1
+            :budget {:states 4096 :steps 100000}
+            :assumptions [:supported-sdk-ingress :provider-idempotency]}
+ :runtime {:status :witnessed :scenes [1 2 3 4 5 6 7]}
+ :cleanup {:status :complete}
+ :native-admission false}
+#+end_src
+
+This report is evidence. The already admitted runtime performs publication and
+adoption using its current identities and fences. A race after checking can make
+the final operation refuse; the report never overrides that refusal.
+
+Tests witness executions. The finite protocol algorithm proves its stated
+property for its supported model. Model/implementation conformance needs its own
+evidence. A selected proof requirement that returns unknown blocks this gate;
+ordinary Ward warnings retain their advisory meaning for other tests.
+
+** Prototype 0 is complete when these gates pass
+
+1. *Representation.* The descriptor is bounded, its action bindings resolve to
+   actual compiler-owned clauses, and altered/stale evidence refuses. An
+   unsupported guard, body, call, or capture leaves explicit unknown coverage.
+2. *Language operations.* Derivatives consume the correct action. Inclusion
+   rejects an invalid split with a trace. Exhaustive tiny-word fixtures agree
+   with the automata for sequence, choice, repetition, and shuffle. Exhaustion
+   reports unknown before producing a proof.
+3. *Client behavior.* The supported client checker rejects use after finish,
+   duplicate terminal rights, use after transfer, and unfinished scope exits
+   without declared cleanup. The valid branch and bounded-loop fixtures pass.
+   Unknown calls and rebinding invalidate the appropriate summary.
+4. *Receiver conformance.* For the complete tiny upload state space, compare
+   modeled acceptance and transitions with actual compiled callbacks and
+   supported admission. Check patterns, guards, replies, credits, and stage
+   updates. This is an executable finite comparison with an explicit domain.
+5. *Races.* Competing finish calls, repeated handoff acceptance, close versus
+   acceptance, owner death during prepare, and lost replies preserve the right
+   budget. No refused operation enters a business body. No accepted operation
+   is replayed merely because its caller timed out.
+6. *Lifecycle.* Scenes 5 and 6 verify actual code, serving, adoption, and
+   retirement identities. An outstanding inspector keeps its promised behavior;
+   a restart invalidates dead-incarnation handles. Data views cannot authorize
+   calls. The source bundle path's partial-effect semantics remain explicit.
+7. *Persistence.* Scene 7 reopens actual persistent storage and reconciles the
+   recorded intent. It asserts provider apply/lookup counts and receipt identity.
+   Store-open or durability prerequisites must succeed; unavailable storage is
+   an explicit unmet gate.
+8. *Isolation and cleanup.* Run the scenes twice in one warm VM and in reversed
+   order. Check owned workers, registrations, graph pins, sessions, queues, and
+   stores against an owner-scoped baseline after cleanup. Use the existing
+   contamination observer for the surfaces it covers. Fixture control events
+   must leave unrelated runner messages untouched.
+9. *Presentation.* One command produces all seven scenes, code snippets, the
+   lifecycle diagram, the refusal witness, and Ward's complete report. Expected
+   output and observed receipts are distinguishable. A second command runs the
+   focused negative and race controls without an interactive viewer.
+
+These gates make the first prototype a complete demonstration of the vision at
+small scale. Its bounded domain makes completeness reviewable. It is promoted
+only after each gate has an attached observed receipt.
+
+** Running the future prototype on this host
+
+Implement =research/actor-capabilities/demo.bl= and =gate_test.bl= as one-shot
+entry points. The proposed commands become available when those files exist:
+
+#+begin_src sh
+scripts/bl-mem
+systemd-run --user --collect --wait --working-directory="$PWD" \
+  --property=MemoryMax=8G --property=MemorySwapMax=2G \
+  ./bin/bl --cold run research/actor-capabilities/demo.bl
+#+end_src
+
+#+begin_src sh
+scripts/bl-mem
+systemd-run --user --collect --wait --working-directory="$PWD" \
+  --property=MemoryMax=8G --property=MemorySwapMax=2G \
+  ./bin/bl --cold test research/actor-capabilities/gate_test.bl
+#+end_src
+
+Each entry point uses one VM and closes everything it starts in cleanup. The
+process-tree cap contains any child VM needed for a recovery control. Warm
+repeatability runs happen inside that VM. A later warm checkout-transport gate
+uses a private runtime directory and explicitly stops its realm afterward.
+
+* From the first prototype to the complete system
+
+Each step expands one demonstrated boundary. Preserve exact candidate identities
+and publish bounded coverage, assumptions, unknowns, runtime requirements, and
+cleanup results at every step.
+
+| Step | Working result | Demonstration and exit gate |
+|------+----------------+-----------------------------|
+| P0: one whole agreement | The upload vertical slice above. | All seven scenes and nine gates, using actual owners and persisted recovery. |
+| P1: compiler-owned protocols | Protocol descriptors and supported client summaries become compiler/publication outputs; checks follow known library calls and supported captures. | Ordinary source, macros, AOT, and reload produce matching identities and equivalent protocol verdicts; stale/rebound/unknown controls refuse or retain obligations. |
+| P2: standard process patterns | Server calls, reply handles, callback transfer, scoped work, flow demand, bus subscriptions, and capacity expose the same agreement vocabulary. | One showcase per pattern, bounded model conformance, realistic loops/branches, ownership death, and interop ingress controls. |
+| P3: coherent live change | Reload plans over outstanding agreements, supported state/message/reply adaptations, and exact candidate artifacts. Ward records separate invariant, conversation, conformance, and runtime evidence. | New requests, retained work, adoption, drain, and retirement share the validated contract; stale plan and concurrent publication controls pass. |
+| P4: durable recovery | Queue attempts, provider effects, schedules, and reservations use explicit recovery transitions and fresh authority after restart. | Worker/owner death and fresh-process store reopen preserve effect identities, lease fencing, and supported recovery; cross-owner activation has a durable coordinator. |
+| P5: language-wide consolidation | Supported source, artifact, native, and JavaScript boundaries consume the same contract semantics; tooling exposes them as explanations. | Required backend controls, packaged consumers, performance limits, and the deletion inventory below all pass. |
+
+Quantitative credits in P0 range from zero to two. P2 adds runtime quantities
+with checked arithmetic and bounded reservations. Keep SMT translation success
+and dynamic enforcement explicit; a sequence language alone does not prove
+arbitrary resource inequalities.
+
+Publish timing, peak process-tree memory, protocol-state counts, and retained
+code/resource counts with each milestone. Measure preparation separately from
+invocation and retirement. P0 records the baseline; P1 and P2 set explicit
+regression budgets from it. Cache evidence through existing incremental identity
+and reverse-dependency machinery, invalidating only affected summaries. Keep
+solvers, graph searches, and publication analysis off the ordinary invocation
+path; runtime admission uses bounded checks against current native state.
+
+P3 adds richer message/reply adapters and state relations. Compatibility must
+preserve future promised conversations through those adapters. A guard that
+narrows an input domain, a changed reply shape, and a removed terminal operation
+are independently explainable reasons to hold a transition.
+
+P4 distinguishes a durable journal commit, synced local bytes, provider
+acknowledgment, and confirmed recovery. Distributed multi-owner publication
+needs a coordinator and recovery protocol; a set of slot swaps cannot supply
+that guarantee by itself.
+
+P5 qualifies JavaScript's scheduler, mailbox, restart, and authority semantics
+separately. Shared protocol data helps maintain consistency across backends;
+equivalent backend behavior still needs executable evidence.
+
+* Consolidation means deleting redundant responsibilities
+
+Maintain a migration inventory with a caller list, replacement owner, conformance
+fixture, artifact consumer, and deletion gate for each row. Different guarantees
+can keep different implementations; duplication means two places claiming the
+same responsibility or an obsolete route bypassing the selected owner.
+
+| Surface to inventory | Intended owner | Deletion or simplification gate |
+|----------------------+----------------+----------------------------------|
+| Protocol shapes repeated in client wrappers, callback admission, docs, and checker seeds | Compiler-owned descriptor from canonical clauses | All consumers use the descriptor; generated examples and actual callbacks agree. Remove repeated shape tables. |
+| Research automata/checker/boundary adapters | Promoted compiler/system/proc homes | Research driver imports promoted code, all P0 gates pass there, then implementation copies disappear. Keep examples and fixtures. |
+| Name-based action/effect guesses introduced by prototype work | Resolved binding identities and =system.footprint= | Exact source/AOT/macro binding controls pass; remove prototype lookup tables and textual resolvers. |
+| Hand-written callback transfer and cleanup scaffolding in supported patterns | Existing native ownership plus checked scope/transfer adapters | Death, timeout, lost reply, accepted-work drain, and exceptional cleanup controls pass at every migrated call site. Remove duplicate scaffolding where the scope owns it. |
+| Parallel reload activation/publication entry paths | One planning protocol, with actual serving-slot and owner-transition executors | Every supported caller routes through the selected planner; direct bypass controls refuse. Remove obsolete coordinators and flags once their distinct guarantees are covered. |
+| Message-label coverage used as an authoritative protocol verdict | Evidence-backed message and temporal descriptors | Known-shape/target coverage replaces the relevant verdict. Label queries can remain useful coarse observations with that scope. |
+| Ward-specific copies of coherence, invariant, or protocol rules | Shared checker APIs plus one Ward report adapter | Same candidate and budgets yield the same scoped verdict through CLI, Ward, reload, and editor. Remove duplicate rules, retain runner isolation and reporting. |
+| Ad hoc retry flags and status transitions around provider effects | Queue's effect-intent/reconciliation protocol | Stable effect identity, durable reopen, and provider uncertainty controls pass; remove redundant retry state. |
+| Parallel observers retaining callbacks or executable graphs | Existing bounded observation stream and data projections | UI and CLI consume the same inert events; retention baseline proves viewers do not keep executable authority alive. |
+| Temporary compatibility routes and feature switches | Selected production path | Source search, dependency inventory, packaged consumer controls, and runtime entry counters show no supported caller needs the route. Delete the route and switch. |
+
+The inventory is evidence-driven. For example, =reload.upgrade= checks an
+invariant, =proc.message-domain= checks a supported input-adaptation implication,
+and native execution checks custody. Those checks have complementary jobs.
+Compose their reports before deciding which wrapper or duplicated rule to remove.
+
+The final gate runs the relevant existing qualification fixtures as well as new
+ones, inventories all executable entry paths, and lists zero remaining supported
+callers of superseded routes. It also checks retained artifact consumers before
+removing compatibility code. After that gate, the ordinary entry path exercises
+the new implementation without an alternate production implementation selected
+by configuration.
+
+* What becomes simpler for the person writing code
+
+- A service handle comes with available operations and a useful explanation of
+  the next step. Domain functions remain ordinary functions.
+- Session scopes own predictable cleanup; uncertain accepted effects leave an
+  explicit recovery value or durable obligation.
+- A library can publish a small protocol summary. Its clients can be checked
+  without reconstructing an entire running system.
+- A reload report names the outstanding agreement that blocks adoption or
+  retirement and offers the supported preserve, adapt, or drain choices.
+- A Ward example shows code, an actual execution, its limits, and the same
+  witness used by the editor and live-change tools.
+- Removing repeated ownership scaffolding and contract tables makes the standard
+  library smaller while preserving the runtime checks that still matter.
+
+Keep the first demonstration small enough that a reader can follow every right
+from creation to discharge. The full system grows by applying that same account
+to more process patterns, executable forms, and recovery boundaries.
+
+* Reading and implementation anchors
+
+- Gordon: [[https://arxiv.org/html/2502.07958v2][full extended paper]],
+  [[https://arxiv.org/pdf/2502.07958][PDF]], and
+  [[https://dl.acm.org/doi/10.1145/3830434.3839001][2026 keynote DOI]].
+- [[file:the-process-pattern-language.md][The process pattern language]] explains the
+  process vocabulary; its shipped/proposed markers distinguish the two.
+- [[file:patterns/25-messages-are-patterns.md][Messages are patterns]] describes the
+  shape and temporal direction. Its sketch supplies design context.
+- [[file:../research/phase-compiler/ownership-analysis.bl.org][Finite ownership analysis]]
+  explains the existing ownership report, supported fragment, and runtime obligations.
+- [[file:../research/execution-protocol-audit/actor-frames.bl.org][Actor frames]] and
+  [[file:../research/execution-protocol-audit/graph-retention.bl.org][graph retention]]
+  explain the native lifetime boundary and retained execution.
+- Existing focused controls:
+  [[file:../test/bl/proc/contract_test.bl][callback contracts]],
+  [[file:../test/bl/proc/message_domain_test.bl][message domains]],
+  [[file:../test/bl/system/ownership_test.bl][ownership]],
+  [[file:../test/bl/native_execution_handoff_test.bl][native handoff]], and
+  [[file:../examples/reload/10-ward-warm-runner.bl][Ward's warm-runner demonstration]].

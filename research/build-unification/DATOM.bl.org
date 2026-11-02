@@ -1,0 +1,274 @@
+#+title: Datom keys that agree — and an upgrade that keeps your data
+#+subtitle: The equality defect, the proposed format change, and the smallest complete path from an existing store to a verified replacement.
+#+kicker: Beam Lisp · Datom migration review · 2 November 2026
+#+status: Design review · format change retained on a research branch · no business store migrated
+#+author: Codex for Othman
+
+* The change in one breath
+#+begin_lede
+*Equal values should find the same fact.* The research branch corrects index
+keys for equal list/vector values and some large numbers. That is a useful
+correctness fix. Existing databases, however, contain keys written by the old
+encoder. They need conversion before the corrected encoder can find everything.
+
+The lean first delivery is an offline *prepare* tool: capture an immutable
+source, build a separate destination, and independently verify a ready artifact.
+Application activation follows through an explicit writer handoff. The original
+database and executable stay available throughout.
+#+end_lede
+
+#+begin_stats
+2 | different identities to preserve | logical equality for keys; exact representation for stored payloads
+1 | destination per prepared generation | separate from the source and its immutable backup
+0 | automatic business upgrades performed | this document and its models touch no real application store
+2 | distinct collision gates | physical key collisions and semantic uniqueness conflicts
+#+end_stats
+
+#+begin_honest :title "What exists today"
+Main has Datom's existing codec, checkpoints, ownership and schema-migration
+primitives. Commit ec819ce824 on the retained research branch proposes key
+format 2 and refuses legacy stores. The branch's later research specifies the
+upgrade and supplies synthetic controls. A complete reindex CLI, durable
+migration journal and application activation handshake do not yet exist.
+#+end_honest
+
+#+begin_terms
+Key | Ordered bytes used to locate a fact in EAVT, AEVT, AVET or VAET.
+Payload | The stored fact: entity, attribute, value, transaction and assertion/retraction flag, including the value's actual representation.
+Snapshot | A consistent, immutable source generation with its old codec, metadata and required blobs identified.
+Ready artifact | A complete separate destination plus independent verification and durable receipts; a format header alone is insufficient.
+Activation | Selecting one ready application generation and admitting its writer after the old writer is fenced.
+Rollback | Returning before new writes, or preserving all acknowledged new writes through a separately qualified repair path.
+#+end_terms
+
+* Why a correct encoder needs an upgrade
+#+begin_rosetta
+Value | Logical question | Storage question
+List (1) and vector [1] | Do they compare equal? | Does an index probe encode to the same bytes?
+Equal large integer and float | Does numeric equality hold? | Does the prefix/tie-break encoder preserve equality and neighboring order?
+Nested sequences | Do equal nested values compare equal recursively? | Does canonicalization apply inside maps, sets and tuples too?
+Original list versus vector payload | Can they address the same logical value? | Can both original representations survive without one overwriting the other?
+#+end_rosetta
+
+The correction belongs in key encoding and transaction equality keys. It does
+not authorize rewriting stored lists into vectors or dropping an old history
+row. The new runtime must recognize incompatible source format before ordinary
+connection initialization can install schema, counters or indexes.
+
+This cell reads the current selected runtime's codec. It reports the observation
+without pretending to execute the proposed format-2 implementation.
+
+#+begin_src beam-lisp :id current-encoder
+(ns datom-upgrade.review (:require [datom.codec :as codec]))
+(def list-value (list 1))
+(def vector-value [1])
+{:logical-equality (= list-value vector-value)
+ :same-current-index-key (= (codec/encode-value list-value) (codec/encode-value vector-value))
+ :same-native-representation (= (erlang/term_to_binary list-value) (erlang/term_to_binary vector-value))}
+#+end_src
+#+RESULTS: current-encoder
+: {:logical-equality true, :same-current-index-key false, :same-native-representation false}
+
+
+Sources: main's =priv/lib/datom/codec.bl= and =priv/lib/datom/value-codec.bl=;
+the candidate =ec819ce824= and its =test/bl/datom/sequential_key_test.bl=.
+
+* Two collisions, two different decisions
+#+begin_rosetta
+Collision | Synthetic example | Required result
+Physical key | One entity has list (1) and vector [1] at the same attribute, transaction and operation; both canonicalize to the same new full key | Refuse before publication: a simple put loop would overwrite a distinct payload.
+Semantic uniqueness | Two entities claim logically equal values of a unique attribute | Refuse unless the declared history policy establishes a legal retract-and-transfer; entity IDs make their physical keys different.
+Historical overlap | Conflicting claims overlap at transaction 2, but one is retracted at transaction 3 | A clean final state does not erase the earlier conflict.
+#+end_rosetta
+
+Do not silently deduplicate distinct payloads or merge business entities.
+An archival sidecar preserves bytes, but by itself does not preserve ordinary
+Datom history/query behavior. Ambiguous stores need a reviewed resolution policy
+or a representation capable of retaining those rows.
+
+#+begin_screen :id collision-screen :title "A blocked upgrade" :caption "Illustrative synthetic conflict; no real store has been scanned."
+bar Datom upgrade | @more
+banner warn | Source preserved · application generation unchanged
+section Needs review | synthetic example
+card fail | Two payloads would occupy one key | entity 101 · :contact/key · tx 7 | The list (1) and vector [1] must both be preserved. The converter has stopped before publication.
+row Destination | Private, incomplete
+row Active database | Original generation
+actions Inspect conflict! | Keep original
+note A successful exit is never allowed to hide a discarded history row.
+#+end_screen
+
+The following model covers bounded sequential fixtures only. It demonstrates
+the distinction between logical keys and exact payloads; it is not a legacy
+reader, numeric encoder or migration implementation.
+
+#+begin_src beam-lisp :id collision-model
+(defn fixture-key [row] (codec/encode-value [(:e row) (:a row) (vec (:v row)) (:tx row) (:added row)]))
+(defn physical-conflicts [rows]
+ (filter #(> (count (set (map (fn [row] (erlang/term_to_binary row)) %))) 1) (vals (group-by fixture-key rows))))
+(def list-row {:e 101 :a :contact/key :v (list 1) :tx 7 :added true})
+(def vector-row (assoc list-row :v [1]))
+(assert (= (fixture-key list-row) (fixture-key vector-row)))
+(assert (not= (erlang/term_to_binary list-row) (erlang/term_to_binary vector-row)))
+(assert (= 1 (count (physical-conflicts [list-row vector-row]))))
+(def other-entity (assoc vector-row :e 102))
+(assert (= 0 (count (physical-conflicts [list-row other-entity]))))
+(defn fixture-live-at [rows basis]
+ (filter :added
+  (vals (reduce (fn [out row]
+    (if (> (:tx row) basis) out
+     (let [key (codec/encode-value [(:e row) (:a row) (vec (:v row))]) old (get out key)]
+      (if (or (nil? old) (> (:tx row) (:tx old))
+              (and (= (:tx row) (:tx old)) (not (:added row))))
+       (assoc out key row) out)))) {} rows))))
+(defn uniqueness-conflicts [rows basis]
+ (filter #(> (count (set (map :e %))) 1)
+  (vals (group-by #(codec/encode-value [(:a %) (vec (:v %))]) (fixture-live-at rows basis)))))
+(def claims [list-row (assoc other-entity :tx 8) (assoc other-entity :tx 9 :added false)])
+(assert (= 1 (count (uniqueness-conflicts claims 8))))
+(assert (= 0 (count (uniqueness-conflicts claims 9))))
+(assert (= 0 (count (uniqueness-conflicts
+ [list-row (assoc list-row :tx 8 :added false) (assoc other-entity :tx 9)] 9))))
+{:physical-collision-detected true :different-entity-keys-distinct true
+ :historical-overlap-detected true :legal-transfer-accepted true}
+#+end_src
+#+RESULTS: collision-model
+: {:physical-collision-detected true, :different-entity-keys-distinct true, :historical-overlap-detected true, :legal-transfer-accepted true}
+
+
+* The offline path
+#+begin_procedure :id offline-procedure :title "Prepare a replacement, then hand off its writer" :makes "One verified generation and an acknowledged active owner"
+step @lock Fence every writer | Application owner | Drained requests, jobs, schedules, direct writes and blob collection · required
+step @seal Capture an immutable source | Maintenance owner | Consistent stores, metadata and blob inventory with original code identity · required
+check @search Inventory the source | Converter | Supported codec, every KV namespace accounted for, corruption refused · required
+step @file Build a separate destination | Converter | Bounded pages, original history and counters, both collision gates · required
+check @check Independently verify | Verifier | Exact payload conservation, full index fan-out, metadata and blob checks · required
+step @seal Publish a ready artifact | Converter | Closed and synced target plus content-bound receipt · required
+gate @version Select the new generation | Application adapter | Expected predecessor and epoch match; old writer remains fenced · required
+check @user Acknowledge the new owner | New application owner | Exact receipt, exclusive ownership, read-only health checks · required
+step @play Admit new writes | Application owner | One writer generation, retained predecessor and explicit rollback policy · required
+#+end_procedure
+
+A Fjall open may recover or modify engine files. Extraction therefore opens a
+disposable copy of the sealed snapshot unless a genuine read-only adapter is
+qualified. The immutable original is hashed before and after. Never rename an
+open database directory or use ordinary application startup to discover schema.
+
+#+begin_sequence :title "The boundary between ready and serving"
+lanes Old owner · application | Upgrade · bounded worker | New owner · application
+Old owner -> Old owner : Stop ingress and drain accepted writes
+Old owner -> Upgrade : Sealed source and exact predecessor identity
+Upgrade -> Upgrade : Build separate destination, validate, sync and publish READY
+Upgrade --> Old owner : READY receipt; application selection unchanged
+Old owner -> New owner : Fenced generation selection with expected epoch
+New owner -> New owner : Open exact generation and run read-only health checks
+New owner --> Old owner : Durable owner acknowledgement
+New owner => New owner : Admit writes under the new epoch
+#+end_sequence
+
+* What must survive
+#+begin_rosetta
+Data | Conservation requirement
+History | Every surviving entity/attribute/value/transaction/operation payload, including retractions and exact representation.
+Indexes | Independently regenerated covering indexes with the declared schema/coverage rules; no copied old keys.
+Counters | Exact entity and transaction high-water marks, including allocation gaps.
+Schema | Schema entity IDs and history; no initializers or invented transaction timestamps.
+Operational state | Queue, command, outbox, dedupe, uncertain outcome and migration ledger identities; every unknown KV needs a handler or refusal.
+Blobs | Required historical and operational references plus verified bytes and retention during the entire operation.
+Derived indexes | Recognized caches invalidated or rebuilt under the new semantics; old readiness certificates cannot be copied as proof.
+Executable and control state | Original runtime and explicit database/blob/control-store generation identities retained together.
+#+end_rosetta
+
+Normal =transact!= and =load-facts!= assign new transaction metadata. They are
+not lossless historical import APIs. Existing =datom.migrate= handles schema/data
+evolution inside an admitted store; it does not convert an incompatible keyspace.
+
+* Recovery and rollback
+#+begin_rosetta
+Failure point | Safe recovery
+Before READY | Keep the original selected; resume only against the exact snapshot, converter identity, destination and committed page receipt.
+After target publication, before selection | Reconcile the existing ready artifact; a caller timeout does not authorize deleting or rebuilding it under the same identity.
+After pointer change, before owner acknowledgement | Keep writers fenced; recover the durable selection and establish the exact owner before serving.
+Before any new write | A qualified fenced switch can return to the retained original generation.
+After acknowledged new writes | A pointer rollback would discard accepted work; require a separately qualified reverse replay or forward repair.
+#+end_rosetta
+
+Each page's data and progress cursor commit together and sync before reporting
+durability. A small external journal tracks phases and expected identities.
+Activation selects the database, blobs, executable and control-store bindings
+together. Separate directory renames do not make a multi-store atomic switch.
+
+This pure model checks the writer handoff only; it performs no filesystem or
+database operations and establishes no power-loss guarantee.
+
+#+begin_src beam-lisp :id writer-handoff-model
+(defn fixture-select [state ready]
+ (when (and (:fenced state) (nil? (:writer state)) (:verified ready)
+            (= (:active state) (:predecessor ready)) (= (:epoch state) (:expected-epoch ready)))
+  (assoc state :active (:generation ready) :epoch (inc (:epoch state)) :phase :awaiting-owner-ack)))
+(defn fixture-ack [state generation epoch]
+ (when (and (= :awaiting-owner-ack (:phase state)) (= generation (:active state)) (= epoch (:epoch state)))
+  (assoc state :writer generation :phase :serving)))
+(def paused {:active "old" :epoch 4 :writer nil :fenced true})
+(def ready {:generation "new" :predecessor "old" :expected-epoch 4 :verified true})
+(assert (nil? (fixture-select (assoc paused :writer "old") ready)))
+(assert (nil? (fixture-select paused (assoc ready :verified false))))
+(assert (nil? (fixture-select paused (assoc ready :expected-epoch 3))))
+(def selected (fixture-select paused ready))
+(assert (nil? (:writer selected)))
+(assert (nil? (fixture-ack selected "old" 4)))
+(assert (= "new" (:writer (fixture-ack selected "new" 5))))
+{:old-writer-fenced true :unverified-target-refused true :stale-epoch-refused true
+ :selection-alone-admits-no-writer true :matching-owner-ack-required true}
+#+end_src
+#+RESULTS: writer-handoff-model
+: {:old-writer-fenced true, :unverified-target-refused true, :stale-epoch-refused true, :selection-alone-admits-no-writer true, :matching-owner-ack-required true}
+
+
+* Concurrency we can reuse
+#+begin_rosetta
+Responsibility | Existing pattern | Boundary
+Private page checks and hashing | Bounded task/flow demand | No more work admitted than memory/disk budgets allow; private work can stop before accepted publication.
+Conversion progress | Existing bounded page/checkpoint patterns | Needs a new durable content-bound migration cursor; process-local cursors are insufficient.
+Accepted publication and activation | One owner, exact identity and expected-epoch checks | A timeout stops waiting; it does not prove the effect did not happen.
+Optional derived rebuilds | Existing rank/coverage/dirty-set rebuilding | Useful after compatible conversion; not a substitute for converting the authoritative keyspace.
+#+end_rosetta
+
+Online conversion needs a durable ordered mutation journal captured atomically
+with the snapshot offset, including deletes/excision, raw metadata, counters and
+blobs. Existing transaction broadcasts and transaction counters do not supply
+that journal. The first delivery should use a maintenance window.
+
+* The implementation cuts
+#+begin_roadmap :id migration-roadmap :title "Small deliveries with explicit completion criteria"
+now | Document and reproduce the key mismatch | Keep the format change isolated; current codec observation and synthetic collision model | ec819ce824 and this dossier
+next | Prepare supported snapshots offline | Bounded legacy reader, inventory, collision checks, separate target, independent verifier and durable READY receipt | Proposed first implementation
+later | Activate a supported application | Explicit storage manifest, writer fence, pointer/epoch recovery, owner acknowledgement and verified pre-write rollback | Requires an application adapter
+later | Convert while the application writes | Atomic durable mutation journal, gap detection, ordered replay and final fenced verification | Separate project
+#+end_roadmap
+
+Before production qualification, exercise corruption, unknown metadata, stale
+epochs, source/destination overlap, disk exhaustion, lost replies, restart/resume,
+collisions across page boundaries, missing blobs and crashes around each durable
+publication step. Preserve both source and target failures. SIGKILL tests alone
+do not simulate every storage power-loss failure.
+
+Evidence: the retained research branch's
+=research/current-datom-reindex/STATUS.org= and =findings.json=;
+=test/bl/datom/reindex_research_test.bl= (synthetic fixed-SDK evidence only);
+main's =priv/lib/datom/{store,store-fjall,value-codec,migrate,broadcast}.bl=,
+=priv/lib/datom/blob-retention.bl= and =native/datom_fjall/src/checkpoint.rs=.
+No existing application store was opened to write this review.
+
+* Your decisions
+#+begin_decision :id offline-first :title "Deliver a prepare-only offline tool first" :status proposed
+- [x] Produce a fully verified separate READY artifact; keep application selection explicit.
+- [ ] Ship key format 2 and let ordinary startup deal with old stores.
+- [ ] Start with online dual writes.
+This bounds the first implementation and gives us something concrete to inspect
+without coupling conversion to an unimplemented application handoff.
+#+end_decision
+
+#+begin_ask :id migration-priority :title "Which delivery should follow the scene integration?" :options "Offline prepare prototype|Application handoff design|Keep Datom as research"
+The build restructuring is owned by the other session. This review describes
+the Datom work separately, so you can choose its next concrete deliverable.
+#+end_ask

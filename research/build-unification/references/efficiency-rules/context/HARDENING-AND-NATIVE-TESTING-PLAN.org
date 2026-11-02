@@ -1,0 +1,352 @@
+#+TITLE: Hardening, single paths and native Beam Lisp testing
+#+DATE: 2026-10-16
+#+STATUS: Proposed; not started. Baseline source 42d001e, runtime 9d2de673
+#+TODO: TODO WORKING VERIFY | DONE DEFERRED
+
+* Why
+The focused booking delivery (F1–F6) is accepted locally. This plan addresses
+what the review of that implementation found, in three areas:
+
+1. Small correctness defects at the PMS and communication boundaries.
+2. Duplicate implementations of the same behaviour: two senders, two money
+   parsers, two ways to decide live versus synthetic, two guest apps and two
+   booking roles. Each pair is a place where a fix lands in one copy only.
+3. A test setup that works around the language instead of using it. Every
+   check is a cold ~150 MB VM run one at a time behind a global lock, inside
+   a Python/bubblewrap sandbox. Tests use 217 hand-written =check= helpers
+   instead of =deftest=. =veritas.model= serves fakes in 58 places but checks
+   state machines in only 3, each with 6–20 histories.
+
+Goal: one path for each behaviour, an offline guarantee inside the
+application itself, and a test suite that runs in one VM, in parallel, and
+uses =veritas.model= to generate the failure orderings currently scripted by
+hand.
+
+* Changes to the current working rules
+These items deliberately override rules in [[file:FOCUSED-BOOKING-COMPLETION.org][the focused plan]] and need the
+user's sign-off, which was given in conversation on 2026-10-16:
+- "All behavioral tests run in Veritas": that rule refers to the bubblewrap
+  sandbox. Under this plan, ordinary tests run in the VM with the
+  in-application offline guard (Phase 2). The sandbox remains only for
+  browser and real-process-death checks.
+- "Do not build a new testing framework": no framework is built. The plan
+  adopts the stdlib's =deftest=, =bl test --async=, =veritas.model= and
+  =veritas.ledger=, and deletes repo-local test machinery.
+- "No runtime pin promotion": stays in force. Phase 0 checks the pinned
+  runtime. If a required feature is missing, a pin change is a separate,
+  explicit decision.
+
+* Phase 0 — check the runtime (gate, about 15 min)
+Run one 10-line test file with the pinned runtime. It confirms each of the
+following:
+- =deftest= / =is=;
+- =bl test --async= (added upstream in 7f49e9f0, 2026-08-28);
+- =veritas.model/check= with =::vm/sys= replacement;
+- =veritas.ledger/record!= (added upstream in 33bd2351, 2026-09-28).
+
+Outcome:
+- All pass: continue.
+- =--async= or the ledger is missing: Phases 3 and 5 run serially and without
+  the ledger until the pin is changed. Phases 1, 2 and 4 are unaffected.
+
+* Phase 1 — quick defect fixes (one sitting, one commit each)
+Each finding below was verified against 42d001e.
+
+| # | Fix | Where | Check |
+|---+-----+-------+-------|
+| 1.1 | =settle!= catches everything and returns the op. Record the exception on the operation; do not report the result as success | src/reception/pms_execution.bl:84-86 | PMS model check (Phase 4) |
+| 1.2 | =(catch _ {:outcome :uncertain})= keeps the outcome but discards the cause. Store the cause on the operation | packages/pms/src/pms/operations.bl:76, :125 | existing pms_late_results.bl |
+| 1.3 | Recovery from =:submitting= runs only at startup. Also run =operations/recover!= in the periodic repair | src/reception/pms_execution.bl repair path, src/reception/pms.bl:272 | Phase 4 =:nothing-stuck= |
+| 1.4 | Money goes through =Float/parse= and =round=. Use one integer-cents parser and refuse amounts that are not exact cents (see 1.D2) | src/booking/claims.bl:23-24, src/hotel/providers/pluriel.bl:52-53, packages/pms/src/pms/pluriel.bl:13,51 | new deftest: 0.1+0.2 style and 3-decimal cases |
+| 1.5 | The tool error envelope includes the stack trace. Return only the code and message; log the trace | src/booking/runtime.bl:318 | deftest on the error shape |
+| 1.6 | =contact-ingress-repair= maps every exception to =:refused=. Return =:refused= only for =:contact-repair-*= codes and re-throw the rest | src/reception/contact_ingress_repair.bl:241 | deftest |
+| 1.7 | Inbound bridge errors retry every cycle forever. Add an attempt count, a quarantine state, and show quarantined events in the pending view | src/reception/communication.bl:386-436 | Phase 4 communication model |
+| 1.8 | The fixture path is relative to the working directory. Resolve it from the application root | src/hotel/providers/pluriel.bl:106 | run from a different cwd |
+| 1.9 | Cancel sends no reservation version. Send it if Pluriel accepts it; otherwise re-read and compare immediately before cancelling, and document the remaining race | packages/pms/src/pms/pluriel.bl:65-67 | Phase 4 amend/cancel interleaving |
+
+Item 1.9 depends on Pluriel's API. Check it before writing code.
+
+* Phase 1.D — remove duplicate paths
+Order: lowest risk first. Each item ends with one implementation and deletes
+the other, together with the tests that existed only for the deleted path.
+
+** D1 Legacy WhatsApp sender (low risk)
+=reception.channel/deliver-whatsapp!=, its =transport= server and
+=hotel.providers.whatsapp/send-text= form a second sender. That sender has no
+policy checks, treats any mode other than the exact string ="sandbox"= as
+live, and records every failure as =uncertain=. Only tests/reception/workers.bl
+starts it. The canonical path is =communication.dispatch= + =meta.whatsapp=.
+- Delete the sender functions, the =transport= server and =send-text=.
+- Keep only the pieces of =reception.channel= that the application imports.
+  Five src namespaces require it; check each one's use before deleting.
+- Point workers.bl at the dispatch worker.
+
+** D2 One money representation (low risk)
+- Add =hotel.money/parse-cents=, built on the existing integer parser at
+  src/reception/web.bl:76 (or on =decimal=).
+- Use it in all four sites from item 1.4 and delete the float paths.
+
+** D3 One way to decide live versus synthetic (medium risk; this is Phase 2)
+Today three mechanisms decide it:
+- the process-wide =RECEPTION_MODE=;
+- the per-route =:sandbox?= flag;
+- the presence of =OPENROUTER_API_KEY= or a =.env= file.
+
+Phase 2 replaces them with one decision.
+
+** D4 One guest application (needs a decision, see Decisions)
+The guest is currently served by two applications:
+- the legacy Python guest app: web/server.py + stdio MCP + =booking.mcp=,
+  launched by web/start.sh on port 8813 and run by the user service
+  =knowledger-booking-guest.service=;
+- the native Live guest session in =reception.web=. This is the one F2–F5
+  accepted.
+
+If the legacy app is retired:
+- delete web/start.sh, web/server.py and its Python helpers (=client=,
+  =model_boundary=, =reception_prompt=, =provider_tools=);
+- delete serve.bl, the guest_*.py and exploration_live.py drivers, and the
+  cassettes that exercise only that path;
+- keep historical evidence files; do not regenerate them;
+- disable the service only after the user confirms.
+
+** D5 One booking role (medium risk; after D4)
+=booking.runtime= keeps a legacy =receptionist= role next to
+=receptionist-native=, plus =booking.compatibility= with its version and
+pinning checks for old stores. After D4, the compatibility role has no live
+caller. Steps:
+- remove the role branches in booking.runtime (lines 168, 253-260);
+- delete =booking.compatibility=;
+- remove its uses in six src files: domain.bl, channel.bl, goal_work.bl and
+  the continuity and offers procedures.
+
+Stores created under the old role must refuse to open with a clear error,
+not silently migrate.
+
+** D6 One launcher (low risk)
+Five launchers exist today:
+| Launcher | What it starts | Port |
+|----------+----------------+------|
+| web/start.sh | Python guest app | 8813 |
+| prototype/start.sh | =reception.live.web= | 8815 |
+| reception/start.sh | =reception.web= | 8814 |
+| scripts/conversation-lab.sh | conversation lab | 8816 |
+| scripts/live-pilot.sh | pilot entry | 8824 |
+
+Target:
+- =reception/start.sh= becomes the only application entry. It prints the
+  mode, runtime build, source revision and URLs at startup.
+- The conversation lab remains a developer tool.
+- The pilot becomes =RECEPTION_MODE=live reception/start.sh= plus its store
+  and credential settings. It must fail to start without
+  =RECEPTION_AUTH_SECRET= (fixes the unauthenticated pilot).
+- Delete the prototype launcher if =reception.web= does not import
+  =reception.live.web= (check this first).
+
+** D7 One sandbox mechanism (Phase 3)
+After Phase 2, bubblewrap and the global lock are kept only for the browser
+and real-process-death drivers.
+
+* Phase 2 — the offline guarantee inside the application (half a day)
+New namespace =hotel.mode=, read once at startup:
+- =:synthetic= is the default. =:live= requires =RECEPTION_MODE=live=, plus
+  =RECEPTION_AUTH_SECRET= and =RECEPTION_PROPERTY=; startup refuses otherwise.
+- Expose =(mode)=, =(live?)= and =(outbound-allowed? url)=.
+
+Enforcement points. All outbound traffic already passes through these:
+- =hotel.integrations.http/request!=
+- =meta.graph/request!=
+- the model endpoint construction in reception/agent.bl:199,
+  goal_execution.bl:86, knowledge.bl:42 and insight_execution.bl:84
+
+Rules in =:synthetic= mode:
+- Only loopback URLs are allowed. Anything else throws =:synthetic-egress=
+  before any network I/O.
+- Do not read =.env= (packages/meta/src/meta/config.bl:12).
+- Do not read =OPENROUTER_API_KEY=; use the controlled model service.
+- =meta.connect/configured-token!= refuses to run.
+- Remove the default real Graph base URL (meta/config.bl:15); a URL must be
+  configured explicitly.
+- Refuse any listener other than loopback: =RECEPTION_TAILNET_IP= requires
+  =:live=. This fixes the open Tailscale preview.
+- The non-live =staff:amina= default actor remains only on loopback.
+
+Rules in =:live= mode:
+- Refuse modelled or sandbox connections. This is the existing check in
+  =hotel.integrations.core/save!=, moved here.
+
+Also derive the media cache root (communication.bl:449) from the route's
+sandbox flag, not the environment.
+
+Verify:
+- a deftest asserts a non-loopback request throws in synthetic mode before
+  any I/O;
+- a deftest asserts the live-mode startup refusals;
+- grep confirms no remaining direct =System/get_env "OPENROUTER_API_KEY"= or
+  =RECEPTION_MODE= reads outside =hotel.mode=.
+
+* Phase 3 — move tests onto the stdlib (1–2 days, mostly mechanical)
+** 3.1 Convert to deftest
+Current state:
+- 74 files use the identical one-line helper
+  =(defn check [label value] (when-not value (throw …)) (println "PASS" label))=;
+- 9 use the =yes= variant;
+- 24 use a multi-line variant;
+- 4 append to a local check list.
+
+Conversion:
+- Script the rewrite: wrap each file's top-level =try= body in a =deftest=
+  named after the file, and turn =(check "label" x)= into =(is x "label")=.
+- Convert the 33 non-standard variants by hand. Keep any recorded check list
+  only where a receipt depends on it.
+- Rename files to =*_test.bl= so =bl test= finds them.
+
+Expected result: each failure is reported with its label, and the run
+continues past the first one.
+
+** 3.2 Run in one VM, in parallel
+- Run =bl test --async tests/communication tests/reception tests/live-procedures=
+  under one =systemd-run= memory cap (from the beam-lisp AGENTS.md rules).
+- The documented limit applies: suites using named singleton processes that
+  apply Beam Lisp functions in their own process stay serial. Mark those files
+  explicitly.
+- Most files use =s/open!= with no path, which gives an in-memory connection
+  per call, so they qualify.
+- Replace =scripts/communication-checks.sh= and the ordinary use of
+  =scripts/veritas-checks.sh= with one =scripts/test.sh=.
+
+** 3.3 Keep only the drivers that need real processes
+Keep, under the existing sandbox:
+- the 13 =*_process_adoption.py= and =*_crash.py= drivers, which prove state
+  survives real VM death and reopen;
+- the browser rehearsal =focused_booking_platform.bl=.
+
+Collapse the process drivers to three representative ones (PMS write, send,
+agent goal) only if Phase 4 covers the rest of their logic in-VM. Drop the
+source-hash manifest in veritas-sandbox.py; with the ledger, the git
+revision is the identity.
+
+Verify:
+- before conversion, record each suite's pass/fail per label from the old
+  runner;
+- after conversion, the same labels must give the same outcomes;
+- report the wall-clock difference measured on this host; make no estimate.
+
+* Phase 4 — state-machine checks with =veritas.model= (1–2 days)
+The fakes are already models. Drive the real code with generated command
+histories instead of hand-scripted sequences.
+
+** 4.1 PMS effects model (highest value)
+- System under test: =pms.operations= + =pms.pluriel= against
+  =(vm/serve (pms.fake/model {}))=, with a file-backed store so restarts are
+  real reopens.
+- Commands: =:enqueue= (create, amend, cancel), =:execute=, =:fault=
+  (none, accept-then-error, lost-response, read-unavailable, change-price,
+  read-profile-mismatch), =:restart= (reopen the store and run =recover!=),
+  =:amend-elsewhere= (provider-side change, using the fake's existing control
+  commands) and =:drain= (repair and readback) as =:settle=.
+
+Invariants, checked after every step:
+- the number of provider creates equals the number of distinct create keys;
+- every =:confirmed= operation has a receipt that matches readback;
+- no operation reports =:confirmed= while its provider state differs;
+- a confirmation is never announced from an =:uncertain= state.
+
+Checked after the settle step:
+- no operation is still =:submitting=;
+- every =:uncertain= operation carries a recorded cause (item 1.2).
+
+Run with ={:histories 300 :max-len 20}=, with fixed seeds in CI and a random
+seed nightly. Expected to catch items 1.3 and 1.9 before their fixes. Run it
+before the Phase 1 fixes to confirm it detects them, then after.
+
+** 4.2 Communication send-admission model
+- System: =communication.store= + =dispatch= + =policy= against
+  =(vm/serve (meta.fake/model …))=.
+- Commands: inbound (with duplicate ids), send, window expiry (clock tick),
+  STOP, START, staff takeover and release, route change, content edit,
+  restart, settle.
+
+Invariants:
+- no send is admitted after STOP, outside the window without an approved
+  template, or under staff control by the agent;
+- one provider message per send intent;
+- duplicate inbound is processed once;
+- every quarantined event is visible (item 1.7).
+
+** 4.3 Approval authority model
+Commands interleave the agent proposing terms, the guest approving, a terms
+change and staff override. Invariant: no PMS write is enqueued without a guest
+approval of the exact current terms fingerprint. The agent cannot produce one.
+
+** 4.4 Retire the scripted tests these models cover
+Mark each scripted test that a model covers. Delete it after the model has run
+green for a week of nightly seeds. Keep the few that pin a specific historical
+regression.
+
+Each model file stays under about 150 lines. Shrunk failures replay with
+=vm/replay= from the recorded seed and history.
+
+* Phase 5 — results as data, with =veritas.ledger= (half a day)
+- Each =vm/check= and each deftest suite records a verdict with =vl/record!=:
+  claim, =:about= (the namespaces covered), seed, shrunk witness and replay
+  command. The ledger lives at =.local/veritas.fjall= and is not committed.
+- Generate the acceptance summary with =vl/report=, replacing new hand-written
+  receipt JSON under evidence/.
+- Keep existing evidence files as history. Stop producing new
+  boundary.json / receipt JSON for ordinary checks.
+- Limit: automatic stale-verdict detection depends on code hashes the stdlib
+  does not record yet. Until then, re-run on change.
+
+* Phase 6 — documentation (1 hour)
+- README: one Run section with the single launcher, modes, URLs and runtime
+  9d2de673. Remove the e6993c5b and 0430b42a instructions or label them
+  historical.
+- Remove sections describing deleted paths (legacy guest app, compatibility
+  MCP protocol, cassette tooling) or move them to a short Historical note
+  that links the checkpoint commits.
+- Add an override note to FOCUSED-BOOKING-COMPLETION.org pointing here.
+
+* Order and estimates
+| Step | Depends on | Estimate |
+|------+------------+----------|
+| Phase 0 runtime check | none | 15 min |
+| Phase 4.1 PMS model, run against current code | 0 | 0.5 day |
+| Phase 1 fixes 1.1–1.8 | none | 0.5 day |
+| D1, D2, D6 | none | 0.5 day |
+| Phase 2 mode and egress guard (D3) | none | 0.5 day |
+| Phase 3 deftest conversion and async runner | 0 | 1–2 days |
+| Phase 4.2, 4.3 | 2, 3 | 1 day |
+| D4, D5 (after the decision) | 2, 3 | 1 day |
+| Phase 5 ledger | 0, 3, 4 | 0.5 day |
+| Phase 6 docs | all | 1 hour |
+
+The PMS model comes first on purpose. It shows whether the suspected defects
+are real before any code changes, and it confirms the fixes after.
+
+* Decisions needed
+1. D4: retire the legacy Python guest app on 8813 and its user service? This
+   plan recommends yes; the native Live guest session is the accepted path.
+2. D5: refuse to open stores created under the old role, or keep a read-only
+   migration? This plan recommends refusing; all stores are synthetic.
+3. Phase 0 outcome: if =--async= or the ledger is missing in 9d2de673, change
+   the runtime pin, or run serially without the ledger for now?
+4. Item 1.9: does Pluriel's cancel endpoint accept a version?
+
+* Risks
+- Converting tests could hide a behaviour change. Mitigation: compare
+  per-label outcomes before and after (3.3) and change no assertions in the
+  conversion commit.
+- Some suites depend on named singletons that cannot run async. Mitigation:
+  mark them serial explicitly; parallelism is an optimization, not a
+  requirement.
+- Deleting duplicate paths removes tests that pinned historical behaviour.
+  Mitigation: delete only after the surviving path's model or deftest covers
+  the same claim, and list each deleted test in its commit message.
+- Model checks sample histories. A pass is =:witnessed=, not =:proven=, and
+  reports must say so.
+
+* Out of scope
+Everything parked in the focused plan's deferred table (Instagram expansion,
+remote subscription removal, template administration, catalog/Flow expansion,
+additional PMS vendors, live acceptance), plus runtime performance work.
