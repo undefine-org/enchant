@@ -1,0 +1,57 @@
+;; One verified unit stream feeds SDK ownership and precompiled metadata.
+;; Workers own disjoint files in a disposable image; one caller seals metadata.
+(ns build-image (:require [build :as build] [build-execution :as execution]))
+
+(defn- write-term! [destination value]
+  (let [temporary (str destination ".writing-" (System/unique_integer (list :positive)))]
+    (try
+      (File/write! temporary (erlang/term_to_binary value (list :deterministic)))
+      (File/rename! temporary destination)
+      (finally (File/rm temporary)))))
+
+(defn assemble!
+  "Copy, relocate and authenticate complete units with bounded concurrency.
+   complete includes existing floor units; manifest identifies units to copy.
+   The native writer validates each complete unit from actual source and BEAM
+   bytes. Merge only disjoint ownership; publish metadata after all succeed."
+  [manifest complete root outputs ebin inventory-path index-path jobs]
+  (let [scratch (str inventory-path ".units-" (System/unique_integer (list :positive)))
+        _ (reduce (fn [owners [source record]]
+                    (reduce (fn [out module]
+                              (when (contains? out module)
+                                (throw (ex-info "Duplicate image module ownership" {:module module})))
+                              (assoc out module source)) owners (:modules record))) {} complete)]
+    (File/mkdir_p! scratch)
+    (try
+      (let [modules
+            (execution/reduce! (min 4 jobs)
+              (fn [[source record]]
+                (let [unit {source record}
+                      proof (Path/join scratch (str (System/unique_integer (list :positive)) ".term"))]
+                  (when (contains? manifest source)
+                    (build/assemble-outputs! unit outputs ebin)
+                    (build/relocate-unit-sources! unit root ebin))
+                  (BeamLisp.AOT/write_sdk_inventory! root unit ebin proof)
+                  ;; This decoder and native writer are the existing SDK proof
+                  ;; boundary; no copied receipt is allowed to bless new bytes.
+                  (let [rows (BeamLisp.AOT/decode_sdk_inventory! (File/read! proof))]
+                    (File/rm! proof)
+                    rows)))
+              (fn [out _ rows]
+                (reduce (fn [acc [module row]]
+                          (when (contains? acc module)
+                            (throw (ex-info "Duplicate image inventory identity" {:module module})))
+                          (assoc acc module row)) out rows))
+              {} (sort-by first complete))
+            entries
+            (into {} (map (fn [[_ record]]
+                            (let [names (mapv (fn [module] (Atom/to_string module)) (:modules record))
+                                  digests (into {} (map (fn [name] [name (:sha256 (get modules name))]) names))]
+                              (when-not (every? some? (vals digests))
+                                (throw (ex-info "Image index omits a verified module" {})))
+                              [(tuple (:key record) (:hash record)) {:modules (to-list names) :digests digests}])) manifest))]
+        (write-term! inventory-path {:version 2 :identities :binary
+                                     :compiler-key (BeamLisp.AOTCache/compiler_key) :modules modules})
+        (write-term! index-path {:version 1 :entries entries})
+        (count modules))
+      (finally (File/rm_rf! scratch)))))

@@ -1,0 +1,53 @@
+(ns build-pipeline-image-test)
+
+(doseq [file ["build-execution" "build-inputs" "unit-store" "build-image"]]
+  (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+        source (File/read! (Path/join root (str "priv/build/" file ".bl")))
+        renamed (reduce (fn [text name]
+                          (String/replace text name (str "pipeline-image-" name)))
+                        source ["build-execution" "build-inputs" "unit-store" "build-image"])]
+    (BeamLisp/eval renamed)))
+(ns build-pipeline-image-test (:require [build :as build]))
+
+(defn- invoke [namespace function args]
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! (str "pipeline-image-" namespace) function) args))
+(defn- contents [directory]
+  (into {} (map (fn [path] [(Path/basename path) (File/read! path)])
+                (filter (fn [path] (File/regular? path)) (Path/wildcard (Path/join directory "*"))))))
+
+(deftest restored-units-feed-byte-identical-serial-and-parallel-images
+  (let [scratch (Path/join (System/tmp_dir!) (str "build-image-" (System/unique_integer (list :positive))))
+        root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+        sdk (System/fetch_env! "BL_SDK_PRODUCT")
+        sources (mapv #(Path/join root %) ["std/errors.bl" "std/proc/task.bl" "std/vm/owner.bl"])
+        opts {:root root :sources sources :previous (Path/join sdk "unit-store")}
+        serial-out (Path/join scratch "serial-units") parallel-out (Path/join scratch "parallel-units")
+        serial (Path/join scratch "serial") parallel (Path/join scratch "parallel")
+        inventory (Path/join parallel "sdk-code.term") index (Path/join parallel "precompiled.term")]
+    (File/mkdir_p! scratch)
+    (try
+      (let [a (invoke "unit-store" "produce!" (list (assoc opts :out serial-out :jobs 1)))
+            b (invoke "unit-store" "produce!" (list (assoc opts :out parallel-out :jobs 4)))
+            manifest (:manifest b)]
+        (is (= 0 (:compiled a)))
+        (is (= 3 (:cached a)))
+        (is (= (:manifest a) manifest))
+        ;; Independent existing assembly remains the equivalence control.
+        (build/assemble-outputs! (:manifest a) serial-out serial)
+        (build/relocate-unit-sources! (:manifest a) root serial)
+        (BeamLisp.AOT/write_sdk_inventory! root (:manifest a) serial (Path/join serial "sdk-code.term"))
+        (build/write-precompiled-index! (:manifest a) serial (Path/join serial "precompiled.term"))
+        (is (pos? (invoke "build-image" "assemble!"
+                    (list manifest manifest root parallel-out parallel inventory index 4))))
+        (is (= (contents serial) (contents parallel)))
+        ;; A changed producer object must fail before metadata publication.
+        (let [before (File/read! inventory)
+              module (first (:modules (second (first manifest))))
+              path (Path/join parallel-out (str (Atom/to_string module) ".beam"))]
+          (File/write! path "corrupt")
+          (is (= :refused (try (invoke "build-image" "assemble!"
+                               (list manifest manifest root parallel-out parallel inventory index 4))
+                             :accepted (catch _ :refused))))
+          (is (= before (File/read! inventory))))
+        (is (= [] (vec (Path/wildcard (str inventory ".units-*"))))))
+      (finally (File/rm_rf! scratch)))))

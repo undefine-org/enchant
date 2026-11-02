@@ -1,6 +1,7 @@
 ;; One artifact producer for SDK library units. Reuse is bound to the inputs
 ;; the constructor read, not the inventory of the containing SDK/workspace.
-(ns unit-store (:require [build-log :as blog]))
+(ns unit-store (:require [build-log :as blog] [build-inputs :as inputs]
+                        [build-execution :as execution]))
 
 (defn- measure [timings stage run]
   (let [started (erlang/monotonic_time :microsecond)]
@@ -188,61 +189,90 @@
                                  (Regex/compile! "^[A-Za-z_][A-Za-z0-9_.-]*$") %)) (keys old))
             (throw (ex-info "Unit reuse index has an invalid namespace" {})))
         _ (File/mkdir_p! (Path/join out ".units"))
-        ;; Share dependency parsing across this immutable production pass.
-        ;; The final input check runs after the snapshot closes.
-        result
+        width (min 4 (or (:jobs opts) 1))
+        receipts (mapcat #(get % "inputs") (keep #(get old %) (keys selected)))
+        snapshot (measure timings :input-snapshot (fn [] (inputs/capture root selected receipts)))
+        ;; Compiler workspaces and Env mutation remain on this single owner.
+        ;; Only verified immutable restoration crosses the task boundary.
+        plans
         (BeamLisp.AOT/with_source_snapshot
-         (fn [] (reduce (fn [acc path]
-          (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
-                unit-key (measure timings :unit-keys (fn [] (BeamLisp.AOTCache/key_for_source path)))
-                prior (get old namespace)
-                directory (Path/join (Path/join out ".units") namespace)
-                reusable (and (not (:force? opts)) prior (= unit-key (get prior "key"))
-                              (measure timings :reuse-inputs (fn [] (inputs-current? (get prior "inputs") root selected))))
-                [verified inputs compiled?]
-                (if reusable
-                  (let [source (Path/join (Path/join previous ".units") namespace)
-                        verified (measure timings :verify-restored (fn [] (BeamLisp.AOT/verify_unit source)))]
-                    (verify-inputs! verified (get prior "inputs") namespace)
-                    (when (not= source directory)
-                      (measure timings :copy-restored (fn [] (File/rm_rf! directory) (File/cp_r! source directory))))
-                    [verified (get prior "inputs") false])
-                  (let [workspace (BeamLisp.AOT/open_workspace
-                          {:version 2 :phase-imports (list 'core 'sugar) :roots (list root)
-                           :sources (list {:namespace (symbol namespace) :file path})} {})]
-                    (try
-                      (let [prepared (BeamLisp.AOT/prepare_unit workspace (symbol namespace))
-                            _ (File/rm_rf! directory)
-                            _ (BeamLisp.AOT/emit_unit prepared directory)
-                            inputs (to-list (sort-by #(get % "namespace")
-                                      (map #(relative-input % root) (vals (:inputs prepared)))))
-                            verified (BeamLisp.AOT/verify_unit directory)]
-                        (verify-inputs! verified inputs namespace)
-                        [verified inputs true])
-                      (finally (BeamLisp.AOT/close_workspace! workspace)))))
-                same? (and (not compiled?) (= previous out)
-                       (every? (fn [[module bytes]]
-                         (= (tuple :ok bytes) (File/read (Path/join out (str (Atom/to_string module) ".beam")))))
-                         (:beams verified)))
-                modules (vec (map first (:beams verified)))
-                _ (measure timings :write-flat (fn [] (doseq [[module bytes] (:beams verified)]
-                    (File/write! (Path/join out (str (Atom/to_string module) ".beam")) bytes))))
-                entry {:hash (measure timings :closure-hash (fn [] (BeamLisp.AOT/ns_closure_hash namespace)))
-                       :key unit-key :modules modules
-                       :digests (measure timings :output-digests (fn [] (blog/artifact-digests out modules)))
-                       :preparation-key (digest (Jason/encode! inputs))}]
-            (when-let [log (:log opts)]
-              (when-not same? (log (str (if compiled? "compile " "restore ") namespace))))
-            (-> acc
-              (update (if compiled? :compiled :cached) + (if same? 0 1))
-              (update :built + (if same? 0 1))
-              (assoc-in [:manifest path] entry)
-              (assoc-in [:units namespace] {"file" (Path/relative_to path root) "key" unit-key "inputs" inputs}))))
-          {:built 0 :compiled 0 :cached 0 :errors [] :manifest {} :units {} :ex-built 0
-           :lock-wait-us 0 :native {:built 0 :cached 0 :artifacts [] :errors []}} paths)))]
-    (measure timings :final-inputs (fn [] (doseq [[namespace row] (:units result)]
-      (when-not (inputs-current? (get row "inputs") root selected)
-        (throw (ex-info "Unit inputs changed during production" {:namespace namespace}))))))
+          (fn [] (mapv (fn [path]
+            (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))
+                  unit-key (measure timings :unit-keys (fn [] (BeamLisp.AOTCache/key_for_source path)))
+                  prior (get old namespace)
+                  directory (Path/join (Path/join out ".units") namespace)
+                  reusable (and (not (:force? opts)) prior (= unit-key (get prior "key"))
+                                (measure timings :reuse-inputs
+                                  (fn [] (inputs/current? snapshot (get prior "inputs")))))
+                  prepared
+                  (when-not reusable
+                    (let [workspace (BeamLisp.AOT/open_workspace
+                            {:version 2 :phase-imports (list 'core 'sugar) :roots (list root)
+                             :sources (list {:namespace (symbol namespace) :file path})} {})]
+                      (try
+                        (let [prepared (BeamLisp.AOT/prepare_unit workspace (symbol namespace))
+                              _ (File/rm_rf! directory)
+                              _ (BeamLisp.AOT/emit_unit prepared directory)
+                              actual (to-list (sort-by #(get % "namespace")
+                                        (map #(relative-input % root) (vals (:inputs prepared)))))
+                              verified (BeamLisp.AOT/verify_unit directory)]
+                          (verify-inputs! verified actual namespace)
+                          {:verified verified :inputs actual})
+                        (finally (BeamLisp.AOT/close_workspace! workspace)))))]
+              {:path path :namespace namespace :key unit-key :prior prior :directory directory
+               :prepared prepared :reusable reusable
+               :hash (measure timings :closure-hash (fn [] (BeamLisp.AOT/ns_closure_hash namespace)))})) paths)))
+        result
+        (execution/reduce! width
+          (fn [plan]
+            (if (:reusable plan)
+              (let [namespace (:namespace plan)
+                    source (Path/join (Path/join previous ".units") namespace)
+                    verified (measure timings :verify-restored (fn [] (BeamLisp.AOT/verify_unit source)))
+                    actual (get (:prior plan) "inputs")]
+                (verify-inputs! verified actual namespace)
+                (when (not= source (:directory plan))
+                  (measure timings :copy-restored
+                    (fn [] (File/rm_rf! (:directory plan)) (File/cp_r! source (:directory plan)))))
+                (assoc plan :verified verified :inputs actual :compiled? false))
+              (merge plan (:prepared plan) {:compiled? true})))
+          (fn [acc _ plan]
+            (let [verified (:verified plan) actual (:inputs plan) namespace (:namespace plan)
+                  same? (and (not (:compiled? plan)) (= previous out)
+                         (every? (fn [[module bytes]]
+                           (= (tuple :ok bytes) (File/read (Path/join out (str (Atom/to_string module) ".beam")))))
+                           (:beams verified)))
+                  modules (vec (map first (:beams verified)))
+                  _ (doseq [module modules]
+                      (when-let [owner (get-in acc [:module-owners module])]
+                        (throw (ex-info "Two SDK units own the same output module"
+                                        {:module module :owners [owner namespace]}))))
+                  _ (measure timings :write-flat (fn [] (doseq [[module bytes] (:beams verified)]
+                      (File/write! (Path/join out (str (Atom/to_string module) ".beam")) bytes))))
+                  digests (measure timings :output-digests (fn []
+                            (vec (sort-by first (map (fn [[module bytes]] [(Atom/to_string module) (digest bytes)])
+                                                      (:beams verified))))))
+                  entry {:hash (:hash plan) :key (:key plan) :modules modules :digests digests
+                         :preparation-key (digest (Jason/encode! actual))}]
+              (when-let [log (:log opts)]
+                (when-not same? (log (str (if (:compiled? plan) "compile " "restore ") namespace))))
+              (-> acc
+                (update (if (:compiled? plan) :compiled :cached) + (if same? 0 1))
+                (update :built + (if same? 0 1))
+                (update :module-owners merge (into {} (map (fn [module] [module namespace]) modules)))
+                (assoc-in [:manifest (:path plan)] entry)
+                (assoc-in [:units namespace] {"file" (Path/relative_to (:path plan) root)
+                                              "key" (:key plan) "inputs" actual}))))
+          {:built 0 :compiled 0 :cached 0 :errors [] :manifest {} :units {} :module-owners {} :ex-built 0
+           :lock-wait-us 0 :native {:built 0 :cached 0 :artifacts [] :errors []}} plans)
+        final-receipts (mapcat #(get % "inputs") (vals (:units result)))
+        final-snapshot
+        (measure timings :final-inputs (fn []
+          (let [fresh (inputs/capture root selected final-receipts)]
+            (doseq [[namespace row] (:units result)]
+              (when-not (inputs/current? fresh (get row "inputs"))
+                (throw (ex-info "Unit inputs changed during production" {:namespace namespace}))))
+            fresh)))]
     ;; Full production owns removal. No old beam can survive outside the new
     ;; manifest; partial/scoped production preserves its explicit predecessor.
     (doseq [namespace (keys old)]
@@ -259,5 +289,7 @@
       (blog/write! log (blog/facts-of (blog/state-of-manifest (:manifest result)))))
     (println (str "SDK-UNIT-PHASES " (Jason/encode!
       {:elapsed-us (- (erlang/monotonic_time :microsecond) started)
-       :phases-us @timings :compiled (:compiled result) :cached (:cached result)})))
-    (dissoc result :units)))
+       :phases-us @timings :compiled (:compiled result) :cached (:cached result) :jobs width
+       :input-reads {:initial (:reads snapshot) :final (:reads final-snapshot)
+                     :references (count final-receipts)}})))
+    (dissoc result :units :module-owners)))
