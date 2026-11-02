@@ -16,7 +16,8 @@ const fs = require("fs");
 const path = require("path");
 
 const clientJs = fs.readFileSync(
-  path.join(__dirname, "../../priv/lib/live/client.js"),
+  process.env.LIVE_CLIENT_SOURCE ||
+    path.join(__dirname, "../../priv/lib/live/client.js"),
   "utf8"
 );
 const fixture = JSON.parse(
@@ -190,6 +191,33 @@ test("an inserted subtree with a seq of seqs renders every child", async ({
     );
     expect(canonical(got), `nested step ${i + 1}`).toBe(canonical(step.html));
   }
+});
+
+test("an inserted subtree keeps its tag classes beside a :class attr", async ({
+  page,
+}) => {
+  // REGRESSION: `[:span.x {:class "y"}]` is class="x y" in the first paint,
+  // but render() set the attrs map's class over the shorthand's, so the same
+  // element INSERTED by a patch painted class="y"; and a :class toggle shipped
+  // the bare value, wiping `x` on an element the first paint rendered.
+  const classes = fixture.classes;
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, classes.mount);
+  for (let i = 0; i < classes.patches.length; i++) {
+    const step = classes.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `class step ${i + 1}`).toBe(canonical(step.html));
+  }
+  await expect(page.locator("#live-root span")).toHaveAttribute("class", "x");
 });
 
 test("clipboard confirms only after resolution and offers manual copy on denial", async ({ page }) => {
