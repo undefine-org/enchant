@@ -29,6 +29,16 @@
 // `path` is a vector of child indices from the mount root. A keyed op names
 // its child by the element's `key` attribute (the server strips `:key` from
 // HTML but re-emits it as `data-key` on rendered elements — see render()).
+//
+// What a page can listen to (CustomEvents on `document`) and wait on
+// (attributes on <html>):
+//   live:state    {up}           the socket opened/closed  · html[data-live="1"|"0"]
+//   live:pending  {count}        un-acked durable gestures · html[data-live-pending]
+//   live:mount    {root}         a ["mount"] repainted root · html[data-mounted="1"]
+//   live:patch    {root, ops}    a ["patch"] was applied
+//   live:denied   {why}          the server refused an intent (["denied", why]);
+//                                also opts.onDenied(why) when the shell passed one
+//   live:tap      {t, basis}     a tapped socket's frame id (dev tools)
 
 (function () {
   "use strict";
@@ -599,7 +609,11 @@
         } else if (kind === "tap") {
           announce("live:tap", { t: a, basis: b });
         } else if (kind === "denied") {
+          // a refusal must reach the page even when the shell passed no
+          // onDenied (live.app's default shell gives an app no way to): the
+          // DOM event is what any page can listen to
           if (opts.onDenied) opts.onDenied(a);
+          announce("live:denied", { why: a });
         } else if (kind === "ack") {
           if (outbox) { outbox.ack(a); setLive(true); }   // the gesture landed — drop it
         } else if (kind === "input-ack") {

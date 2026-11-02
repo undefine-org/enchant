@@ -14,7 +14,8 @@ const fs = require("fs");
 const path = require("path");
 
 const clientJs = fs.readFileSync(
-  path.join(__dirname, "../../priv/lib/live/client.js"),
+  process.env.LIVE_CLIENT_SOURCE ||
+    path.join(__dirname, "../../priv/lib/live/client.js"),
   "utf8"
 );
 
@@ -190,4 +191,40 @@ test("session: a fresh connect() mints a NEW sid (a reload is a new session)", a
   });
   expect(other).not.toBe(first);
   expect(other).toMatch(/[?&]live-sid=[0-9a-f]{32}/);
+});
+
+// ── a refused intent ──────────────────────────────────────────────────
+//
+// ["denied", why] reached only opts.onDenied. A shell that passes no
+// onDenied — live.app's default shell, which gives an app no way to pass one —
+// swallowed every refusal in silence. It is now ALSO a `live:denied` DOM
+// event, like live:mount / live:patch, so any page can show it.
+
+test("denied: a refusal is announced as a live:denied event with no onDenied", async ({ page }) => {
+  await boot(page, { heartbeatMs: 0 });
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const seen = await page.evaluate(() => {
+    var got = [];
+    document.addEventListener("live:denied", function (e) { got.push(e.detail); });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", "Seul un associé"]) });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", { reason: "key-not-held" }]) });
+    return got;
+  });
+  expect(seen).toEqual([{ why: "Seul un associé" }, { why: { reason: "key-not-held" } }]);
+});
+
+test("denied: onDenied still receives it, beside the event", async ({ page }) => {
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: FAKE });
+  await page.addScriptTag({ content: clientJs });
+  const seen = await page.evaluate(async () => {
+    var got = [];
+    document.addEventListener("live:denied", function (e) { got.push(["event", e.detail.why]); });
+    window.Live.connect({ root: document.getElementById("live-root"), url: "ws://fake/ws",
+                          heartbeatMs: 0, onDenied: function (why) { got.push(["callback", why]); } });
+    await new Promise(function (r) { setTimeout(r, 10); });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", "Clé non gardée"]) });
+    return got;
+  });
+  expect(seen).toEqual([["callback", "Clé non gardée"], ["event", "Clé non gardée"]]);
 });
