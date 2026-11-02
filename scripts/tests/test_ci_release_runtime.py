@@ -55,28 +55,31 @@ class PinnedRuntimePathTests(unittest.TestCase):
 
 
 class WorkflowShellPathTests(unittest.TestCase):
-    def test_release_adapters_resolve_outside_the_workspace_and_with_spaces(self):
+    def test_release_adapters_run_inside_standard_bash_steps_with_space_in_cwd(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary) / 'checkout with spaces'
             (workspace / 'scripts').mkdir(parents=True)
             adapter = workspace / 'scripts/with-release-runtime'
             shutil.copy2(ROOT / 'scripts/with-release-runtime', adapter)
-            unrelated = Path(temporary) / 'nix-profile/bin'
-            unrelated.mkdir(parents=True)
+            bash = shutil.which('bash')
             count = 0
             for name in ('build-drop.yml', 'release.yml'):
-                for line in (ROOT / '.github/workflows' / name).read_text().splitlines():
-                    if 'shell:' not in line or 'with-release-runtime' not in line:
+                lines = (ROOT / '.github/workflows' / name).read_text().splitlines()
+                for index, line in enumerate(lines):
+                    if 'shell:' in line:
+                        self.assertNotIn('with-release-runtime', line)
+                        self.assertNotIn('${{ github.workspace }}', line)
+                    if "<<'BL_PINNED_RELEASE_CHECK'" not in line:
                         continue
-                    scalar = line.split('shell:', 1)[1].strip()
-                    self.assertTrue(scalar.startswith("'") and scalar.endswith("'"))
-                    command = scalar[1:-1].replace('${{ github.workspace }}', str(workspace))
+                    self.assertEqual('shell: bash', lines[index - 2].strip())
+                    self.assertEqual('run: |', lines[index - 1].strip())
+                    command = line.split('<<', 1)[0].strip()
                     executable = shlex.split(command)[0]
-                    self.assertEqual(str(adapter), executable)
-                    self.assertTrue(Path(executable).is_absolute())
+                    self.assertEqual('./scripts/with-release-runtime', executable)
                     environment = dict(os.environ, PATH=str(Path(sys.executable).parent))
-                    result = subprocess.run([executable, '--help'], cwd=unrelated, env=environment,
-                                            text=True, capture_output=True)
+                    result = subprocess.run([bash, '--noprofile', '--norc', '-e', '-o', 'pipefail',
+                                             '-c', executable + ' --help'], cwd=workspace,
+                                            env=environment, text=True, capture_output=True)
                     self.assertEqual(0, result.returncode, result.stderr)
                     self.assertIn('pinned FHS loader', result.stdout)
                     count += 1
