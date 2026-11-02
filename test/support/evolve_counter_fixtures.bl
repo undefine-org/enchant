@@ -1,0 +1,46 @@
+; Shared native fixtures for actual managed Source counter generations.
+(ns test.support.evolve-counter-fixtures
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+
+(defn source [mode]
+ (let [old? (= :integer mode)
+       migration (case mode
+                   :integer "value"
+                   :map "{:count value}"
+                   :invalid "-1"
+                   :effectful "(do (Process/sleep 100) {:count value})"
+                   :identity "value")]
+  (str "(ns counter.business)
+        (defn accepts [message] (erlang/is_binary message))
+        (defn state-valid [value] " (if old? "(erlang/is_integer value)" "(erlang/is_map value)") ")
+        (defn migrate [value] " migration ")
+        (defn upcast [message] message)
+        (defn handler [message value]
+          (let [delta (cond (= message \"inc\") 1 (= message \"five\") 5 :else 0)
+                next (+ " (if old? "value" "(:count value)") " delta)]
+           {:reply next :state " (if old? "next" "{:count next}") "}))
+        (defn spec [version digest]
+          {:version version :digest digest :accept? accepts :check-state state-valid
+           :handler handler :migrate-state migrate :upcast upcast})")))
+
+(defn graph [application version mode]
+ (g/prepare! {:application-id application :fixed-runtime true
+              :native-modules #{"erlang" "Process"}
+              :resources {:fixture-version version :fixture-mode mode}
+              :sources {"counter.business" (source mode)}}))
+(defn spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "counter.business/spec" [version (:digest graph)]))))
+(defn upgrade [graph pid expected version]
+ (g/with! graph #(ev/upgrade! pid expected (spec graph version))))
+(defn with-owner [application releases initial options action]
+ (let [graphs (mapv (fn [[version mode]] (graph application version mode)) releases)
+       old (first graphs) pid (atom nil)]
+  (try
+   (g/with! old #(state/bind! {}))
+   (doseq [fresh (rest graphs)] (g/inherit-runtime! fresh old))
+   (reset! pid (g/with! old #(ev/start! (spec old 1) initial options)))
+   (action graphs @pid)
+   (finally
+    (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+    (doseq [graph (reverse graphs)] (g/retire! graph))))))
+

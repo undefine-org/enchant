@@ -23,12 +23,14 @@ class Receipts(unittest.TestCase):
         self.assertEqual(RUNNER.runtime_environment(explicit), explicit)
         self.assertNotIn("BL_TEST_USER_RUNTIME_DIR", RUNNER.runtime_environment({}))
 
-    def run_process_control(self, fail_first=False, empty_suite=False):
+    def run_process_control(self, fail_first=False, empty_suite=False, stress_seconds=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
             (root / "scripts/test-prerequisites.json").write_text('{"version":1,"tests":{}}')
-            (root / "scripts/test-isolation.json").write_text('{"fault.bl": "isolated"}')
+            isolation = {"fault.bl": "isolated" if stress_seconds is None else {
+                "reason": "finite stress control", "timeout_seconds": stress_seconds}}
+            (root / "scripts/test-isolation.json").write_text(json.dumps(isolation))
             outer_runtime = root / "preflight-private-endpoints"
             outer_runtime.mkdir()
             candidate = root / "candidate"
@@ -40,7 +42,8 @@ assert Path(os.environ['BL_QUALIFY_CANDIDATE']).resolve() == Path(__file__).reso
 files = os.environ['BL_QUALIFY_FILES'].splitlines()
 report = files if fail_first else files[:1]
 for name in report:
-    print('BL-QUALIFY ' + json.dumps({'file': name, 'fail': 0, 'error': 0}))
+    print('BL-QUALIFY ' + json.dumps({'file': name, 'fail': 0, 'error': 0,
+                                    'timeout_ms': int(os.environ['BL_QUALIFY_TIMEOUT_MS'])}))
 if len(report) < len(files):
     print('BL-QUALIFY-HANDOVER ' + json.dumps({'completed': len(report)}))
 raise SystemExit(70 if fail_first and len(files) > 1 else 0)
@@ -71,6 +74,20 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
         self.assertEqual("incoherent", row["status"])
         self.assertEqual(1, row["error"])
         self.assertEqual("suite-discovery", row["details"][0]["test"])
+
+    def test_only_the_declared_isolated_stress_file_gets_its_finite_budget(self):
+        status, rows = self.run_process_control(stress_seconds=1200)
+        self.assertEqual(0, status)
+        self.assertEqual({'a.bl': 300000, 'b.bl': 300000, 'fault.bl': 1200000},
+                         {row['file']: row['timeout_ms'] for row in rows if 'file' in row})
+        self.assertEqual([300, 300, 1200], [row['timeout_seconds'] for row in rows
+                                          if row.get('type') == 'process'])
+
+    def test_stress_budget_refuses_unbounded_or_malformed_declarations(self):
+        for seconds in (0, 1801, True, '1200'):
+            with self.subTest(seconds=seconds), self.assertRaisesRegex(ValueError, 'test budget'):
+                RUNNER.process_timeout(['stress.bl'], {'stress.bl': {
+                    'reason': 'stress', 'timeout_seconds': seconds}}, 300)
 
     def test_later_success_cannot_hide_an_earlier_failed_process(self):
         status, rows = self.run_process_control(fail_first=True)

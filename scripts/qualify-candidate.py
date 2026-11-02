@@ -85,6 +85,19 @@ def process_groups(files, isolated):
     return ([warm] if warm else []) + [[name] for name in files if name in isolated]
 
 
+def process_timeout(files, isolated, default):
+    """An isolated stress file may declare a larger finite worker bound."""
+    if len(files) != 1 or not isinstance(isolated.get(files[0]), dict):
+        return default
+    spec = isolated[files[0]]
+    if (set(spec) != {'reason', 'timeout_seconds'}
+            or not isinstance(spec['reason'], str) or not spec['reason'].strip()
+            or type(spec['timeout_seconds']) is not int
+            or not 1 <= spec['timeout_seconds'] <= 1800):
+        raise ValueError('Invalid isolated test budget: ' + files[0])
+    return max(default, spec['timeout_seconds'])
+
+
 def runtime_environment(environ):
     """Retain the manager runtime for fixtures with nested systemd clients."""
     env = dict(environ)
@@ -109,7 +122,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="default file bound in seconds; isolated stress declarations may raise it")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("files", nargs="+")
     args = parser.parse_args()
@@ -144,6 +158,8 @@ def main():
             while groups:
                 selected = groups.pop(0)
                 env["BL_QUALIFY_FILES"] = "\n".join(selected)
+                timeout_seconds = process_timeout(selected, isolated, args.timeout)
+                env["BL_QUALIFY_TIMEOUT_MS"] = str(timeout_seconds * 1000)
                 reported, handover = set(), False
                 # Each process owns its endpoint directory. Lifetime handovers and
                 # privileged fixtures stay serial inside the caller's tree cap.
@@ -183,7 +199,8 @@ def main():
                         current_status = process.wait()
                         status = status or current_status
                         receipts.write(json.dumps({"type": "process", "identity": identity,
-                                                   "files": selected, "process_status": current_status}) + "\n")
+                                                   "files": selected, "process_status": current_status,
+                                                   "timeout_seconds": timeout_seconds}) + "\n")
                         receipts.flush()
                         os.fsync(receipts.fileno())
                     finally:
