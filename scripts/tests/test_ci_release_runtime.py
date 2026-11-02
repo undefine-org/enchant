@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import shutil
+import shlex
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -50,3 +52,32 @@ class PinnedRuntimePathTests(unittest.TestCase):
                                       text=True, capture_output=True)
             self.assertEqual(91, original.returncode)
             self.assertIn('host loader library missing', original.stderr)
+
+
+class WorkflowShellPathTests(unittest.TestCase):
+    def test_release_adapters_resolve_outside_the_workspace_and_with_spaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / 'checkout with spaces'
+            (workspace / 'scripts').mkdir(parents=True)
+            adapter = workspace / 'scripts/with-release-runtime'
+            shutil.copy2(ROOT / 'scripts/with-release-runtime', adapter)
+            unrelated = Path(temporary) / 'nix-profile/bin'
+            unrelated.mkdir(parents=True)
+            count = 0
+            for name in ('build-drop.yml', 'release.yml'):
+                for line in (ROOT / '.github/workflows' / name).read_text().splitlines():
+                    if 'shell:' not in line or 'with-release-runtime' not in line:
+                        continue
+                    scalar = line.split('shell:', 1)[1].strip()
+                    self.assertTrue(scalar.startswith("'") and scalar.endswith("'"))
+                    command = scalar[1:-1].replace('${{ github.workspace }}', str(workspace))
+                    executable = shlex.split(command)[0]
+                    self.assertEqual(str(adapter), executable)
+                    self.assertTrue(Path(executable).is_absolute())
+                    environment = dict(os.environ, PATH=str(Path(sys.executable).parent))
+                    result = subprocess.run([executable, '--help'], cwd=unrelated, env=environment,
+                                            text=True, capture_output=True)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn('pinned FHS loader', result.stdout)
+                    count += 1
+            self.assertEqual(6, count)
