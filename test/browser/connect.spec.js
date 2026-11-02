@@ -228,3 +228,34 @@ test("denied: onDenied still receives it, beside the event", async ({ page }) =>
   });
   expect(seen).toEqual([["callback", "Clé non gardée"], ["event", "Clé non gardée"]]);
 });
+
+// ── a patch op that cannot apply ──────────────────────────────────────
+//
+// applyPatch ran its ops in one loop with no guard: one op that threw (a
+// path into a DOM the model did not describe) aborted the loop, and every
+// later op of that patch was lost in silence. Each op is now guarded: the
+// rest of the patch still lands, the failure is reported (console +
+// `live:patch-error`), and the client asks the server for a fresh mount
+// (["remount"]) — once, until that mount arrives.
+
+test("patch: one op that throws does not sink the rest; the client asks to remount", async ({ page }) => {
+  await boot(page, { heartbeatMs: 0 });
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const out = await page.evaluate(() => {
+    var s = window.__sockets[0], errors = [];
+    document.addEventListener("live:patch-error", function (e) { errors.push(e.detail.failed.length); });
+    s.onmessage({ data: JSON.stringify(["mount", "<main><p>old</p><span>À relire</span></main>"]) });
+    var patch = ["patch", [["text", [9, 9, 0], "nowhere"], ["text", [1, 0], "Signé"]]];
+    s.onmessage({ data: JSON.stringify(patch) });
+    s.onmessage({ data: JSON.stringify(patch) });          // still out of step: no second request
+    var asked1 = s.sent.filter(function (d) { return d === '["remount"]'; }).length;
+    s.onmessage({ data: JSON.stringify(["mount", "<main><p>new</p><span>Signé</span></main>"]) });
+    s.onmessage({ data: JSON.stringify(patch) });          // a fresh failure after the mount asks again
+    return { pill: document.querySelector("#live-root span").textContent, errors: errors, asked1: asked1,
+             asked2: s.sent.filter(function (d) { return d === '["remount"]'; }).length };
+  });
+  expect(out.pill).toBe("Signé");
+  expect(out.errors).toEqual([1, 1, 1]);
+  expect(out.asked1).toBe(1);
+  expect(out.asked2).toBe(2);
+});
