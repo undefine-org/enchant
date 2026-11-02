@@ -14,6 +14,19 @@ in {
       description = "Remote build station for this client; commands require no routing flags.";
       type = lib.types.nullOr (lib.types.submodule {
         options = {
+          evaluation = lib.mkOption {
+            default = null;
+            description = "Optional station evaluation transport from the local host description. ssh-ng alone only places realization.";
+            type = lib.types.nullOr (lib.types.submodule {
+              options = {
+                storeUri = lib.mkOption { type = lib.types.str; };
+                transport = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  description = "Operator-owned argv, with one {endpoint} token for the copied immutable station executable.";
+                };
+              };
+            });
+          };
           hostName = lib.mkOption { type = lib.types.str; };
           sshUser = lib.mkOption { type = lib.types.str; default = "nix-ssh"; };
           sshKey = lib.mkOption {
@@ -67,6 +80,12 @@ in {
       Delegate = true;
       MemoryMax = cfg.daemonMemoryMax;
       MemorySwapMax = cfg.daemonMemorySwapMax;
+    };
+    environment.etc = lib.mkIf (cfg.buildStation != null && cfg.buildStation.evaluation != null) {
+      "beam-lisp/build-station.json".text = builtins.toJSON {
+        version = 1;
+        inherit (cfg.buildStation.evaluation) storeUri transport;
+      };
     };
     environment.sessionVariables.BL_ARTIFACT_PLATFORM = toString cfg.platform;
     environment.sessionVariables.BL_NATIVE_PROVIDER = "nix";

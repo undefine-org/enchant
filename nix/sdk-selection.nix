@@ -1,6 +1,6 @@
 # Product references are selection data. Runtime SDK authority remains in the
 # original image's compiler-produced sealed units, which this recipe never edits.
-{ pkgs, image, release, platform, coordinator, assemblyIdentity ? null }:
+{ pkgs, image, platform, coordinator, assemblyIdentity ? null }:
 pkgs.runCommand "beam-lisp-sdk-selection" {
   nativeBuildInputs = [ pkgs.python3 ];
 } ''
@@ -29,11 +29,8 @@ pkgs.runCommand "beam-lisp-sdk-selection" {
   import json, os
   from pathlib import Path
   metadata = json.loads(Path('${image}/artifact.json').read_text())
-  portable = json.loads(Path('${release}/artifact.json').read_text())
   assert metadata['kind'] == 'sdk' and metadata['version'] == 1
-  assert metadata['compiler'] == portable['compiler']
-  assert portable['kind'] == 'release' and portable['target'] == metadata['target']
-  metadata.update(release='${release}', image='${image}', coordinator='${coordinator}', platform='${platform}')
+  metadata.update(image='${image}', coordinator='${coordinator}', platform='${platform}')
   metadata['assemblyIdentity'] = ${builtins.toJSON (builtins.toJSON assemblyIdentity)}
   metadata['assemblyIdentity'] = json.loads(metadata['assemblyIdentity'])
   (Path(os.environ['out']) / 'artifact.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')

@@ -33,54 +33,6 @@
       (refuse "Artifact recipes must use the pinned startup platform" {}))
     pinned))
 
-(defn verify-release!
-  "Authenticate the portable output retained by the selected SDK."
-  [sdk]
-  (let [sdk (immutable-directory! sdk)
-        selected (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
-        _ (when-not (and (= 1 (get selected "version")) (= "sdk" (get selected "kind"))
-                         (= "x86_64-linux" (get selected "target")))
-            (refuse "Unsupported SDK release selection" {}))
-        _ (when-not (string? (get selected "release"))
-            (refuse "Selected SDK does not retain a managed Nix release" {:sdk sdk}))
-        output (immutable-directory! (get selected "release"))
-        descriptor (Jason/decode! (File/read! (Path/join output "artifact.json")))
-        file (Path/join output "bl.drop")]
-    (when-not (and (= 1 (get descriptor "version")) (= "release" (get descriptor "kind"))
-                  (= "x86_64-linux" (get descriptor "target")) (= "bl.drop" (get descriptor "file"))
-                  (= (get selected "compiler") (get descriptor "compiler"))
-                  (= :regular (:type (File/lstat! file)))
-                  (= (get descriptor "sha256") (drop/sha256-hex-of file 0 (drop/file-size file))))
-      (refuse "Release identity or bytes disagree with the selected SDK" {:output output}))
-    {:output output :file file :manifest descriptor}))
-
-(defn publish-release!
-  "Copy an already produced immutable release under destination custody."
-  [sdk destination]
-  (let [release (verify-release! sdk)
-        destination (Path/expand destination)
-        temporary (str destination ".nix-" (System/system_time :microsecond)
-                       "-" (erlang/unique_integer (list :positive)))]
-    (claim/with-writer! (claim/artifact-scope destination) "Nix release publication"
-      (fn []
-        (File/mkdir_p! (Path/dirname destination))
-        (let [target (File/open! temporary (list :write :binary :exclusive))]
-          (try
-            (try
-              (let [source (File/open! (:file release) (list :read :binary))]
-                (try
-                  (when-not (= (tuple :ok (drop/file-size (:file release)))
-                               (erlang/apply :file :copy (list source target)))
-                    (refuse "Release copy did not complete" {}))
-                  (finally (File/close source))))
-              (finally (File/close target)))
-            (when-not (= (get-in release [:manifest "sha256"])
-                         (drop/sha256-hex-of temporary 0 (drop/file-size temporary)))
-              (refuse "Release copy digest disagrees" {}))
-            (File/chmod! temporary 493)
-            (File/rename! temporary destination)
-            (assoc release :destination destination)
-            (finally (File/rm temporary))))))))
 (defn- name? [value]
   (and (string? value) (Regex/match? #"^[A-Za-z_][A-Za-z0-9_]*$" value)))
 (defn selected?
@@ -280,6 +232,63 @@
                             "--extra-experimental-features" "nix-command flakes"]))
                        (catch _ nil))]
       (retain-product! selected directory run))))
+
+(defn verify-release!
+  "Prepare on demand and authenticate the portable product of the exact SDK image."
+  [sdk]
+  (let [sdk (immutable-directory! sdk)
+        selected (Jason/decode! (File/read! (Path/join sdk "artifact.json")))
+        _ (when-not (and (= 1 (get selected "version")) (= "sdk" (get selected "kind"))
+                         (= "x86_64-linux" (get selected "target")))
+            (refuse "Unsupported SDK release selection" {}))
+        output (immutable-directory!
+                 (or (get selected "release")
+                   (let [directory (fresh-directory! (cache-root) "portable-release")
+                         platform (platform! {})
+                         run (fn [label executable argv]
+                               (managed! platform executable argv 3600000 2147483648
+                                 (Path/join directory (str label ".json"))))
+                         prepared (or (existing-product! platform "release" sdk {} directory run)
+                                      (prepare-job! directory {"version" 1 "kind" "release" "sdk" sdk} 3600000))]
+                     (get prepared "output"))))
+        descriptor (Jason/decode! (File/read! (Path/join output "artifact.json")))
+        file (Path/join output "bl.drop")]
+    (when-not (and (= 1 (get descriptor "version")) (= "release" (get descriptor "kind"))
+                  (= "x86_64-linux" (get descriptor "target")) (= "bl.drop" (get descriptor "file"))
+                  (= (get selected "compiler") (get descriptor "compiler"))
+                  (or (get selected "release") (= (get selected "image") (get descriptor "image")))
+                  (= :regular (:type (File/lstat! file)))
+                  (= (get descriptor "sha256") (drop/sha256-hex-of file 0 (drop/file-size file))))
+      (refuse "Release identity or bytes disagree with the selected SDK" {:output output}))
+    {:output output :file file :manifest descriptor}))
+
+(defn publish-release!
+  "Copy an already produced immutable release under destination custody."
+  [sdk destination]
+  (let [release (verify-release! sdk)
+        destination (Path/expand destination)
+        temporary (str destination ".nix-" (System/system_time :microsecond)
+                       "-" (erlang/unique_integer (list :positive)))]
+    (claim/with-writer! (claim/artifact-scope destination) "Nix release publication"
+      (fn []
+        (File/mkdir_p! (Path/dirname destination))
+        (let [target (File/open! temporary (list :write :binary :exclusive))]
+          (try
+            (try
+              (let [source (File/open! (:file release) (list :read :binary))]
+                (try
+                  (when-not (= (tuple :ok (drop/file-size (:file release)))
+                               (erlang/apply :file :copy (list source target)))
+                    (refuse "Release copy did not complete" {}))
+                  (finally (File/close source))))
+              (finally (File/close target)))
+            (when-not (= (get-in release [:manifest "sha256"])
+                         (drop/sha256-hex-of temporary 0 (drop/file-size temporary)))
+              (refuse "Release copy digest disagrees" {}))
+            (File/chmod! temporary 493)
+            (File/rename! temporary destination)
+            (assoc release :destination destination)
+            (finally (File/rm temporary))))))))
 
 (defn prepare-application!
   "Realize an application through the trusted recipe and an exact SDK. Source

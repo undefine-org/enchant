@@ -7,18 +7,31 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   for executable in ${pkgs.nix}/bin/*; do
     ln -s "$executable" "$out/bin/$(basename "$executable")"
   done
+  ln -s ${pkgs.openssh}/bin/ssh "$out/bin/ssh"
+  ln -s ${pkgs.openssh}/bin/ssh-keygen "$out/bin/ssh-keygen"
   ln -s ${pkgs.systemd}/bin/systemd-run "$out/bin/systemd-run"
   ln -s ${pkgs.systemd}/bin/systemctl "$out/bin/systemctl"
   ln -s ${pkgs.util-linux}/bin/setsid "$out/bin/setsid"
   ln -s ${pkgs.procps}/bin/kill "$out/bin/kill"
   cp ${commandExecutor}/executor.json "$out/executor.json"
   ${pkgs.lib.optionalString includeRecipes ''
+  cp ${./build-station.py} "$out/nix/build-station.py"
+  cat > "$out/bin/beam-build-station" <<EOF
+  #!${pkgs.runtimeShell}
+  export PATH=${pkgs.nix}/bin:\$PATH
+  export NIX_CONFIG='experimental-features = nix-command flakes'
+  exec ${pkgs.python3}/bin/python3 "$out/nix/build-station.py" --serve
+  EOF
+  chmod 555 "$out/bin/beam-build-station"
   cp ${./native-compile.nix} "$out/nix/native-compile.nix"
   cp ${./native-artifact.nix} "$out/nix/native-artifact.nix"
   cp ${./native-snapshot.nix} "$out/nix/native-snapshot.nix"
   cp ${./native-workspace.nix} "$out/nix/native-workspace.nix"
   cp ${./sdk-source.nix} "$out/nix/sdk-source.nix"
   cp ${./engine-inputs.json} "$out/nix/engine-inputs.json"
+  cp ${./portable-artifact.nix} "$out/nix/portable-artifact.nix"
+  cp ${./portable-product.nix} "$out/nix/portable-product.nix"
+  printf '%s\n' '${builtins.toJSON { tools = toString commandExecutor; }}' > "$out/portable-tools.json"
   cp ${./sdk-artifact.nix} "$out/nix/sdk-artifact.nix"
   cp ${./native-source.nix} "$out/nix/native-source.nix"
   cp ${./bounded-build.nix} "$out/nix/bounded-build.nix"

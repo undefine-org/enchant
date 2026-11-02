@@ -35,6 +35,14 @@
     in
     {
       nixosModules.artifacts = import ./nix/artifact-host.nix;
+      nixosModules.artifact-workstation = { config, ... }: {
+        imports = [ ./nix/artifact-host.nix ];
+        services.beam-lisp-artifacts.enable = true;
+        assertions = [{
+          assertion = config.services.beam-lisp-artifacts.buildStation != null;
+          message = "Supply services.beam-lisp-artifacts.buildStation from the local workstation description.";
+        }];
+      };
       # A module factory: callers pass their local station description.
       lib.artifact-workstation = import ./nix/workstation-artifacts.nix;
       packages.${system} = {

@@ -8,5 +8,5 @@ pkgs.runCommand "beam-lisp-sdk-unit-archive" {
   test -z "$(find ${units} -type l -print -quit)"
   mkdir -p "$out"
   tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
-    -czf "$out/units.tar.gz" -C ${units} .
+    -czf "$out/units.tar.gz" --exclude=./producer -C ${units} .
 ''

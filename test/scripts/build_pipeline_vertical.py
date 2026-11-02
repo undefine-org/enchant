@@ -200,7 +200,13 @@ def main():
         report['products']['application'] = str(product)
         jobs_before = set(retained.glob('*/job-*'))
         info = json.loads((changed / 'artifact.json').read_text())
-        expected = sha(Path(info['release']) / 'bl.drop')
+        native_before = sha(changed / 'bl')
+        first_portable = output / 'first-portable'
+        run('portable-on-demand', [engine / 'bin/bl', '--cold', 'self-build', '--out', first_portable], timeout=900)
+        expected = sha(first_portable)
+        assert sha(changed / 'bl') == native_before, 'portable packaging changed the native SDK'
+        report['portable'] = dict(first_request_seconds=report['stages'][-1]['seconds'], sha256=expected,
+                                  lazy='release' not in info)
         warm = []
         with tempfile.TemporaryDirectory(prefix='bl-pipeline-warm-', dir='/run/user/' + str(os.getuid())) as runtime:
             extra = dict(XDG_RUNTIME_DIR=runtime)

@@ -111,6 +111,8 @@ let
       ../env.bl ../bl.lock
       ../scripts/prepare-release.bl
       ../scripts/produce-sdk.bl
+      ../scripts/restore-producer.exs
+      ../scripts/retain-producer.bl
       ../scripts/qualify-artifact-generation
       ../scripts/demo-artifact-production
       ../scripts/check-source-floor
@@ -171,6 +173,10 @@ let
     then import ./sdk-unit-archive.nix { inherit pkgs; units = previousUnits; }
     else null;
 
+  producer = if previousUnits != null && builtins.pathExists (previousUnits + "/producer/unit-index.json")
+    then import ./producer-product.nix { inherit pkgs; directory = previousUnits + "/producer"; }
+    else null;
+
   dependencies = worker (pkgs.runCommand "beam-lisp-dependencies-1" {
     nativeBuildInputs = producerTools;
   } ''
@@ -206,12 +212,11 @@ let
       && previousMetadata.dependencies == toString dependencies;
   };
 
-  # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
-  # launcher come from the two derivations above.
-  bl-drop = workerFor true (pkgs.stdenv.mkDerivation {
-    pname = "bl-drop";
+  # 3. Retain the native image. Portable ELF retargeting is an independent
+  # requested product; ordinary SDK selection never forces it.
+  native-image = workerFor true (pkgs.stdenv.mkDerivation {
+    pname = "beam-lisp-sdk-image";
     version = "0.1.0";
-    outputs = [ "out" "sdk" ];
     inherit src;
     nativeBuildInputs = producerTools;
     dontConfigure = true;
@@ -244,11 +249,8 @@ let
       cp ${z3Runtime}/LICENSE.txt priv/z3/
       echo 7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e > priv/z3/.fetched
 
-      # the launcher the target executes: FHS loader, no store RUNPATH
-      cp ${drop-tools}/bin/drop-launcher $TMPDIR/launcher
+      # The native SDK keeps its Nix-linked launcher.
       cp ${drop-tools}/bin/drop $TMPDIR/drop
-      chmod u+w $TMPDIR/launcher
-      patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
       export BL_PRODUCTION_LAUNCHER=${drop-tools}/bin/drop-launcher
       export BL_PRODUCTION_PACKER=$TMPDIR/drop
@@ -260,6 +262,18 @@ let
         mkdir -p "$TMPDIR/previous-units"
         tar -xzf ${previousUnitArchive}/units.tar.gz -C "$TMPDIR/previous-units"
         export BL_PREVIOUS_UNIT_STORE="$TMPDIR/previous-units"
+        # Parser frames are content/generation checked by the ordinary reader.
+        # Seed parent startup as well as the later library child.
+        if [ -d "$BL_PREVIOUS_UNIT_STORE/source-parts/parts" ]; then
+          cp -a --no-preserve=ownership "$BL_PREVIOUS_UNIT_STORE/source-parts/parts" priv/parts
+        fi
+        sdk_phase_end
+      ''}
+      ${lib.optionalString (producer != null) ''
+        sdk_phase_start materialize-producer
+        mkdir -p "$TMPDIR/producer"
+        tar -xzf ${producer}/producer.tar.gz -C "$TMPDIR/producer"
+        export BL_PRODUCTION_CACHE="$TMPDIR/producer"
         sdk_phase_end
       ''}
       # Preparation, floor validation and assembly share one producer VM.
@@ -271,9 +285,11 @@ let
       chmod -R u+w $TMPDIR/payload
       # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
       # checks the existing sealed metadata and actual bytes at load time.
+      sdk="$out"
       mkdir -p "$sdk"
       cp -a --no-preserve=ownership "$TMPDIR/unit-store" "$sdk/unit-store"
-      cp -a --reflink=auto --no-preserve=ownership $TMPDIR/payload/lib "$sdk/lib"
+      cp -a --reflink=auto --no-preserve=ownership "$TMPDIR/payload" "$sdk/payload"
+      ln -s payload/lib "$sdk/lib"
       for application in "$sdk"/lib/beam_lisp-*; do
         ln -s "lib/$(basename "$application")" "$sdk/image"
       done
@@ -313,75 +329,14 @@ let
         coordinator = toString coordinator;
         target = "x86_64-linux";
       }}' > "$sdk/artifact.json"
-      ${pkgs.jq}/bin/jq --arg release "$out" --arg source "$src" \
-        '. + {release: $release, source: $source}' "$sdk/artifact.json" > "$sdk/artifact.tmp"
+      ${pkgs.jq}/bin/jq --arg source "$src" \
+        '. + {source: $source}' "$sdk/artifact.json" > "$sdk/artifact.tmp"
       mv "$sdk/artifact.tmp" "$sdk/artifact.json"
-      sdk_phase_end
-      sdk_phase_start portable-retarget
-      # A portable drop carries bytes rather than references to its build store.
-      for native in $TMPDIR/payload/lib/beam_lisp-*/priv/native/*.so; do
-        if [ -L "$native" ]; then
-          cp --dereference "$native" "$native.materialized"
-          mv "$native.materialized" "$native"
-        fi
-      done
-      ${pkgs.python3}/bin/python3 - <<'PORTABLE'
-      import json, os
-      from pathlib import Path
-      import subprocess
-      patcher = '${pkgs.patchelf}/bin/patchelf'
-      counts = dict(files=0, elf=0, interpreters=0)
-      for path in (Path(os.environ['TMPDIR']) / 'payload').rglob('*'):
-          if path.is_symlink() or not path.is_file():
-              continue
-          counts['files'] += 1
-          with path.open('rb') as stream:
-              marker = stream.read(4)
-              first = marker + stream.readline(4092) if marker.startswith(b'#!') else marker
-          if marker == b'\x7fELF':
-              counts['elf'] += 1
-              dynamic = subprocess.run([patcher, '--print-interpreter', path],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-              if dynamic:
-                  subprocess.run([patcher, '--set-interpreter', '/lib64/ld-linux-x86-64.so.2',
-                                  '--remove-rpath', path], check=True)
-              else:
-                  subprocess.run([patcher, '--remove-rpath', path],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-          elif first.startswith(b'#!') and b'/nix/store/' in first:
-              interpreter = first.strip().split()[0].rsplit(b'/', 1)[-1]
-              if interpreter not in (b'sh', b'bash', b'dash'):
-                  raise SystemExit(f'undeclared portable interpreter: {path}: {first!r}')
-              replacement = b'#!/bin/bash\n' if interpreter == b'bash' else b'#!/bin/sh\n'
-              path.write_bytes(replacement + path.read_bytes()[len(first):])
-              counts['interpreters'] += 1
-      print('PORTABLE-PAYLOAD ' + json.dumps(counts), flush=True)
-      PORTABLE
-      sdk_phase_end
-      sdk_phase_start pack-portable
-      $TMPDIR/drop pack --release $TMPDIR/payload --launcher $TMPDIR/launcher --out $TMPDIR/bl.drop
       sdk_phase_end
       runHook postBuild
     '';
 
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out
-      cp $TMPDIR/bl.drop $out/bl.drop
-      digest=$(sha256sum "$out/bl.drop" | cut -d' ' -f1)
-      printf '%s\n' '${builtins.toJSON {
-        version = 1;
-        kind = "release";
-        packaging = "portable-shell-v1";
-        target = "x86_64-linux";
-        compiler = toString compiler;
-        file = "bl.drop";
-      }}' > "$out/artifact.json"
-      ${pkgs.jq}/bin/jq --arg sha "$digest" '. + {sha256: $sha}' \
-        "$out/artifact.json" > "$out/artifact.tmp"
-      mv "$out/artifact.tmp" "$out/artifact.json"
-      runHook postInstall
-    '';
+    installPhase = "true";
   });
   # SDK bytes depend on their producer inputs; command/coordinator recipes are
   # selection data. Provider-only edits can select the same qualified payload.
@@ -399,12 +354,13 @@ let
     toolchain = toString pkgs.path;
     recipe = builtins.readFile ./bl-drop.nix;
     unitArchive = builtins.readFile ./sdk-unit-archive.nix;
+    producerRecipe = builtins.readFile ./producer-product.nix;
     worker = builtins.readFile ./bounded-build.nix;
   });
   reuseAssembly = previousMetadata != null
     && (previousMetadata.assemblyIdentity or null) == assemblyIdentity;
-  image = if reuseAssembly then builtins.storePath previousMetadata.image else bl-drop.sdk;
-  portable = if reuseAssembly then builtins.storePath previousMetadata.release else bl-drop;
+  image = if reuseAssembly then builtins.storePath previousMetadata.image else native-image;
+  portable = import ./portable-product.nix { inherit pkgs image; tools = drop-tools; };
   coordinator = import ./coordinator-runtime.nix {
     inherit pkgs;
     # The control plane boots a matching, already qualified runtime. Submitting
@@ -416,11 +372,10 @@ let
   };
   selection = import ./sdk-selection.nix {
     inherit pkgs coordinator image assemblyIdentity;
-    release = portable;
     platform = buildCheckout;
   };
 in
-{ inherit drop-tools natives dependencies compiler coordinator;
+{ inherit drop-tools natives dependencies compiler coordinator producer;
   bl-drop = portable;
   sdk = selection;
   sdk-image = image;

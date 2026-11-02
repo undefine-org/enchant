@@ -9,6 +9,10 @@ let
       sshUser = "builder";
       sshKey = "/run/keys/local-build";
       maxJobs = 3;
+      evaluation = {
+        storeUri = "ssh-ng://fixture-store";
+        transport = [ "ssh" "fixture-operator" "{endpoint}" ];
+      };
       hostPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMcF6me4e++om0gZLNkZ1H8LnB3r7VHJtqVdUQhLcF0z fixture";
     }; }) {
       system.stateVersion = "25.05";
@@ -19,6 +23,10 @@ let
   cfg = evaluated.config;
   station = builtins.head cfg.nix.buildMachines;
 in
+assert (builtins.fromJSON cfg.environment.etc."beam-lisp/build-station.json".text) == {
+  version = 1; storeUri = "ssh-ng://fixture-store";
+  transport = [ "ssh" "fixture-operator" "{endpoint}" ];
+};
 assert cfg.nix.distributedBuilds;
 assert cfg.nix.settings.max-jobs == 0;
 assert cfg.nix.settings.builders-use-substitutes;
