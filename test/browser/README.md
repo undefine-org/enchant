@@ -68,6 +68,13 @@ driving a real Chromium with Playwright against the JS client.
    without losing a draft, doc replies interleaved with eval results, and a
    320px layout without horizontal overflow.
 
+7. **`mount.spec.js` › the server-rendered page survives the socket** — the
+   socket's `["mount"]` replaces the first paint. Text typed, boxes ticked,
+   options picked, the focused field and its caret survive it (matched by id,
+   else name, else child path); a restored field the view binds re-sends its
+   value so the session agrees; `<html data-mounted="1">` marks the mount.
+   Against the pre-fix client the typed values come back empty.
+
 ## Run it
 
 ```sh

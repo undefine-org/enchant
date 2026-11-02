@@ -555,10 +555,21 @@
       ws.onmessage = function (msg) {
         const [kind, a, b] = JSON.parse(msg.data);
         if (kind === "mount") {
+          // The mount REPLACES the server-rendered page. Whatever the reader
+          // did to that page before the socket came up — text typed into a
+          // field, a box ticked, the caret in a textarea — lived only in the
+          // DOM the innerHTML below throws away. Carry it across (see
+          // keepFields): typed values, focus and selection survive, and a
+          // field bound to the server re-sends its value so the session's
+          // state agrees with what the reader sees.
+          const kept = keepFields(root);
           discardInputs();
           root.__liveInputAck = !!(b && b["input-ack"]);
           root.innerHTML = a;
           syncInputs(root);
+          restoreFields(root, kept);
+          // a waitable mark (an event can fire before a test starts waiting)
+          try { document.documentElement.setAttribute("data-mounted", "1"); } catch (_e) {}
           announce("live:mount", { root: root });
         } else if (kind === "style") {
           // the head sheet holds what the warm reached; a socket that renders
@@ -683,6 +694,122 @@
     });
 
     return ws;
+  }
+
+  // ── what the reader did to the page survives the mount ────────────────
+  //
+  // The first paint is server HTML; the socket's ["mount"] replaces it. A
+  // reader who typed before the socket opened lost the text and the focus.
+  // keepFields snapshots, before the swap, every field the reader CHANGED
+  // (its value differs from what the HTML said: value ≠ defaultValue,
+  // checked ≠ defaultChecked, a select off its default option) plus the
+  // focused element and its selection; restoreFields finds each one again in
+  // the new DOM — by id, else by name (radios by name + value, nth among the
+  // same name), else by its child-index path — and puts it back. A restored
+  // field the view binds (data-ev-input / data-ev-change) fires its event, so
+  // the server's state learns the value instead of overwriting it later.
+  function isTextLike(el) {
+    return el.tagName === "TEXTAREA" ||
+      (el.tagName === "INPUT" && !/^(checkbox|radio|file|button|submit|reset|image|hidden)$/.test(el.type));
+  }
+  function isDirty(el) {
+    if (el.tagName === "SELECT") {
+      var opts = el.options, i;
+      if (el.multiple) {
+        for (i = 0; i < opts.length; i++) if (opts[i].selected !== opts[i].defaultSelected) return true;
+        return false;
+      }
+      var def = -1;
+      for (i = 0; i < opts.length; i++) if (opts[i].defaultSelected) def = i;
+      if (def < 0) for (i = 0; i < opts.length; i++) if (!opts[i].disabled) { def = i; break; }
+      return opts.length > 0 && el.selectedIndex !== def;
+    }
+    if (el.type === "checkbox" || el.type === "radio") return el.checked !== el.defaultChecked;
+    return isTextLike(el) && el.value !== el.defaultValue;
+  }
+  function childPath(root, el) {
+    var path = [];
+    for (var n = el; n && n !== root; n = n.parentNode) {
+      var p = n.parentNode;
+      if (!p) return null;
+      path.unshift(domChildren(p).indexOf(n));
+    }
+    return path;
+  }
+  function sameName(root, tag, name, radioValue) {
+    return Array.prototype.filter.call(root.getElementsByTagName(tag), function (o) {
+      return o.getAttribute("name") === name &&
+        (radioValue === null || (o.type === "radio" && o.value === radioValue));
+    });
+  }
+  function keyOf(root, el) {
+    if (el.id) return { id: el.id };
+    var name = el.getAttribute("name");
+    if (name) {
+      var radio = el.type === "radio" ? el.value : null;
+      return { name: name, tag: el.tagName, radio: radio,
+               n: sameName(root, el.tagName, name, radio).indexOf(el) };
+    }
+    return { path: childPath(root, el) };
+  }
+  function findKey(root, key) {
+    if (key.id) {
+      var byId = document.getElementById(key.id);
+      return byId && root.contains(byId) ? byId : null;
+    }
+    if (key.name) return sameName(root, key.tag, key.name, key.radio)[key.n] || null;
+    if (!key.path) return null;
+    var el = root;
+    for (var i = 0; i < key.path.length && el; i++) el = domChildren(el)[key.path[i]];
+    return el && el.nodeType === 1 ? el : null;
+  }
+  function keepFields(root) {
+    var kept = { fields: [], focus: null };
+    for (var el of root.querySelectorAll("input,textarea,select")) {
+      if (!isDirty(el)) continue;
+      var rec = { key: keyOf(root, el), tag: el.tagName, type: el.type };
+      if (el.tagName === "SELECT")
+        rec.selected = Array.prototype.map.call(el.selectedOptions, function (o) { return o.value; });
+      else if (el.type === "checkbox" || el.type === "radio") rec.checked = el.checked;
+      else rec.value = el.value;
+      kept.fields.push(rec);
+    }
+    var active = document.activeElement;
+    if (active && active !== root && root.contains(active)) {
+      kept.focus = { key: keyOf(root, active), tag: active.tagName };
+      try {
+        if (typeof active.selectionStart === "number")
+          kept.focus.sel = [active.selectionStart, active.selectionEnd, active.selectionDirection];
+      } catch (_e) { /* a type with no selection API */ }
+    }
+    return kept;
+  }
+  function restoreFields(root, kept) {
+    var bound = [];
+    for (var rec of kept.fields) {
+      var el = findKey(root, rec.key);
+      if (!el || el.tagName !== rec.tag || el.type !== rec.type) continue;
+      if (rec.selected) {
+        for (var o of el.options) o.selected = rec.selected.indexOf(o.value) >= 0;
+      } else if (rec.checked !== undefined) {
+        el.checked = rec.checked;
+      } else {
+        el.value = rec.value;
+      }
+      var ev = isTextLike(el) ? "input" : "change";
+      if (closestAttrPrefix(el, "data-ev-" + ev)) bound.push([el, ev]);
+    }
+    if (kept.focus) {
+      var f = findKey(root, kept.focus.key);
+      if (f && f.tagName === kept.focus.tag && typeof f.focus === "function") {
+        try { f.focus({ preventScroll: true }); } catch (_e) { f.focus(); }
+        if (kept.focus.sel) {
+          try { f.setSelectionRange(kept.focus.sel[0], kept.focus.sel[1], kept.focus.sel[2] || "none"); }
+          catch (_e) { /* not a text control after all */ }
+        }
+      }
+    }
+    for (var b of bound) b[0].dispatchEvent(new Event(b[1], { bubbles: true }));
   }
 
   // the value of the input nearest `el` (itself, or one in its container),
