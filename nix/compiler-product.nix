@@ -76,7 +76,12 @@ let
         ''}
     '';
   });
-  p = generation "P" (if previousCompiler == null then null else previousCompiler + "/seed") previousPreparation;
+  # P always boots the committed foundation. A retained current-key floor may
+  # have different runtime-host Source (Env is not an emitter-key input), so
+  # it cannot authenticate against the new producer tree during startup.
+  # Incrementality comes from the verified baseline/units above, independently
+  # of this bootstrap choice. B and C still boot their actual predecessors.
+  p = generation "P" null previousPreparation;
   b = generation "B" (p + "/P") p;
   c = generation "C" (b + "/B") p;
 in if previousIdentity == identity then previousCompiler else
