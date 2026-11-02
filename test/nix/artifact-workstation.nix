@@ -4,7 +4,13 @@ let
   pkgsSource = builtins.fetchTree lock.nodes.nixpkgs.locked;
   evaluated = import (pkgsSource.outPath + "/nixos/lib/eval-config.nix") {
     system = "x86_64-linux";
-    modules = [ ../../nix/workstation-artifacts.nix {
+    modules = [ (import ../../nix/workstation-artifacts.nix { station = {
+      hostName = "build.example.invalid";
+      sshUser = "builder";
+      sshKey = "/run/keys/local-build";
+      maxJobs = 3;
+      hostPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMcF6me4e++om0gZLNkZ1H8LnB3r7VHJtqVdUQhLcF0z fixture";
+    }; }) {
       system.stateVersion = "25.05";
       boot.isContainer = true;
       fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
@@ -17,11 +23,11 @@ assert cfg.nix.distributedBuilds;
 assert cfg.nix.settings.max-jobs == 0;
 assert cfg.nix.settings.builders-use-substitutes;
 assert builtins.length cfg.nix.buildMachines == 1;
-assert station.hostName == "100.66.112.86";
+assert station.hostName == "build.example.invalid";
 assert station.protocol == "ssh-ng";
-assert station.sshUser == "nix-ssh";
-assert station.sshKey == "/var/lib/beam-workstation/keys/build_ed25519";
-assert station.maxJobs == 2;
+assert station.sshUser == "builder";
+assert station.sshKey == "/run/keys/local-build";
+assert station.maxJobs == 3;
 assert cfg.programs.ssh.knownHosts.beam-artifact-station.hostNames == [ station.hostName ];
 assert builtins.elem "kvm" station.supportedFeatures;
 assert builtins.all (entry: entry.assertion) cfg.assertions;

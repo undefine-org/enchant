@@ -35,7 +35,8 @@
     in
     {
       nixosModules.artifacts = import ./nix/artifact-host.nix;
-      nixosModules.artifact-workstation = import ./nix/workstation-artifacts.nix;
+      # A module factory: callers pass their local station description.
+      lib.artifact-workstation = import ./nix/workstation-artifacts.nix;
       packages.${system} = {
         artifact-platform = import ./nix/artifact-platform.nix { inherit pkgs; };
         command-executor = import ./nix/command-executor.nix { inherit pkgs; };
