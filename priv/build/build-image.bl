@@ -11,7 +11,8 @@
       (finally (File/rm temporary)))))
 
 (defn assemble!
-  "Copy, relocate and authenticate complete units with bounded concurrency.
+  "Copy, relocate and authenticate small batches of complete units.
+   Amortize Task handoff and native proof framing across at most sixteen units.
    complete includes existing floor units; manifest identifies units to copy.
    The native writer validates each complete unit from actual source and BEAM
    bytes. Merge only disjoint ownership; publish metadata after all succeed."
@@ -26,12 +27,12 @@
     (try
       (let [modules
             (execution/reduce! (min 4 jobs)
-              (fn [[source record]]
-                (let [unit {source record}
+              (fn [batch]
+                (let [unit (:unit batch) copied (:copied batch)
                       proof (Path/join scratch (str (System/unique_integer (list :positive)) ".term"))]
-                  (when (contains? manifest source)
-                    (build/assemble-outputs! unit outputs ebin)
-                    (build/relocate-unit-sources! unit root ebin))
+                  (when (seq copied)
+                    (build/assemble-outputs! copied outputs ebin)
+                    (build/relocate-unit-sources! copied root ebin))
                   (BeamLisp.AOT/write_sdk_inventory! root unit ebin proof)
                   ;; This decoder and native writer are the existing SDK proof
                   ;; boundary; no copied receipt is allowed to bless new bytes.
@@ -43,7 +44,10 @@
                           (when (contains? acc module)
                             (throw (ex-info "Duplicate image inventory identity" {:module module})))
                           (assoc acc module row)) out rows))
-              {} (sort-by first complete))
+              {} (map (fn [batch]
+                        {:unit (into {} batch)
+                         :copied (into {} (filter (fn [[source _]] (contains? manifest source)) batch))})
+                      (Enum/chunk_every (to-list (sort-by first complete)) 16)))
             entries
             (into {} (map (fn [[_ record]]
                             (let [names (mapv (fn [module] (Atom/to_string module)) (:modules record))
@@ -54,6 +58,9 @@
         (write-term! inventory-path {:version 2 :identities :binary
                                      :compiler-key (BeamLisp.AOTCache/compiler_key) :modules modules})
         (write-term! index-path {:version 1 :entries entries})
+        (println (str "SDK-IMAGE-RESULT " (Jason/encode!
+          {:units (count complete) :batches (count (Enum/chunk_every (to-list complete) 16))
+           :jobs (min 4 jobs) :modules (count modules)})))
         (count modules))
       (finally (File/rm_rf! scratch)))))
 
