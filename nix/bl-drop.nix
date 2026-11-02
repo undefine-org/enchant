@@ -272,7 +272,7 @@ let
       # Keep the Nix-linked SDK before portable ELF retargeting. Its receiver
       # checks the existing sealed metadata and actual bytes at load time.
       mkdir -p "$sdk"
-      mv "$TMPDIR/unit-store" "$sdk/unit-store"
+      cp -a --no-preserve=ownership "$TMPDIR/unit-store" "$sdk/unit-store"
       cp -a --reflink=auto --no-preserve=ownership $TMPDIR/payload/lib "$sdk/lib"
       for application in "$sdk"/lib/beam_lisp-*; do
         ln -s "lib/$(basename "$application")" "$sdk/image"

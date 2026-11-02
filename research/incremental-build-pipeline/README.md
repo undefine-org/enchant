@@ -50,8 +50,9 @@ flowchart LR
   frames feed its freshness checks, final image priming and the next unit-store
   archive. Both exact content and the existing build generation select reuse;
   missing or corrupt frames parse normally. Volatile timing stays in logs.
-- The closed Nix worker moves the retained unit directory into its final output
-  instead of copying it twice. SDK image copying requests filesystem reflinks
+- The closed Nix worker renames retained units within its guest filesystem,
+  then explicitly copies to the separate Nix output store without preserving
+  guest ownership. SDK image copying requests filesystem reflinks
   with an ordinary-copy fallback. Portable ELF mutations retain separate bytes.
 
 ## Validation
