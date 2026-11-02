@@ -98,9 +98,9 @@
 ; parallel: one process per source, all interning into the `:global` Env.
 ; What an emitter mutates is keyed by its own namespace, so two sources in
 ; one wave never touch the same rows; `*ns*` is per-process. Results fold
-; back in plan order, so the manifest and cache stores are as deterministic
-; as a serial build (and the beams are byte-identical — pinned by
-; test/beam_lisp/aot_reproducible_test.exs).
+; through one publisher as preparation completes. Dependency waves and the
+; toolchain barrier remain ordered; independent source effects stay serial.
+; Manifest identities and emitted bytes do not depend on completion order.
 ;
 ; ── Failure ─────────────────────────────────────────────────────────────────
 ;
@@ -112,6 +112,7 @@
 (ns build
   (:require [build-plan :as plan]
             [build-log :as blog]
+            [build-execution :as execution]
             [substrate :as sub]
             [drop :as d]
             [store :as st]
@@ -305,41 +306,10 @@
 
 ; ── parallel wave ────────────────────────────────────────────────────────────
 
-(defn- chunks-of
-  "`xs` in consecutive groups of at most `n` (the last may be short)."
-  [n xs]
-  (loop [xs (seq xs) acc []]
-    (if (nil? xs)
-      acc
-      (recur (seq (drop n xs)) (conj acc (vec (take n xs)))))))
-
 (defn- pmap-ordered
-  "Map `f` over `xs` in parallel (at most `n` at once), results in order.
-   Plain spawn/receive: one process per element in a chunk, each sending
-   `[ref result]` back; collected in chunk order. A crash in `f` is
-   linked, so it surfaces as the build's own failure — the publisher already
-   catches compile errors into a result, so a crash here is a real bug."
+  "Shared bounded tasks, preserving result order for serial publication."
   [n f xs]
-  (let [me (erlang/self)
-        ; CONVEYED IN THE PARENT, THEN SPAWNED. `convey` captures the CALLER's
-        ; process dictionary — env id, chain, ns, caps, heap — and a freshly
-        ; spawned worker's pdict is empty, so a token made INSIDE the worker
-        ; names `:global`: the ns/alias binding is gone (the settle-retry once
-        ; died as `function Thread.sleep/1 is undefined`) AND a fork's search
-        ; roots go with it, so the emitter folded `sibling:?` into every
-        ; closure key and the beam's stamp never matched the gate's live key.
-        ; The token made HERE, where the caller's bindings are live, carries
-        ; both into the worker; `bind/1` re-derives caps from the env.
-        cf (BeamLisp.Env/convey f)]
-    (apply concat
-      (map (fn [chunk]
-             (let [refs (mapv (fn [x]
-                                (let [ref (erlang/make_ref)]
-                                  (erlang/spawn_link (fn [] (erlang/send me (erlang/list_to_tuple (list ref (cf x))))))
-                                  ref))
-                              chunk)]
-               (mapv (fn [ref] (receive [r v] :when (= r ref) v)) refs)))
-           (chunks-of n xs)))))
+  (execution/map! n f xs))
 
 ; ── structural toolchain barrier ───────────────────────────────────────────────
 
@@ -467,17 +437,17 @@
 
 (defn- build-wave [wave jobs st p todo? cache? hashes out log-path log root]
   (let [state (:state st)
-        paths (vec (map :path (filter (fn [n] (todo? state (:path n))) wave)))
-        results (reduce
-                  (fn [acc window]
-                    (let [prepared (pmap-ordered jobs
-                                     (fn [path]
-                                       (let [tkey (source-key root path)]
-                                         (prepare-one path (get (:key p) path) tkey (when cache? tkey)
-                                           (when cache? (get (:key p) path)) out log))) window)]
-                      (into acc (pmap-ordered 1 publish-one prepared))))
-                  [] (chunks-of (max 1 jobs) paths))]
-    (fold-results st results out log-path)))
+        paths (vec (map :path (filter (fn [n] (todo? state (:path n))) wave)))]
+    (execution/reduce! (min 128 (max 1 jobs))
+      (fn [path]
+        (let [tkey (source-key root path)]
+          (prepare-one path (get (:key p) path) tkey (when cache? tkey)
+                       (when cache? (get (:key p) path)) out log)))
+      (fn [current _ prepared]
+        ;; Keep initializer Env state scoped to its own task and shared effects
+        ;; serialized. Preparation continues while this one publication drains.
+        (fold-results current (pmap-ordered 1 publish-one [prepared]) out log-path))
+      st paths)))
 
 (defn- build-ordinary [waves jobs st p todo? cache? hashes out log-path log root]
   (reduce (fn [s w] (build-wave w jobs s p todo? cache? hashes out log-path log root)) st waves))
