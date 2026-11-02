@@ -163,6 +163,87 @@
   [node]
   (and (vector? node) (> (count node) 0) (keyword? (first node))))
 
+;; ── the HTML parser's table fix-ups ─────────────────────────────────
+;;
+;; The DOM a browser builds from `<table><tr>…</tr></table>` is NOT that markup:
+;; the HTML parser inserts the <tbody> a row needs (on the first paint and on
+;; every innerHTML mount alike), and a cell outside a row gets an implicit
+;; <tr>. A model that kept the rows as the table's children indexed every
+;; patch path through the table one level short of the DOM — the client walked
+;; into undefined, threw, and the rest of the patch was lost. So the model IS
+;; the parser's tree: `parser-children` re-groups a table section's children
+;; exactly where the parser would, the renderer emits the inferred elements,
+;; and live.diff indexes them (its `children-of` calls this too), so an
+;; inserted table also ships the <tbody> a createElement-built subtree would
+;; otherwise lack.
+;;
+;;   in <table>:                 a run of <tr> → one <tbody>
+;;                               a run of <td>/<th> → <tbody><tr>
+;;   in <thead>/<tbody>/<tfoot>: a run of <td>/<th> → <tr>
+;;
+;; Any other child (an explicit section, a caption, text) ends the run. Content
+;; the parser foster-parents OUT of a table (a <div> in a <table>) is not
+;; modelled: it cannot be expressed as this element's children.
+
+(def ^:private table-sections #{"table" "thead" "tbody" "tfoot"})
+
+(defn table-section
+  "The bare name when keyword `tag` is table/thead/tbody/tfoot, else nil.
+   Cheap for the common case: a tag not starting with `t` is rejected first."
+  [tag]
+  (when (and (keyword? tag) (starts-with? (name tag) "t"))
+    (let [t (:tag (parse-tag tag))]
+      (when (contains? table-sections t) t))))
+
+(defn- cell? [t] (or (= t "td") (= t "th")))
+
+(defn- child-tag [c]
+  (when (and (vector? c) (> (count c) 0) (keyword? (first c)))
+    (:tag (parse-tag (first c)))))
+
+(defn parser-children
+  "`children` (already spliced: no seqs, no nils) of a `section` element
+   (the result of `table-section`) as the HTML parser places them."
+  [section children]
+  (let [in-table (= section "table")]
+    (if (not (some (fn [c] (let [t (child-tag c)] (or (cell? t) (and in-table (= t "tr")))))
+                   children))
+      children
+      (let [flush-row (fn [st]
+                        (if (nil? (:row st)) st
+                          (let [tr (into [:tr] (:row st))]
+                            (assoc (if in-table
+                                     (assoc st :body (conj (or (:body st) []) tr))
+                                     (assoc st :out (conj (:out st) tr)))
+                                   :row nil))))
+            flush-body (fn [st]
+                         (if (nil? (:body st)) st
+                           (assoc st :out (conj (:out st) (into [:tbody] (:body st))) :body nil)))
+            end (reduce
+                  (fn [st c]
+                    (let [t (child-tag c)]
+                      (cond
+                        (cell? t) (assoc st :row (conj (or (:row st) []) c))
+                        (= t "tr")
+                          (let [st (flush-row st)]
+                            (if in-table
+                              (assoc st :body (conj (or (:body st) []) c))
+                              (assoc st :out (conj (:out st) c))))
+                        :else (let [st (flush-body (flush-row st))]
+                                (assoc st :out (conj (:out st) c))))))
+                  {:out [] :body nil :row nil}
+                  children)]
+        (:out (flush-body (flush-row end)))))))
+
+(defn- spliced
+  "A child list flattened as rendering flattens it: groups splice, nils drop."
+  [cs]
+  (reduce (fn [acc c]
+            (cond (nil? c) acc
+                  (and (or (seq? c) (list? c)) (not (vector? c))) (into acc (spliced (into [] c)))
+                  :else (conj acc c)))
+          [] cs))
+
 (defn hiccup->html
   "Render a hiccup tree to an HTML string.
 
@@ -192,6 +273,10 @@
             children (if has-attrs (drop 2 node) (rest node))
             sh (parse-tag (first node))
             tag (:tag sh)
+            ;; a table section renders the rows/cells the parser would infer
+            children (if (contains? table-sections tag)
+                       (parser-children tag (spliced children))
+                       children)
             open (str "<" tag (render-attrs sh attrs) ">")]
         (cond
           (contains? void-tags tag) open
