@@ -44,6 +44,7 @@ class SDKCacheSelectionTests(unittest.TestCase):
             self.assertEqual(self.record['sdk'], CACHE.restore(self.root, self.cache))
         exact = self.root / '.bl/sdks' / self.record['engine_fingerprint'] / 'result-sdk'
         self.assertEqual(self.record['sdk'], str(exact.readlink()))
+        self.assertEqual(self.record['engine_source'], str((exact.parent / 'source-engine').readlink()))
         self.assertEqual(self.record['sdk'], str((self.root / '.bl/sdks/current-sdk').readlink()))
         self.assertEqual(['nix-store', '--add-root', str(self.cache / 'sdk-root'),
                           '--indirect', '--realise', self.record['sdk']], run.call_args_list[0].args[0])

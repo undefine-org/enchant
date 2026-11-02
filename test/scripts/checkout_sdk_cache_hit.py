@@ -12,12 +12,13 @@ import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--sdk', type=Path, required=True)
+parser.add_argument('--engine', type=Path, required=True)
 args = parser.parse_args()
+engine = args.engine.resolve(strict=True)
 sdk = args.sdk.resolve(strict=True)
-metadata = json.loads((sdk / 'artifact.json').read_text())
 with tempfile.TemporaryDirectory(prefix='bl-sdk-cache-hit-') as temporary:
     root = Path(temporary) / 'tree'
-    shutil.copytree(metadata['source'], root)
+    shutil.copytree(engine, root)
     for path in [root, *root.rglob('*')]:
         path.chmod(path.stat().st_mode | 0o200)
     tools = Path(temporary) / 'tools'
@@ -39,6 +40,7 @@ with tempfile.TemporaryDirectory(prefix='bl-sdk-cache-hit-') as temporary:
         directory = root / '.bl/sdks' / fingerprint
         directory.mkdir(parents=True)
         (directory / 'result-sdk').symlink_to(sdk, target_is_directory=True)
+        (directory / 'source-engine').symlink_to(engine, target_is_directory=True)
         return fingerprint, directory
 
     fingerprint, directory = retain()

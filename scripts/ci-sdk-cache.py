@@ -145,7 +145,9 @@ def retain(root, cache, record):
         gc_root.unlink(missing_ok=True)
         subprocess.run(['nix-store', '--add-root', str(gc_root), '--indirect',
                         '--realise', target], check=True, stdout=subprocess.DEVNULL)
-    replace_link(sdk, root / '.bl/sdks' / record['engine_fingerprint'] / 'result-sdk')
+    directory = root / '.bl/sdks' / record['engine_fingerprint']
+    replace_link(record['engine_source'], directory / 'source-engine')
+    replace_link(sdk, directory / 'result-sdk')
     replace_link(sdk, root / '.bl/sdks/current-sdk')
 
 
@@ -165,8 +167,9 @@ def capture(root, cache, sdk):
         job = directory / name
         engine = store_path(str((job / 'source-retained').resolve(strict=True)))
         operation = json.loads((job / 'operation.json').read_text())
-        if ((operation.get('version'), operation.get('kind'), operation.get('source'),
-             operation.get('product')) != (2, 'sdk', str(engine), 'sdk')
+        if (operation.get('version') not in (2, 3)
+                or (operation.get('kind'), operation.get('source'), operation.get('product'))
+                    != ('sdk', str(engine), 'sdk')
                 or (job / 'retained').resolve(strict=True) != Path(record['sdk'])
                 or (directory / 'result-sdk').resolve(strict=True) != Path(record['sdk'])):
             raise ValueError('SDK differs from its managed immutable preparation result')
