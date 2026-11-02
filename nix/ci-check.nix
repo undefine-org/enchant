@@ -42,6 +42,12 @@ let
     source = toString input;
     inherit previous;
   } else builtins.storePath sdk;
+  sdkMetadata = builtins.fromJSON (builtins.unsafeDiscardStringContext
+    (builtins.readFile (selection + "/artifact.json")));
+  release = if sdkMetadata ? release then builtins.storePath sdkMetadata.release else
+    import (builtins.storePath sdkMetadata.platform + "/artifact-platform/nix/portable-artifact.nix") {
+      sdk = toString selection;
+    };
   bounded = import ./bounded-build.nix { inherit pkgs memoryMiB cpuCount; diskMiB = 24576; commandManager = true; };
 in bounded (pkgs.runCommand "beam-lisp-ci-check" {
   __structuredAttrs = true;
@@ -61,6 +67,7 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
   export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.openssl pkgs.ncurses pkgs.zlib pkgs.glibc pkgs.stdenv.cc.cc.lib pkgs.brotli pkgs.zstd ]}
   export ELIXIR_ERL_OPTIONS='+fnu +S ${toString cpuCount}:${toString cpuCount} +SDcpu 1:1 +SDio 1:1'
   export HOME=/build/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  export CI_CHECK_RELEASE=${release}
   export CI_CHECK_SDK_RETAINED=${if sdk == null then "0" else "1"}
   ${pkgs.lib.optionalString (models != null) ''
     export BEAM_LISP_MODEL_DIR=${builtins.storePath models}

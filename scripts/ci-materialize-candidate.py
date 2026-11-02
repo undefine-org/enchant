@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -35,13 +36,16 @@ def selection(sdk, candidate):
     metadata = json.loads((sdk / 'artifact.json').read_text())
     if (metadata['version'], metadata['kind'], metadata['target']) != (1, 'sdk', 'x86_64-linux'):
         raise ValueError('Unsupported produced SDK')
-    release, platform = immutable(metadata['release']), immutable(metadata['platform'])
+    spec = importlib.util.spec_from_file_location('sdk_release', Path(__file__).with_name('sdk-release.py'))
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    release, platform = helper.release(sdk), immutable(metadata['platform'])
     portable = json.loads((release / 'artifact.json').read_text())
     if (portable['version'], portable['kind'], portable['target'], portable['file'], portable['compiler']) != (
             1, 'release', 'x86_64-linux', 'bl.drop', metadata['compiler']):
         raise ValueError('SDK/release identity mismatch')
     expected = portable['sha256']
-    if digest(release / 'bl.drop') != expected or digest(candidate) != expected:
+    if digest(candidate) != expected:
         raise ValueError('Candidate bytes differ from the selected immutable release')
     descriptor = json.loads((platform / 'platform.json').read_text())
     coordinator = immutable(metadata['coordinator'])

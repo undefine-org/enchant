@@ -7,6 +7,7 @@ outlive a timed-out caller and retain their own roots for later inspection.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -210,7 +211,10 @@ def main():
         portable_dir.mkdir()
         portable = portable_dir / 'bl.drop'
         bl('self-build', ['self-build', '--out', str(portable)], output, marker='self-build:')
-        release = Path(metadata['release'])
+        spec = importlib.util.spec_from_file_location('sdk_release', repo / 'scripts/sdk-release.py')
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        release = helper.release(sdk)
         release_metadata = json.loads((release / 'artifact.json').read_text())
         assert release_metadata['compiler'] == metadata['compiler']
         assert release_metadata['sha256'] == digest(portable) == digest(release / 'bl.drop')

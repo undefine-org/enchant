@@ -27,6 +27,13 @@ def model_input():
     return module
 
 
+def sdk_release(sdk):
+    spec = importlib.util.spec_from_file_location('sdk_release', ROOT / 'scripts/sdk-release.py')
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    return helper.release(sdk)
+
+
 def digest(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -56,11 +63,13 @@ def retained_source_fingerprint(source):
     # Preserve each predecessor's original identity and filtering rules so
     # existing SDK units remain reusable without relabelling their source.
     allowed = [current]
-    # These two additions changed the capture policy after the last published
+    # These additions changed the capture policy after the last published
     # SDK. Keep those exact predecessors reusable under THEIR actual digest;
     # the normal producer still verifies every retained compiler/SDK unit.
     root_predecessor = current
     for additions in (
+            ('scripts/retain-producer.bl',),
+            ('scripts/restore-producer.exs',),
             ('scripts/retain-compiler-preparation.py',),
             ('scripts/assemble-compiler-generations.py',
              'scripts/compiler-unit-baseline.py', 'scripts/check-produced-compiler.py')):
@@ -90,8 +99,10 @@ def describe_sdk(sdk):
     if (metadata.get('version'), metadata.get('kind'), metadata.get('target'),
             metadata.get('producerAPI')) != (1, 'sdk', 'x86_64-linux', 2):
         raise ValueError('Unsupported retained SDK selection')
-    for field in ('source', 'compiler', 'dependencies', 'image', 'platform', 'release', 'coordinator'):
+    for field in ('source', 'compiler', 'dependencies', 'image', 'platform', 'coordinator'):
         store_path(metadata[field])
+    if 'release' in metadata:
+        store_path(metadata['release'])
     coordinator = store_path(metadata['coordinator'])
     if (sdk / 'preparation-coordinator').resolve(strict=True) != coordinator:
         raise ValueError('SDK coordinator selection differs from its descriptor')
@@ -131,7 +142,7 @@ def replace_link(target, path):
 
 
 def discard_hint(cache):
-    for name in ('selection.json', 'sdk-root', 'engine-root'):
+    for name in ('selection.json', 'sdk-root', 'engine-root', 'release-root'):
         (cache / name).unlink(missing_ok=True)
 
 
@@ -145,6 +156,16 @@ def retain(root, cache, record):
         gc_root.unlink(missing_ok=True)
         subprocess.run(['nix-store', '--add-root', str(gc_root), '--indirect',
                         '--realise', target], check=True, stdout=subprocess.DEVNULL)
+    portable_root = cache / 'release-root'
+    portable_root.unlink(missing_ok=True)
+    try:
+        portable = sdk_release(Path(sdk))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        # Native-only predecessor hints remain useful after partial failures.
+        portable = None
+    if portable is not None:
+        subprocess.run(['nix-store', '--add-root', str(portable_root), '--indirect', '--realise', str(portable)],
+                       check=True, stdout=subprocess.DEVNULL)
     directory = root / '.bl/sdks' / record['engine_fingerprint']
     replace_link(record['engine_source'], directory / 'source-engine')
     replace_link(sdk, directory / 'result-sdk')
@@ -275,7 +296,7 @@ def write_selector(root, cache, path, key, revision, run_id):
         raise ValueError('Full inventory selector requires its pinned model prerequisite')
     record = {'version': 1, 'kind': 'ci-sdk-selection', 'cache_key': key, 'sdk': str(sdk),
               'sdk_descriptor_sha256': retained['descriptor_sha256'],
-              'candidate_sha256': digest(store_path(metadata['release']) / 'bl.drop'),
+              'candidate_sha256': json.loads((sdk_release(sdk) / 'artifact.json').read_text())['sha256'],
               'engine_fingerprint': retained['engine_fingerprint'],
               'models': models['path'], 'model_pins_sha256': models['pins_sha256'],
               'revision': revision, 'run_id': run_id}
@@ -292,7 +313,7 @@ def verify_selector(root, cache, path, revision, run_id):
     models = model_input().restore(cache)
     if (record['sdk'] != retained['sdk']
             or record['sdk_descriptor_sha256'] != retained['descriptor_sha256']
-            or record['candidate_sha256'] != digest(store_path(metadata['release']) / 'bl.drop')
+            or record['candidate_sha256'] != json.loads((sdk_release(sdk) / 'artifact.json').read_text())['sha256']
             or record['engine_fingerprint'] != retained['engine_fingerprint']
             or record['engine_fingerprint'] != source_fingerprint(root)
             or not models or record['models'] != models['path']

@@ -1,4 +1,4 @@
-# Check the SDK's already-produced portable bytes; never select another SDK.
+# Check the portable product of this exact SDK; native selection stays separate.
 { sdk }:
 let
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
@@ -8,7 +8,8 @@ let
   descriptor = path: builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.readFile path));
   selection = builtins.storePath sdk;
   metadata = descriptor (selection + "/artifact.json");
-  release = builtins.storePath metadata.release;
+  release = if metadata ? release then builtins.storePath metadata.release else
+    import (builtins.storePath metadata.platform + "/artifact-platform/nix/portable-artifact.nix") { inherit sdk; };
   portable = descriptor (release + "/artifact.json");
   platform = descriptor (builtins.storePath metadata.platform + "/platform.json");
   executor = builtins.storePath platform.executor;

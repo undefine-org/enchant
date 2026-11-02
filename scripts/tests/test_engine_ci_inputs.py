@@ -145,6 +145,8 @@ class EngineCIInputTests(unittest.TestCase):
     def test_compiler_preparation_root_additions_keep_exact_old_identities(self):
         policy = copy.deepcopy(self.policy)
         for additions in (
+                ('scripts/retain-producer.bl',),
+                ('scripts/restore-producer.exs',),
                 ('scripts/retain-compiler-preparation.py',),
                 ('scripts/assemble-compiler-generations.py',
                  'scripts/compiler-unit-baseline.py', 'scripts/check-produced-compiler.py')):

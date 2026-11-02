@@ -2,7 +2,10 @@
 # Selecting an SDK cannot realize this derivation or run its ELF mutations.
 { pkgs, image, tools }:
 let
-  metadata = builtins.fromJSON (builtins.readFile (image + "/artifact.json"));
+  metadata = builtins.fromJSON (builtins.unsafeDiscardStringContext
+    (builtins.readFile (image + "/artifact.json")));
+  imagePath = builtins.storePath (builtins.unsafeDiscardStringContext (toString image));
+  toolsPath = builtins.storePath (builtins.unsafeDiscardStringContext (toString tools));
   worker = import ./bounded-build.nix {
     inherit pkgs; memoryMiB = 4096; diskMiB = 16384; cpuCount = 2;
     commandManager = false; trace = true;
@@ -18,10 +21,10 @@ worker (pkgs.runCommand "beam-lisp-portable-release" {
     printf 'SDK-SHELL-PHASE {"stage":"%s","elapsed-us":%s}\n' "$sdk_phase_label" "$elapsed"
   }
   sdk_phase_start materialize-native-image
-  cp -a --reflink=auto --no-preserve=ownership ${image}/payload "$TMPDIR/payload"
+  cp -a --reflink=auto --no-preserve=ownership ${imagePath}/payload "$TMPDIR/payload"
   chmod -R u+w "$TMPDIR/payload"
-  cp ${tools}/bin/drop-launcher "$TMPDIR/launcher"
-  cp ${tools}/bin/drop "$TMPDIR/drop"
+  cp ${toolsPath}/bin/drop-launcher "$TMPDIR/launcher"
+  cp ${toolsPath}/bin/drop "$TMPDIR/drop"
   chmod u+w "$TMPDIR/launcher"
   patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$TMPDIR/launcher"
   sdk_phase_end
@@ -78,7 +81,7 @@ worker (pkgs.runCommand "beam-lisp-portable-release" {
   output = Path(os.environ['out'])
   descriptor = ${builtins.toJSON (builtins.toJSON {
     version = 1; kind = "release"; packaging = "portable-shell-v1";
-    inherit (metadata) compiler target; image = toString image; file = "bl.drop";
+    inherit (metadata) compiler target; image = toString imagePath; file = "bl.drop";
   })}
   descriptor = json.loads(descriptor)
   with (output / 'bl.drop').open('rb') as stream:

@@ -14,6 +14,7 @@ import shutil
 import secrets
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -74,7 +75,7 @@ def arguments(value, platform=PLATFORM):
 
 def command(argv, **options):
     started = time.monotonic()
-    result = subprocess.run(list(map(str, argv)), check=True, timeout=3300, **options)
+    result = subprocess.run(list(map(str, argv)), check=True, timeout=options.pop('timeout', 3300), **options)
     print('BUILD-STATION-PHASE ' + json.dumps(dict(tool=str(argv[0]), seconds=time.monotonic()-started)), file=sys.stderr, flush=True)
     return result
 
@@ -111,7 +112,24 @@ def serve(message):
     rows = json.loads(command(['nix', 'build', '--impure', '--print-build-logs', *arguments(value),
                               '--json', '--out-link', directory / 'result', '--option', 'timeout', '3300'],
                              stdout=subprocess.PIPE, text=True).stdout)
-    return dict(version=1, ticket=ticket, operationSHA=digest(value), rows=rows, host=socket.gethostname())
+    target = store(rows[0]['outputs']['out'])
+    if value['kind'] == 'sdk' and value['product'] == 'sdk':
+        metadata = json.loads((Path(target) / 'artifact.json').read_text())
+        target = store(metadata['image'])
+    # The thin client does not import derivation/toolchain closures merely to
+    # fetch logs. Keep a bounded report while its own remote output root lives.
+    log = ''
+    with tempfile.TemporaryFile() as stream:
+        try:
+            command(['nix', 'log', target], stdout=stream, stderr=subprocess.STDOUT, timeout=60)
+        except subprocess.SubprocessError:
+            pass  # A binary-cache hit need not have a local build log.
+        else:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 256 * 1024))
+            log = stream.read().decode('utf-8', errors='replace')
+    return dict(version=1, ticket=ticket, operationSHA=digest(value), rows=rows,
+                host=socket.gethostname(), log=log, logTarget=target)
 
 
 def client(value, link, description=None):
@@ -137,13 +155,18 @@ def client(value, link, description=None):
         inputs.append(store(value['request']['source']))
     command(['nix', 'copy', '--to', uri, *dict.fromkeys(inputs)])
     ticket = secrets.token_hex(32)
-    response = json.loads(command(argv, input=json.dumps(dict(version=1, action='build', operation=value, ticket=ticket)),
-                                  stdout=subprocess.PIPE, text=True).stdout)
+    body = command(argv, input=json.dumps(dict(version=1, action='build', operation=value, ticket=ticket)),
+                   stdout=subprocess.PIPE, text=True).stdout
+    if len(body) > 3 * 1024 * 1024:
+        raise ValueError('station response exceeds bound')
+    response = json.loads(body)
     if response.get('version') != 1 or response.get('ticket') != ticket or response.get('operationSHA') != digest(value) or len(response['rows']) != 1:
         raise ValueError('station answered a different operation')
     output = store(response['rows'][0]['outputs']['out'])
     command(['nix', 'copy', '--from', uri, output])
     command(['nix-store', '--add-root', link, '--indirect', '--realise', output], stdout=subprocess.DEVNULL)
+    if response.get('log'):
+        (Path(link).parent / 'station-build.log').write_text(response['log'])
     print('BUILD-STATION-PLACEMENT ' + json.dumps(dict(host=response['host'], evaluation='station', output=output)), file=sys.stderr, flush=True)
     try:
         command(argv, input=json.dumps(dict(version=1, action='release', ticket=response['ticket'])), stdout=subprocess.DEVNULL, text=True)

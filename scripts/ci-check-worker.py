@@ -38,11 +38,11 @@ def main():
     # Resolve this on the executing station. Evaluation-time SDK metadata reads
     # would force a thin client to fetch the producer closure before offload.
     os.environ['PATH'] = str(Path(metadata['platform']) / 'bin') + os.pathsep + os.environ['PATH']
-    portable = Path(metadata['release']) / 'bl.drop'
+    portable = module(root / 'scripts/sdk-release.py').release(sdk) / 'bl.drop'
     qualifier = module(root / 'scripts/qualify-candidate.py')
     receipt = {'version': 1, 'status': 'running', 'request': request,
                'sdk_descriptor_sha256': digest(sdk / 'artifact.json'),
-               'candidate_sha256': digest(portable),
+               'candidate_sha256': json.loads((portable.parent / 'artifact.json').read_text())['sha256'],
                'compiler_manifest_sha256': digest(sdk / 'image/priv/bootstrap/seed/manifest.term'),
                'SDK_production_requested': os.environ['CI_CHECK_SDK_RETAINED'] != '1',
                'execution': 'host-nix' if args.host_nix else 'bounded-vm'}
