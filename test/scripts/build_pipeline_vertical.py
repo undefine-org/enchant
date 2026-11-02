@@ -90,6 +90,9 @@ def main():
             assert result.returncode == 0, Path(stage['log']).read_text(errors='replace')[-10000:]
             stage['status'] = 'passed'
             return Path(stage['log']).read_text()
+        except BaseException as error:
+            stage.update(status='failed', error=str(error))
+            raise
         finally:
             stage['seconds'] = round(time.monotonic() - started, 3)
             save()
@@ -128,7 +131,7 @@ def main():
 
     def receiver(name, sdk, real=None):
         info = json.loads((sdk / 'artifact.json').read_text())
-        image = output / (name + '-source-free/lib/beam_lisp-0.1.0')
+        image = output / (name + '-source-free-' + str(len(report['stages'])) + '/lib/beam_lisp-0.1.0')
         shutil.copytree(sdk / 'image', image, symlinks=True)
         for path in [image, *image.rglob('*')]:
             if not path.is_symlink():
@@ -184,7 +187,7 @@ def main():
             *[ROOT / 'test/bl' / name for name in checks]],
             extra={'BL_TEST_SOURCE_ROOT': str(ROOT)}, timeout=900)
         project = output / 'application'
-        (project / 'src').mkdir(parents=True)
+        (project / 'src').mkdir(parents=True, exist_ok=True)
         (project / 'env.bl').write_text('{:paths ["src"] :build {:paths ["src"] :jobs 2}}\n')
         (project / 'src/application.bl').write_text(
             '(ns vertical.application (:require [errors :as errors])) '
