@@ -1,11 +1,16 @@
 // mount.spec.js — what the client does to the SERVER-RENDERED page when the
-// socket arrives. A FakeWebSocket stands in for the server.
+// socket arrives: the ["mount"] that replaces it, and the ["style"] rules it
+// adds to <head>. A FakeWebSocket stands in for the server.
 //
 //   1. The mount used to be a bare `root.innerHTML = html`: text typed into
 //      the first paint before the socket mounted vanished, and focus with it.
 //      Typed values, ticks, selections, focus and caret now survive; a field
 //      the view binds re-sends its value; `<html data-mounted="1">` marks the
 //      mount for anything that waits on it.
+//   2. live's rules used to be appended at the END of <head>, so its base
+//      reset overrode an app's own stylesheet. They now go into the page's
+//      <style id="live-style"> (the SSR shell's sheet), or before the first
+//      stylesheet when the page has none.
 //
 // Run:  cd test/browser && npx playwright test mount.spec.js
 
@@ -110,4 +115,24 @@ test("a restored field the view binds re-sends its value to the server", async (
   // and the controlled field is pending, so the server's stale echo cannot erase it
   await frame(page, ["patch", [["set-attr", [0], "value", ""]]]);
   await expect(page.locator("#draft")).toHaveValue("hello before mount");
+});
+
+test("live's rules go before the app's stylesheet, so the app's rules win", async ({ page }) => {
+  await load(page, '<style id="app">body{color:rgb(1, 2, 3)}</style>', "<p>x</p>");
+  await connect(page);
+  await frame(page, ["style", "body{color:rgb(9, 9, 9)}"]);
+  expect(await page.evaluate(() => getComputedStyle(document.body).color)).toBe("rgb(1, 2, 3)");
+  expect(await page.evaluate(() =>
+    Array.from(document.head.querySelectorAll("style")).map((e) => e.id))).toEqual(["live-style", "app"]);
+});
+
+test("rules land in the page's own <style id=live-style>, where the shell put it", async ({ page }) => {
+  await load(page,
+    '<style id="live-style">body{color:rgb(9, 9, 9)}</style>' +
+    '<style id="app">body{color:rgb(1, 2, 3)}</style>', "<p>x</p>");
+  await connect(page);
+  await frame(page, ["style", "body{color:rgb(8, 8, 8)} p{margin:7px}"]);
+  expect(await page.evaluate(() => getComputedStyle(document.body).color)).toBe("rgb(1, 2, 3)");
+  expect(await page.evaluate(() => getComputedStyle(document.querySelector("p")).marginTop)).toBe("7px");
+  expect(await page.evaluate(() => document.querySelectorAll("style").length)).toBe(2);
 });
