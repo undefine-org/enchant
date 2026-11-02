@@ -56,6 +56,18 @@ def retained_source_fingerprint(source):
     # Preserve each predecessor's original identity and filtering rules so
     # existing SDK units remain reusable without relabelling their source.
     allowed = [current]
+    # These two additions changed the capture policy after the last published
+    # SDK. Keep those exact predecessors reusable under THEIR actual digest;
+    # the normal producer still verifies every retained compiler/SDK unit.
+    root_predecessor = current
+    for additions in (
+            ('scripts/retain-compiler-preparation.py',),
+            ('scripts/assemble-compiler-generations.py',
+             'scripts/compiler-unit-baseline.py', 'scripts/check-produced-compiler.py')):
+        if all(root_predecessor['roots'].count(name) == 1 for name in additions):
+            root_predecessor = dict(root_predecessor, roots=[
+                name for name in root_predecessor['roots'] if name not in additions])
+            allowed.append(root_predecessor)
     predecessor = current
     if current['reserved'].count('__pycache__') == 1:
         predecessor = dict(current, reserved=[name for name in current['reserved']

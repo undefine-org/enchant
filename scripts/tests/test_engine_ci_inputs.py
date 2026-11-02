@@ -142,6 +142,22 @@ class EngineCIInputTests(unittest.TestCase):
         self.assertNotEqual(expected, CACHE.retained_source_fingerprint(self.engine))
         self.assertEqual(CACHE.source_fingerprint(self.root), CACHE.retained_source_fingerprint(self.root))
 
+    def test_compiler_preparation_root_additions_keep_exact_old_identities(self):
+        policy = copy.deepcopy(self.policy)
+        for additions in (
+                ('scripts/retain-compiler-preparation.py',),
+                ('scripts/assemble-compiler-generations.py',
+                 'scripts/compiler-unit-baseline.py', 'scripts/check-produced-compiler.py')):
+            policy['roots'] = [name for name in policy['roots'] if name not in additions]
+            self.write_policy(self.engine, policy)
+            expected = CACHE.source_fingerprint(self.engine, policy)
+            self.assertEqual(expected, CACHE.retained_source_fingerprint(self.engine))
+            self.assertNotEqual(CACHE.source_fingerprint(self.root), expected)
+            # Existing declared compiler bytes remain part of the old identity.
+            source = self.engine / 'priv/boot/compiler.bl'
+            source.write_text(source.read_text() + '\nchanged compiler')
+            self.assertNotEqual(expected, CACHE.retained_source_fingerprint(self.engine))
+
     def test_no_other_historical_policy_or_weaker_boundaries_are_accepted(self):
         variants = []
         value = copy.deepcopy(self.previous); value['excluded'].append('priv/boot'); variants.append(value)
