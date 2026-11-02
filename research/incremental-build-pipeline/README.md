@@ -160,3 +160,16 @@ The next structural work should target these measured remaining costs:
 The prototype validates the responsibility boundaries and their correctness. It
 is not sufficient evidence to merge this branch as a finished latency solution.
 Full repository CI and broader target qualification remain outside this run.
+
+The final copy-only correction also passed normal managed production with zero
+compiled units and all 513 retained units byte-identical. The SDK image has no
+content differences, and every nonvolatile release entry is identical (4,831 of
+4,833 entries). Only `BUILD_INFO.bl`'s cold build timestamp and the fresh
+`releases/COOKIE` differ, matching their existing producer semantics. The first
+whole-release hash assertion rejected these expected differences; the retained
+entry-by-entry comparison and cold smoke establish the corrected scope. No
+production timestamp/cookie normalization or integrity bypass was added.
+
+Machine-readable identities, counts, timing scope and limitations are recorded in
+[`checks.json`](checks.json). The final SDK is a separate immutable product;
+its release hash must not be relabeled as the earlier matched-run artifact.
