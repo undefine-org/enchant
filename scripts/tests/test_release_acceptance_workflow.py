@@ -17,7 +17,15 @@ def step(name):
     source = (ROOT / '.github/workflows/build-drop.yml').read_text()
     block = source.split('      - name: ' + name + '\n', 1)[1].split('      - name:', 1)[0]
     body = re.search(r'        run: \|\n((?:          .*\n|\n)+)', block)[1]
-    return block, '\n'.join(line[10:] for line in body.splitlines())
+    program = '\n'.join(line[10:] for line in body.splitlines()).strip()
+    # These controls exercise the unchanged check program; adapter lookup is
+    # covered separately by test_ci_release_runtime with the real executable.
+    lines = program.splitlines()
+    if lines[0].endswith("<<'BL_PINNED_RELEASE_CHECK'"):
+        assert lines[0].startswith('./scripts/with-release-runtime ')
+        assert lines[-1] == 'BL_PINNED_RELEASE_CHECK'
+        program = '\n'.join(lines[1:-1])
+    return block, program
 
 
 class ReleaseAcceptanceWorkflowTests(unittest.TestCase):
