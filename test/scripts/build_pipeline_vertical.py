@@ -187,9 +187,10 @@ def main():
             *[ROOT / 'test/bl' / name for name in checks]],
             extra={'BL_TEST_SOURCE_ROOT': str(ROOT)}, timeout=900)
         project = output / 'application'
-        (project / 'src').mkdir(parents=True, exist_ok=True)
+        (project / 'src/vertical').mkdir(parents=True, exist_ok=True)
+        (project / 'src/application.bl').unlink(missing_ok=True)
         (project / 'env.bl').write_text('{:paths ["src"] :build {:paths ["src"] :jobs 2}}\n')
-        (project / 'src/application.bl').write_text(
+        (project / 'src/vertical/application.bl').write_text(
             '(ns vertical.application (:require [errors :as errors])) '
             '(defn answer [] (errors/incremental-prototype-value))\n')
         appout = output / 'application-build'
