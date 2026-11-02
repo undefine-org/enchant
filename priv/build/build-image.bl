@@ -11,43 +11,28 @@
       (finally (File/rm temporary)))))
 
 (defn assemble!
-  "Copy, relocate and authenticate small batches of complete units.
-   Amortize Task handoff and native proof framing across at most sixteen units.
-   complete includes existing floor units; manifest identifies units to copy.
-   The native writer validates each complete unit from actual source and BEAM
-   bytes. Merge only disjoint ownership; publish metadata after all succeed."
+  "Copy and relocate disjoint complete units with bounded workers, then ask
+   the native writer to seal the entire image once. No partial proof crosses
+   publication; ownership and every actual source/BEAM byte are verified by
+   the existing native boundary before either metadata file is replaced."
   [manifest complete root outputs ebin inventory-path index-path jobs]
-  (let [scratch (str inventory-path ".units-" (System/unique_integer (list :positive)))
+  (let [proof (str inventory-path ".units-" (System/unique_integer (list :positive)))
+        batches (Enum/chunk_every (to-list (sort-by first manifest)) 16)
         _ (reduce (fn [owners [source record]]
                     (reduce (fn [out module]
                               (when (contains? out module)
                                 (throw (ex-info "Duplicate image module ownership" {:module module})))
                               (assoc out module source)) owners (:modules record))) {} complete)]
-    (File/mkdir_p! scratch)
     (try
-      (let [modules
-            (execution/reduce! (min 4 jobs)
-              (fn [batch]
-                (let [unit (:unit batch) copied (:copied batch)
-                      proof (Path/join scratch (str (System/unique_integer (list :positive)) ".term"))]
-                  (when (seq copied)
-                    (build/assemble-outputs! copied outputs ebin)
-                    (build/relocate-unit-sources! copied root ebin))
-                  (BeamLisp.AOT/write_sdk_inventory! root unit ebin proof)
-                  ;; This decoder and native writer are the existing SDK proof
-                  ;; boundary; no copied receipt is allowed to bless new bytes.
-                  (let [rows (BeamLisp.AOT/decode_sdk_inventory! (File/read! proof))]
-                    (File/rm! proof)
-                    rows)))
-              (fn [out _ rows]
-                (reduce (fn [acc [module row]]
-                          (when (contains? acc module)
-                            (throw (ex-info "Duplicate image inventory identity" {:module module})))
-                          (assoc acc module row)) out rows))
-              {} (map (fn [batch]
-                        {:unit (into {} batch)
-                         :copied (into {} (filter (fn [[source _]] (contains? manifest source)) batch))})
-                      (Enum/chunk_every (to-list (sort-by first complete)) 16)))
+      (execution/reduce! (min 4 jobs)
+        (fn [batch]
+          (let [copied (into {} batch)]
+            (build/assemble-outputs! copied outputs ebin)
+            (build/relocate-unit-sources! copied root ebin)
+            :ok))
+        (fn [out _ _] out) nil batches)
+      (BeamLisp.AOT/write_sdk_inventory! root complete ebin proof)
+      (let [modules (BeamLisp.AOT/decode_sdk_inventory! (File/read! proof))
             entries
             (into {} (map (fn [[_ record]]
                             (let [names (mapv (fn [module] (Atom/to_string module)) (:modules record))
@@ -55,14 +40,13 @@
                               (when-not (every? some? (vals digests))
                                 (throw (ex-info "Image index omits a verified module" {})))
                               [(tuple (:key record) (:hash record)) {:modules (to-list names) :digests digests}])) manifest))]
-        (write-term! inventory-path {:version 2 :identities :binary
-                                     :compiler-key (BeamLisp.AOTCache/compiler_key) :modules modules})
+        (File/rename! proof inventory-path)
         (write-term! index-path {:version 1 :entries entries})
         (println (str "SDK-IMAGE-RESULT " (Jason/encode!
-          {:units (count complete) :batches (count (Enum/chunk_every (to-list complete) 16))
+          {:units (count complete) :batches (count batches) :seals 1
            :jobs (min 4 jobs) :modules (count modules)})))
         (count modules))
-      (finally (File/rm_rf! scratch)))))
+      (finally (File/rm proof)))))
 
 (defn prime!
   "Prime source facts once before the compiler child, then carry the same
