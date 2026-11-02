@@ -1,0 +1,83 @@
+(ns build-pipeline-test)
+
+;; Check edited helpers with an admitted immutable compiler, without replacing
+;; any selected SDK module. The complete Nix producer is qualified separately.
+(doseq [[file namespace] [["build-execution" "pipeline-execution-under-test"]
+                         ["build-inputs" "pipeline-inputs-under-test"]]]
+  (let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))]
+    (BeamLisp/eval (String/replace (File/read! (Path/join root (str "priv/build/" file ".bl")))
+                                 (str "(ns " file ")") (str "(ns " namespace ")")))))
+(ns build-pipeline-test)
+(defn- execute [width action values]
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "pipeline-execution-under-test" "map!")
+                        (list width action values)))
+(defn- capture [root selected receipts]
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "pipeline-inputs-under-test" "capture")
+                        (list root selected receipts)))
+(defn- current? [snapshot receipts]
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "pipeline-inputs-under-test" "current?")
+                        (list snapshot receipts)))
+(defn- started [value]
+  (receive [:started n pid] :when (= n value) pid
+    (after 10000 (throw (ex-info "Task did not start" {:value value})))))
+
+(deftest refill-on-completion-is-bounded-and-results-retain-input-order
+  (let [parent (erlang/self) env (BeamLisp.Env/env_id)
+        runner (BeamLisp.Refs/task_exec
+                 (fn [] (execute 2 (fn [n]
+                   (assert (= env (BeamLisp.Env/env_id)))
+                   (erlang/send parent [:started n (erlang/self)])
+                   (receive :release n)) [0 1 2 3])) :link)]
+    (try
+      (let [a (started 0) b (started 1)]
+        (is (= :bounded (receive [:started _ _] :unbounded (after 0 :bounded))))
+        (erlang/send b :release)
+        ;; Third task starts while the first is deliberately blocked.
+        (let [c (started 2)]
+          (is (Process/alive? a))
+          (erlang/send c :release)
+          (let [d (started 3)] (erlang/send d :release)))
+        (erlang/send a :release)
+        (is (= [0 1 2 3] (Task/await runner 10000))))
+      (finally (Task/shutdown runner :brutal_kill)))))
+
+(deftest failure-drains-owned-workers-before-returning
+  (let [parent (erlang/self)
+        runner (BeamLisp.Refs/task_exec
+                 (fn [] (try
+                   (execute 2 (fn [n]
+                     (erlang/send parent [:started n (erlang/self)])
+                     (receive :release (if (= n 1) (throw (ex-info "expected failure" {})) n))) [0 1 2])
+                   (catch error (ex-message error)))) :link)]
+    (try
+      (let [a (started 0) b (started 1) ref (erlang/monitor :process a)]
+        (erlang/send b :release)
+        (is (= "expected failure" (Task/await runner 10000)))
+        (is (= :down (receive [:DOWN r :process _ _] :when (= ref r) :down (after 1000 :leaked))))
+        (is (= :bounded (receive [:started 2 _] :unbounded (after 0 :bounded)))))
+      (finally (Task/shutdown runner :brutal_kill)))))
+
+(deftest input-observations-deduplicate-and-final-pass-detects-edits-and-resolution
+  (let [root (Path/join (System/tmp_dir!) (str "build-inputs-" (System/unique_integer (list :positive))))
+        file (Path/join root "value.bl") other (Path/join root "other.bl")]
+    (File/mkdir_p! root)
+    (try
+      (File/write! file "(ns pipeline.value) (def value 1)")
+      (let [sha (Base/encode16 (crypto/hash :sha256 (File/read! file)) (list (tuple :case :lower)))
+            receipt {"namespace" "pipeline.value" "scope" "root" "file" "value.bl" "sha256" sha}
+            receipts [receipt receipt receipt]
+            initial (capture root {"pipeline.value" file} receipts)]
+        (is (= 1 (:reads initial)))
+        (is (current? initial receipts))
+        (File/write! other (File/read! file))
+        (is (not (current? (capture root {"pipeline.value" other} receipts) receipts)))
+        (File/write! file "(ns pipeline.value) (def value 2)")
+        (is (current? initial receipts))
+        (is (not (current? (capture root {"pipeline.value" file} receipts) receipts)))
+        (File/rm! file)
+        (is (not (current? (capture root {"pipeline.value" file} receipts) receipts))))
+      (finally (File/rm_rf! root)))))
+
+(deftest empty-work-and-invalid-concurrency
+  (is (= [] (execute 2 identity [])))
+  (is (= :refused (try (execute 0 identity [1]) :accepted (catch _ :refused)))))

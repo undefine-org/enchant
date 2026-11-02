@@ -1,0 +1,46 @@
+;; Bootstrap-safe bounded tasks. Uses the same native Task entry as proc.task;
+;; it cannot require the library namespaces this producer is compiling.
+(ns build-execution)
+
+(defn reduce!
+  "Execute at most width private preparations at once. Refill on completion,
+   fold completed results in the caller, and stop/await every owned task.
+   The caller owns publication; workers only prepare disposable outputs."
+  [width action publish initial items]
+  (when-not (and (int? width) (<= 1 width 128))
+    (throw (ex-info "Build concurrency requires 1 <= jobs <= 128" {})))
+  (let [active (atom {}) owner (erlang/self) ticket (erlang/make_ref)
+        start! (fn [[index value]]
+                 (let [task (BeamLisp.Refs/task_exec
+                              (fn []
+                                (let [outcome (try [:ok (action value)]
+                                                (catch error [:error __EXCEPTION_KIND__ error __STACKTRACE__]))]
+                                  (erlang/send owner [:build-completed ticket index outcome]))) :link)]
+                   (swap! active assoc index task)))
+        indexed (map-indexed (fn [index value] [index value]) items)]
+    (try
+      (doseq [item (take width indexed)] (start! item))
+      (loop [remaining (drop width indexed) result initial]
+        (if (empty? @active)
+          result
+          (let [[index outcome] (receive [:build-completed seen index outcome]
+                                  :when (= seen ticket) [index outcome])
+                task (get @active index)]
+            (Task/await task :infinity)
+            (swap! active dissoc index)
+            (if (= :error (first outcome))
+              (erlang/raise (second outcome) (nth outcome 2) (nth outcome 3))
+              (do
+                (when (seq remaining) (start! (first remaining)))
+                (recur (rest remaining) (publish result index (second outcome))))))))
+      (finally
+        (doseq [[_ task] @active] (Task/shutdown task :brutal_kill))
+        ;; Results sent just before cancellation belong only to this invocation.
+        (loop [] (receive [:build-completed seen _ _] :when (= seen ticket) (recur)
+                   (after 0 :ok)))))))
+
+(defn map!
+  "Bounded completion-driven execution with deterministic input-order results."
+  [width action items]
+  (let [results (reduce! width action (fn [out index result] (assoc out index result)) {} items)]
+    (mapv #(get results %) (range (count results)))))
