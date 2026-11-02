@@ -250,6 +250,36 @@ test("an inserted child group that leads with text renders as text", async ({
   expect(errors).toEqual([]);
 });
 
+test("a table written without <tbody> patches through the parser's tbody", async ({
+  page,
+}) => {
+  // REGRESSION: the browser inserts <tbody> into `<table><tr>…`, so the DOM
+  // is table > tbody > tr; the differ indexed rows as the table's children,
+  // `at` walked into undefined and threw, and every later op of the patch was
+  // lost — the pill after the table kept its old text.
+  const tb = fixture.table;
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, tb.mount);
+  for (let i = 0; i < tb.patches.length; i++) {
+    const step = tb.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `table step ${i + 1}`).toBe(canonical(step.html));
+  }
+  await expect(page.locator("#live-root .pill")).toHaveText("Archivé");
+  expect(errors).toEqual([]);
+});
+
 test("clipboard confirms only after resolution and offers manual copy on denial", async ({ page }) => {
   await page.setContent('<div><button data-copy="original" data-copy-success="Copié" data-copy-failure="Copiez le texte"><span class="kn-lab">Copier</span></button></div>');
   await page.addScriptTag({ content: clientJs });
