@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,8 +25,8 @@ def main():
     capsule = out / 'capsule'
     writer = out / 'retain.bl'
     writer.write_text('''(ns producer.probe (:require [selfbuild]))
-(BeamLisp/eval (File/read! (Path/join (System/fetch_env! "BL_TEST_SOURCE_ROOT") "priv/build/producer-cache.bl")))
-(BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "producer-cache" "retain!")
+(BeamLisp/eval (File/read! (Path/join (System/fetch_env! "BL_TEST_SOURCE_ROOT") "scripts/retain-producer.bl")))
+(BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "tooling.retain-producer" "retain!")
  (list (Path/join (System/fetch_env! "BL_SDK_PRODUCT") "unit-store")
        (Path/join (System/fetch_env! "BL_SDK_PRODUCT") "image")
        (System/fetch_env! "BL_TEST_PRODUCER_OUT")))
@@ -36,8 +35,11 @@ def main():
                ELIXIR_ERL_OPTIONS='+S 2:2 +SDcpu 1:1 +SDio 1:1')
     def run(label, argv, **options):
         with (out / (label + '.log')).open('w') as stream:
-            subprocess.run(list(map(str, argv)), stdout=stream, stderr=subprocess.STDOUT,
-                           env=env, check=True, timeout=600, **options)
+            result = subprocess.run(list(map(str, argv)), stdout=stream, stderr=subprocess.STDOUT,
+                                    env=env, timeout=600, **options)
+        if result.returncode:
+            print((out / (label + '.log')).read_text()[-12000:], flush=True)
+            result.check_returncode()
     run('retain', [sdk / 'bin/bl', '--cold', 'run', writer])
     metadata = json.loads((sdk / 'artifact.json').read_text())
     image = out / 'lib/beam_lisp-0.1.0'

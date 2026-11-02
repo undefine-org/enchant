@@ -57,6 +57,18 @@ clean.()
 
 %{eligible: true, modules: restored} = run.()
 if restored == 0, do: raise("empty restored producer")
+tracer = spawn_link(fn ->
+  loop = fn loop ->
+    receive do
+      {:trace, _, :call, {_, :constructor_compile_sdk_unit!, [_source, opts]}} ->
+        IO.puts("SDK-PRODUCER-UNEXPECTED-COMPILE " <> inspect(Keyword.get(opts, :file)))
+        loop.(loop)
+      _ -> loop.(loop)
+    end
+  end
+  loop.(loop)
+end)
+:erlang.trace(:all, true, [:call, {:tracer, tracer}])
 patterns = [{BeamLisp.AOT, :constructor_compile_sdk_unit!, 2}, {BeamLisp.AOT, :compile_source_unit_impl, 2}, {BeamLisp.AOT, :compile_unit, 1}]
 for pattern <- patterns, do: :erlang.trace_pattern(pattern, true, [:local, :call_count])
 0 = BeamLisp.Launcher.boot(["--cold", "eval", "(ns producer.probe (:require [selfbuild])) (println :producer-loaded)"], %{halt: fn status -> status end})
