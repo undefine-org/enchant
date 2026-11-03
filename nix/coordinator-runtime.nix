@@ -35,12 +35,13 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   ln -s lib/beam_lisp-0.1.0 "$out/image"
   cp -a ${ledger}/. "$out/foundry/"
   chmod -R u+w "$out/foundry"
-  mkdir -p "$out/foundry/bin"
+  mkdir -p "$out/foundry/bin" "$out/foundry/src/build"
+  cp ${../priv/build/build-environment.bl} "$out/foundry/src/build-environment.bl"
   cp ${./preparation-jobs.bl} "$out/foundry/bin/jobs.bl"
   cp ${./preparation-operation.bl} "$out/foundry/bin/preparation-operation.bl"
   cat > "$out/foundry/env.bl" <<'PROJECT'
   {:name "foundry-artifact-coordinator"
-   :paths ["src/foundry/operations" "src/foundry/support" "src/foundry/credentials"]}
+   :paths ["src" "src/foundry/operations" "src/foundry/support" "src/foundry/credentials"]}
   PROJECT
   cat > "$out/boot.exs" <<EOF_BOOT
   for path <- Path.wildcard("$out/lib/*/ebin"), do: Code.prepend_path(path)

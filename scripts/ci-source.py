@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 ROOTS = {'.gitignore', '.github', 'AGENTS.md', 'README.md', 'README.bl.org', 'bin', 'nix',
-         'scripts', 'test', 'priv', 'native', 'tooling', 'vendor', 'docs', 'research',
+         'scripts', 'test', 'priv', 'native', 'tooling', 'vendor', 'packages', 'docs', 'research',
          'examples', 'env.bl', 'bl.lock', 'flake.nix', 'flake.lock', 'rust-toolchain', 'rust-toolchain.toml'}
 
 

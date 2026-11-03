@@ -67,6 +67,11 @@ def retained_source_fingerprint(source):
     # SDK. Keep those exact predecessors reusable under THEIR actual digest;
     # the normal producer still verifies every retained compiler/SDK unit.
     root_predecessor = current
+    if 'packages/job-runner' in current['roots']:
+        root_predecessor = dict(current, roots=[
+            'vendor/foundry-ledger' if name == 'packages/job-runner' else name
+            for name in current['roots']])
+        allowed.append(root_predecessor)
     for additions in (
             ('scripts/retain-producer.bl',),
             ('scripts/restore-producer.exs',),
@@ -77,9 +82,11 @@ def retained_source_fingerprint(source):
             root_predecessor = dict(root_predecessor, roots=[
                 name for name in root_predecessor['roots'] if name not in additions])
             allowed.append(root_predecessor)
-    predecessor = current
+    predecessor = dict(current, roots=[
+        'vendor/foundry-ledger' if name == 'packages/job-runner' else name
+        for name in current['roots']])
     if current['reserved'].count('__pycache__') == 1:
-        predecessor = dict(current, reserved=[name for name in current['reserved']
+        predecessor = dict(predecessor, reserved=[name for name in current['reserved']
                                               if name != '__pycache__'])
         allowed.append(predecessor)
     if all(predecessor['excluded'].count(name) == 1 for name in CI_ONLY_EXCLUSIONS):

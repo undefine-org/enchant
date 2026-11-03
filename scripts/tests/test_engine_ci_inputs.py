@@ -42,7 +42,11 @@ class EngineCIInputTests(unittest.TestCase):
         self.write_policy(self.root, self.policy)
         self.engine = self.base / 'retained-engine'
         shutil.copytree(self.root, self.engine)
-        self.bytecode_previous = dict(self.policy, reserved=[name for name in self.policy['reserved']
+        shutil.copytree(self.engine / 'packages/job-runner', self.engine / 'vendor/foundry-ledger')
+        self.legacy_policy = dict(self.policy, roots=[
+            'vendor/foundry-ledger' if name == 'packages/job-runner' else name
+            for name in self.policy['roots']])
+        self.bytecode_previous = dict(self.legacy_policy, reserved=[name for name in self.policy['reserved']
                                                             if name != '__pycache__'])
         self.previous = dict(self.bytecode_previous, excluded=[name for name in self.policy['excluded']
                                                              if name not in CACHE.CI_ONLY_EXCLUSIONS])
@@ -150,7 +154,7 @@ class EngineCIInputTests(unittest.TestCase):
         self.assertEqual(CACHE.source_fingerprint(self.root), CACHE.retained_source_fingerprint(self.root))
 
     def test_compiler_preparation_root_additions_keep_exact_old_identities(self):
-        policy = copy.deepcopy(self.policy)
+        policy = copy.deepcopy(self.legacy_policy)
         for additions in (
                 ('scripts/retain-producer.bl',),
                 ('scripts/restore-producer.exs',),
