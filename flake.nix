@@ -38,12 +38,13 @@
         imports = [ ./nix/artifact-host.nix ];
         services.beam-lisp-artifacts.enable = true;
         assertions = [{
-          assertion = config.services.beam-lisp-artifacts.buildStation != null;
-          message = "Supply services.beam-lisp-artifacts.buildStation from the local workstation description.";
+          assertion = config.services.beam-lisp-artifacts.buildDescription != null;
+          message = "Supply services.beam-lisp-artifacts.buildDescription from a local .bl backend description.";
         }];
       };
-      # A module factory: callers pass their local station description.
+      # A module factory: callers pass their Source-owned backend description.
       lib.artifact-workstation = import ./nix/workstation-artifacts.nix;
+      lib.build-backend = description: import ./nix/backend-description.nix { inherit description; };
       packages.${system} = {
         artifact-platform = import ./nix/artifact-platform.nix { inherit pkgs; };
         command-executor = import ./nix/command-executor.nix { inherit pkgs; };
@@ -54,6 +55,7 @@
         };
         native-products = nativeProducts.bundle;
         native-bl-json = nativeProducts.products.bl_json;
+        native-bl-nix = nativeProducts.products.bl_nix;
         native-code-embed = nativeProducts.products.code_embed;
         native-datom-datalog = nativeProducts.products.datom_datalog;
         native-datom-fjall = nativeProducts.products.datom_fjall;

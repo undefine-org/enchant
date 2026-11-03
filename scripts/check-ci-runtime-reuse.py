@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 
-NON_RUNTIME_PREFIXES = ('test/', 'docs/', 'reports/')
+NON_RUNTIME_PREFIXES = ('test/', 'docs/', 'reports/', 'tooling/build-backends/')
 NON_RUNTIME_FILES = frozenset((
     'README.md', 'AGENTS.md', '.github/workflows/ci.yml', 'scripts/qualify-candidate.py',
     'scripts/qualify-candidate.bl', 'scripts/qualify-self-build.py', 'scripts/ci-test-shard.py',

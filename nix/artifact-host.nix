@@ -1,9 +1,17 @@
 # Managed Linux artifact policy. Apply once through the host deployment.
 { config, lib, pkgs, ... }:
-let cfg = config.services.beam-lisp-artifacts;
+let
+  cfg = config.services.beam-lisp-artifacts;
+  described = if cfg.buildDescription == null then {} else
+    (import ./backend-description.nix { description = cfg.buildDescription; }) { inherit lib; };
 in {
   options.services.beam-lisp-artifacts = {
     enable = lib.mkEnableOption "managed Beam Lisp native artifact production";
+    buildDescription = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Source-owned .bl backend description with its generated Nix projection.";
+    };
     platform = lib.mkOption {
       type = lib.types.package;
       default = import ./artifact-platform.nix { inherit pkgs; };
@@ -58,15 +66,18 @@ in {
     daemonMemoryMax = lib.mkOption { type = lib.types.str; default = "8G"; description = "Aggregate Nix daemon and worker cgroup memory limit."; };
     daemonMemorySwapMax = lib.mkOption { type = lib.types.str; default = "1G"; description = "Aggregate Nix daemon and worker cgroup swap limit."; };
   };
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable (lib.mkMerge [{
     nix.settings = {
       sandbox = true;
       sandbox-fallback = false;
       use-cgroups = true;
-      max-jobs = if cfg.buildStation == null then cfg.maxJobs else 0;
-      builders-use-substitutes = true;
+      max-jobs = lib.mkDefault (if cfg.buildStation == null then cfg.maxJobs else 0);
+      builders-use-substitutes = lib.mkDefault true;
     };
-    assertions = lib.optionals (cfg.buildStation != null) [{
+    assertions = [{
+      assertion = cfg.buildDescription == null || cfg.buildStation == null;
+      message = "Use one Source buildDescription; the legacy buildStation adapter cannot also select a backend.";
+    }] ++ lib.optionals (cfg.buildStation != null) [{
       assertion = cfg.buildStation.sshKey == null || (lib.hasPrefix "/" cfg.buildStation.sshKey
         && !(lib.hasPrefix "/nix/store/" cfg.buildStation.sshKey));
       message = "Artifact build-station credentials require an absolute host key path outside the Nix store.";
@@ -95,5 +106,10 @@ in {
     };
     environment.sessionVariables.BL_ARTIFACT_PLATFORM = toString cfg.platform;
     environment.sessionVariables.BL_NATIVE_PROVIDER = "nix";
-  };
+  } (lib.mkIf (cfg.buildDescription != null) {
+    nix.settings = described.nix.settings or {};
+    nix.buildMachines = described.nix.buildMachines or [];
+    nix.distributedBuilds = lib.mkIf (described.nix ? distributedBuilds) described.nix.distributedBuilds;
+    environment.etc = described.environment.etc or {};
+  })]);
 }

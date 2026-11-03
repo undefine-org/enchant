@@ -10,7 +10,8 @@ class RuntimeReuseTests(unittest.TestCase):
     def test_qualification_changes_do_not_rebuild_a_runtime(self):
         paths = ['test/fixtures/actor.bl', 'scripts/qualify-candidate.bl',
                  'scripts/tests/test_ci_runtime_reuse.py', '.github/workflows/ci.yml',
-                 'reports/qualification.org']
+                 'reports/qualification.org', 'tooling/build-backends/nixbuild.bl',
+                 'tooling/build-backends/nixbuild.nix']
         self.assertEqual([], REUSE.runtime_changes(paths))
 
     def test_every_runtime_and_unknown_input_requires_a_new_producer(self):

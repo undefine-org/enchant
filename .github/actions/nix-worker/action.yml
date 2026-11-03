@@ -1,41 +1,58 @@
 name: Configure the Nix build backend
-description: Select local KVM, existing Nix configuration, or nixbuild.net without changing recipes
+description: Apply a Beam Lisp backend description through its generated Nix projection
 inputs:
-  backend:
-    description: local, configured (existing Nix routing), or nixbuild
-    default: local
+  description:
+    description: Repository or operator .bl backend description with its checked .nix projection
+    default: tooling/build-backends/local.bl
   nixbuild-token:
     description: nixbuild.net auth token supplied by the calling workflow secret
     default: ''
 runs:
   using: composite
   steps:
-    - name: Validate the selected backend
-      shell: bash
-      env:
-        BACKEND: ${{ inputs.backend }}
-        NIXBUILD_TOKEN: ${{ inputs.nixbuild-token }}
-      run: |
-        set -eu
-        case "$BACKEND" in
-          local|configured) ;;
-          nixbuild) test -n "$NIXBUILD_TOKEN" || { echo '::error::nixbuild backend requires NIXBUILD_TOKEN'; exit 64; } ;;
-          *) echo '::error::Unknown Nix backend; choose local, configured, or nixbuild'; exit 64 ;;
-        esac
     - uses: cachix/install-nix-action@v31
       with:
         extra_nix_config: |
           experimental-features = nix-command flakes
-          ${{ inputs.backend == 'local' && 'max-jobs = 1' || '' }}
-          ${{ inputs.backend == 'nixbuild' && 'max-jobs = 0' || '' }}
-          ${{ inputs.backend == 'local' && 'cores = 4' || '' }}
-          ${{ inputs.backend == 'local' && 'extra-system-features = kvm' || '' }}
-          ${{ inputs.backend == 'local' && 'extra-sandbox-paths = /dev/kvm' || '' }}
+    - name: Read the Source-owned backend projection
+      id: policy
+      shell: bash
+      env:
+        DESCRIPTION: ${{ inputs.description }}
+      run: |
+        python3 scripts/build-backend.py --description "$DESCRIPTION" \
+          --config-out "$RUNNER_TEMP/beam-lisp-backend.conf" --github-output "$GITHUB_OUTPUT"
+    - name: Validate the selected backend
+      shell: bash
+      env:
+        BACKEND: ${{ steps.policy.outputs.backend }}
+        NIXBUILD_TOKEN: ${{ inputs.nixbuild-token }}
+      run: |
+        set -eu
+        case "$BACKEND" in
+          local|configured|ssh) ;;
+          nixbuild) test -n "$NIXBUILD_TOKEN" || { echo '::error::nixbuild backend requires NIXBUILD_TOKEN'; exit 64; } ;;
+          *) echo '::error::Unknown compiled build backend'; exit 64 ;;
+        esac
     - name: Configure nixbuild.net
-      if: inputs.backend == 'nixbuild'
+      if: steps.policy.outputs.backend == 'nixbuild'
       uses: nixbuild/nixbuild-action@ccd11ee76c26c018e8470835dc2e286a5a024a14 # v27
       with:
         nixbuild_token: ${{ inputs.nixbuild-token }}
+        ssh_address: ${{ steps.policy.outputs.nixbuild-host }}
+    - name: Apply the compiled client policy
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ steps.policy.outputs.config-path }}
+      run: |
+        set -eu
+        delimiter="backend_$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+        {
+          echo "NIX_CONFIG<<$delimiter"
+          printf '%s\n' "${NIX_CONFIG:-}"
+          printf 'include %s\n' "$CONFIG_PATH"
+          echo "$delimiter"
+        } >> "$GITHUB_ENV"
     - name: Enable the host qualifier user manager
       shell: bash
       run: |
@@ -48,7 +65,7 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends sqlite3 ripgrep
     - name: Verify local KVM access
-      if: inputs.backend == 'local'
+      if: steps.policy.outputs.backend == 'local'
       shell: bash
       run: |
         set -eu

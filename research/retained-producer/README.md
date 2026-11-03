@@ -162,7 +162,7 @@ prototype branch.
 The build recipes consume standard Nix routing. The station module accepts
 `ssh` and `ssh-ng`, external SSH configuration and explicitly declared builder
 capabilities. The CI worker adapter selects `local`, `configured` or `nixbuild`
-through repository configuration; runner labels are configurable independently.
+through a Source backend description; runner labels are configurable independently.
 The nixbuild.net route uses its pinned official action and a CI token secret.
 It disables local Nix builds and does not require KVM on the orchestration runner.
 
@@ -176,6 +176,26 @@ The [portability report](portability-checks.json) records 165 passing Python
 tests with three skips, workflow lint, module policy checks and eight real
 Source/environment controls in a bounded worker on the configured builder.
 These checks do not claim a live nixbuild.net account run. Activating that CI
-backend requires `NIX_BUILD_BACKEND=nixbuild`, the `NIXBUILD_TOKEN` secret and
+backend selects `tooling/build-backends/nixbuild.bl` through `CI_BUILD_DESCRIPTION`, requires the `NIXBUILD_TOKEN` secret and
 a successful full provider run. Store-only nixbuild.net realization does not
 depend on deploying the optional operator shell evaluation endpoint.
+
+## Source-owned Nix compilation
+
+Beam Lisp owns `nix`, `nix.native` and `native/bl_nix`. The implementation is
+ported from Foundry's lossless codec with its dependency lock and laws, and
+adapted to the current Vector representation. The codec has no Foundry runtime
+dependency. The existing vendored durable job runner is a separate dependency.
+
+`build.backend` owns description validation, Nix emission, its inverse and
+client-option generation. Four `.bl` descriptions declare local, configured,
+SSH and nixbuild.net workers. Checked adjacent Nix projections let a clean
+client select its backend before an SDK exists. Both CI and the NixOS module
+consume those projections; the SDK gate checks exact regeneration. Backend
+policy data stays outside the SDK's engine capture, so changing worker routing
+does not itself invalidate compiled language units.
+
+See [the Source/Nix workflow](../../docs/build/nix-codec.org) and the
+[qualification report](backend-description-checks.json) for measured scope.
+A live nixbuild.net account run and full production SDK/CI qualification remain
+separate deployment requirements.

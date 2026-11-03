@@ -1,0 +1,147 @@
+;; Backend policy is Source data. Nix projections bootstrap clean clients.
+(ns build.backend (:require [nix :as nix] [clojure.edn :as edn]))
+
+(defn- refuse! [message] (throw (ex-info message {:kind :build-backend})))
+(defn- exact! [value required optional]
+  (when-not (and (map? value) (every? #(contains? value %) required)
+                (every? #(contains? (set (concat required optional)) %) (keys value)))
+    (refuse! "Unknown or missing backend description fields")))
+(defn- data! [value depth]
+  (when (> depth 64) (refuse! "Backend data exceeds nesting bound"))
+  (cond
+    (map? value)
+    (doseq [[key item] value]
+      (when-not (and (string? key) (not (contains? #{"nix/expr" "nix/path"} key)))
+        (refuse! "Nix configuration uses string keys and plain data"))
+      (data! item (inc depth)))
+    (vector? value) (doseq [item value] (data! item (inc depth)))
+    (or (nil? value) (string? value) (number? value) (= true value) (= false value)) nil
+    :else (refuse! "Backend configuration must contain plain Nix data")))
+
+(defn validate
+  "A closed, data-only description. Nix owns validation of its own option types."
+  [description]
+  (exact! description [:version :kind :nix] [:evaluation])
+  (when-not (and (= 1 (:version description))
+                (contains? #{:local :configured :ssh :nixbuild} (:kind description))
+                (map? (:nix description)))
+    (refuse! "Unsupported backend description"))
+  (data! (:nix description) 0)
+  (when-not (every? #(contains? #{"settings" "buildMachines" "distributedBuilds"} %) (keys (:nix description)))
+    (refuse! "Backend Nix options must describe settings and builders"))
+  (let [jobs (get-in description [:nix "settings" "max-jobs"])
+        machines (get-in description [:nix "buildMachines"])]
+    (when (and (some? jobs) (not (and (int? jobs) (>= jobs 0))))
+      (refuse! "max-jobs must be a nonnegative integer"))
+    (when (and (= :local (:kind description)) (not (and (int? jobs) (> jobs 0))))
+      (refuse! "A local backend declares a positive local job bound"))
+    (when (contains? #{:ssh :nixbuild} (:kind description))
+      (when-not (and (= 0 jobs) (vector? machines) (not (empty? machines)))
+        (refuse! "Remote backends disable local workers and declare their builders"))))
+  (when (contains? description :evaluation)
+    (let [evaluation (:evaluation description)]
+      (exact! evaluation ["storeUri" "transport"] [])
+      (data! evaluation 0)
+      (when-not (and (string? (get evaluation "storeUri"))
+                    (Regex/match? #"^ssh(-ng)?://.+$" (get evaluation "storeUri"))
+                    (vector? (get evaluation "transport"))
+                    (every? string? (get evaluation "transport"))
+                    (= 1 (count (filter #(= "{endpoint}" %) (get evaluation "transport")))))
+        (refuse! "Evaluation requires an SSH store and a finite endpoint command"))))
+  description)
+
+(defn read
+  "Read exactly one .bl data declaration without evaluating Source."
+  [source]
+  (when (> (erlang/byte_size source) 1048576) (refuse! "Backend description exceeds byte bound"))
+  (let [forms (edn/read-string-all source)]
+    (when-not (= 1 (count forms)) (refuse! "A backend description contains exactly one value"))
+    (validate (first forms))))
+
+(defn- projection [description]
+  (let [description (validate description)
+        result {"version" 1 "kind" (name (:kind description)) "nix" (:nix description)}]
+    (if (contains? description :evaluation) (assoc result "evaluation" (:evaluation description)) result)))
+
+(defn- token! [value]
+  (when-not (and (string? value) (not (empty? value))
+                (not (Regex/match? #"[\s;\x00]" value)))
+    (refuse! "Nix builder fields must be single tokens")) value)
+(defn- setting [value]
+  (cond
+    (= true value) "true"
+    (= false value) "false"
+    (int? value) (str value)
+    (and (string? value) (not (Regex/match? #"[\r\n\x00]" value))) value
+    (vector? value) (join " " (map #(token! (setting %)) value))
+    :else (refuse! "Unsupported nix.conf setting value")))
+(defn- machine-rows [machine]
+  (exact! machine ["hostName"] ["protocol" "system" "systems" "sshUser" "sshKey"
+                               "maxJobs" "speedFactor" "supportedFeatures" "mandatoryFeatures"])
+  (let [protocol (get machine "protocol" "ssh") user (get machine "sshUser")
+        host (token! (get machine "hostName"))
+        systems (if (get machine "system") [(get machine "system")] (get machine "systems"))
+        jobs (get machine "maxJobs" 1) speed (get machine "speedFactor" 1)
+        features (fn [key] (let [items (get machine key [])]
+                             (if (empty? items) "-" (join "," (map token! items)))))]
+    (when-not (and (contains? #{"ssh" "ssh-ng"} protocol)
+                  (vector? systems) (not (empty? systems))
+                  (int? jobs) (> jobs 0) (int? speed) (> speed 0))
+      (refuse! "Invalid Nix builder transport, systems or capacity"))
+    (map (fn [system]
+           (join " " [(str protocol "://" (when user (str (token! user) "@")) host)
+                      (token! system) (token! (or (get machine "sshKey") "-"))
+                      (str jobs) (str speed) (features "supportedFeatures") (features "mandatoryFeatures")])) systems)))
+
+(defn client-config
+  "Compile client options from the same Nix data used by the NixOS module."
+  [description]
+  (let [description (validate description) settings (get (:nix description) "settings" {})
+        machines (get (:nix description) "buildMachines" [])
+        lines (map (fn [key]
+                     (when-not (Regex/match? #"^[A-Za-z][A-Za-z0-9-]*$" key)
+                       (refuse! "Invalid nix.conf setting name"))
+                     (str key " = " (setting (get settings key)))) (sort (keys settings)))
+        _ (when (and (not (empty? machines)) (contains? settings "builders"))
+            (refuse! "Declare builders once through buildMachines"))
+        rows (mapcat machine-rows machines)
+        lines (if (empty? rows) lines (concat lines [(str "builders = " (join "; " rows))]))]
+    (if (empty? lines) "" (str (join "\n" lines) "\n"))))
+
+(defn from-nix
+  "Recover a .bl backend value from its Nix data projection. Never evaluates Nix."
+  [source]
+  (let [document (nix/data (nix/read source))
+        value (get document "description")
+        kind (case (get value "kind") "local" :local "configured" :configured
+               "ssh" :ssh "nixbuild" :nixbuild (refuse! "Unknown backend kind"))
+        result {:version (get value "version") :kind kind :nix (get value "nix")}]
+    (exact! document ["description" "sourceSha256" "clientConfig"] [])
+    (exact! value ["version" "kind" "nix"] ["evaluation"])
+    (let [result (validate (if (contains? value "evaluation") (assoc result :evaluation (get value "evaluation")) result))]
+      (when-not (= (get document "clientConfig") (client-config result))
+        (refuse! "Nix client projection disagrees with the Source description"))
+      result)))
+
+(defn compile
+  "Compile .bl data to a deterministic Nix bootstrap projection and verify its inverse."
+  [source]
+  (let [description (read source)
+        digest (String/downcase (Base/encode16 (crypto/hash :sha256 source)))
+        emitted (str "# Generated by build.backend from the adjacent .bl description.\n"
+                     (nix/emit {"sourceSha256" digest "description" (projection description)
+                                "clientConfig" (client-config description)}) "\n")]
+    (when-not (= description (from-nix emitted)) (refuse! "Backend/Nix round trip changed the description"))
+    emitted))
+
+(defn compile-file!
+  "Write the adjacent .nix projection, or check exact generated bytes with :check true."
+  ([path] (compile-file! path {}))
+  ([path options]
+   (when-not (String/ends_with? path ".bl") (refuse! "Backend description must end in .bl"))
+   (let [output (str (String/slice path 0 (- (String/length path) 3)) ".nix")
+         expected (compile (File/read! path))]
+     (if (:check options)
+       (when-not (= (tuple :ok expected) (File/read output)) (refuse! (str "Stale backend projection: " output)))
+       (File/write! output expected))
+     output)))

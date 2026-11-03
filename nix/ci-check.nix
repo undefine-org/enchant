@@ -5,7 +5,7 @@ let
   root = /. + source;
   roots = builtins.filter (name: builtins.pathExists (root + "/${name}")) [
     ".gitignore" ".github" "AGENTS.md" "README.md" "README.bl.org" "examples" "bin" "nix" "scripts"
-    "test" "priv" "native" "tooling/drop" "vendor/foundry-ledger"
+    "test" "priv" "native" "tooling/drop" "tooling/build-backends" "vendor/foundry-ledger"
     "docs" "research" "env.bl" "bl.lock" "flake.nix" "flake.lock"
     "rust-toolchain" "rust-toolchain.toml"
   ];

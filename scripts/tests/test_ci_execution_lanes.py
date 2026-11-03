@@ -107,7 +107,8 @@ class ExecutionLaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / 'project'
             root.mkdir()
-            for name in ['env.bl', 'examples/real.bl', 'README.bl.org', 'ignored.secret']:
+            for name in ['env.bl', 'examples/real.bl', 'README.bl.org',
+                         'tooling/build-backends/ci.bl', 'tooling/build-backends/ci.nix', 'ignored.secret']:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(name)
@@ -117,6 +118,7 @@ class ExecutionLaneTests(unittest.TestCase):
             source.capture(root, snapshot)
             self.assertEqual('examples/real.bl', (snapshot / 'examples/real.bl').read_text())
             self.assertEqual('README.bl.org', (snapshot / 'README.bl.org').read_text())
+            self.assertEqual('tooling/build-backends/ci.bl', (snapshot / 'tooling/build-backends/ci.bl').read_text())
             self.assertFalse((snapshot / 'ignored.secret').exists())
 
 

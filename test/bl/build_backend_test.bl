@@ -1,0 +1,43 @@
+(ns build.backend-test (:require [build.backend :as backend] [nix :as nix]))
+
+(defn- refused? [f] (try (f) false (catch error true)))
+(def local {:version 1 :kind :local :nix {"settings" {"max-jobs" 1 "cores" 2}}})
+
+(deftest backend-policy-round-trips-through-the-native-nix-codec
+  (doseq [description [local {:version 1 :kind :configured :nix {}}
+                       {:version 1 :kind :ssh :nix {"settings" {"max-jobs" 0}
+                                                   "buildMachines" [{"hostName" "build.example.invalid" "systems" ["x86_64-linux"]}]}}]]
+    (let [source (pr-str description) generated (backend/compile source)]
+      (is (= description (backend/from-nix generated)))
+      (is (= generated (backend/compile source)))
+      (is (= (String/downcase (Base/encode16 (crypto/hash :sha256 source)))
+             (get (nix/data (nix/read generated)) "sourceSha256"))))))
+
+(deftest backend-reader-refuses-expressions-extra-forms-and-unknown-policies
+  (is (refused? #(backend/read "(throw (ex-info \"must not run\" {}))")))
+  (is (refused? #(backend/read (str (pr-str local) "\n42"))))
+  (is (refused? #(backend/compile (pr-str (assoc local :kind :other)))))
+  (is (refused? #(backend/compile (pr-str (assoc local :argv ["sh"]))))))
+
+(deftest descriptions-retain-literal-configuration-and-refuse-embedded-nix-code
+  (let [description (assoc local :nix {"settings" {"max-jobs" 1 "literal" "${neverExecute}"}})]
+    (is (= description (backend/from-nix (backend/compile (pr-str description))))))
+  (is (refused? #(backend/compile (pr-str (assoc local :nix {"settings" {"command" {:nix/expr "builtins.abort \"no\""}}}))))))
+
+(deftest remote-backends-never-enable-a-local-worker
+  (is (refused? #(backend/compile (pr-str (assoc local :kind :nixbuild)))))
+  (is (refused? #(backend/compile (pr-str {:version 1 :kind :ssh :nix {"settings" {"max-jobs" 0}}})))))
+
+(deftest client-configuration-refuses-line-and-builder-field-injection
+  (doseq [host ["host;second-builder" "host\nextra-line" "host name"]]
+    (is (refused? #(backend/client-config
+                    {:version 1 :kind :ssh :nix {"settings" {"max-jobs" 0}
+                      "buildMachines" [{"hostName" host "systems" ["x86_64-linux"]}]}}))))
+  (is (refused? #(backend/client-config (assoc local :nix {"settings" {"builders\nextra-setting" "value"}})))))
+
+(deftest every-repository-backend-has-an-exact-generated-projection
+  (doseq [name ["local" "configured" "nixbuild" "ssh"]]
+    (let [path (str "tooling/build-backends/" name ".bl")]
+      (is (= (backend/read (File/read! path))
+             (backend/from-nix (File/read! (str "tooling/build-backends/" name ".nix")))))
+      (is (string? (backend/compile-file! path {:check true}))))))

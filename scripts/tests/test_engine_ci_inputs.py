@@ -66,7 +66,7 @@ class EngineCIInputTests(unittest.TestCase):
         self.assertIsNotNone(match, data['command'])
         return Path(match.group(1)), data['derivation']
 
-    def test_python_bytecode_cache_never_changes_fingerprint_or_canonical_capture(self):
+    def test_generated_cache_and_backend_data_never_change_engine_capture(self):
         source = self.root / 'nix/application-inventory.py'
         source.write_text('VERSION = 1\n')
         before = CACHE.source_fingerprint(self.root)
@@ -77,6 +77,13 @@ class EngineCIInputTests(unittest.TestCase):
         self.assertEqual(before, CACHE.source_fingerprint(self.root))
         self.assertEqual(captured, self.capture())
         self.assertFalse((captured[0] / 'nix/__pycache__').exists())
+        for name in ('tooling/build-backends/ci.bl', 'tooling/build-backends/ci.nix'):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('operator-owned backend policy')
+            self.assertEqual(before, CACHE.source_fingerprint(self.root))
+            self.assertEqual(captured, self.capture())
+        self.assertFalse((captured[0] / 'tooling/build-backends').exists())
         bytecode.write_bytes(bytecode.read_bytes() + b'edited generated cache')
         self.assertEqual(before, CACHE.source_fingerprint(self.root))
         self.assertEqual(captured, self.capture())
