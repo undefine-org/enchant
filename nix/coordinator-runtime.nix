@@ -77,13 +77,25 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   done
   case "\$job" in job_*) ;; *) echo 'worker job id required' >&2; exit 64 ;; esac
   case "\$job" in *[!A-Za-z0-9_]*) exit 64 ;; esac
-  exec ${platform}/bin/systemd-run --user --quiet --collect --wait --pipe \\
+  # Operator Nix policy crosses the manager boundary as runtime environment,
+  # never as request data or a captured credential in this immutable product.
+  manager_environment=()
+  worker_environment=()
+  for name in NIX_CONFIG NIX_SSHOPTS NIX_USER_CONF_FILES NIX_CONF_DIR SSH_AUTH_SOCK XDG_CONFIG_HOME; do
+    if [[ -v \$name ]]; then
+      manager_environment+=("--setenv=\$name")
+      worker_environment+=("\$name=\''${!name}")
+    fi
+  done
+  exec ${platform}/bin/systemd-run --user --quiet --collect --wait --pipe --expand-environment=no \\
     --working-directory="$out/foundry" --unit="foundry-artifact-\$job.service" \\
     --property=MemoryMax=4G --property=MemorySwapMax=0 \\
     --property=RuntimeMaxSec=3600 --property=KillMode=control-group \\
+    "\''${manager_environment[@]}" \\
     -- ${pkgs.coreutils}/bin/env -i "HOME=\$HOME" "PATH=${platform}/bin:/usr/bin:/bin" \\
       "XDG_RUNTIME_DIR=\''${XDG_RUNTIME_DIR:-}" \\
       "DBUS_SESSION_BUS_ADDRESS=\''${DBUS_SESSION_BUS_ADDRESS:-}" \\
+      "\''${worker_environment[@]}" \\
       "$out/bin/bl" --cold "\$@"
   EOF_WORKER
   chmod 555 "$out/bin/bl" "$out/bin/worker"

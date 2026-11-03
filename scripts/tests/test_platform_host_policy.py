@@ -24,14 +24,20 @@ class PlatformHostPolicy(unittest.TestCase):
             manager.write_text('''#!/usr/bin/env python3
 import os, sys
 start = sys.argv.index('nix-build')
-os.execvp('nix-build', sys.argv[start:])
+# Simulate the manager's separate environment: only explicit settings cross.
+env = dict(os.environ)
+for key in ('NIX_CONFIG', 'NIX_SSHOPTS'):
+    env.pop(key, None)
+    if '--setenv=' + key in sys.argv[:start]:
+        env[key] = os.environ[key]
+os.execvpe('nix-build', sys.argv[start:], env)
 ''')
             manager.chmod(0o755)
             builder = project / 'tools/nix-build'
             builder.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
 pathlib.Path(os.environ['PLATFORM_CAPTURE']).write_text(json.dumps({
-    'argv': sys.argv[1:], 'config': os.environ['NIX_CONFIG']}))
+    'argv': sys.argv[1:], 'config': os.environ['NIX_CONFIG'], 'ssh': os.environ['NIX_SSHOPTS']}))
 target = pathlib.Path(sys.argv[sys.argv.index('--out-link') + 1])
 target.mkdir(parents=True)
 (target / 'platform.json').write_text('{}')
@@ -43,13 +49,14 @@ target.mkdir(parents=True)
                     shutil.rmtree(project / '.bl', ignore_errors=True)
                     policy = f'max-jobs = {jobs}\ncores = 4\n'
                     env = dict(os.environ, PATH=str(project / 'tools') + os.pathsep + os.environ['PATH'],
-                               PLATFORM_CAPTURE=str(capture), NIX_CONFIG=policy)
+                               PLATFORM_CAPTURE=str(capture), NIX_CONFIG=policy, NIX_SSHOPTS='-F/operator/ssh-$literal')
                     subprocess.run(['bash', str(project / 'scripts/prepare-checkout-platform')],
                                    env=env, check=True, capture_output=True, text=True)
                     actual = json.loads(capture.read_text())
                     self.assertNotIn('--cores', actual['argv'])
                     self.assertNotIn('--max-jobs', actual['argv'])
                     self.assertEqual(policy, actual['config'])
+                    self.assertEqual(env['NIX_SSHOPTS'], actual['ssh'])
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 """Finite preparation transport. Placement is operator-owned local data.
 
-The ssh-ng store is only a copy transport. Evaluation runs in the endpoint
+The configured Nix store is a copy transport. Evaluation runs in the endpoint
 process, from recipes copied with this immutable platform. Without a local
 station description the same operations run through the ordinary Nix daemon.
 """
@@ -74,8 +74,13 @@ def arguments(value, platform=PLATFORM):
 
 
 def command(argv, **options):
+    argv = list(map(str, argv))
+    if argv[0] == 'nix':
+        # Enable our CLI features without replacing operator NIX_CONFIG,
+        # credentials, substituters or provider routing.
+        argv[1:1] = ['--extra-experimental-features', 'nix-command flakes']
     started = time.monotonic()
-    result = subprocess.run(list(map(str, argv)), check=True, timeout=options.pop('timeout', 3300), **options)
+    result = subprocess.run(argv, check=True, timeout=options.pop('timeout', 3300), **options)
     print('BUILD-STATION-PHASE ' + json.dumps(dict(tool=str(argv[0]), seconds=time.monotonic()-started)), file=sys.stderr, flush=True)
     return result
 

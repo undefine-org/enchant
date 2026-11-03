@@ -85,7 +85,10 @@ class ExecutionLaneTests(unittest.TestCase):
         root = Path('/frozen/source')
         command = host.unit_command(root, Path('/nix/store/sdk'), Path('/nix/store/runtime'),
                                     Path('/request.json'), Path('/receipts'), '/run/user/1/private',
-                                    {'PATH': '/bin', 'HOME': '/home/runner'}, python='/bin/python3')
+                                    {'PATH': '/bin', 'HOME': '/home/runner',
+                                     'NIX_CONFIG': 'include /operator/nix.conf',
+                                     'NIX_SSHOPTS': '-F/operator/ssh-$literal',
+                                     'UNRELATED_SECRET': 'must-stay-out'}, python='/bin/python3')
         delimiter = command.index('--')
         prefix = command.index(str(root / 'scripts/with-release-runtime'))
         worker = command.index(str(root / 'scripts/ci-check-worker.py'))
@@ -94,6 +97,10 @@ class ExecutionLaneTests(unittest.TestCase):
         self.assertIn('--property=MemoryMax=6G', command[:delimiter])
         self.assertIn('--property=MemorySwapMax=0', command[:delimiter])
         self.assertIn('--property=KillMode=control-group', command[:delimiter])
+        self.assertIn('--setenv=NIX_CONFIG=include /operator/nix.conf', command[:delimiter])
+        self.assertIn('--setenv=NIX_SSHOPTS=-F/operator/ssh-$literal', command[:delimiter])
+        self.assertIn('--expand-environment=no', command[:delimiter])
+        self.assertFalse(any('UNRELATED_SECRET' in value for value in command))
 
     def test_both_execution_lanes_keep_real_example_and_literate_fixture_inputs(self):
         source = load('ci-source.py')

@@ -3,8 +3,7 @@
 # measured glibc requirement is recorded in the release requirements receipt;
 # see docs/native-bundler.md. The SDK retains its pinned Nix runtime.
 #
-# nixpkgs is pinned to the SAME rev as ../foundry/infra/flake.lock.
-# Keep the two in step: `nix flake lock --override-input nixpkgs <rev>`.
+# This repository's lock owns the toolchain independently of host deployments.
 {
   description = "beam-lisp: incremental SDK and qualified Linux drop";
 
@@ -97,7 +96,7 @@
           echo "$got"
           v=$(echo "$got" | cut -d' ' -f1)
           [ "$(printf '%s\n2.44\n' "$v" | sort -V | tail -1)" = 2.44 ] \
-            || { echo "glibc floor $v > 2.44 (the servers' glibc)" >&2; exit 1; }
+            || { echo "glibc floor $v > 2.44 (the release ABI ceiling)" >&2; exit 1; }
           touch $out
         '';
       };

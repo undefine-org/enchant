@@ -9,6 +9,7 @@ let
       sshUser = "builder";
       sshKey = "/run/keys/local-build";
       maxJobs = 3;
+      supportedFeatures = [ "kvm" ];
       evaluation = {
         storeUri = "ssh-ng://fixture-store";
         transport = [ "ssh" "fixture-operator" "{endpoint}" ];

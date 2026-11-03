@@ -28,10 +28,16 @@ in {
             });
           };
           hostName = lib.mkOption { type = lib.types.str; };
-          sshUser = lib.mkOption { type = lib.types.str; default = "nix-ssh"; };
+          protocol = lib.mkOption {
+            type = lib.types.enum [ "ssh" "ssh-ng" ];
+            default = "ssh-ng";
+            description = "Nix builder transport supported by the operator's provider.";
+          };
+          sshUser = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           sshKey = lib.mkOption {
-            type = lib.types.str;
-            description = "Absolute host-owned key location. Key bytes must never enter the Nix store.";
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Absolute host-owned key location, or null to use the daemon's SSH configuration. Key bytes must never enter the Nix store.";
           };
           hostPublicKey = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
@@ -42,12 +48,13 @@ in {
           maxJobs = lib.mkOption { type = lib.types.ints.positive; default = 2; };
           supportedFeatures = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ "kvm" "nixos-test" "benchmark" ];
+            default = [];
+            description = "Capabilities declared by the operator for this builder; VM recipes require kvm.";
           };
         };
       });
     };
-    maxJobs = lib.mkOption { type = lib.types.ints.positive; default = 1; description = "Concurrent local Nix builds on this shared host."; };
+    maxJobs = lib.mkOption { type = lib.types.ints.unsigned; default = 1; description = "Concurrent local Nix builds; zero delegates to externally configured builders."; };
     daemonMemoryMax = lib.mkOption { type = lib.types.str; default = "8G"; description = "Aggregate Nix daemon and worker cgroup memory limit."; };
     daemonMemorySwapMax = lib.mkOption { type = lib.types.str; default = "1G"; description = "Aggregate Nix daemon and worker cgroup swap limit."; };
   };
@@ -60,14 +67,13 @@ in {
       builders-use-substitutes = true;
     };
     assertions = lib.optionals (cfg.buildStation != null) [{
-      assertion = lib.hasPrefix "/" cfg.buildStation.sshKey
-        && !(lib.hasPrefix "/nix/store/" cfg.buildStation.sshKey);
+      assertion = cfg.buildStation.sshKey == null || (lib.hasPrefix "/" cfg.buildStation.sshKey
+        && !(lib.hasPrefix "/nix/store/" cfg.buildStation.sshKey));
       message = "Artifact build-station credentials require an absolute host key path outside the Nix store.";
     }];
     nix.distributedBuilds = lib.mkIf (cfg.buildStation != null) true;
     nix.buildMachines = lib.optional (cfg.buildStation != null) {
-      inherit (cfg.buildStation) hostName sshUser sshKey systems maxJobs supportedFeatures;
-      protocol = "ssh-ng";
+      inherit (cfg.buildStation) hostName protocol sshUser sshKey systems maxJobs supportedFeatures;
     };
     programs.ssh.knownHosts = lib.mkIf
       (cfg.buildStation != null && cfg.buildStation.hostPublicKey != null) {

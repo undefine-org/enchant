@@ -31,7 +31,7 @@ class IsolatedContinuity(unittest.TestCase):
                            env=dict(os.environ, RUNNER_TEMP=str(root), CAPTURE_ARGV=str(receipt)),
                            check=True)
             self.assertEqual(receipt.read_text().splitlines(), [
-                '--local', '--sdk', '/nix/store/retained-selection', '--out',
+                '--sdk', '/nix/store/retained-selection', '--out',
                 str(root / 'check-isolated-continuity'), 'test/bl/reload/continuity_demo_test.bl'])
 
 

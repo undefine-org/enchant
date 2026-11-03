@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,16 @@ OUTPUT = '/nix/store/' + 'c' * 32 + '-output'
 
 
 class BuildStationTests(unittest.TestCase):
+    def test_nix_features_do_not_replace_operator_policy_or_credentials(self):
+        policy = 'include /operator/nix.conf'
+        with patch.dict(os.environ, NIX_CONFIG=policy, NIX_SSHOPTS='-F/operator/ssh.conf'), \
+                patch.object(STATION.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            STATION.command(['nix', 'build', '--file', 'recipe.nix'])
+            argv = run.call_args.args[0]
+            self.assertEqual(['nix', '--extra-experimental-features', 'nix-command flakes', 'build'], argv[:4])
+            self.assertNotIn('env', run.call_args.kwargs)
+            self.assertEqual(policy, os.environ['NIX_CONFIG'])
+
     def test_finite_operations_share_the_normal_pinned_recipes(self):
         for value, recipe in [
             ({'version': 1, 'kind': 'sdk', 'source': SOURCE, 'product': 'sdk'}, 'sdk-artifact.nix'),

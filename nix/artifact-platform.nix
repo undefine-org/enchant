@@ -19,7 +19,6 @@ pkgs.runCommand "beam-lisp-artifact-platform" {} ''
   cat > "$out/bin/beam-build-station" <<EOF
   #!${pkgs.runtimeShell}
   export PATH=${pkgs.nix}/bin:\$PATH
-  export NIX_CONFIG='experimental-features = nix-command flakes'
   exec ${pkgs.python3}/bin/python3 "$out/nix/build-station.py" --serve
   EOF
   chmod 555 "$out/bin/beam-build-station"

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CheckHostPolicyTests(unittest.TestCase):
-    def test_station_default_and_explicit_hosted_local_reach_actual_nix_argv(self):
+    def test_configured_routing_and_explicit_overrides_reach_actual_nix_argv(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             source = base / 'source'
@@ -33,14 +33,18 @@ receipt.update({name: '0' * 64 for name in ['sdk_descriptor_sha256', 'candidate_
 ''')
             nix.chmod(0o755)
             capture = base / 'nix-argv.json'
-            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'], CHECK_CAPTURE=str(capture))
-            for flags, expected in (([], '0'), (['--local'], '1')):
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'], CHECK_CAPTURE=str(capture),
+                       NIX_CONFIG='builders = ssh://provider.example.invalid x86_64-linux\nmax-jobs = 0\n')
+            for index, (flags, expected) in enumerate((([], None), (['--local'], '1'), (['--remote'], '0'))):
                 with self.subTest(flags=flags):
-                    out = base / ('station' if not flags else 'hosted')
+                    out = base / str(index)
                     subprocess.run([str(ROOT / 'scripts/ci-check'), *flags, '--source', str(source),
                                     '--out', str(out), 'test/finite_test.bl'], env=env,
                                    check=True, stdout=subprocess.DEVNULL)
                     argv = json.loads(capture.read_text())
-                    self.assertEqual(expected, argv[argv.index('--max-jobs') + 1])
+                    if expected is None:
+                        self.assertNotIn('--max-jobs', argv)
+                    else:
+                        self.assertEqual(expected, argv[argv.index('--max-jobs') + 1])
                     self.assertIn('--out-link', argv)
-                    self.assertNotIn('--option builders', argv)
+                    self.assertNotIn('builders', argv)
