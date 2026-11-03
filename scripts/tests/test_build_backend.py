@@ -7,6 +7,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import contextlib
+import io
+import sys
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('build_backend', ROOT / 'scripts/build-backend.py')
@@ -15,6 +19,18 @@ SPEC.loader.exec_module(BACKEND)
 
 
 class BuildBackendTests(unittest.TestCase):
+    def test_user_station_install_consumes_the_source_owned_transport(self):
+        evaluation = {'storeUri': 'ssh-ng://operator-station', 'transport': ['ssh', 'operator-station', '{endpoint}']}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'station.json'
+            argv = ['backend', '--description', 'operator.bl', '--station-out', str(output)]
+            with patch.object(sys, 'argv', argv), patch.object(BACKEND, 'load', return_value=(
+                    dict(version=1, kind='configured', nix={}, evaluation=evaluation), '')), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                BACKEND.main()
+            self.assertEqual(dict(version=1, **evaluation), json.loads(output.read_text()))
+            self.assertEqual(0o600, output.stat().st_mode & 0o777)
+
     def test_source_owned_projections_feed_the_real_nix_client(self):
         with tempfile.TemporaryDirectory() as temporary:
             for name, jobs in [('local', 1), ('configured', None), ('nixbuild', 0), ('ssh', 0)]:

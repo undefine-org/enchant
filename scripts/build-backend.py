@@ -42,11 +42,18 @@ def main():
     parser.add_argument('--description', type=Path, required=True)
     parser.add_argument('--config-out', type=Path)
     parser.add_argument('--github-output', type=Path)
+    parser.add_argument('--station-out', type=Path, help='Install the declared evaluation transport as private user configuration')
     args = parser.parse_args()
     if args.github_output and not args.config_out:
         parser.error('--github-output requires --config-out')
     description, config = load(args.description)
+    if args.station_out and 'evaluation' not in description:
+        parser.error('station-out requires an evaluation transport in the Source description')
     result = dict(backend=description['kind'], nixConfig=config)
+    if args.station_out:
+        args.station_out.write_text(json.dumps(dict(version=1, **description['evaluation']), sort_keys=True) + '\n')
+        args.station_out.chmod(0o600)
+        result['stationPath'] = str(args.station_out.resolve())
     if args.config_out:
         args.config_out.write_text(config)
         args.config_out.chmod(0o600)

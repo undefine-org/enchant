@@ -24,6 +24,11 @@ LIMIT = 1048576
 PLATFORM = Path(__file__).resolve().parent.parent
 
 
+def default_description():
+    user = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'beam-lisp/build-station.json'
+    return user if user.exists() else Path('/etc/beam-lisp/build-station.json')
+
+
 def store(value):
     if not isinstance(value, str) or not STORE.fullmatch(value):
         raise ValueError('immutable store object required')
@@ -185,7 +190,7 @@ def main():
     parser.add_argument('--serve', action='store_true')
     parser.add_argument('--operation', type=Path)
     parser.add_argument('--out-link', type=Path)
-    parser.add_argument('--description', type=Path, default=Path('/etc/beam-lisp/build-station.json'))
+    parser.add_argument('--description', type=Path, help='Explicit station description; otherwise use user or system configuration')
     args = parser.parse_args()
     if args.serve:
         result = serve(bounded_json(sys.stdin))
@@ -195,8 +200,9 @@ def main():
         with args.operation.open() as stream:
             value = bounded_json(stream)
         description = None
-        if args.description.exists():
-            with args.description.open() as stream:
+        selected = args.description if args.description is not None else default_description()
+        if args.description is not None or selected.exists():
+            with selected.open() as stream:
                 description = bounded_json(stream)
         result = client(value, args.out_link, description)
     print(json.dumps(result))

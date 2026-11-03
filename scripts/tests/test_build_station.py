@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,25 @@ OUTPUT = '/nix/store/' + 'c' * 32 + '-output'
 
 
 class BuildStationTests(unittest.TestCase):
+    def test_user_station_precedes_system_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(STATION.os.environ, XDG_CONFIG_HOME=directory):
+            self.assertEqual(Path('/etc/beam-lisp/build-station.json'), STATION.default_description())
+            user = Path(directory) / 'beam-lisp/build-station.json'
+            user.parent.mkdir()
+            user.write_text('{}')
+            self.assertEqual(user, STATION.default_description())
+
+    def test_explicit_missing_description_does_not_fall_back_to_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            operation = Path(directory) / 'operation.json'
+            operation.write_text(json.dumps(dict(version=1, kind='release', sdk=SDK)))
+            argv = ['station', '--operation', str(operation), '--out-link', directory + '/result',
+                    '--description', directory + '/missing.json']
+            with patch.object(sys, 'argv', argv), patch.object(STATION, 'client') as client:
+                with self.assertRaises(FileNotFoundError):
+                    STATION.main()
+            client.assert_not_called()
+
     def test_nix_features_do_not_replace_operator_policy_or_credentials(self):
         policy = 'include /operator/nix.conf'
         with patch.dict(os.environ, NIX_CONFIG=policy, NIX_SSHOPTS='-F/operator/ssh.conf'), \
