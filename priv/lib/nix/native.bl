@@ -1,0 +1,84 @@
+; priv/lib/nix/native.bl — the native half of `nix`: the Nix grammar and the byte loop.
+;
+; ── Why this namespace exists ───────────────────────────────────────────────
+;
+; `priv/lib/nix.bl` DECIDES; this is the seam where a `.nix` file becomes bytes. Which
+; paths name what, what an edit means, what a refusal says — all of that is
+; policy and all of it stays in `priv/lib/nix.bl`. Parsing the language and walking a
+; document's nodes happen in Rust (`native/bl_nix`) because:
+;
+;   • the GRAMMAR is not ours to get wrong. `rnix` implements all of Nix —
+;     indented strings, `''${…}''`, path literals, `?` defaults, `@` binds,
+;     `let`/`with`/`rec`, operator precedence. A parser written here would be
+;     shorter and wrong, silently, on exactly the files nobody tests.
+;   • a beam-lisp call costs ~0.7–1.0 us, and a `.nix` document holds
+;     thousands of nodes. `bl.json` has a native half for the same reason.
+;
+; ── Five functions, and why each is one ─────────────────────────────────────
+;
+;   nix-parse/2   source → the lossless tree              (the grammar)
+;   nix-print/1   tree → the source, byte for byte        (the leaves, folded)
+;   nix-data/2    tree → beam-lisp values                 (the projection)
+;   nix-emit/2    beam-lisp values → fresh Nix source     (its inverse)
+;   nix-count/1   source → how many nodes, building none  (the instrument)
+;
+; `nix-count` exists so the cost of this crate can be MEASURED rather than
+; argued: parse minus count, on the same bytes, brackets what the Rust/BEAM
+; boundary costs with the grammar held constant.
+;
+; ── An absent crate is a LOUD problem ───────────────────────────────────────
+;
+; There is no beam-lisp fallback parser and there cannot be one. So a missing
+; `.so` is not a slow path here — it is every path, and it must say so at the
+; first call with the command that fixes it, rather than at the fortieth with
+; `:nif_not_loaded`.
+
+(ns nix.native
+  (:require [vm.native :as vn]))
+
+; The host module is `Elixir.BeamLisp.Native.Nix.Native`, which is also the
+; string the crate passes to `rustler::init!`. Those two must agree or
+; `load_nif` binds nothing and EVERY call raises `:nif_not_loaded` while the
+; .so sits there looking correct.
+;
+; Arities are the BEAM arity — the `Env` a NIF takes is implicit — and are
+; read off the Rust signatures, not guessed. A wrong arity is not a
+; wrong-answer bug: `load_nif` is all-or-nothing, so one bad signature leaves
+; every function unbound, and the failure is a silently-absent capability.
+(defnative "bl_nix"
+  (nix-parse 2)
+  (nix-print 1)
+  (nix-data 2)
+  (nix-emit 2)
+  (nix-count 1))
+
+(defn loaded?
+  "Whether the native Nix codec is present.
+
+   A one-way LATCH in `:persistent_term`, deliberately: the host module's
+   `@on_load` runs exactly once per VM, so if it ran while the .so was absent
+   or stale, that module never asks again. A cached `false` could therefore
+   only ever be stale, while a cached `true` cannot be. The re-ask happens
+   only when the native is ABSENT."
+  []
+  (if (erlang/apply :persistent_term :get (list :bl-nix-codec-present false))
+    true
+    (let [now (vn/available? "nix.native")]
+      (when now (erlang/apply :persistent_term :put (list :bl-nix-codec-present true)))
+      now)))
+
+(defn missing!
+  "Raise, naming the crate and the one command that installs it.
+
+   Called from every entry point in `priv/lib/nix.bl` when `loaded?` is false. The
+   message carries the whole repair, because the alternative — thirteen call
+   sites each failing differently — is how an absent native turns into an
+   afternoon."
+  []
+  (throw (ex-info
+           (str "the native Nix codec is not loaded, and there is no beam-lisp fallback."
+                "\n  crate:   native/bl_nix  (in the Beam Lisp repository)"
+                "\n  build:   ./bin/bl --cold version"
+                "\n  install: the managed SDK retains the verified bl_nix native product"
+                "\n  searched: " (pr-str (vn/lib-path "bl_nix")))
+           {:crate "bl_nix" :ns "nix.native"})))

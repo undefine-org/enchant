@@ -1,0 +1,430 @@
+; priv/lib/nix.bl — Nix as data: read it, address it, change it, write it.
+;
+; ── What this is for ────────────────────────────────────────────────────────
+;
+; Build and deployment descriptions compile to `.nix` files. As text it can be copied and it
+; can be shipped and that is all; as a VALUE it can be queried, diffed, patched
+; and generated. This namespace is that value's surface.
+;
+; The bytes and the grammar are `priv/lib/nix/native.bl`'s (the `bl_nix` crate). Everything
+; here is the part that knows beam-lisp: what a path means, what an edit is,
+; what a refusal should say.
+;
+; ── Two laws ────────────────────────────────────────────────────────────────
+;
+; 1. LOSSLESS. `(= src (nix/text (nix/read src)))` for every input, comments
+;    and whitespace included. The tree carries its trivia, so a document is a
+;    self-contained value — an edit is surgical because everything the edit did
+;    not touch was never reformatted.
+;
+; 2. DATA IS A FIXED POINT.
+;    `(= (nix/data d) (nix/data (nix/read (nix/emit (nix/data d)))))`.
+;    The plain view of a document, turned back into Nix and read again, is the
+;    same plain view.
+;
+; ── The document, as a value ────────────────────────────────────────────────
+;
+;   {:kind :node-attr-set :children ({:kind :token-whitespace :text " "} …)}
+;   {:kind :token-ident   :text "outputs"}
+;
+; A node has `:children`, a token has `:text`, and never both. EVERY node is a
+; document fragment: `nix/text`, `nix/data` and `nix/get` take any of them, so
+; a subtree is as good a value as the file it came from.
+;
+; ── Refusals are part of the interface ──────────────────────────────────────
+;
+; Nix is lazy and Turing-complete, and nothing here evaluates it. `nix/data`
+; projects the parts that ARE data and REFUSES the rest — a lambda, a `let`,
+; an interpolation — naming the node kind and where it starts, because a
+; projection that invents a value for `pkgs.lib.optional` is how a wrong
+; document gets written. `{:unsupported :tag}` keeps such a node verbatim as
+; `{:nix/expr "…"}` instead, which makes the projection total without claiming
+; anything about what the text means.
+
+(ns nix
+  (:require [nix.native :as native]))
+
+;; ── the native seam ─────────────────────────────────────────────────────────
+
+(defn loaded?
+  "Whether the native Nix codec is present. See `nix.native/loaded?`."
+  []
+  (native/loaded?))
+
+(defn- where-str
+  "The position a refusal carries, or nothing.
+
+   A WHOLE document's refusal points into the file; a subtree's does not, and
+   says so by leaving `where` out. Rendering `(line , column )` for a subtree was
+   how this read before there was a rule: a plausible-looking position that
+   belongs to the fragment's own line 1 sends a caller to the wrong line."
+  [detail]
+  (let [w (:where detail)]
+    (if (nil? w)
+      ""
+      (str " (line " (:line w) ", column " (:column w) ")"))))
+
+(defn- unroll!
+  "The value from a native reply, or a raise carrying the refusal.
+
+   Every refusal crosses as data — a message, the node kind, where it starts,
+   the source text it refused — because the caller that can act on a refusal is
+   this one. The exception's data is that map, so `(ex-data e)` is queryable
+   rather than a string to parse."
+  [op reply]
+  (if (some? (:ok reply))
+    (:ok reply)
+    (let [d (:error reply)]
+      (throw (ex-info
+               (str op ": " (:message d)
+                    (when (some? (:kind d)) (str " [" (:kind d) "]"))
+                    (when (some? (:text d)) (str " `" (:text d) "`"))
+                    (where-str d))
+               (assoc d :op op))))))
+
+(defn- require-native! []
+  (when-not (native/loaded?)
+    (native/missing!)))
+
+;; ── the tree, as beam-lisp sees it ──────────────────────────────────────────
+
+(defn node?
+  "A node: it has children."
+  [x]
+  (some? (:children x)))
+
+(defn token?
+  "A token: it has text."
+  [x]
+  (some? (:text x)))
+
+(defn kind
+  "The `:kind` of a node or token, e.g. `:node-attr-set`."
+  [x]
+  (:kind x))
+
+(defn- kids [x] (:children x))
+
+(defn- natives [x] (filter node? (kids x)))
+
+(defn fold-text
+  "The source text of a node: every leaf, in order.
+
+   This fold IS the round trip — the leaves are the bytes — so it is the
+   REFERENCE implementation, public for two reasons: it is the honest answer
+   when the native printer is absent, and it is what `test/bl/nix_test.bl` compares
+   `nix/text` against. Two implementations of one job are only a liability when
+   nothing compares them."
+  [x]
+  (if (token? x)
+    (:text x)
+    (apply str (map fold-text (kids x)))))
+
+;; ── reading and writing ─────────────────────────────────────────────────────
+
+(defn read
+  "Nix source → its document.
+
+   STRICT unless told otherwise: a `.nix` file with a syntax error has no
+   meaning, and returning a best-effort tree for one is how a wrong document
+   gets written. `{:strict false}` gives the tree anyway — for showing a file
+   that is being typed — and nothing else changes."
+  ([src] (read src {}))
+  ([src opts]
+   (require-native!)
+   (unroll! "nix/read" (native/nix-parse src opts))))
+
+(defn text
+  "The source of a document, byte for byte.
+
+   Not a formatter. `(= src (text (read src)))` holds for every input, which is
+   what makes `set` a surgical edit rather than a rewrite."
+  [doc]
+  (require-native!)
+  (unroll! "nix/text" (native/nix-print doc)))
+
+(defn read-file
+  "Read a `.nix` file. The path is on the exception when it refuses, because a
+   refusal in a file nobody named is a refusal nobody can act on."
+  ([path] (read-file path {}))
+  ([path opts]
+   (let [src (File/read! path)]
+     (try
+       (read src opts)
+       (catch e
+         (throw (ex-info (str path ": " (ex-message e))
+                         (assoc (ex-data e) :path path))))))))
+
+(defn write-file!
+  "Write a document back. A file and its bytes, nothing else."
+  [path doc]
+  (File/write! path (text doc))
+  path)
+
+;; ── the data view ───────────────────────────────────────────────────────────
+
+(defn data
+  "The parts of a document that ARE data, as beam-lisp values.
+
+      { a = 1; b.c = [ 1 \"two\" ]; }   →   {\"a\" 1, \"b\" {\"c\" [1 \"two\"]}}
+      ''\\n  text''                    →   \"text\"   (indentation stripped)
+      ./relative                       →   {:nix/path \"./relative\"}
+
+   Everything else is refused by name — a lambda, a `let`, a `with`, an
+   application, a select, an `inherit`, a `rec`, an interpolated string, a
+   variable. Nix is not data and this does not pretend it is.
+
+   Options:
+     :keys         :string (default) | :keyword | :existing-atom
+                   A Nix attribute name is arbitrary text, and a keyword costs
+                   a permanently-interned atom — so a document from anywhere
+                   gets strings unless the caller asks otherwise.
+     :unsupported  :throw (default) | :tag
+                   `:tag` keeps a refused node as `{:nix/expr \"…\"}`, which
+                   makes the projection TOTAL and keeps `nix/emit` able to
+                   rebuild the document. Nothing is claimed about the text."
+  ([doc] (data doc {}))
+  ([doc opts]
+   (require-native!)
+   (unroll! "nix/data" (native/nix-data doc opts))))
+
+(defn emit
+  "beam-lisp values → fresh Nix source — the inverse of `nix/data`.
+
+   Maps become attrsets, vectors and lists become Nix lists, and
+   `{:nix/path \"…\"}` / `{:nix/expr \"…\"}` are spliced as written (the second
+   in parentheses, so it is legal wherever an expression is). Keys are SORTED:
+   an Erlang map has no order of its own to keep, and a generator whose output
+   depends on map internals is not one anybody can diff. A caller who needs the
+   author's order edits the TREE, where the order is the document's.
+
+   A value with no Nix spelling is refused with the path to it — a keyword, a
+   function, a tuple, a NaN. Options: `:indent` (default 2)."
+  ([value] (emit value {}))
+  ([value opts]
+   (require-native!)
+   (unroll! "nix/emit" (native/nix-emit value opts))))
+
+;; ── addresses ───────────────────────────────────────────────────────────────
+;;
+;; An address is a vector of attribute NAMES: `[\"inputs\" \"nixpkgs\" \"url\"]`
+;; names `inputs.nixpkgs.url`, however the document chose to spell it — one
+;; `a.b.c = …;` binding and three nested attrsets address the same thing, and
+;; both spellings resolve. That is Nix's own rule, and `nix/paths` reports the
+;; addresses in exactly the form `nix/get` accepts.
+
+(defn- name-of
+  "The name a `NODE_IDENT` or `NODE_STRING` carries. A computed name
+   (`\"${…}\"`) has none, and says so."
+  [n]
+  (case (kind n)
+    :node-ident (fold-text n)
+    ; The string's own projection is the authority on what it says — quotes,
+    ; escapes and indentation are exactly the case `nix/data` already handles,
+    ; and an interpolated name is refused there for free.
+    :node-string (data n)
+    (throw (ex-info (str "a nix address cannot contain " (kind n))
+                    {:kind (kind n) :node n}))))
+
+(defn names
+  "The attribute names a `NODE_ATTRPATH` carries, as a vector."
+  [attrpath]
+  (vec (map name-of (natives attrpath))))
+
+(defn- value-child
+  "The expression a `NODE_ATTRPATH_VALUE` binds — its only non-attrpath child."
+  [entry]
+  (first (filter (fn [c] (not= :node-attrpath (kind c))) (natives entry))))
+
+(defn- bindings
+  "Every binding directly inside an attrset, as `{:names […] :entry node}`."
+  [set-node]
+  (->> (kids set-node)
+       (filter (fn [c] (= :node-attrpath-value (kind c))))
+       (map (fn [c] {:names (names (first (natives c))) :entry c}))))
+
+(defn- prefix?
+  "Do `a`'s names open `b`'s? `[a b]` opens `[a b c]` and equals `[a b]`."
+  [a b]
+  (and (<= (count a) (count b))
+       (= a (vec (take (count a) b)))))
+
+(defn- index-where [pred coll]
+  (first (keep-indexed (fn [i x] (when (pred x) i)) coll)))
+
+(defn- hit-in
+  "The binding in `set-node` that opens `path`: {:index n :names […]}. nil when
+   there is none."
+  [set-node path]
+  (first (keep-indexed
+           (fn [i c]
+             (when (= :node-attrpath-value (kind c))
+               (let [ns (names (first (natives c)))]
+                 (when (prefix? ns path) {:index i :names ns}))))
+           (kids set-node))))
+
+(defn- not-an-attrset [node path]
+  (throw (ex-info (str "a nix address cannot be followed into " (kind node)
+                       " at " (pr-str (vec path)))
+                  {:kind (kind node) :path (vec path)})))
+
+(defn- body
+  "The expression a document holds.
+
+   `nix/read` answers a `NODE_ROOT` — the whole file, trivia and all — whose
+   one node child is the expression. Every other node is its own body, so this
+   is the single place the difference is known, and the reason `nix/set`
+   returns the same shape it was given."
+  [x]
+  (if (= :node-root (kind x))
+    (first (natives x))
+    x))
+
+(defn- locate
+  "Resolve `path` inside `set-node` → `{:ok value-node}` or `{:missing […]}`."
+  [set-node path]
+  (let [hit (hit-in set-node path)]
+    (if (nil? hit)
+      {:missing (map :names (bindings set-node))}
+      (let [entry (nth (kids set-node) (:index hit))
+            rest-path (vec (drop (count (:names hit)) path))]
+        (if (empty? rest-path)
+          {:ok (value-child entry)}
+          (let [inner (value-child entry)]
+            (if (= :node-attr-set (kind inner))
+              (locate inner rest-path)
+              (not-an-attrset inner path))))))))
+
+(defn- splice-children
+  "A copy of `node` with the child at `i` replaced.
+
+   `to-list` is LOAD-BEARING: the tree crosses into Rust as Erlang terms, and
+   `map-indexed` answers a lazy seq — which the codec sees as a struct, not a
+   list, and refuses. Every `:children` a document leaves this namespace with
+   is a real list."
+  [node i child]
+  (assoc node :children
+         (to-list (map-indexed (fn [j x] (if (= j i) child x)) (kids node)))))
+
+(defn- set-value
+  "A copy of an attrpath-value `entry` whose bound expression is `value`."
+  [entry value]
+  (let [i (index-where (fn [c] (and (node? c) (not= :node-attrpath (kind c)))) (kids entry))]
+    (splice-children entry i value)))
+
+(defn at
+  "The node bound at `path`, or nil. Every node is a document fragment, so the
+   answer is a value `text`, `data` and `at` all take."
+  [doc path]
+  (require-native!)
+  (let [path (vec (map (fn [e] (if (keyword? e) (name e) e)) path))
+        r (locate (body doc) path)]
+    (when (contains? r :ok) (:ok r))))
+
+(defn get
+  "The node bound at `path`. Like `at`, but a miss is an error that names what
+   IS addressable at the level where the address ran out — the alternative is a
+   nil that a caller has to guess the shape of."
+  [doc path]
+  (let [path (vec (map (fn [e] (if (keyword? e) (name e) e)) path))
+        r (locate (body doc) path)]
+    (if (contains? r :ok)
+      (:ok r)
+      (throw (ex-info (str "no nix binding at " (pr-str path)
+                           "; addressable here: " (pr-str (vec (:missing r))))
+                      {:path path :available (vec (:missing r))})))))
+
+(defn paths
+  "Every address in a document, in the form `nix/get` takes.
+
+   Every binding, plus every bindings' bindings: a UI can offer exactly what is
+   configurable rather than a file's worth of text."
+  [doc]
+  (letfn [(descend [set-node prefix]
+            (mapcat (fn [b]
+                      (let [p (vec (concat prefix (:names b)))
+                            v (value-child (:entry b))]
+                        (if (= :node-attr-set (kind v))
+                          (concat [p] (descend v p))
+                          [p])))
+                    (bindings set-node)))]
+    (if (= :node-attr-set (kind (body doc)))
+      (descend (body doc) [])
+      [])))
+
+;; ── the surgical edit ───────────────────────────────────────────────────────
+
+(defn- expression-of
+  "The one expression of a source — what `nix/emit` produces, ready to be
+   dropped into a tree."
+  [src]
+  (let [doc (read src)
+        e (first (natives doc))]
+    (when (nil? e)
+      (throw (ex-info (str "nix/emit produced no expression: " (pr-str src)) {:src src})))
+    e))
+
+(defn- rewrite
+  "Rebuild `set-node` with the binding at `path` rewritten by `f`. Returns
+   `{:ok node}` or `{:missing […]}` — the miss is a VALUE here, because the
+   caller decides whether it is an error."
+  [set-node path f]
+  (let [hit (hit-in set-node path)]
+    (if (nil? hit)
+      {:missing (map :names (bindings set-node))}
+      (let [{:keys [index names]} hit
+            entry (nth (kids set-node) index)
+            rest-path (vec (drop (count names) path))]
+        (if (empty? rest-path)
+          {:ok (splice-children set-node index (set-value entry (f (value-child entry))))}
+          (let [inner (value-child entry)]
+            (if (= :node-attr-set (kind inner))
+              (let [r (rewrite inner rest-path f)]
+                (if (contains? r :missing)
+                  r
+                  {:ok (splice-children set-node index (set-value entry (:ok r)))}))
+              (not-an-attrset inner path))))))))
+
+(defn- splice-body [doc new-body]
+  (if (= :node-root (kind doc))
+    (splice-children doc (index-where node? (kids doc)) new-body)
+    new-body))
+
+(defn- address
+  "An address as this namespace takes it: a vector of names, keywords allowed
+   where a name is meant."
+  [path]
+  (vec (map (fn [e] (if (keyword? e) (name e) e)) path)))
+
+(defn- rewritten!
+  "The miss message, or the rewritten document in the shape it arrived in."
+  [doc path r]
+  (if (contains? r :missing)
+    (throw (ex-info (str "no nix binding at " (pr-str path)
+                         "; addressable here: " (pr-str (vec (:missing r))))
+                    {:path path :available (vec (:missing r))}))
+    (splice-body doc (:ok r))))
+
+(defn set
+  "`doc` with the binding at `path` holding `value`. Everything the edit did not
+   touch is byte-identical — the tree keeps the author's comments, spacing and
+   key order, so this is a patch rather than a rewrite.
+
+   Throws when the address is absent, naming what IS addressable there: adding
+   a binding is a different operation from changing one, and guessing which was
+   meant is how a config grows a duplicate."
+  [doc path value]
+  (require-native!)
+  (let [path (address path)
+        replacement (expression-of (emit value))]
+    (rewritten! doc path (rewrite (body doc) path (fn [_] replacement)))))
+
+(defn update
+  "`doc` with the binding at `path` replaced by `(f current-value)`, where the
+   current value arrives as a DOCUMENT (so `nix/data` and `nix/text` both work
+   on it)."
+  [doc path f]
+  (require-native!)
+  (let [path (address path)]
+    (rewritten! doc path
+                (rewrite (body doc) path (fn [node] (expression-of (emit (f node))))))))

@@ -2,7 +2,7 @@
 # Each crate has its own derivation: editing one never recompiles its siblings.
 { pkgs, root ? ../., target ? "x86_64-linux", includeDesktop ? false }:
 let
-  names = [ "bl_json" "code_embed" "datom_datalog" "datom_fjall" "datom_vector" "lazy_memo" ]
+  names = [ "bl_json" "bl_nix" "code_embed" "datom_datalog" "datom_fjall" "datom_vector" "lazy_memo" ]
     ++ pkgs.lib.optional includeDesktop "wry_webview";
   products = builtins.listToAttrs (map (crate: {
     name = crate;

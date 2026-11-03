@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-NAMES = {'bl_json', 'code_embed', 'datom_datalog', 'datom_fjall', 'datom_vector', 'lazy_memo'}
+NAMES = {'bl_json', 'bl_nix', 'code_embed', 'datom_datalog', 'datom_fjall', 'datom_vector', 'lazy_memo'}
 
 
 class NativeProductIdentities(unittest.TestCase):

@@ -1,0 +1,329 @@
+; test/bl/nix_test.bl — the laws `priv/lib/nix.bl` promises, checked against a real flake.
+;
+; Run with: ./bin/bl test test/bl/nix_test.bl
+;
+; Two laws, and everything here is one of them or the interface that makes them
+; usable:
+;
+;   1. LOSSLESS        (= src (nix/text (nix/read src)))
+;   2. FIXED POINT     (= (nix/data d) (nix/data (nix/read (nix/emit (nix/data d)))))
+;
+; Plus the parts a caller actually leans on: addressing, the surgical edit, and
+; what a refusal says. The flake under test is a pinned fixture's — the file this is
+; meant to make addressable — because a law that only holds on a fixture is a
+; law about the fixture.
+
+(ns nix.test (:require [nix]))
+
+;; ── helpers ────────────────────────────────────────────────────────────────
+
+(defn- refusal
+  "The raised error from calling `f`, or nil when it did not refuse.
+
+   Refusals are part of this interface, so the suite reads them as VALUES
+   rather than only asserting that something went wrong."
+  [f]
+  (try (f) nil (catch e e)))
+
+;; ── sources under test ─────────────────────────────────────────────────────
+
+(def flake-path "test/fixtures/nix/flake.nix")
+
+(defn- flake-source [] (File/read! flake-path))
+
+(def every-shape
+  "One of everything the projection claims to handle, plus one of most of the
+   things it refuses. Written out rather than generated: this is the record of
+   what the value model IS."
+  (str
+    "{\n"
+    "  # a comment, which the tree keeps\n"
+    "  ints   = [ 0 1 (-3) 42 ];\n"
+    "  floats = [ 1.5 (-0.25) 2.0 ];\n"
+    "  flags  = [ true false null ];\n"
+    "  text   = \"a \\\"quoted\\\" word, a \\\\ and a tab\\t\";\n"
+    "  block  = ''\n"
+    "    line one\n"
+    "      indented\n"
+    "  '';\n"
+    "  url    = https://example.com/a?b=c;\n"
+    "  paths  = { rel = ./x/y; abs = /x/y; home = ~/x; search = <nixpkgs>; };\n"
+    "  nested.deep.value = 1;\n"
+    "  nested.deep.other = 2;\n"
+    "  quoted.\"a b\" = 3;\n"
+    "  list   = [ { a = 1; } [ 2 3 ] \"four\" ];\n"
+    "  paren  = ( 1 );\n"
+    "}\n"))
+
+;; ── law 1: lossless ────────────────────────────────────────────────────────
+
+(deftest reading-then-writing-a-real-flake-is-the-file-again
+  (let [src (flake-source)]
+    (is (= src (nix/text (nix/read src)))
+        "the whole of the fixture flake.nix, byte for byte")))
+
+(deftest every-shape-of-nix-survives-the-round-trip
+  (is (= every-shape (nix/text (nix/read every-shape)))))
+
+(deftest the-native-printer-and-the-fold-agree
+  (let [doc (nix/read (flake-source))]
+    (is (= (nix/text doc)
+           (apply str (map nix/fold-text (:children doc))))
+        "two implementations of one job, compared — and against the file itself above")))
+
+(deftest an-empty-file-is-not-a-document
+  (is (some? (refusal (fn [] (nix/read ""))))
+      "Nix has no empty expression, so there is nothing to parse")
+  (is (= "{ }\n" (nix/text (nix/read "{ }\n")))
+      "but an empty attrset is a value and round-trips"))
+
+;; ── law 2: the data fixed point ────────────────────────────────────────────
+
+(deftest the-plain-view-survives-being-written-and-read-again
+  (let [d (nix/data (nix/read every-shape) {:unsupported :tag})]
+    (is (= d (nix/data (nix/read (nix/emit d)) {:unsupported :tag}))
+        "(= d (data (read (emit d)))) — the projection is a fixed point")))
+
+(deftest the-plain-view-of-fixture-flake-is-a-fixed-point
+  (let [d (nix/data (nix/read (flake-source)) {:unsupported :tag})]
+    (is (= d (nix/data (nix/read (nix/emit d)) {:unsupported :tag})))
+    (is (= "Beam Lisp Nix codec fixture" (get d "description")))
+    (is (= "github:NixOS/nixpkgs/nixos-unstable"
+           (get-in d ["inputs" "nixpkgs" "url"]))
+        "the DOTTED binding `inputs.nixpkgs.url = …` is nested by the projection")))
+
+;; ── the projection, shape by shape ─────────────────────────────────────────
+
+(deftest what-data-means
+  (let [d (nix/data (nix/read every-shape))]
+    (is (= [0 1 -3 42] (get d "ints"))
+        "a negative literal is a unary minus over a number, and it is still a number")
+    (is (= [1.5 -0.25 2.0] (get d "floats")))
+    (is (= [true false nil] (get d "flags")))
+    (is (= "a \"quoted\" word, a \\ and a tab\t" (get d "text"))
+        "double-quoted escapes are decoded")
+    (is (= "line one\n  indented\n" (get d "block"))
+        "an indented string loses its margin — Nix's rule, not a coincidence")
+    (is (= "https://example.com/a?b=c" (get d "url"))
+        "a bare URI IS a string, which is what Nix evaluates it to")
+    (is (= 3 (get-in d ["quoted" "a b"]))
+        "a quoted attribute name is a name like any other")
+    (is (= {:nix/path "./x/y"} (get-in d ["paths" "rel"])))
+    (is (= {:nix/path "/x/y"} (get-in d ["paths" "abs"])))
+    (is (= {:nix/path "~/x"} (get-in d ["paths" "home"])))
+    (is (= {:nix/path "<nixpkgs>"} (get-in d ["paths" "search"])))
+    (is (= 1 (get-in d ["nested" "deep" "value"]))
+        "`a.b.c = …` is one binding and three levels of map")
+    (is (= [{ "a" 1 } [2 3] "four"] (get d "list"))
+        "a Nix list is a vector, so an index survives a round trip")
+    (is (= 1 (get d "paren"))
+        "parentheses are punctuation, not a value")))
+
+(deftest attribute-keys-are-strings-unless-the-caller-says-otherwise
+  (let [doc (nix/read "{ a = 1; }")]
+    (is (= {"a" 1} (nix/data doc)))
+    (is (= {:a 1} (nix/data doc {:keys :keyword})))
+    (is (= {"a" 1} (nix/data doc {:keys :string})))))
+
+(deftest a-document-cannot-intern-atoms-on-its-own
+  (let [doc (nix/read "{ zorkmid = 1; }")]
+    (is (some? (refusal (fn [] (nix/data doc {:keys :existing-atom}))))
+        "a name this VM does not already know is REFUSED, not interned — the atom table is bounded and never collected")
+    (let [kw (keyword "zorkmid")]
+      (is (= {kw 1} (nix/data doc {:keys :existing-atom}))
+          "once the CALLER interns it, the document may use it"))))
+
+(deftest a-name-that-is-not-an-identifier-is-quoted-on-the-way-out
+  (is (= "{\n  \"a b\" = 1;\n}"
+         (nix/emit {"a b" 1})))
+  (is (= "{\n  \"if\" = 1;\n}"
+         (nix/emit {"if" 1}))
+      "a Nix keyword cannot be a bare attribute name")
+  (is (= "{\n  true = 1;\n}"
+         (nix/emit {"true" 1}))
+      "but `true` is an identifier in Nix, not a keyword, so it needs no quotes"))
+
+(deftest emit-escapes-what-would-otherwise-mean-something-else
+  (is (= "{\n  a = \"\\${x}\";\n}"
+         (nix/emit {"a" "${x}"}))
+      "an unescaped ${ would turn a string into an interpolation")
+  (is (= "{\n  a = \"q\\\"b\\\\s\";\n}"
+         (nix/emit {"a" "q\"b\\s"}))))
+
+(deftest a-tag-is-spliced-as-written-and-nothing-is-claimed-about-it
+  (is (= "{\n  a = (pkgs.lib.mkIf x y);\n}"
+         (nix/emit {"a" {:nix/expr "pkgs.lib.mkIf x y"}}))
+      "parenthesised, so it is legal wherever an expression is")
+  (is (= "{\n  a = ./x;\n}"
+         (nix/emit {"a" {:nix/path "./x"}}))))
+
+(deftest a-value-with-no-nix-spelling-is-refused-with-its-path
+  (let [e (try (nix/emit {"a" {"b" :keyword}}) nil
+               (catch err err))]
+    (is (some? e) "a keyword is not a Nix value")
+    (is (= ["a" "b"] (:path (ex-data e)))
+        "the refusal says WHERE, because the caller who can fix it is the one holding the map")))
+
+;; ── refusals are part of the interface ─────────────────────────────────────
+
+(deftest nix-that-is-not-data-is-refused-by-name
+  (let [doc (nix/read (str "{\n"
+                           "  lambda  = x: x + 1;\n"
+                           "  letin   = let a = 1; in a;\n"
+                           "  withit  = with pkgs; hello;\n"
+                           "  applied = pkgs.lib.foo 1;\n"
+                           "  selected = pkgs.a.b;\n"
+                           "  iffy    = if x then 1 else 2;\n"
+                           "  computed = \"v=${x}\";\n"
+                           "  free    = someIdentifier;\n"
+                           "  recursive = rec { a = 1; };\n"
+                           "}\n"))]
+    (doseq [[what kind] [["lambda" :node-lambda]
+                         ["letin" :node-let-in]
+                         ["withit" :node-with]
+                         ["applied" :node-apply]
+                         ["selected" :node-select]
+                         ["iffy" :node-if-else]
+                         ["computed" :node-interpol]
+                         ["free" :node-ident]
+                         ["recursive" :node-attr-set]]]
+      (let [e (refusal (fn [] (nix/data (nix/get doc [what]))))]
+        (is (some? e) (str what " is not data"))
+        (is (= kind (:kind (ex-data e))) (str what " names its node kind"))))))
+
+(deftest an-inherit-has-no-value-shaped-hole-so-the-attrset-holds-the-refusal
+  (let [doc (nix/read "{ inherit x; }")]
+    (is (some? (refusal (fn [] (nix/data doc))))
+        "`inherit` names a variable in scope, and a map has nowhere to put that")
+    (is (= {:nix/expr "{ inherit x; }"} (nix/data doc {:unsupported :tag}))
+        "so the ATTRSET is tagged — the nearest node that can hold it")))
+
+(deftest a-refusal-says-what-and-only-a-whole-document-says-where
+  (let [e (refusal (fn [] (nix/data (nix/get (nix/read "{ a = 1; b = x: x; }") ["b"]))))]
+    (is (= :node-lambda (:kind (ex-data e))))
+    (is (= "x: x" (:text (ex-data e)))
+        "the source it refused, so the message is recognisable")
+    (is (nil? (:where (ex-data e)))
+        "a subtree indexes only itself, so its line 1 would be a lie about the file"))
+  (let [e (refusal (fn [] (nix/data (nix/read "{\n  a = x: x;\n}"))))]
+    (is (= 2 (get-in (ex-data e) [:where :line]))
+        "a WHOLE document's refusal does point into the file")))
+
+(deftest tagging-makes-the-projection-total
+  (let [d (nix/data (nix/read "{ a = x: x + 1; b = 2; }") {:unsupported :tag})]
+    (is (= {"a" {:nix/expr "x: x + 1"} "b" 2} d))
+    (is (= {:nix/expr "x: x + 1"}
+           (nix/data (nix/get (nix/read "{ a = x: x + 1; }") ["a"])
+                     {:unsupported :tag}))
+        "a tag holds the node it refused, not the document around it")))
+
+(deftest a-syntax-error-is-an-error-with-a-position
+  (let [e (refusal (fn [] (nix/read "{ a = ; }")))]
+    (is (some? e))
+    (is (= 1 (get-in (ex-data e) [:where :line])))
+    (is (= 7 (get-in (ex-data e) [:where :column])))
+    (is (= 6 (get-in (ex-data e) [:where :offset]))))
+  (let [e (refusal (fn [] (nix/read "{\n  a = 1;\n  b = ;\n}")))]
+    (is (= 3 (get-in (ex-data e) [:where :line])) "a second-line error reports the second line"))
+  (is (some? (nix/read "{ a = ; }" {:strict false}))
+      "{:strict false} gives the tree anyway, for a file that is being typed"))
+
+;; ── addresses ──────────────────────────────────────────────────────────────
+
+(deftest paths-are-the-addresses-get-accepts
+  (let [doc (nix/read (flake-source))
+        ps (nix/paths doc)
+        has? (fn [p] (some (fn [q] (= (vec q) (vec p))) ps))]
+    (is (has? ["description"]))
+    (is (has? ["inputs" "nixpkgs" "url"])
+        "the DOTTED binding's full path is the address")
+    (is (has? ["outputs"]))
+    (is (= 3 (count ps)))
+    (doseq [p ps]
+      (is (some? (nix/at doc p)) (str "every path returned resolves: " (pr-str p))))))
+
+(deftest a-miss-names-what-is-addressable
+  (let [doc (nix/read (flake-source))
+        e (refusal (fn [] (nix/get doc ["inputs" "nixpkgs"])))]
+    (is (some? e)
+        "`inputs.nixpkgs` is not written as a binding — `inputs.nixpkgs.url` is")
+    (is (= [["description"] ["inputs" "nixpkgs" "url"] ["outputs"]]
+           (vec (:available (ex-data e))))
+        "and the refusal lists exactly what IS"))
+  (is (nil? (nix/at (nix/read (flake-source)) ["nope"])))
+  (let [e (refusal (fn [] (nix/get (nix/read (flake-source)) ["outputs" "x"])))]
+    (is (some? e) "following an address into a lambda is refused, not silently nil")))
+
+(deftest a-subtree-is-a-document-too
+  (let [doc (nix/read (flake-source))
+        node (nix/get doc ["inputs" "nixpkgs" "url"])]
+    (is (= "\"github:NixOS/nixpkgs/nixos-unstable\"" (nix/text node))
+        "an address yields a node, and a node is a document fragment")
+    (is (= "github:NixOS/nixpkgs/nixos-unstable" (nix/data node)))))
+
+;; ── the surgical edit ──────────────────────────────────────────────────────
+
+(defn- differing-lines [a b]
+  (->> (map (fn [x y] [x y])
+            (to-list (erlang/apply :string :split (list a "\n" :all)))
+            (to-list (erlang/apply :string :split (list b "\n" :all))))
+       (filter (fn [pair] (not= (first pair) (second pair))))))
+
+(deftest setting-a-binding-changes-that-binding-and-nothing-else
+  (let [src (flake-source)
+        doc (nix/read src)
+        patched (nix/set doc ["inputs" "nixpkgs" "url"] "github:NixOS/nixpkgs/pinned")
+        text (nix/text patched)
+        diff (differing-lines src text)]
+    (is (= 1 (count diff)) "exactly one line differs")
+    (is (= "  inputs.nixpkgs.url = \"github:NixOS/nixpkgs/pinned\";"
+           (second (first diff))))
+    (is (= src (nix/text doc)) "the original document is untouched")
+    (is (= "github:NixOS/nixpkgs/pinned"
+           (nix/data (nix/get (nix/read text) ["inputs" "nixpkgs" "url"])))
+        "and the result is a file that reads back with the new value")))
+
+(deftest comments-survive-an-edit
+  (let [src (str "{\n"
+                 "  # keep me\n"
+                 "  a = 1;   # and me\n"
+                 "  b = 2;\n"
+                 "}\n")
+        out (nix/text (nix/set (nix/read src) ["a"] 9))]
+    (is (= "{\n  # keep me\n  a = 9;   # and me\n  b = 2;\n}\n" out)
+        "a patch, not a rewrite — the tree kept the trivia")))
+
+(deftest setting-inside-a-nested-attrset-reaches-the-right-level
+  (let [src "{\n  a = {\n    b = {\n      c = 1;\n    };\n  };\n  d = 2;\n}\n"
+        out (nix/text (nix/set (nix/read src) ["a" "b" "c"] 7))]
+    (is (= "{\n  a = {\n    b = {\n      c = 7;\n    };\n  };\n  d = 2;\n}\n" out))))
+
+(deftest an-edit-can-write-any-shape-and-any-shape-can-be-read-back
+  (let [doc (nix/read "{\n  a = 1;\n}\n")
+        out (nix/text (nix/set doc ["a"] {"nested" [1 2 3] "s" "x"}))]
+    (is (= {"nested" [1 2 3] "s" "x"} (nix/data (nix/get (nix/read out) ["a"]))))
+    (is (= out (nix/text (nix/read out))))))
+
+(deftest setting-an-absent-address-is-refused-rather-than-guessed
+  (let [e (refusal (fn [] (nix/set (nix/read "{\n  a = 1;\n}\n") ["b"] 2)))]
+    (is (some? e) "adding a binding is a different operation from changing one")
+    (is (= [["a"]] (vec (:available (ex-data e)))))))
+
+(deftest update-reads-the-current-value-as-a-document
+  (let [doc (nix/read "{ a = \"one\"; }")
+        out (nix/text (nix/update doc ["a"] (fn [v] (str (nix/data v) " and two"))))]
+    (is (= "{ a = \"one and two\"; }" out))))
+
+;; ── the interface advertises what it can do ────────────────────────────────
+
+(deftest the-codec-is-actually-loaded
+  (is (nix/loaded?)
+      "a missing crate is not a slow path here, it is every path"))
+
+
+(deftest repository-flake-roundtrips-losslessly
+  (let [source (File/read! "flake.nix")
+        doc (nix/read source)
+        data (nix/data doc {:unsupported :tag})]
+    (is (= source (nix/text doc)))
+    (is (= data (nix/data (nix/read (nix/emit data)) {:unsupported :tag})))))
