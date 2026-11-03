@@ -156,3 +156,26 @@ Main can be called fully green only after its complete required CI lanes pass
 on the integrated commit. Station evaluation additionally requires deploying
 and exercising the local endpoint description. No tag is launched from this
 prototype branch.
+
+## Provider portability follow-up
+
+The build recipes consume standard Nix routing. The station module accepts
+`ssh` and `ssh-ng`, external SSH configuration and explicitly declared builder
+capabilities. The CI worker adapter selects `local`, `configured` or `nixbuild`
+through repository configuration; runner labels are configurable independently.
+The nixbuild.net route uses its pinned official action and a CI token secret.
+It disables local Nix builds and does not require KVM on the orchestration runner.
+
+Managed process boundaries preserve the finite operator Nix/SSH environment.
+Bootstrap, Source artifact clients and the coordinator use the same policy;
+experimental CLI features are enabled without replacing operator configuration.
+The Source clients share `artifact-process/operator-environment`. Credentials
+remain runtime configuration, outside artifact requests and product inputs.
+
+The [portability report](portability-checks.json) records 165 passing Python
+tests with three skips, workflow lint, module policy checks and eight real
+Source/environment controls in a bounded worker on the configured builder.
+These checks do not claim a live nixbuild.net account run. Activating that CI
+backend requires `NIX_BUILD_BACKEND=nixbuild`, the `NIXBUILD_TOKEN` secret and
+a successful full provider run. Store-only nixbuild.net realization does not
+depend on deploying the optional operator shell evaluation endpoint.
