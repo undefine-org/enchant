@@ -10,7 +10,7 @@ let
   inputs = pkgs.lib.fileset.toSource {
     root = source;
     fileset = pkgs.lib.fileset.unions (map (name: source + "/${name}") [
-      "priv/build/artifact-process.bl" "priv/build/artifact-jobs.bl" "priv/build/artifact.bl"
+      "priv/build/build-environment.bl" "priv/build/artifact-process.bl" "priv/build/artifact-jobs.bl" "priv/build/artifact.bl"
       "test/scripts/operator_environment.exs"
     ]);
   };
@@ -27,7 +27,7 @@ in bounded (pkgs.runCommand "beam-lisp-operator-environment-check" {} ''
   rm -f "$image/priv/precompiled.term" "$image/priv/sdk-code.term"
   rm -rf "$image/priv/parts"
   cp -a --no-preserve=ownership ${compiler}/seed/. "$image/ebin/"
-  for name in artifact-process artifact-jobs artifact; do
+  for name in build-environment artifact-process artifact-jobs artifact; do
     cp ${inputs}/priv/build/$name.bl "$image/priv/build/$name.bl"
   done
   export BL_ROOT="$image" BL_POLICY_SDK=${selection}
