@@ -13,7 +13,7 @@ class ExactCacheRestoreTests(unittest.TestCase):
     def ownership_step(self):
         source = (Path(__file__).resolve().parents[2] / '.github/actions/nix-sdk-cache/action.yml').read_text()
         restore = source.index('    - name: Restore registered Nix products')
-        repair = source.index('    - name: Restore runner ownership of the Nix client cache')
+        repair = source.index('    - name: Restore runner ownership of client and Beam Lisp caches')
         consumer = source.index('    - name: Require the exact producer cache')
         self.assertLess(restore, repair)
         self.assertLess(repair, consumer)
@@ -27,11 +27,13 @@ class ExactCacheRestoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / 'runner'
-            cache = home / '.cache/nix'
-            cache.mkdir(parents=True)
-            cache.chmod(0o500)
-            with self.assertRaises(PermissionError):
-                (cache / 'fetcher-locks').mkdir()
+            caches = [home / '.cache' / name for name in ('nix', 'beam_lisp', 'enchant-ci')]
+            for directory in caches:
+                directory.mkdir(parents=True)
+                directory.chmod(0o500)
+                with self.assertRaises(PermissionError):
+                    (directory / 'new-stage').mkdir()
+            cache = caches[0]
             # Fake the privileged cache restore in a controlled fixture. sudo
             # executes real filesystem commands as this fixture's owner; the
             # captured chown arguments establish the production UID/GID target.
@@ -59,10 +61,15 @@ class ExactCacheRestoreTests(unittest.TestCase):
             cache.chmod(0o700)
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             (cache / 'fetcher-locks').mkdir()
+            (caches[1] / 'aot/sdk-proof-stage').mkdir(parents=True)
+            (caches[2] / 'new-selection').mkdir()
             calls = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertEqual([['mkdir', '-p', '--', str(cache)],
-                              ['chown', '-R', '--no-dereference', '--',
-                               f'{os.getuid()}:{os.getgid()}', str(cache)]], calls)
+            expected = []
+            for directory in caches:
+                expected.extend([['mkdir', '-p', '--', str(directory)],
+                                 ['chown', '-R', '--no-dereference', '--',
+                                  f'{os.getuid()}:{os.getgid()}', str(directory)]])
+            self.assertEqual(expected, calls)
             self.assertEqual(before, (sentinel.stat().st_uid, sentinel.stat().st_gid,
                                      stat.S_IMODE(sentinel.stat().st_mode), sentinel.read_bytes()))
 
