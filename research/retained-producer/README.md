@@ -1,9 +1,10 @@
 # Retained producer and locally described build placement
 
-This vertical prototype extends `prototype/build-pipeline` and integrates main
-through `1a89c9a7f`. It lives on `prototype/retained-producer`; it is not a main
-release. Its qualification runs the normal checkout preparation, SDK receiver,
-application and public self-build commands against immutable Nix products.
+This directory retains the design and measured prototype history. The current
+[Build-side qualification](release-checks.json) covers SDK preparation,
+source-free receivers, applications, native workspaces, portable products, and
+cache reuse. Exact main CI and tagged publication provide the complete release
+gates. The earlier measurements below retain their original product identities.
 
 ```mermaid
 flowchart LR
@@ -56,11 +57,14 @@ flowchart LR
 
 See [station configuration](../../docs/build/build-station.org) for the local
 schema. The existing workstation inventory already describes daemon routing.
-Its current key grants the Nix store/build protocol; it does not grant command
-execution for the evaluation endpoint. Operator SSH was denied. Realization on
-Build is exercised; evaluation on Build is implemented and fixture tested but
-has not been activated or qualified on that machine. Source capture and
-bootstrap coordinator selection remain local.
+The original machine key granted the Nix store/build protocol. The deployed
+runner now supplies a separate evaluation transport, exercised by a real
+Work-to-Build portable round trip. Its Source description and generated Nix
+projection live in the workstation repository. The client verifies the returned
+derivation and retrieves the completed output through its authenticated Nix
+builder, with signature checks enabled and local build jobs disabled. Source
+capture and bootstrap coordinator selection remain client operations; release
+qualification runs from a checkout on Build to place those phases there too.
 
 ## Measured decisions
 
