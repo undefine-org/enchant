@@ -15,8 +15,8 @@ PATCHER = os.environ.get('BL_TEST_PATCHELF') or shutil.which('patchelf')
 @unittest.skipUnless(PATCHER, 'Set BL_TEST_PATCHELF to the pinned patchelf executable')
 class PortablePayloadTests(unittest.TestCase):
     def run_pass(self, directory):
-        recipe = (ROOT / 'nix/bl-drop.nix').read_text()
-        program = textwrap.dedent(recipe.split("<<'PORTABLE'\n", 1)[1].split('\n      PORTABLE', 1)[0])
+        recipe = (ROOT / 'nix/portable-product.nix').read_text()
+        program = textwrap.dedent(recipe.split("<<'PORTABLE'\n", 1)[1].split('\n  PORTABLE', 1)[0])
         program = program.replace('${pkgs.patchelf}/bin/patchelf', PATCHER)
         return subprocess.run(['python3', '-c', program],
                               env=dict(os.environ, TMPDIR=str(directory)),
