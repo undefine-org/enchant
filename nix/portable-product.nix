@@ -2,16 +2,15 @@
 # Selecting an SDK cannot realize this derivation or run its ELF mutations.
 { pkgs, image, tools }:
 let
-  metadata = builtins.fromJSON (builtins.unsafeDiscardStringContext
-    (builtins.readFile (image + "/artifact.json")));
-  imagePath = builtins.storePath (builtins.unsafeDiscardStringContext (toString image));
-  toolsPath = builtins.storePath (builtins.unsafeDiscardStringContext (toString tools));
+  # Keep derivation dependencies intact for a cold flake. Reading the image
+  # descriptor here would build the SDK during evaluation, even with --no-build.
+  imagePath = image;
+  toolsPath = tools;
   worker = import ./bounded-build.nix {
     inherit pkgs; memoryMiB = 4096; diskMiB = 16384; cpuCount = 2;
     commandManager = false; trace = true;
   };
 in
-assert metadata.version == 1 && metadata.kind == "sdk" && metadata.target == "x86_64-linux";
 worker (pkgs.runCommand "beam-lisp-portable-release" {
   nativeBuildInputs = [ pkgs.patchelf pkgs.python3 pkgs.coreutils ];
 } ''
@@ -79,11 +78,12 @@ worker (pkgs.runCommand "beam-lisp-portable-release" {
   import hashlib, json, os
   from pathlib import Path
   output = Path(os.environ['out'])
-  descriptor = ${builtins.toJSON (builtins.toJSON {
-    version = 1; kind = "release"; packaging = "portable-shell-v1";
-    inherit (metadata) compiler target; image = toString imagePath; file = "bl.drop";
-  })}
-  descriptor = json.loads(descriptor)
+  image = Path('${imagePath}')
+  metadata = json.loads((image / 'artifact.json').read_text())
+  assert (metadata['version'], metadata['kind'], metadata['target']) == (1, 'sdk', 'x86_64-linux')
+  descriptor = dict(version=1, kind='release', packaging='portable-shell-v1',
+                    compiler=metadata['compiler'], target=metadata['target'],
+                    image=str(image), file='bl.drop')
   with (output / 'bl.drop').open('rb') as stream:
       descriptor['sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
   (output / 'artifact.json').write_text(json.dumps(descriptor, sort_keys=True) + '\n')

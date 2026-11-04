@@ -16,7 +16,8 @@ let
   direct = import ../../nix/portable-product.nix {
     inherit pkgs;
     image = builtins.storePath metadata.image;
-    tools = import ../../nix/drop-tools.nix { inherit pkgs; };
+    tools = builtins.storePath (builtins.unsafeDiscardStringContext
+      (toString (import ../../nix/drop-tools.nix { inherit pkgs; })));
   };
 in
 assert first.outPath == second.outPath;
