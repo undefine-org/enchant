@@ -35,6 +35,23 @@
 
 (defn- cell [srv stage k] (get (pipeline/pipeline-row srv stage) k))
 
+(defn- await-worker-exits
+  "Monitor the exact cohort before `action`, then share one five-second budget.
+   Sending exit signals is not a receipt that their targets have exited."
+  [workers action]
+  (let [watches (mapv (fn [pid] [pid (Process/monitor pid)]) (vec (set workers)))
+        deadline (+ (erlang/monotonic_time :millisecond) 5000)]
+    (try
+      (action)
+      (every? true?
+        (mapv (fn [[pid watch]]
+                (let [remaining (max 0 (- deadline (erlang/monotonic_time :millisecond)))]
+                  (receive
+                    [:DOWN seen :process stopped _] :when (and (= watch seen) (= pid stopped)) true
+                    (after remaining false)))) watches))
+      (finally
+        (doseq [[_ watch] watches] (Process/demonitor watch (list :flush)))))))
+
 (defn- wait-for
   "Block until `flag` is set, or `ms` runs out — a LATCH.
 
@@ -311,11 +328,11 @@
   ; fact, not a silence.
   (let [s (start brittle nil {})]
     (is (await (fn [] (>= (cell :brittle :wave :errors) 1)) 8000) "the failure is counted")
-    (Process/sleep 150)
     (is (= 3 (cell :brittle :wave :in)) "the stage took three events and stopped")
     (is (= 2 (cell :brittle :wave :out)) "…two came out, the third did not")
     (let [ws (vec (get (pipeline/pipeline-row :brittle :wave) :workers))]
       (is (seq ws) "the worker is named")
+      (is (await-worker-exits ws (fn [] nil)) "the worker's exit is observed")
       (is (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) ws)
           "…and it is dead, where a reader can see it"))
     (stop s)))
@@ -328,8 +345,7 @@
     (is (await (fn [] (= 20 (cell :line :cook :out))) 8000) "the line drains")
     (let [workers (vec (get (pipeline/pipeline-row :line :check) :workers))
           size (erlang/apply :ets :info (list :bl_pipeline :size))]
-      (stop s)
-      (Process/sleep 60)
+      (is (await-worker-exits workers #(stop s)) "the worker exits are observed")
       (is (seq (pipeline/pipeline-of :line))
           "the rows are still there with the pipeline GONE: a fact, not a call")
       (is (= 20 (cell :line :cook :out)) "…with the numbers it finished on")
@@ -397,7 +413,48 @@
         "a worker exists to be taken down")
     (let [workers (vec (mapcat (fn [r] (get r :workers)) (pipeline/pipeline-of :line)))]
       (is (seq workers))
-      (stop s)
-      (Process/sleep 100)
+      (is (await-worker-exits workers #(stop s)) "the worker exits are observed")
       (is (every? (fn [p] (not (:alive (pipeline/worker-vitals p)))) workers)
           "every worker the pipeline started went with it"))))
+
+(deftest stopping-does-not-query-suspended-distributors-or-forget-the-owned-source
+  (let [release (atom false)
+        spec (pipeline/spec :closed-cohort :block :fail
+               [(pipeline/from-node 1 (range 100))
+                (pipeline/stage-node 2 :held (fn [n] (wait-for release 8000) n) 2)])
+        topo (pipeline/arm-first spec)
+        owned (vec (concat (:workers topo) (:pids topo)))]
+    (try
+      (is (= 3 (count (:workers topo))) "the constructor retains every worker")
+      (is (await (fn [] (seq (get (pipeline/pipeline-row :closed-cohort :held) :workers))) 8000))
+      (doseq [dist (:dists topo)] (erlang/suspend_process dist))
+      (is (await-worker-exits owned
+            #(do (pipeline/stop-topology topo)
+                 (doseq [dist (:dists topo)]
+                   (try (erlang/resume_process dist) (catch _ nil)))))
+          "cleanup needs no distributor reply and observes every constructed process exit")
+      (is (not (Process/alive? (:source topo))) "the internally created source exits too")
+      (finally
+        (reset! release true)
+        (doseq [dist (:dists topo)] (try (erlang/resume_process dist) (catch _ nil)))
+        (pipeline/stop-topology topo)
+        (doseq [pid owned] (when (Process/alive? pid) (erlang/exit pid :kill)))))))
+
+(deftest stopping-keeps-a-borrowed-input-producer-alive
+  (let [release (atom false)
+        input (flow/from-seq (range 100))
+        spec (pipeline/spec :borrowed-input :block :fail
+               [(pipeline/from-node 1 input)
+                (pipeline/stage-node 2 :held (fn [n] (wait-for release 8000) n) 1)])
+        topo (pipeline/arm-first spec)
+        owned (vec (concat (:workers topo) (:pids topo)))]
+    (try
+      (is (= input (:source topo)))
+      (is (not (some (fn [pid] (= input pid)) owned)) "a borrowed source is not owned")
+      (is (await-worker-exits owned #(pipeline/stop-topology topo)))
+      (is (Process/alive? input) "cleanup preserves the caller's input producer")
+      (finally
+        (reset! release true)
+        (pipeline/stop-topology topo)
+        (doseq [pid (conj owned input)]
+          (when (Process/alive? pid) (erlang/exit pid :kill)))))))

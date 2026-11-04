@@ -406,15 +406,16 @@
         cfg (assoc cfg0 :dist dist*)
         collect (start pipeline-collect cfg {})
         cfg2 (assoc cfg :collect collect)
-        dist (flow/distribute
+        distribution (flow/start-distribution
                up
                (worker-fn cfg2)
                {:concurrency (:concurrency cfg2) :batch 1
                 :on-down (fn [notice]
                            (erlang/send collect [:lost (count (:lost notice))]))
-                :on-done (fn [] (erlang/send collect [:up-done]))})]
+                :on-done (fn [] (erlang/send collect [:up-done]))})
+        dist (:pid distribution)]
     (reset! dist* dist)
-    {:in dist :out collect :pids [collect dist]}))
+    {:in dist :out collect :pids [collect dist] :workers (:workers distribution)}))
 
 ;; ── the declaration, as data ────────────────────────────────────────────
 ;;
@@ -477,13 +478,16 @@
    model wants its counters (how much the source was made to hand over) as much
    as it wants a stage's."
   [spec]
-  (let [nodes (:nodes spec)]
+  (let [nodes (:nodes spec)
+        source (:src (first nodes))
+        producer (source-producer source)]
     (loop [rest (vec nodes)
-           up (source-producer (:src (first nodes)))
-           pids []
-           dists []]
+           up producer
+           pids (if (erlang/is_pid source) [] [producer])
+           dists []
+           workers []]
       (if (empty? rest)
-        {:up up :pids pids :dists dists}
+        {:up up :source producer :pids pids :dists dists :workers workers}
         (let [node (first rest)]
           (if (= :batch (:kind node))
             ;; a batcher, and ONE node over it — the node is what counts, and the
@@ -494,12 +498,14 @@
               (recur (vec (drop 1 rest))
                      (:out nout)
                      (vec (concat pids [batcher] (:pids nout)))
-                     (vec (conj dists (:in nout)))))
+                     (vec (conj dists (:in nout)))
+                     (vec (concat workers (:workers nout)))))
             (let [nd (start-node up (node-cfg spec node))]
               (recur (vec (drop 1 rest))
                      (:out nd)
                      (vec (concat pids (:pids nd)))
-                     (vec (conj dists (:in nd)))))))))))
+                     (vec (conj dists (:in nd)))
+                     (vec (concat workers (:workers nd)))))))))))
 
 (def ^:private topologies
   "Pipeline name → the topology its prelude armed. An atom, for the same reason
@@ -537,8 +543,9 @@
   (doseq [node (:nodes spec)] (put-row! spec node))
   (let [wired (wire! spec)
         sink (spawn (fn [] (flow/run-each (:up wired) (fn [_] nil) 8)))
-        topo {:name (:name spec) :spec spec :up (:up wired)
-              :dists (:dists wired) :pids (conj (:pids wired) sink)}]
+        topo {:name (:name spec) :spec spec :up (:up wired) :source (:source wired)
+              :dists (:dists wired) :workers (:workers wired)
+              :pids (conj (:pids wired) sink)}]
     (swap! topologies assoc (:name spec) topo)
     topo))
 
@@ -554,29 +561,17 @@
                       {:pipeline nm})))
     {:pipeline topo}))
 
-(defn- workers-of
-  "A distributor's live workers, asked with a bounded wait: a teardown must not
-   block on a process that may already be gone."
-  [d]
-  (if (and (some? d) (erlang/is_process_alive d))
-    (do (erlang/send d [:workers (erlang/self)])
-        (receive
-          [:workers ws] (vec (to-list ws))
-          (after 200 [])))
-    []))
-
 (defn stop-topology
   "Take the whole topology down with the server that declared it.
 
-   The workers are asked of their distributors rather than read from the row —
-   the row keeps every pid that ever worked, and a dead pid is not worth
-   killing. The ROWS stay: they are facts about what ran, and a fact does not
-   become false when the process stops."
+   The construction handle retains every worker, including workers that have
+   not taken an event. Cleanup never queries a distributor or the read model.
+   Owned input producers are retained too; input PIDs supplied by callers stay
+   borrowed. The rows remain facts about what ran. Exit signals are asynchronous."
   [topo]
   (when (some? topo)
-    (doseq [d (:dists topo)]
-      (doseq [w (workers-of d)]
-        (when (erlang/is_process_alive w) (erlang/exit w :kill))))
+    (doseq [w (:workers topo)]
+      (when (erlang/is_process_alive w) (erlang/exit w :kill)))
     (doseq [p (:pids topo)]
       (when (and (some? p) (erlang/is_process_alive p)) (erlang/exit p :kill)))
     (swap! topologies dissoc (:name topo))
