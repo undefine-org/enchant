@@ -15,6 +15,7 @@ SPEC.loader.exec_module(STATION)
 SOURCE = '/nix/store/' + 'a' * 32 + '-source'
 SDK = '/nix/store/' + 'b' * 32 + '-sdk'
 OUTPUT = '/nix/store/' + 'c' * 32 + '-output'
+DERIVATION = '/nix/store/' + 'd' * 32 + '-output.drv'
 
 
 class BuildStationTests(unittest.TestCase):
@@ -70,20 +71,42 @@ class BuildStationTests(unittest.TestCase):
                 message = json.loads(options['input'])
                 if message['action'] == 'build':
                     response = dict(version=1, ticket=message['ticket'], operationSHA=STATION.digest(value),
-                                    host='fixture-station', rows=[dict(outputs={'out': OUTPUT})])
+                                    host='fixture-station', rows=[dict(drvPath=DERIVATION, outputs={'out': OUTPUT})])
                     return subprocess.CompletedProcess(argv, 0, json.dumps(response))
+            if argv[0] == 'nix-store':
+                return subprocess.CompletedProcess(argv, 0, OUTPUT + '\n')
             return subprocess.CompletedProcess(argv, 0, '')
 
         description = dict(version=1, storeUri='ssh-ng://fixture-station', transport=['ssh', 'fixture-station', '{endpoint}'])
-        with patch.object(STATION, 'command', command):
+        with patch.object(STATION, 'command', command), patch.object(STATION.Path, 'readlink', return_value=Path(OUTPUT)):
             rows = STATION.client(value, '/tmp/owned-root', description)
         self.assertEqual(OUTPUT, rows[0]['outputs']['out'])
         self.assertEqual(['nix', 'copy', '--to', description['storeUri']], calls[0][0][:4])
         self.assertIn(SDK, calls[0][0])
         self.assertEqual(str(STATION.PLATFORM / 'bin/beam-build-station'), calls[1][0][-1])
-        self.assertEqual(['nix', 'copy', '--from', description['storeUri'], OUTPUT], calls[2][0])
-        self.assertEqual('nix-store', calls[3][0][0])
-        self.assertEqual('release', json.loads(calls[4][1]['input'])['action'])
+        self.assertEqual(['nix', 'copy', '--from', description['storeUri'], DERIVATION], calls[2][0])
+        self.assertEqual(['nix-store', '--query', '--outputs', DERIVATION], calls[3][0])
+        self.assertEqual(['--max-jobs', '0'], calls[4][0][-2:])
+        self.assertEqual('release', json.loads(calls[5][1]['input'])['action'])
+
+    def test_station_cannot_substitute_an_unrelated_output_or_acknowledge_it(self):
+        value = dict(version=1, kind='release', sdk=SDK)
+        calls = []
+
+        def command(argv, **options):
+            calls.append(argv)
+            if argv[0] == 'ssh':
+                message = json.loads(options['input'])
+                return subprocess.CompletedProcess(argv, 0, json.dumps(dict(
+                    version=1, ticket=message['ticket'], operationSHA=STATION.digest(value),
+                    host='fixture', rows=[dict(drvPath=DERIVATION, outputs={'out': OUTPUT})])))
+            return subprocess.CompletedProcess(argv, 0, SDK + '\n')
+
+        description = dict(version=1, storeUri='ssh-ng://fixture', transport=['ssh', 'fixture', '{endpoint}'])
+        with patch.object(STATION, 'command', command), self.assertRaisesRegex(ValueError, 'disagrees'):
+            STATION.client(value, '/tmp/result', description)
+        self.assertFalse(any('--realise' in argv for argv in calls))
+        self.assertEqual(1, sum(argv[0] == 'ssh' for argv in calls))
 
     def test_a_station_failure_never_falls_back_to_local_evaluation(self):
         description = dict(version=1, storeUri='ssh-ng://fixture', transport=['ssh', 'fixture', '{endpoint}'])

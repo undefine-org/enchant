@@ -173,8 +173,21 @@ def client(value, link, description=None):
     if response.get('version') != 1 or response.get('ticket') != ticket or response.get('operationSHA') != digest(value) or len(response['rows']) != 1:
         raise ValueError('station answered a different operation')
     output = store(response['rows'][0]['outputs']['out'])
-    command(['nix', 'copy', '--from', uri, output])
-    command(['nix-store', '--add-root', link, '--indirect', '--realise', output], stdout=subprocess.DEVNULL)
+    derivation = store(response['rows'][0]['drvPath'])
+    if not derivation.endswith('.drv'):
+        raise ValueError('station must return a derivation')
+    # An ordinary untrusted client cannot import unsigned build outputs.
+    # Import the derivation, verify its output, and let the configured daemon
+    # retrieve the completed product through its authenticated builder. This
+    # performs no local evaluation and cannot start a local build worker.
+    command(['nix', 'copy', '--from', uri, derivation])
+    declared = command(['nix-store', '--query', '--outputs', derivation], stdout=subprocess.PIPE, text=True).stdout.splitlines()
+    if declared != [output]:
+        raise ValueError('station output disagrees with its derivation')
+    command(['nix-store', '--add-root', link, '--indirect', '--realise', derivation,
+             '--max-jobs', '0'], stdout=subprocess.DEVNULL)
+    if Path(link).readlink() != Path(output):
+        raise ValueError('daemon realised a different station output')
     if response.get('log'):
         (Path(link).parent / 'station-build.log').write_text(response['log'])
     print('BUILD-STATION-PLACEMENT ' + json.dumps(dict(host=response['host'], evaluation='station', output=output)), file=sys.stderr, flush=True)
