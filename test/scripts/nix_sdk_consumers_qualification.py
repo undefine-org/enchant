@@ -226,7 +226,7 @@ def main():
         fhs = output / 'portable-fhs'
         run('portable-no-nix-store', [platform / 'artifact-platform/bin/nix', 'build', '--impure',
                                     '--file', repo / 'test/nix/portable-runtime-control.nix',
-                                    '--argstr', 'release', release, '--max-jobs', '0',
+                                    '--argstr', 'release', release,
                                     '--option', 'experimental-features', 'nix-command flakes',
                                     '--out-link', fhs], output)
         fhs_result = json.loads((fhs / 'result.json').read_text())
