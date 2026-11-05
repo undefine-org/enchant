@@ -1,0 +1,136 @@
+;; Independent reconstruction: source and target are traversed afresh, every
+;; required row is compared byte-for-byte, and uniqueness gets a NEW disk
+;; witness. Builder counters, cursors and event rows cannot certify success.
+(ns datom.offline.verify
+ (:require [datom.offline.layout :as l] [datom.offline.audit :as audit]
+           [datom.offline.reindex :as reindex] [datom.offline.unique :as unique]
+           [datom.store-fjall :as fj] [datom.index :as index]
+           [datom.value-codec :as slot]))
+
+(defn- require-raw! [st key expected]
+ (let [actual (fj/raw-get st key)]
+  (when (nil? actual) (l/refuse! :offline-missing-target-row))
+  (when-not (erlang/=:= expected actual) (l/refuse! :offline-target-payload-mismatch))))
+
+(defn- expected-row [source target inspected acc [key raw]]
+ (let [classification (l/classify key)]
+  (case (:kind classification)
+   :index
+    (if (= :eavt (:index classification))
+     (let [d (l/checked-datom raw (:basis inspected))
+           indexes (index/indexes-for (:schema inspected) (get d 1))
+           acc (reduce (fn [acc idx]
+                         (require-raw! target (l/key-for 2 idx d) raw)
+                         (let [next (update-in acc [:indexes idx] inc)]
+                          (if (= idx :avet)
+                           (update-in next [:avet-rows (get d 1)] (fn [n] (inc (or n 0)))) next))) acc indexes)
+           acc (update acc :datoms inc)]
+      (if (contains? (:unique-attrs inspected) (get d 1))
+       (-> acc (update :events conj [:put (unique/event-key d) raw]) (update :unique-events inc))
+       acc)) acc)
+   :counter (do (require-raw! target key raw) (update acc :authoritative inc))
+   :authoritative (do (require-raw! target key raw) (update acc :authoritative inc))
+   :cache acc
+   :format acc)))
+
+(defn- expected-pass [source target scratch inspected]
+ (loop [after nil acc {:datoms 0 :indexes {:eavt 0 :aevt 0 :avet 0 :vaet 0}
+                      :authoritative 0 :unique-events 0 :avet-rows {}}]
+  (let [page (fj/raw-page source nil after nil 512 4194304)
+        next (reduce #(expected-row source target inspected %1 %2) (assoc acc :events []) (:entries page))]
+   (when (seq (:events next)) (fj/commit-raw! scratch (:events next)))
+   (if (:done? page) (dissoc next :events)
+    (do (when (or (nil? (:last page)) (= after (:last page)))
+         (l/refuse! :offline-page-did-not-advance))
+        (recur (:last page) (dissoc next :events)))))))
+
+(defn- target-row [source target inspected acc [key raw]]
+ (cond
+  (= key reindex/STATE-KEY) acc
+  (l/starts? key unique/PREFIX)
+   (let [d (l/checked-datom raw (:basis inspected))]
+    (when-not (and (= key (unique/event-key d))
+                  (contains? (:unique-attrs inspected) (get d 1))
+                  (erlang/=:= raw (fj/raw-get source (l/key-for 1 :eavt d))))
+     (l/refuse! :offline-unrecognized-work-row))
+    acc)
+  :else
+   (let [classification (l/classify key)]
+    (if (= :format (:kind classification)) (update acc :format-entries inc)
+     (let [acc (update acc :digest #(crypto/hash_update % (erlang/term_to_binary [key raw])))]
+      (case (:kind classification)
+       :index
+        (let [d (l/checked-datom raw (:basis inspected)) idx (:index classification)]
+         (when-not (and (= key (l/key-for 2 idx d))
+                       (contains? (set (index/indexes-for (:schema inspected) (get d 1))) idx))
+          (l/refuse! :offline-unexpected-target-index))
+         (when-not (and (erlang/=:= raw (fj/raw-get source (l/key-for 1 :eavt d)))
+                       (erlang/=:= raw (fj/raw-get target (l/key-for 2 :eavt d))))
+          (l/refuse! :offline-target-payload-mismatch))
+         (update-in acc [:indexes idx] inc))
+       :counter (do (when-not (erlang/=:= raw (fj/raw-get source key))
+                      (l/refuse! :offline-target-metadata-mismatch))
+                    (update acc :authoritative inc))
+       :authoritative (do (when-not (erlang/=:= raw (fj/raw-get source key))
+                            (l/refuse! :offline-target-metadata-mismatch))
+                          (update acc :authoritative inc))
+       :cache (l/refuse! :offline-stale-derived-state)))))))
+
+(defn- target-pass [source target inspected]
+ (let [result (audit/fold-pages target nil nil #(target-row source target inspected %1 %2)
+               {:indexes {:eavt 0 :aevt 0 :avet 0 :vaet 0} :authoritative 0 :format-entries 0
+                :digest (crypto/hash_init :sha256)})]
+  (assoc result :digest (String/downcase (binary/encode_hex (crypto/hash_final (:digest result)))))))
+
+(defn- verify-unique! [scratch basis]
+ (let [folded (audit/fold-pages scratch unique/PREFIX (l/prefix-end unique/PREFIX)
+                (fn [state [key raw]]
+                 (let [d (l/checked-datom raw basis)]
+                  (when-not (= key (unique/event-key d))
+                   (l/refuse! :offline-unique-event-mismatch))
+                  (unique/advance state d))) (unique/initial))]
+  (unique/complete folded)))
+
+(defn- unchanged-source! [source expected]
+ (let [digest (audit/fold-pages source nil nil
+               (fn [h entry] (crypto/hash_update h (erlang/term_to_binary entry)))
+               (crypto/hash_init :sha256))
+       digest (String/downcase (binary/encode_hex (crypto/hash_final digest)))]
+  (when-not (= digest expected) (l/refuse! :offline-source-changed))))
+
+(defn verify!
+ "Reread a copied private store. The scratch store MUST be fresh and separate;
+  its events are generated from the source, never copied from builder work.
+  Returns a durable logical proof, not whole-root READY or activation authority."
+ [source target scratch bound]
+ (doseq [[a b] [[source target] [source scratch] [target scratch]]]
+  (when (or (= (:path a) (:path b))
+            (String/starts_with? (:path a) (str (:path b) "/"))
+            (String/starts_with? (:path b) (str (:path a) "/")))
+   (l/refuse! :offline-overlapping-stores)))
+ (when (seq (:entries (fj/raw-page scratch nil nil nil 1 4194304)))
+  (l/refuse! :offline-verifier-scratch-not-empty))
+ (let [state (reindex/state target bound)
+       inspected (audit/inspect-store source 1)]
+  (when-not (and (contains? #{:copied :verified} (:phase state))
+                (= (:source-digest state) (:digest inspected))
+                (= (:schema-digest state) (:schema-digest inspected)))
+   (l/refuse! :offline-unverifiable-job))
+  (let [expected (expected-pass source target scratch inspected)
+        actual (target-pass source target inspected)]
+   (when-not (and (= (:indexes expected) (:indexes actual))
+                 (= (:authoritative expected) (:authoritative actual))
+                 (= 1 (:format-entries actual)))
+    (l/refuse! :offline-target-inventory-mismatch))
+   (verify-unique! scratch (:basis inspected))
+   (unchanged-source! source (:digest inspected))
+   (let [proof {:version 1 :protocol :offline-key-reindex :binding bound
+                :source-format 1 :target-format 2 :source-digest (:digest inspected)
+                :data-digest (:digest actual) :schema-digest (:schema-digest inspected)
+                :basis (:basis inspected) :entity-counter (:entity-counter inspected)
+                :datoms (:datoms expected) :indexes (:indexes expected) :avet-rows (:avet-rows expected)
+                :authoritative (:authoritative expected) :unique-events (:unique-events expected)}
+         next (assoc state :phase :verified :proof proof :proof-digest (l/digest proof))]
+    (fj/commit-raw! target [[:put reindex/STATE-KEY (slot/encode-slot next)]])
+    (fj/sync! target)
+    proof))))

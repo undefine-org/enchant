@@ -1,0 +1,111 @@
+(ns datom.offline-verify-test
+ (:require [datom :as d] [datom.offline.verify :as verify] [datom.offline.reindex :as r]
+           [datom.offline.audit :as audit] [datom.offline.layout :as l]
+           [datom.offline.unique :as unique] [datom.store-fjall :as fj]
+           [datom.store :as s] [datom.schema :as schema] [datom.index :as index]
+           [datom.value-codec :as slot]))
+
+(def definition {:db/ident :fixture/key :db/valueType :db.type/tuple
+                 :db/cardinality :db.cardinality/one :db/unique :db.unique/identity})
+(def bound (r/job-binding (l/digest :source-runtime) (l/digest :tool)
+                         (l/digest :snapshot) (l/digest :manifest)))
+(def fact [42 :fixture/key (list 1 [2]) l/FIRST-TX true])
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn rows [st] (audit/fold-pages st nil nil conj []))
+(defn seed [facts]
+ (let [st (fj/open-fresh) sch (assoc (schema/empty-schema) :fixture/key definition)
+       ds (into (mapv (fn [op] [(get op 1) (get op 2) (get op 3) l/FIRST-TX true])
+                      (schema/definition-datoms 500 definition)) facts)]
+  (s/-put st l/TX-KEY (+ l/FIRST-TX 19))
+  (s/-put st l/ENTITY-KEY 700)
+  (doseq [dt ds]
+   (fj/commit-raw! st (mapv (fn [idx] [:put (l/key-for 1 idx dt) (erlang/term_to_binary dt)])
+                            (index/indexes-for sch (get dt 1)))))
+  st))
+(defn drain-to [job phase]
+ (loop [remaining 100]
+  (when (zero? remaining) (throw (ex-info "test conversion did not finish" {})))
+  (let [status (r/step! job)] (if (= phase (:phase status)) status (recur (dec remaining))))))
+(defn remove-builder-events! [target]
+ (let [ks (audit/fold-pages target unique/PREFIX (l/prefix-end unique/PREFIX)
+            (fn [ks [key _]] (conj ks key)) [])]
+  (fj/commit-raw! target (mapv (fn [key] [:delete key]) ks))))
+
+(deftest independent-proof-reconstructs-counts-and-a-new-uniqueness-witness
+ (let [source (seed [fact]) target (fj/open-fresh) scratch (fj/open-fresh)]
+  (try
+   (let [before (rows source) job (r/begin! source target bound)]
+    (drain-to job :copied)
+    ;; Neither counts nor event rows from the builder are proof. Removing
+    ;; them cannot disable the verifier's independent source replay.
+    (remove-builder-events! target)
+    (fj/commit-raw! target [[:put r/STATE-KEY
+                            (slot/encode-slot (assoc (r/state target bound) :datoms 999 :events 0))]])
+    (let [proof (verify/verify! source target scratch bound)]
+     (is (= 5 (:datoms proof)))
+     (is (= {:eavt 5 :aevt 5 :avet 2 :vaet 0} (:indexes proof)))
+     (is (= 1 (get (:avet-rows proof) :fixture/key)))
+     (is (= (+ l/FIRST-TX 19) (:basis proof)))
+     (is (= 700 (:entity-counter proof)))
+     (is (= bound (:binding proof)))
+     (is (= 64 (String/length (:data-digest proof))))
+     (is (= :verified (:phase (r/state target bound))))
+     (is (= (l/digest proof) (:proof-digest (r/state target bound))))
+     (is (= (r/descriptor bound) (s/-get target l/FORMAT-KEY)))
+     (is (= :incompatible-index-key-format (kind #(d/connect-with target []))))
+     (is (= before (rows source)))
+     (is (= :offline-verifier-scratch-not-empty
+            (kind #(verify/verify! source target scratch bound))))
+     (let [fresh (fj/open-fresh)]
+      (try (is (= proof (verify/verify! source target fresh bound)))
+       (finally (s/close fresh))))))
+   (finally (s/close source) (s/close target) (s/close scratch)))))
+
+(deftest incomplete-conflicting-extra-or-stale-target-rows-never-get-a-proof
+ (doseq [damage [:missing :reencoded :extra :stale-cache :counter]]
+  (let [source (seed [fact]) target (fj/open-fresh) scratch (fj/open-fresh)]
+   (try
+    (drain-to (r/begin! source target bound) :copied)
+    (case damage
+     :missing (s/-delete target (l/key-for 2 :aevt fact))
+     ;; Same decoded value, different persisted slot: byte conservation matters.
+     :reencoded (s/-put target (l/key-for 2 :eavt fact) fact)
+     :extra (let [extra [43 :fixture/key [9] l/FIRST-TX true]]
+             (fj/commit-raw! target [[:put (l/key-for 2 :eavt extra) (erlang/term_to_binary extra)]]))
+     :stale-cache (s/-put target (l/derived-key [:datom.current/pair 42 :fixture/key]) {:values [[1 2]]})
+     :counter (s/-put target l/TX-KEY (+ l/FIRST-TX 20)))
+    (let [before (rows target) source-before (rows source)
+          error (kind #(verify/verify! source target scratch bound))]
+     (is (contains? #{:offline-missing-target-row :offline-target-payload-mismatch
+                     :offline-stale-derived-state} error))
+     (is (= before (rows target)))
+     (is (= source-before (rows source)))
+     (is (= :copied (:phase (r/state target bound)))))
+    (finally (s/close source) (s/close target) (s/close scratch))))))
+
+(deftest forged-builder-completion-and-missing-events-cannot-hide-historical-collisions
+ (let [source (seed [[101 :fixture/key (list 1) l/FIRST-TX true]
+                     [102 :fixture/key [1] (+ l/FIRST-TX 1) true]
+                     [101 :fixture/key (list 1) (+ l/FIRST-TX 2) false]])
+       target (fj/open-fresh) scratch (fj/open-fresh)]
+  (try
+   (drain-to (r/begin! source target bound) :checking-uniqueness)
+   (remove-builder-events! target)
+   (fj/commit-raw! target [[:put r/STATE-KEY
+                           (slot/encode-slot (assoc (r/state target bound) :phase :copied :events 0))]])
+   (let [before (rows target)]
+    (is (= :offline-canonical-unique-collision
+           (kind #(verify/verify! source target scratch bound))))
+    (is (= before (rows target)))
+    (is (= :copied (:phase (r/state target bound)))))
+   (finally (s/close source) (s/close target) (s/close scratch)))))
+
+(deftest source-and-target-aliases-are-never-accepted-as-verifier-scratch
+ (let [source (seed [fact]) target (fj/open-fresh)]
+  (try
+   (drain-to (r/begin! source target bound) :copied)
+   (let [before (rows source)]
+    (is (= :offline-overlapping-stores (kind #(verify/verify! source target source bound))))
+    (is (= :offline-overlapping-stores (kind #(verify/verify! source target target bound))))
+    (is (= before (rows source))))
+   (finally (s/close source) (s/close target)))))
