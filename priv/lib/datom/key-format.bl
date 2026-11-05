@@ -1,0 +1,43 @@
+;; Index encoding admission. Value-slot encoding and app dataVersion are separate.
+(ns datom.key-format (:require [datom.store :as store] [datom.codec :as codec]))
+
+(def KEY (erlang/list_to_binary (list 0 107)))
+(def CURRENT {:version (codec/supported-format-version! codec/INDEX-VERSION)})
+
+(defn- refuse! [found reason]
+ (let [version (when (erlang/is_map found) (maps/get :version found nil))]
+  ;; Unknown metadata may contain unrelated data. Report only a bounded version,
+  ;; never the descriptor's contents or a guessed downgrade/relabel operation.
+  (throw (ex-info "Datom index format is not supported by this runtime"
+           {:kind :incompatible-index-key-format :reason reason
+            :expected-version (:version CURRENT)
+            :found-version (when (and (erlang/is_integer version) (<= 0 version 65535)) version)
+            :action :compatible-runtime-or-offline-inventory-required}))))
+
+(defn check!
+ "Read-only admission before schema/counter mutation or Db construction.
+  Existing unversioned stores retain their legacy encoding and are not stamped.
+  A current descriptor is one point read. Missing/nil uses one exact-key probe,
+  never an unbounded database scan; stored nil is corruption, not legacy proof."
+ [st]
+ (let [found (store/-get st KEY)]
+  (cond
+   (erlang/=:= found CURRENT) :current
+   (some? found) (refuse! found :unsupported-descriptor)
+   :else
+    (let [counted (store/count-range st KEY KEY 1)
+          present? (if (some? counted) (pos? (:count counted))
+                       (seq (store/-range st KEY KEY)))]
+     (when present? (refuse! nil :malformed-descriptor))
+     :legacy))))
+
+(defn checked-extra-ops
+ "Materialize once. Transaction side operations cannot publish, erase or
+  relabel index format, including through host list/tuple operation forms."
+ [ops]
+ (mapv (fn [operation]
+         (let [op (store/checked-op operation)]
+          (when (erlang/=:= KEY (get op 1))
+            (throw (ex-info "Index format metadata is reserved for the storage upgrade protocol"
+                     {:kind :reserved-index-format-key})))
+          op)) ops))

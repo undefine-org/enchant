@@ -1,0 +1,103 @@
+(ns datom.key-format-admission-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.db :as db]
+           [datom.index :as index] [datom.key-format :as format] [datom.schema :as schema]
+           [datom.codec :as codec]
+           [datom.store :as s] [datom.store-ets :as se] [datom.store-map :as sm]
+           [datom.store-fjall :as fj]))
+
+(defrecord ReadSpy [inner calls]
+ s/Store
+ (-get [st k] (swap! (:calls st) conj [:get k]) (s/-get (:inner st) k))
+ (-range [st lo hi] (swap! (:calls st) conj [:range lo hi]) (s/-range (:inner st) lo hi))
+ (-put [st k v] (swap! (:calls st) conj [:put k]) (s/-put (:inner st) k v))
+ (-delete [st k] (swap! (:calls st) conj [:delete k]) (s/-delete (:inner st) k))
+ (-update [st k f] (swap! (:calls st) conj [:update k]) (s/-update (:inner st) k f))
+ (-commit [st ops] (swap! (:calls st) conj [:commit]) (s/-commit (:inner st) ops)))
+
+(def factories [se/open sm/open fj/open-fresh])
+(def invalid-descriptors [{:version 2 :sequential-tag 113} {:version 1 :state :building}
+                          {:version 1.0} {:version "1"} {} false "private-descriptor-payload"])
+(defn refusal [compute]
+ (try (compute) nil (catch error (ex-data error))))
+
+(deftest unknown-encoders-refuse-without-realizing-values
+ (let [calls (atom 0) payload (map (fn [value] (swap! calls inc) value) [1 2])]
+  (doseq [version [nil false 0 -1 2 1.0 :future]]
+   (is (= :unsupported-key-encoder-version
+          (:kind (refusal #(codec/encode-for-format version payload))))))
+  (is (= 0 @calls))
+  (is (= (codec/encode-value [1 2]) (codec/encode-for-format 1 [1 2])))))
+
+(deftest unsupported-formats-refuse-before-counter-schema-or-index-writes
+ (doseq [open factories]
+  (let [base (open) calls (atom []) st (->ReadSpy base calls)]
+   (try
+    (s/-put base conn/ENTITY-COUNTER-KEY 4321)
+    (s/-put base conn/TX-COUNTER-KEY 1000100)
+    (doseq [descriptor invalid-descriptors]
+     (s/-put base format/KEY descriptor)
+     (let [before (vec (s/-range base nil nil))]
+      (doseq [attempt [#(conn/connect-with st [])
+                      #(db/db-value st (schema/empty-schema) 1000100)
+                      #(index/write-datoms st (schema/empty-schema)
+                         [[1 :format/value :example 1000100 true]])]]
+       (reset! calls [])
+       (let [error (refusal attempt)]
+        (is (= :incompatible-index-key-format (:kind error)))
+        (is (= 1 (:expected-version error)))
+        (is (not (String/contains? (pr-str error) "private-descriptor-payload")))
+        (is (= [[:get format/KEY]] @calls))
+        (is (= before (vec (s/-range base nil nil))))))))
+    (finally (s/close base))))))
+
+(deftest stored-nil-is-not-treated-as-an-unversioned-store
+ (doseq [open factories]
+  (let [base (open)]
+   (try
+    (s/-put base format/KEY nil)
+    (let [before (vec (s/-range base nil nil))
+          error (refusal #(conn/connect-with base []))]
+     (is (= :incompatible-index-key-format (:kind error)))
+     (is (= :malformed-descriptor (:reason error)))
+     (is (= before (vec (s/-range base nil nil)))))
+    (finally (s/close base))))))
+
+(deftest admission-is-a-point-probe-and-never-relabels-legacy-data
+ (let [base (se/open) calls (atom []) st (->ReadSpy base calls)]
+  (try
+   (s/-put base "unrelated" :kept)
+   (is (= :legacy (format/check! st)))
+   (is (= [[:get format/KEY] [:range format/KEY format/KEY]] @calls))
+   (is (nil? (s/-get base format/KEY)))
+   (s/-put base format/KEY format/CURRENT)
+   (reset! calls [])
+   (is (= :current (format/check! st)))
+   (is (= [[:get format/KEY]] @calls))
+   (is (= :kept (s/-get base "unrelated")))
+   (finally (s/close base)))))
+
+(deftest transaction-side-operations-cannot-relabel-or-remove-format
+ (doseq [open factories]
+  (let [st (open)]
+   (try
+    (s/-put st format/KEY format/CURRENT)
+    (doseq [op [[:put format/KEY {:version 2}] [:delete format/KEY]
+               (list :put format/KEY {:version 2}) (tuple :delete format/KEY)]]
+     (let [before (vec (s/-range st nil nil))
+           error (refusal #(index/write-datoms st (schema/empty-schema)
+                            [[1 :format/value :example 1000100 true]] [op]))]
+      (is (= :reserved-index-format-key (:kind error)))
+      (is (= before (vec (s/-range st nil nil))))))
+    (finally (s/close st))))))
+
+(deftest ordinary-legacy-connections-keep-their-facts-and-basis
+ (doseq [open factories]
+  (let [st (open)
+        c (d/connect-with st [{:db/ident :format/value :db/valueType :db.type/term}])]
+   (try
+    (d/transact! c [{:db/id -1 :format/value [1 [2]]}])
+    (let [basis (d/basis-t (d/db c))]
+     (is (= #{[[1 [2]]]} (d/q '[:find ?v :where [_ :format/value ?v]] (d/db c))))
+     (is (= basis (d/basis-t (d/db c))))
+     (is (nil? (s/-get st format/KEY))))
+    (finally (d/close! c) (s/close st))))))
