@@ -161,6 +161,7 @@ def main():
                 timeout_seconds = process_timeout(selected, isolated, args.timeout)
                 env["BL_QUALIFY_TIMEOUT_MS"] = str(timeout_seconds * 1000)
                 reported, handover = set(), False
+                file_elapsed = {}
                 # Each process owns its endpoint directory. Lifetime handovers and
                 # privileged fixtures stay serial inside the caller's tree cap.
                 # Preserve the host's runtime-filesystem contract as well as
@@ -171,6 +172,7 @@ def main():
                         dir=env.get("BL_TEST_USER_RUNTIME_DIR")) as runtime:
                     env["XDG_RUNTIME_DIR"] = runtime
                     command = [str(candidate), "--cold", "run", str(ROOT / "scripts/qualify-candidate.bl")]
+                    process_started = time.monotonic()
                     process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                     try:
@@ -187,6 +189,7 @@ def main():
                                         "test": "suite-discovery", "actual":
                                         "No tests or assertions ran in this file's declared namespace"})
                                 reported.add(row["file"])
+                                file_elapsed[row["file"]] = max(0, int(row.get("elapsed_ms", 0)))
                                 row["identity"] = identity
                                 receipts.write(json.dumps(row, sort_keys=True) + "\n")
                                 receipts.flush()
@@ -198,8 +201,12 @@ def main():
                                                            **row}) + "\n")
                         current_status = process.wait()
                         status = status or current_status
+                        elapsed_ms = round((time.monotonic() - process_started) * 1000)
+                        file_ms = sum(file_elapsed.values())
                         receipts.write(json.dumps({"type": "process", "identity": identity,
                                                    "files": selected, "process_status": current_status,
+                                                   "elapsed_ms": elapsed_ms, "file_elapsed_ms": file_ms,
+                                                   "setup_ms": max(0, elapsed_ms - file_ms),
                                                    "timeout_seconds": timeout_seconds}) + "\n")
                         receipts.flush()
                         os.fsync(receipts.fileno())
