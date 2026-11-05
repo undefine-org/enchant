@@ -43,7 +43,7 @@ def drop_identity():
     os.setgid(gid)
     os.setuid(uid)
 
-child = subprocess.Popen([str(candidate), '--cold', 'run', str(worker), str(parent)],
+child = subprocess.Popen([str(candidate), '--cold', 'run', str(worker), '--', str(parent)],
                          cwd=sandbox, env=env, preexec_fn=drop_identity,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, start_new_session=True)
