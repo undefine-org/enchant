@@ -1,0 +1,40 @@
+;; Historical uniqueness policy, streamed in canonical (a,v,tx,e,op) order.
+;; Builder and independent verifier each construct/replay their own event
+;; index; neither can infer historical safety from a clean final state.
+(ns datom.offline.unique
+ (:require [datom.codec :as codec] [datom.offline.layout :as l]))
+
+(def PREFIX (l/bytes [0 109 1]))
+(defn event-key [d]
+ (let [[e a v tx op] d]
+  (codec/concat-bins
+   (into [PREFIX] (mapv #(codec/encode-for-format 2 %) [a v tx e op])))))
+(defn initial [] {:value-key nil :tx nil :owners #{} :changes {}})
+
+(defn- finish-turn [state]
+ (let [owners (reduce (fn [owners [entity asserted?]]
+                       (if asserted? (conj owners entity) (disj owners entity)))
+                (:owners state) (:changes state))]
+  (when (> (count owners) 1) (l/refuse! :offline-canonical-unique-collision))
+  (assoc state :owners owners :changes {})))
+
+(defn advance
+ "Fold one event. Check uniqueness at every completed transaction boundary.
+  Same-tx retractions take precedence, independent of entity/event order."
+ [state d]
+ (let [[e a v tx asserted?] d
+       k (codec/encode-for-format 2 [a v])
+       same-value? (= k (:value-key state))
+       _ (when (and same-value? (:tx state) (< tx (:tx state)))
+           (l/refuse! :offline-unique-events-out-of-order))
+       state (cond (nil? (:value-key state)) (assoc state :value-key k :tx tx)
+                   (not same-value?) (assoc (finish-turn state) :value-key k :tx tx :owners #{})
+                   (not= tx (:tx state)) (assoc (finish-turn state) :tx tx)
+                   :else state)
+       changes (:changes state)]
+  (when (and (not (contains? changes e)) (>= (count changes) 4096))
+   (l/refuse! :offline-unique-turn-budget))
+  (assoc state :changes
+   (assoc changes e (if (erlang/=:= false (get changes e)) false asserted?)))))
+
+(defn complete [state] (finish-turn state))
