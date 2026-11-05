@@ -2264,7 +2264,10 @@
    BEAM attributes nor a caller-supplied route claim authorize the function body.
    Protected routes come only from the attested compiler artifact inventory."
   [beam ns routes]
-  (let [mod (erlang/element 1 beam) bytes (erlang/element 2 beam) result (beam_disasm/file bytes)]
+  (verify_sdk_forwarder_disassembly! (erlang/element 1 beam)
+    (beam_disasm/file (erlang/element 2 beam)) ns routes))
+
+(defn- verify_sdk_forwarder_disassembly! [mod result ns routes]
     (when-not (and (erlang/is_tuple result) (erlang/== 6 (erlang/tuple_size result))
                   (erlang/== :beam_file (erlang/element 1 result)) (erlang/== mod (erlang/element 2 result))
                   (erlang/is_map routes) (erlang/is_binary ns))
@@ -2280,7 +2283,7 @@
                           (MapSet/member? exports key)
                           (sdk-forwarder-instructions? instructions mod (erlang/element 1 key) (erlang/element 2 key) target ns))
               (erlang/error :sdk_forwarder_route_changed)))))
-      true)))
+      true))
 
 (defn- sdk_class_source_metadata! [source owner]
   (let [forms (BeamLisp.Reader/read_string (BeamLisp.Loader/read_source source) source)
@@ -2310,7 +2313,9 @@
 (defn- sdk_binding_routes! [mod bytes routes]
  ;; Literal checked compiler definitions identify exact emitted routes only.
  ;; They NEVER supply privacy: callers join explicit declaration metadata.
- (let [definitions (sdk_stage_literal_definitions! mod bytes)]
+ (sdk_binding_routes_from_definitions! mod (sdk_stage_literal_definitions! mod bytes) routes))
+
+(defn- sdk_binding_routes_from_definitions! [mod definitions routes]
   (when definitions
    (when-not (and (erlang/is_map definitions) (<= (erlang/map_size definitions) 8192))
     (erlang/error :invalid_sdk_binding_routes))
@@ -2336,7 +2341,17 @@
                         (= arity (if (= :variadic (elem definition 0)) (inc (elem definition 1)) (elem definition 1)))
                         (= body (Map/get routes (tuple function arity))))
           (erlang/error :invalid_sdk_binding_routes))
-         (list (tuple mod function arity) (tuple body function arity))))))))))))))
+         (list (tuple mod function arity) (tuple body function arity)))))))))))))
+
+(defn- sdk_forwarder_metadata! [mod bytes ns routes]
+ ;; Two independent validations consume the same actual disassembly: exact
+ ;; executable forwarding and passive literal definitions (including on_load
+ ;; refusal). Keep it lexical; a later artifact always disassembles again.
+ (let [disassembly (beam_disasm/file bytes)]
+  (verify_sdk_forwarder_disassembly! mod disassembly ns routes)
+  (sdk_binding_routes_from_definitions! mod
+    (sdk_stage_literal_definitions_from_functions!
+      (passive_binary_functions_from_disassembly! mod disassembly)) routes)))
 
 (defn- sdk_lambda_routes! [bytes]
  ;; Decode only the finite native BEAM lambda/atom tables, never ETF function
@@ -2657,12 +2672,17 @@
   ;; validation never blesses a later re-read of a replaceable pathname.
   (let [root (physical_sdk_path root) source (physical_sdk_path source)
         _ (when-not (and root source (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))
-            (erlang/error :sdk_inventory_source_outside_root))
-        chunks (beam_lib/chunks bytes (list :attributes))
+            (erlang/error :sdk_inventory_source_outside_root))]
+    (sdk_artifact_captured_entry! root source mod bytes
+      (crypto/hash :sha256 (BeamLisp.Loader/read_source source)))))
+
+(defn- sdk_artifact_captured_entry! [root source mod bytes input_digest]
+  ;; Only native producers supply this synchronous Source observation. Every
+  ;; artifact still proves its own metadata, executable routes and ownership.
+  (let [chunks (beam_lib/chunks bytes (list :attributes))
         _ (when-not (and (erlang/== :ok (elem chunks 0)) (erlang/== mod (elem (elem chunks 1) 0)))
             (erlang/error :sdk_inventory_module_mismatch))
         attrs (Keyword/get (elem (elem chunks 1) 1) :attributes)
-        input_digest (crypto/hash :sha256 (BeamLisp.Loader/read_source source))
         stamped (normalized_attribute attrs :bl_unit_source_digest)
         owner (normalized_attribute attrs :bl_declaration_owner)
         role (normalized_attribute attrs :bl_aot_artifact_role)
@@ -2729,10 +2749,7 @@
                        (erlang/== input_digest stamped)
                        (erlang/== (normalized_attribute attrs :bl_unit_namespace) (elem declarations 1))
                        (sdk_generation_matches? attrs source root))))
-        (erlang/error :sdk_inventory_invalid_declaration_metadata))
-      (verify_sdk_forwarder! (tuple mod bytes)
-        (normalized_attribute attrs :bl_aot_forwarder_namespace)
-        (normalized_attribute attrs :bl_aot_forwarder_routes)))
+        (erlang/error :sdk_inventory_invalid_declaration_metadata)))
     {:source (Path/relative_to source root) :source-digest input_digest
      :requires (sdk_unit_requires attrs)
      :sha256 (crypto/hash :sha256 bytes) :md5 (elem (elem (beam_lib/md5 bytes) 1) 1)
@@ -2744,7 +2761,9 @@
      :initializer-lambda-kind initializer_kind
      :callable-kinds callable
      :binding-routes (when (= :mutable-forwarder role)
-                       (sdk_binding_routes! mod bytes (normalized_attribute attrs :bl_aot_forwarder_routes)))
+                       (sdk_forwarder_metadata! mod bytes
+                         (normalized_attribute attrs :bl_aot_forwarder_namespace)
+                         (normalized_attribute attrs :bl_aot_forwarder_routes)))
      :forwarder-namespace (normalized_attribute attrs :bl_aot_forwarder_namespace)
      :forwarder-routes (normalized_attribute attrs :bl_aot_forwarder_routes)
      :unit-references
@@ -2841,17 +2860,34 @@
    the normal compiler result, never scans arbitrary loaded modules or blesses
    classes by name. Any missing/stale/mismatched output fails the build."
   [root manifest ebin destination]
-  (let [modules (Enum/reduce manifest (Map/new)
+  (let [requested-root root
+        root (physical_sdk_path root)
+        modules (Enum/reduce manifest (Map/new)
                   (fn [source_entry out]
-                    (Enum/reduce (Map/fetch! (elem source_entry 1) :modules) out
+                    ;; One unit owns one Source snapshot. Reuse its canonical
+                    ;; path and digest for its complete member set, then read
+                    ;; independently again before accepting any of those rows.
+                    (let [requested-source (elem source_entry 0)
+                          source (physical_sdk_path requested-source)
+                          _ (when-not (and root source (String/starts_with? source
+                                                        (erlang/iolist_to_binary (list root "/"))))
+                              (erlang/error :sdk_inventory_source_outside_root))
+                          input_digest (crypto/hash :sha256 (BeamLisp.Loader/read_source source))
+                          result (Enum/reduce (Map/fetch! (elem source_entry 1) :modules) out
                       (fn [module out]
                         (let [mod (if (erlang/is_atom module) module (String/to_existing_atom module))
                               path (Path/join ebin (erlang/iolist_to_binary (list (Atom/to_string mod) ".beam")))
-                              entry (sdk_artifact_entry! root (elem source_entry 0) mod path)
+                              entry (sdk_artifact_captured_entry! root source mod (File/read! path) input_digest)
                               prior (Map/get out (Atom/to_string mod))]
                           (when (and prior (erlang/not (erlang/== prior entry)))
                             (erlang/error :sdk_inventory_duplicate_module_owner))
-                          (Map/put out (Atom/to_string mod) entry))))))
+                          (Map/put out (Atom/to_string mod) entry))))]
+                      (when-not (and (erlang/== source (physical_sdk_path requested-source))
+                                     (erlang/== input_digest (crypto/hash :sha256 (BeamLisp.Loader/read_source source))))
+                        (erlang/error :sdk_inventory_source_changed))
+                      result)))
+        _ (when-not (erlang/== root (physical_sdk_path requested-root))
+            (erlang/error :sdk_inventory_source_outside_root))
         _ (verify_complete_sdk_units! (Map/new (Enum/map modules
               (fn [entry] (tuple (String/to_existing_atom (elem entry 0)) (elem entry 1))))))
         inventory {:version 2 :identities :binary
@@ -3652,8 +3688,7 @@
         (when-not (and (or (nil? declarations)
                           (sdk_declaration_descriptor? declarations (Map/get row :forwarder-namespace)))
                        (erlang/== declarations (Map/get row :declarations)))
-          (erlang/error :sdk_image_declaration_metadata_changed)))
-      (verify_sdk_forwarder! (tuple mod bytes) (Map/get row :forwarder-namespace) routes))
+          (erlang/error :sdk_image_declaration_metadata_changed))))
     (tuple mod (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
                     :unit-namespace unit-namespace
                     :initializer-lambda-kind initializer_kind
@@ -3663,7 +3698,8 @@
                                                   (Map/get row :seed-runtime-lambdas?))
                                              (and (= :initializer (Map/get row :role)) (= :values initializer_kind)))
                                      (sdk_lambda_routes! bytes))
-                    :binding-routes (when forwarder? (sdk_binding_routes! mod bytes routes))}))))
+                    :binding-routes (when forwarder?
+                                      (sdk_forwarder_metadata! mod bytes (Map/get row :forwarder-namespace) routes))}))))
 
 (defn- complete_image_sdk_closure! [root inventory]
   (let [manifest (BeamLisp.Bootstrap/manifest)
@@ -4832,27 +4868,35 @@
          (try (closure_hash_of ns file)
               (finally (Process/put :bl_source_snapshot (Process/get :bl_source_info_cache {})))))))))
 
-(defn- source_resolution_key [ns]
+(defn- source_resolution_context []
+  ;; One native graph discovery executes no project callbacks or environment
+  ;; switches. Capture its shared roots/realm once, rather than rebuilding
+  ;; them at every edge. The next graph recaptures even inside the same pass.
   (let [dirs (BeamLisp.Loader/search_dirs)]
-    (tuple (BeamLisp.Env/env_id) dirs (BeamLisp.Loader/realm_context) ns
-           (BeamLisp.Loader/package_provider ns)
+    (tuple (BeamLisp.Env/env_id) dirs (BeamLisp.Loader/realm_context)
            (when (Enum/any? dirs (fn [d] (not= :absolute (Path/type d)))) (File/cwd!)))))
 
-(defn- source_graph_node_cached [ns]
-  (let [key (source_resolution_key ns)
+(defn- source_resolution_key [ns context]
+  ;; Providers remain namespace-specific and live; installing a package in an
+  ;; existing realm must not reuse that namespace's previous absence.
+  (tuple context ns (BeamLisp.Loader/package_provider ns)))
+
+(defn- source_graph_node_cached [ns context]
+  (let [key (source_resolution_key ns context)
         cache (Process/get :bl_source_graph_nodes {})]
     (if (Map/has_key? cache key) (Map/get cache key)
-      (let [content (source_content_cached ns)
+      (let [content (source_content_cached ns key)
             node (when content (source_node_cached ns content))]
         (when (< (erlang/map_size cache) 8192)
           (Process/put :bl_source_graph_nodes (Map/put cache key node)))
         node))))
 
 (defn- closure_hash_of [ns file]
-  (let [seed (when (and file (File/exists? file))
+  (let [context (source_resolution_context)
+        seed (when (and file (File/exists? file))
                (source_node_cached ns (BeamLisp.Loader/read_source file)))
         nodes (BeamLisp.BuildPlan/nodes_from_resolver ns
-                (fn [name] (if (and seed (= name ns)) seed (source_graph_node_cached name))))]
+                (fn [name] (if (and seed (= name ns)) seed (source_graph_node_cached name context))))]
     (when nodes (BeamLisp.BuildPlan/key_from_nodes ns nodes))))
 
 (defn- primed_source_parts
@@ -4896,9 +4940,8 @@
    bound, together with the current environment and package provider. The same
    name cannot reuse an absent/live result after provider installation, or use
    another environment's immutable source fallback."
-  [ns]
-  (let [key (source_resolution_key ns)
-        cache (Process/get :bl_source_info_cache {})]
+  [ns key]
+  (let [cache (Process/get :bl_source_info_cache {})]
     (if (erlang/is_map_key key cache)
       (Map/get cache key)
       (let [v (BeamLisp.Loader/source_content ns)]
@@ -6023,20 +6066,20 @@
  ;; A compiled-but-uninitialized SDK provider has no runtime Fn binding yet.
  ;; Read only its compiler-emitted literal definition table and exact body
  ;; receipt. Never initialize a provider merely to compile a declaration.
- (when-not (sdk_unit_compiled? ns) (stage-refuse :sdk-stage-constructor-not-compiled))
- (let [shim (BeamLisp.Emit/module_for ns)
+ (let [evidence (BeamLisp.PackageAuthority/sdk_unit_evidence ns (sdk_inventory_input))
+       _ (when-not evidence (stage-refuse :sdk-stage-constructor-not-compiled))
+       shim (:shim evidence)
        definitions (erlang/apply shim :__bl_ns_defs__ (list))
        entries (Map/get definitions name (list))
        matching (Enum/filter entries (fn [entry]
                   (and (= :fixed (elem entry 0)) (= arity (elem entry 1)))))
        entry (when (= 1 (count matching)) (first matching))
        module (when entry (elem entry 4)) function (when entry (elem entry 2))
-       row (when module (sdk_compiler_row module))
-       root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-       source (or (physical_sdk_path (BeamLisp.Loader/source_path ns))
-                  (when row (sdk_unit_source_path root (Map/get row :source))))]
-  (when-not (and row source (sdk_source_current? root module row) (= :stable-body (Map/get row :role))
-                 (= (Path/relative_to source root) (Map/get row :source))
+       ;; The complete-unit check already authenticated this exact Source and
+       ;; every member's bytes. Consume its rows only in this lookup; never
+       ;; retain a YES across calls. Execution identity is checked at selection.
+       row (when module (Map/get (:members evidence) module))]
+  (when-not (and row (= :stable-body (Map/get row :role))
                  (= name (Atom/to_string function))
                  (= (Map/get row :md5) (erlang/apply module :module_info (list :md5)))
                  (erlang/function_exported module function arity))
@@ -6302,8 +6345,10 @@
  "Inspect executable instructions before publication. Attributes alone do not
   reveal on_load, which OTP lowers into code. This operation loads nothing."
  [mod bytes]
-  (let [disassembly (beam_disasm/file bytes)
-        _ (when-not (and (erlang/is_tuple disassembly) (erlang/== 6 (erlang/tuple_size disassembly))
+  (passive_binary_functions_from_disassembly! mod (beam_disasm/file bytes)))
+
+(defn- passive_binary_functions_from_disassembly! [mod disassembly]
+  (let [_ (when-not (and (erlang/is_tuple disassembly) (erlang/== 6 (erlang/tuple_size disassembly))
                          (erlang/== :beam_file (elem disassembly 0)) (erlang/== mod (elem disassembly 1)))
             (erlang/error :invalid_compiled_binary_disassembly))
         functions (elem disassembly 5)]
@@ -6319,7 +6364,9 @@
     functions))
 
 (defn- sdk_stage_literal_definitions! [mod bytes]
-  (let [functions (passive_binary_functions! mod bytes)]
+  (sdk_stage_literal_definitions_from_functions! (passive_binary_functions! mod bytes)))
+
+(defn- sdk_stage_literal_definitions_from_functions! [functions]
     (let [definition (Enum/find functions
                        (fn [function] (and (erlang/== :__bl_ns_defs__ (elem function 1))
                                            (erlang/== 0 (elem function 2)))))]
@@ -6337,7 +6384,7 @@
                          (erlang/is_tuple operand) (erlang/== 2 (erlang/tuple_size operand))
                          (erlang/== :literal (elem operand 0)) (erlang/is_map (elem operand 1)))
             (erlang/error :sdk_stage_cached_definition_not_literal))
-          (elem operand 1))))))
+          (elem operand 1)))))
 
 (defn- sdk_stage_cached_unit [ns source content requested key closure out]
   ;; Existing v2 cache format and provenance contract, without generic fetch's
