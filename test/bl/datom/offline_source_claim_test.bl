@@ -93,3 +93,28 @@
     (is (= before (fs/tree-digest original))))
    (finally (when (deref held) (try (seal/release! (deref held)) (catch _ nil)))
             (release scope) (close original) (close job)))))
+
+(deftest accepted-engine-retains-original-after-coordinator-detaches
+ (let [{:keys [source-path job scope]} (fixture) original (fs/claim! source-path {:readonly true})
+       owner (erlang/self) tag (erlang/make_ref)]
+  (try
+   (engine/bind-source! scope original spec)
+   (let [monitored (erlang/spawn_monitor
+          (fn []
+           (let [store (engine/open! scope "scratch/accepted" {:create true})]
+            (erlang/send owner [tag :opened])
+            (receive [reply :finish] :when (= tag reply) nil)
+            ;; Keep the actual accepted engine live across the parent's checks.
+            (s/-put store "still-owned" true))))
+         pid (elem monitored 0) monitor (elem monitored 1)]
+    (try
+     (receive [reply :opened] :when (= tag reply) nil
+       (after 30000 (throw (ex-info "engine did not open" {}))))
+     (is (engine/release-source! scope))
+     (is (= :offline-filesystem-refused (kind #(fs/close! original))))
+     (is (try (fj/open (str source-path "/control.fjall")) false (catch _ true)))
+     (finally
+      (erlang/send pid [tag :finish])
+      (receive [:DOWN ref :process worker reason] :when (and (= ref monitor) (= worker pid)) nil
+       (after 30000 (throw (ex-info "engine did not exit" {})))))))
+   (finally (release scope) (close original) (close job)))))
