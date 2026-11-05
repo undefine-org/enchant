@@ -63,7 +63,9 @@ rows = for mod <- Process.get(:restoration_profile_modules), {fun,arity} <- mod.
   {count,elapsed} = Enum.reduce(records,{0,0},fn {_pid,n,sec,us},{c,t} -> {c+n,t+sec*1_000_000+us} end)
   %{function: inspect(mod) <> "." <> to_string(fun) <> "/" <> to_string(arity), calls: count, exclusive_us: elapsed}
 end
-for row <- Enum.take(Enum.sort_by(rows,& &1.exclusive_us,:desc),100), do: IO.puts("RESTORE-CALL " <> Jason.encode!(row))
+ranked = Enum.take(Enum.sort_by(rows,& &1.exclusive_us,:desc),100)
+cleanup = Enum.filter(rows, &String.contains?(&1.function, "source_owner"))
+for row <- Enum.uniq(ranked ++ cleanup), do: IO.puts("RESTORE-CALL " <> Jason.encode!(row))
 '''
 
 
