@@ -71,6 +71,7 @@ impl Directory {
         }
         Ok(())
     }
+    pub(crate) fn readonly(&self) -> bool { self.root.readonly }
     pub(crate) fn writable(&self) -> std::io::Result<()> {
         self.check()?;
         self.writable_path(&self.path)
@@ -114,13 +115,16 @@ impl Directory {
         Ok(Reader { parent: self.clone(), name: child.into(), metadata, file, offset: 0 })
     }
 }
-struct DirectoryHandle(Arc<Directory>);
+pub(crate) struct DirectoryHandle(pub(crate) Arc<Directory>);
 #[rustler::resource_impl]
 impl Resource for DirectoryHandle {}
 
 /// A private job capability is minted only from its already claimed directory
 /// and an exact durable marker. A path or a copied BL record cannot mint it.
-pub(crate) struct OfflineScope { pub(crate) directory: Arc<Directory>, pub(crate) marker: Reader }
+pub(crate) struct OfflineScope {
+    pub(crate) directory: Arc<Directory>, pub(crate) marker: Reader,
+    pub(crate) source: Mutex<Option<Arc<super::source::Original>>>,
+}
 #[rustler::resource_impl]
 impl Resource for OfflineScope {}
 
@@ -166,7 +170,7 @@ fn fjall_offline_scope(directory: ResourceArc<DirectoryHandle>, expected: Binary
     if bytes != expected.as_slice() { return Err(err("offline job binding mismatch")); }
     marker.file.sync_all().map_err(err)?;
     directory.0.file.sync_all().map_err(err)?;
-    Ok(ResourceArc::new(OfflineScope { directory: directory.0.clone(), marker }))
+    Ok(ResourceArc::new(OfflineScope { directory: directory.0.clone(), marker, source: Mutex::new(None) }))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]

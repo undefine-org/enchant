@@ -1,0 +1,94 @@
+(ns datom.offline-source-claim-test
+ (:require [datom.offline.engine :as engine] [datom.offline.fs :as fs]
+           [datom.offline.snapshot :as snapshot] [datom.offline.seal :as seal]
+           [datom.offline.layout :as l] [datom.store-fjall :as fj] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}]
+           :files ["config.json"] :directories []})
+(def marker (erlang/term_to_binary {:version 1 :job (l/digest :source-claim-fixture)}))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn close [root] (when root (try (fs/close! root) (catch _ nil))))
+(defn release [scope] (when scope (try (engine/release-source! scope) (catch _ nil))))
+(defn fixture []
+ (let [parent (s/fresh-path ".offline-original-parent") _ (File/mkdir_p! (str parent "/original"))
+       source (fj/open-fresh) job (fs/claim! (str parent "/job") {:create true})]
+  (try
+   (s/-put source "key" :original)
+   (s/checkpoint! source (str parent "/original/control.fjall"))
+   (File/write! (str parent "/original/config.json") "{\"fixture\":true}")
+   (fs/put! job ".bl-offline-job" nil marker)
+   {:source-path (str parent "/original") :job job :scope (engine/scope! job marker)
+    :destination (str parent "/generation")}
+   (finally (s/close source)))))
+
+(deftest bound-capture-retains-every-original-engine-without-opening-it
+ (let [{:keys [source-path job scope]} (fixture) original (fs/claim! source-path {:readonly true})
+       captured (fs/child! job "snapshot" {:create true})]
+  (try
+   (let [before (fs/tree-digest original)]
+    (is (engine/bind-source! scope original spec))
+    (is (= :offline-engine-refused (kind #(engine/bind-source! scope original spec))))
+    (is (engine/check-source! scope original spec))
+    (is (= :captured (:status (snapshot/capture-bound! scope original captured spec))))
+    (is (= before (fs/tree-digest captured)))
+    (is (= before (fs/tree-digest original)))
+    ;; The binding owns the directory flocks even after capture has returned.
+    (is (try (fj/open (str source-path "/control.fjall")) false (catch _ true)))
+    (is (= :offline-filesystem-refused (kind #(fs/close! original))))
+    (is (= :offline-filesystem-refused (kind #(fs/child! original "control.fjall" {:lock true}))))
+    (is (= before (fs/tree-digest original)))
+    (engine/release-source! scope)
+    (is (= :offline-engine-refused (kind #(engine/check-source! scope original spec))))
+    (let [free (fs/child! original "control.fjall" {:lock true})]
+     (is (seq (:entries (fs/entries free)))))
+    (is (= before (fs/tree-digest original))))
+   (finally (release scope) (close original) (close job)))))
+
+(deftest original-admission-uses-actual-native-access-and-inventory
+ (let [{:keys [source-path job scope]} (fixture) writable (fs/claim! source-path)]
+  (try
+   (let [before (fs/tree-digest writable)]
+    (is (= :offline-engine-refused (kind #(engine/bind-source! scope (assoc writable :readonly true) spec))))
+    (is (= :offline-engine-refused (kind #(engine/bind-source! scope job spec))))
+    (is (= before (fs/tree-digest writable))))
+   (finally (release scope) (close writable) (close job))))
+ (let [{:keys [source-path job scope]} (fixture) original (fs/claim! source-path {:readonly true})
+       other-path (str source-path "-other") _ (File/mkdir_p! other-path)
+       other (fs/claim! other-path {:readonly true})]
+  (try
+   (engine/bind-source! scope original spec)
+   (is (= :offline-engine-refused (kind #(engine/check-source! scope (assoc other :path source-path) spec))))
+   (is (= :offline-engine-refused
+          (kind #(engine/check-source! scope original (assoc-in spec [:stores 0 :path] "different.fjall")))))
+   (finally (release scope) (close original) (close other) (close job)))))
+
+(deftest live-or-unsupported-originals-refuse-without-engine-recovery
+ (doseq [damage [:live :physical-version]]
+  (let [{:keys [source-path job scope]} (fixture)
+        live (when (= damage :live) (fj/open (str source-path "/control.fjall")))]
+   (when (= damage :physical-version) (File/write! (str source-path "/control.fjall/version") "FJL\u0003"))
+   (let [original (fs/claim! source-path {:readonly true})]
+    (try
+     (let [before (fs/tree-digest original)]
+      (is (= :offline-engine-refused (kind #(engine/bind-source! scope original spec))))
+      (is (= before (fs/tree-digest original))))
+     (finally (when live (s/close live)) (release scope) (close original) (close job)))))))
+
+(deftest sealed-publisher-inherits-original-custody-until-explicit-completion
+ (let [{:keys [source-path job scope destination]} (fixture) original (fs/claim! source-path {:readonly true})
+       target (fs/child! job "target" {:create true}) held (atom nil)]
+  (try
+   (engine/bind-source! scope original spec)
+   (let [before (fs/tree-digest original)]
+    (snapshot/copy-tree! original target spec {})
+    (reset! held (seal/target! scope spec))
+    (is (= :offline-engine-refused (kind #(engine/release-source! scope))))
+    (is (= :offline-filesystem-refused (kind #(fs/close! original))))
+    (is (= destination (seal/publish! (deref held) destination)))
+    (is (= :offline-engine-refused (kind #(engine/release-source! scope))))
+    (is (= before (fs/tree-digest original)))
+    (seal/release! (deref held))
+    (is (engine/release-source! scope))
+    (is (= before (fs/tree-digest original))))
+   (finally (when (deref held) (try (seal/release! (deref held)) (catch _ nil)))
+            (release scope) (close original) (close job)))))

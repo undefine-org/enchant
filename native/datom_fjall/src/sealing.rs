@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
 mod atoms { rustler::atoms! { accepted, released, error } }
-struct Custody(Arc<Root>);
+pub(crate) struct Custody(pub(crate) Arc<Root>);
 impl Drop for Custody {
     fn drop(&mut self) { self.0.pins.fetch_sub(1, Ordering::AcqRel); }
 }
@@ -28,13 +28,13 @@ struct Sealed {
     scope: ResourceArc<OfflineScope>, target: Arc<Directory>,
     publication: Mutex<Publication>,
     // Drop closed-store locks before releasing the job's explicit custody pin.
-    _stores: Vec<Arc<Directory>>, _custody: Custody,
+    _stores: Vec<Arc<Directory>>, _original: Option<Arc<super::source::Original>>, _custody: Custody,
 }
 struct SealHandle { value: Mutex<Option<Arc<Sealed>>>, busy: AtomicBool }
 #[rustler::resource_impl]
 impl Resource for SealHandle {}
 
-fn relative(parts: &str) -> std::io::Result<Vec<&str>> {
+pub(crate) fn relative(parts: &str) -> std::io::Result<Vec<&str>> {
     let values: Vec<_> = parts.split('/').collect();
     if values.is_empty() || values.len() > 128 || parts.len() > 4096 {
         return Err(std::io::Error::other("invalid sealed store path"));
@@ -70,6 +70,7 @@ fn fjall_offline_seal(scope: ResourceArc<OfflineScope>, paths: Vec<String>)
         return Err(err("sealed store inventory omitted a native opening"));
     }
     drop(opened);
+    let original = scope.source.lock().map_err(err)?.clone();
     let mut seal = scope.directory.root.sealed.lock().map_err(err)?;
     if seal.is_some() { return Err(err("job target already sealed")); }
     *seal = Some(target.path.clone());
@@ -78,7 +79,7 @@ fn fjall_offline_seal(scope: ResourceArc<OfflineScope>, paths: Vec<String>)
     Ok(ResourceArc::new(SealHandle {
         value: Mutex::new(Some(Arc::new(Sealed { scope: scope.clone(), target,
             publication: Mutex::new(Publication { destination: None, moved: false, stable: false }),
-            _stores: stores, _custody: custody }))), busy: AtomicBool::new(false),
+            _stores: stores, _original: original, _custody: custody }))), busy: AtomicBool::new(false),
     }))
 }
 

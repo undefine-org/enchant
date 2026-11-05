@@ -53,6 +53,7 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMo
 mod checkpoint;
 mod directory;
 mod sealing;
+mod source;
 mod keycodec;
 use keycodec::KeyVal;
 
