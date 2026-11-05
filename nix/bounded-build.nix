@@ -49,7 +49,7 @@ pkgs.vmTools.runInLinuxVM (pkgs.lib.overrideDerivation drv (old: {
       cp ${pkgs.dbus}/etc/systemd/user/dbus.socket /etc/systemd/user/dbus.socket
       sed 's|--session |--config-file=${pkgs.dbus}/share/dbus-1/session.conf |' \
         ${pkgs.dbus}/etc/systemd/user/dbus.service > /etc/systemd/user/dbus.service
-      ln -s ../dbus.socket /etc/systemd/user/sockets.target.wants/dbus.socket
+      ln -sfn ../dbus.socket /etc/systemd/user/sockets.target.wants/dbus.socket
       export SYSTEMD_UNIT_PATH=/etc/systemd/user:${pkgs.systemd}/example/systemd/user
       ${pkgs.systemd}/lib/systemd/systemd --user --unit=basic.target --log-target=console > /tmp/command-manager.log 2>&1 &
       ready=0
