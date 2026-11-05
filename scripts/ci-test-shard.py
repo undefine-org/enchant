@@ -26,9 +26,11 @@ def host_nix_files(root):
             set(targets.get('all', []) + targets.get('linux', []))}
 
 
-def partitions(root, count, *, lane='all'):
+def partitions(root, count, *, lane='all', startup_ms=20000):
     if count < 1:
         raise ValueError("count must be positive")
+    if type(startup_ms) is not int or startup_ms < 0:
+        raise ValueError("startup_ms must be a nonnegative integer")
     files = []
     for directory, dirs, names in os.walk(root / "test"):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
@@ -44,11 +46,18 @@ def partitions(root, count, *, lane='all'):
     if not timing_file.exists():
         return [sorted(files)[index::count] for index in range(count)]
     timings = json.loads(timing_file.read_text())
+    isolation_file = root / "scripts/test-isolation.json"
+    isolated = json.loads(isolation_file.read_text()) if isolation_file.exists() else {}
+    # File receipts exclude application startup. Each isolated file owns an
+    # additional cold VM; the ordinary warm group pays startup once per shard.
+    # Keep every isolation boundary and charge its estimated fixed work here.
+    def cost(name):
+        return max(1, timings.get(name, 1000)) + (startup_ms if name in isolated else 0)
     groups, loads = [[] for _ in range(count)], [0] * count
-    for name in sorted(files, key=lambda name: (-timings.get(name, 1000), name)):
+    for name in sorted(files, key=lambda name: (-cost(name), name)):
         index = min(range(count), key=lambda index: (loads[index], index))
         groups[index].append(name)
-        loads[index] += max(1, timings.get(name, 1000))
+        loads[index] += cost(name)
     return groups
 
 
@@ -86,11 +95,13 @@ def main():
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--count", type=int, required=True)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--startup-ms", type=int, default=20000,
+                        help="estimated cold VM startup cost for each isolated file")
     args = parser.parse_args()
     if not 0 <= args.index < args.count:
         parser.error("index must be within [0, count)")
     root = Path(__file__).resolve().parent.parent
-    selected = partitions(root, args.count)[args.index]
+    selected = partitions(root, args.count, startup_ms=args.startup_ms)[args.index]
     if not selected:
         parser.error("empty shard")
     print(f"Shard {args.index + 1}/{args.count}: {len(selected)} test files", flush=True)
