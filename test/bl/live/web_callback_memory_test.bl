@@ -1,0 +1,50 @@
+;; A listener pool must share its callback, not copy its captured application
+;; into every idle acceptor. This fixture contains only synthetic integers.
+(ns live.web-callback-memory-test (:require [web]))
+(defn- free-port []
+ (let [socket (elem (gen_tcp/listen 0 (list :binary (tuple :active false)
+                                     (tuple :ip (tuple 127 0 0 1)))) 1)
+       port (elem (elem (inet/sockname socket) 1) 1)]
+  (gen_tcp/close socket) port))
+(defn- reply [port]
+ (let [socket (elem (gen_tcp/connect (tuple 127 0 0 1) port
+                       (list :binary (tuple :active false)) 3000) 1)]
+  (try
+   (gen_tcp/send socket "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+   (let [response (loop [parts ""]
+                    (let [result (gen_tcp/recv socket 0 3000)]
+                     (if (= :ok (elem result 0))
+                      (recur (str parts (elem result 1))) parts)))]
+    (last (split response "\r\n\r\n")))
+   (finally (gen_tcp/close socket)))))
+(defn- captured-plug [payload]
+ (fn [conn] (web/text conn 200 (str (count payload)))))
+(defn- pool-sample [payload]
+ (let [before (set (erlang/processes)) port (free-port)
+       listener (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                                  :plug (captured-plug payload)}) 1)]
+  (try
+   (let [rows (reduce (fn [out pid]
+                        (if (contains? before pid) out
+                         (let [info (erlang/process_info pid :memory)]
+                          (if (and (erlang/is_tuple info) (= :memory (elem info 0)))
+                           (conj out (elem info 1)) out)))) [] (erlang/processes))
+         sample {:processes (count rows) :bytes (reduce + 0 rows)}]
+    (assoc sample :reply (reply port)))
+   (finally (Supervisor/stop listener :normal 30000)))))
+
+(deftest idle-listener-memory-does-not-multiply-the-captured-application-by-the-pool
+ (Application/ensure_all_started :bandit)
+ (let [small (pool-sample [0]) payload (vec (range 65536))
+       payload-bytes (* (erlang/system_info :wordsize) (erts_debug/flat_size payload))
+       large (pool-sample payload)
+       ;; Permit ordinary allocator noise and a few working copies; hundreds
+       ;; of idle copies are a different lifetime/ownership error.
+       budget (+ (:bytes small) (* 8 payload-bytes) (* 16 1024 1024))]
+  (println :listener-pool-memory {:small (dissoc small :reply) :large (dissoc large :reply)
+                                :payload-bytes payload-bytes :large-budget-bytes budget})
+  (is (pos? (:processes small)))
+  (is (pos? (:processes large)))
+  (is (= "1" (:reply small)))
+  (is (= "65536" (:reply large)))
+  (is (<= (:bytes large) budget))))
