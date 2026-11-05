@@ -82,6 +82,7 @@ impl Directory {
         if sealed.as_ref().is_some_and(|frozen| path.starts_with(frozen)) {
             return Err(failure("offline target is sealed"));
         }
+        super::generation::check_write(path)?;
         Ok(())
     }
     pub(crate) fn child(self: &Arc<Self>, child: &str, create: bool, lock: bool) -> std::io::Result<Arc<Self>> {
@@ -104,7 +105,7 @@ impl Directory {
         Ok(Arc::new(Self { file, path: self.path.join(child), metadata,
             root: self.root.clone(), parent: Some(self.clone()) }))
     }
-    fn open_file(self: &Arc<Self>, child: &str) -> std::io::Result<Reader> {
+    pub(crate) fn open_file(self: &Arc<Self>, child: &str) -> std::io::Result<Reader> {
         self.check()?;
         let file = open_at(&self.file, child, libc::O_RDONLY, 0)?;
         let metadata = file.metadata()?;
@@ -219,6 +220,7 @@ fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relati
 
 pub(crate) struct Reader { parent: Arc<Directory>, name: String, metadata: Metadata, file: File, offset: u64 }
 impl Reader {
+    pub(crate) fn len(&self) -> u64 { self.metadata.len() }
     pub(crate) fn check(&self) -> std::io::Result<()> {
         self.parent.check()?;
         if !unchanged(&self.metadata, &self.file.metadata()?)
@@ -227,7 +229,7 @@ impl Reader {
         }
         Ok(())
     }
-    fn read(&mut self, limit: usize) -> std::io::Result<Vec<u8>> {
+    pub(crate) fn read(&mut self, limit: usize) -> std::io::Result<Vec<u8>> {
         if limit == 0 || limit > 1048576 { return Err(failure("invalid file read byte bound")); }
         self.check()?;
         let n = usize::try_from((self.metadata.len()-self.offset).min(limit as u64)).unwrap();
@@ -242,6 +244,7 @@ impl Resource for FileHandle {}
 fn claim(path: &Path, readonly: bool, create: bool) -> std::io::Result<Arc<Directory>> {
     if !path.is_absolute() { return Err(failure("absolute canonical directory required")); }
     if create {
+        super::generation::check_write(path)?;
         let parent = path.parent().ok_or_else(|| failure("directory needs a parent"))?;
         if fs::canonicalize(parent)? != parent { return Err(failure("directory parent is not canonical")); }
         fs::DirBuilder::new().mode(0o700).create(path)?;

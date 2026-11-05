@@ -54,6 +54,7 @@ mod checkpoint;
 mod directory;
 mod sealing;
 mod source;
+mod generation;
 mod keycodec;
 use keycodec::KeyVal;
 
@@ -202,6 +203,9 @@ struct StoreClaim<E = StoreEngine> {
     _lock: File,
     /// Rust drops fields in order: signal ONLY after engine and flock teardown.
     _retirement: RetirementSignal,
+    // Exports retain StoreClaim too. Keep generation custody until actual
+    // engine retirement, even after its last ordinary handle has disappeared.
+    _generation: Option<Arc<generation::Owner>>,
 }
 
 #[derive(Default)]
@@ -290,16 +294,23 @@ enum ClaimError {
 /// by a failed open is released when its `File` drops.
 fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
     refuse_offline_path(path).map_err(ClaimError::Io)?;
+    if generation::access(path).map_err(ClaimError::Io)?.is_some() {
+        return Err(ClaimError::Io(std::io::Error::other("generation opening must retain its owner")));
+    }
     claim_store_mode(path, false)
 }
 
 fn claim_store_mode(path: &Path, existing_only: bool) -> Result<Arc<StoreClaim>, ClaimError> {
+    claim_store_owned(path, existing_only, None)
+}
+fn claim_store_owned(path: &Path, existing_only: bool, owner: Option<&Arc<generation::Owner>>) -> Result<Arc<StoreClaim>, ClaimError> {
     // The directory must exist to be canonicalized and opened. fjall creates
     // it too, later, when it is already ours.
-    fs::create_dir_all(path).map_err(ClaimError::Io)?;
+    if owner.is_none() { fs::create_dir_all(path).map_err(ClaimError::Io)?; }
     // Collapse symlinks, relative paths and trailing separators to the one
     // real directory, so the map keys the same way the kernel's flock does.
     let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
+    let owned = owner.map(|value| value.store_lock(&canon)).transpose().map_err(ClaimError::Io)?;
     loop {
         let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
         match existing_claim(&mut claims, &canon) {
@@ -311,12 +322,16 @@ fn claim_store_mode(path: &Path, existing_only: bool) -> Result<Arc<StoreClaim>,
             }
             ExistingClaim::Missing => {}
         }
-        let dir = File::open(&canon).map_err(ClaimError::Io)?;
-        match dir.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
-            Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
-        }
+        let dir = if let Some(file) = &owned { file.try_clone().map_err(ClaimError::Io)? }
+        else {
+            let file = File::open(&canon).map_err(ClaimError::Io)?;
+            match file.try_lock() {
+                Ok(()) => {},
+                Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
+                Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
+            }
+            file
+        };
         if existing_only { require_existing_engine(&canon).map_err(ClaimError::Io)?; }
         let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
         if existing_only && !keyspace.partition_exists("datoms") {
@@ -329,6 +344,7 @@ fn claim_store_mode(path: &Path, existing_only: bool) -> Result<Arc<StoreClaim>,
         let claim = Arc::new(StoreClaim {
             _lock: dir,
             _retirement: RetirementSignal(retirement.clone()),
+            _generation: owner.cloned(),
             engine: StoreEngine {
                 keyspace,
                 datoms,
@@ -345,9 +361,11 @@ impl Resource for DbHandle {}
 
 impl DbHandle {
     fn offline_write_guard(&self) -> NifResult<Option<std::sync::MutexGuard<'_, ()>>> {
+        if let Some(owner) = &self._claim._generation { return owner.write_guard().map(Some).map_err(err); }
         self._offline.as_ref().map(|scope| scope.write_guard()).transpose().map_err(err)
     }
     fn offline_read_admit(&self) -> NifResult<()> {
+        if let Some(owner) = &self._claim._generation { owner.check().map_err(err)?; }
         self._offline.as_ref().map(|scope| scope.check_live()).transpose().map_err(err)?;
         Ok(())
     }
@@ -442,7 +460,10 @@ fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 /// than a second LSM instance over the same segment files.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    let claim = match claim_store(Path::new(&path)) {
+    refuse_offline_path(Path::new(&path)).map_err(err)?;
+    let owner = generation::access(Path::new(&path)).map_err(err)?;
+    let claim = match if owner.is_some() { claim_store_owned(Path::new(&path), true, owner.as_ref()) }
+                      else { claim_store(Path::new(&path)) } {
         Ok(claim) => claim,
         Err(ClaimError::Held(canon)) => {
             return Err(Error::Term(Box::new((
@@ -491,8 +512,10 @@ fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
     refuse_offline_path(p).map_err(err)?;
-    fs::create_dir_all(p).map_err(|e| err(e))?;
+    let owner = generation::access(p).map_err(err)?;
+    if owner.is_none() { fs::create_dir_all(p).map_err(|e| err(e))?; }
     let canon = fs::canonicalize(p).map_err(|e| err(e))?;
+    if let Some(owner) = owner { owner.store_lock(&canon).map_err(err)?; }
     Ok(to_binary(env, canon.to_string_lossy().as_bytes())?.to_term(env))
 }
 
@@ -1930,6 +1953,7 @@ mod tests {
             engine: ProbeEngine { dir: dir.clone(), held_at_drop: held_at_drop.clone() },
             _lock: lock,
             _retirement: RetirementSignal(Arc::new(Retirement::default())),
+            _generation: None,
         };
 
         assert_eq!(held_at_drop.get(), None, "the engine is alive until the claim drops");
@@ -2004,6 +2028,7 @@ mod tests {
             engine: BlockedEngine { entered: entered_tx, release: Mutex::new(release_rx) },
             _lock: lock,
             _retirement: RetirementSignal(retirement.clone()),
+            _generation: None,
         });
         let mut registry = HashMap::new();
         registry.insert(dir.clone(), ClaimEntry { claim: Arc::downgrade(&claim), retirement });

@@ -1,0 +1,129 @@
+(ns datom.generation-owner-test
+ (:require [datom.generation :as generation] [datom.offline.root :as root]
+           [datom.offline.fs :as fs] [datom.offline.journal :as journal]
+           [datom.offline.layout :as l] [datom.store-fjall :as fj]
+           [datom.blob-fs :as blob-fs] [datom.blob :as blob] [datom.file :as file]
+           [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 2 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+                    {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+           :files ["config.json"] :directories ["empty"]})
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn native-refused? [value]
+ (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0))))
+(defn close [directory] (try (fs/close! directory) (catch _ nil)))
+(defn fixture []
+ (let [parent (s/fresh-path ".generation-owner") original (str parent "/original")
+       evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
+  (File/mkdir_p! original)
+  (doseq [part (get evidence "archives")]
+   (let [result (System/cmd "tar" (list "-xzf" (Path/expand (str "test/fixtures/datom/" (get part "file"))) "-C" original))]
+    (when-not (= 0 (elem result 1)) (throw (ex-info "fixture extraction failed" {})))))
+  (root/prepare! original (str parent "/job") (str parent "/generation")
+   (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"]) (l/digest :fixture-release) (assoc spec :key-format 1))
+  {:app (fs/claim! (str parent "/writer") {:create true})
+   :root (fs/claim! (str parent "/generation"))}))
+(defn release-closed! [owner]
+ (loop [left 100]
+  (let [error (kind #(generation/release! owner))]
+   (when error
+    (when (= 0 left) (throw (ex-info "generation engine did not retire" {:kind error})))
+    (erlang/garbage_collect) (Process/sleep 10) (recur (dec left))))))
+
+(deftest enrolled-roots-reject-unowned-engine-blob-and-generic-file-mutations
+ (let [{:keys [app root]} (fixture) alias (str (:path root) "-alias")
+       before (fs/tree-digest root) sha (file/sha256 "attempt")]
+  (try
+   (File/ln_s! (:path root) alias)
+   (doseq [path [(str (:path root) "/control.fjall") (str alias "/control.fjall")
+                 (str alias "/new.fjall")]]
+    (is (try (fj/open path) false (catch _ true))))
+   (is (not (File/exists? (str (:path root) "/new.fjall"))))
+   (is (= :offline-filesystem-refused (kind #(fs/put! root "unowned" nil "changed"))))
+   (is (= :offline-filesystem-refused (kind #(fs/claim! (str (:path root) "/unowned") {:create true}))))
+   (is (= :generation-blob-ownership-required (kind #(blob-fs/open (str alias "/new.blobs")))))
+   ;; A caller-constructed record and a handle opened before enrollment cannot
+   ;; bypass a guard placed only in open. Every mutator rechecks protection.
+   (let [forged (blob-fs/->BlobFs (str (:path root) "/libraries/a.fjall.blobs") false)]
+    (is (= :generation-blob-ownership-required (kind #(blob/-blob-put forged sha "attempt"))))
+    (is (= :generation-blob-ownership-required (kind #(blob/-blob-delete forged sha))))
+    (is (= :generation-blob-ownership-required
+           (kind #(blob/-blob-import forged (str (:path root) "/config.json") {})))))
+   (is (= before (fs/tree-digest root)))
+   (finally (File/rm alias) (close root) (close app)))))
+
+(deftest application-and-every-closed-store-remain-owned-through-native-worker-retirement
+ (let [{:keys [app root]} (fixture) owner (generation/claim! app root spec)
+       parent (erlang/self) tag (erlang/make_ref) path (str (:path root) "/control.fjall")
+       monitored (erlang/spawn_monitor
+        (fn []
+         (let [store (fj/open path) before (fj/raw-get store l/TX-KEY)]
+          (erlang/send parent [tag :opened (s/-get store l/TX-KEY)])
+          (receive [reply :finish] :when (= reply tag) nil)
+          (erlang/send parent [tag :readonly
+           [(kind #(s/-put store l/TX-KEY 2000000))
+            (kind #(s/-delete store l/TX-KEY))
+            (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) l/TX-KEY before))
+            (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle store) l/TX-KEY))
+            (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle store) l/TX-KEY before before))
+            (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store) (list (tuple :delete l/TX-KEY))))
+            (s/-get store l/TX-KEY)]]))))
+       pid (elem monitored 0) monitor (elem monitored 1)]
+  (try
+   (receive [reply :opened value] :when (= reply tag) (is (= 1000031 value))
+    (after 30000 (throw (ex-info "generation worker did not open" {}))))
+   (is (= :generation-ownership-refused (kind #(generation/release! owner))))
+   (is (= :offline-filesystem-refused (kind #(fs/close! app))))
+   (is (= :offline-filesystem-refused (kind #(fs/close! root))))
+   ;; Even an engine not opened by the candidate is already kernel-claimed.
+   (is (= :offline-filesystem-refused
+          (kind #(fs/child! (fs/child! root "libraries") "a.fjall" {:lock true}))))
+   (is (= :offline-filesystem-refused (kind #(fs/put! root "readonly" nil "changed"))))
+   (erlang/send pid [tag :finish])
+   (receive [reply :readonly values] :when (= reply tag)
+    (is (= [:native-store-operation-failed :native-store-operation-failed true true true true 1000031] values))
+    (after 30000 (throw (ex-info "generation worker did not report" {}))))
+   (receive [:DOWN ref :process worker reason] :when (and (= ref monitor) (= worker pid))
+    (is (= :normal reason)) (after 30000 (throw (ex-info "generation worker did not exit" {}))))
+   (release-closed! owner)
+   (is (try (fj/open path) false (catch _ true)))
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (erlang/send pid [tag :finish]) (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest copied-flags-or-derived-capabilities-cannot-substitute-for-independent-root-claims
+ (let [{:keys [app root]} (fixture)
+       raw (journal/read-file root ".bl-generation" 1048576)
+       derived (fs/child! root "libraries")]
+  (try
+   (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
+                         (:handle root) (:handle root) raw (list "control.fjall"))))
+   (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
+                         (:handle app) (:handle derived) raw (list "a.fjall"))))
+   (is (= :generation-identity-mismatch
+          (kind #(generation/claim! app root (assoc spec :application "other")))))
+   (let [owner (generation/claim! app root spec)]
+    (try
+     (is (= :generation-ownership-refused (kind #(generation/claim! app root spec))))
+     (finally (generation/release! owner))))
+   (finally (close root) (close app)))))
+
+(deftest a-checkpoint-retains-generation-custody-after-the-opening-worker-exits
+ (let [{:keys [app root]} (fixture) owner (generation/claim! app root spec)
+       parent (erlang/self) tag (erlang/make_ref) path (str (:path root) "/control.fjall")
+       monitored (erlang/spawn_monitor
+        (fn [] (let [store (fj/open path)]
+                 (erlang/send parent [tag (s/capture-checkpoint! store)]))))
+       pid (elem monitored 0) monitor (elem monitored 1)]
+  (try
+   (receive [reply cursor] :when (= reply tag)
+    (try
+     (receive [:DOWN ref :process worker reason] :when (and (= ref monitor) (= worker pid))
+      (is (= :normal reason)) (after 30000 (throw (ex-info "checkpoint worker did not exit" {}))))
+     (is (= :generation-ownership-refused (kind #(generation/release! owner))))
+     (is (= :offline-filesystem-refused (kind #(fs/close! app))))
+     (is (= :offline-filesystem-refused (kind #(fs/close! root))))
+     (finally (s/release-checkpoint! cursor)))
+    (after 30000 (throw (ex-info "checkpoint worker did not report" {}))))
+   (release-closed! owner)
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
