@@ -1,0 +1,40 @@
+(ns structural.image-profile (:require [unit-store :as units] [build-image :as image]))
+(def root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root)))
+(def sdk (System/fetch_env! "BL_SDK_PRODUCT"))
+(def sources (mapv #(Path/join root (get % "file"))
+               (vals (get (Jason/decode! (File/read! (Path/join sdk "unit-store/unit-index.json"))) "units"))))
+(def scratch (Path/join (System/tmp_dir!) (str "image-profile-" (System/unique_integer (list :positive)))))
+(def patterns [(tuple :Elixir.BeamLisp.Refs :task_exec 2)
+               (tuple :Elixir.BeamLisp.AOT :write_sdk_inventory! 4)
+               (tuple :Elixir.BeamLisp.AOT :sdk_artifact_captured_entry! 5)
+               (tuple :Elixir.BeamLisp.AOT :physical_sdk_path 1)
+               (tuple :Elixir.BeamLisp.Loader :read_source 1)
+               (tuple :Elixir.File :read! 1)
+               (tuple :Elixir.File :write! 2)
+               (tuple :beam_lib :all_chunks 1)
+               (tuple :beam_lib :chunks 2)
+               (tuple :beam_lib :md5 1)
+               (tuple :beam_disasm :file 1)
+               (tuple :crypto :hash 2)])
+(defn measure [stage action]
+ (doseq [pattern patterns] (erlang/trace_pattern pattern true (list :local :call_count)))
+ (try
+  (let [start (erlang/monotonic_time :microsecond)
+        result (action)
+        elapsed (- (erlang/monotonic_time :microsecond) start)
+        counts (Enum/map (to-list patterns) (fn [pattern] (list (pr-str pattern) (elem (erlang/trace_info pattern :call_count) 1))))]
+   (println (str "IMAGE-PROFILE " (Jason/encode! {:stage stage :elapsed-us elapsed :counts counts :result result
+                     :memory (erlang/memory :total)}))))
+  (finally (doseq [pattern patterns] (erlang/trace_pattern pattern false (list :local :call_count))))))
+(File/mkdir_p! scratch)
+(try
+ (let [output (Path/join scratch "units")
+       result (units/produce! {:root root :sources sources :previous (Path/join sdk "unit-store") :out output :jobs 4})
+       manifest (:manifest result)]
+  (when-not (= 0 (:compiled result)) (throw (ex-info "Image probe must restore every baseline unit" result)))
+  (doseq [width [1 4]]
+   (let [ebin (Path/join scratch (str "image-" width))]
+    (measure (str "assembly-" width)
+      (fn [] (image/assemble! manifest manifest root output ebin
+        (Path/join ebin "sdk-code.term") (Path/join ebin "precompiled.term") width))))))
+ (finally (File/rm_rf! scratch)))
