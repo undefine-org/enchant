@@ -1,0 +1,81 @@
+(ns datom.offline-journal-test
+ (:require [datom.offline.journal :as journal] [datom.offline.fs :as fs]
+           [datom.offline.layout :as l] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}]
+           :files [] :directories []})
+(def intent {:source "/tmp/synthetic-original" :destination "/tmp/synthetic-generation"
+             :source-runtime (l/digest :old-runtime) :tool (l/digest :tool)
+             :code (l/digest :target-code) :manifest spec})
+(def captured {:version 1 :kind :physical :status :captured :tree-digest (l/digest :snapshot)
+               :manifest-digest (l/digest spec) :entries 10 :declared-key-format 1 :data-version 1})
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn fresh [] (fs/claim! (s/fresh-path ".offline-journal") {:create true}))
+
+(deftest durable-journal-reloads-exact-intent-and-reconciles-a-lost-save-reply
+ (let [root (fresh)]
+  (try
+   (let [initial (journal/create! root intent)
+         next (assoc (:state initial) :phase :captured :snapshot captured)
+         saved (journal/save! root initial next)]
+    (is (= :capturing (get-in initial [:state :phase])))
+    (is (= saved (journal/load! root intent)))
+    (is (= (journal/marker intent) (journal/read-file root journal/MARKER 1048576)))
+    (is (= :offline-journal-changed (kind #(journal/save! root initial next))))
+    (is (= saved (journal/load! root intent)))
+    (is (= :offline-job-not-empty (kind #(journal/create! root intent))))
+    (is (= :offline-job-intent-changed (kind #(journal/load! root (assoc intent :tool (l/digest :new-tool))))))
+    (is (= :offline-job-intent-changed (kind #(journal/load! root (assoc intent :code (l/digest :new-code)))))))
+   (finally (fs/close! root)))))
+
+(deftest malformed-or-skipped-transitions-never-repair-or-overwrite-the-journal
+ (let [root (fresh)]
+  (try
+   (let [initial (journal/create! root intent) before (fs/tree-digest root)]
+    (doseq [next [(assoc (:state initial) :version 2) (assoc (:state initial) :version 1.0)
+                  (assoc (:state initial) :extra :unknown)
+                  (assoc (:state initial) :phase :unknown)
+                  (assoc (:state initial) :phase :published :snapshot captured)
+                  (assoc (:state initial) :phase :captured)
+                  (assoc (:state initial) :phase :captured :snapshot (assoc captured :manifest-digest (l/digest :other)))]]
+     (is (some? (kind #(journal/save! root initial next))))
+     (is (= before (fs/tree-digest root))))
+    ;; Expected bytes cannot authenticate a forged in-memory phase envelope.
+    (let [forged (assoc initial :state (assoc (:state initial) :phase :ready :snapshot captured))]
+     (is (= :offline-invalid-journal-envelope
+            (kind #(journal/save! root forged (assoc (:state forged) :phase :publishing))))))
+     (is (= before (fs/tree-digest root)))
+    (let [captured-state (journal/save! root initial (assoc (:state initial) :phase :captured :snapshot captured))]
+     (is (= :offline-invalid-journal-transition
+            (kind #(journal/save! root captured-state
+                     (assoc (:state captured-state) :phase :seeding :snapshot (assoc captured :tree-digest (l/digest :changed)))))))))
+   (finally (fs/close! root)))))
+
+(deftest missing-corrupt-or-replaced-control-files-refuse-without-initialization
+ (doseq [damage [:missing :corrupt :marker]]
+  (let [root (fresh) state (journal/create! root intent)]
+   (case damage
+    :missing (File/rm! (str (:path root) "/" journal/FILE))
+    :corrupt (fs/put! root journal/FILE (:bytes state) "not a valid journal")
+    :marker (fs/put! root journal/MARKER (journal/marker intent) "different intent"))
+   (try
+    (let [before (fs/tree-digest root)]
+     (is (some? (kind #(journal/load! root intent))))
+     (is (= before (fs/tree-digest root))))
+    (finally (fs/close! root))))))
+
+(deftest intent-and-metadata-byte-bounds-are-explicit
+ (let [root (fresh)]
+  (try
+   (doseq [bad [(assoc intent :source-runtime "unknown") (assoc intent :destination "/")
+                (assoc intent :source "relative") (assoc intent :extra :unknown)
+                (assoc-in intent [:manifest :key-format] 2)]]
+    (is (some? (kind #(journal/create! root bad))))
+    (is (= [] (:entries (fs/entries root)))))
+   (is (= :offline-overlapping-roots
+          (kind #(journal/create! root (assoc intent :destination "/tmp/synthetic-original/nested")))))
+   (fs/put! root "large" nil (String/duplicate "x" 1025))
+   (is (= :offline-journal-byte-limit (kind #(journal/read-file root "large" 1024))))
+   (is (= :offline-journal-byte-limit (kind #(journal/read-file root "large" 0))))
+   (is (nil? (journal/read-file root "absent" 1024)))
+   (finally (fs/close! root)))))

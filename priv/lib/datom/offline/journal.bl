@@ -1,0 +1,122 @@
+;; One private preparation journal. Foundry remains the owner of the release
+;; activation decision; this record describes only the offline job it invokes.
+(ns datom.offline.journal
+ (:require [datom.offline.fs :as fs] [datom.offline.manifest :as manifest]
+           [datom.offline.layout :as l]))
+(def FILE "job.etf")
+(def MARKER ".bl-offline-job")
+(def LIMIT 16777216)
+(def FIELDS #{:version :intent :phase :snapshot :proofs :ready})
+(def TRANSITIONS
+ {:capturing #{:capturing :captured} :captured #{:captured :seeding}
+  :seeding #{:seeding :converting} :converting #{:converting :verifying}
+  :verifying #{:verifying :ready} :ready #{:ready :verifying :publishing}
+  :publishing #{:publishing :verifying :published} :published #{:published :verifying}})
+(defn digest? [value] (and (string? value) (Regex/match? #"^[0-9a-f]{64}$" value)))
+(defn intent!
+ "Explicit code/runtime/source/manifest binding. The coordinator must derive
+  :tool from its selected SDK; a supplied digest alone grants no authority."
+ [value]
+ (when-not (and (erlang/is_map value)
+                (= #{:source :destination :source-runtime :tool :code :manifest} (set (keys value)))
+                (every? digest? [(:source-runtime value) (:tool value) (:code value)]))
+  (l/refuse! :offline-invalid-job-intent))
+ (doseq [path [(:source value) (:destination value)]]
+  (when-not (and (string? path) (= path (Path/expand path)) (not= "/" path)
+                 (<= 1 (erlang/byte_size path) 4096))
+   (l/refuse! :offline-invalid-job-intent)))
+ (when (or (manifest/within? (:source value) (:destination value))
+           (manifest/within? (:destination value) (:source value)))
+  (l/refuse! :offline-overlapping-roots))
+ (manifest/validate! (:manifest value))
+ (when-not (erlang/=:= 1 (get-in value [:manifest :key-format]))
+  (l/refuse! :offline-unsupported-source-format))
+ value)
+(defn marker [intent] (erlang/term_to_binary {:version 1 :intent (intent! intent)}))
+
+(defn read-file
+ "Bounded pinned metadata read. Absence is checked by directory inventory;
+  permission/identity/read errors never masquerade as a missing journal."
+ [root name limit]
+ (when-not (and (erlang/is_integer limit) (<= 1 limit LIMIT)) (l/refuse! :offline-journal-byte-limit))
+ (loop [after nil]
+  (let [page (fs/entries root after 512) entry (some #(when (= name (:name %)) %) (:entries page))]
+   (cond
+    entry
+     (do
+      (when-not (= :file (:kind entry)) (l/refuse! :offline-invalid-journal-entry))
+      (when (> (:bytes entry) limit) (l/refuse! :offline-journal-byte-limit))
+      (let [reader (fs/file-reader root name)]
+       (loop [parts [] size 0]
+        (let [chunk (fs/read-chunk reader) size (+ size (erlang/byte_size (:bytes chunk)))]
+         (when (> size limit) (l/refuse! :offline-journal-byte-limit))
+         (let [parts (conj parts (:bytes chunk))]
+          (if (:done? chunk) (erlang/iolist_to_binary (to-list parts)) (recur parts size)))))))
+    (:done? page) nil
+    :else (recur (:last page))))))
+
+(defn- checked! [state]
+ (BeamLisp.CompilerData/check_first_order! state
+  {:max-nodes 131072 :max-depth 64 :max-bytes LIMIT})
+ (when-not (and (erlang/is_map state) (= FIELDS (set (keys state)))
+                (erlang/=:= 1 (:version state)) (contains? TRANSITIONS (:phase state))
+                (vector? (:proofs state)) (<= (count (:proofs state)) 256)
+                (or (nil? (:snapshot state)) (erlang/is_map (:snapshot state)))
+                (or (nil? (:ready state)) (erlang/is_map (:ready state))))
+  (l/refuse! :offline-invalid-journal))
+ (intent! (:intent state))
+ (when-not (= :capturing (:phase state))
+  (let [snapshot (:snapshot state)]
+   (when-not (and (erlang/=:= 1 (:version snapshot)) (= :physical (:kind snapshot))
+                  (= :captured (:status snapshot)) (digest? (:tree-digest snapshot))
+                  (= (l/digest (get-in state [:intent :manifest])) (:manifest-digest snapshot)))
+    (l/refuse! :offline-invalid-journal-snapshot))))
+ state)
+(defn- encoded [state]
+ (let [bytes (erlang/term_to_binary (checked! state))]
+  (when (> (erlang/byte_size bytes) LIMIT) (l/refuse! :offline-journal-byte-limit)) bytes))
+
+(defn create!
+ "Initialize only a fresh empty claimed job. An interrupted creation with no
+  journal is retained for inspection and requires a fresh private attempt."
+ [root intent]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (intent! intent)
+ (when (seq (:entries (fs/entries root nil 1))) (l/refuse! :offline-job-not-empty))
+ (let [state {:version 1 :intent intent :phase :capturing :snapshot nil :proofs [] :ready nil}
+       bytes (encoded state)]
+  (when-not (fs/put! root MARKER nil (marker intent)) (l/refuse! :offline-job-intent-changed))
+  (when-not (fs/put! root FILE nil bytes) (l/refuse! :offline-journal-changed))
+  {:state state :bytes bytes}))
+
+(defn load!
+ "Resume only the same exact intent and well-formed protocol. Phase/proofs
+  are progress hints; they are never whole-root READY or activation evidence."
+ [root intent]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when-not (erlang/=:= (marker intent) (read-file root MARKER 1048576))
+  (l/refuse! :offline-job-intent-changed))
+ (let [bytes (read-file root FILE LIMIT)]
+  (when (nil? bytes) (l/refuse! :offline-incomplete-journal))
+  (let [state (checked! (l/checked-slot bytes))]
+   (when-not (= intent (:intent state)) (l/refuse! :offline-job-intent-changed))
+   {:state state :bytes bytes})))
+
+(defn save!
+ "Durably compare-and-replace one allowed transition. Source snapshot and
+  intent cannot change once recorded. A lost reply is reconciled by load!."
+ [root previous next]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (checked! (:state previous)) (checked! next)
+ (when-not (erlang/=:= (:bytes previous) (encoded (:state previous)))
+  (l/refuse! :offline-invalid-journal-envelope))
+ (when-not (and (= (:intent (:state previous)) (:intent next))
+                (contains? (get TRANSITIONS (:phase (:state previous))) (:phase next))
+                (or (nil? (:snapshot (:state previous)))
+                    (= (:snapshot (:state previous)) (:snapshot next))))
+  (l/refuse! :offline-invalid-journal-transition))
+ (when-not (erlang/=:= (marker (:intent next)) (read-file root MARKER 1048576))
+  (l/refuse! :offline-job-intent-changed))
+ (let [bytes (encoded next)]
+  (when-not (fs/put! root FILE (:bytes previous) bytes) (l/refuse! :offline-journal-changed))
+  {:state next :bytes bytes}))
