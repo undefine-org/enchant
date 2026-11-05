@@ -14,10 +14,12 @@ class PlatformHostPolicy(unittest.TestCase):
     def test_preparation_preserves_station_and_hosted_worker_configuration(self):
         with tempfile.TemporaryDirectory(prefix='bl-platform-policy-') as temporary:
             project = Path(temporary) / 'source'
-            for name in ('scripts', 'nix', 'native', 'tooling/drop', 'tools'):
+            for name in ('scripts', 'nix', 'native', 'tooling/drop', 'tools', 'test/scripts'):
                 (project / name).mkdir(parents=True)
             for name in ('flake.nix', 'flake.lock'):
                 (project / name).write_text('{}\n')
+            for name in ('scripts/sdk-inputs', 'test/scripts/test_engine_snapshot.py'):
+                (project / name).write_text('# platform qualification input\n')
             shutil.copyfile(ROOT / 'scripts/prepare-checkout-platform',
                             project / 'scripts/prepare-checkout-platform')
             manager = project / 'tools/systemd-run'
