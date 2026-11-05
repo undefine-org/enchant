@@ -1,0 +1,69 @@
+(ns datom.offline-legacy-root-test
+ (:require [datom.offline.engine :as engine] [datom.offline.fs :as fs]
+           [datom.offline.manifest :as manifest] [datom.offline.snapshot :as snapshot]
+           [datom.offline.blobs :as blobs] [datom.offline.reindex :as reindex]
+           [datom.offline.verify :as verify] [datom.offline.layout :as l]
+           [datom.store-fjall :as fj] [datom.store :as s]))
+(def spec
+ {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+  :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+           {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+  :files ["config.json"] :directories ["empty"]})
+(defn drain! [job]
+ (loop [left 100]
+  (when (zero? left) (throw (ex-info "fixture conversion did not finish" {})))
+  (when-not (= :copied (:phase (reindex/step! job))) (recur (dec left)))))
+
+(deftest retained-sdk-root-is-captured-without-opening-original-engines
+ (let [evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))
+       parent (s/fresh-path ".cross-sdk-root") original (str parent "/original")
+       job-path (str parent "/job")]
+  (File/mkdir_p! original)
+  (doseq [part (get evidence "archives")]
+   (let [archive (Path/expand (str "test/fixtures/datom/" (get part "file")))]
+    (is (= (get part "sha256")
+           (String/downcase (binary/encode_hex (crypto/hash :sha256 (File/read! archive))))))
+    (let [unpacked (System/cmd "tar" (list "-xzf" archive "-C" original))]
+     (is (= 0 (elem unpacked 1)))
+     (when-not (= 0 (elem unpacked 1)) (throw (ex-info "fixture extraction refused" {}))))))
+  (let [source (fs/claim! original {:readonly true}) job (fs/claim! job-path {:create true})]
+   (try
+    (let [before (fs/tree-digest source) captured (fs/child! job "snapshot" {:create true})
+          receipt (snapshot/capture! source captured spec)
+          bound (reindex/job-binding (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"])
+                  (l/digest :synthetic-candidate-tool) (:tree-digest receipt) (l/digest spec))
+          extraction (fs/child! job "extract" {:create true})
+          target-root (fs/child! job "target" {:create true})]
+     (is (= :captured (:status receipt)))
+     (snapshot/copy-tree! captured extraction spec {:omit-protocol true})
+     (snapshot/copy-tree! captured target-root spec {:omit-protocol true :omit-stores true})
+     (is (fs/put! job ".bl-offline-job" nil (erlang/term_to_binary bound)))
+     (let [scope (engine/scope! job (erlang/term_to_binary bound))]
+      (doseq [store-spec (:stores spec)]
+       (let [id (if (= "control" (:id store-spec)) "control" "library")
+             old (engine/open! scope (str "extract/" (:path store-spec)))
+             target (engine/open! scope (str "target/" (:path store-spec)) {:create true})
+             scratch (engine/open! scope (str "scratch/verify-" id) {:create true})
+             old-blobs (engine/open! scope (str "scratch/source-blobs-" id) {:create true})
+             new-blobs (engine/open! scope (str "scratch/target-blobs-" id) {:create true})]
+        (try
+         (drain! (reindex/begin! old target bound))
+         (let [proof (verify/verify! old target scratch bound)
+               old-proof (blobs/inspect-store! old 1 captured store-spec old-blobs)
+               new-proof (blobs/inspect-store! old 1 target-root store-spec new-blobs)]
+          (is (= (if (= id "control") 8 11) (:datoms proof)))
+          (is (= 1000031 (:basis proof)))
+          (is (= 900 (:entity-counter proof)))
+          (is (= old-proof new-proof))
+          (is (= (if (= id "control") 0 3) (:references old-proof)))
+          (is (= (if (= id "control") 0 2) (:distinct-blobs old-proof)))
+          (is (= :verified (:phase (reindex/state target bound))))
+          ;; Verified is still private/building, never whole-root READY.
+          (is (= (reindex/descriptor bound) (s/-get target l/FORMAT-KEY))))
+         (finally (s/close old) (s/close target) (s/close scratch)
+                  (s/close old-blobs) (s/close new-blobs))))))
+     (is (= "preserve orphan bytes" (File/read! (str job-path "/target/libraries/a.fjall.blobs/orphan"))))
+     (is (= before (fs/tree-digest source)))
+     (is (= before (fs/tree-digest captured)))
+     (is (not (File/exists? (str job-path "/target/READY.json")))))
+    (finally (fs/close! source) (fs/close! job))))))

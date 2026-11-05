@@ -1,0 +1,54 @@
+;; Run explicitly with the retained pre-integration SDK. The archive contains
+;; only synthetic closed engines and synthetic blobs, never application code.
+(ns datom.legacy-root-producer-test
+ (:require [datom.store :as s] [datom.store-fjall :as fj] [datom.index :as index]
+           [datom.schema :as schema] [datom.file :as file]))
+
+(def definitions
+ [{:db/ident :fixture/key :db/valueType :db.type/tuple :db/cardinality :db.cardinality/one
+   :db/unique :db.unique/identity}
+  {:db/ident :fixture/attachment :db/valueType :db.type/file :db/cardinality :db.cardinality/one}])
+(def first-tx 1000000)
+(defn closed-store! [path facts]
+ (let [source (fj/open-fresh) sch (schema/install-all (schema/empty-schema) definitions)
+       ds (into (vec (mapcat (fn [[id definition]]
+                              (mapv (fn [op] [(get op 1) (get op 2) (get op 3) first-tx true])
+                               (schema/definition-datoms id definition)))
+                           (mapv (fn [id definition] [id definition]) [500 501] definitions))) facts)]
+  (try
+   (s/-put source (erlang/list_to_binary (list 0 116)) (+ first-tx 31))
+   (s/-put source (erlang/list_to_binary (list 0 101)) 900)
+   (doseq [d ds idx (index/indexes-for sch (get d 1))]
+    ;; A retained raw ETF payload, rather than the candidate's current slot
+    ;; encoder, is the compatibility fixture under test.
+    (let [result (BeamLisp.Native.Datom.StoreFjall/fjall_put
+                  (:handle source) (index/key-for idx d) (erlang/term_to_binary d))]
+     (when-not (= :ok result) (throw (ex-info "legacy producer write refused" {})))))
+   (s/checkpoint! source path {:chunk-size 4 :max-chunk-bytes 65536})
+   (finally (s/close source)))))
+(defn blob! [root descriptor bytes]
+ (let [hex (file/sha-hex (:sha descriptor))
+       parent (str root "/" (String/slice hex 0 2) "/" (String/slice hex 2 2))]
+  (File/mkdir_p! parent) (File/write! (str parent "/" hex) bytes)))
+
+(deftest export-synthetic-closed-legacy-root
+ (let [root (s/fresh-path ".legacy-root") archive (str root ".tar.gz")
+       old (file/at-rest (file/file "historical attachment" {:media-type "text/plain"}))
+       current (file/at-rest (file/file "current attachment"))]
+  (File/mkdir_p! (str root "/libraries"))
+  (File/mkdir_p! (str root "/empty"))
+  (closed-store! (str root "/control.fjall")
+    [[42 :fixture/key [1 (list 2 {:nested [3]})] first-tx true]])
+  (closed-store! (str root "/libraries/a.fjall")
+    [[43 :fixture/key (with-meta (list 4 [5]) {:fixture "retained"}) first-tx true]
+     [44 :fixture/attachment old first-tx true]
+     [44 :fixture/attachment old (+ first-tx 1) false]
+     [44 :fixture/attachment current (+ first-tx 1) true]])
+  (blob! (str root "/libraries/a.fjall.blobs") old "historical attachment")
+  (blob! (str root "/libraries/a.fjall.blobs") current "current attachment")
+  (File/write! (str root "/libraries/a.fjall.blobs/orphan") "preserve orphan bytes")
+  (File/write! (str root "/config.json") "{\"fixture\":true}")
+  (let [result (System/cmd "tar" (list "-czf" archive "-C" root "."))]
+   (is (= 0 (elem result 1)))
+   (when-not (= 0 (elem result 1)) (throw (ex-info "legacy archive refused" {}))))
+  (println (str "DATOM-LEGACY-ROOT " (Base/encode64 (File/read! archive))))))

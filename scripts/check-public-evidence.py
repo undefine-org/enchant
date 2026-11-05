@@ -19,7 +19,9 @@ import zlib
 
 PRIVATE_ROOTS = frozenset(('knowledger', 'foundry'))
 MAX_BLOB = 64 * 1024 * 1024
-MAX_MEMBER = 16 * 1024 * 1024
+# Fjall preallocates 32 MiB journals, including tiny closed synthetic fixtures.
+# Keep recursive member scanning and the aggregate 256 MiB budget unchanged.
+MAX_MEMBER = 32 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
 MAX_MEMBERS = 16384
 MAX_DEPTH = 3
