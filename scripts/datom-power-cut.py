@@ -13,7 +13,9 @@ def main():
     parser.add_argument('--virtiofsd', required=True)
     parser.add_argument('qemu_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    command = [args.qemu] + args.qemu_args[1:]
+    # Replacing vmTools' launcher must retain hardware acceleration. Never
+    # silently fall back to TCG for these memory-bounded durability controls.
+    command = [args.qemu, '-accel', 'kvm', '-cpu', 'max'] + args.qemu_args[1:]
     # vmTools defaults cache=unsafe, which ignores the guest's flushes. This
     # control requires fsync to reach the host before the simulated power cut.
     command = [arg.replace('cache=unsafe', 'cache=writeback,format=raw')
