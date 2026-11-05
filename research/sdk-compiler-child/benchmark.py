@@ -63,11 +63,14 @@ def prepare(label):
     drv = subprocess.check_output(['nix-store', '-q', '--deriver', metadata['image']], text=True).strip()
     log = subprocess.check_output(['nix-store', '-l', drv], text=True)
     (out/(label+'.image.log')).write_text(log)
+    # A cache hit returns this image's historical build log. Never attribute
+    # those historical phases to the wall time of an unchanged command.
+    row['phase_scope'] = 'retained image producer log, separate from command wall time'
     row['phases'] = []
     seen = set()
     row['duplicate_phase_lines'] = 0
     for line in log.splitlines():
-        if re.match(r'^SDK-(?:UNIT-PHASES|PHASE|SHELL-PHASE|PARTS-RESULT) ', line):
+        if label.startswith(('prime', 'edit-')) and re.match(r'^SDK-(?:UNIT-PHASES|PHASE|SHELL-PHASE|PARTS-RESULT) ', line):
             if line in seen:
                 row['duplicate_phase_lines'] += 1
                 continue
