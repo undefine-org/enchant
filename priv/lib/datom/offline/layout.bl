@@ -1,0 +1,124 @@
+;; Explicit persisted-format readers. No Conn, initialization, application
+;; callback or current-runtime format admission is involved in offline reads.
+(ns datom.offline.layout
+ (:require [datom.codec :as codec] [datom.value-codec :as slot]))
+
+(def FIRST-TX 1000000)
+(def ENTITY-KEY (erlang/list_to_binary (list 0 101)))
+(def TX-KEY (erlang/list_to_binary (list 0 116)))
+(def FORMAT-KEY (erlang/list_to_binary (list 0 107)))
+(def DERIVED-PREFIX (erlang/list_to_binary (list 0 100)))
+(def INDEXES {1 :eavt 2 :aevt 3 :avet 4 :vaet})
+(def TAGS {:eavt 1 :aevt 2 :avet 3 :vaet 4})
+
+(defn refuse! [kind]
+ (throw (ex-info "Offline Datom preparation refused; retain the captured generation"
+           {:kind kind})))
+
+(defn bytes [values] (erlang/list_to_binary (to-list values)))
+(defn starts? [value prefix]
+ (and (erlang/is_binary value) (<= (erlang/byte_size prefix) (erlang/byte_size value))
+      (erlang/=:= prefix (erlang/binary_part value 0 (erlang/byte_size prefix)))))
+(defn byte-at [value at] (slot/byte-at value at))
+
+(defn prefix [version index components]
+ (when-not (get TAGS index) (refuse! :offline-unknown-index))
+ (codec/concat-bins
+  (into [(bytes [(get TAGS index)])]
+        (mapv #(codec/encode-for-format version %) components))))
+(defn prefix-end [value] (codec/concat-bins [value (bytes [255])]))
+(defn derived-key [ident] (codec/concat-bins [DERIVED-PREFIX (erlang/term_to_binary ident)]))
+(defn key-for [version index d]
+ (let [[e a v tx op] d]
+  (prefix version index
+   (case index :eavt [e a v tx op] :aevt [a e v tx op]
+               :avet [a v e tx op] :vaet [v a e tx op]
+               (refuse! :offline-unknown-index)))))
+
+(declare checked-slot-in)
+(defn- checked-etf [raw]
+ (let [value (BeamLisp.Env/decode_data_term! raw)]
+  (BeamLisp.CompilerData/check_first_order! value
+   {:max-nodes 131072 :max-depth 64 :max-bytes 16777216})
+  ;; This reader explicitly supports default, uncompressed ETF from the
+  ;; retained runtime contract. Different/trailing encodings require a reader,
+  ;; never a best-effort reinterpretation or a silent end-of-scan.
+  (when-not (erlang/=:= raw (erlang/term_to_binary value))
+   (refuse! :offline-unsupported-payload-encoding))
+  value))
+
+(defn- checked-slot-in [raw depth]
+ (when-not (and (erlang/is_binary raw) (< 0 (erlang/byte_size raw) 16777217) (< depth 64))
+  (refuse! :offline-invalid-slot))
+ (let [n (erlang/byte_size raw) lane (byte-at raw 0)]
+  (case lane
+   131 (checked-etf raw)
+   255 (checked-etf (erlang/binary_part raw 1 (- n 1)))
+   6 (do
+       (when (or (< n 19) (> (byte-at raw 17) 1)
+                 (>= (+ 19 (byte-at raw 18)) n))
+        (refuse! :offline-invalid-slot))
+       (let [offset (+ 19 (byte-at raw 18))]
+        (checked-slot-in (erlang/binary_part raw offset (- n offset)) (inc depth)))
+       (slot/decode-slot raw))
+   1 (do (when-not (= n 9) (refuse! :offline-invalid-slot)) (slot/decode-slot raw))
+   5 (do (when-not (= n 9) (refuse! :offline-invalid-slot)) (slot/decode-slot raw))
+   2 (do (when (or (not= n 2) (> (byte-at raw 1) 1)) (refuse! :offline-invalid-slot))
+         (slot/decode-slot raw))
+   3 (slot/decode-slot raw)
+   4 (slot/decode-slot raw)
+   (refuse! :offline-invalid-slot))))
+
+(defn checked-slot
+ "Strict supported slot reader. In particular non-0/1 operation bytes cannot
+  quietly become retractions. Error data never includes customer payloads."
+ [raw]
+ (try (checked-slot-in raw 0)
+  (catch error
+   (if (= :offline-unsupported-payload-encoding (:kind (ex-data error)))
+    (refuse! :offline-unsupported-payload-encoding)
+    (refuse! :offline-invalid-slot)))))
+
+(defn checked-datom [raw basis]
+ (let [d (checked-slot raw)]
+  (when-not (and (vector? d) (= 5 (count d))
+                (erlang/is_integer (get d 0)) (keyword? (get d 1))
+                (erlang/is_integer (get d 3)) (<= FIRST-TX (get d 3) basis)
+                (or (erlang/=:= true (get d 4)) (erlang/=:= false (get d 4))))
+   (refuse! :offline-invalid-datom))
+  d))
+
+(def CACHE-IDENTS
+ {:datom.attr-basis/build 1
+  :datom.current/attribute 2 :datom.current/pair 3 :datom.current/reverse 2
+  :datom.index-coverage/avet 2
+  :datom.text/indexed 2 :datom.text/ready 2 :datom.text/frequency 3
+  :datom.corpus 3
+  :datom.query.rank/registry 1 :datom.query.rank/retired 1
+  :datom.query.rank/header 2 :datom.query.rank/node 4 :datom.query.rank/member 4})
+
+(defn- derived-class [key]
+ (when (> (erlang/byte_size key) 65536) (refuse! :offline-unknown-metadata))
+ (let [ident (try (checked-etf (erlang/binary_part key 2 (- (erlang/byte_size key) 2)))
+                 (catch _ (refuse! :offline-unknown-metadata)))]
+  (when-not (vector? ident) (refuse! :offline-unknown-metadata))
+  (cond (= [:datom.attr-basis] ident) :authoritative
+        (= (get CACHE-IDENTS (get ident 0)) (count ident)) :cache
+        :else (refuse! :offline-unknown-metadata))))
+
+(defn classify
+ "Every persisted namespace has a handler or refuses. Recognized disposable
+  artifacts are invalidated; their original bytes remain in the sealed backup."
+ [key]
+ (when-not (and (erlang/is_binary key) (pos? (erlang/byte_size key)))
+  (refuse! :offline-unknown-namespace))
+ (cond (get INDEXES (byte-at key 0)) {:kind :index :index (get INDEXES (byte-at key 0))}
+       (or (= key ENTITY-KEY) (= key TX-KEY)) {:kind :counter}
+       (= key FORMAT-KEY) {:kind :format}
+       (starts? key DERIVED-PREFIX) {:kind (derived-class key)}
+       (or (starts? key (bytes [0 99 1])) (starts? key (bytes [0 99 2]))
+           (starts? key (bytes [0 120]))) {:kind :cache}
+       :else (refuse! :offline-unknown-namespace)))
+
+(defn digest [value]
+ (String/downcase (binary/encode_hex (crypto/hash :sha256 (erlang/term_to_binary value)))))

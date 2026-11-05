@@ -71,6 +71,7 @@
   ; concurrent get waited the whole scan (max 3421ms). Chunks release that
   ; lane between reads and bound the native transient.
   (fjall-range-chunk 5)
+  (fjall-raw-page 6)
   ; fjall-resolve-chunk: the DATOM read path — up to `limit` datoms from the
   ; same three bounds, DECODED IN RUST. Args: (start after stop limit mode),
   ; where mode is :datoms (a list under "datoms"), :pairs ([k v] decoded values,
@@ -597,3 +598,43 @@
  (let [tag (erlang/make_ref)
        _ (checkpoint-result (BeamLisp.Native.Datom.StoreFjall/fjall_sync_directory path (erlang/self) tag))]
   (receive [reply-tag value] :when (= reply-tag tag) (checkpoint-result value))))
+
+
+(defn raw-get
+ "Exact persisted slot bytes, or nil. Offline tools must not open a sealed
+  original engine: use a disposable working copy of a captured generation."
+ [store key]
+ (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) key))
+
+(defn raw-page
+ "Bounded, ordered raw KV page. Cursor is the last key (exclusive on resume).
+  Any engine/oversize error raises; an empty page alone is not a success flag."
+ ([store after] (raw-page store nil after nil 512 4194304))
+ ([store start after stop rows max-bytes]
+  (let [r (BeamLisp.Native.Datom.StoreFjall/fjall_raw_page
+            (:handle store) start after stop rows max-bytes)]
+   (when-not (and (erlang/is_tuple r) (= 4 (erlang/tuple_size r)))
+    (throw (ex-info "Raw store page failed" {:kind :raw-store-page-failed})))
+   {:entries (mapv (fn [pair] [(elem pair 0) (elem pair 1)]) (elem r 0))
+    :last (elem r 1) :done? (elem r 2) :bytes (elem r 3)})))
+
+(defn commit-raw!
+ "Atomic ordered raw-slot batch for offline preparation, retaining the native
+  writer admission boundary. Values are already encoded bytes, never re-encoded.
+  Progress and rows can be committed together; call sync! for durable progress."
+ [store operations]
+ (native-mutation-admit! store)
+ (let [ops (mapv (fn [operation]
+                  (let [op (datom.store/checked-op operation)]
+                   (when-not (and (erlang/is_binary (get op 1))
+                                  (or (= :delete (get op 0)) (erlang/is_binary (get op 2))))
+                    (throw (ex-info "Raw store batch needs binary keys and slots"
+                              {:kind :invalid-raw-store-operation})))
+                   (erlang/list_to_tuple (to-list op)))) operations)
+       size (reduce (fn [n op] (+ n (erlang/byte_size (elem op 1))
+                                  (if (= 3 (erlang/tuple_size op)) (erlang/byte_size (elem op 2)) 0))) 0 ops)]
+  (when (or (> (count ops) 16384) (> size 16777216))
+   (throw (ex-info "Raw store batch exceeds its bound" {:kind :raw-store-batch-too-large})))
+  (when (= :legacy (native-mutation store :fjall-commit [(to-list ops)]))
+   (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store) (to-list ops)))
+  store))

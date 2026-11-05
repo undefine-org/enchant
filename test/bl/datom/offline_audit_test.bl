@@ -1,0 +1,138 @@
+(ns datom.offline-audit-test
+ (:require [datom.offline.audit :as audit] [datom.offline.layout :as l]
+           [datom.store-fjall :as fj] [datom.store :as s] [datom.schema :as schema]
+           [datom.value-codec :as slot] [datom.index :as index]
+           [datom.index-coverage :as coverage]))
+
+(def definition {:db/ident :fixture/key :db/valueType :db.type/tuple
+                 :db/cardinality :db.cardinality/one :db/unique :db.unique/identity})
+(def sch (assoc (schema/empty-schema) :fixture/key definition))
+(def fact [42 :fixture/key [1 (list 2)] l/FIRST-TX true])
+(defn seed []
+ (let [st (fj/open-fresh)
+       ds (conj (mapv (fn [op] [(get op 1) (get op 2) (get op 3) l/FIRST-TX true])
+                      (schema/definition-datoms 100 definition)) fact)]
+  (s/-put st l/TX-KEY (+ l/FIRST-TX 19))
+  (s/-put st l/ENTITY-KEY 500)
+  (doseq [d ds]
+   (fj/commit-raw! st
+    (mapv (fn [idx] [:put (l/key-for 1 idx d)
+                     (if (= idx :eavt) (erlang/term_to_binary d) (slot/encode-slot d))])
+          (index/indexes-for sch (get d 1)))))
+  st))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn raw-rows [st] (audit/fold-pages st nil nil conj []))
+
+(deftest inventory-recovers-without-a-connection-and-conserves-all-source-bytes
+ (let [st (seed)]
+  (try
+   (let [before (raw-rows st) report (audit/inspect-store st 1)]
+    (is (= (+ l/FIRST-TX 19) (:basis report)))
+    (is (= 500 (:entity-counter report)))
+    (is (= definition (get (:schema report) :fixture/key)))
+    (is (contains? (:unique-attrs report) :fixture/key))
+    (is (contains? (:unique-attrs report) :db/ident))
+    (is (= 5 (get (:indexes report) :eavt)))
+    (is (= 5 (get (:indexes report) :aevt)))
+    (is (= 2 (get (:indexes report) :avet)))
+    (is (= 0 (get (:indexes report) :vaet)))
+    (is (= 2 (:authoritative report)))
+    (is (= 64 (String/length (:digest report))))
+    (is (= (:digest report) (:digest (audit/inspect-store st 1))))
+    (is (= before (raw-rows st)))
+    (is (nil? (fj/raw-get st l/FORMAT-KEY))))
+   (finally (s/close st)))))
+
+(deftest malformed-or-missing-high-water-metadata-never-becomes-a-fresh-database
+ (doseq [bad [:missing nil false 0 (- l/FIRST-TX 1) (+ l/FIRST-TX 0.5) "private-counter"]]
+  (let [st (seed)]
+   (try
+    (if (= :missing bad) (s/-delete st l/TX-KEY) (s/-put st l/TX-KEY bad))
+    (let [before (raw-rows st)]
+     (is (= :offline-invalid-counter (kind #(audit/inspect-store st 1))))
+     (is (= before (raw-rows st))))
+    (finally (s/close st))))))
+
+(deftest missing-and-conflicting-index-copies-refuse
+ (doseq [index [:eavt :aevt]]
+  (let [st (seed)]
+   (try
+    (s/-delete st (l/key-for 1 index fact))
+    (is (= :offline-missing-source-index (kind #(audit/inspect-store st 1))))
+    (finally (s/close st)))))
+ (let [st (seed)]
+  (try
+   (s/-put st (l/key-for 1 :aevt fact) (assoc fact 2 ["other"]))
+   (is (= :offline-conflicting-source-index (kind #(audit/inspect-store st 1))))
+   (finally (s/close st)))))
+
+(deftest partial-optional-index-is-not-mistaken-for-complete-coverage
+ (let [st (seed)]
+  (try
+   (s/-delete st (l/key-for 1 :avet fact))
+   (is (= 5 (get (:indexes (audit/inspect-store st 1)) :eavt)))
+   (s/-put st (l/derived-key [:datom.index-coverage/avet :fixture/key])
+    {:status :complete :definition (coverage/definition sch :fixture/key)
+     :basis (+ l/FIRST-TX 19) :rows 1})
+   (is (= :offline-missing-source-index (kind #(audit/inspect-store st 1))))
+   (finally (s/close st)))))
+
+(deftest unknown-metadata-or-a-malformed-operation-bit-refuses-without-source-edits
+ (doseq [unknown [(l/bytes [0 115]) (l/derived-key [:future/authoritative])]]
+  (let [st (seed)]
+   (try
+    (s/-put st unknown {:payload "private-value"})
+    (let [before (raw-rows st)]
+     (is (contains? #{:offline-unknown-namespace :offline-unknown-metadata}
+            (kind #(audit/inspect-store st 1))))
+     (is (= before (raw-rows st))))
+    (finally (s/close st)))))
+ (let [st (seed) raw (slot/encode-slot fact)]
+  (try
+   (fj/commit-raw! st [[:put (l/key-for 1 :eavt fact)
+    (erlang/iolist_to_binary (list (erlang/binary_part raw 0 17) (l/bytes [2])
+                                  (erlang/binary_part raw 18 (- (erlang/byte_size raw) 18))))]])
+   (is (= :offline-invalid-slot (kind #(audit/inspect-store st 1))))
+   (finally (s/close st)))))
+
+(deftest authoritative-write-marks-remain-distinct-from-recognized-disposable-caches
+ (let [st (seed)]
+  (try
+   (s/-put st (l/derived-key [:datom.attr-basis]) {:fixture/key l/FIRST-TX})
+   (s/-put st (l/derived-key [:datom.current/pair 42 :fixture/key]) {:values [[1 2]]})
+   (let [report (audit/inspect-store st 1)]
+    (is (= 3 (:authoritative report)))
+    (is (= 1 (:disposable report))))
+   (s/-put st (l/derived-key [:datom.attr-basis]) nil)
+   (is (= :offline-invalid-attribute-marks (kind #(audit/inspect-store st 1))))
+   (finally (s/close st)))))
+
+(deftest history-retractions-and-provenance-are-not-filtered-out-of-the-inventory
+ (let [st (seed)
+       retraction (assoc (assoc fact 3 (+ l/FIRST-TX 1)) 4 false)
+       annotation [(+ l/FIRST-TX 1) :db/doc "transaction provenance" (+ l/FIRST-TX 1) true]]
+  (try
+   (doseq [d [retraction annotation]]
+    (fj/commit-raw! st
+     (mapv (fn [idx] [:put (l/key-for 1 idx d) (erlang/term_to_binary d)])
+           (index/indexes-for sch (get d 1)))))
+   (let [before (raw-rows st) report (audit/inspect-store st 1)]
+    (is (= 7 (get (:indexes report) :eavt)))
+    (is (= (+ l/FIRST-TX 19) (:basis report)))
+    (is (= before (raw-rows st))))
+   (finally (s/close st)))))
+
+(deftest unused-entity-allocators-and-empty-legacy-snapshots-remain-supported
+ (let [st (seed)]
+  (try
+   (s/-delete st l/ENTITY-KEY)
+   (is (nil? (:entity-counter (audit/inspect-store st 1))))
+   (is (nil? (fj/raw-get st l/ENTITY-KEY)))
+   (finally (s/close st))))
+ (let [st (fj/open-fresh)]
+  (try
+   (let [report (audit/inspect-store st 1)]
+    (is (= 0 (:entries report)))
+    (is (= (- l/FIRST-TX 1) (:basis report)))
+    (is (= (schema/empty-schema) (:schema report))))
+   (finally (s/close st)))))

@@ -1,0 +1,161 @@
+;; Source validation runs on an extraction copy, without Conn or app callbacks.
+;; This pass is also rerun by the independent destination verifier.
+(ns datom.offline.audit
+ (:require [datom.offline.layout :as l] [datom.store-fjall :as fj] [datom.codec :as codec]
+           [datom.schema :as schema] [datom.index-coverage :as coverage]))
+
+(defn fold-pages
+ "Bounded native reads; the caller owns accumulator bounds and the quiesced
+  extraction copy. Iterator failures and oversize records always propagate."
+ [st lo hi f initial]
+ (loop [after nil acc initial]
+  (let [page (fj/raw-page st (when (nil? after) lo) after hi 512 4194304)
+        result (reduce f acc (:entries page))]
+   (if (:done? page) result
+    (do (when (or (nil? (:last page)) (= after (:last page)))
+         (l/refuse! :offline-page-did-not-advance))
+        (recur (:last page) result))))))
+
+(defn read-slot [st key]
+ (let [raw (fj/raw-get st key)] (when (some? raw) (l/checked-slot raw))))
+
+(defn counters [st version]
+ (when-not (or (erlang/=:= 1 version) (erlang/=:= 2 version))
+  (l/refuse! :offline-unsupported-source-format))
+ (let [raw-format (fj/raw-get st l/FORMAT-KEY)
+       format (when raw-format (l/checked-slot raw-format))
+       tx-raw (fj/raw-get st l/TX-KEY) entity-raw (fj/raw-get st l/ENTITY-KEY)
+       tx (when tx-raw (l/checked-slot tx-raw))
+       entity (when entity-raw (l/checked-slot entity-raw))]
+  (when-not (or (and (= version 1) (nil? raw-format))
+                (erlang/=:= {:version version} format))
+   (l/refuse! :offline-unsupported-source-format))
+  (when (or (and tx-raw (not (and (erlang/is_integer tx) (<= (- l/FIRST-TX 1) tx))))
+            (and entity-raw (not (and (erlang/is_integer entity) (<= 0 entity)))))
+   (l/refuse! :offline-invalid-counter))
+  (let [first (fj/raw-page st (l/bytes [1]) nil (l/bytes [1 255]) 1 4194304)]
+   (when (and (seq (:entries first)) (or (nil? tx) (< tx l/FIRST-TX)))
+    (l/refuse! :offline-invalid-counter)))
+  {:basis (or tx (- l/FIRST-TX 1)) :entity-counter entity :source-format version}))
+
+(def SCHEMA-FIELDS (set schema/SCHEMA-ATTRS))
+
+(defn- window-datoms [st version index components basis]
+ (let [lo (l/prefix version index components)]
+  (:rows
+   (fold-pages st lo (l/prefix-end lo)
+    (fn [out [key raw]]
+     (let [size (+ (:bytes out) (erlang/byte_size key) (erlang/byte_size raw))]
+      (when (or (>= (count (:rows out)) 16384) (> size 16777216))
+       (l/refuse! :offline-schema-history-budget))
+      (let [d (l/checked-datom raw basis)]
+       (when-not (= key (l/key-for version index d)) (l/refuse! :offline-source-key-mismatch))
+       {:rows (conj (:rows out) d) :bytes size}))) {:rows [] :bytes 0}))))
+
+(defn- live-schema-datoms [datoms version]
+ (let [latest (reduce (fn [m d]
+                (let [k [(get d 0) (get d 1) (codec/encode-for-format version (get d 2))]
+                      old (get m k)]
+                 (if (or (nil? old) (> (get d 3) (get old 3))
+                         (and (= (get d 3) (get old 3)) (not (get d 4))))
+                  (assoc m k d) m))) {} datoms)
+       live (filterv #(get % 4) (vals latest))]
+  ;; Schema fields are cardinality-one. Do not arbitrarily pick one of two
+  ;; surviving declarations and make a corrupt schema appear usable.
+  (doseq [[_ choices] (group-by (fn [d] [(get d 0) (get d 1)]) live)]
+   (when (> (count choices) 1) (l/refuse! :offline-ambiguous-schema)))
+  live))
+
+(defn recover-schema [st version basis]
+ (let [idents (window-datoms st version :aevt [:db/ident] basis)
+       ids (vec (set (mapv first idents)))
+       recovered
+        (reduce (fn [result id]
+          (let [history (filterv #(contains? SCHEMA-FIELDS (get % 1))
+                          (window-datoms st version :eavt [id] basis))
+                live (live-schema-datoms history version)
+                definitions (schema/schema-from-datoms (mapv #(subvec % 0 3) live))
+                names (set (mapv #(get % 2) (filterv #(= :db/ident (get % 1)) history)))
+                was-unique? (some #(and (= :db/unique (get % 1)) (get % 4)) history)]
+           (doseq [[name definition] definitions]
+            (when (or (contains? (:definitions result) name) (schema/validate-attr-def definition))
+             (l/refuse! :offline-ambiguous-schema)))
+           (let [next {:definitions (merge (:definitions result) definitions)
+                       :historical-unique (if was-unique? (into (:historical-unique result) names)
+                                              (:historical-unique result))}]
+            (when (> (erlang/byte_size (erlang/term_to_binary next)) 16777216)
+             (l/refuse! :offline-schema-budget))
+            next))) {:definitions {} :historical-unique #{}} ids)
+       sch (merge (schema/empty-schema) (:definitions recovered))]
+  {:schema sch :schema-digest (l/digest sch)
+   :unique-attrs (into (:historical-unique recovered)
+                  (filterv #(schema/unique? sch %) (keys sch)))}))
+
+(defn- committed-marks [st basis]
+ (let [raw (fj/raw-get st (l/derived-key [:datom.attr-basis]))
+       marks (if (nil? raw) {} (l/checked-slot raw))]
+  (when-not (and (erlang/is_map marks)
+                 (every? (fn [[a t]] (and (keyword? a) (erlang/is_integer t) (<= 0 t basis))) marks))
+   (l/refuse! :offline-invalid-attribute-marks))
+  marks))
+
+(defn- covered-attrs [st sch basis marks]
+ (into #{} (filterv
+  (fn [a]
+   (let [c (read-slot st (l/derived-key [:datom.index-coverage/avet a]))
+         through (or (:through c) (:basis c))
+         attrs (conj (mapv first (:tuple (:definition c))) a)]
+    (and (schema/indexed? sch a) (= :complete (:status c))
+         (= (coverage/definition sch a) (:definition c))
+         (erlang/is_integer (:basis c)) (<= 0 (:basis c) basis)
+         (erlang/is_integer through) (<= 0 through basis)
+         (every? #(<= (get marks % through) through) attrs)))) (keys sch))))
+
+(defn- require-copy! [st version index d]
+ (let [raw (fj/raw-get st (l/key-for version index d))]
+  (when (nil? raw) (l/refuse! :offline-missing-source-index))
+  ;; Backfills may encode a legacy ETF row in the newer packed lane. Compare
+  ;; representation of the decoded payload, including metadata/list/vector
+  ;; shape, rather than insisting redundant slots use the same envelope.
+  (when-not (erlang/=:= (erlang/term_to_binary d)
+                       (erlang/term_to_binary (l/checked-slot raw)))
+   (l/refuse! :offline-conflicting-source-index))))
+
+(defn inspect-store
+ "Exhaustive read-only logical inventory. No initialization, counter repair,
+  schema install or cache adoption. A coordinator must bind this to a sealed
+  snapshot and its working-copy identity before calling it migration proof."
+ [st version]
+ (let [state (counters st version)
+       basis (:basis state)
+       recovered (recover-schema st version basis)
+       sch (:schema recovered)
+       marks (committed-marks st basis)
+       covered (covered-attrs st sch basis marks)
+       result (fold-pages st nil nil
+        (fn [acc [key raw]]
+         (let [classification (l/classify key)
+               acc (-> acc (update :entries inc)
+                           (update :bytes + (erlang/byte_size key) (erlang/byte_size raw))
+                           (update :digest #(crypto/hash_update % (erlang/term_to_binary [key raw]))))]
+          (case (:kind classification)
+           :index
+            (let [d (l/checked-datom raw basis) idx (:index classification) a (get d 1)]
+             (when-not (= key (l/key-for version idx d)) (l/refuse! :offline-source-key-mismatch))
+             (if (= idx :eavt)
+              (do (require-copy! st version :aevt d)
+                  (when (and (contains? covered a) (schema/indexed? sch a))
+                   (require-copy! st version :avet d))
+                  (when (and (contains? covered a) (schema/ref? sch a))
+                   (require-copy! st version :vaet d)))
+              (require-copy! st version :eavt d))
+             (update-in acc [:indexes idx] inc))
+           :counter (do (l/checked-slot raw) (update acc :authoritative inc))
+           :authoritative (do (l/checked-slot raw) (update acc :authoritative inc))
+           :format (update acc :format-entries inc)
+           :cache (update acc :disposable inc))))
+        {:entries 0 :bytes 0 :digest (crypto/hash_init :sha256)
+         :indexes {:eavt 0 :aevt 0 :avet 0 :vaet 0}
+         :authoritative 0 :format-entries 0 :disposable 0})]
+  (merge state recovered
+   (assoc result :digest (String/downcase (binary/encode_hex (crypto/hash_final (:digest result))))))))

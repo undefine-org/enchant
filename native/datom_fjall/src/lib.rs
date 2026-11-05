@@ -509,6 +509,45 @@ fn fjall_range_chunk<'a>(
     Ok(pairs.encode(env))
 }
 
+/// Bounded raw slots for offline inventory/conversion. Never decode a slot,
+/// silently skip an error, or turn an oversize first row into end-of-scan.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_raw_page<'a>(
+    env: Env<'a>, handle: ResourceArc<DbHandle>, start: Option<Binary>,
+    after: Option<Binary>, stop: Option<Binary>, rows: usize, max_bytes: usize,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    if rows == 0 || rows > 4096 || max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
+        return Err(err("invalid raw page bounds"));
+    }
+    if start.is_some() && after.is_some() { return Err(err("raw page has two lower bounds")); }
+    let lower = match (&start, &after) {
+        (Some(b), _) => Included(b.as_slice().to_vec()),
+        (_, Some(b)) => Excluded(b.as_slice().to_vec()),
+        _ => Unbounded,
+    };
+    let upper = stop.map_or(Unbounded, |b| Included(b.as_slice().to_vec()));
+    let mut iter = handle.datoms.range((lower, upper));
+    let mut pairs: Vec<(Binary<'a>, Binary<'a>)> = Vec::with_capacity(rows);
+    let mut bytes = 0usize;
+    let mut last: Option<Binary<'a>> = None;
+    let mut done = false;
+    while pairs.len() < rows {
+        let Some(entry) = iter.next() else { done = true; break; };
+        let (key, value) = entry.map_err(err)?;
+        let size = key.len().checked_add(value.len()).ok_or_else(|| err("raw entry size overflow"))?;
+        if size > max_bytes {
+            if pairs.is_empty() { return Err(err("raw entry exceeds page byte bound")); }
+            break;
+        }
+        if bytes + size > max_bytes { break; }
+        let key = to_binary(env, &key)?;
+        let value = to_binary(env, &value)?;
+        last = Some(key); pairs.push((key, value)); bytes += size;
+    }
+    Ok((pairs, last, done, bytes).encode(env))
+}
+
 /// `fjall_count_range`: how many KEYS lie in `[start, stop]`, counting at most
 /// `limit` of them.
 ///
