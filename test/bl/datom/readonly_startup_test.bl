@@ -2,23 +2,26 @@
  (:require [datom :as d] [datom.conn :as conn] [datom.store :as s]
            [datom.store-ets :as ets] [datom.store-fjall :as fj]
            [datom.blob :as blob] [datom.blob-ets :as memory] [datom.profile :as profile]
+           [datom.derived :as derived] [datom.index-coverage :as coverage]
            [datom.offline.fs :as fs] [datom.offline.engine :as engine]))
 (defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
 (defrecord Gate [inner admitted attempts])
 (defn effect! [gate]
  (swap! (:attempts gate) inc)
  (when-not @(:admitted gate) (throw (ex-info "probe write refused" {:kind :probe-write-refused}))))
+(extend-protocol datom.store/WriteAdmission
+ Gate
+ (-write-admitted? [gate] @(:admitted gate)))
 (extend-type Gate
- s/WriteAdmission
- (-write-admitted? [gate] @(:admitted gate))
- s/Store
+ datom.store/Store
  (-get [gate key] (s/-get (:inner gate) key))
  (-range [gate lo hi] (s/-range (:inner gate) lo hi))
  (-put [gate key value] (effect! gate) (s/-put (:inner gate) key value) gate)
  (-delete [gate key] (effect! gate) (s/-delete (:inner gate) key) gate)
  (-update [gate key f] (effect! gate) [gate (second (s/-update (:inner gate) key f))])
- (-commit [gate ops] (effect! gate) (s/-commit (:inner gate) ops) gate)
- s/Closeable
+ (-commit [gate ops] (effect! gate) (s/-commit (:inner gate) ops) gate))
+(extend-protocol datom.store/Closeable
+ Gate
  (-close [gate] (s/close (:inner gate))))
 (def definitions [{:db/ident :probe/value :db/valueType :db.type/string
                    :db/cardinality :db.cardinality/one :db/index true}])
@@ -66,6 +69,9 @@
   (try
    (d/transact! seeded [{:db/id 41 :probe/value "retained"}])
    (conn/release! seeded)
+   ;; An older/partial selective index must remain readable through fallback;
+   ;; read-only startup must not silently certify or repair its coverage.
+   (s/-delete base (derived/record-key (coverage/ident :probe/value)))
    (s/checkpoint! base (str (:path extraction) "/store.fjall"))
    (fs/put! job ".bl-offline-job" nil marker)
    (let [scope (engine/scope! job marker) store (engine/open! scope "extract/store.fjall")
@@ -75,9 +81,11 @@
                                          :db/cardinality :db.cardinality/one}) {:blobs (memory/open)})]
     (try
      (is (not (s/write-admitted? store)))
+     (is (not (s/write-admitted? (assoc store :readonly false :writes-admitted true))))
      (is (= before (vec (s/-range store nil nil))))
      (is (nil? (get (:schema (d/db connection)) :probe/deferred)))
      (is (= #{["retained"]} (d/q '[:find ?v :where [_ :probe/value ?v]] (d/db connection))))
+     (is (nil? (coverage/certificate store :probe/value)))
      (refused-writers! connection)
      (is (= before (vec (s/-range store nil nil))))
      (finally (d/close! connection))))
