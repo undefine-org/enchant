@@ -368,6 +368,14 @@ let
     compiler = if previousMetadata == null then compiler else builtins.storePath previousMetadata.compiler;
     dependencies = if previousMetadata == null then dependencies else builtins.storePath previousMetadata.dependencies;
     source = if previousMetadata == null then src else builtins.storePath previousMetadata.source;
+    # Extract data only: retain neither the predecessor's full image closure
+    # nor a dependency on the target SDK. Missing/different generations parse.
+    sourceParts = if previousMetadata == null then null else
+      let parts = builtins.storePath previousMetadata.image + "/image/priv/parts";
+      in if builtins.pathExists parts then builtins.path {
+        path = parts;
+        name = "beam-lisp-coordinator-parts";
+      } else null;
     platform = buildCheckout;
   };
   selection = import ./sdk-selection.nix {
