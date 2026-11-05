@@ -1,0 +1,108 @@
+(ns datom.offline-fs-test
+ (:require [datom.offline.fs :as fs] [datom.store :as s]))
+
+(defn refusal [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn close [cap] (when cap (try (fs/close! cap) (catch _ nil))))
+(defn workspace []
+ (let [root (s/fresh-path ".offline-fs")]
+  (File/mkdir_p! (str root "/source/branch"))
+  (File/mkdir_p! (str root "/source/empty"))
+  (File/write! (str root "/source/a") "preserved bytes")
+  (File/write! (str root "/source/branch/b") "nested bytes")
+  root))
+
+(deftest pinned-copy-preserves-files-empty-directories-and-durable-metadata-guards
+ (let [root (workspace) source (fs/claim! (str root "/source") {:readonly true})
+       target (fs/claim! (str root "/target") {:create true})]
+  (try
+   (let [a (fs/entries source nil 1) b (fs/entries source (:last a) 512)]
+    (is (= ["a"] (mapv :name (:entries a))))
+    (is (not (:done? a)))
+    (is (= ["branch" "empty"] (mapv :name (:entries b))))
+    (is (:done? b)))
+   (is (fs/copy! source "a" target "a"))
+   (is (not (fs/copy! source "a" target "a")))
+   (let [source-branch (fs/child! source "branch") target-branch (fs/child! target "branch" {:create true})]
+    (fs/copy! source-branch "b" target-branch "b")
+    (fs/child! target "empty" {:create true})
+    (is (= (fs/tree-digest source) (fs/tree-digest target)))
+    (is (= 4 (:entries (fs/tree-digest source))))
+    (is (= 15 (:bytes (fs/digest-file target "a"))))
+    (is (fs/put! target "state" nil "prepared"))
+    (is (not (fs/put! target "state" nil "clobber")))
+    (is (not (fs/put! target "state" "wrong" "clobber")))
+    (is (fs/put! target "state" "prepared" "verified"))
+    (is (= "verified" (:bytes (fs/read-chunk (fs/file-reader target "state")))))
+    (is (fs/sync! target))
+    (close target)
+    (is (= :offline-filesystem-refused (refusal #(fs/entries target-branch)))))
+   (finally (close source) (close target)))))
+
+(deftest readonly-source-and-canonical-claim-boundaries-refuse-before-effects
+ (let [root (workspace) source-path (str root "/source")
+       source (fs/claim! source-path {:readonly true})
+       target (fs/claim! (str root "/target") {:create true})]
+  (try
+   (let [before (fs/tree-digest source)]
+    (is (= :offline-filesystem-refused (refusal #(fs/claim! source-path))))
+    (is (= :offline-filesystem-refused (refusal #(fs/put! source "a" "preserved bytes" "bad"))))
+    (is (= :offline-filesystem-refused (refusal #(fs/child! source "created" {:create true}))))
+    (is (= :offline-filesystem-refused (refusal #(fs/copy! target "a" source "created"))))
+    (is (= :offline-filesystem-refused (refusal #(fs/child! target "../escape" {:create true}))))
+    (is (= :offline-filesystem-refused (refusal #(fs/file-reader source "../a"))))
+    (is (= :offline-filesystem-refused (refusal #(fs/claim! (str root "/target") {:create true}))))
+    (is (= before (fs/tree-digest source)))
+    (is (not (File/exists? (str source-path "/created")))))
+   (doseq [limit [0 513]]
+    (is (= :offline-filesystem-refused (refusal #(fs/entries source nil limit)))))
+   (let [reader (fs/file-reader source "a")]
+    (doseq [limit [0 1048577]]
+     (is (= :offline-filesystem-refused (refusal #(fs/read-chunk reader limit))))))
+   (finally (close source) (close target)))))
+
+(deftest aliases-and-links-are-not-captured-as-ordinary-data
+ (let [root (workspace) source-path (str root "/source")]
+  (File/ln_s! source-path (str root "/alias"))
+  (is (= :offline-filesystem-refused (refusal #(fs/claim! (str root "/alias")))))
+  (is (= :offline-filesystem-refused
+         (refusal #(fs/claim! (str root "/alias/created") {:create true}))))
+  (is (not (File/exists? (str source-path "/created"))))
+  (File/ln_s! (str source-path "/a") (str source-path "/link"))
+  (let [source (fs/claim! source-path {:readonly true})
+        target (fs/claim! (str root "/target") {:create true})]
+   (try
+    (is (= :offline-filesystem-refused (refusal #(fs/entries source))))
+    (is (= :offline-filesystem-refused (refusal #(fs/file-reader source "link"))))
+    (is (= :offline-filesystem-refused (refusal #(fs/copy! source "link" target "bad"))))
+    (is (not (File/exists? (str root "/target/bad"))))
+    (finally (close source) (close target))))))
+
+(deftest source-namespace-and-streamed-file-replacement-cannot-look-like-eof
+ (let [root (workspace) path (str root "/source")
+       source (fs/claim! path {:readonly true}) reader (fs/file-reader source "a")]
+  (try
+   (is (= "p" (:bytes (fs/read-chunk reader 1))))
+   (File/write! (str path "/a") "changed bytes")
+   (is (= :offline-filesystem-refused (refusal #(fs/read-chunk reader 1))))
+   (File/write! (str path "/new") "namespace changed")
+   (is (= :offline-filesystem-refused (refusal #(fs/entries source))))
+   (is (= :offline-filesystem-refused (refusal #(fs/close! source))))
+   (let [new-owner (fs/claim! path {:readonly true})]
+    (try (is (= 4 (count (:entries (fs/entries new-owner)))))
+     (finally (close new-owner))))
+   (is (= :offline-filesystem-refused (refusal #(fs/read-chunk reader 1))))
+   (finally (close source)))))
+
+(deftest root-rebinding-and-conflicting-copy-retries-preserve-existing-data
+ (let [root (workspace) path (str root "/source")
+       source (fs/claim! path {:readonly true})
+       target (fs/claim! (str root "/target") {:create true})]
+  (try
+   (fs/put! target "a" nil "existing different data")
+   (is (= :offline-filesystem-refused (refusal #(fs/copy! source "a" target "a"))))
+   (is (= "existing different data" (:bytes (fs/read-chunk (fs/file-reader target "a")))))
+   (File/rename! path (str root "/retired"))
+   (File/mkdir_p! path)
+   (is (= :offline-filesystem-refused (refusal #(fs/entries source))))
+   (is (= :offline-filesystem-refused (refusal #(fs/close! source))))
+   (finally (close source) (close target)))))

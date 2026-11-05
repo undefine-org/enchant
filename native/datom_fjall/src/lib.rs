@@ -51,6 +51,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
 mod checkpoint;
+mod directory;
 mod keycodec;
 use keycodec::KeyVal;
 

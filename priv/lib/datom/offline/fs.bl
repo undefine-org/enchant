@@ -1,0 +1,120 @@
+;; Pinned filesystem capabilities. This is the substrate for the whole-root
+;; coordinator, not permission to convert a live application directory.
+(ns datom.offline.fs
+ (:require [datom.store-fjall] [datom.offline.layout :as l]))
+
+(defrecord Directory [handle path readonly])
+(defn- call! [operation compute]
+ (try
+  (let [result (compute)]
+   (when (and (erlang/is_tuple result) (= 2 (erlang/tuple_size result)) (= :error (elem result 0)))
+    (throw (ex-info "Native filesystem operation refused" {:kind :offline-filesystem-refused})))
+   result)
+  (catch _ (throw (ex-info "Offline filesystem operation refused"
+                   {:kind :offline-filesystem-refused :operation operation})))))
+
+(defn claim!
+ "Claim one canonical existing directory, or create an absent private root.
+  Sealed source claims are read-only and reject namespace identity changes."
+ ([path] (claim! path {}))
+ ([path opts]
+  (BeamLisp.Env/assert_native_framework_execution!)
+  (let [readonly (= true (:readonly opts))]
+   (->Directory
+    (call! :claim #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_open
+                    path readonly (= true (:create opts)))) path readonly))))
+
+(defn close! [directory]
+ (call! :close #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_close (:handle directory))))
+(defn sync! [directory]
+ (call! :sync #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_sync (:handle directory))))
+(defn child!
+ "Derive one directory component; links and parent traversal refuse. :lock
+  claims a store directory without opening an engine. Permissions never widen."
+ ([directory name] (child! directory name {}))
+ ([directory name opts]
+  (->Directory
+   (call! :child #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_child
+      (:handle directory) name (= true (:create opts)) (= true (:lock opts))))
+   (str (:path directory) "/" name) (:readonly directory))))
+
+(defn entries
+ ([directory] (entries directory nil 512))
+ ([directory after limit]
+  (let [r (call! :entries #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_entries
+                            (:handle directory) after limit))]
+   {:entries (mapv (fn [row] {:name (elem row 0) :kind (keyword (elem row 1)) :bytes (elem row 2)}) (elem r 0))
+    :last (elem r 1) :done? (elem r 2)})))
+
+(defn file-reader [directory name]
+ (call! :file #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_file (:handle directory) name)))
+(defn read-chunk
+ ([reader] (read-chunk reader 1048576))
+ ([reader limit]
+  (let [r (call! :read #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_read reader limit))]
+   {:bytes (elem r 0) :done? (elem r 1)})))
+(defn digest-file [directory name]
+ (let [reader (file-reader directory name)]
+  (loop [digest (crypto/hash_init :sha256) size 0]
+   (let [chunk (read-chunk reader)
+         digest (crypto/hash_update digest (:bytes chunk))
+         size (+ size (erlang/byte_size (:bytes chunk)))]
+    (if (:done? chunk)
+     {:sha256 (String/downcase (binary/encode_hex (crypto/hash_final digest))) :bytes size}
+     (recur digest size))))))
+
+(defn put!
+ "Durably compare and replace one bounded metadata file. nil expected means
+  create without clobbering. False means the expected bytes did not match."
+ [directory name expected bytes]
+ (call! :put #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_put
+                (:handle directory) name expected bytes)))
+(defn copy!
+ "Durably copy one regular file without overwriting a destination. Existing
+  identical bytes reconcile a lost reply; conflicting bytes refuse."
+ [source name destination target-name]
+ (call! :copy #(BeamLisp.Native.Datom.StoreFjall/fjall_directory_copy
+                 (:handle source) name (:handle destination) target-name)))
+
+(defn fold-tree
+ "Depth-first traversal: at most 256 directory frames and one bounded native
+  page per frame. reducer entries carry a transient parent capability; callers
+  must keep only plain metadata in receipts, never filesystem resources."
+ [root reducer initial]
+ (loop [stack [{:directory root :relative "" :after nil :pending [] :done? false}] result initial]
+  (if (empty? stack) result
+   (let [frame (peek stack) remaining (:pending frame)]
+    (cond
+     (seq remaining)
+      (let [entry (first remaining) parent (:directory frame)
+            relative (if (= "" (:relative frame)) (:name entry) (str (:relative frame) "/" (:name entry)))
+            stack (conj (pop stack) (assoc frame :pending (subvec remaining 1)))
+            next (reducer result (assoc entry :relative relative :parent parent))]
+       (if (= :directory (:kind entry))
+        (do (when (>= (count stack) 256) (l/refuse! :offline-directory-depth-budget))
+            (recur (conj stack {:directory (child! parent (:name entry)) :relative relative
+                                :after nil :pending [] :done? false}) next))
+        (recur stack next)))
+     (:done? frame) (recur (pop stack) result)
+     :else
+      (let [page (entries (:directory frame) (:after frame) 512)]
+       (when (and (not (:done? page))
+                  (or (nil? (:last page)) (= (:after frame) (:last page))))
+        (l/refuse! :offline-page-did-not-advance))
+       (recur (conj (pop stack) (assoc frame :pending (:entries page) :after (:last page) :done? (:done? page))) result)))))))
+
+(defn tree-digest
+ "Representation-sensitive framing includes names, empty directories, sizes
+  and file SHA-256. Exclusions are exact protocol paths supplied by coordinator."
+ ([root] (tree-digest root #{}))
+ ([root excluded]
+  (let [r (fold-tree root
+           (fn [acc entry]
+            (if (contains? excluded (:relative entry)) acc
+             (let [row (if (= :file (:kind entry))
+                         [(:relative entry) :file (digest-file (:parent entry) (:name entry))]
+                         [(:relative entry) :directory])]
+              (-> acc (update :entries inc)
+                      (update :digest #(crypto/hash_update % (erlang/term_to_binary row)))))))
+           {:entries 0 :digest (crypto/hash_init :sha256)})]
+   {:entries (:entries r) :sha256 (String/downcase (binary/encode_hex (crypto/hash_final (:digest r))))})))
