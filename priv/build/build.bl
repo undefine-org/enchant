@@ -166,6 +166,25 @@
       (finally (File/rm temporary)))
     (count entries)))
 
+(defn- write-relocated-unit! [path bytes relative]
+  (let [parsed (beam_lib/all_chunks bytes)
+        _ (when-not (= :ok (elem parsed 0)) (throw (ex-info "Invalid compiled unit" {:path path})))
+        chunks (map (fn [[name data]]
+                      (tuple name
+                        (if (= name (String/to_charlist "CInf"))
+                          (erlang/term_to_binary
+                            (Keyword/put (erlang/binary_to_term data (list :safe)) :source
+                              (String/to_charlist relative)) (list :deterministic))
+                          data))) (elem parsed 2))
+        rebuilt (beam_lib/build_module (to-list chunks))
+        _ (when-not (and (= :ok (elem rebuilt 0))
+                         (= (beam_lib/md5 bytes) (beam_lib/md5 (elem rebuilt 1))))
+            (throw (ex-info "Source relocation changed executable code" {:path path})))
+        temporary (str path ".source-" (System/unique_integer (list :positive)))]
+    (try (File/write! temporary (elem rebuilt 1))
+         (File/rename! temporary path)
+         (finally (File/rm temporary)))))
+
 (defn relocate-unit-sources!
   "Make shipped BEAM source hints relative to the application root. Preserve
    executable identity and replace files atomically, including cache hardlinks."
@@ -173,26 +192,31 @@
   (doseq [[source record] manifest]
     (let [relative (str "priv/" (Path/relative_to source root))]
       (doseq [module (:modules record)]
-        (let [path (Path/join ebin (str (Atom/to_string module) ".beam"))
-              bytes (File/read! path)
-              parsed (beam_lib/all_chunks bytes)
-              _ (when-not (= :ok (elem parsed 0)) (throw (ex-info "Invalid compiled unit" {:path path})))
-              chunks (map (fn [[name data]]
-                            (tuple name
-                              (if (= name (String/to_charlist "CInf"))
-                                (erlang/term_to_binary
-                                  (Keyword/put (erlang/binary_to_term data (list :safe)) :source
-                                    (String/to_charlist relative)) (list :deterministic))
-                                data))) (elem parsed 2))
-              rebuilt (beam_lib/build_module (to-list chunks))
-              _ (when-not (and (= :ok (elem rebuilt 0))
-                               (= (beam_lib/md5 bytes) (beam_lib/md5 (elem rebuilt 1))))
-                  (throw (ex-info "Source relocation changed executable code" {:path path})))
-              temporary (str path ".source-" (System/unique_integer (list :positive)))]
-          (try (File/write! temporary (elem rebuilt 1))
-               (File/rename! temporary path)
-               (finally (File/rm temporary)))))))
+        (let [path (Path/join ebin (str (Atom/to_string module) ".beam"))]
+          (write-relocated-unit! path (File/read! path) relative)))))
   :ok)
+
+(defn assemble-relocated-outputs!
+  "Verify each actual producer object, relocate its Source hint in memory and
+   publish only the final bytes in the disposable image. Retain input hashes,
+   unchanged executable identity and atomic replacement. The inventory writer
+   independently authenticates the resulting files before metadata publication."
+  [manifest root outputs destination]
+  (File/mkdir_p! destination)
+  (doseq [[source entry] manifest]
+    (let [hashes (into {} (:digests entry))
+          names (blog/module-names (:modules entry))
+          relative (str "priv/" (Path/relative_to source root))]
+      (when-not (= (count names) (count hashes))
+        (throw (ex-info "Incomplete persistent unit hashes" {:source source})))
+      (doseq [name names]
+        (let [file (str name ".beam")
+              bytes (File/read! (Path/join outputs file))
+              digest (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes)))]
+          (when-not (= digest (get hashes name))
+            (throw (ex-info "Persistent unit changed before assembly" {:source source :module name})))
+          (write-relocated-unit! (Path/join destination file) bytes relative)))))
+  (count manifest))
 
 (defn manifest-path [out] (Path/join out "compile.beam_lisp"))
 
