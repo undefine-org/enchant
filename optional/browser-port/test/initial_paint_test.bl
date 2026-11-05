@@ -1,0 +1,58 @@
+;; A known paint and the recorder's first frame are separate conditions.
+;; Qualify the opt-in barrier with native video, never a substituted frame.
+(ns browser.initial-paint-test (:require [browser.page :as page] [browser.film :as film] [interop]))
+(deftest newly-sized-static-viewports-can-start-and-finish-an-owned-recording
+ (doseq [width [1280 1024 390 1280 1024 390]]
+  (let [root (str "/tmp/bl-initial-paint-" (erlang/unique_integer (list :positive)))
+        p (page/open! {:width width :height 814
+             :launch {"profile" (str root "/profile") "runtime" (str root "/runtime")
+                      "chromium" (System/get_env "CHROMIUM") "compositor" (System/get_env "SWAY")
+                      "vnc" (System/get_env "WAYVNC") "width" (max 640 width) "height" 914}})]
+   (try
+    (page/cdp! p "Page.bringToFront" {})
+    (page/evaluate! p "new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))")
+    (let [outcome (try
+                    (let [start (page/record! p (str root "/blank.mp4")
+                                  {:fps 30 :record-preset "ultrafast" :paint-before-record? true})]
+                     (Process/sleep 700)
+                     {:started start :finished (page/stop-recording! p)})
+                    (catch error {:error (:operation (ex-data error))}))]
+     (is (get-in outcome [:started "sourceFrames"]) (pr-str outcome))
+     (is (= true (get-in outcome [:started "paintBeforeRecord"])) (pr-str outcome))
+     (is (pos? (get-in outcome [:finished "encodedFrames"] 0)) (pr-str outcome)))
+    (finally (page/close! p) (File/rm_rf! root))))))
+
+(deftest invalid-paint-options-refuse-before-creating-recording-artifacts
+ (let [root (str "/tmp/bl-invalid-paint-" (erlang/unique_integer (list :positive)))
+       p (page/open! {:width 800 :height 600
+            :launch {"profile" (str root "/profile") "runtime" (str root "/runtime")
+                     "chromium" (System/get_env "CHROMIUM") "compositor" (System/get_env "SWAY")
+                     "vnc" (System/get_env "WAYVNC") "width" 800 "height" 700}})]
+  (try
+   (doseq [value [nil "true" 1 {} [] :paint]]
+    (let [path (str root "/invalid-" (erlang/unique_integer (list :positive)) ".mp4")]
+     (is (thrown? (page/record! p path {:paint-before-record? value :record-preset "ultrafast"})))
+     (is (not (File/exists? path)))
+     (is (not (File/exists? (String/replace_suffix path ".mp4" ".frames.jsonl")))))
+    (try (page/stop-recording! p) (catch _ nil)))
+   (finally (page/close! p) (File/rm_rf! root)))))
+
+(deftest owned-worlds-propagate-the-explicit-paint-option-to-every-recorder
+ (let [root (str "/tmp/bl-world-paint-" (erlang/unique_integer (list :positive)))
+       actors (mapv (fn [[actor width]] [actor {:width width :height 814
+                  :launch {"chromium" (System/get_env "CHROMIUM") "compositor" (System/get_env "SWAY")
+                           "vnc" (System/get_env "WAYVNC") "width" (max 640 width) "height" 914}}])
+                  [[:office 1280] [:station 1024] [:reader 390]])
+       world (film/owned-worlds actors root {:fps 30 :record-preset "ultrafast"
+                     :paint-before-record? true :compose-on-close? false})]
+  (try
+   (let [pages ((:open world) nil)]
+    (doseq [[actor options] actors]
+     (is (= (:width options) (page/evaluate! (get pages actor) "innerWidth"))))
+    (Process/sleep 800)
+    ((:close! world) pages)
+    (let [records (get (interop/json-> (File/read! (str root "/recordings.json"))) "recordings")]
+     (is (= 3 (count records)))
+     (is (every? #(pos? (get % "sourceFrames")) records))
+     (is (every? #(pos? (get % "encodedFrames")) records))))
+   (finally ((:dispose! world)) (File/rm_rf! root)))))

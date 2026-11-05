@@ -192,6 +192,15 @@ dispatch synthetic DOM drag events or manufacture a film-only pointer path.
 `optional/browser-port/test/recording_test.bl` verifies animated frames arrive
 without scenario actions/screenshots, trusted drag input, and a decodable movie.
 
+Recording foregrounds the requested page, awaits two browser animation-frame callbacks and captures
+its current surface before starting the recorder. That temporary image is
+discarded; video still comes from the native frame stream. The start receipt
+acknowledges `paintBeforeRecord`, and owned worlds check that acknowledgement
+for each actor when explicitly requested. Callers that already own this paint
+boundary can pass `:paint-before-record? false`; the option accepts only booleans.
+`initial_paint_test.bl` checks static desktop/phone pages,
+early refusal of invalid options and propagation to three actual recorders.
+
 `browser.film/owned-worlds` opens independent actors, records each continuously,
 and aligns their native takes into one horizontal video. Use ordered
 `[[:actor page-options] ...]`, equal viewport heights, and narrated scenes with
