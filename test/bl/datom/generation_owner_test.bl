@@ -12,10 +12,8 @@
 (defn native-refused? [value]
  (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0))))
 (defn close [directory] (try (fs/close! directory) (catch _ nil)))
-(defn fixture
- ([] (fixture (fn [_] nil)))
- ([populate]
- (let [parent (s/fresh-path ".generation-owner") original (str parent "/original")
+(defn fixture-at [parent populate]
+ (let [original (str parent "/original")
        evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
   (File/mkdir_p! original)
   (doseq [part (get evidence "archives")]
@@ -25,13 +23,174 @@
   (root/prepare! original (str parent "/job") (str parent "/generation")
    (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"]) (l/digest :fixture-release) (assoc spec :key-format 1))
   {:app (fs/claim! (str parent "/writer") {:create true})
-   :root (fs/claim! (str parent "/generation"))})))
+   :root (fs/claim! (str parent "/generation"))}))
+(defn fixture
+ ([] (fixture (fn [_] nil)))
+ ([populate] (fixture-at (s/fresh-path ".generation-owner") populate)))
 (defn release-closed! [owner]
  (loop [left 100]
   (let [error (kind #(generation/release! owner))]
    (when error
     (when (= 0 left) (throw (ex-info "generation engine did not retire" {:kind error})))
     (erlang/garbage_collect) (Process/sleep 10) (recur (dec left))))))
+
+(defn activation [app root]
+ (let [ready (Jason/decode! (journal/read-file root "READY.json" journal/LIMIT))
+       marker (Jason/decode! (journal/read-file root ".bl-generation" 1048576))]
+  {"version" 1 "phase" "write-admitted" "journalRevision" 1 "writesAdmitted" true
+   "candidateReleaseId" (get ready "code") "dataVersion" 1
+   "dataGeneration" {"version" 1 "application" "fixture.app" "writerRoot" (:path app)
+                     "root" (:path root) "generation" (get marker "generation") "ready" (get marker "ready")
+                     "keyFormat" 2 "dataVersion" 1 "code" (get ready "code") "runtime" (get ready "tool")}}))
+(defn save-activation! [app value]
+ (let [state (fs/claim! (Path/dirname (:path app)))]
+  (try
+   (let [old (journal/read-file state "activation.json" 1048576)]
+    (when-not (fs/put! state "activation.json" old (if (string? value) value (Jason/encode! value)))
+     (throw (ex-info "fixture journal CAS failed" {}))))
+   (finally (close state)))))
+
+(deftest only-the-actual-durable-host-journal-admits-existing-db-and-blob-handles
+ ;; The VM runs this synthetic fixture as root, with protected /tmp ancestry.
+ ;; /build is deliberately not authority: its worker directory is writable.
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".admission")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))
+       owner (generation/claim! app root spec) record (activation app root)
+       bs (blob-fs/open (str (:path root) "/control.fjall.blobs"))
+       sha (file/sha256 "admitted") hex (file/sha-hex sha)
+       input (str parent "/input") bytes (String/duplicate "bounded input\n" 16000)
+       native (:generation bs)]
+  (try
+   ((fn []
+    (let [store (fj/open (str (:path root) "/control.fjall")) before (fs/tree-digest root)]
+     (try
+   (File/write! input bytes)
+   (is (not (BeamLisp.Native.Datom.StoreFjall/fjall_write_admitted (:handle store))))
+   (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+   (doseq [value [(assoc record "phase" "candidate-ready") (assoc record "writesAdmitted" false)
+                  (assoc record "version" 2) (assoc record "journalRevision" 0)
+                  (assoc record "dataVersion" 2) (assoc record "candidateReleaseId" (l/digest :wrong-code))
+                  (assoc-in record ["dataGeneration" "generation"] (l/digest :other))
+                  (assoc-in record ["dataGeneration" "writerRoot"] (str parent "/other"))
+                  (assoc-in record ["dataGeneration" "root"] (str parent "/other"))
+                  (assoc-in record ["dataGeneration" "runtime"] (l/digest :other))
+                  (assoc-in record ["dataGeneration" "keyFormat"] 1)
+                  (assoc-in record ["dataGeneration" "application"] "other")
+                  (str "{\"version\":1," (String/trim_leading (Jason/encode! record) "{"))]]
+    (save-activation! app value)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (is (not (BeamLisp.Native.Datom.StoreFjall/fjall_write_admitted (:handle store)))))
+   (doseq [result [(BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_put native hex "admitted")
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_delete native hex)
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_import native input)
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) "new" "value")
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle store) "new")
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle store) "new" nil "value")
+                   (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store) (list (tuple :put "new" "value")))]]
+    (is (native-refused? result)))
+   (is (= before (fs/tree-digest root)))
+   (is (not (File/exists? (:dir bs))))
+   (save-activation! app record)
+   ;; The JSON contents alone are never authority. The host-owned file and
+   ;; ancestry must exclude application writers, and aliases must refuse.
+   (let [journal-path (str parent "/activation.json") alias (str parent "/journal-alias")]
+    (File/chmod! journal-path 438)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/chmod! journal-path 384)
+    (File/ln! journal-path alias)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/rm! alias)
+    (File/chmod! (:path app) 511)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/chmod! (:path app) 448)
+    (File/chmod! (:path root) 511)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/chmod! (:path root) 1023)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/chmod! (:path root) 448)
+    (File/chown! journal-path 1)
+    (is (= :generation-ownership-refused (kind #(generation/admit! owner))))
+    (File/chown! journal-path 0)
+    (is (not (BeamLisp.Native.Datom.StoreFjall/fjall_write_admitted (:handle store)))))
+   (is (generation/admit! owner))
+   (is (generation/admit! owner))
+   (is (BeamLisp.Native.Datom.StoreFjall/fjall_write_admitted (:handle store)))
+   (is (= :ok (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) "new" "first")))
+   (is (= (tuple true "second") (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle store) "new" "first" "second")))
+   (is (= :ok (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store)
+                (list (tuple :delete "new") (tuple :put "new" "third")))))
+   (is (= "third" (fj/raw-get store "new")))
+   (is (= :ok (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle store) "new")))
+   (is (nil? (fj/raw-get store "new")))
+   (is (= bs (blob/-blob-put bs sha "admitted")))
+   (is (= bs (blob/-blob-put bs sha "admitted")))
+   (is (= "admitted" (blob/-blob-get bs sha)))
+   (is (= :generation-blob-write-refused (kind #(blob/-blob-put bs sha "different"))))
+   (let [alias (str input "-alias")]
+    (File/ln_s! input alias)
+    (try (is (= :generation-blob-write-refused (kind #(blob/-blob-import bs alias {}))))
+     (finally (File/rm! alias))))
+   (let [f (blob/-blob-import bs input {:media-type "text/plain"}) pin (blob/retain! bs)]
+    (try
+     (is (= (file/sha256 bytes) (:sha f)))
+     (is (= (erlang/byte_size bytes) (:size f)))
+     (is (= "text/plain" (:media-type f)))
+     (is (= bytes (erlang/iolist_to_binary (to-list (blob/stream bs (:sha f))))))
+     (is (= :blob-retention-active (kind #(blob/-blob-delete bs sha))))
+     (finally (blob/release! bs pin)))
+    (is (= f (blob/-blob-import bs input {:media-type "text/plain"})))
+    (is (= #{sha (:sha f)} (set (blob/-blob-shas bs)))))
+   (is (= bs (blob/-blob-delete bs sha)))
+   (is (not (blob/-blob-has? bs sha)))
+   (is (= [] (into [] (File/ls! (str (:dir bs) "/.tmp")))))
+   (is (= :offline-filesystem-refused (kind #(fs/put! root "bypass" nil "bad"))))
+   (is (= :generation-blob-ownership-required
+          (kind #(blob/-blob-put (blob-fs/->BlobFs (:dir bs) false) sha "admitted"))))
+   (let [ready (str (:path root) "/READY.json")]
+    (File/rename! ready (str ready "-original")) (File/cp! (str ready "-original") ready)
+    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) "new" "changed")))
+    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_put native hex "admitted"))))
+      (finally (try (s/close store) (catch _ nil)))))))
+   (finally (s/close bs) (release-closed! owner) (close root) (close app)))))
+
+(deftest actual-source-borrows-admitted-blob-writers-without-host-authority
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".source-admission")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil)) owner (generation/claim! app root spec)
+       input (str parent "/input") path (str (:path root) "/control.fjall.blobs")
+       graph (source/prepare!
+              {:application-id "generation-blob-writer"
+               :stable-namespaces #{"datom.blob" "datom.blob-fs" "datom.file" "datom.store" "datom.generation"}
+               :sources {"fixture.blob-writer"
+                "(ns fixture.blob-writer (:require [datom.blob :as b] [datom.blob-fs :as fs] [datom.file :as f] [datom.store :as s] [datom.generation :as g]))
+                 (defn write [path input]
+                  (let [bs (fs/open path) sha (f/sha256 \"Source content\")]
+                   (try (b/-blob-put bs sha \"Source content\")
+                        [(b/-blob-get bs sha) (:sha (b/-blob-import bs input {}))]
+                        (catch error (:kind (ex-data error)))
+                        (finally (s/close bs)))))
+                 (defn write-store [store]
+                   (try (s/-put store \"source-writer\" :source)
+                        (let [value (s/-get store \"source-writer\")] (s/-delete store \"source-writer\") value)
+                        (catch error (:kind (ex-data error)))))
+                 (defn admit [] (try (g/admit! nil) false (catch _ true)))"}})]
+  (try
+   (File/write! input "Source import")
+   (is (= :generation-write-admission-required (source/invoke! graph "fixture.blob-writer/write" [path input])))
+   (is (source/invoke! graph "fixture.blob-writer/admit" []))
+   (is (not (File/exists? path)))
+   ((fn []
+     (let [store (fj/open (str (:path root) "/control.fjall"))]
+      (try
+       (is (= :native-store-operation-failed (source/invoke! graph "fixture.blob-writer/write-store" [store])))
+       (save-activation! app (activation app root))
+       (is (generation/admit! owner))
+       (is (= ["Source content" (file/sha256 "Source import")]
+              (source/invoke! graph "fixture.blob-writer/write" [path input])))
+       (is (= :source (source/invoke! graph "fixture.blob-writer/write-store" [store])))
+       (is (source/invoke! graph "fixture.blob-writer/admit" []))
+       (finally (s/close store))))))
+   (release-closed! owner)
+   (finally (source/retire! graph) (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
 
 (deftest enrolled-roots-reject-unowned-engine-blob-and-generic-file-mutations
  (let [{:keys [app root]} (fixture) alias (str (:path root) "-alias")
@@ -96,12 +255,13 @@
 (deftest copied-flags-or-derived-capabilities-cannot-substitute-for-independent-root-claims
  (let [{:keys [app root]} (fixture)
        raw (journal/read-file root ".bl-generation" 1048576)
+       ready-raw (journal/read-file root "READY.json" journal/LIMIT)
        derived (fs/child! root "libraries")]
   (try
    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
-                         (:handle root) (:handle root) raw (list "control.fjall") (list "control.fjall.blobs"))))
+                         (:handle root) (:handle root) raw ready-raw (list "control.fjall") (list "control.fjall.blobs"))))
    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
-                         (:handle app) (:handle derived) raw (list "a.fjall") (list "a.fjall.blobs"))))
+                         (:handle app) (:handle derived) raw ready-raw (list "a.fjall") (list "a.fjall.blobs"))))
    (is (= :generation-identity-mismatch
           (kind #(generation/claim! app root (assoc spec :application "other")))))
    (let [owner (generation/claim! app root spec)]

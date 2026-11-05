@@ -1,13 +1,16 @@
 //! Declared FS blob tiers borrow the same generation owner as ordinary stores.
 //! No path flag becomes authority; all reads walk from its pinned root fd.
-use super::{directory::{Directory, Reader}, generation::{self, Owner}, err, to_binary};
+use super::{directory::{self, Directory, Reader}, generation::{self, BlobTier, Owner, WriteGuard}, err, to_binary};
 use rustler::{Encoder, Env, NifResult, Resource, ResourceArc, Term};
-use std::fs::{self, ReadDir};
+use std::fs::{self, OpenOptions, ReadDir};
+use std::io::{Read, Write};
+use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
 
 mod atoms { rustler::atoms! { nil } }
-struct Blob { owner: Arc<Owner>, parts: Vec<String>, path: PathBuf }
+struct Blob { owner: Arc<Owner>, tier: Arc<BlobTier> }
 struct BlobHandle(Mutex<Option<Arc<Blob>>>);
 #[rustler::resource_impl]
 impl Resource for BlobHandle {}
@@ -48,14 +51,17 @@ fn canonical_missing(path: &Path) -> std::io::Result<PathBuf> {
 }
 fn directory(blob: &Blob) -> std::io::Result<Option<Arc<Directory>>> {
     blob.owner.check()?;
+    let mut cached = blob.tier.directory.lock().map_err(|_| failure("blob tier poisoned"))?;
+    if let Some(directory) = cached.as_ref() { directory.check()?; return Ok(Some(directory.clone())); }
     let mut current = blob.owner.root.clone();
-    for part in &blob.parts {
+    for part in &blob.tier.parts {
         current = match current.child(part, false, false) {
             Ok(value) => value,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
     }
+    *cached = Some(current.clone());
     Ok(Some(current))
 }
 fn reader(blob: &Blob, sha: &str) -> std::io::Result<Option<Reader>> {
@@ -79,15 +85,12 @@ fn fjall_generation_blob_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<
     super::refuse_offline_path(Path::new(&path)).map_err(err)?;
     let Some(owner) = generation::access(Path::new(&path)).map_err(err)? else { return Ok(atoms::nil().encode(env)); };
     let canonical = canonical_missing(Path::new(&path)).map_err(err)?;
-    if !owner.blobs.contains(&canonical) { return Err(err("blob tier outside generation inventory")); }
-    let relative = canonical.strip_prefix(&owner.root.path).map_err(err)?;
-    let parts = super::sealing::relative(relative.to_str().ok_or_else(|| err("invalid blob path"))?).map_err(err)?
-        .into_iter().map(str::to_owned).collect();
-    let blob = Arc::new(Blob { owner, parts, path: canonical });
+    let tier = owner.blobs.get(&canonical).cloned().ok_or_else(|| err("blob tier outside generation inventory"))?;
+    let blob = Arc::new(Blob { owner, tier });
     // Existing tiers must be actual directories; missing empty tiers stay
     // absent until admission, including their .tmp directory.
     directory(&blob).map_err(err)?;
-    let path = blob.path.to_string_lossy().into_owned();
+    let path = blob.tier.path.to_string_lossy().into_owned();
     Ok((ResourceArc::new(BlobHandle(Mutex::new(Some(blob)))), path).encode(env))
 }
 #[rustler::nif(schedule = "DirtyIo")]
@@ -96,7 +99,7 @@ fn fjall_generation_blob_close(handle: ResourceArc<BlobHandle>) -> NifResult<boo
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_generation_blob_identity(handle: ResourceArc<BlobHandle>) -> NifResult<String> {
-    Ok(live(&handle)?.path.to_string_lossy().into_owned())
+    Ok(live(&handle)?.tier.path.to_string_lossy().into_owned())
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_generation_blob_has(handle: ResourceArc<BlobHandle>, sha: String) -> NifResult<bool> {
@@ -167,4 +170,109 @@ fn fjall_generation_blob_page(handle: ResourceArc<BlobScan>, limit: usize) -> Ni
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_generation_blob_scan_close(handle: ResourceArc<BlobScan>) -> NifResult<bool> {
     handle.0.lock().map_err(err)?.take(); Ok(true)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_blob_writable(handle: ResourceArc<BlobHandle>) -> NifResult<bool> {
+    live(&handle)?.owner.writable().map_err(err)
+}
+fn owned_directory(blob: &Blob, permit: &WriteGuard<'_>) -> std::io::Result<Arc<Directory>> {
+    let mut cached = blob.tier.directory.lock().map_err(|_| failure("blob tier poisoned"))?;
+    if let Some(directory) = cached.as_ref() { permit.directory(directory)?; return Ok(directory.clone()); }
+    let mut current = blob.owner.root.clone();
+    for part in &blob.tier.parts { current = current.owned_child(part, permit)?; }
+    *cached = Some(current.clone());
+    Ok(current)
+}
+fn shard(blob: &Blob, sha: &str) -> std::io::Result<Option<Arc<Directory>>> {
+    if !hex(sha, 64) { return Err(failure("invalid content digest")); }
+    let Some(mut current) = directory(blob)? else { return Ok(None); };
+    for part in [&sha[..2], &sha[2..4]] {
+        current = match current.child(part, false, false) {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+    }
+    Ok(Some(current))
+}
+fn checksum(reader: &mut Reader) -> std::io::Result<String> {
+    let mut hash = Sha256::new();
+    loop { let part = reader.read(65536)?; if part.is_empty() { break; } hash.update(part); }
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn existing(blob: &Blob, sha: &str) -> std::io::Result<bool> {
+    let Some(mut reader) = reader(blob, sha)? else { return Ok(false); };
+    if checksum(&mut reader)? != sha { return Err(failure("stored content digest differs")); }
+    Ok(true)
+}
+fn publish(temp_dir: &Directory, temp: &str, target: &Arc<Directory>, sha: &str, permit: &WriteGuard<'_>) -> std::io::Result<()> {
+    permit.directory(temp_dir)?; permit.directory(target)?;
+    let from = directory::name(temp)?; let to = directory::name(sha)?;
+    if unsafe { libc::renameat2(temp_dir.file.as_raw_fd(), from.as_ptr(), target.file.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(error); }
+        if checksum(&mut target.open_file(sha)?)? != sha { return Err(failure("conflicting blob publication")); }
+        // Another admitted writer won with the same content. Keep its inode.
+        if unsafe { libc::unlinkat(temp_dir.file.as_raw_fd(), from.as_ptr(), 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    target.file.sync_all()?; temp_dir.file.sync_all()?;
+    permit.directory(temp_dir)?; permit.directory(target)
+}
+fn target(tier: &Arc<Directory>, sha: &str, permit: &WriteGuard<'_>) -> std::io::Result<Arc<Directory>> {
+    tier.owned_child(&sha[..2], permit)?.owned_child(&sha[2..4], permit)
+}
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_blob_put(handle: ResourceArc<BlobHandle>, sha: String, bytes: rustler::Binary) -> NifResult<bool> {
+    let blob = live(&handle)?; let permit = blob.owner.write_guard().map_err(err)?;
+    if !hex(&sha, 64) || format!("{:x}", Sha256::digest(bytes.as_slice())) != sha { return Err(err("blob content digest differs")); }
+    if existing(&blob, &sha).map_err(err)? { return Ok(false); }
+    let tier = owned_directory(&blob, &permit).map_err(err)?;
+    let tmp_dir = tier.owned_child(".tmp", &permit).map_err(err)?;
+    let target = target(&tier, &sha, &permit).map_err(err)?;
+    let (mut file, temp) = directory::temporary(&tmp_dir).map_err(err)?;
+    file.write_all(bytes.as_slice()).map_err(err)?; file.sync_all().map_err(err)?;
+    publish(&tmp_dir, &temp.name, &target, &sha, &permit).map_err(err)?;
+    Ok(true)
+}
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_blob_delete(handle: ResourceArc<BlobHandle>, sha: String) -> NifResult<bool> {
+    let blob = live(&handle)?; let permit = blob.owner.write_guard().map_err(err)?;
+    let Some(parent) = shard(&blob, &sha).map_err(err)? else { return Ok(false); };
+    let reader = match parent.open_file(&sha) {
+        Ok(value) => value,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(err(e)),
+    };
+    permit.directory(&parent).map_err(err)?; reader.check().map_err(err)?;
+    let name = directory::name(&sha).map_err(err)?;
+    if unsafe { libc::unlinkat(parent.file.as_raw_fd(), name.as_ptr(), 0) } < 0 { return Err(err(std::io::Error::last_os_error())); }
+    parent.file.sync_all().map_err(err)?; permit.directory(&parent).map_err(err)?;
+    Ok(true)
+}
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_blob_import(handle: ResourceArc<BlobHandle>, path: String) -> NifResult<(String, u64)> {
+    let blob = live(&handle)?; let permit = blob.owner.write_guard().map_err(err)?;
+    let mut input = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path).map_err(err)?;
+    let before = input.metadata().map_err(err)?;
+    if !before.is_file() { return Err(err("blob input must be a regular file")); }
+    let tier = owned_directory(&blob, &permit).map_err(err)?;
+    let tmp_dir = tier.owned_child(".tmp", &permit).map_err(err)?;
+    let (mut file, temp) = directory::temporary(&tmp_dir).map_err(err)?;
+    let mut left = before.len(); let mut buffer = [0u8; 65536]; let mut hash = Sha256::new();
+    while left != 0 {
+        let want = left.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..want]).map_err(err)?;
+        file.write_all(&buffer[..want]).map_err(err)?; hash.update(&buffer[..want]); left -= want as u64;
+    }
+    if !directory::unchanged(&before, &input.metadata().map_err(err)?)
+        || !directory::unchanged(&before, &fs::symlink_metadata(&path).map_err(err)?) {
+        return Err(err("blob input changed while importing"));
+    }
+    let sha = format!("{:x}", hash.finalize()); file.sync_all().map_err(err)?;
+    let target = target(&tier, &sha, &permit).map_err(err)?;
+    publish(&tmp_dir, &temp.name, &target, &sha, &permit).map_err(err)?;
+    Ok((sha, before.len()))
 }

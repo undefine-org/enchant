@@ -46,14 +46,19 @@
  (native-ready!)
  (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_guard dir)))
 (defn- writable! [bs]
- (when (:generation bs)
-  (throw (ex-info "Generation has no durable write admission" {:kind :generation-write-admission-required})))
- (writable-path! (:dir bs)))
+ (if (:generation bs)
+  (when-not (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_writable (:generation bs)))
+   (throw (ex-info "Generation has no durable write admission" {:kind :generation-write-admission-required})))
+  (writable-path! (:dir bs))))
+(defn- owned-write! [result]
+ (when (and (erlang/is_tuple result) (= 2 (erlang/tuple_size result)) (= :error (elem result 0)))
+  (throw (ex-info "Owned blob write refused" {:kind :generation-blob-write-refused})))
+ result)
 
 (defn open
-  "A blob store at directory `dir` (created if absent). `:tmp` picks a fresh
-   directory under the system temp dir. An unwritable location fails HERE, at
-   setup, never at the first put."
+  "Open a filesystem blob store. Ordinary tiers are created at setup; declared
+   generation tiers borrow their owner and stay absent until write admission.
+   `:tmp` picks a fresh directory under the system temp dir."
   [dir]
   (let [ephemeral? (= dir :tmp)
         d (if ephemeral?
@@ -112,14 +117,16 @@
 
   (-blob-put [bs sha bytes]
     (writable! bs)
-    (let [final (path-for bs sha)]
+    (if (:generation bs)
+     (do (owned-write! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_put (:generation bs) (datom.file/sha-hex sha) bytes)) bs)
+     (let [final (path-for bs sha)]
       (if (= true (File/exists? final))
         bs                                   ; idempotent: content-addressed
         (let [tmp (str (:dir bs) "/.tmp/" (datom.file/sha-hex sha) "_" (unique-suffix))]
           (File/mkdir_p! (shard-dir bs (datom.file/sha-hex sha)))
           (File/write! tmp bytes)
           (File/rename! tmp final)
-          bs))))
+          bs)))))
 
   (-blob-get [bs sha]
     (if (:generation bs) (owned-get bs sha)
@@ -134,8 +141,10 @@
   (-blob-delete [bs sha]
     (writable! bs)
     (retention/with-delete! (retention-identity bs)
-     (fn [] (let [p (path-for bs sha)]
-      (if (= true (File/exists? p)) (File/rm! p) nil) bs))))
+     (fn []
+      (if (:generation bs)
+       (owned-write! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_delete (:generation bs) (datom.file/sha-hex sha)))
+       (let [p (path-for bs sha)] (when (File/exists? p) (File/rm! p)))) bs)))
 
   (-blob-shas [bs]
     (if (:generation bs) (owned-shas bs)
@@ -201,7 +210,10 @@
   BlobFs
   (-blob-import [bs path opts]
     (writable! bs)
-    (let [tmp (str (:dir bs) "/.tmp/import_" (unique-suffix))
+    (if (:generation bs)
+     (let [result (owned-write! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_import (:generation bs) path))]
+      (datom.file/->DFile (binary/decode_hex (elem result 0)) (elem result 1) (:media-type opts)))
+     (let [tmp (str (:dir bs) "/.tmp/import_" (unique-suffix))
           input (File/open! path (to-list [:read :binary :raw]))
           output (try (File/open! tmp (to-list [:write :binary :raw]))
                       (catch e (File/close input) (throw e)))]
@@ -223,7 +235,7 @@
           (if (File/exists? final) (File/rm! tmp) (File/rename! tmp final))
           (datom.file/->DFile (:sha result) (:size result) (:media-type opts)))
         (finally (File/close input) (File/close output)
-                 (when (File/exists? tmp) (File/rm tmp)))))))
+                 (when (File/exists? tmp) (File/rm tmp))))))))
 
 (extend-protocol datom.blob/BlobRetention
  BlobFs

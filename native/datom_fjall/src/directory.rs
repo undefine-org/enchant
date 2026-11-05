@@ -26,7 +26,7 @@ pub(crate) fn name(value: &str) -> std::io::Result<CString> {
 pub(crate) fn identity(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino() && a.file_type() == b.file_type()
 }
-fn unchanged(a: &Metadata, b: &Metadata) -> bool {
+pub(crate) fn unchanged(a: &Metadata, b: &Metadata) -> bool {
     identity(a,b) && a.len() == b.len() && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
         && a.ctime() == b.ctime() && a.ctime_nsec() == b.ctime_nsec()
 }
@@ -115,6 +115,17 @@ impl Directory {
         }
         Ok(Reader { parent: self.clone(), name: child.into(), metadata, file, offset: 0 })
     }
+    pub(crate) fn owned_child(self: &Arc<Self>, child: &str, permit: &super::generation::WriteGuard<'_>)
+        -> std::io::Result<Arc<Self>> {
+        permit.directory(self)?; let cname = name(child)?;
+        let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), 0o700) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(std::io::Error::last_os_error());
+        }
+        let directory = self.child(child, false, false)?;
+        self.file.sync_all()?; permit.directory(self)?;
+        Ok(directory)
+    }
 }
 pub(crate) struct DirectoryHandle(pub(crate) Arc<Directory>);
 #[rustler::resource_impl]
@@ -136,6 +147,7 @@ pub(crate) struct OfflineAccess {
     _original: Option<Arc<super::source::Original>>,
 }
 impl OfflineAccess {
+    pub(crate) fn readonly(&self) -> bool { self.readonly }
     pub(crate) fn write_guard(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
         let guard = self.scope.directory.root.write.lock().map_err(|_| failure("offline job writer lock poisoned"))?;
         self.scope.marker.check()?;
@@ -221,6 +233,8 @@ fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relati
 pub(crate) struct Reader { parent: Arc<Directory>, name: String, metadata: Metadata, file: File, offset: u64 }
 impl Reader {
     pub(crate) fn len(&self) -> u64 { self.metadata.len() }
+    pub(crate) fn metadata(&self) -> &Metadata { &self.metadata }
+    pub(crate) fn sync(&self) -> std::io::Result<()> { self.check()?; self.file.sync_all()?; self.check() }
     pub(crate) fn check(&self) -> std::io::Result<()> {
         self.parent.check()?;
         if !unchanged(&self.metadata, &self.file.metadata()?)
@@ -317,13 +331,13 @@ fn fjall_directory_read<'a>(env: Env<'a>, handle: ResourceArc<FileHandle>, limit
     Ok((to_binary(env, &bytes)?, reader.offset == reader.metadata.len()).encode(env))
 }
 
-struct Temporary<'a> { parent: &'a Directory, name: String }
+pub(crate) struct Temporary<'a> { parent: &'a Directory, pub(crate) name: String }
 impl Drop for Temporary<'_> {
     fn drop(&mut self) {
         if let Ok(name) = name(&self.name) { unsafe { libc::unlinkat(self.parent.file.as_raw_fd(), name.as_ptr(), 0); } }
     }
 }
-fn temporary(parent: &Directory) -> std::io::Result<(File, Temporary<'_>)> {
+pub(crate) fn temporary(parent: &Directory) -> std::io::Result<(File, Temporary<'_>)> {
     loop {
         let name = format!("{}{}-{}", TEMP_PREFIX, std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
         match open_at(&parent.file, &name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600) {

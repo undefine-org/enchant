@@ -1,0 +1,54 @@
+(ns datom.generation-nonroot-test
+ (:require [datom.generation :as generation] [datom.offline.root :as root]
+           [datom.offline.fs :as fs] [datom.offline.journal :as journal]
+           [datom.offline.layout :as l] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 2 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+                    {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+           :files ["config.json"] :directories ["empty"]})
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn native-refused? [value]
+ (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0))))
+(defn close [directory] (try (fs/close! directory) (catch _ nil)))
+(defn fixture-at [parent populate]
+ (let [original (str parent "/original")
+       evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
+  (File/mkdir_p! original)
+  (doseq [part (get evidence "archives")]
+   (let [result (System/cmd "tar" (list "-xzf" (Path/expand (str "test/fixtures/datom/" (get part "file"))) "-C" original))]
+    (when-not (= 0 (elem result 1)) (throw (ex-info "fixture extraction failed" {})))))
+  (populate original)
+  (root/prepare! original (str parent "/job") (str parent "/generation")
+   (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"]) (l/digest :fixture-release) (assoc spec :key-format 1))
+  {:app (fs/claim! (str parent "/writer") {:create true})
+   :root (fs/claim! (str parent "/generation"))}))
+(defn fixture
+ ([] (fixture (fn [_] nil)))
+ ([populate] (fixture-at (s/fresh-path ".generation-owner") populate)))
+(defn activation [app root]
+ (let [ready (Jason/decode! (journal/read-file root "READY.json" journal/LIMIT))
+       marker (Jason/decode! (journal/read-file root ".bl-generation" 1048576))]
+  {"version" 1 "phase" "write-admitted" "journalRevision" 1 "writesAdmitted" true
+   "candidateReleaseId" (get ready "code") "dataVersion" 1
+   "dataGeneration" {"version" 1 "application" "fixture.app" "writerRoot" (:path app)
+                     "root" (:path root) "generation" (get marker "generation") "ready" (get marker "ready")
+                     "keyFormat" 2 "dataVersion" 1 "code" (get ready "code") "runtime" (get ready "tool")}}))
+(defn save-activation! [app value]
+ (let [state (fs/claim! (Path/dirname (:path app)))]
+  (try
+   (let [old (journal/read-file state "activation.json" 1048576)]
+    (when-not (fs/put! state "activation.json" old (if (string? value) value (Jason/encode! value)))
+     (throw (ex-info "fixture journal CAS failed" {}))))
+   (finally (close state)))))
+
+(deftest root-owned-host-selection-admits-an-actual-unprivileged-candidate
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".nonroot-admission")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))]
+  (try (save-activation! app (activation app root))
+   (finally (close root) (close app)))
+  (let [result (System/cmd "python3"
+                (list "test/support/datom-generation-nonroot.py" (Path/expand ".bl/ci-candidate")
+                      (Path/expand "test/fixtures/datom/generation-nonroot.bl") parent))]
+   (is (= 0 (elem result 1)) (elem result 0))
+   (is (String/contains? (elem result 0) "NONROOT-GENERATION-ADMITTED")))))
+

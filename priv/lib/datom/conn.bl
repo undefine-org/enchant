@@ -567,6 +567,7 @@
   (when (Process/get :datom.conn/guard-publication)
     (guard-fail! :guard-publication-writer-forbidden))
   (writable-context!)
+  (datom.store/require-write-admission! (:store conn))
   ;; Policy ownership is checked before enqueue and again inside the writer.
   (guards-for conn)
   ; A dead writer must not disable the connection FOREVER. It holds no
@@ -635,6 +636,7 @@
 (defn- writer-operation [conn f]
   (let [prior (erlang/put :datom.conn/writing-store (:store conn))]
     (try
+      (datom.store/require-write-admission! (:store conn))
       (guards-for conn)
       (datom.index/check-key-format! (:store conn))
       (check-writer-counters! conn)
@@ -700,8 +702,10 @@
    above L1 is written against the protocol and cannot tell the
    difference.
 
-   `connect` is this with a fresh ETS store, which is the development
-   substrate rather than the only one."
+   A native candidate without write admission recovers its existing schema
+   and basis without initialization or backfills. After admission, reopening
+   this same store applies the requested definitions and coverage normally.
+   `connect` uses a fresh ETS store."
   ([store] (connect-with store [] {}))
   ([store schema-defs] (connect-with store schema-defs {}))
   ([store schema-defs opts]
@@ -757,6 +761,8 @@
                       (:subs cell)
                       (:blobs cell)
                       (:lifetime cell)) :snapshot (:snapshot cell) :schema-publication (:schema-publication cell))]
+     (if (datom.store/write-admitted? store)
+      (do
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -789,7 +795,8 @@
                                         [:db/add (datom.index/-e dt) :db/tupleAttrs attrs])))) schema-defs))]
        (when (seq repairs) (transact! conn repairs)))
      (with-canonical-writer conn :coverage (fn [] (ensure-schema-coverage-in-writer conn)))
-     (migration-policy-finish-connect! conn))))
+     (migration-policy-finish-connect! conn))
+      conn))))
 
 (defn owned-connections
  "Observe actual native path-backed connections under the registry fence.
@@ -1240,14 +1247,27 @@
 ;; data is the one-shot convenience for small files: the pipeline uploads it
 ;; before the commit.
 
+(defn- admit-blob-write! [conn]
+ (native-canonical-connection! conn)
+ (writable-context!)
+ (datom.store/require-write-admission! (:store conn)))
+
 (defn put-file!
   "Store `bytes` in the connection's blob store and return the DFile at
    rest, ready to be transacted. Runs here, in the caller's process."
   ([conn bytes] (put-file! conn bytes {}))
   ([conn bytes opts]
+   (admit-blob-write! conn)
    (let [staged (datom.file/file bytes opts)]
      (datom.blob/-blob-put (:blobs conn) (:sha staged) (:body staged))
      (datom.file/at-rest staged))))
+
+(defn put-file-path!
+ "Import outside the writer queue, after the connection's write admission."
+ ([conn path] (put-file-path! conn path {}))
+ ([conn path opts]
+  (admit-blob-write! conn)
+  (datom.blob/import-file! (:blobs conn) path opts)))
 
 (defn- stage-files!
   "For every `:db.type/file` op: upload a staged body and strip it, or

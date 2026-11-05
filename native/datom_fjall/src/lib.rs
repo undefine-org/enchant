@@ -360,16 +360,30 @@ fn claim_store_owned(path: &Path, existing_only: bool, owner: Option<&Arc<genera
 #[rustler::resource_impl]
 impl Resource for DbHandle {}
 
+enum MutationPermit<'a> {
+    Offline { _guard: std::sync::MutexGuard<'a, ()> },
+    Generation { _guard: generation::WriteGuard<'a> },
+}
 impl DbHandle {
-    fn offline_write_guard(&self) -> NifResult<Option<std::sync::MutexGuard<'_, ()>>> {
-        if let Some(owner) = &self._claim._generation { return owner.write_guard().map(Some).map_err(err); }
-        self._offline.as_ref().map(|scope| scope.write_guard()).transpose().map_err(err)
+    fn offline_write_guard(&self) -> NifResult<Option<MutationPermit<'_>>> {
+        if let Some(owner) = &self._claim._generation {
+            return owner.write_guard().map(|guard| Some(MutationPermit::Generation { _guard: guard })).map_err(err);
+        }
+        self._offline.as_ref().map(|scope| scope.write_guard().map(|guard| MutationPermit::Offline { _guard: guard }))
+            .transpose().map_err(err)
     }
     fn offline_read_admit(&self) -> NifResult<()> {
         if let Some(owner) = &self._claim._generation { owner.check().map_err(err)?; }
         self._offline.as_ref().map(|scope| scope.check_live()).transpose().map_err(err)?;
         Ok(())
     }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_write_admitted(handle: ResourceArc<DbHandle>) -> NifResult<bool> {
+    handle.offline_read_admit()?;
+    if let Some(owner) = &handle._claim._generation { return owner.writable().map_err(err); }
+    Ok(handle._offline.as_ref().map_or(true, |scope| !scope.readonly()))
 }
 
 /// Refuse before mkdir/canonicalization can modify a private migration tree.
