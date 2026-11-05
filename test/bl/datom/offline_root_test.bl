@@ -1,0 +1,75 @@
+(ns datom.offline-root-test
+ (:require [datom.offline.root :as root] [datom.offline.fs :as fs]
+           [datom.offline.layout :as l] [datom.offline.tool :as tool]
+           [datom.offline.journal :as journal] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+                    {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+           :files ["config.json"] :directories ["empty"]})
+(def code (l/digest :fixture-release))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn fixture []
+ (let [parent (s/fresh-path ".whole-offline-root") original (str parent "/original")
+       evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
+  (File/mkdir_p! original)
+  (doseq [part (get evidence "archives")]
+   (let [archive (Path/expand (str "test/fixtures/datom/" (get part "file")))
+         result (System/cmd "tar" (list "-xzf" archive "-C" original))]
+    (when-not (= 0 (elem result 1)) (throw (ex-info "fixture extraction refused" {})))))
+  {:original original :job (str parent "/job") :destination (str parent "/generation")
+   :source-runtime (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"])}))
+(defn digest [path]
+ (let [claimed (fs/claim! path {:readonly true})]
+  (try (fs/tree-digest claimed) (finally (fs/close! claimed)))))
+(defn prepare [fixture]
+ (root/prepare! (:original fixture) (:job fixture) (:destination fixture) (:source-runtime fixture) code spec))
+
+(deftest whole-root-ready-binds-independent-proofs-and-preserves-the-original
+ (let [fixture (fixture) before (digest (:original fixture)) receipt (prepare fixture)]
+  (is (= 1 (get receipt "version")))
+  (is (= "datom-offline-root-v1" (get receipt "protocol")))
+  (is (= 2 (get receipt "keyFormat"))) (is (= 1 (get receipt "dataVersion")))
+  (is (= code (get receipt "code")))
+  (is (= (tool/identity!) (get receipt "tool")))
+  (is (= (:sha256 before) (get receipt "snapshot")))
+  (is (= ["control" "library/one"] (mapv #(get % "id") (get receipt "stores"))))
+  (is (every? #(journal/digest? (get % "proof")) (get receipt "stores")))
+  (is (= before (digest (:original fixture))))
+  (is (= "preserve orphan bytes" (File/read! (str (:destination fixture) "/libraries/a.fjall.blobs/orphan"))))
+  (is (not (File/exists? (str (:job fixture) "/target"))))
+  (let [published (fs/claim! (:destination fixture) {:readonly true})]
+   (try
+    (is (= receipt (Jason/decode! (journal/read-file published "READY.json" journal/LIMIT))))
+    (is (= (get-in receipt ["tree" "sha256"]) (:sha256 (fs/tree-digest published root/PROTOCOL))))
+    (finally (fs/close! published))))
+  (let [target-before (digest (:destination fixture))]
+   ;; Lost final reply/repeated prepare replays fresh verification over copies;
+   ;; neither actual engine recovery nor a cached READY can certify success.
+   (is (= receipt (prepare fixture)))
+   (is (= target-before (digest (:destination fixture))))
+   (is (= before (digest (:original fixture)))))
+  (let [job (fs/claim! (:job fixture) {:readonly true})]
+   (try (is (= :published (:phase (l/checked-slot (journal/read-file job journal/FILE journal/LIMIT)))))
+    (finally (fs/close! job))))))
+
+(deftest published-reconciliation-refuses-blob-or-receipt-tampering
+ (doseq [damage [:orphan :ready]]
+  (let [fixture (fixture) before (digest (:original fixture)) receipt (prepare fixture)]
+   (case damage
+    :orphan (File/write! (str (:destination fixture) "/libraries/a.fjall.blobs/orphan") "changed orphan")
+    :ready (File/write! (str (:destination fixture) "/READY.json") "{\"version\":3}"))
+   (let [target-before (digest (:destination fixture))]
+    (is (contains? #{:offline-non-engine-conservation-mismatch :offline-invalid-ready}
+           (kind #(prepare fixture))))
+    (is (= target-before (digest (:destination fixture))))
+    (is (= before (digest (:original fixture))))))))
+
+(deftest unknown-source-protocol-or-undeclared-content-cannot-become-ready
+ (doseq [damage [:protocol :unknown]]
+  (let [fixture (fixture)]
+   (File/write! (str (:original fixture) "/" (if (= damage :protocol) "READY.json" "unknown.data")) "unsupported")
+   (let [before (digest (:original fixture))]
+    (is (contains? #{:offline-unsupported-source-generation :offline-undeclared-root-entry}
+           (kind #(prepare fixture))))
+    (is (= before (digest (:original fixture))))
+    (is (not (File/exists? (:destination fixture))))))))

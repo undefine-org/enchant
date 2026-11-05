@@ -130,6 +130,9 @@ impl Resource for OfflineScope {}
 
 pub(crate) struct OfflineAccess {
     scope: ResourceArc<OfflineScope>, directory: Arc<Directory>, readonly: bool,
+    // An aborted caller may detach Scope.source, but accepted engine work
+    // must retain the actual original claims through its own resource drop.
+    _original: Option<Arc<super::source::Original>>,
 }
 impl OfflineAccess {
     pub(crate) fn write_guard(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
@@ -203,10 +206,11 @@ fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relati
     let claim = super::claim_store_mode(&directory.path, !create)
         .map_err(|_| err("offline engine claim or supported reader refused"))?;
     scope.directory.root.engines.lock().map_err(err)?.insert(directory.path.clone());
+    let original = scope.source.lock().map_err(err)?.clone();
     let handle = super::DbHandle {
         path: directory.path.clone(), keyspace: claim.engine.keyspace.clone(),
         datoms: claim.engine.datoms.clone(), lock: claim.engine.lock.clone(), _claim: claim,
-        _offline: Some(OfflineAccess { scope: scope.clone(), directory, readonly }),
+        _offline: Some(OfflineAccess { scope: scope.clone(), directory, readonly, _original: original }),
     };
     scope.marker.check().map_err(err)?;
     let path = handle.path.to_string_lossy().into_owned();
@@ -328,12 +332,43 @@ fn temporary(parent: &Directory) -> std::io::Result<(File, Temporary<'_>)> {
 }
 fn rename(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -> std::io::Result<()> {
     parent.writable()?; parent.writable_path(&parent.path.join(target))?;
+    rename_anchored(parent, temporary, target, no_replace)
+}
+fn rename_anchored(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -> std::io::Result<()> {
+    parent.check()?;
     let from = name(temporary)?; let to = name(target)?;
     let flags = if no_replace { libc::RENAME_NOREPLACE } else { 0 };
     if unsafe { libc::renameat2(parent.file.as_raw_fd(), from.as_ptr(), parent.file.as_raw_fd(), to.as_ptr(), flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     parent.file.sync_all()?; parent.check()
+}
+
+/// Only the sealed publisher can call this. Never unfreeze the data subtree:
+/// two fixed metadata names have a separate absent-or-identical write path.
+pub(crate) fn put_protocol(parent: &Arc<Directory>, target: &str, value: &[u8]) -> std::io::Result<()> {
+    parent.check()?;
+    if parent.root.readonly || !matches!(target, "READY.json" | ".bl-generation") || value.len() > MAX_META {
+        return Err(failure("invalid sealed protocol publication"));
+    }
+    match parent.open_file(target) {
+        Ok(mut reader) => {
+            if reader.metadata.len() != value.len() as u64 { return Err(failure("sealed protocol content differs")); }
+            let mut offset = 0;
+            loop {
+                let part = reader.read(1048576)?;
+                if part != value[offset..offset + part.len()] { return Err(failure("sealed protocol content differs")); }
+                offset += part.len(); if part.is_empty() { break; }
+            }
+            reader.file.sync_all()?; parent.file.sync_all()?;
+            return parent.check();
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    let (mut file, temp) = temporary(parent)?;
+    file.write_all(value)?; file.sync_all()?;
+    rename_anchored(parent, &temp.name, target, true)
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, expected: Option<Binary>, value: Binary)

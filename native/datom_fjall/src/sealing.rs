@@ -1,8 +1,8 @@
 //! Seal closed private target engines and carry their actual ownership through
 //! accepted publication. This is a filesystem primitive, not READY verification
 //! or an application deployment journal.
-use super::{err, checkpoint, directory::{Directory, OfflineScope, Root, identity, name, pinned}};
-use rustler::{Atom, Encoder, LocalPid, NifResult, OwnedEnv, Resource, ResourceArc, Term};
+use super::{err, checkpoint, directory::{Directory, DirectoryHandle, OfflineScope, Root, identity, name, pinned}};
+use rustler::{Atom, Binary, Encoder, LocalPid, NifResult, OwnedEnv, Resource, ResourceArc, Term};
 use std::fs::{self, File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
@@ -28,11 +28,29 @@ struct Sealed {
     scope: ResourceArc<OfflineScope>, target: Arc<Directory>,
     publication: Mutex<Publication>,
     // Drop closed-store locks before releasing the job's explicit custody pin.
-    _stores: Vec<Arc<Directory>>, _original: Option<Arc<super::source::Original>>, _custody: Custody,
+    _stores: Vec<Arc<Directory>>, _original: Option<Arc<super::source::Original>>,
+    _published_custody: Option<Custody>, _custody: Custody,
 }
 struct SealHandle { value: Mutex<Option<Arc<Sealed>>>, busy: AtomicBool }
 #[rustler::resource_impl]
 impl Resource for SealHandle {}
+struct Busy<'a>(&'a AtomicBool);
+impl Drop for Busy<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_offline_metadata(handle: ResourceArc<SealHandle>, ready: Binary, generation: Binary) -> NifResult<bool> {
+    handle.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| err("sealed publication in progress"))?;
+    let _busy = Busy(&handle.busy);
+    let value = handle.value.lock().map_err(err)?.clone().ok_or_else(|| err("sealed custody released"))?;
+    let _job = value.scope.directory.root.write.lock().map_err(err)?;
+    value.scope.marker.check().map_err(err)?;
+    let state = value.publication.lock().map_err(err)?;
+    if state.moved { return Err(err("published protocol is immutable")); }
+    super::directory::put_protocol(&value.target, "READY.json", ready.as_slice()).map_err(err)?;
+    super::directory::put_protocol(&value.target, ".bl-generation", generation.as_slice()).map_err(err)?;
+    Ok(true)
+}
 
 pub(crate) fn relative(parts: &str) -> std::io::Result<Vec<&str>> {
     let values: Vec<_> = parts.split('/').collect();
@@ -79,7 +97,45 @@ fn fjall_offline_seal(scope: ResourceArc<OfflineScope>, paths: Vec<String>)
     Ok(ResourceArc::new(SealHandle {
         value: Mutex::new(Some(Arc::new(Sealed { scope: scope.clone(), target,
             publication: Mutex::new(Publication { destination: None, moved: false, stable: false }),
-            _stores: stores, _original: original, _custody: custody }))), busy: AtomicBool::new(false),
+            _stores: stores, _original: original, _published_custody: None, _custody: custody }))), busy: AtomicBool::new(false),
+    }))
+}
+
+/// Recover the same published inode with actual root/store ownership. No
+/// engine opens, no unowned gap between verification and durability sync.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_offline_adopt(scope: ResourceArc<OfflineScope>, published: ResourceArc<DirectoryHandle>, paths: Vec<String>)
+ -> NifResult<ResourceArc<SealHandle>> {
+    let _job = scope.directory.root.write.lock().map_err(err)?;
+    scope.directory.writable().map_err(err)?; scope.marker.check().map_err(err)?;
+    if !published.0.readonly() || published.0.path == scope.directory.path {
+        return Err(err("published recovery requires a distinct read-only root"));
+    }
+    let _published = published.0.root.write.lock().map_err(err)?;
+    published.0.check().map_err(err)?;
+    let destination = destination(&scope, &published.0.path).map_err(err)?;
+    if paths.is_empty() || paths.len() > 256 { return Err(err("invalid published store inventory")); }
+    let mut stores = Vec::new(); let mut canonical = Vec::new();
+    for path in paths {
+        let parts = relative(&path).map_err(err)?; let mut current = published.0.clone();
+        for (index, part) in parts.iter().enumerate() {
+            current = current.child(part, false, index + 1 == parts.len()).map_err(err)?;
+        }
+        if canonical.iter().any(|old: &PathBuf| old.starts_with(&current.path) || current.path.starts_with(old)) {
+            return Err(err("overlapping published stores"));
+        }
+        super::require_existing_engine(&current.path).map_err(err)?;
+        canonical.push(current.path.clone()); stores.push(current);
+    }
+    let original = scope.source.lock().map_err(err)?.clone();
+    scope.directory.root.pins.fetch_add(1, Ordering::AcqRel);
+    published.0.root.pins.fetch_add(1, Ordering::AcqRel);
+    Ok(ResourceArc::new(SealHandle {
+        value: Mutex::new(Some(Arc::new(Sealed { scope: scope.clone(), target: published.0.clone(),
+            publication: Mutex::new(Publication { destination: Some(destination), moved: true, stable: false }),
+            _stores: stores, _original: original,
+            _published_custody: Some(Custody(published.0.root.clone())),
+            _custody: Custody(scope.directory.root.clone()) }))), busy: AtomicBool::new(false),
     }))
 }
 

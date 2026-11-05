@@ -1,0 +1,199 @@
+;; Whole-root format1->2 preparation. Foundry owns release activation; this
+;; coordinator produces/reconciles a private, content-bound generation only.
+(ns datom.offline.root
+ (:require [datom.offline.fs :as fs] [datom.offline.engine :as engine]
+           [datom.offline.snapshot :as snapshot] [datom.offline.manifest :as manifest]
+           [datom.offline.worker :as worker] [datom.offline.journal :as journal]
+           [datom.offline.seal :as seal] [datom.offline.reindex :as reindex]
+           [datom.offline.layout :as l] [datom.offline.tool :as tool]
+           [datom.store-fjall :as fj]))
+
+(def PROTOCOL #{"READY.json" ".bl-generation"})
+(def READY-FIELDS #{"version" "protocol" "application" "generation" "sourceRuntime" "tool"
+                    "code" "manifest" "snapshot" "dataVersion" "keyFormat" "destination"
+                    "tree" "preserved" "stores"})
+(defn- nonce [] (String/downcase (binary/encode_hex (crypto/strong_rand_bytes 16))))
+(defn- close [root] (when root (try (fs/close! root) (catch _ nil))))
+(defn- save! [job record update]
+ (let [next (journal/save! job (deref record) update)] (reset! record next) next))
+(defn- phase! [job record phase]
+ (save! job record (assoc (:state (deref record)) :phase phase)))
+(defn- state [record] (:state (deref record)))
+(defn- no-legacy-protocol! [source]
+ (doseq [name PROTOCOL]
+  (when (some? (journal/read-file source name journal/LIMIT))
+   (l/refuse! :offline-unsupported-source-generation))))
+
+(defn- conserved [root spec]
+ ;; Include every non-engine byte and empty directory, including orphan blobs.
+ ;; Do not materialize an inventory proportional to corpus/file count.
+ (let [lookup (manifest/compile-index spec)
+       result (fs/fold-tree root
+        (fn [acc entry]
+         (let [section (manifest/classify-index lookup (:relative entry) (:kind entry))]
+          (if (contains? #{:store :protocol} (:kind section)) acc
+           (let [row (if (= :file (:kind entry))
+                       [(:relative entry) :file (fs/digest-file (:parent entry) (:name entry))]
+                       [(:relative entry) :directory])]
+            (-> acc (update :entries inc)
+                (update :hash #(crypto/hash_update % (erlang/term_to_binary row))))))))
+        {:entries 0 :hash (crypto/hash_init :sha256)})]
+  {:entries (:entries result) :sha256 (String/downcase (binary/encode_hex (crypto/hash_final (:hash result))))}))
+
+(defn- unchanged! [scope original captured spec expected]
+ (engine/check-source! scope original spec)
+ (manifest/inspect! captured spec)
+ (when-not (= expected (:sha256 (fs/tree-digest captured)) (:sha256 (fs/tree-digest original)))
+  (l/refuse! :offline-source-snapshot-changed)))
+(defn- binding [intent receipt]
+ (reindex/job-binding (:source-runtime intent) (:tool intent) (:tree-digest receipt) (l/digest (:manifest intent))))
+
+(defn- capture! [scope original job record spec]
+ (let [captured (fs/child! job "snapshot" {:create true})]
+  (when (= :capturing (:phase (state record)))
+   ;; A partially copied physical attempt is never overlaid or relabeled.
+   (when (seq (:entries (fs/entries captured nil 1)))
+    (l/refuse! :offline-fresh-private-attempt-required))
+   (let [receipt (snapshot/capture-bound! scope original captured spec)]
+    (save! job record (assoc (state record) :phase :captured :snapshot receipt))))
+  (unchanged! scope original captured spec (get-in (state record) [:snapshot :tree-digest]))
+  captured))
+
+(defn- seed! [job record captured spec]
+ (when (= :captured (:phase (state record))) (phase! job record :seeding))
+ (when (= :seeding (:phase (state record)))
+  (let [extract (fs/child! job "extract" {:create true}) target (fs/child! job "target" {:create true})]
+   ;; Seeding precedes ANY engine open. Existing exact files reconcile a lost
+   ;; copy reply; conflicts/reserved partial files require a fresh attempt.
+   (snapshot/copy-tree! captured extract spec {:omit-protocol true})
+   (snapshot/copy-tree! captured target spec {:omit-protocol true :omit-stores true})
+   (when-not (= (fs/tree-digest captured) (fs/tree-digest extract))
+    (l/refuse! :offline-fresh-private-attempt-required))
+   (when-not (= (conserved captured spec) (conserved target spec))
+    (l/refuse! :offline-fresh-private-attempt-required))
+   (phase! job record :converting))))
+
+(defn- convert! [scope captured target job record spec bound]
+ (when (= :converting (:phase (state record)))
+  (doseq [store (:stores spec)]
+   ;; Never use a prior builder/journal proof to skip a store. Complete stores
+   ;; are independently reconstructed; interrupted ones resume atomic pages.
+   (let [result (worker/run! scope captured target store bound :convert nil)
+         previous (filterv #(not= (:store result) (:store %)) (:proofs (state record)))]
+    (save! job record (assoc (state record) :proofs (conj previous result)))))
+  (phase! job record :verifying)))
+
+(defn- verify! [scope captured target job record spec bound]
+ (manifest/inspect! target (assoc spec :key-format 2))
+ (when-not (= (conserved captured spec) (conserved target spec))
+  (l/refuse! :offline-non-engine-conservation-mismatch))
+ (let [prefix (str "verify-" (nonce))
+       clone (fs/child! (fs/child! job "extract") prefix {:create true})
+       before (fs/tree-digest target PROTOCOL)]
+  (snapshot/copy-tree! target clone spec {:omit-protocol true})
+  (let [proofs (mapv #(worker/run! scope captured target % bound :reconcile prefix) (:stores spec))]
+   (when-not (= before (fs/tree-digest target PROTOCOL)) (l/refuse! :offline-target-changed))
+   (save! job record (assoc (state record) :proofs proofs))
+   {:tree before :preserved (conserved target spec) :proofs proofs})))
+
+(defn- ready [intent snapshot verified]
+ (let [id (l/digest {:version 1 :intent intent :snapshot (:tree-digest snapshot)})]
+  {"version" 1 "protocol" "datom-offline-root-v1" "application" (get-in intent [:manifest :application])
+   "generation" id "sourceRuntime" (:source-runtime intent) "tool" (:tool intent) "code" (:code intent)
+   "manifest" (l/digest (:manifest intent)) "snapshot" (:tree-digest snapshot)
+   "dataVersion" (get-in intent [:manifest :data-version]) "keyFormat" 2 "destination" (:destination intent)
+   "tree" {"sha256" (get-in verified [:tree :sha256]) "entries" (get-in verified [:tree :entries])}
+   "preserved" {"sha256" (get-in verified [:preserved :sha256]) "entries" (get-in verified [:preserved :entries])}
+   "stores" (to-list (mapv (fn [result] {"id" (:store result) "path" (:path result)
+                          "proof" (l/digest (:proof result)) "blobs" (l/digest (:blobs result))}) (:proofs verified)))}))
+(defn- generation [receipt]
+ {"version" 1 "protocol" "datom-generation-v1" "generation" (get receipt "generation")
+  "ready" (l/digest receipt) "keyFormat" 2 "dataVersion" (get receipt "dataVersion")})
+(defn- published-receipt! [target expected]
+ (let [ready-raw (journal/read-file target "READY.json" journal/LIMIT)
+       generation-raw (journal/read-file target ".bl-generation" 1048576)
+       actual (when ready-raw (Jason/decode! ready-raw))]
+  (when-not (and (= READY-FIELDS (set (keys actual))) (= expected actual)
+                generation-raw (= (generation actual) (Jason/decode! generation-raw))
+                (= (get-in actual ["tree" "sha256"]) (:sha256 (fs/tree-digest target PROTOCOL))))
+   (l/refuse! :offline-invalid-ready))
+  actual))
+
+(defn- seal-closed! [scope spec]
+ ;; A DOWN notification does not assume resource destructor scheduling. Actual
+ ;; directory flocks, held by the returned native seal, are the boundary.
+ (loop [left 100]
+  (let [attempt (try {:seal (seal/target! scope spec)} (catch error {:kind (:kind (ex-data error))}))]
+   (if (:seal attempt) (:seal attempt)
+    (if (and (pos? left) (= :offline-sealed-publication-refused (:kind attempt)))
+     (do (erlang/garbage_collect) (Process/sleep 10) (recur (dec left)))
+     (l/refuse! :offline-target-not-closed))))))
+
+(defn- prepare-open! [scope original job record intent]
+ (let [spec (:manifest intent) captured (capture! scope original job record spec)
+       bound (binding intent (:snapshot (state record)))]
+  (seed! job record captured spec)
+  (let [target (fs/child! job "target")]
+   (convert! scope captured target job record spec bound)
+   (when (contains? #{:ready :publishing :published} (:phase (state record))) (phase! job record :verifying))
+   (let [held (seal-closed! scope spec)]
+    (try
+     (let [verified (verify! scope captured target job record spec bound)
+           receipt (ready intent (:snapshot (state record)) verified)]
+      (unchanged! scope original captured spec (:tree-digest (:snapshot (state record))))
+      (seal/metadata! held (Jason/encode! receipt) (Jason/encode! (generation receipt)))
+      (published-receipt! target receipt)
+      (save! job record (assoc (state record) :phase :ready :ready receipt))
+      (phase! job record :publishing)
+      (seal/publish! held (:destination intent))
+      (phase! job record :published)
+      receipt)
+     (finally (seal/release! held)))))))
+
+(defn- reconcile-open! [scope original job record intent]
+ (when-not (contains? #{:publishing :published :verifying} (:phase (state record)))
+  (l/refuse! :offline-unexpected-destination))
+ (let [spec (:manifest intent) captured (capture! scope original job record spec)
+       bound (binding intent (:snapshot (state record))) target (fs/claim! (:destination intent) {:readonly true})
+       held (atom nil)]
+  (try
+   (reset! held (seal/adopt! scope target spec))
+   (phase! job record :verifying)
+   (let [verified (verify! scope captured target job record spec bound)
+         receipt (ready intent (:snapshot (state record)) verified)]
+    (published-receipt! target receipt)
+    (unchanged! scope original captured spec (:tree-digest (:snapshot (state record))))
+    (save! job record (assoc (state record) :phase :ready :ready receipt))
+    (phase! job record :publishing)
+    ;; Same publication substrate retains root/store/original claims through
+    ;; stable-storage reconciliation. There is no unowned verification gap.
+    (seal/publish! (deref held) (:destination intent))
+    (phase! job record :published)
+    receipt)
+   (finally (when (deref held) (seal/release! (deref held))) (close target)))))
+
+(defn prepare!
+ "Prepare/reconcile a new generation; never activate a release or permit app
+  writes. Existing job resumes only exact intent/tool. Originals stay claimed
+  and read-only; no original engine is opened. Job and destination are siblings."
+ [source job-path destination source-runtime code spec]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [intent (journal/intent! {:source source :destination destination :source-runtime source-runtime
+                                :code code :tool (tool/identity!) :manifest spec})
+       _ (when-not (and (= job-path (Path/expand job-path))
+                        (= (Path/dirname job-path) (Path/dirname destination))
+                        (not= job-path destination)) (l/refuse! :offline-invalid-job-path))
+       original (fs/claim! source {:readonly true}) job (atom nil) scope (atom nil)]
+  (try
+   (no-legacy-protocol! original)
+   (reset! job (fs/claim! job-path {:create (not (File/exists? job-path))}))
+   (let [record (atom (if (seq (:entries (fs/entries (deref job) nil 1)))
+                        (journal/load! (deref job) intent) (journal/create! (deref job) intent)))]
+    (reset! scope (engine/scope! (deref job) (journal/marker intent)))
+    (engine/bind-source! (deref scope) original spec)
+    (if (File/exists? destination)
+     (reconcile-open! (deref scope) original (deref job) record intent)
+     (prepare-open! (deref scope) original (deref job) record intent)))
+   (finally
+    (when (deref scope) (try (engine/release-source! (deref scope)) (catch _ nil)))
+    (close (deref job)) (close original)))))
