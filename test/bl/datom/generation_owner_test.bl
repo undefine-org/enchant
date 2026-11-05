@@ -3,7 +3,7 @@
            [datom.offline.fs :as fs] [datom.offline.journal :as journal]
            [datom.offline.layout :as l] [datom.store-fjall :as fj]
            [datom.blob-fs :as blob-fs] [datom.blob :as blob] [datom.file :as file]
-           [datom.store :as s]))
+           [datom.store :as s] [reload.generation :as source]))
 (def spec {:version 1 :application "fixture.app" :key-format 2 :data-version 1
            :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
                     {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
@@ -12,17 +12,20 @@
 (defn native-refused? [value]
  (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0))))
 (defn close [directory] (try (fs/close! directory) (catch _ nil)))
-(defn fixture []
+(defn fixture
+ ([] (fixture (fn [_] nil)))
+ ([populate]
  (let [parent (s/fresh-path ".generation-owner") original (str parent "/original")
        evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
   (File/mkdir_p! original)
   (doseq [part (get evidence "archives")]
    (let [result (System/cmd "tar" (list "-xzf" (Path/expand (str "test/fixtures/datom/" (get part "file"))) "-C" original))]
     (when-not (= 0 (elem result 1)) (throw (ex-info "fixture extraction failed" {})))))
+  (populate original)
   (root/prepare! original (str parent "/job") (str parent "/generation")
    (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"]) (l/digest :fixture-release) (assoc spec :key-format 1))
   {:app (fs/claim! (str parent "/writer") {:create true})
-   :root (fs/claim! (str parent "/generation"))}))
+   :root (fs/claim! (str parent "/generation"))})))
 (defn release-closed! [owner]
  (loop [left 100]
   (let [error (kind #(generation/release! owner))]
@@ -96,9 +99,9 @@
        derived (fs/child! root "libraries")]
   (try
    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
-                         (:handle root) (:handle root) raw (list "control.fjall"))))
+                         (:handle root) (:handle root) raw (list "control.fjall") (list "control.fjall.blobs"))))
    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_generation_claim
-                         (:handle app) (:handle derived) raw (list "a.fjall"))))
+                         (:handle app) (:handle derived) raw (list "a.fjall") (list "a.fjall.blobs"))))
    (is (= :generation-identity-mismatch
           (kind #(generation/claim! app root (assoc spec :application "other")))))
    (let [owner (generation/claim! app root spec)]
@@ -127,3 +130,146 @@
    (release-closed! owner)
    (is (fs/close! root)) (is (fs/close! app))
    (finally (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest ordinary-blob-opens-borrow-readonly-custody-without-creating-empty-tiers
+ (let [{:keys [app root]} (fixture) owner (generation/claim! app root spec)
+       before (fs/tree-digest root) alias (str (:path root) "-alias")
+       bs (blob-fs/open (str (:path root) "/libraries/a.fjall.blobs"))
+       empty (blob-fs/open (str (:path root) "/control.fjall.blobs"))
+       missing (file/sha256 "missing") sha (file/sha256 "current attachment")]
+  (try
+   (File/ln_s! (:path root) alias)
+   (let [same (blob-fs/open (str alias "/libraries/a.fjall.blobs")) pin (blob/retain! empty)]
+    (try
+     (is (= "current attachment" (blob/-blob-get bs sha)))
+     (is (= "historical attachment" (blob/-blob-get same (file/sha256 "historical attachment"))))
+     (is (blob/-blob-has? bs sha))
+     (is (= #{(file/sha256 "current attachment") (file/sha256 "historical attachment")}
+            (set (blob/-blob-shas bs))))
+     (is (= "current attachment" (erlang/iolist_to_binary (to-list (blob/stream same sha)))))
+     (is (nil? (blob/-blob-get bs missing)))
+     (is (nil? (blob/stream bs missing)))
+     (is (not (blob/-blob-has? empty missing)))
+     (is (= [] (blob/-blob-shas empty)))
+     (is (not (File/exists? (str (:path root) "/control.fjall.blobs"))))
+     (is (= :released (blob/release! empty pin)))
+     ;; Native custody, rather than mutable record fields, binds reads and URLs.
+     (is (= "current attachment" (blob/-blob-get (assoc bs :dir "/absent") sha)))
+     (is (= (blob/-blob-url bs sha {}) (blob/-blob-url (assoc bs :dir "/absent") sha {})))
+     (is (= :generation-blob-ownership-required (kind #(blob-fs/open (str (:path root) "/undeclared.blobs")))))
+     (doseq [write [#(blob/-blob-put bs missing "missing") #(blob/-blob-delete bs sha)
+                    #(blob/-blob-import empty (str (:path root) "/config.json") {})]]
+      (is (= :generation-write-admission-required (kind write))))
+     (is (= :generation-ownership-refused (kind #(generation/release! owner))))
+     (is (= before (fs/tree-digest root)))
+     (finally (s/close same) (blob/release! empty pin))))
+   (s/close bs) (s/close empty)
+   (is (= :generation-blob-ownership-required (kind #(blob/-blob-get bs sha))))
+   (is (nil? (s/close bs)))
+   (generation/release! owner)
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (s/close bs) (s/close empty) (File/rm alias)
+    (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest a-blob-stream-retains-custody-after-close-and-releases-it-at-eof
+ (let [bytes (String/duplicate "x" 150000) sha (file/sha256 bytes)
+       {:keys [app root]} (fixture
+        (fn [original]
+         (let [bs (blob-fs/open (str original "/libraries/a.fjall.blobs"))]
+          (blob/-blob-put bs sha bytes) (blob/-blob-put bs (file/sha256 "") "") (s/close bs))))
+       owner (generation/claim! app root spec)
+       bs (blob-fs/open (str (:path root) "/libraries/a.fjall.blobs"))
+       stream (blob/stream bs sha) empty (blob/stream bs (file/sha256 ""))]
+  (try
+   (s/close bs)
+   (is (= :generation-ownership-refused (kind #(generation/release! owner))))
+   (is (= [65536 65536 18928] (mapv erlang/byte_size stream)))
+   (is (= bytes (erlang/iolist_to_binary (to-list stream))))
+   (is (= [] (into [] empty)))
+   ;; Even retained memo cells and the closed BlobFs no longer own the root.
+   (is (generation/release! owner))
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (s/close bs) (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest actual-source-uses-ordinary-owned-blobs-without-gaining-write-admission
+ (let [{:keys [app root]} (fixture) owner (generation/claim! app root spec)
+       graph (source/prepare!
+              {:application-id "generation-blob-reader"
+               :stable-namespaces #{"datom.blob" "datom.blob-fs" "datom.file" "datom.store"}
+               :sources {"fixture.blob-reader"
+                "(ns fixture.blob-reader (:require [datom.blob :as b] [datom.blob-fs :as fs] [datom.file :as f] [datom.store :as s]))
+                 (defn read [path]
+                  (let [bs (fs/open path) sha (f/sha256 \"current attachment\")]
+                   (try [(b/-blob-get bs sha)
+                         (into [] (b/stream bs sha))
+                         (try (b/-blob-put bs sha \"current attachment\") :unexpected
+                              (catch error (:kind (ex-data error))))]
+                        (finally (s/close bs)))))"}})]
+  (try
+   (is (= ["current attachment" ["current attachment"] :generation-write-admission-required]
+          (source/invoke! graph "fixture.blob-reader/read" [(str (:path root) "/libraries/a.fjall.blobs")])))
+   (is (generation/release! owner))
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (source/retire! graph) (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest owned-blob-reads-refuse-file-aliases-and-replaced-generation-markers
+ (let [{:keys [app root]} (fixture) owner (generation/claim! app root spec)
+       store (fj/open (str (:path root) "/control.fjall"))
+       bs (blob-fs/open (str (:path root) "/libraries/a.fjall.blobs"))
+       sha (file/sha256 "current attachment") hex (file/sha-hex sha)
+       path (str (:dir bs) "/" (String/slice hex 0 2) "/" (String/slice hex 2 2) "/" hex)
+       moved (str path "-original") marker (str (:path root) "/.bl-generation")]
+  (try
+   (File/rename! path moved) (File/ln_s! moved path)
+   (is (= :generation-blob-ownership-required (kind #(blob/-blob-get bs sha))))
+   (is (= :generation-blob-ownership-required (kind #(blob/-blob-has? bs sha))))
+   (is (= :generation-blob-ownership-required (kind #(blob/-blob-shas bs))))
+   (File/rm! path) (File/ln! moved path)
+   (is (= :generation-blob-ownership-required (kind #(blob/stream bs sha))))
+   (File/rm! path) (File/rename! moved path)
+   (is (= "current attachment" (blob/-blob-get bs sha)))
+   (let [stream (blob/stream bs sha)]
+    (File/rename! marker (str marker "-original"))
+    (is (try (fj/open (str (:path root) "/unexpected.fjall")) false (catch _ true)))
+    (is (= :generation-blob-ownership-required (kind #(blob-fs/open (str (:path root) "/unexpected.blobs")))))
+    (is (= :offline-filesystem-refused (kind #(fs/put! root "unexpected" nil "changed"))))
+    (is (not (File/exists? (str (:path root) "/unexpected.fjall"))))
+    (is (not (File/exists? (str (:path root) "/unexpected.blobs"))))
+    (is (not (File/exists? (str (:path root) "/unexpected"))))
+    (is (native-refused? (BeamLisp.Native.Datom.StoreFjall/fjall_checkpoint_capture (:handle store))))
+    (File/cp! (str marker "-original") marker)
+    (is (= :generation-blob-ownership-required (kind #(blob/-blob-get bs sha))))
+    (is (= :generation-blob-ownership-required (kind #(first stream)))))
+   (finally (s/close bs) (try (generation/release! owner) (catch _ nil)) (close root) (close app)))))
+
+(deftest enrollment-cannot-be-escaped-by-replacing-a-declared-directory
+ (let [{:keys [app root]} (fixture) tier (str (:path root) "/libraries/a.fjall.blobs")
+       path (str (:path root) "/control.fjall") outside (str (:path app) "-outside")]
+  (File/mkdir_p! outside)
+  (try
+   (File/rename! tier (str tier "-original")) (File/ln_s! outside tier)
+   ;; Even BEFORE an owner is acquired, a marked lexical root cannot become
+   ;; writable legacy storage through a link out to an unrelated directory.
+   (is (= :generation-blob-ownership-required (kind #(blob-fs/open tier))))
+   (is (= [] (into [] (File/ls! outside))))
+   (File/rm! tier) (File/rename! (str tier "-original") tier)
+   (let [owner (generation/claim! app root spec)]
+    (try
+     (File/rename! tier (str tier "-original")) (File/ln_s! outside tier)
+     (is (= :generation-blob-ownership-required (kind #(blob-fs/open tier))))
+     (is (= [] (into [] (File/ls! outside))))
+     (File/rm! tier) (File/rename! (str tier "-original") tier)
+     (File/rename! path (str path "-original")) (File/ln_s! outside path)
+     (is (try (fj/open path) false (catch _ true)))
+     (is (= [] (into [] (File/ls! outside))))
+     (File/rm! path) (File/cp_r! (str path "-original") path)
+     ;; The same pathname cannot substitute a fresh inode for the directory
+     ;; whose actual flock the owner acquired. Use a valid CLOSED engine copy,
+     ;; so a missing header cannot accidentally satisfy this refusal control.
+     (let [copy (fs/child! root "control.fjall") before (fs/tree-digest copy)]
+      (is (try (fj/open path) false (catch _ true)))
+      (is (= before (fs/tree-digest copy))))
+     (is (generation/release! owner))
+     (finally (try (generation/release! owner) (catch _ nil)))))
+   (is (fs/close! root)) (is (fs/close! app))
+   (finally (close root) (close app)))))

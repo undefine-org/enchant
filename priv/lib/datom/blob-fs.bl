@@ -32,15 +32,23 @@
        "_" (erlang/monotonic_time :nanosecond)
        "_" (erlang/unique_integer (to-list [:positive]))))
 
+(defn- native! [result]
+ (when (and (erlang/is_tuple result) (= 2 (erlang/tuple_size result)) (= :error (elem result 0)))
+  (throw (ex-info "Blob access requires generation custody" {:kind :generation-blob-ownership-required})))
+ result)
+(defn- native-ready! []
+ (when-not (erlang/function_exported :Elixir.BeamLisp.Native.Datom.StoreFjall :fjall_generation_blob_open 1)
+  (BeamLisp.Loader/ensure_loaded "datom.store-fjall")))
 (defn- writable-path! [dir]
  ;; Resolve the physical path at the native boundary, including aliases and
  ;; absent descendants. Lazy loading avoids a declaration cycle: store-fjall
  ;; requires this namespace, but no blob operation runs during its declaration.
- (BeamLisp.Loader/ensure_loaded "datom.store-fjall")
- (let [result (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_guard dir)]
-  (when (and (erlang/is_tuple result) (= 2 (erlang/tuple_size result)) (= :error (elem result 0)))
-   (throw (ex-info "Blob writes require generation custody" {:kind :generation-blob-ownership-required})))
-  result))
+ (native-ready!)
+ (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_guard dir)))
+(defn- writable! [bs]
+ (when (:generation bs)
+  (throw (ex-info "Generation has no durable write admission" {:kind :generation-write-admission-required})))
+ (writable-path! (:dir bs)))
 
 (defn open
   "A blob store at directory `dir` (created if absent). `:tmp` picks a fresh
@@ -51,15 +59,41 @@
         d (if ephemeral?
             (str (System/tmp_dir!) "/beam_lisp_blobs_" (unique-suffix))
             dir)]
-    (writable-path! d)
-    (File/mkdir_p! d)
-    (File/mkdir_p! (str d "/.tmp"))
-    (->BlobFs d ephemeral?)))
+    (native-ready!)
+    (let [owned (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_open d))]
+     (if owned
+      (assoc (->BlobFs (elem owned 1) false) :generation (elem owned 0))
+      (do (writable-path! d)
+          (File/mkdir_p! d)
+          (File/mkdir_p! (str d "/.tmp"))
+          (->BlobFs d ephemeral?))))))
 
 (defn- retention-identity [bs]
  ;; Filesystem identity also joins differently spelled aliases of one tier.
- (let [st (File/stat! (:dir bs))]
-  [:blob-fs (:major_device st) (:minor_device st) (:inode st)]))
+ (if (:generation bs)
+  [:blob-generation (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_identity (:generation bs)))]
+  (let [st (File/stat! (:dir bs))]
+   [:blob-fs (:major_device st) (:minor_device st) (:inode st)])))
+
+(defn- owned-reader [bs sha]
+ (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_reader (:generation bs) (datom.file/sha-hex sha))))
+(defn- owned-chunk [reader]
+ (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_chunk reader 65536)))
+(defn- owned-get [bs sha]
+ (when-let [reader (owned-reader bs sha)]
+  (try
+   (loop [parts []]
+    (let [chunk (owned-chunk reader) parts (conj parts (elem chunk 0))]
+     (if (elem chunk 1) (erlang/iolist_to_binary (to-list parts)) (recur parts))))
+   (finally (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_reader_close reader))))))
+(defn- owned-shas [bs]
+ (let [scan (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_scan (:generation bs)))]
+  (try
+   (loop [result []]
+    (let [page (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_page scan 512))
+          result (into result (map #(binary/decode_hex %) (elem page 0)))]
+     (if (elem page 1) result (recur result))))
+   (finally (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_scan_close scan))))))
 
 (defn- shard-dir [bs hex]
   (str (:dir bs) "/" (erlang/binary_part hex 0 2) "/" (erlang/binary_part hex 2 2)))
@@ -77,7 +111,7 @@
   datom.blob/BlobStore
 
   (-blob-put [bs sha bytes]
-    (writable-path! (:dir bs))
+    (writable! bs)
     (let [final (path-for bs sha)]
       (if (= true (File/exists? final))
         bs                                   ; idempotent: content-addressed
@@ -88,41 +122,56 @@
           bs))))
 
   (-blob-get [bs sha]
-    (let [p (path-for bs sha)]
-      (if (= true (File/exists? p)) (File/read! p) nil)))
+    (if (:generation bs) (owned-get bs sha)
+     (let [p (path-for bs sha)]
+      (if (= true (File/exists? p)) (File/read! p) nil))))
 
   (-blob-has? [bs sha]
-    (= true (File/exists? (path-for bs sha))))
+    (if (:generation bs)
+     (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_has (:generation bs) (datom.file/sha-hex sha)))
+     (= true (File/exists? (path-for bs sha)))))
 
   (-blob-delete [bs sha]
-    (writable-path! (:dir bs))
+    (writable! bs)
     (retention/with-delete! (retention-identity bs)
      (fn [] (let [p (path-for bs sha)]
       (if (= true (File/exists? p)) (File/rm! p) nil) bs))))
 
   (-blob-shas [bs]
-    (into []
+    (if (:generation bs) (owned-shas bs)
+     (into []
           (mapcat (fn [l1]
                     (mapcat (fn [l2]
                               (mapv (fn [nm] (binary/decode_hex nm))
                                     (ls (str (:dir bs) "/" l1 "/" l2))))
                             (ls (str (:dir bs) "/" l1))))
-                  (filterv (fn [nm] (not (= nm ".tmp"))) (ls (:dir bs)))))))
+                  (filterv (fn [nm] (not (= nm ".tmp"))) (ls (:dir bs))))))))
 
 ;; Extending from the protocol side, as store-fjall does for FileBacked: two
 ;; `extend-type BlobFs` blocks would collide under AOT.
 (extend-protocol datom.blob/BlobUrl
   BlobFs
-  (-blob-url [bs sha opts] (str "file://" (path-for bs sha))))
+  (-blob-url [bs sha opts]
+   (let [bs (if (:generation bs)
+              (assoc bs :dir (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_identity (:generation bs))))
+              bs)]
+    (str "file://" (path-for bs sha)))))
 
 (def ^:private CHUNK-BYTES 65536)
 
-;; The lazy seq does not own a live descriptor between chunks: consumers may
-;; stop after `take`, or realize it from a different process. Positional reads
-;; keep both early termination and process ownership safe, with bounded memory.
+;; Owned streams pin their reader and generation until EOF or resource drop,
+;; independently of the blob handle. Legacy streams use positional reads and
+;; hold no descriptor between chunks. Both can be consumed by another process.
 (extend-protocol datom.blob/BlobStream
   BlobFs
   (-blob-stream [bs sha]
+   (if (:generation bs)
+    (when-let [reader (owned-reader bs sha)]
+     ((fn next-chunk []
+       (lazy-seq
+        (let [chunk (owned-chunk reader) bytes (elem chunk 0)]
+         (when (pos? (erlang/byte_size bytes))
+          (cons bytes (when-not (elem chunk 1) (next-chunk)))))))))
     (let [p (path-for bs sha)]
       (if (= true (File/exists? p))
         ((fn next-chunk [offset]
@@ -133,23 +182,25 @@
                (cond (= r :eof) nil
                      (= :ok (elem r 0)) (cons (elem r 1) (next-chunk (+ offset (erlang/byte_size (elem r 1)))))
                      :else (throw (ex-info "Blob stream read failed" {})))))) 0)
-        nil))))
+        nil)))))
 
 ;; A `:tmp` directory is deleted on close; a named one is durable and kept.
 ;; Idempotent: `rm_rf` of an absent directory is fine.
 (extend-protocol datom.store/Closeable
   BlobFs
   (-close [bs]
-    (if (and (:ephemeral? bs) (File/exists? (:dir bs)))
+    (if (:generation bs)
+     (native! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_blob_close (:generation bs)))
+     (when (and (:ephemeral? bs) (File/exists? (:dir bs)))
      (do (writable-path! (:dir bs))
-      (retention/with-delete! (retention-identity bs) #(File/rm_rf! (:dir bs)))) nil)
+      (retention/with-delete! (retention-identity bs) #(File/rm_rf! (:dir bs))))))
     nil))
 
 
 (extend-protocol datom.blob/BlobImport
   BlobFs
   (-blob-import [bs path opts]
-    (writable-path! (:dir bs))
+    (writable! bs)
     (let [tmp (str (:dir bs) "/.tmp/import_" (unique-suffix))
           input (File/open! path (to-list [:read :binary :raw]))
           output (try (File/open! tmp (to-list [:write :binary :raw]))

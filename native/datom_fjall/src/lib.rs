@@ -55,6 +55,7 @@ mod directory;
 mod sealing;
 mod source;
 mod generation;
+mod generation_blob;
 mod keycodec;
 use keycodec::KeyVal;
 
