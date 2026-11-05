@@ -78,6 +78,42 @@
 (defn- reads [] (filterv (fn [o] (not= :commit o)) (deref OPS)))
 (defn- reset-ops! [] (reset! OPS []))
 
+(defn- without-optional-memo [compute]
+  (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)]
+    (Application/put_env :beam_lisp :lazy_cache_budget_bytes 0)
+    (try {:value (compute)} (catch cause {:error (ex-message cause)
+          :stack (mapv (fn [frame] [(str (elem frame 0)) (str (elem frame 1))
+                                    (let [arity (elem frame 2)] (if (number? arity) arity (count arity)))]) __STACKTRACE__)})
+      (finally
+        (if (nil? previous) (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+
+(deftest finite-buffer-probes-and-merged-prefixes-need-no-optional-memo
+  (let [base (->CapableStore (datom.store-ets/open)) ov (datom.store-overlay/open base)
+        a [1 :p/n "buffer-a" 10 true] b [2 :p/n "base-b" 10 true]
+        z [3 :p/n "buffer-z" 10 true] bounds [["z" "z"] ["a" "b"] ["a" "a"]]]
+    (datom.store/-put base "b" b)
+    (datom.store/-put ov "a" a) (datom.store/-put ov "z" z)
+    ;; Startup/protocol resolution is separate from finite read execution.
+    (datom.store/count-range ov "m" "n" 10)
+    (is (= [z a b a] (datom.store/scan-prefixes ov bounds)))
+    (let [opened (without-optional-memo #(datom.store-overlay/open base))]
+      (is (nil? (:error opened)))
+      (is (= [["b" b]] (datom.store/-range (:value opened) nil nil))))
+    (doseq [[lo hi expected-reads] [["m" "n" [:count]] ["a" "a" []] [nil nil []] ["b" "b" [:count]]]]
+      (let [expected (datom.store/count-range ov lo hi 10)
+            _ (reset-ops!)
+            actual (without-optional-memo #(datom.store/count-range ov lo hi 10))]
+        (when (:error actual) (println :finite-overlay-failure actual))
+        (is (nil? (:error actual)))
+        (is (= expected (:value actual)))
+        (is (= expected-reads (reads)) "Only untouched bounds forward the probe")))
+    (let [actual (without-optional-memo #(datom.store/scan-prefixes ov bounds))]
+      (when (:error actual) (println :finite-overlay-prefix-failure actual))
+      (is (nil? (:error actual)))
+      (is (= [z a b a] (:value actual)) "Preserve prefix order, overlaps and duplicates"))
+    (is (= [["b" b]] (datom.store/-range base nil nil)) "Speculation never changes its base")))
+
 ;; ── the fixture ──────────────────────────────────────────────────────
 
 (def SCHEMA

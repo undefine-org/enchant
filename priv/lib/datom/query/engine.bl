@@ -62,6 +62,17 @@
   [f coll]
   (reduce (fn [acc x] (reduce conj acc (f x))) [] coll))
 
+(defn- distinct-rows
+  "First-occurrence deduplication of a finite materialized relation.
+   Query execution must not ask optional lazy memo admission to traverse
+   rows it already owns. Set membership retains core distinct's equality."
+  [rows]
+  (:rows (reduce (fn [state row]
+                  (if (contains? (:seen state) row) state
+                    {:seen (conj (:seen state) row)
+                     :rows (conj (:rows state) row)}))
+                {:seen #{} :rows []} rows)))
+
 (defn unify-term
   "Extend `bindings` so `term` matches `value`, or nil if it cannot.
 
@@ -361,7 +372,7 @@
     ; a rule INVOCATION — also a call form, so it must be claimed before the
     ; plain predicate path, and only when its name is a defined rule.
     (and (seq rules-rel)
-         (datom.query.parse/rule-invocation? clause (set (keys rules-rel))))
+         (datom.query.parse/rule-invocation? clause (set (mapv key rules-rel))))
       (let [call (datom.query.parse/rule-invocation-call clause)]
         (datom.query.rules/relation-for rules-rel
                                         (first call)
@@ -399,19 +410,19 @@
         (reduce (fn [acc sub]
                   (flat-into (fn [b] (eval-clause db b sub resolve-fn rules-rel)) acc))
                 [bindings]
-                (datom.query.plan/order-clauses (keys bindings) subs))
+                (datom.query.plan/order-clauses (mapv key bindings) subs))
 
       (= op :or)
         ; Any sub-clause succeeding keeps the binding. Distinct, because
         ; two branches matching the same way must not double a row.
-        (into [] (distinct (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn rules-rel))
+        (into [] (distinct-rows (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn rules-rel))
                                       subs)))
 
       (= op :not)
         (let [matches (reduce (fn [acc sub]
                                 (flat-into (fn [b] (eval-clause db b sub resolve-fn rules-rel)) acc))
                               [bindings]
-                              (datom.query.plan/order-clauses (keys bindings) subs))]
+                              (datom.query.plan/order-clauses (mapv key bindings) subs))]
           (if (empty? matches) [bindings] []))
 
       ; ── the -join forms ──────────────────────────────────────
@@ -439,8 +450,8 @@
               ; Keep only the shared variables' bindings on the way OUT,
               ; so a branch's local variables do not leak into the outer
               ; binding set and accidentally constrain later clauses.
-              project (fn [b] (select-keys b (into (into [] (keys bindings)) shared)))]
-          (into [] (distinct
+              project (fn [b] (select-keys b (into (into [] (mapv key bindings)) shared)))]
+          (into [] (distinct-rows
                      (mapv project
                            (flat-into (fn [sub] (eval-clause db bindings sub resolve-fn rules-rel))
                                       branches)))))
@@ -708,7 +719,7 @@
                            (reduce (fn [m k]
                                      (if (= (get b k) (get acc k)) m (dissoc m k)))
                                    acc
-                                   (into [] (keys acc)))))
+                                   (mapv key acc))))
                        nil
                        bindings)
         terms (datom.query.plan/pattern-terms clause)
@@ -717,7 +728,7 @@
         ; Every shared bound position constrains a match. Hashing only the
         ; first variable makes a constant entity key hide a selective value
         ; key, and makes multi-column joins quadratic inside one bucket.
-        join-vars (into [] (distinct
+        join-vars (into [] (distinct-rows
                      (filterv (fn [v] (and (datom.query.parse/variable? v)
                                            (every? (fn [b] (contains? b v)) bindings)))
                               terms)))
@@ -734,7 +745,7 @@
         join-values (if (and (some? join-var)
                              (not (contains? (or common {}) join-var))
                              (every? (fn [b] (contains? b join-var)) bindings))
-                      (into [] (distinct (mapv (fn [b] (get b join-var)) bindings)))
+                      (into [] (distinct-rows (mapv (fn [b] (get b join-var)) bindings)))
                       nil)
         semi-selection (if (and (some? join-values)
                                (<= (count join-values) SEMI-JOIN-MAX)
@@ -794,7 +805,7 @@
                              (= position 2) (datom.index/-v d)
                              :else (datom.index/-tx d)))
             positions (mapv (fn [v]
-                              (first (filterv (fn [i] (= v (get terms i))) (range 4))))
+                              (first (filterv (fn [i] (= v (get terms i))) [0 1 2 3])))
                             join-vars)
             ; The semantic projection follows language equality: 1 and 1.0,
             ; or a list and a vector, must land in the same bucket. Raw BEAM
@@ -1077,7 +1088,13 @@
                                           (if (datom.query.parse/rules-var? (get in-forms i))
                                             nil
                                             [(get supplied i)]))
-                                        (range (count in-forms))))
+                                        ;; The query has finitely many input
+                                        ;; forms, including none. A lazy range
+                                        ;; still claims optional memo admission
+                                        ;; when forced, even for zero inputs.
+                                        (loop [i 0 indices []]
+                                          (if (>= i (count in-forms)) indices
+                                            (recur (+ i 1) (conj indices i))))))
             binding-args (mapv (fn [w] (get w 0)) binding-args)
             initial (bind-inputs binding-forms binding-args)
             ; FEAT-025: call-site adornment. Find every rule invocation in
@@ -1132,7 +1149,7 @@
                            bindings))]
           {:value (cond
                     (= kind :scalar) (if (empty? rows) nil (get (first rows) 0))
-                    (= kind :collection) (into [] (distinct (mapv (fn [r] (get r 0)) rows)))
+                    (= kind :collection) (into [] (distinct-rows (mapv (fn [r] (get r 0)) rows)))
                     (= kind :tuple) (if (empty? rows) nil (first rows))
                     :else (set rows))
            :work (max (count bindings) (count initial))})))))
@@ -1178,7 +1195,7 @@
                               (<= 3 (count c) 4)
                               (keyword? (get c 1))
                               (nil? (relation/relation (get c 1))))) clauses))
-      (vec (distinct (mapv (fn [c] (get c 1)) clauses))))))
+      (vec (distinct-rows (mapv (fn [c] (get c 1)) clauses))))))
 
 (defn- plain-read-attrs [parsed]
   (or (flat-read-attrs parsed) (read-plan/attributes parsed)))
@@ -1188,11 +1205,14 @@
   ;; finite vectors/lists. Lazy/external input producers keep authoritative reads.
   (let [forms (datom.query.parse/input-forms parsed)]
     (and (= (count forms) (count supplied))
-         (every? (fn [pair]
-                   (or (datom.query.parse/variable? (first pair))
-                       (and (datom.query.parse/collection-binding? (first pair))
-                            (or (vector? (second pair)) (erlang/is_list (second pair))))))
-                 (mapv (fn [form value] [form value]) forms supplied)))))
+         (let [values (into [] supplied)]
+           (loop [i 0]
+             (if (>= i (count forms)) true
+               (let [form (get forms i) value (get values i)]
+                 (if (or (datom.query.parse/variable? form)
+                         (and (datom.query.parse/collection-binding? form)
+                              (or (vector? value) (erlang/is_list value))))
+                   (recur (+ i 1)) false))))))))
 
 (defn q-uncached
   "Authoritative execution for profiling/parity checks, without result reuse."
