@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -44,3 +45,26 @@ class TestPartitions(unittest.TestCase):
     def test_partition_count_must_be_positive(self):
         with self.assertRaises(ValueError):
             SHARD.partitions(Path("."), 0)
+
+    def test_isolated_startup_is_balanced_without_combining_private_lifetimes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test").mkdir()
+            (root / "scripts").mkdir()
+            for name in "abcd":
+                (root / "test" / f"{name}_test.bl").touch()
+            timings = {f"test/{name}_test.bl": duration
+                       for name, duration in zip("abcd", [9000, 8000, 1000, 1000])}
+            isolated = {"test/c_test.bl": "requires a private VM"}
+            (root / "scripts/test-durations.json").write_text(json.dumps(timings))
+            (root / "scripts/test-isolation.json").write_text(json.dumps(isolated))
+            groups = SHARD.partitions(root, 2, startup_ms=8000)
+            self.assertEqual([["test/a_test.bl", "test/b_test.bl"],
+                              ["test/c_test.bl", "test/d_test.bl"]], groups)
+            self.assertEqual(isolated, json.loads((root / "scripts/test-isolation.json").read_text()))
+            self.assertEqual(set(timings), {name for group in groups for name in group})
+
+    def test_startup_estimate_must_be_a_nonnegative_integer(self):
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SHARD.partitions(Path("."), 1, startup_ms=value)

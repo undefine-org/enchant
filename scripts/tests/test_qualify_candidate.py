@@ -64,6 +64,11 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
         self.assertEqual(0, status)
         self.assertEqual(["a.bl", "b.bl", "fault.bl"], [row["file"] for row in rows if "file" in row])
         self.assertEqual(3, sum(row.get("type") == "process" for row in rows))
+        for row in rows:
+            if row.get("type") == "process":
+                self.assertGreaterEqual(row["elapsed_ms"], 0)
+                self.assertEqual(0, row["file_elapsed_ms"])
+                self.assertEqual(row["elapsed_ms"], row["setup_ms"])
         self.assertEqual(1, sum(row.get("type") == "handover" for row in rows))
         self.assertEqual(0, rows[-1]["process_status"])
 
