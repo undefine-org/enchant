@@ -1,0 +1,128 @@
+;; One explicit application-root inventory. A storage manifest grants no
+;; authority by itself; the coordinator must own the native directory claims.
+(ns datom.offline.manifest
+ (:require [datom.offline.layout :as l] [datom.offline.fs :as fs]))
+
+(def PROTOCOL-FILES #{".bl-generation" "READY.json"})
+(defn components [path]
+ (when-not (and (string? path) (< 0 (erlang/byte_size path) 4096)
+                (not (String/contains? path "\\")) (not (String/contains? path (l/bytes [0]))))
+  (l/refuse! :offline-invalid-relative-path))
+ (let [parts (vec (String/split path "/"))]
+  (when-not (every? #(and (not (contains? #{"" "." ".."} %))
+                          (<= (erlang/byte_size %) 255)
+                          (not (String/starts_with? % ".bl-copy-"))) parts)
+   (l/refuse! :offline-invalid-relative-path))
+  parts))
+(defn within? [path root] (or (= path root) (String/starts_with? path (str root "/"))))
+(defn- id! [value]
+ (when-not (and (string? value) (Regex/match? #"^[a-z0-9][a-z0-9._:/-]{0,127}$" value))
+  (l/refuse! :offline-invalid-storage-identity))
+ value)
+(defn- paths! [xs]
+ (when-not (and (vector? xs) (<= (count xs) 4096)) (l/refuse! :offline-invalid-storage-manifest))
+ (doseq [path xs] (components path)) xs)
+
+(defn validate!
+ "Version 1 declares every persistent store, FS blob binding, additional file
+  and empty directory. Unsupported blob tiers and overlapping sections refuse."
+ [value]
+ (when-not (and (erlang/is_map value)
+                (= #{:version :application :key-format :data-version :stores :files :directories} (set (keys value)))
+                (erlang/=:= 1 (:version value))
+                (erlang/is_integer (:key-format value)) (contains? #{1 2} (:key-format value))
+                (erlang/is_integer (:data-version value)) (<= 1 (:data-version value) 65535)
+                (vector? (:stores value)) (<= 1 (count (:stores value)) 256)
+                (<= (erlang/byte_size (erlang/term_to_binary value)) 1048576))
+  (l/refuse! :offline-invalid-storage-manifest))
+ (id! (:application value))
+ (paths! (:files value)) (paths! (:directories value))
+ (doseq [store (:stores value)]
+  (when-not (and (erlang/is_map store) (= #{:id :path :blobs} (set (keys store)))
+                (erlang/is_map (:blobs store))
+                (= #{:kind :path} (set (keys (:blobs store))))
+                (= :fs (get-in store [:blobs :kind])))
+   (l/refuse! :offline-unsupported-storage-binding))
+  (id! (:id store)) (components (:path store)) (components (get-in store [:blobs :path])))
+ (let [ids (mapv :id (:stores value))
+       roots (into (into (mapv :path (:stores value)) (mapv #(get-in % [:blobs :path]) (:stores value)))
+                   (into (:files value) (:directories value)))]
+  (when-not (= (count ids) (count (set ids))) (l/refuse! :offline-duplicate-storage-identity))
+  (doseq [path roots]
+   (when (or (contains? PROTOCOL-FILES (first (components path)))
+             (= ".bl-offline-job" (first (components path))))
+    (l/refuse! :offline-reserved-root-path)))
+  ;; Include the separator in the ordering: "a-b" must not hide the overlap
+  ;; between "a" and "a/child". Adjacent prefix tests then avoid N-squared work.
+  (let [ordered (vec (sort (mapv #(str % "/") roots)))]
+   (loop [i 1]
+    (when (< i (count ordered))
+     (when (String/starts_with? (get ordered i) (get ordered (dec i)))
+      (l/refuse! :offline-overlapping-root-sections))
+     (recur (inc i)))))
+  value))
+
+(defn sections [manifest]
+ (into (into (mapv #(assoc % :kind :store) (:stores manifest))
+              (mapv (fn [store] {:kind :blobs :id (:id store) :path (get-in store [:blobs :path])}) (:stores manifest)))
+       (into (mapv (fn [path] {:kind :file :path path}) (:files manifest))
+             (mapv (fn [path] {:kind :empty-directory :path path}) (:directories manifest)))))
+
+(defn compile-index [spec]
+ (reduce (fn [lookup section]
+           (let [parts (components (:path section))]
+            (loop [parts parts path "" lookup lookup]
+             (if (empty? parts) lookup
+              (let [path (if (= path "") (first parts) (str path "/" (first parts)))
+                    final? (= 1 (count parts))]
+               (recur (subvec parts 1) path
+                (assoc lookup path (if final? section {:kind :parent :path path}))))))))
+         {} (sections spec)))
+
+(defn classify-index [lookup relative kind]
+ (let [parts (components relative)]
+  (when (= relative ".bl-offline-job") (l/refuse! :offline-building-source))
+  (if (contains? PROTOCOL-FILES relative)
+   (do (when-not (= :file kind) (l/refuse! :offline-root-kind-mismatch)) {:kind :protocol :path relative})
+   (let [section (loop [parts parts path ""]
+                   (when (seq parts)
+                    (let [path (if (= path "") (first parts) (str path "/" (first parts)))
+                          found (get lookup path)]
+                     (if (and found (or (not= :parent (:kind found)) (= path relative))) found
+                      (recur (subvec parts 1) path)))))]
+    (when (nil? section) (l/refuse! :offline-undeclared-root-entry))
+    (when (or (and (= relative (:path section))
+                   (not= kind (if (= :file (:kind section)) :file :directory)))
+              (and (contains? #{:file :empty-directory} (:kind section)) (not= relative (:path section))))
+     (l/refuse! :offline-root-kind-mismatch))
+    section))))
+
+(defn classify [manifest relative kind]
+ (classify-index (compile-index manifest) relative kind))
+
+(defn inspect!
+ "Account for the whole tree before conversion. Absent FS blob directories
+  mean an empty tier; historical descriptor validation must still prove that."
+ [root manifest]
+ (validate! manifest)
+ (let [lookup (compile-index manifest)
+       inventory (fs/fold-tree root
+                  (fn [acc entry]
+                   (let [section (classify-index lookup (:relative entry) (:kind entry))]
+                    (cond-> (update acc :entries inc)
+                     (and (contains? #{:store :blobs :file :empty-directory} (:kind section))
+                          (= (:relative entry) (:path section)))
+                      (update :present conj (:relative entry)))))
+                  {:entries 0 :present #{}})
+       present (:present inventory)
+       required (into (mapv :path (:stores manifest)) (into (:files manifest) (:directories manifest)))]
+  (doseq [path required]
+   (when-not (contains? present path) (l/refuse! :offline-missing-root-section)))
+  {:manifest-digest (l/digest manifest) :entries (:entries inventory)
+   :missing-empty-blob-tiers (filterv #(not (contains? present %))
+                              (mapv #(get-in % [:blobs :path]) (:stores manifest)))}))
+
+(defn directory [root relative]
+ (reduce fs/child! root (components relative)))
+(defn ensure-directory! [root relative]
+ (reduce (fn [parent name] (fs/child! parent name {:create true})) root (components relative)))

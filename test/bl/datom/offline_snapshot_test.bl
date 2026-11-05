@@ -1,0 +1,105 @@
+(ns datom.offline-snapshot-test
+ (:require [datom.offline.manifest :as manifest] [datom.offline.snapshot :as snapshot]
+           [datom.offline.fs :as fs] [datom.store :as s] [datom.store-fjall :as fj]))
+
+(def spec
+ {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+  :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+           {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+  :files ["config.json"] :directories ["empty"]})
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn close [cap] (when cap (try (fs/close! cap) (catch _ nil))))
+(defn fixture []
+ (let [root (s/fresh-path ".offline-snapshot") source (str root "/source")]
+  ;; Deliberately plain physical files: capture must never initialize engines.
+  (doseq [path ["control.fjall" "libraries/a.fjall" "empty"
+                "control.fjall.blobs/.tmp" "control.fjall.blobs/ab/cd"]]
+   (File/mkdir_p! (str source "/" path)))
+  (File/write! (str source "/control.fjall/raw") "control bytes")
+  (File/write! (str source "/libraries/a.fjall/raw") "library bytes")
+  (File/write! (str source "/control.fjall.blobs/ab/cd/orphan") "orphan bytes")
+  (File/write! (str source "/config.json") "{\"version\":1}")
+  root))
+
+(deftest versioned-storage-manifest-has-one-unambiguous-handler-for-every-section
+ (is (= spec (manifest/validate! spec)))
+ (is (= :store (:kind (manifest/classify spec "libraries/a.fjall/raw" :file))))
+ (is (= :blobs (:kind (manifest/classify spec "control.fjall.blobs/ab/cd/orphan" :file))))
+ (is (= :parent (:kind (manifest/classify spec "libraries" :directory))))
+ (is (= :file (:kind (manifest/classify spec "config.json" :file))))
+ (is (= :protocol (:kind (manifest/classify spec "READY.json" :file))))
+ (is (= :offline-undeclared-root-entry (kind #(manifest/classify spec "unknown.db" :file))))
+ (is (= :offline-root-kind-mismatch (kind #(manifest/classify spec "empty/file" :file))))
+ (is (= :offline-building-source (kind #(manifest/classify spec ".bl-offline-job" :file))))
+ (doseq [bad [(assoc spec :version 2) (assoc spec :key-format 3) (assoc spec :key-format 1.0)
+              (assoc spec :data-version 0) (assoc spec :unknown :metadata)
+              (assoc spec :stores [])]]
+  (is (= :offline-invalid-storage-manifest (kind #(manifest/validate! bad)))))
+ (doseq [path ["/absolute" "../escape" "a/../b" "a//b" "a/" "." "a\\b" ".bl-copy-owned"]]
+  (is (= :offline-invalid-relative-path (kind #(manifest/components path)))))
+ (is (= :offline-unsupported-storage-binding
+        (kind #(manifest/validate! (assoc-in spec [:stores 0 :blobs :kind] :s3)))))
+ (is (= :offline-duplicate-storage-identity
+        (kind #(manifest/validate! (assoc-in spec [:stores 1 :id] "control")))))
+ (is (= :offline-reserved-root-path
+        (kind #(manifest/validate! (assoc spec :files ["READY.json"])))))
+ (doseq [files [["a" "a/child"] ["a" "a-b" "a/child"] ["same" "same"]]]
+  (is (= :offline-overlapping-root-sections
+         (kind #(manifest/validate! (assoc spec :files files)))))))
+
+(deftest complete-physical-capture-preserves-all-bytes-without-opening-engines
+ (let [root (fixture) source (fs/claim! (str root "/source") {:readonly true})
+       destination (fs/claim! (str root "/snapshot") {:create true})]
+  (try
+   (let [before (fs/tree-digest source) result (snapshot/capture! source destination spec)]
+    (is (= :captured (:status result)))
+    (is (= :physical (:kind result)))
+    (is (= (:sha256 before) (:tree-digest result)))
+    (is (= 1 (:declared-key-format result)))
+    (is (= before (fs/tree-digest source)))
+    (is (= before (fs/tree-digest destination)))
+    (is (= #{"raw"} (set (mapv :name (:entries (fs/entries (fs/child! source "control.fjall")))))))
+    (is (= ["libraries/a.fjall.blobs"] (:missing-empty-blob-tiers (manifest/inspect! source spec))))
+    (is (= :offline-snapshot-destination-not-empty
+           (kind #(snapshot/capture! source destination spec)))))
+   (finally (close source) (close destination)))))
+
+(deftest undeclared-or-missing-sections-refuse-before-copying
+ (doseq [damage [:extra :missing :nonempty]]
+  (let [root (fixture) source-path (str root "/source")]
+   (case damage
+    :extra (File/write! (str source-path "/unknown.db") "unclassified")
+    :missing (File/rm! (str source-path "/config.json"))
+    :nonempty (File/write! (str source-path "/empty/hidden") "not empty"))
+   (let [source (fs/claim! source-path {:readonly true})
+         destination (fs/claim! (str root "/snapshot") {:create true})]
+    (try
+     (is (contains? #{:offline-undeclared-root-entry :offline-missing-root-section :offline-root-kind-mismatch}
+            (kind #(snapshot/capture! source destination spec))))
+     (is (= [] (:entries (fs/entries destination))))
+     (finally (close source) (close destination)))))))
+
+(deftest a-live-native-engine-refuses-capture-before-it-can-be-copied
+ (let [root (fixture) path (str root "/source") engine (fj/open (str path "/control.fjall"))
+       source (fs/claim! path {:readonly true}) destination (fs/claim! (str root "/snapshot") {:create true})]
+  (try
+   (is (= :offline-filesystem-refused (kind #(snapshot/capture! source destination spec))))
+   (is (= [] (:entries (fs/entries destination))))
+   (finally (close source) (close destination) (s/close engine)))))
+
+(deftest extraction-and-new-target-seeding-do-not-copy-old-root-protocol-metadata
+ (let [root (fixture) path (str root "/source")]
+  (File/write! (str path "/READY.json") "retained original protocol bytes")
+  (let [source (fs/claim! path {:readonly true})
+        extraction (fs/claim! (str root "/extraction") {:create true})
+        target (fs/claim! (str root "/target") {:create true})]
+   (try
+    (snapshot/copy-tree! source extraction spec {:omit-protocol true})
+    (snapshot/copy-tree! source target spec {:omit-protocol true :omit-stores true})
+    (is (not (File/exists? (str root "/extraction/READY.json"))))
+    (is (= "control bytes" (File/read! (str root "/extraction/control.fjall/raw"))))
+    (is (not (File/exists? (str root "/target/control.fjall"))))
+    (is (not (File/exists? (str root "/target/libraries/a.fjall"))))
+    (is (= "orphan bytes" (File/read! (str root "/target/control.fjall.blobs/ab/cd/orphan"))))
+    (is (= "{\"version\":1}" (File/read! (str root "/target/config.json"))))
+    (finally (close source) (close extraction) (close target))))))

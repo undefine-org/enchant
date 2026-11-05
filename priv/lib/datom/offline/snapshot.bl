@@ -1,0 +1,63 @@
+;; Physical root capture only. A captured tree is not a migration, READY
+;; generation or permission to activate code. Original engines never open here.
+(ns datom.offline.snapshot
+ (:require [datom.offline.fs :as fs] [datom.offline.manifest :as manifest]
+           [datom.offline.layout :as l]))
+
+(defn- distinct-roots! [source destination]
+ (let [a (:path source) b (:path destination)]
+  (when (or (manifest/within? a b) (manifest/within? b a))
+   (l/refuse! :offline-overlapping-roots))
+  (when (or (not (:readonly source)) (:readonly destination))
+   (l/refuse! :offline-invalid-root-access))))
+
+(defn- lock-stores! [root spec]
+ (mapv (fn [store]
+         (let [parts (manifest/components (:path store))
+               parent (reduce fs/child! root (subvec parts 0 (dec (count parts))))]
+          (fs/child! parent (peek parts) {:lock true}))) (:stores spec)))
+
+(defn copy-tree!
+ "Copy a declared tree without replacing files. :omit-stores is used ONLY
+  to seed a new target before key conversion; snapshots never omit data.
+  Protocol metadata is retained in backup, omitted from extraction/targets."
+ [source destination spec options]
+ (let [lookup (manifest/compile-index spec)]
+  (fs/fold-tree source
+  (fn [copied entry]
+   (let [section (manifest/classify-index lookup (:relative entry) (:kind entry))
+         omit (or (and (:omit-stores options) (= :store (:kind section)))
+                  (and (:omit-protocol options) (= :protocol (:kind section))))]
+    (if omit copied
+     (let [parts (manifest/components (:relative entry))]
+      (if (= :directory (:kind entry))
+       (manifest/ensure-directory! destination (:relative entry))
+       (let [parent (reduce (fn [parent name] (fs/child! parent name {:create true}))
+                      destination (subvec parts 0 (dec (count parts))))]
+        (fs/copy! (:parent entry) (:name entry) parent (peek parts))))
+      (inc copied))))) 0)))
+
+(defn capture!
+ "Capture into a freshly created empty private root. All declared engine
+  directories are locked WITHOUT opening/recovering them. Source namespaces,
+  content and destination content are checked before reporting :captured.
+  Restart an interrupted capture in a fresh private attempt, never clobber it."
+ [source destination spec]
+ (distinct-roots! source destination)
+ (manifest/validate! spec)
+ (when (seq (:entries (fs/entries destination nil 1)))
+  (l/refuse! :offline-snapshot-destination-not-empty))
+ (let [locks (lock-stores! source spec)
+       inventory (manifest/inspect! source spec)
+       before (fs/tree-digest source)
+       copied (copy-tree! source destination spec {})
+       after (fs/tree-digest source)
+       captured (fs/tree-digest destination)]
+  ;; Keep every flock resource live THROUGH both content passes, not merely
+  ;; until the last constructor call before the copy.
+  (doseq [lock locks] (fs/entries lock nil 1))
+  (when-not (= before after captured) (l/refuse! :offline-snapshot-content-mismatch))
+  (fs/sync! destination)
+  {:version 1 :status :captured :kind :physical :manifest-digest (:manifest-digest inventory)
+   :tree-digest (:sha256 captured) :entries copied
+   :declared-key-format (:key-format spec) :data-version (:data-version spec)}))
