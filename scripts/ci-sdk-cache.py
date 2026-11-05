@@ -18,6 +18,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 STORE = re.compile(r'/nix/store/[0-9a-z]{32}-[^/]+')
 CI_ONLY_EXCLUSIONS = ('nix/ci-check.nix', 'nix/ci-release-runtime.nix', 'nix/ci-sdk-gates.nix')
+DATOM_CHECK_EXCLUSION = 'nix/datom-crash-check.nix'
 
 
 def model_input():
@@ -63,14 +64,22 @@ def retained_source_fingerprint(source):
     # Preserve each predecessor's original identity and filtering rules so
     # existing SDK units remain reusable without relabelling their source.
     allowed = [current]
+    # The standalone Datom death fixture is captured by its own CI recipe,
+    # never an SDK producer. Preserve the immediately preceding policy under
+    # its original digest, then derive only its actual historical ancestors.
+    prior_ci = current
+    if current['excluded'].count(DATOM_CHECK_EXCLUSION) == 1:
+        prior_ci = dict(current, excluded=[name for name in current['excluded']
+                                          if name != DATOM_CHECK_EXCLUSION])
+        allowed.append(prior_ci)
     # These additions changed the capture policy after the last published
     # SDK. Keep those exact predecessors reusable under THEIR actual digest;
     # the normal producer still verifies every retained compiler/SDK unit.
-    root_predecessor = current
-    if 'packages/job-runner' in current['roots']:
-        root_predecessor = dict(current, roots=[
+    root_predecessor = prior_ci
+    if 'packages/job-runner' in prior_ci['roots']:
+        root_predecessor = dict(prior_ci, roots=[
             'vendor/foundry-ledger' if name == 'packages/job-runner' else name
-            for name in current['roots']])
+            for name in prior_ci['roots']])
         allowed.append(root_predecessor)
     for additions in (
             ('scripts/retain-producer.bl',),
@@ -82,11 +91,11 @@ def retained_source_fingerprint(source):
             root_predecessor = dict(root_predecessor, roots=[
                 name for name in root_predecessor['roots'] if name not in additions])
             allowed.append(root_predecessor)
-    predecessor = dict(current, roots=[
+    predecessor = dict(prior_ci, roots=[
         'vendor/foundry-ledger' if name == 'packages/job-runner' else name
-        for name in current['roots']])
-    if current['reserved'].count('__pycache__') == 1:
-        predecessor = dict(predecessor, reserved=[name for name in current['reserved']
+        for name in prior_ci['roots']])
+    if prior_ci['reserved'].count('__pycache__') == 1:
+        predecessor = dict(predecessor, reserved=[name for name in prior_ci['reserved']
                                               if name != '__pycache__'])
         allowed.append(predecessor)
     if all(predecessor['excluded'].count(name) == 1 for name in CI_ONLY_EXCLUSIONS):
