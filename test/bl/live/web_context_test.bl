@@ -44,3 +44,130 @@
    (is (= overlay (osenv/overlay)))
    (finally (Supervisor/stop sa :normal 30000) (Supervisor/stop sb :normal 30000)
             (env/destroy a) (env/destroy b)))))
+
+;; ── a WebSocket runs in the serving scope too ─────────────────────────
+;; Bandit runs a socket's callbacks in its connection process AFTER the plug
+;; has returned, i.e. outside the per-request conveyance above. So a WebSocket
+;; handler saw the bare OS environment: under `bl run`/`bl test` a
+;; `System/put_env` (which writes the command's process-local overlay) reached
+;; every HTTP page and no live socket — the socket that live.app starts from
+;; `ws-init` captures that bare scope and keeps it for the session's life.
+
+(defn- ws-connect [port path]
+ (let [socket (elem (gen_tcp/connect (tuple 127 0 0 1) port
+                       (list :binary (tuple :active false)) 3000) 1)]
+  (gen_tcp/send socket (str "GET " path " HTTP/1.1\r\nHost: localhost\r\n"
+                            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                            "Sec-WebSocket-Version: 13\r\n\r\n"))
+  (let [head (loop [buf ""]
+               (if (String/contains? buf "\r\n\r\n") buf
+                 (let [r (gen_tcp/recv socket 0 10000)]
+                  (if (= :ok (elem r 0)) (recur (erlang/iolist_to_binary (list buf (elem r 1))))
+                    (throw (ex-info "no upgrade response" {:got buf}))))))]
+   (when-not (String/contains? head " 101 ")
+    (throw (ex-info "not upgraded" {:got head})))
+   {:socket socket :buf (second (binary/split head "\r\n\r\n"))})))
+
+(defn- ws-read-text
+  "The next server text frame's payload (unmasked, short or 16-bit length)."
+  [conn]
+  (loop [buf (:buf @conn)]
+   (let [n (erlang/byte_size buf)
+         len7 (when (>= n 2) (erlang/band (binary/at buf 1) 127))
+         hdr (cond (nil? len7) nil (< len7 126) 2 :else 4)
+         len (cond (nil? len7) nil (< len7 126) len7
+                   (>= n 4) (+ (* 256 (binary/at buf 2)) (binary/at buf 3)) :else nil)]
+    (if (and len (>= n (+ hdr len)))
+     (do (swap! conn assoc :buf (binary/part buf (+ hdr len) (- n (+ hdr len))))
+         (binary/part buf hdr len))
+     ;; generous: a cold VM compiles the live stack on the first mount
+     (let [r (gen_tcp/recv (:socket @conn) 0 30000)]
+      (if (= :ok (elem r 0)) (recur (erlang/iolist_to_binary (list buf (elem r 1))))
+        (throw (ex-info "no frame" {:got buf :why (elem r 1)}))))))))
+
+(defn- ws-send-text [conn s]
+ ;; a client frame is masked; an all-zero mask leaves the payload as is
+ (gen_tcp/send (:socket @conn)
+  (erlang/iolist_to_binary (list 129 (+ 128 (erlang/byte_size s)) 0 0 0 0 s))))
+
+(defn- scope-probe [] (str (System/get_env "BL_WEB_CONTEXT_FIXTURE") ":" (BeamLisp/cwd)))
+
+(defn- start-scoped-ws [scope port marker root]
+ (env/with-env scope
+  (fn []
+   (osenv/with-env {"BL_WEB_CONTEXT_FIXTURE" marker}
+    (fn []
+     (BeamLisp/with_cwd root
+      (fn []
+       (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                         :plug (fn [c]
+                                 (web/upgrade c {:init (fn [s] [:push [[:text (str "init " (scope-probe))]] s])
+                                                 :handle-in (fn [_frame s] [:push [[:text (str "in " (scope-probe))]] s])
+                                                 :handle-info (fn [_msg s] [:push [[:text (str "info " (scope-probe))]] s])}))})
+             1))))))))
+
+(deftest websocket-callbacks-run-in-the-serving-scope
+ (let [a (env/fork) port (free-port)
+       before (env/current) overlay (osenv/overlay)
+       listener (start-scoped-ws a port "ws-alpha" "/scope/ws")]
+  (try
+   (let [conn (atom (ws-connect port "/ws"))]
+    (try
+     (is (= "init ws-alpha:/scope/ws" (ws-read-text conn)))
+     (ws-send-text conn "hello")
+     (is (= "in ws-alpha:/scope/ws" (ws-read-text conn)))
+     (finally (gen_tcp/close (:socket @conn)))))
+   ;; the caller's own scope is untouched by serving one
+   (is (= before (env/current)))
+   (is (= overlay (osenv/overlay)))
+   (finally (Supervisor/stop listener :normal 30000) (env/destroy a)))))
+
+(deftest a-push-to-a-websocket-runs-in-the-serving-scope
+ ;; handle-info is how live.app ships every mount and patch
+ (let [a (env/fork) port (free-port) parent (erlang/self)
+       listener (env/with-env a
+                 (fn []
+                  (osenv/with-env {"BL_WEB_CONTEXT_FIXTURE" "ws-info"}
+                   (fn []
+                    (elem (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                                      :plug (fn [c]
+                                              (web/upgrade c {:init (fn [s] (erlang/send parent [:ws-pid (erlang/self)]) [:ok s])
+                                                              :handle-info (fn [_msg s] [:push [[:text (str "info " (System/get_env "BL_WEB_CONTEXT_FIXTURE"))]] s])}))})
+                          1)))))]
+  (try
+   (let [conn (atom (ws-connect port "/ws"))]
+    (try
+     (let [pid (receive [:ws-pid p] p (after 5000 nil))]
+      (is (some? pid))
+      (when pid (web/send! pid :tick))
+      (is (= "info ws-info" (ws-read-text conn))))
+     (finally (gen_tcp/close (:socket @conn)))))
+   (finally (Supervisor/stop listener :normal 30000) (env/destroy a)))))
+
+(defn- ws-read-until [conn prefix]
+ (loop [i 0]
+  (let [frame (ws-read-text conn)]
+   (cond (String/starts_with? frame prefix) frame
+         (> i 8) (throw (ex-info "frame never arrived" {:prefix prefix :last frame}))
+         :else (recur (+ i 1))))))
+
+(deftest a-live-socket-sees-the-put-env-its-page-saw
+ ;; The reported shape: under `bl run`, `System/put_env` before `live.app/serve`
+ ;; reached the SSR page and not the live socket, so the socket's first mount
+ ;; repainted the page with the bare OS value. `osenv/with-env {}` is the
+ ;; command runner's own binding, which is what makes put_env process-scoped.
+ (osenv/with-env {}
+  (fn []
+   (System/put_env "BL_WEB_CONTEXT_FIXTURE" "put-before-serve")
+   (let [port (free-port)
+         started (app/serve {:home "/" :principal (fn [_] nil) :worlds (fn [_ _] {})
+                             :routes [["/" (fn [_] [:main [:p (str "env=" (System/get_env "BL_WEB_CONTEXT_FIXTURE"))]])]]}
+                            {:port port :ip (tuple 127 0 0 1) :log :off})]
+    (try
+     (is (String/contains? (get-body port) "env=put-before-serve"))
+     (let [conn (atom (ws-connect port "/ws/"))]
+      (try
+       (is (String/contains? (ws-read-until conn "[\"mount\"") "env=put-before-serve"))
+       (finally (gen_tcp/close (:socket @conn)))))
+     (finally (app/stop! started)))))))
