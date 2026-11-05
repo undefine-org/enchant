@@ -7,6 +7,7 @@ let
   products = builtins.listToAttrs (map (crate: {
     name = crate;
     value = import ./native-artifact.nix {
+      packages = pkgs;
       requestJson = builtins.toJSON {
         version = 1;
         inherit crate target;

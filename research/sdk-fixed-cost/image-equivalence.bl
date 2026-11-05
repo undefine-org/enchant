@@ -1,0 +1,52 @@
+;; Run against the frozen immutable SDK, under a cap on Build. Compare its
+;; actual image producer with the candidate Source under a private namespace.
+(ns fixed-cost.image-equivalence
+  (:require [unit-store :as units] [build-image :as image]))
+
+(let [checkout (System/fetch_env! "BL_TEST_SOURCE_ROOT")
+      source (File/read! (Path/join checkout "priv/build/build-image.bl"))]
+  (BeamLisp/eval (String/replace source "(ns build-image " "(ns fixed-cost-image ")))
+(ns fixed-cost.image-equivalence)
+
+(defn- timed [label action]
+  (let [started (System/monotonic_time :microsecond)
+        result (action)]
+    (println (str "IMAGE-EQUIVALENCE-PHASE " (Jason/encode!
+      {:stage label :elapsed-us (- (System/monotonic_time :microsecond) started)})))
+    result))
+
+(defn- contents [directory]
+  (Enum/reduce (Path/wildcard (Path/join directory "*")) {}
+    (fn [path out]
+      (if (File/regular? path)
+        (assoc out (Path/basename path) (crypto/hash :sha256 (File/read! path))) out))))
+
+(let [sdk (System/fetch_env! "BL_SDK_PRODUCT")
+      root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+      index (get (Jason/decode! (File/read! (Path/join sdk "unit-store/unit-index.json"))) "units")
+      sources (Enum/map index (fn [[_ row]] (Path/join root (get row "file"))))
+      scratch (System/fetch_env! "BL_IMAGE_PROBE_OUTPUT")
+      outputs (Path/join scratch "units")
+      before (Path/join scratch "before") after (Path/join scratch "after")]
+  (File/mkdir_p! scratch)
+  (try
+    (let [result (timed "restore-units" (fn []
+                   (units/produce! {:root root :sources sources :previous (Path/join sdk "unit-store")
+                                    :out outputs :jobs 4})))
+          manifest (:manifest result)
+          _ (when-not (and (= 0 (:compiled result)) (= (count sources) (:cached result)))
+              (throw (ex-info "Expected complete unchanged unit reuse" result)))
+          old (timed "before" (fn []
+                (image/assemble! manifest manifest root outputs before
+                  (Path/join before "sdk-code.term") (Path/join before "precompiled.term") 4)))
+          new (timed "after" (fn []
+                (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch_exact! "fixed-cost-image" "assemble!")
+                  (list manifest manifest root outputs after
+                    (Path/join after "sdk-code.term") (Path/join after "precompiled.term") 4))))
+          files (contents before)]
+      (when-not (and (= old new) (= files (contents after)))
+        (throw (ex-info "Image assembly changed published bytes" {})))
+      (println (str "IMAGE-EQUIVALENCE-RESULT " (Jason/encode!
+        {:status "passed" :units (count sources) :modules old :identical-files (count files)
+         :memory (erlang/memory :total)}))))
+    (finally (File/rm_rf! outputs) (File/rm_rf! before) (File/rm_rf! after))))
