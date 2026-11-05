@@ -7,6 +7,7 @@ let
   server = import ./native-products.nix { inherit pkgs root; };
   products = if nativeProducts != null then nativeProducts else server.products // pkgs.lib.optionalAttrs includeDesktop {
     wry_webview = import ./native-artifact.nix {
+    packages = pkgs;
     requestJson = builtins.toJSON {
       version = 1;
       crate = "wry_webview";

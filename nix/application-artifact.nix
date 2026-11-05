@@ -1,5 +1,5 @@
 # Closed data request, exact immutable SDK, existing BL compiler/producer.
-{ requestJson ? null, requestPath ? null, sdk }:
+{ requestJson ? null, requestPath ? null, sdk, packages ? null }:
 let
   request = builtins.fromJSON (builtins.unsafeDiscardStringContext (if requestPath != null
     then builtins.readFile (/. + requestPath)
@@ -7,7 +7,8 @@ let
   scoped = (request.scope or "full") == "scoped";
   base = if (request.base or null) == null then null else builtins.storePath request.base;
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
-  pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
+  pkgs = if packages != null then packages else
+    import (builtins.fetchTree lock.nodes.nixpkgs.locked).outPath { system = "x86_64-linux"; };
   storeObject = value: builtins.isString value && builtins.match "/nix/store/[0-9a-z]{32}-[^/]+" value != null;
   relative = value: builtins.isString value && value != "" && builtins.substring 0 1 value != "/"
     && builtins.all (part: part != ".." && part != "") (pkgs.lib.splitString "/" value);
@@ -37,6 +38,7 @@ let
   products = builtins.listToAttrs (map (item: {
     name = item.crate;
     value = import ./native-artifact.nix {
+      packages = pkgs;
       requestJson = builtins.toJSON (item // { source = toString (source + "/${item.source}"); });
     };
   }) declarations);
@@ -110,6 +112,7 @@ assert request.ex == null || (builtins.isAttrs request.ex && builtins.attrNames 
   && relative request.ex.root && builtins.isList request.ex.exclude && builtins.all builtins.isString request.ex.exclude);
 if unchanged then import ./application-artifact.nix {
   inherit sdk;
+  packages = pkgs;
   requestJson = builtins.readFile (base + "/production-request.json");
 } else worker (pkgs.runCommand "beam-lisp-application" {
   nativeBuildInputs = [ pkgs.python3 ];

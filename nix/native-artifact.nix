@@ -1,5 +1,5 @@
 # Fixed trusted recipe. Requests carry data, never caller-supplied expressions.
-{ requestJson }:
+{ requestJson, packages ? null }:
 let
   # JSON is data. The source field re-enters Nix dependency tracking through
   # storePath/path below, including requests constructed by flake outputs.
@@ -10,7 +10,9 @@ let
   validName = value: builtins.isString value && builtins.stringLength value <= 128 && builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" value != null;
   lock = builtins.fromJSON (builtins.readFile ../flake.lock);
   nixpkgs = builtins.fetchTree lock.nodes.nixpkgs.locked;
-  pkgs = import nixpkgs.outPath { system = request.target; };
+  # Composite producers supply their exact pinned package set. Standalone
+  # requests still import the same pin; no result survives this evaluation.
+  pkgs = if packages != null then packages else import nixpkgs.outPath { system = request.target; };
   source = if builtins.match "/nix/store/[0-9a-z]{32}-[^/]+" request.source != null
     then builtins.storePath request.source
     else import ./native-source.nix {

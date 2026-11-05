@@ -12,7 +12,9 @@ sampler=spawn(fn ->
     send(parent,{:sdk_samples,ref,%{iterations: iterations,rows: Enum.take(rows,100)}})
   after 10 ->
    {counts,records}=Enum.reduce(Process.list(),{counts,records},fn pid,{counts,records} ->
-    if pid==self(),do: {counts,records},else:
+    if pid==self() do
+     {counts,records}
+    else
      case Process.info(pid,[:status,:current_stacktrace]) do
       [status: status,current_stacktrace: stack] ->
        own=Enum.any?(stack,fn {m,_,_,_} -> String.starts_with?(Atom.to_string(m),"Elixir.BeamLisp") end)
@@ -24,6 +26,7 @@ sampler=spawn(fn ->
        else {counts,records} end
       _ -> {counts,records}
      end
+    end
    end)
    loop.(loop,counts,records,iterations+1)
   end
@@ -37,3 +40,5 @@ receive do {:sdk_samples,^ref,report} -> IO.puts("SDK-SAMPLE-PROFILE " <> Jason.
 '''
 def bl(code):return '(erlang/apply :Elixir.Code :eval_string (list '+json.dumps(code)+'))\n'
 (root/'.local/fixed-cost/produce-sdk-sampler.bl').write_text(source.replace(marker,bl(start)+marker)+bl(finish))
+
+(root/".local/fixed-cost/sampler-preflight.exs").write_text(start+finish.replace("Jason.encode!(report)","inspect(report)"))

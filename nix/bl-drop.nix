@@ -65,6 +65,7 @@ let
     inherit pkgs erlang elixir;
     executor = drop-tools;
     inherit includeDesktop;
+    nativeProducts = nativeProducts.products;
   };
   compilerNatives = { names = [ "lazy_memo" ]; bundle = import ./native-bundle.nix {
     inherit pkgs;
