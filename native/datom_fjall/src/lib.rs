@@ -385,7 +385,8 @@ fn require_existing_engine(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     for name in ["version", "partitions/datoms/manifest", "partitions/datoms/config"] {
         let metadata = fs::symlink_metadata(path.join(name))?;
-        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() == 0 {
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() == 0
+            || (name == "version" && metadata.len() != 4) {
             return Err(std::io::Error::other("unsupported captured engine file"));
         }
     }
