@@ -1,0 +1,122 @@
+(ns datom.offline-reindex-test
+ (:require [datom :as d] [datom.offline.reindex :as r] [datom.offline.audit :as audit]
+           [datom.offline.layout :as l] [datom.store-fjall :as fj]
+           [datom.store :as s] [datom.schema :as schema] [datom.index :as index]
+           [datom.value-codec :as slot]))
+
+(def definition {:db/ident :fixture/key :db/valueType :db.type/tuple
+                 :db/cardinality :db.cardinality/one :db/unique :db.unique/identity})
+(def bound (r/job-binding (l/digest :source-runtime) (l/digest :tool)
+                         (l/digest :sealed-snapshot) (l/digest :storage-manifest)))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn rows [st] (audit/fold-pages st nil nil conj []))
+(defn seed [definition facts]
+ (let [st (fj/open-fresh) sch (assoc (schema/empty-schema) (:db/ident definition) definition)
+       datoms (into (mapv (fn [op] [(get op 1) (get op 2) (get op 3) l/FIRST-TX true])
+                          (schema/definition-datoms 500 definition)) facts)]
+  (s/-put st l/TX-KEY (+ l/FIRST-TX 19))
+  (s/-put st l/ENTITY-KEY 700)
+  (doseq [dt datoms]
+   (fj/commit-raw! st
+    (mapv (fn [idx] [:put (l/key-for 1 idx dt)
+                     (if (= idx :eavt) (erlang/term_to_binary dt) (slot/encode-slot dt))])
+          (index/indexes-for sch (get dt 1)))))
+  st))
+(defn drain [job]
+ (loop [remaining 100]
+  (when (zero? remaining) (throw (ex-info "conversion did not finish within test budget" {})))
+  (let [status (r/step! job)]
+   (if (= :copied (:phase status)) status (recur (dec remaining))))))
+
+(deftest conversion-retains-raw-payloads-counters-and-authoritative-metadata
+ (let [fact [42 :fixture/key (list 1 [2]) l/FIRST-TX true]
+       source (seed definition [fact]) target (fj/open-fresh)
+       marks-key (l/derived-key [:datom.attr-basis])
+       cache-key (l/derived-key [:datom.current/pair 42 :fixture/key])]
+  (try
+   (s/-put source marks-key {:fixture/key l/FIRST-TX})
+   (s/-put source cache-key {:values [(list 1 [2])]})
+   (let [before (rows source) original (fj/raw-get source (l/key-for 1 :eavt fact))
+         job (r/begin! source target bound)
+         status (drain job)]
+    (is (= :copied (:phase status)))
+    (is (= 5 (:datoms status)))
+    (doseq [idx [:eavt :aevt :avet]]
+     (is (= original (fj/raw-get target (l/key-for 2 idx fact)))))
+    (is (= (fj/raw-get source l/TX-KEY) (fj/raw-get target l/TX-KEY)))
+    (is (= (fj/raw-get source l/ENTITY-KEY) (fj/raw-get target l/ENTITY-KEY)))
+    (is (= (fj/raw-get source marks-key) (fj/raw-get target marks-key)))
+    (is (nil? (fj/raw-get target cache-key)))
+    (is (= before (rows source)))
+    (is (= (r/descriptor bound) (s/-get target l/FORMAT-KEY)))
+    (let [private-before (rows target)]
+     (is (= :incompatible-index-key-format (kind #(d/connect-with target []))))
+     (is (= private-before (rows target))))
+    (is (= :copied (:phase (r/step! (r/resume! source target bound))))))
+   (finally (s/close source) (s/close target)))))
+
+(deftest physical-key-collisions-refuse-without-publishing-a-partial-page
+ (let [source (seed definition [[42 :fixture/key (list 1) l/FIRST-TX true]
+                                [42 :fixture/key [1] l/FIRST-TX true]])
+       target (fj/open-fresh)]
+  (try
+   (let [source-before (rows source) job (r/begin! source target bound) target-before (rows target)]
+    (is (= :offline-physical-key-collision (kind #(r/step! job))))
+    (is (= target-before (rows target)))
+    (is (= source-before (rows source))))
+   (finally (s/close source) (s/close target)))))
+
+(deftest collisions-against-an-earlier-page-still-refuse-after-resume
+ (let [many {:db/ident :fixture/key :db/valueType :db.type/term
+             :db/cardinality :db.cardinality/many}
+       facts (conj (mapv (fn [n] [42 :fixture/key (list n) l/FIRST-TX true]) (range 1 151))
+                    [42 :fixture/key [1] l/FIRST-TX true])
+       source (seed many facts) target (fj/open-fresh)]
+  (try
+   (let [job (r/begin! source target bound)]
+    (is (= :copying (:phase (r/step! job))))
+    (let [before (rows target) resumed (r/resume! source target bound)]
+     (is (= :offline-physical-key-collision (kind #(r/step! resumed))))
+     (is (= before (rows target)))))
+   (finally (s/close source) (s/close target)))))
+
+(deftest historical-unique-collisions-refuse-and-legal-same-turn-transfers-complete
+ (doseq [conflict? [true false]]
+  (let [first [101 :fixture/key (list 1) l/FIRST-TX true]
+        second [102 :fixture/key [1] (+ l/FIRST-TX 1) true]
+        retraction [101 :fixture/key (list 1) (+ l/FIRST-TX (if conflict? 2 1)) false]
+        source (seed definition [first second retraction]) target (fj/open-fresh)]
+   (try
+    (let [before (rows source) job (r/begin! source target bound)]
+     (if conflict?
+      (is (= :offline-canonical-unique-collision (kind #(drain job))))
+      (is (= :copied (:phase (drain job)))))
+     (is (= before (rows source)))
+     (is (= (r/descriptor bound) (s/-get target l/FORMAT-KEY))))
+    (finally (s/close source) (s/close target))))))
+
+(deftest changed-snapshot-or-tool-cannot-borrow-an-earlier-cursor
+ (let [fact [42 :fixture/key [1] l/FIRST-TX true]
+       source (seed definition [fact]) target (fj/open-fresh)]
+  (try
+   (r/begin! source target bound)
+   (let [before (rows target)
+         other (r/job-binding (:source-runtime bound) (l/digest :different-tool)
+                  (:snapshot bound) (:manifest bound))]
+    (is (= :offline-job-state-mismatch (kind #(r/resume! source target other))))
+    (s/-put source l/TX-KEY (+ l/FIRST-TX 20))
+    (is (= :offline-source-changed (kind #(r/resume! source target bound))))
+    (is (= before (rows target))))
+   (finally (s/close source) (s/close target)))))
+
+(deftest source-alias-and-preexisting-destinations-refuse-without-relabeling
+ (let [source (seed definition []) target (fj/open-fresh)]
+  (try
+   (let [before (rows source)]
+    (is (= :offline-overlapping-stores (kind #(r/begin! source source bound))))
+    (is (= before (rows source))))
+   (s/-put target "existing" :kept)
+   (let [before (rows target)]
+    (is (= :offline-destination-not-empty (kind #(r/begin! source target bound))))
+    (is (= before (rows target))))
+   (finally (s/close source) (s/close target)))))

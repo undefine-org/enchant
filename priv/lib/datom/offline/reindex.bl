@@ -1,0 +1,158 @@
+;; Private-destination, single-writer conversion. A copied store is NOT READY.
+;; The whole-root coordinator owns path claims and publication; independent
+;; verification must succeed before any building descriptor can be removed.
+(ns datom.offline.reindex
+ (:require [datom.offline.layout :as l] [datom.offline.audit :as audit]
+           [datom.offline.unique :as unique] [datom.store-fjall :as fj]
+           [datom.value-codec :as slot] [datom.index :as index]))
+
+(def STATE-KEY (l/bytes [0 109 0]))
+(def PAGE-ROWS 128)
+(def PAGE-BYTES 2097152)
+(def PHASES #{:copying :checking-uniqueness :copied :verified :cleaning})
+
+(defn job-binding
+ "Bind the private job to sealed runtime, snapshot and storage-manifest
+  identities. The whole-root coordinator supplies these verified identities."
+ [source-runtime tool snapshot manifest]
+ (let [m {:source-runtime source-runtime :tool tool :snapshot snapshot :manifest manifest}]
+  (when-not (every? #(and (string? %) (Regex/match? #"^[0-9a-f]{64}$" %)) (vals m))
+   (l/refuse! :offline-invalid-job-binding))
+  (assoc m :job (l/digest (assoc m :from 1 :to 2 :protocol 1)))))
+
+(defn descriptor [bound] {:version 2 :state :building :job (:job bound)})
+(defn- exclusive [target action]
+ ;; Same-process callers share one writer lock, as Conn does for live stores.
+ ;; The coordinator additionally owns the cross-process directory/job claim.
+ (global/trans (tuple (tuple ::writer (:path target)) (erlang/self)) action))
+
+(defn state [target bound]
+ (let [raw (fj/raw-get target STATE-KEY)
+       s (when raw (l/checked-slot raw))]
+  (when-not (and (erlang/is_map s) (= 1 (:version s)) (= bound (:binding s))
+                (contains? PHASES (:phase s))
+                (= (descriptor bound) (audit/read-slot target l/FORMAT-KEY)))
+   (l/refuse! :offline-job-state-mismatch))
+  s))
+
+(defn- context [source target bound inspected]
+ {:source source :target target :binding bound :audit inspected})
+
+(defn- distinct-paths! [source target]
+ (let [a (:path source) b (:path target)]
+  (when (or (not (string? a)) (not (string? b)) (= a b)
+            (String/starts_with? a (str b "/")) (String/starts_with? b (str a "/")))
+   (l/refuse! :offline-overlapping-stores))))
+
+(defn begin!
+ "Start on an already-open empty, private destination. No source writes and
+  no Conn. The caller must have fenced and validated paths before opening it."
+ [source target bound]
+ (distinct-paths! source target)
+ (when-not (= bound (job-binding (:source-runtime bound) (:tool bound) (:snapshot bound) (:manifest bound)))
+  (l/refuse! :offline-invalid-job-binding))
+ (let [inspected (audit/inspect-store source 1)]
+  (exclusive target
+   (fn []
+    (when (seq (:entries (fj/raw-page target nil nil nil 1 PAGE-BYTES)))
+     (l/refuse! :offline-destination-not-empty))
+    (let [s {:version 1 :binding bound :phase :copying :after nil
+             :source-digest (:digest inspected) :schema-digest (:schema-digest inspected)
+             :source-rows 0 :datoms 0 :authoritative 0 :events 0
+             :unique-after nil :unique-state (unique/initial)}]
+     (fj/commit-raw! target [[:put l/FORMAT-KEY (slot/encode-slot (descriptor bound))]
+                            [:put STATE-KEY (slot/encode-slot s)]])
+     (fj/sync! target))))
+  (context source target bound inspected)))
+
+(defn resume!
+ "Reconcile an interrupted job against the same captured source and tool.
+  Changed source/tool/manifest cannot borrow an earlier cursor or proof."
+ [source target bound]
+ (distinct-paths! source target)
+ (let [inspected (audit/inspect-store source 1)]
+  (exclusive target
+   (fn []
+    (let [s (state target bound)]
+     (when-not (and (= (:digest inspected) (:source-digest s))
+                   (= (:schema-digest inspected) (:schema-digest s)))
+      (l/refuse! :offline-source-changed))
+     (when (and (:after s) (nil? (fj/raw-get source (:after s))))
+      (l/refuse! :offline-job-state-mismatch)))))
+  (context source target bound inspected)))
+
+(defn- put-row [target prepared key raw]
+ (let [pending (:pending prepared)
+       found (if (contains? pending key) (get pending key) (fj/raw-get target key))]
+  (when (and (some? found) (not (erlang/=:= found raw)))
+   (l/refuse! :offline-physical-key-collision))
+  (if (contains? pending key) prepared
+   (-> prepared (assoc-in [:pending key] raw) (update :ops conj [:put key raw])))))
+
+(defn- prepare-row [job prepared [key raw]]
+ (let [classification (l/classify key) target (:target job)
+       source-audit (:audit job)]
+  (case (:kind classification)
+   :index
+    (if (= :eavt (:index classification))
+     (let [d (l/checked-datom raw (:basis source-audit))
+           prepared (reduce (fn [p idx] (put-row target p (l/key-for 2 idx d) raw))
+                       prepared (index/indexes-for (:schema source-audit) (get d 1)))
+           prepared (update prepared :datoms inc)]
+      (if (contains? (:unique-attrs source-audit) (get d 1))
+       (update (put-row target prepared (unique/event-key d) raw) :events inc)
+       prepared))
+     prepared)
+   :counter (update (put-row target prepared key raw) :authoritative inc)
+   :authoritative (update (put-row target prepared key raw) :authoritative inc)
+   :format prepared
+   :cache prepared)))
+
+(defn- copy-step [job s]
+ (let [target (:target job)
+       page (fj/raw-page (:source job) nil (:after s) nil PAGE-ROWS PAGE-BYTES)
+       prepared (reduce #(prepare-row job %1 %2)
+                  {:ops [] :pending {} :datoms 0 :events 0 :authoritative 0} (:entries page))
+       next (-> s (assoc :after (or (:last page) (:after s))
+                         :phase (if (:done? page) :checking-uniqueness :copying))
+                  (update :source-rows + (count (:entries page)))
+                  (update :datoms + (:datoms prepared))
+                  (update :events + (:events prepared))
+                  (update :authoritative + (:authoritative prepared)))]
+  ;; Event rows and cursor share this SAME atomic batch. No second progress
+  ;; database or cross-store transaction is needed to recover a page.
+  (fj/commit-raw! target (conj (:ops prepared) [:put STATE-KEY (slot/encode-slot next)]))
+  (fj/sync! target)
+  next))
+
+(defn- uniqueness-step [job s]
+ (let [target (:target job)
+       page (fj/raw-page target (when (nil? (:unique-after s)) unique/PREFIX)
+               (:unique-after s) (l/prefix-end unique/PREFIX) PAGE-ROWS PAGE-BYTES)
+       folded (reduce (fn [folded [key raw]]
+                        (let [d (l/checked-datom raw (get-in job [:audit :basis]))]
+                         (when-not (= key (unique/event-key d))
+                          (l/refuse! :offline-unique-event-mismatch))
+                         (unique/advance folded d))) (:unique-state s) (:entries page))
+       folded (if (:done? page) (unique/complete folded) folded)
+       next (assoc s :unique-state (if (:done? page) (unique/initial) folded)
+                     :unique-after (or (:last page) (:unique-after s))
+                     :phase (if (:done? page) :copied :checking-uniqueness))]
+  (fj/commit-raw! target [[:put STATE-KEY (slot/encode-slot next)]])
+  (fj/sync! target)
+  next))
+
+(defn step!
+ "One bounded writer turn. A returned :copied phase is only input to the
+  independent verifier; it grants no startup, READY or activation permission."
+ [job]
+ (exclusive (:target job)
+  (fn []
+   (let [s (state (:target job) (:binding job))]
+    (when-not (= (:source-digest s) (get-in job [:audit :digest]))
+     (l/refuse! :offline-source-changed))
+    (let [next (case (:phase s)
+                 :copying (copy-step job s)
+                 :checking-uniqueness (uniqueness-step job s)
+                 s)]
+     (select-keys next [:phase :source-rows :datoms :authoritative :events]))))))
