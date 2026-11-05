@@ -26,7 +26,7 @@ def host_nix_files(root):
             set(targets.get('all', []) + targets.get('linux', []))}
 
 
-def partitions(root, count, *, lane='all', startup_ms=20000):
+def partitions(root, count, *, lane='all', startup_ms=11000):
     if count < 1:
         raise ValueError("count must be positive")
     if type(startup_ms) is not int or startup_ms < 0:
@@ -50,6 +50,7 @@ def partitions(root, count, *, lane='all', startup_ms=20000):
     isolated = json.loads(isolation_file.read_text()) if isolation_file.exists() else {}
     # File receipts exclude application startup. Each isolated file owns an
     # additional cold VM; the ordinary warm group pays startup once per shard.
+    # Serial produced-SDK receipts measured 10.7--11.4 s per isolated process.
     # Keep every isolation boundary and charge its estimated fixed work here.
     def cost(name):
         return max(1, timings.get(name, 1000)) + (startup_ms if name in isolated else 0)
@@ -95,7 +96,7 @@ def main():
     parser.add_argument("--index", type=int, required=True)
     parser.add_argument("--count", type=int, required=True)
     parser.add_argument("--list", action="store_true")
-    parser.add_argument("--startup-ms", type=int, default=20000,
+    parser.add_argument("--startup-ms", type=int, default=11000,
                         help="estimated cold VM startup cost for each isolated file")
     args = parser.parse_args()
     if not 0 <= args.index < args.count:
