@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import py_compile
 import re
@@ -33,9 +34,10 @@ class EngineCIInputTests(unittest.TestCase):
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('declared engine input: ' + name)
-        for name in (*CACHE.CI_ONLY_EXCLUSIONS, 'bin/bl', 'priv/boot/compiler.bl',
+        for name in (*CACHE.CI_ONLY_EXCLUSIONS, CACHE.DATOM_CHECK_EXCLUSION, 'bin/bl', 'priv/boot/compiler.bl',
                      'native/lazy_memo/src/lib.rs', 'native/lazy_memo/Cargo.lock',
-                     'nix/bl-drop.nix', 'nix/compiler-product.nix', 'nix/native-compile.nix'):
+                     'nix/bl-drop.nix', 'nix/compiler-product.nix', 'nix/native-compile.nix',
+                     'nix/coordinator-runtime.nix'):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('original source: ' + name)
@@ -43,12 +45,14 @@ class EngineCIInputTests(unittest.TestCase):
         self.engine = self.base / 'retained-engine'
         shutil.copytree(self.root, self.engine)
         shutil.copytree(self.engine / 'packages/job-runner', self.engine / 'vendor/foundry-ledger')
-        self.legacy_policy = dict(self.policy, roots=[
+        self.before_datom = dict(self.policy, excluded=[name for name in self.policy['excluded']
+                                                        if name != CACHE.DATOM_CHECK_EXCLUSION])
+        self.legacy_policy = dict(self.before_datom, roots=[
             'vendor/foundry-ledger' if name == 'packages/job-runner' else name
             for name in self.policy['roots']])
         self.bytecode_previous = dict(self.legacy_policy, reserved=[name for name in self.policy['reserved']
                                                             if name != '__pycache__'])
-        self.previous = dict(self.bytecode_previous, excluded=[name for name in self.policy['excluded']
+        self.previous = dict(self.bytecode_previous, excluded=[name for name in self.bytecode_previous['excluded']
                                                              if name not in CACHE.CI_ONLY_EXCLUSIONS])
         self.write_policy(self.engine, self.previous)
 
@@ -134,13 +138,82 @@ class EngineCIInputTests(unittest.TestCase):
         before = CACHE.source_fingerprint(self.root)
         for name in ('bin/bl', 'priv/boot/compiler.bl', 'native/lazy_memo/src/lib.rs',
                      'native/lazy_memo/Cargo.lock', 'nix/bl-drop.nix', 'nix/compiler-product.nix',
-                     'nix/native-compile.nix', 'nix/engine-inputs.json', 'flake.lock'):
+                     'nix/native-compile.nix', 'nix/coordinator-runtime.nix',
+                     'nix/engine-inputs.json', 'flake.lock'):
             with self.subTest(name=name):
                 path = self.root / name
                 original = path.read_bytes()
                 path.write_bytes(original + b'\nchanged producer input\n')
                 self.assertNotEqual(before, CACHE.source_fingerprint(self.root))
                 path.write_bytes(original)
+
+    def test_datom_death_recipe_stays_in_ci_but_not_the_sdk_snapshot(self):
+        path = self.root / CACHE.DATOM_CHECK_EXCLUSION
+        self.assertIn(CACHE.DATOM_CHECK_EXCLUSION, self.policy['excluded'])
+        before, captured = CACHE.source_fingerprint(self.root), self.capture()
+        self.assertFalse((captured[0] / CACHE.DATOM_CHECK_EXCLUSION).exists())
+        spec = importlib.util.spec_from_file_location('ci_full_source', ROOT / 'scripts/ci-source.py')
+        ci = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ci)
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        ci.capture(self.root, self.base / 'ci-before')
+        original = path.read_bytes()
+        path.write_bytes(original + b'\nchanged CI death fixture\n')
+        self.assertEqual(before, CACHE.source_fingerprint(self.root))
+        self.assertEqual(captured, self.capture())
+        ci.capture(self.root, self.base / 'ci-after')
+        self.assertEqual(original, (self.base / 'ci-before' / CACHE.DATOM_CHECK_EXCLUSION).read_bytes())
+        self.assertEqual(path.read_bytes(), (self.base / 'ci-after' / CACHE.DATOM_CHECK_EXCLUSION).read_bytes())
+
+    def test_before_datom_policy_hashes_its_own_fixture_bytes(self):
+        self.write_policy(self.engine, self.before_datom)
+        expected = CACHE.source_fingerprint(self.engine, self.before_datom)
+        self.assertEqual(expected, CACHE.retained_source_fingerprint(self.engine))
+        self.assertNotEqual(expected, CACHE.source_fingerprint(self.engine))
+        path = self.engine / CACHE.DATOM_CHECK_EXCLUSION
+        current = CACHE.source_fingerprint(self.engine)
+        path.write_text('changed bytes under the original captured policy')
+        self.assertNotEqual(expected, CACHE.retained_source_fingerprint(self.engine))
+        self.assertEqual(current, CACHE.source_fingerprint(self.engine))
+
+    def test_platform_cache_ignores_ci_but_recaptures_native_policy_and_selector_edits(self):
+        script = self.root / 'scripts/prepare-checkout-platform'
+        shutil.copy2(ROOT / 'scripts/prepare-checkout-platform', script)
+        tools, output, calls = self.base / 'tools', self.base / 'platform', self.base / 'calls'
+        tools.mkdir(); output.mkdir()
+        (output / 'platform.json').write_text('{}')
+        # Mock only realization/manager transport; execute the actual selector
+        # and its complete filesystem hashing on each invocation.
+        manager = tools / 'systemd-run'
+        manager.write_text('#!/usr/bin/env python3\nimport os,sys\ni=sys.argv.index("nix-build")\nos.execvp(sys.argv[i],sys.argv[i:])\n')
+        builder = tools / 'nix-build'
+        builder.write_text('#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\n'
+            'link=Path(sys.argv[sys.argv.index("--out-link")+1])\n'
+            'link.symlink_to(os.environ["PLATFORM_FIXTURE_OUTPUT"])\n'
+            'with open(os.environ["PLATFORM_FIXTURE_CALLS"],"a") as f:f.write(link.name+"\\n")\n')
+        manager.chmod(0o755); builder.chmod(0o755)
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                   PLATFORM_FIXTURE_OUTPUT=str(output), PLATFORM_FIXTURE_CALLS=str(calls))
+
+        def select():
+            self.assertEqual(str(output), subprocess.check_output([str(script)], cwd=self.base,
+                                                                  env=env, text=True).strip())
+            return calls.read_text().splitlines()
+
+        first = select()
+        self.assertEqual(1, len(first))
+        for name in (*CACHE.CI_ONLY_EXCLUSIONS, CACHE.DATOM_CHECK_EXCLUSION):
+            path = self.root / name
+            path.write_text('changed CI recipe')
+            self.assertEqual(first, select())
+            path.unlink()
+            self.assertEqual(first, select())
+            path.write_text('recreated CI recipe')
+            self.assertEqual(first, select())
+        for count, path in enumerate((self.root / 'native/lazy_memo/src/lib.rs',
+                                      self.root / 'nix/engine-inputs.json', script), start=2):
+            path.write_bytes(path.read_bytes() + b'\n# changed producer input\n')
+            self.assertEqual(count, len(select()))
 
     def test_exact_predecessor_keeps_its_captured_fingerprint(self):
         expected = CACHE.source_fingerprint(self.engine, self.previous)
@@ -183,6 +256,8 @@ class EngineCIInputTests(unittest.TestCase):
         # This cross-product never existed: excluding bytecode was introduced
         # after the three CI-only exclusions, not before them.
         value = copy.deepcopy(self.previous); value['reserved'].append('__pycache__'); variants.append(value)
+        # The Datom exclusion did not exist with the old framework root.
+        value = copy.deepcopy(self.legacy_policy); value['excluded'].append(CACHE.DATOM_CHECK_EXCLUSION); variants.append(value)
         for policy in variants:
             with self.subTest(policy=policy):
                 self.write_policy(self.engine, policy)

@@ -1,7 +1,7 @@
 # Foundry's job mechanism needs an independent runtime while the target SDK is
 # being produced. Use the verified compiler cohort and immutable framework
 # Source; this package neither depends on nor pretends to be the target SDK.
-{ pkgs, compiler, dependencies, source, platform, foundry ? import ./foundry-ledger.nix }:
+{ pkgs, compiler, dependencies, source, platform, sourceParts ? null, foundry ? import ./foundry-ledger.nix }:
 let
   ledgerFiles = [
     "src/foundry/operations/deployment-runner.bl"
@@ -21,6 +21,12 @@ in pkgs.runCommand "beam-lisp-foundry-coordinator-runtime" {} ''
   prepared=$(readlink -f ${platform}/native-products)
   cp -a ${source}/priv "$image/priv"
   chmod -R u+w "$image/priv"
+  # Pure syntax frames, never executable evidence. Readers still select the
+  # exact generation and current content hash and check the bounded frame.
+  ${if sourceParts == null then "" else ''
+    mkdir -p "$image/priv/parts"
+    cp -a ${sourceParts}/. "$image/priv/parts/"
+  ''}
   rm -rf "$image/priv/bootstrap/seed"
   mkdir -p "$image/priv/bootstrap/seed" "$image/priv/native"
   cp -a ${compiler}/seed/. "$image/ebin/"

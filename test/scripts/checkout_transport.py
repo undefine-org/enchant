@@ -54,16 +54,34 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
         output = run(label, *flags, 'eval', '(println (str "OWNER " (System/pid)))', **kwargs)
         return int(next(line[6:] for line in output.splitlines() if line.startswith('OWNER ')))
 
-    def cleanup():
+    def owned_vms():
+        owned = []
         for proc in Path('/proc').iterdir():
             if not proc.name.isdigit():
                 continue
             try:
                 if f'XDG_RUNTIME_DIR={runtime}'.encode() + b'\0' in (proc / 'environ').read_bytes():
-                    cmd = (proc / 'cmdline').read_bytes()
-                    if b'BeamLisp' in cmd:
-                        os.kill(int(proc.name), signal.SIGTERM)
+                    command = (proc / 'cmdline').read_bytes().split(b'\0', 1)[0]
+                    if Path(os.fsdecode(command)).name in {'beam.smp', 'beam'}:
+                        owned.append(int(proc.name))
             except (FileNotFoundError, ProcessLookupError, PermissionError):
+                pass
+        return owned
+
+    def cleanup():
+        for pid in owned_vms():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 3
+        while owned_vms() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Recheck private-runtime ownership before the fallback signal.
+        for pid in owned_vms():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
 
     try:
