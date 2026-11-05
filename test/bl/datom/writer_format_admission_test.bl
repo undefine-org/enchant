@@ -1,0 +1,54 @@
+(ns datom.writer-format-admission-test
+ (:require [datom :as d] [datom.key-format :as format] [datom.store :as s]
+           [datom.store-ets :as se] [datom.store-map :as sm] [datom.store-fjall :as fj]))
+
+(defn refusal [compute] (try (compute) nil (catch error (ex-data error))))
+
+(deftest existing-writers-recheck-format-before-any-operation-effects
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (doseq [operation [:transact :bulk :excise :schema :speculate]]
+   (let [st (open) c (d/connect-with st [])]
+    (try
+     (d/transact! c [[:db/add 42 :db/doc "retained"]])
+     (let [basis (d/basis-t (d/db c))
+           schema @(:schema c) publication @(:schema-publication c)]
+      (s/-put st format/KEY {:version 2})
+      (let [before (vec (s/-range st nil nil))
+            error (refusal #(case operation
+                    :transact (d/transact! c [[:db/add -1 :db/doc "new"]])
+                    :bulk (d/load-facts! c [[:db/add 43 :db/doc "new"]])
+                    :excise (d/excise! c [[:entity 42]])
+                    :schema (d/install-schema! c [{:db/ident :format/new
+                                                  :db/valueType :db.type/string}])
+                    :speculate (d/with c [[:db/add -1 :db/doc "new"]])))]
+       (is (= :incompatible-index-key-format (:kind error)))
+       (is (= basis (d/basis-t (d/db c))))
+       (is (= schema @(:schema c)))
+       (is (= publication @(:schema-publication c)))
+       (is (= before (vec (s/-range st nil nil))))))
+     ;; Test-only restoration allows cleanup; runtime never relabels the store.
+     (finally (s/-delete st format/KEY) (d/close! c) (s/close st)))))))
+
+(deftest supported-descriptors-keep-all-writer-paths-available
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (let [st (open)]
+   (try
+    (s/-put st format/KEY format/CURRENT)
+    (let [c (d/connect-with st [])]
+     (try
+      (let [report (d/transact! c [[:db/add 42 :db/doc "retained"]])
+            basis (:tx report)
+            speculative (d/with c [[:db/add -1 :db/doc "speculative"]])]
+       (is (= basis (d/basis-t (d/db c))))
+       (is (= #{["retained"] ["speculative"]}
+              (d/q '[:find ?v :where [_ :db/doc ?v]] (:db-after speculative)))))
+      (d/load-facts! c [[:db/add 43 :db/doc "loaded"]])
+      (is (= #{["retained"] ["loaded"]}
+             (d/q '[:find ?v :where [_ :db/doc ?v]] (d/db c))))
+      (d/install-schema! c [{:db/ident :format/new :db/valueType :db.type/string}])
+      (is (contains? (d/schema c) :format/new))
+      (is (pos? (:excised (d/excise! c [[:entity 42]]))))
+      (is (= #{["loaded"]} (d/q '[:find ?v :where [_ :db/doc ?v]] (d/db c))))
+      (is (= format/CURRENT (s/-get st format/KEY)))
+      (finally (d/close! c))))
+    (finally (s/close st))))))
