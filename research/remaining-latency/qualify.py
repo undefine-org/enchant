@@ -54,6 +54,8 @@ def main():
     parser.add_argument('--before-root', required=True, type=Path)
     parser.add_argument('--after-root', required=True, type=Path)
     parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--only', choices=('before', 'after'), help='measure one prepared revision')
+    parser.add_argument('--trace', action='store_true', help='record warm-client syscall counts')
     args = parser.parse_args()
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -87,6 +89,8 @@ def main():
 
     try:
         for variant, checkout in [('before', args.before_root.resolve()), ('after', args.after_root.resolve())]:
+            if args.only and variant != args.only:
+                continue
             launcher = checkout / 'bin/bl'
             project = output / (variant + '-project')
             project.mkdir()
@@ -112,6 +116,10 @@ def main():
                     owner = re.search(r'LATENCY-OWNER (\d+)', first).group(1)
                     for repeat in range(3):
                         result = run(f'{variant}-warm-{repeat}', [launcher, 'eval', owner_form], project, env)
+                        assert re.search(r'LATENCY-OWNER (\d+)', result).group(1) == owner
+                    if args.trace:
+                        result = run(variant + '-warm-syscalls', ['strace', '-f', '-c', '-o',
+                            output / (variant + '-warm.strace'), launcher, 'eval', owner_form], project, env)
                         assert re.search(r'LATENCY-OWNER (\d+)', result).group(1) == owner
                     run(variant + '-build-first', [launcher, 'build', '--out', build], project, env)
                     product = (build / '.nix-product').resolve(strict=True)

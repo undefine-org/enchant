@@ -65,16 +65,20 @@ fn checkout_main(args: &[String]) -> ! {
         fail("usage: drop-launcher --checkout ROOT -- ARGV...");
     }
     let argv = &args[2..];
+    let evidence = engine_inputs::Snapshot::capture(&root)
+        .unwrap_or_else(|e| fail(&format!("checkout engine inventory: {e}")));
+    std::env::set_var("BL_CHECKOUT_SDK_INPUTS", &evidence.fingerprint);
     let cwd = std::env::current_dir().unwrap_or_else(|e| fail(&e.to_string()));
     let project = root_override(argv)
         .or_else(|| project_dir(&cwd))
         .unwrap_or_else(|| cwd.clone());
     let project = std::fs::canonicalize(project).unwrap_or_else(|e| fail(&e.to_string()));
     let extra_sources = checkout_extra_sources(&project, &request_cwd(&cwd, argv), argv);
-    let runtime = checkout_runtime_generation(&root)
+    let runtime = checkout_runtime_generation(&root, Some(&evidence))
         .unwrap_or_else(|e| fail(&format!("checkout runtime inventory: {e}")));
-    let sources = checkout_project_generation(&root, &project, &extra_sources)
+    let sources = checkout_project_generation(&root, &project, &extra_sources, Some(&evidence))
         .unwrap_or_else(|e| fail(&format!("checkout project inventory: {e}")));
+    evidence.verify().unwrap_or_else(|e| fail(&format!("checkout engine inventory: {e}")));
     std::env::set_var("BL_CHECKOUT_ROOT", &root);
     std::env::set_var("BL_CHECKOUT_GENERATION", runtime);
     std::env::set_var("BL_CHECKOUT_SOURCE_GENERATION", sources);
@@ -216,11 +220,11 @@ fn checkout_scope(command: Command) -> Command {
 fn checkout_generation(root: &Path, project: &Path) -> std::io::Result<String> {
     Ok(format!(
         "{}:{}",
-        checkout_runtime_generation(root)?,
+        checkout_runtime_generation(root, None)?,
         checkout_project_generation(
             root,
             project,
-            &checkout_extra_sources(project, project, &[])
+            &checkout_extra_sources(project, project, &[]), None
         )?
     ))
 }
@@ -269,7 +273,7 @@ fn checkout_extra_sources(project: &Path, cwd: &Path, argv: &[String]) -> Vec<Pa
     roots
 }
 
-fn checkout_runtime_generation(root: &Path) -> std::io::Result<String> {
+fn checkout_runtime_generation(root: &Path, evidence: Option<&engine_inputs::Snapshot>) -> std::io::Result<String> {
     let mut files = Vec::new();
     checkout_sources(&root.join("priv"), &mut files)?;
     checkout_sources(&root.join("native"), &mut files)?;
@@ -291,13 +295,14 @@ fn checkout_runtime_generation(root: &Path) -> std::io::Result<String> {
     if let Some(ebin) = std::env::var_os("BEAM_LISP_EBIN") {
         checkout_sources(&PathBuf::from(ebin), &mut files)?;
     }
-    checkout_hash_files(root, files)
+    checkout_hash_files(root, files, evidence)
 }
 
 fn checkout_project_generation(
     root: &Path,
     project: &Path,
     extra_sources: &[PathBuf],
+    evidence: Option<&engine_inputs::Snapshot>,
 ) -> std::io::Result<String> {
     let mut files = Vec::new();
     checkout_sources(project, &mut files)?;
@@ -310,10 +315,10 @@ fn checkout_project_generation(
     for path in extra_sources {
         checkout_sources(path, &mut files)?;
     }
-    checkout_hash_files(root, files)
+    checkout_hash_files(root, files, evidence)
 }
 
-fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>) -> std::io::Result<String> {
+fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>, evidence: Option<&engine_inputs::Snapshot>) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     files.sort();
     files.dedup();
@@ -344,16 +349,19 @@ fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>) -> std::io::Result<
         hash.update([0]);
     }
     for path in files {
-        let mut input = std::fs::File::open(&path)?;
-        let mut content = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        loop {
-            let count = std::io::Read::read(&mut input, &mut buffer)?;
-            if count == 0 {
-                break;
+        let digest = if let Some(digest) = evidence.and_then(|snapshot| snapshot.digest(&path)) {
+            *digest
+        } else {
+            let mut input = std::fs::File::open(&path)?;
+            let mut content = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = std::io::Read::read(&mut input, &mut buffer)?;
+                if count == 0 { break; }
+                content.update(&buffer[..count]);
             }
-            content.update(&buffer[..count]);
-        }
+            <[u8; 32]>::from(content.finalize())
+        };
         let canonical = std::fs::canonicalize(&path)?;
         let physical = canonical.as_os_str().as_encoded_bytes();
         hash.update((physical.len() as u64).to_be_bytes());
@@ -361,7 +369,7 @@ fn checkout_hash_files(root: &Path, mut files: Vec<PathBuf>) -> std::io::Result<
         let name = path.as_os_str().as_encoded_bytes();
         hash.update((name.len() as u64).to_be_bytes());
         hash.update(name);
-        hash.update(content.finalize());
+        hash.update(digest);
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -430,6 +438,75 @@ fn checkout_sources_walk(
 mod checkout_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn engine_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("checkout-engine-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("priv/generated")).unwrap();
+        std::fs::create_dir_all(root.join("nix")).unwrap();
+        std::fs::write(root.join("nix/engine-inputs.json"), r#"{
+            "version":1,"roots":["priv","nix"],"excluded":["priv/generated"],
+            "reserved":[".git","__pycache__"],"targetRoots":["priv"],
+            "limits":{"entries":100,"fileBytes":65536,"totalBytes":131072,"depth":10}
+        }"#).unwrap();
+        std::fs::write(root.join("priv/runtime.bl"), "runtime 1").unwrap();
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_engine_bytes_preserve_runtime_and_explicit_project_pins() {
+        let root = engine_fixture("pins");
+        let snapshot = engine_inputs::Snapshot::capture(&root).unwrap();
+        assert_eq!(checkout_runtime_generation(&root, None).unwrap(),
+                   checkout_runtime_generation(&root, Some(&snapshot)).unwrap());
+        assert_eq!(checkout_project_generation(&root, &root, &[root.join("priv")], None).unwrap(),
+                   checkout_project_generation(&root, &root, &[root.join("priv")], Some(&snapshot)).unwrap());
+        snapshot.verify().unwrap();
+        std::fs::write(root.join("priv/runtime.bl"), "runtime 2").unwrap();
+        assert!(snapshot.verify().is_err(), "a captured YES cannot survive a source edit");
+        assert_ne!(snapshot.fingerprint, engine_inputs::Snapshot::capture(&root).unwrap().fingerprint);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generated_and_external_bytes_still_have_independent_live_checks() {
+        let root = engine_fixture("generated");
+        let generated = root.join("priv/generated/code.beam");
+        std::fs::write(&generated, "generation 1").unwrap();
+        let snapshot = engine_inputs::Snapshot::capture(&root).unwrap();
+        assert!(snapshot.digest(&generated).is_none());
+        let before = checkout_runtime_generation(&root, Some(&snapshot)).unwrap();
+        std::fs::write(&generated, "generation 2").unwrap();
+        snapshot.verify().unwrap();
+        assert_ne!(before, checkout_runtime_generation(&root, Some(&snapshot)).unwrap());
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let external = project.join("external.bl");
+        std::fs::write(&external, "external 1").unwrap();
+        let before = checkout_project_generation(&root, &project, &[], Some(&snapshot)).unwrap();
+        std::fs::write(&external, "external 2").unwrap();
+        assert_ne!(before, checkout_project_generation(&root, &project, &[], Some(&snapshot)).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn engine_snapshot_refuses_symlinks_and_changed_policy_or_directory_membership() {
+        let root = engine_fixture("invalidation");
+        let snapshot = engine_inputs::Snapshot::capture(&root).unwrap();
+        std::fs::create_dir(root.join("priv/new-empty-directory")).unwrap();
+        assert!(snapshot.verify().is_err());
+        let snapshot = engine_inputs::Snapshot::capture(&root).unwrap();
+        std::fs::write(root.join("nix/engine-inputs.json"), "{}").unwrap();
+        assert!(snapshot.verify().is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        let root = engine_fixture("symlink");
+        std::os::unix::fs::symlink("runtime.bl", root.join("priv/link.bl")).unwrap();
+        assert!(engine_inputs::Snapshot::capture(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn declared_hidden_and_external_source_paths_are_inventoried() {
         let root = std::env::temp_dir().join(format!("checkout-paths-{}", std::process::id()));
@@ -457,24 +534,24 @@ mod checkout_tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(root.join("priv/runtime.bl"), "runtime 1").unwrap();
         std::fs::write(project.join("value.bl"), "value 1").unwrap();
-        let runtime = checkout_runtime_generation(&root).unwrap();
-        let sources = checkout_project_generation(&root, &project, &[]).unwrap();
+        let runtime = checkout_runtime_generation(&root, None).unwrap();
+        let sources = checkout_project_generation(&root, &project, &[], None).unwrap();
         std::fs::write(project.join("value.bl"), "value 2").unwrap();
-        assert_eq!(runtime, checkout_runtime_generation(&root).unwrap());
+        assert_eq!(runtime, checkout_runtime_generation(&root, None).unwrap());
         assert_ne!(
             sources,
-            checkout_project_generation(&root, &project, &[]).unwrap()
+            checkout_project_generation(&root, &project, &[], None).unwrap()
         );
-        let engine_sources = checkout_project_generation(&root, &root, &[]).unwrap();
+        let engine_sources = checkout_project_generation(&root, &root, &[], None).unwrap();
         std::fs::write(root.join("priv/runtime.bl"), "runtime 2").unwrap();
-        assert_ne!(runtime, checkout_runtime_generation(&root).unwrap());
+        assert_ne!(runtime, checkout_runtime_generation(&root, None).unwrap());
         assert_eq!(
             engine_sources,
-            checkout_project_generation(&root, &root, &[]).unwrap()
+            checkout_project_generation(&root, &root, &[], None).unwrap()
         );
-        let configured = checkout_runtime_generation(&root).unwrap();
+        let configured = checkout_runtime_generation(&root, None).unwrap();
         std::fs::write(root.join("env.bl"), "{:deps []}").unwrap();
-        assert_ne!(configured, checkout_runtime_generation(&root).unwrap());
+        assert_ne!(configured, checkout_runtime_generation(&root, None).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 

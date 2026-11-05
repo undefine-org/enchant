@@ -93,6 +93,8 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
         assert 'true' in run('analysis-stays-light', 'eval', analysis_lazy).splitlines()
         assert 'true' in run('unset-environment', 'eval',
                              '(println (nil? (System/get_env "BL_TRANSPORT_TEST_VALUE")))').splitlines()
+        assert owner('caller-cannot-supply-engine-pin',
+                     extra={'BL_CHECKOUT_SDK_INPUTS': '0' * 64}) == first
         for value in ['first-client', 'second-client']:
             output = run('environment-' + value, 'eval',
                          '(println (System/get_env "BL_TRANSPORT_TEST_VALUE"))',

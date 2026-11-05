@@ -12,7 +12,13 @@
   cargoLock.lockFile = root + "/Cargo.lock";
   cargoBuildFlags = [ "--bin" "drop-launcher" "--bin" "drop" ];
   doCheck = true;
+  nativeCheckInputs = [ pkgs.python3 ];
   cargoTestFlags = [ "--bin" "drop-launcher" "checkout_tests::" ];
+  postCheck = ''
+    python3 ${../test/scripts/test_engine_snapshot.py} \
+      --launcher target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/drop-launcher \
+      --reference ${../scripts/sdk-inputs}
+  '';
   installPhase = ''
     mkdir -p "$out/bin"
     for executable in drop-launcher drop; do

@@ -14,6 +14,7 @@ mod nix_artifact;
 include!("builder.rs");
 include!("hooks.rs");
 include!("checkout.rs");
+mod engine_inputs;
 mod command_domain;
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
@@ -616,6 +617,13 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Some(status) = command_domain::dispatch(&argv) {
         std::process::exit(status);
+    }
+    if argv.first().map(String::as_str) == Some("--engine-inputs") {
+        if argv.len() != 2 { fail("usage: --engine-inputs ROOT"); }
+        let snapshot = engine_inputs::Snapshot::capture(Path::new(&argv[1]))
+            .unwrap_or_else(|error| fail(&format!("checkout engine inventory: {error}")));
+        println!("{}", snapshot.fingerprint);
+        return;
     }
     if argv.first().map(String::as_str) == Some("--checkout-prerequisites") {
         checkout_prerequisites(&argv[1..]).unwrap_or_else(|error| fail(&error));
