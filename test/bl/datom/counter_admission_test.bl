@@ -1,0 +1,53 @@
+(ns datom.counter-admission-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.store :as s]
+           [datom.store-ets :as se] [datom.store-map :as sm] [datom.store-fjall :as fj]))
+
+(defn refusal [compute] (try (compute) nil (catch error (ex-data error))))
+
+(deftest every-transaction-path-refuses-damaged-counters-before-side-effects
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (doseq [[counter damage] [[:transaction :missing] [:transaction :regressed]
+                           [:transaction :stored-nil] [:entity :invalid-value]]]
+   (doseq [operation [:transact :bulk :excise :speculate]]
+    (let [st (open) c (d/connect-with st [])]
+     (try
+      (d/transact! c [[:db/add 42 :db/doc "retained"]])
+      (s/-put st conn/ENTITY-COUNTER-KEY 1000)
+      (let [basis (d/basis-t (d/db c))]
+       (case damage
+        :missing (s/-delete st conn/TX-COUNTER-KEY)
+        :regressed (s/-put st conn/TX-COUNTER-KEY (- basis 1))
+        :stored-nil (s/-put st conn/TX-COUNTER-KEY nil)
+        :invalid-value (s/-put st conn/ENTITY-COUNTER-KEY "private-counter-payload"))
+       (let [before (vec (s/-range st nil nil))
+             error (refusal #(case operation
+                     :transact (d/transact! c [[:db/add -1 :db/doc "new"]])
+                     :bulk (d/load-facts! c [[:db/add 43 :db/doc "new"]])
+                     :excise (d/excise! c [[:entity 42]])
+                     :speculate (d/with c [[:db/add -1 :db/doc "new"]])))]
+        (is (= :invalid-store-counter (:kind error)))
+        (is (= counter (:counter error)))
+        (is (not (String/contains? (pr-str error) "private-counter-payload")))
+        (is (= basis (d/basis-t (d/db c))))
+        (is (= before (vec (s/-range st nil nil))))))
+      (finally (d/close! c) (s/close st))))))))
+
+(deftest refusal-keeps-the-writer-usable-after-authoritative-metadata-is-restored
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (let [st (open) c (d/connect-with st [])]
+   (try
+    (d/transact! c [[:db/add 42 :db/doc "retained"]])
+    (s/-put st conn/ENTITY-COUNTER-KEY 1000)
+    (let [basis (d/basis-t (d/db c))]
+     (s/-delete st conn/TX-COUNTER-KEY)
+     (is (= :invalid-store-counter
+            (:kind (refusal #(d/transact! c [[:db/add -1 :db/doc "refused"]])))))
+     ;; The test restores a saved authoritative value; the runtime must never
+     ;; infer this from facts or silently repair missing metadata itself.
+     (s/-put st conn/TX-COUNTER-KEY basis)
+     (let [report (d/transact! c [[:db/add -1 :db/doc "accepted"]])]
+      (is (= (+ basis 1) (:tx report)))
+      (is (= 1001 (get (:tempids report) -1)))
+      (is (= #{["retained"] ["accepted"]}
+             (d/q '[:find ?v :where [_ :db/doc ?v]] (d/db c))))))
+    (finally (d/close! c) (s/close st))))))
