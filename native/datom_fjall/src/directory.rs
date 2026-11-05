@@ -4,46 +4,50 @@
 use super::{err, to_binary};
 use rustler::{Binary, Encoder, Env, NifResult, Resource, ResourceArc, Term};
 use std::ffi::CString;
+use std::collections::HashSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::{fs::{MetadataExt, OpenOptionsExt, DirBuilderExt}, ffi::OsStrExt};
+use std::os::unix::{fs::{MetadataExt, OpenOptionsExt, DirBuilderExt}};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 const MAX_META: usize = 16 * 1024 * 1024;
 const TEMP_PREFIX: &str = ".bl-copy-";
 
 fn failure(message: &'static str) -> std::io::Error { std::io::Error::other(message) }
-fn name(value: &str) -> std::io::Result<CString> {
+pub(crate) fn name(value: &str) -> std::io::Result<CString> {
     if value.is_empty() || value == "." || value == ".." || value.contains('/') || value.len() > 255 {
         return Err(failure("invalid directory entry name"));
     }
     CString::new(value).map_err(|_| failure("invalid directory entry name"))
 }
-fn identity(a: &Metadata, b: &Metadata) -> bool {
+pub(crate) fn identity(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino() && a.file_type() == b.file_type()
 }
 fn unchanged(a: &Metadata, b: &Metadata) -> bool {
     identity(a,b) && a.len() == b.len() && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
         && a.ctime() == b.ctime() && a.ctime_nsec() == b.ctime_nsec()
 }
-fn open_at(parent: &File, child: &str, flags: i32, mode: u32) -> std::io::Result<File> {
+pub(crate) fn open_at(parent: &File, child: &str, flags: i32, mode: u32) -> std::io::Result<File> {
     let child = name(child)?;
     let fd = unsafe { libc::openat(parent.as_raw_fd(), child.as_ptr(),
         flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, mode) };
     if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
 }
-fn pinned(parent: &File, child: &str) -> PathBuf {
+pub(crate) fn pinned(parent: &File, child: &str) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(child)
 }
-struct Root {
-    file: File, path: PathBuf, metadata: Metadata,
-    readonly: bool, closed: AtomicBool, write: Mutex<()>,
+pub(crate) struct Root {
+    pub(crate) file: File, pub(crate) path: PathBuf, metadata: Metadata,
+    readonly: bool, closed: AtomicBool, pub(crate) write: Mutex<()>,
+    pub(crate) sealed: Mutex<Option<PathBuf>>,
+    pub(crate) engines: Mutex<HashSet<PathBuf>>,
+    pub(crate) pins: AtomicUsize,
 }
 impl Root {
-    fn check(&self) -> std::io::Result<()> {
+    pub(crate) fn check(&self) -> std::io::Result<()> {
         if self.closed.load(Ordering::Acquire) { return Err(failure("directory claim closed")); }
         let observed = fs::symlink_metadata(&self.path)?;
         if !identity(&self.metadata, &observed) || (self.readonly && !unchanged(&self.metadata, &observed)) {
@@ -52,13 +56,13 @@ impl Root {
         Ok(())
     }
 }
-struct Directory {
-    file: File, path: PathBuf, metadata: Metadata, root: Arc<Root>,
+pub(crate) struct Directory {
+    pub(crate) file: File, pub(crate) path: PathBuf, pub(crate) metadata: Metadata, pub(crate) root: Arc<Root>,
     // Keep parent directory identity and optional child flock alive.
     parent: Option<Arc<Directory>>,
 }
 impl Directory {
-    fn check(&self) -> std::io::Result<()> {
+    pub(crate) fn check(&self) -> std::io::Result<()> {
         self.root.check()?;
         if let Some(parent) = &self.parent { parent.check()?; }
         let observed = fs::symlink_metadata(&self.path)?;
@@ -67,15 +71,22 @@ impl Directory {
         }
         Ok(())
     }
-    fn writable(&self) -> std::io::Result<()> {
+    pub(crate) fn writable(&self) -> std::io::Result<()> {
         self.check()?;
+        self.writable_path(&self.path)
+    }
+    fn writable_path(&self, path: &Path) -> std::io::Result<()> {
         if self.root.readonly { return Err(failure("sealed source is read-only")); }
+        let sealed = self.root.sealed.lock().map_err(|_| failure("sealed target lock poisoned"))?;
+        if sealed.as_ref().is_some_and(|frozen| path.starts_with(frozen)) {
+            return Err(failure("offline target is sealed"));
+        }
         Ok(())
     }
-    fn child(self: &Arc<Self>, child: &str, create: bool, lock: bool) -> std::io::Result<Arc<Self>> {
+    pub(crate) fn child(self: &Arc<Self>, child: &str, create: bool, lock: bool) -> std::io::Result<Arc<Self>> {
         self.check()?; let cname = name(child)?;
         if create {
-            self.writable()?;
+            self.writable()?; self.writable_path(&self.path.join(child))?;
             let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), 0o700) };
             if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(std::io::Error::last_os_error());
@@ -109,7 +120,7 @@ impl Resource for DirectoryHandle {}
 
 /// A private job capability is minted only from its already claimed directory
 /// and an exact durable marker. A path or a copied BL record cannot mint it.
-struct OfflineScope { directory: Arc<Directory>, marker: Reader }
+pub(crate) struct OfflineScope { pub(crate) directory: Arc<Directory>, pub(crate) marker: Reader }
 #[rustler::resource_impl]
 impl Resource for OfflineScope {}
 
@@ -120,7 +131,7 @@ impl OfflineAccess {
     pub(crate) fn write_guard(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
         let guard = self.scope.directory.root.write.lock().map_err(|_| failure("offline job writer lock poisoned"))?;
         self.scope.marker.check()?;
-        self.directory.check()?;
+        self.directory.writable()?;
         if self.readonly { return Err(failure("offline extraction is logically read-only")); }
         Ok(guard)
     }
@@ -181,8 +192,13 @@ fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relati
         }
         directory = directory.child(part, create, false).map_err(err)?;
     }
+    directory.writable().map_err(err)?;
+    if scope.directory.root.engines.lock().map_err(err)?.len() >= 65536 {
+        return Err(err("offline engine inventory bound exceeded"));
+    }
     let claim = super::claim_store_mode(&directory.path, !create)
         .map_err(|_| err("offline engine claim or supported reader refused"))?;
+    scope.directory.root.engines.lock().map_err(err)?.insert(directory.path.clone());
     let handle = super::DbHandle {
         path: directory.path.clone(), keyspace: claim.engine.keyspace.clone(),
         datoms: claim.engine.datoms.clone(), lock: claim.engine.lock.clone(), _claim: claim,
@@ -193,9 +209,9 @@ fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relati
     Ok((ResourceArc::new(handle), path).encode(env))
 }
 
-struct Reader { parent: Arc<Directory>, name: String, metadata: Metadata, file: File, offset: u64 }
+pub(crate) struct Reader { parent: Arc<Directory>, name: String, metadata: Metadata, file: File, offset: u64 }
 impl Reader {
-    fn check(&self) -> std::io::Result<()> {
+    pub(crate) fn check(&self) -> std::io::Result<()> {
         self.parent.check()?;
         if !unchanged(&self.metadata, &self.file.metadata()?)
             || !unchanged(&self.metadata, &fs::symlink_metadata(pinned(&self.parent.file, &self.name))?) {
@@ -229,7 +245,8 @@ fn claim(path: &Path, readonly: bool, create: bool) -> std::io::Result<Arc<Direc
     if !identity(&metadata, &fs::symlink_metadata(path)?) { return Err(failure("directory identity changed")); }
     file.try_lock().map_err(std::io::Error::other)?;
     let root = Arc::new(Root { file: file.try_clone()?, path: path.into(), metadata: metadata.clone(),
-        readonly, closed: AtomicBool::new(false), write: Mutex::new(()) });
+        readonly, closed: AtomicBool::new(false), write: Mutex::new(()),
+        sealed: Mutex::new(None), engines: Mutex::new(HashSet::new()), pins: AtomicUsize::new(0) });
     Ok(Arc::new(Directory { file, path: path.into(), metadata, root, parent: None }))
 }
 
@@ -241,11 +258,15 @@ fn fjall_directory_open(path: String, readonly: bool, create: bool) -> NifResult
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_directory_child(parent: ResourceArc<DirectoryHandle>, name: String, create: bool, lock: bool)
  -> NifResult<ResourceArc<DirectoryHandle>> {
+    let _guard = parent.0.root.write.lock().map_err(err)?;
     Ok(ResourceArc::new(DirectoryHandle(parent.0.child(&name, create, lock).map_err(err)?)))
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_directory_close(handle: ResourceArc<DirectoryHandle>) -> NifResult<bool> {
     let _write = handle.0.root.write.lock().map_err(err)?;
+    if handle.0.root.pins.load(Ordering::Acquire) != 0 {
+        return Err(err("sealed or accepted publication still owns this job"));
+    }
     let observed = handle.0.check();
     if !handle.0.root.closed.swap(true, Ordering::AcqRel) { handle.0.root.file.unlock().map_err(err)?; }
     observed.map_err(err)?;
@@ -302,7 +323,7 @@ fn temporary(parent: &Directory) -> std::io::Result<(File, Temporary<'_>)> {
     }
 }
 fn rename(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -> std::io::Result<()> {
-    parent.writable()?;
+    parent.writable()?; parent.writable_path(&parent.path.join(target))?;
     let from = name(temporary)?; let to = name(target)?;
     let flags = if no_replace { libc::RENAME_NOREPLACE } else { 0 };
     if unsafe { libc::renameat2(parent.file.as_raw_fd(), from.as_ptr(), parent.file.as_raw_fd(), to.as_ptr(), flags) } < 0 {
@@ -316,6 +337,7 @@ fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, exp
     if value.len() > MAX_META || expected.as_ref().is_some_and(|v| v.len() > MAX_META) { return Err(err("metadata byte bound exceeded")); }
     let _write = handle.0.root.write.lock().map_err(err)?;
     handle.0.writable().map_err(err)?; name(&target).map_err(err)?;
+    handle.0.writable_path(&handle.0.path.join(&target)).map_err(err)?;
     let old = match handle.0.open_file(&target) {
         Ok(mut reader) => {
             if reader.metadata.len() > MAX_META as u64 { return Err(err("metadata byte bound exceeded")); }
@@ -336,7 +358,8 @@ fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, exp
 fn fjall_directory_copy(source: ResourceArc<DirectoryHandle>, from: String, destination: ResourceArc<DirectoryHandle>, to: String)
  -> NifResult<bool> {
     let _write = destination.0.root.write.lock().map_err(err)?;
-    destination.0.writable().map_err(err)?;
+    destination.0.writable().map_err(err)?; name(&to).map_err(err)?;
+    destination.0.writable_path(&destination.0.path.join(&to)).map_err(err)?;
     let mut source_file = source.0.open_file(&from).map_err(err)?;
     match destination.0.open_file(&to) {
         Ok(mut existing) => {

@@ -169,7 +169,7 @@ fn fjall_checkpoint_step(artifact: ResourceArc<Artifact>, rows: usize, max_bytes
 }
 
 #[cfg(target_os = "linux")]
-fn sync_tree_handle(path: &Path, directory: &File) -> std::io::Result<()> {
+pub(crate) fn sync_tree_handle(path: &Path, directory: &File) -> std::io::Result<()> {
     sync_tree_handle_depth(path, directory, 0)
 }
 #[cfg(target_os = "linux")]
@@ -226,12 +226,21 @@ fn sync_tree(path: &Path) -> std::io::Result<()> {
     { let _ = path; Err(std::io::Error::other("safe directory sync requires Linux")) }
 }
 #[cfg(target_os = "linux")]
-fn publish_no_clobber(stage: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let stage = std::ffi::CString::new(stage.as_os_str().as_bytes())?;
-    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
-    let result = unsafe { libc::renameat2(libc::AT_FDCWD, stage.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_NOREPLACE) };
+pub(crate) fn publish_no_clobber_at(source_parent: &File, source: &str, destination_parent: &File, destination: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let source = super::directory::name(source)?;
+    let destination = super::directory::name(destination)?;
+    let result = unsafe { libc::renameat2(source_parent.as_raw_fd(), source.as_ptr(),
+        destination_parent.as_raw_fd(), destination.as_ptr(), libc::RENAME_NOREPLACE) };
     if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+#[cfg(target_os = "linux")]
+fn publish_no_clobber(stage: &Path, destination: &Path) -> std::io::Result<()> {
+    let source_parent = File::open(stage.parent().ok_or_else(|| std::io::Error::other("stage parent missing"))?)?;
+    let destination_parent = File::open(destination.parent().ok_or_else(|| std::io::Error::other("destination parent missing"))?)?;
+    let source = stage.file_name().and_then(|v| v.to_str()).ok_or_else(|| std::io::Error::other("invalid stage name"))?;
+    let destination = destination.file_name().and_then(|v| v.to_str()).ok_or_else(|| std::io::Error::other("invalid destination name"))?;
+    publish_no_clobber_at(&source_parent, source, &destination_parent, destination)
 }
 #[cfg(not(target_os = "linux"))]
 fn publish_no_clobber(_stage: &Path, _destination: &Path) -> std::io::Result<()> {

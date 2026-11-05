@@ -1,0 +1,105 @@
+(ns datom.offline-seal-test
+ (:require [datom.offline.seal :as seal] [datom.offline.engine :as engine]
+           [datom.offline.fs :as fs] [datom.offline.layout :as l]
+           [datom.store-fjall :as fj] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}]
+           :files ["config.json"] :directories []})
+(def marker (erlang/term_to_binary {:version 1 :job (l/digest :seal-fixture)}))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn close [root] (try (fs/close! root) (catch _ nil)))
+(defn release [value] (when value (try (seal/release! value) (catch _ nil))))
+(defn fixture []
+ (let [parent (s/fresh-path ".offline-seal-parent") _ (File/mkdir_p! parent)
+       root (fs/claim! (str parent "/job") {:create true})
+       target (fs/child! root "target" {:create true}) source (fj/open-fresh)]
+  (try
+   (s/-put source "key" :original)
+   (s/checkpoint! source (str (:path target) "/control.fjall"))
+   (fs/put! target "config.json" nil "{\"fixture\":true}")
+   (fs/put! root ".bl-offline-job" nil marker)
+   {:root root :target target :scope (engine/scope! root marker) :destination (str parent "/generation")}
+   (finally (s/close source)))))
+
+(deftest sealed-target-rejects-native-writes-and-pins-job-custody
+ (let [{:keys [root target scope]} (fixture) sealed (seal/target! scope spec)]
+  (try
+   (let [before (fs/tree-digest target)]
+    (is (= :offline-filesystem-refused (kind #(fs/put! target "new" nil "changed"))))
+    (is (= :offline-filesystem-refused (kind #(fs/child! target "new" {:create true}))))
+    (is (= :offline-filesystem-refused (kind #(fs/child! root "target" {:create true}))))
+    (is (= :offline-filesystem-refused (kind #(fs/copy! root ".bl-offline-job" target "copied"))))
+    (is (= :offline-engine-refused (kind #(engine/open! scope "target/control.fjall"))))
+    (is (= :offline-engine-refused (kind #(engine/open! scope "target/new" {:create true}))))
+    (is (= before (fs/tree-digest target)))
+    (is (= :offline-filesystem-refused (kind #(fs/close! root))))
+    (is (= :offline-filesystem-refused (kind #(fs/claim! (:path root)))))
+    (is (= before (fs/tree-digest target))))
+   (seal/release! sealed)
+   (is (= :offline-filesystem-refused (kind #(fs/put! target "new" nil "changed"))))
+   (finally (release sealed) (close root)))))
+
+(deftest live-or-omitted-native-engines-prevent-sealing-without-poisoning-the-job
+ (doseq [role [:declared :omitted]]
+  (let [{:keys [root target scope]} (fixture)
+        live (if (= role :declared) (engine/open! scope "target/control.fjall")
+               (engine/open! scope "target/extra.fjall" {:create true}))]
+   (try
+    (is (= :offline-sealed-publication-refused (kind #(seal/target! scope spec))))
+    (is (fs/put! target "after-refusal" nil "writable private target"))
+    (s/-put live "probe" :still-owned)
+    (is (= :still-owned (s/-get live "probe")))
+    (finally (s/close live) (close root))))))
+
+(deftest sealed-publication-is-no-clobber-and-repeated-same-path-reconciles
+ (let [{:keys [root target scope destination]} (fixture) sealed (seal/target! scope spec)]
+  (try
+   (let [before (fs/tree-digest target)]
+    (is (= destination (seal/publish! sealed destination)))
+    (is (not (File/exists? (:path target))))
+    (is (= destination (seal/publish! sealed destination)))
+    (is (= :offline-sealed-publication-refused
+           (kind #(seal/publish! sealed (str destination "-different")))))
+    (is (= :offline-filesystem-refused (kind #(fs/claim! destination))))
+    ;; The retired spelling remains reserved, even though its directory moved.
+    (is (= :offline-filesystem-refused (kind #(fs/child! root "target" {:create true}))))
+    (is (= :offline-filesystem-refused (kind #(fs/put! root "target" nil "replacement"))))
+    (is (= :offline-filesystem-refused (kind #(fs/copy! root ".bl-offline-job" root "target"))))
+    (is (= :offline-engine-refused (kind #(engine/open! scope "target/new" {:create true}))))
+    (is (not (File/exists? (:path target))))
+    (seal/release! sealed)
+    (let [published (fs/claim! destination {:readonly true})]
+     (try (is (= before (fs/tree-digest published))) (finally (close published)))))
+   (finally (release sealed) (close root)))))
+
+(deftest conflicting-publication-preserves-both-generations
+ (let [{:keys [root target scope destination]} (fixture) sealed (seal/target! scope spec)]
+  (File/mkdir_p! destination) (File/write! (str destination "/sentinel") "existing generation")
+  (try
+   (let [before (fs/tree-digest target)]
+    (is (= :offline-sealed-publication-refused (kind #(seal/publish! sealed destination))))
+    (is (= "existing generation" (File/read! (str destination "/sentinel"))))
+    (is (= before (fs/tree-digest target))))
+   (finally (release sealed) (close root)))))
+
+(deftest accepted-publisher-outlives-its-submitter-and-keeps-exact-reply-tags
+ (let [{:keys [root target scope destination]} (fixture) sealed (seal/target! scope spec)
+       parent (erlang/self) tag (erlang/make_ref) unrelated (erlang/make_ref)]
+  (try
+   (let [before (fs/tree-digest target)
+         submitted (erlang/spawn (fn []
+                     (erlang/send parent [:accepted
+                       (BeamLisp.Native.Datom.StoreFjall/fjall_offline_publish sealed destination parent tag)])))]
+    (erlang/send parent [unrelated :unrelated-message])
+    (receive [:accepted value] (is (= :accepted value)) (after 10000 (is false)))
+    (receive [reply-tag value] :when (= reply-tag tag)
+     (is (= destination value)) (after 30000 (is false)))
+    (loop [left 100]
+     (when (and (pos? left) (Process/alive? submitted)) (Process/sleep 1) (recur (dec left))))
+    (is (not (Process/alive? submitted)))
+    (receive [reply-tag value] :when (= reply-tag unrelated)
+     (is (= :unrelated-message value)) (after 1000 (is false)))
+    (seal/release! sealed)
+    (let [published (fs/claim! destination {:readonly true})]
+     (try (is (= before (fs/tree-digest published))) (finally (close published)))))
+   (finally (release sealed) (close root)))))
