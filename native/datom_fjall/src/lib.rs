@@ -131,6 +131,9 @@ pub(crate) struct DbHandle {
     /// lives inside `StoreClaim`, whose `engine` field precedes its `_lock`
     /// (see RELEASE ORDER there).
     _claim: Arc<StoreClaim>,
+    // Keep the job claim alive THROUGH the engine claim and refuse writes
+    // from extraction handles even through direct native calls.
+    _offline: Option<directory::OfflineAccess>,
 }
 
 /// The one open engine over a store directory, shared by every handle in this
@@ -284,6 +287,11 @@ enum ClaimError {
 /// begun writing segments it must not touch. A flock taken and then abandoned
 /// by a failed open is released when its `File` drops.
 fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
+    refuse_offline_path(path).map_err(ClaimError::Io)?;
+    claim_store_mode(path, false)
+}
+
+fn claim_store_mode(path: &Path, existing_only: bool) -> Result<Arc<StoreClaim>, ClaimError> {
     // The directory must exist to be canonicalized and opened. fjall creates
     // it too, later, when it is already ours.
     fs::create_dir_all(path).map_err(ClaimError::Io)?;
@@ -307,7 +315,11 @@ fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
             Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
             Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
         }
+        if existing_only { require_existing_engine(&canon).map_err(ClaimError::Io)?; }
         let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
+        if existing_only && !keyspace.partition_exists("datoms") {
+            return Err(ClaimError::Io(std::io::Error::other("captured datoms partition missing")));
+        }
         let datoms = keyspace
             .open_partition("datoms", PartitionCreateOptions::default())
             .map_err(ClaimError::Engine)?;
@@ -328,6 +340,73 @@ fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
 
 #[rustler::resource_impl]
 impl Resource for DbHandle {}
+
+impl DbHandle {
+    fn offline_write_guard(&self) -> NifResult<Option<std::sync::MutexGuard<'_, ()>>> {
+        self._offline.as_ref().map(|scope| scope.write_guard()).transpose().map_err(err)
+    }
+    fn offline_read_admit(&self) -> NifResult<()> {
+        self._offline.as_ref().map(|scope| scope.check_live()).transpose().map_err(err)?;
+        Ok(())
+    }
+}
+
+/// Refuse before mkdir/canonicalization can modify a private migration tree.
+/// Resolve the nearest existing ancestor so symlink aliases meet the same
+/// persistent marker, including after the coordinator process has died.
+fn refuse_offline_path(path: &Path) -> std::io::Result<()> {
+    let mut existing = path.to_path_buf();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !existing.pop() { existing = PathBuf::from("."); break; }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let canonical = fs::canonicalize(existing)?;
+    for ancestor in canonical.ancestors() {
+        match fs::symlink_metadata(ancestor.join(".bl-offline-job")) {
+            Ok(_) => return Err(std::io::Error::other("private offline job requires its native capability")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fjall 2.11's documented physical reader contract. Config::open creates a
+/// new engine when `version` is absent and recovery deletes uninitialized
+/// partitions. Reject those cases BEFORE opening the disposable extraction.
+fn require_existing_engine(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for name in ["version", "partitions/datoms/manifest", "partitions/datoms/config"] {
+        let metadata = fs::symlink_metadata(path.join(name))?;
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() == 0 {
+            return Err(std::io::Error::other("unsupported captured engine file"));
+        }
+    }
+    if fs::read(path.join("version"))? != b"FJL\x02" {
+        return Err(std::io::Error::other("unsupported physical engine version"));
+    }
+    for name in ["journals", "partitions", "partitions/datoms"] {
+        if !fs::symlink_metadata(path.join(name))?.is_dir() {
+            return Err(std::io::Error::other("unsupported captured engine directory"));
+        }
+    }
+    for entry in fs::read_dir(path.join("partitions"))? {
+        if entry?.file_name() != "datoms" {
+            return Err(std::io::Error::other("unsupported extra captured partition"));
+        }
+    }
+    match fs::symlink_metadata(path.join("partitions/datoms/.deleted")) {
+        Ok(_) => return Err(std::io::Error::other("captured datoms partition is deleted")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
 
 pub(crate) fn err(msg: impl std::fmt::Display) -> Error {
     Error::Term(Box::new(format!("{}", msg)))
@@ -377,6 +456,7 @@ fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
         datoms: claim.engine.datoms.clone(),
         lock: claim.engine.lock.clone(),
         _claim: claim,
+        _offline: None,
     });
     Ok(arc.encode(env))
 }
@@ -407,6 +487,7 @@ fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 #[rustler::nif]
 fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
+    refuse_offline_path(p).map_err(err)?;
     fs::create_dir_all(p).map_err(|e| err(e))?;
     let canon = fs::canonicalize(p).map_err(|e| err(e))?;
     Ok(to_binary(env, canon.to_string_lossy().as_bytes())?.to_term(env))
@@ -415,6 +496,7 @@ fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 /// `-get`: the value at `key`, or `nil`.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_get<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     match handle.datoms.get(key.as_slice()).map_err(|e| err(e))? {
         Some(v) => Ok(to_binary(env, &v)?.to_term(env)),
         None => Ok(atoms::nil().to_term(env)),
@@ -435,6 +517,7 @@ fn fjall_range<'a>(
     start: Option<Binary>,
     stop: Option<Binary>,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     use std::ops::Bound;
     let lower = match &start {
         Some(b) => Bound::Included(b.as_slice().to_vec()),
@@ -486,6 +569,7 @@ fn fjall_range_chunk<'a>(
     stop: Option<Binary>,
     limit: usize,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     use std::ops::Bound;
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
@@ -517,6 +601,7 @@ fn fjall_raw_page<'a>(
     env: Env<'a>, handle: ResourceArc<DbHandle>, start: Option<Binary>,
     after: Option<Binary>, stop: Option<Binary>, rows: usize, max_bytes: usize,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     use std::ops::Bound::{Excluded, Included, Unbounded};
     if rows == 0 || rows > 4096 || max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
         return Err(err("invalid raw page bounds"));
@@ -576,6 +661,7 @@ fn fjall_count_range<'a>(
     stop: Option<Binary>,
     limit: usize,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     use std::ops::Bound;
     let lower = match &start {
         Some(b) => Bound::Included(b.as_slice().to_vec()),
@@ -1203,6 +1289,7 @@ fn fjall_resolve_chunk<'a>(
     limit: usize,
     mode: Term<'a>,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     use std::ops::Bound;
     let (mode, byte_budget) = match mode.decode::<Atom>() {
         Ok(atom) => (atom, None),
@@ -1374,6 +1461,7 @@ fn fjall_resolve_prefixes<'a>(
     handle: ResourceArc<DbHandle>,
     bounds: Vec<(Binary, Binary)>,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     resolve_prefixes_impl(env, handle, bounds, false)
 }
 
@@ -1385,6 +1473,7 @@ fn fjall_resolve_prefixes_data<'a>(
     handle: ResourceArc<DbHandle>,
     bounds: Vec<(Binary, Binary)>,
 ) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     resolve_prefixes_impl(env, handle, bounds, true)
 }
 
@@ -1425,6 +1514,7 @@ fn resolve_prefixes_impl<'a>(
 /// The keyspace also persists `SyncAll` on drop, so a clean shutdown is durable.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifResult<Atom> {
+    let _offline = handle.offline_write_guard()?;
     let _g = handle.lock.lock().map_err(|e| err(e))?;
     handle
         .datoms
@@ -1437,6 +1527,7 @@ fn fjall_put(handle: ResourceArc<DbHandle>, key: Binary, value: Binary) -> NifRe
 /// `fjall_put` and `fjall_sync`.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
+    let _offline = handle.offline_write_guard()?;
     let _g = handle.lock.lock().map_err(|e| err(e))?;
     handle.datoms.remove(key.as_slice()).map_err(|e| err(e))?;
     Ok(atoms::ok())
@@ -1460,6 +1551,7 @@ fn fjall_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
 /// Cheap and side-effect free: it reads atomics the engine already maintains.
 #[rustler::nif]
 fn fjall_stats<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>) -> NifResult<Term<'a>> {
+    handle.offline_read_admit()?;
     let ks = &handle.keyspace;
     let m = map_new(env)
         .map_put(atoms::cache_capacity(), ks.cache_capacity())?
@@ -1477,6 +1569,7 @@ fn fjall_stats<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>) -> NifResult<Ter
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_sync(handle: ResourceArc<DbHandle>) -> NifResult<Atom> {
+    handle.offline_read_admit()?;
     let _g = handle.lock.lock().map_err(|e| err(e))?;
     handle
         .keyspace
@@ -1501,6 +1594,7 @@ fn fjall_cas<'a>(
     expected: Option<Binary>,
     new: Binary,
 ) -> NifResult<Term<'a>> {
+    let _offline = handle.offline_write_guard()?;
     let _g = handle.lock.lock().map_err(|e| err(e))?;
 
     let current: Option<Vec<u8>> = handle
@@ -1540,6 +1634,7 @@ fn fjall_cas<'a>(
 /// atomic: everything becomes durable at `commit()`, or none of it does.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_commit(handle: ResourceArc<DbHandle>, ops: Vec<Term>) -> NifResult<Atom> {
+    let _offline = handle.offline_write_guard()?;
     let _g = handle.lock.lock().map_err(|e| err(e))?;
     let mut batch = handle.keyspace.batch();
 

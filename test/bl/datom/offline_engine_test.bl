@@ -1,0 +1,94 @@
+(ns datom.offline-engine-test
+ (:require [datom.offline.engine :as engine] [datom.offline.fs :as fs]
+           [datom.offline.layout :as l] [datom.store-fjall :as fj] [datom.store :as s]))
+(def marker (erlang/term_to_binary {:version 1 :job (l/digest :fixture-job)}))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn native-refused? [value]
+ (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0))))
+(defn fixture []
+ (let [source (fj/open-fresh) root (fs/claim! (s/fresh-path ".offline-engine") {:create true})]
+  (try
+   (s/-put source "key" :original)
+   (fs/child! root "extract" {:create true})
+   (s/checkpoint! source (str (:path root) "/extract/control"))
+   (fs/put! root ".bl-offline-job" nil marker)
+   {:root root :scope (engine/scope! root marker)}
+   (finally (s/close source)))))
+
+(deftest extraction-handles-refuse-all-logical-mutations-at-the-native-boundary
+ (let [{:keys [root scope]} (fixture) source (engine/open! scope "extract/control")]
+  (try
+   (is (= :original (s/-get source "key")))
+   (let [destination (s/fresh-path ".unscoped-export")]
+    (is (try (s/checkpoint! source destination) false (catch _ true)))
+    (is (not (File/exists? destination))))
+   (let [raw (fj/raw-get source "key") before (:entries (fj/raw-page source nil))]
+    (doseq [mutate [#(s/-put source "key" :changed) #(s/-delete source "key")
+                    #(s/-update source "key" (fn [_] :changed))
+                    #(s/-commit source [[:put "other" :changed]])
+                    #(fj/commit-raw! source [[:put "other" raw]])]]
+     (is (= :native-store-operation-failed (kind mutate)))
+     (is (= before (:entries (fj/raw-page source nil)))))
+    (doseq [result [(BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle source) "key" raw)
+                    (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle source) "key")
+                    (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle source) "key" raw raw)
+                    (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle source) (list (tuple :delete "key")))]]
+     (is (native-refused? result)))
+    (is (= before (:entries (fj/raw-page source nil)))))
+   (finally (s/close source) (fs/close! root)))))
+
+(deftest targets-are-explicitly-created-and-reopened-without-overwriting
+ (let [{:keys [root scope]} (fixture) target (engine/open! scope "target/control" {:create true})]
+  (try
+   (s/-put target "key" :prepared) (fj/sync! target)
+   (is (= :prepared (s/-get target "key")))
+   (is (= :offline-engine-refused (kind #(engine/open! scope "target/control" {:create true}))))
+   (let [again (engine/open! scope "target/control")]
+    (try (is (= :prepared (s/-get again "key"))) (s/-put again "other" 42)
+     (is (= 42 (s/-get target "other"))) (finally (s/close again))))
+   (is (= :offline-engine-refused (kind #(engine/open! scope "extract/new" {:create true}))))
+   (is (not (File/exists? (str (:path root) "/extract/new"))))
+   (is (= :offline-engine-refused (kind #(engine/open! scope "other/new" {:create true}))))
+   (is (= :offline-invalid-relative-path (kind #(engine/open! scope "target/../escape" {:create true}))))
+   (is (not (File/exists? (str (:path root) "/escape"))))
+   (finally (s/close target) (fs/close! root)))))
+
+(deftest ordinary-opens-and-aliases-refuse-the-persistent-private-job-marker
+ (let [{:keys [root scope]} (fixture) alias (str (:path root) ".alias")]
+  (try
+   (File/ln_s! (:path root) alias)
+   (doseq [path [(str (:path root) "/extract/control") (str (:path root) "/target/unclassified")
+                 (str alias "/scratch/escaped")]]
+    (is (try (fj/open path) false (catch _ true))))
+   (is (not (File/exists? (str (:path root) "/target"))))
+   (is (not (File/exists? (str (:path root) "/scratch"))))
+   (is (= :offline-engine-refused (kind #(engine/scope! root "wrong job"))))
+   (File/write! (str (:path root) "/.bl-generation") "protected")
+   (is (= :offline-engine-refused (kind #(engine/scope! root marker))))
+   (finally (fs/close! root)))))
+
+(deftest missing-or-incomplete-engine-layout-never-becomes-an-empty-extraction
+ (doseq [damage [:missing-version :missing-partition :deleted]]
+  (let [{:keys [root scope]} (fixture) path (str (:path root) "/extract/control")]
+   (case damage
+    :missing-version (File/rm! (str path "/version"))
+    :missing-partition (File/rm! (str path "/partitions/datoms/manifest"))
+    :deleted (File/write! (str path "/partitions/datoms/.deleted") "deleted"))
+   (try
+    (let [before (fs/tree-digest root)]
+     (is (= :offline-engine-refused (kind #(engine/open! scope "extract/control"))))
+     (is (= before (fs/tree-digest root))))
+    (finally (fs/close! root))))))
+
+(deftest changed-or-closed-job-claims-invalidate-existing-writers
+ (let [{:keys [root scope]} (fixture) target (engine/open! scope "target/control" {:create true})]
+  (try
+   (s/-put target "key" :prepared)
+   (is (fs/put! root ".bl-offline-job" marker "different job"))
+   (is (= :native-store-operation-failed (kind #(s/-put target "key" :changed))))
+   (is (= :prepared (s/-get target "key")))
+   (fs/close! root)
+   (is (= :native-store-operation-failed (kind #(s/-put target "key" :changed))))
+   (is (= :native-store-operation-failed (kind #(s/-get target "key"))))
+   (is (= :offline-engine-refused (kind #(engine/open! scope "scratch/new" {:create true}))))
+   (finally (try (s/close target) (catch _ nil))))))

@@ -54,6 +54,8 @@
 ;; so internal backend execution is never mistaken for a Source-supplied handle.
 (defnative "datom_fjall"
   (fjall-open 1)
+  (fjall-offline-scope 2)
+  (fjall-offline-open 3)
   (fjall-directory-open 3)
   (fjall-directory-child 4)
   (fjall-directory-close 1)
@@ -407,11 +409,18 @@
   []
   (try (vm.native/available? "datom.store-fjall") (catch _ false)))
 
+;; Native refusals are returned error tuples. A write that was refused must
+;; never return its store as though publication succeeded.
+(defn- native-result! [result]
+ (when (and (erlang/is_tuple result) (= 2 (erlang/tuple_size result)) (= :error (elem result 0)))
+  (throw (ex-info "Native store operation refused" {:kind :native-store-operation-failed})))
+ result)
+
 (extend-type FjallStore
   datom.store/Store
 
   (-get [store k]
-    (decode-value (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) k)))
+    (decode-value (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) k))))
 
   (-range [store lo hi]
     ; Bounds INCLUSIVE on both sides, as the port specifies (the NIF uses
@@ -448,13 +457,13 @@
   (-put [store k v]
     (native-mutation-admit! store)
     (let [encoded (encode-value v) answer (native-mutation store :fjall-put [k encoded])]
-     (when (= :legacy answer) (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) k encoded)))
+     (when (= :legacy answer) (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_put (:handle store) k encoded))))
     store)
 
   (-delete [store k]
     (native-mutation-admit! store)
     (when (= :legacy (native-mutation store :fjall-delete [k]))
-     (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle store) k))
+     (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_delete (:handle store) k)))
     store)
 
   (-update [store k f]
@@ -468,11 +477,11 @@
     (native-mutation-admit! store)
     (loop [attempt 0]
       (let [_ (native-mutation-admit! store)
-            raw (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) k)
+            raw (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) k))
             next (native-update-callback #(f (decode-value raw)))
             encoded (encode-value next)
             accepted (native-mutation store :fjall-cas [k raw encoded])
-            result (if (= :legacy accepted) (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle store) k raw encoded) (second accepted))]
+            result (if (= :legacy accepted) (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_cas (:handle store) k raw encoded)) (second accepted))]
         (if (erlang/element 1 result)
           [store next]
           (do (if (> attempt 8) (erlang/yield) nil)
@@ -490,8 +499,8 @@
                            [:delete (get op 1)]))) ops)
           answer (native-mutation store :fjall-commit [encoded])]
      (when (= :legacy answer)
-      (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store)
-       (to-list (mapv #(erlang/list_to_tuple (to-list %)) encoded)))))
+      (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store)
+       (to-list (mapv #(erlang/list_to_tuple (to-list %)) encoded))))))
     store))
 
 ;; fjall is a DIRECTORY keyspace (segment files), not a single file; `.fjall`
@@ -521,7 +530,7 @@
 (extend-protocol datom.store/Closeable
   FjallStore
   (-close [store]
-   (when (= :legacy (native-mutation store :fjall-sync [])) (BeamLisp.Native.Datom.StoreFjall/fjall_sync (:handle store))) nil))
+   (when (= :legacy (native-mutation store :fjall-sync [])) (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_sync (:handle store)))) nil))
 
 (defn open-fresh
   "Open a fjall store at a fresh unique path. The engine owns its naming
@@ -535,7 +544,7 @@
    dominant bulk-load cost. Call this once at a durability boundary (end of a
    transaction or a bulk load) to turn N per-group fsyncs into one."
   [store]
-  (when (= :legacy (native-mutation store :fjall-sync [])) (BeamLisp.Native.Datom.StoreFjall/fjall_sync (:handle store)))
+  (when (= :legacy (native-mutation store :fjall-sync [])) (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_sync (:handle store))))
   store)
 
 (extend-protocol datom.store/Durable
@@ -613,7 +622,7 @@
  "Exact persisted slot bytes, or nil. Offline tools must not open a sealed
   original engine: use a disposable working copy of a captured generation."
  [store key]
- (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) key))
+ (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_get (:handle store) key)))
 
 (defn raw-page
  "Bounded, ordered raw KV page. Cursor is the last key (exclusive on resume).
@@ -645,5 +654,5 @@
   (when (or (> (count ops) 16384) (> size 16777216))
    (throw (ex-info "Raw store batch exceeds its bound" {:kind :raw-store-batch-too-large})))
   (when (= :legacy (native-mutation store :fjall-commit [(to-list ops)]))
-   (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store) (to-list ops)))
+   (native-result! (BeamLisp.Native.Datom.StoreFjall/fjall_commit (:handle store) (to-list ops))))
   store))

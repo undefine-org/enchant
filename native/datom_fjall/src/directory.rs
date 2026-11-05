@@ -107,6 +107,92 @@ struct DirectoryHandle(Arc<Directory>);
 #[rustler::resource_impl]
 impl Resource for DirectoryHandle {}
 
+/// A private job capability is minted only from its already claimed directory
+/// and an exact durable marker. A path or a copied BL record cannot mint it.
+struct OfflineScope { directory: Arc<Directory>, marker: Reader }
+#[rustler::resource_impl]
+impl Resource for OfflineScope {}
+
+pub(crate) struct OfflineAccess {
+    scope: ResourceArc<OfflineScope>, directory: Arc<Directory>, readonly: bool,
+}
+impl OfflineAccess {
+    pub(crate) fn write_guard(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.scope.directory.root.write.lock().map_err(|_| failure("offline job writer lock poisoned"))?;
+        self.scope.marker.check()?;
+        self.directory.check()?;
+        if self.readonly { return Err(failure("offline extraction is logically read-only")); }
+        Ok(guard)
+    }
+    pub(crate) fn check_live(&self) -> std::io::Result<()> {
+        if self.scope.directory.root.closed.load(Ordering::Acquire) {
+            return Err(failure("offline job claim closed"));
+        }
+        Ok(())
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_offline_scope(directory: ResourceArc<DirectoryHandle>, expected: Binary)
+ -> NifResult<ResourceArc<OfflineScope>> {
+    directory.0.writable().map_err(err)?;
+    // Never manufacture a conversion escape hatch under an enrolled app root.
+    for ancestor in directory.0.path.ancestors() {
+        for name in [".bl-generation", ".bl-offline-job"] {
+            if name == ".bl-offline-job" && ancestor == directory.0.path { continue; }
+            match fs::symlink_metadata(ancestor.join(name)) {
+                Ok(_) => return Err(err("offline job overlaps a protected root")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(err(e)),
+            }
+        }
+    }
+    let mut marker = directory.0.open_file(".bl-offline-job").map_err(err)?;
+    if expected.is_empty() || expected.len() > 1048576 || marker.metadata.len() != expected.len() as u64 {
+        return Err(err("invalid offline job binding"));
+    }
+    let bytes = marker.read(1048576).map_err(err)?;
+    if bytes != expected.as_slice() { return Err(err("offline job binding mismatch")); }
+    marker.file.sync_all().map_err(err)?;
+    directory.0.file.sync_all().map_err(err)?;
+    Ok(ResourceArc::new(OfflineScope { directory: directory.0.clone(), marker }))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_offline_open<'a>(env: Env<'a>, scope: ResourceArc<OfflineScope>, relative: String, create: bool)
+ -> NifResult<Term<'a>> {
+    let _guard = scope.directory.root.write.lock().map_err(err)?;
+    scope.directory.writable().map_err(err)?;
+    scope.marker.check().map_err(err)?;
+    let parts: Vec<_> = relative.split('/').collect();
+    if parts.len() < 2 || parts.len() > 128 || !matches!(parts[0], "extract" | "target" | "scratch") {
+        return Err(err("invalid offline store role"));
+    }
+    let readonly = parts[0] == "extract";
+    if readonly && create { return Err(err("cannot initialize an extraction store")); }
+    let mut directory = scope.directory.clone();
+    for (index, part) in parts.iter().enumerate() {
+        if create && index + 1 == parts.len() {
+            match fs::symlink_metadata(pinned(&directory.file, part)) {
+                Ok(_) => return Err(err("offline new store already exists")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(err(e)),
+            }
+        }
+        directory = directory.child(part, create, false).map_err(err)?;
+    }
+    let claim = super::claim_store_mode(&directory.path, !create)
+        .map_err(|_| err("offline engine claim or supported reader refused"))?;
+    let handle = super::DbHandle {
+        path: directory.path.clone(), keyspace: claim.engine.keyspace.clone(),
+        datoms: claim.engine.datoms.clone(), lock: claim.engine.lock.clone(), _claim: claim,
+        _offline: Some(OfflineAccess { scope: scope.clone(), directory, readonly }),
+    };
+    scope.marker.check().map_err(err)?;
+    let path = handle.path.to_string_lossy().into_owned();
+    Ok((ResourceArc::new(handle), path).encode(env))
+}
+
 struct Reader { parent: Arc<Directory>, name: String, metadata: Metadata, file: File, offset: u64 }
 impl Reader {
     fn check(&self) -> std::io::Result<()> {

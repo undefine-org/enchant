@@ -77,6 +77,7 @@ fn capture(source: Arc<StoreClaim>, path: PathBuf) -> Result<Arc<Capture>, Strin
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_checkpoint_capture(source: ResourceArc<DbHandle>) -> NifResult<ResourceArc<Cursor>> {
+    if source._offline.is_some() { return Err(err("offline stores cannot export unscoped checkpoints")); }
     let capture = capture(source._claim.clone(), source.path.clone()).map_err(err)?;
     Ok(ResourceArc::new(Cursor(Mutex::new(Some(capture)))))
 }
