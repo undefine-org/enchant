@@ -1,0 +1,54 @@
+;; Warm reads must not republish unrelated retained plans.
+(ns datom.plan-hit-publication-test
+ (:require [datom :as d] [datom.time :as time] [datom.query.engine :as engine]))
+
+(def schema [{:db/ident :publication/n :db/valueType :db.type/long}
+             {:db/ident :publication/tag :db/valueType :db.type/keyword}])
+(defn cache-version []
+ (elem (BeamLisp.LazyMemo/peek
+         (BeamLisp.Env/fetch! "datom.query.engine" "PLAN-CACHE")) 1))
+
+(deftest native-plan-publication-is-unchanged-by-warm-hits
+ (let [c (d/connect schema)
+       q '[:find ?n :in $ ?e :where [?e :publication/n ?n]]]
+  (try
+   (let [report (d/transact! c [{:db/id -1 :publication/n 7}])
+         e (get (:tempids report) -1) db (d/db c)]
+    (is (= #{[7]} (engine/q q db e)))
+    (let [version (cache-version) before (engine/plan-cache-stats)]
+     (is (= #{[7]} (engine/q q db e)))
+     (is (= #{[7]} (engine/q q db e)))
+     (is (= version (cache-version)))
+     (is (= 2 (- (:hits (engine/plan-cache-stats)) (:hits before))))
+     (is (= (:misses before) (:misses (engine/plan-cache-stats))))))
+   (finally (d/close! c)))))
+
+(deftest learned-history-hints-are-not-republished-on-every-read
+ (let [c (d/connect schema)
+       q '[:find ?e ?n :where [?e :publication/tag :row] [?e :publication/n ?n]]]
+  (try
+   (d/transact! c (mapv (fn [n] {:db/id (- -1 n) :publication/n n :publication/tag :row}) (range 64)))
+   (let [db (time/history (d/db c)) expected (engine/q q db)
+         version (cache-version) before (engine/plan-cache-stats)]
+    (is (= 64 (count expected)))
+    (is (= expected (engine/q q db)))
+    (is (= expected (engine/q q db)))
+    (is (= version (cache-version)))
+    (is (= 2 (- (:hits (engine/plan-cache-stats)) (:hits before)))))
+   (finally (d/close! c)))))
+
+(deftest a-reader-observes-a-plan-published-by-another-reader
+ (let [c (d/connect schema)
+       suffix (str (erlang/unique_integer (list :positive)))
+       q (fn [name] [:find (symbol (str "?publication-" name suffix))
+                      :where ['_ :publication/n (symbol (str "?publication-" name suffix))]])]
+  (try
+   (d/transact! c [{:db/id -1 :publication/n 11}])
+   (let [db (d/db c) initial (q "initial") other (q "other")]
+    (is (= #{[11]} (engine/q initial db)))
+    (is (= #{[11]} @(future (engine/q other db))))
+    (let [before (engine/plan-cache-stats)]
+     (is (= #{[11]} (engine/q other db)))
+     (is (= (:misses before) (:misses (engine/plan-cache-stats))))
+     (is (= 1 (- (:hits (engine/plan-cache-stats)) (:hits before))))))
+   (finally (d/close! c)))))

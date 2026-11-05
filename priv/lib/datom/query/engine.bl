@@ -980,7 +980,19 @@
    Parse + validate + plan measured ~0.45 ms of a ~0.86 ms point query —
    half of every call, for a form that is a literal in the source. Keyed by
    the query VALUE, so the same form from any caller is one entry."
-  (BeamLisp.LazyMemo/create_ref {:entries {} :order (queue/new) :hits 0 :misses 0}))
+  (BeamLisp.LazyMemo/create_ref {:entries {} :order (queue/new) :misses 0}))
+
+(def ^:private PLAN-HITS (BeamLisp.LazyMemo/create_ref 0))
+
+(defn- count-plan-hit! []
+ ;; A hit updates only an immediate integer, never the retained plan map.
+ ;; Native CAS preserves concurrent readers without a Source callback argument.
+ (loop []
+  (let [current (BeamLisp.LazyMemo/read_versioned PLAN-HITS)
+        result (BeamLisp.LazyMemo/exchange_version PLAN-HITS
+                 (elem current 0) (inc (elem current 1)) :keep)]
+   (case result :ok :ok :retry (recur)
+    (throw (ex-info "Invalid private query hit transition" {:kind :invalid-plan-cache-transition}))))))
 
 (defn- offer-plan [state query entry charge]
  (let [entries (Map/get state :entries)
@@ -1009,7 +1021,6 @@
   (let [current (BeamLisp.LazyMemo/read_versioned PLAN-CACHE)
         version (elem current 0) state (elem current 1)
         next (case operation
-               :hit (Map/put state :hits (inc (Map/get state :hits)))
                :offer (offer-plan state query entry charge)
                :rank-watch (let [entries (Map/get state :entries) old (Map/get entries query)]
                              (if old (Map/put state :entries
@@ -1025,7 +1036,7 @@
   "`{:size :hits :misses}` — for tests and `datom/explain`."
   []
   (let [c (BeamLisp.LazyMemo/read PLAN-CACHE)]
-    {:size (count (:entries c)) :hits (:hits c) :misses (:misses c)
+    {:size (count (:entries c)) :hits (BeamLisp.LazyMemo/read PLAN-HITS) :misses (:misses c)
      :declined (or (:declined c) 0) :largest-entry-bytes (or (:largest-entry-bytes c) 0)
      :max-entry-bytes PLAN-CACHE-ENTRY-MAX}))
 
@@ -1034,9 +1045,11 @@
    this exact form has been seen. Throws `invalid query` exactly as the
    unmemoised path did — an invalid form is never cached."
   [query]
+  ;; Keep ownership in the private cell. Reader-local snapshots need separate
+  ;; admission and lifetime evidence before replacing this authoritative read.
   (let [hit (get (:entries (BeamLisp.LazyMemo/read PLAN-CACHE)) query)]
     (if (some? hit)
-      (do (update-plan-cache! :hit nil nil nil)
+      (do (count-plan-hit!)
           hit)
       (let [parsed (datom.query.parse/parse query)
             problems (into (datom.query.parse/validate parsed)
@@ -1272,7 +1285,8 @@
         (when (and (not tracing?) (>= (:work executed) 32)
                    (finite-cache-inputs? (:parsed prepared) inputs))
           (when-let [attrs (or attrs (plain-read-attrs (:parsed prepared)))]
-            (update-plan-cache! :result-cache query nil nil)
+            (when-not (:result-cache? prepared)
+              (update-plan-cache! :result-cache query nil nil))
             ;; First use learns the work hint only. Retention requires
             ;; evidence from BEFORE execution, including empty reads and code.
             (when stamp
