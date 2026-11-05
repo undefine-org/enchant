@@ -1,0 +1,77 @@
+(ns datom.offline-worker-test
+ (:require [datom.offline.worker :as worker] [datom.offline.engine :as engine]
+           [datom.offline.snapshot :as snapshot] [datom.offline.fs :as fs]
+           [datom.offline.seal :as seal] [datom.offline.layout :as l]
+           [datom.offline.reindex :as reindex] [datom.store :as s]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+                    {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+           :files ["config.json"] :directories ["empty"]})
+(def marker (erlang/term_to_binary {:version 1 :intent (l/digest spec)}))
+(defn close [root] (try (fs/close! root) (catch _ nil)))
+(defn fixture []
+ (let [root (s/fresh-path ".offline-worker") source (str root "/source")
+       evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))]
+  (File/mkdir_p! source)
+  (doseq [part (get evidence "archives")]
+   (let [archive (Path/expand (str "test/fixtures/datom/" (get part "file")))
+         unpacked (System/cmd "tar" (list "-xzf" archive "-C" source))]
+    (when-not (= 0 (elem unpacked 1)) (throw (ex-info "fixture extraction refused" {})))))
+  (let [source (fs/claim! source {:readonly true}) job (fs/claim! (str root "/job") {:create true})]
+   (fs/put! job ".bl-offline-job" nil marker)
+   (let [scope (engine/scope! job marker) captured (fs/child! job "snapshot" {:create true})]
+    (engine/bind-source! scope source spec)
+    (let [receipt (snapshot/capture-bound! scope source captured spec)
+          extraction (fs/child! job "extract" {:create true}) target (fs/child! job "target" {:create true})
+          bound (reindex/job-binding (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"])
+                  (l/digest :worker-fixture-tool) (:tree-digest receipt) (l/digest spec))]
+     (snapshot/copy-tree! captured extraction spec {:omit-protocol true})
+     (snapshot/copy-tree! captured target spec {:omit-protocol true :omit-stores true})
+     {:source source :job job :scope scope :captured captured :target target :binding bound
+      :destination (str root "/generation")})))))
+(defn seal-closed! [scope]
+ (loop [left 100]
+  (let [result (try {:sealed (seal/target! scope spec)} (catch error {:error (:kind (ex-data error))}))]
+   (if (:sealed result) (:sealed result)
+    (if (pos? left)
+     (do (erlang/garbage_collect) (Process/sleep 10) (recur (dec left)))
+     (throw (ex-info "worker engines did not retire" {:kind (:error result)})))))))
+
+(deftest fixed-worker-returns-only-proofs-and-retires-engines-before-physical-sealing
+ (let [{:keys [source job scope captured target binding destination]} (fixture) held (atom nil)]
+  (try
+   (let [before (fs/tree-digest source)
+         proofs (mapv (fn [store] (worker/run! scope captured target store binding :convert nil)) (:stores spec))]
+    (is (= [8 11] (mapv #(get-in % [:proof :datoms]) proofs)))
+    (is (= [0 3] (mapv #(get-in % [:blobs :references]) proofs)))
+    (is (= [0 2] (mapv #(get-in % [:blobs :distinct-blobs]) proofs)))
+    (is (= [1000031 1000031] (mapv #(get-in % [:proof :basis]) proofs)))
+    (is (= proofs (BeamLisp.CompilerData/check_first_order! proofs)))
+    ;; A repeated preparation reconstructs already-published store headers with
+    ;; new witnesses. It cannot borrow a prior proof or leave engines resident.
+    (is (= proofs (mapv (fn [store] (worker/run! scope captured target store binding :convert nil)) (:stores spec))))
+    (let [before-target (fs/tree-digest target)
+          clone (fs/child! (fs/child! job "extract") "verification" {:create true})]
+     (snapshot/copy-tree! target clone spec {:omit-protocol true})
+     (is (= proofs (mapv (fn [store] (worker/run! scope captured target store binding :reconcile "verification")) (:stores spec))))
+     (is (= before-target (fs/tree-digest target))))
+    (reset! held (seal-closed! scope))
+    (is (= before (fs/tree-digest source)))
+    (is (= destination (seal/publish! (deref held) destination)))
+    (is (= before (fs/tree-digest captured)))
+    (is (= before (fs/tree-digest source)))
+    (seal/release! (deref held))
+    (is (engine/release-source! scope)))
+   (finally (when (deref held) (try (seal/release! (deref held)) (catch _ nil)))
+            (try (engine/release-source! scope) (catch _ nil)) (close source) (close job)))))
+
+(deftest worker-refusal-is-typed-and-keeps-the-original-and-target-unchanged
+ (let [{:keys [source job scope captured target binding]} (fixture)]
+  (try
+   (let [before (fs/tree-digest source) target-before (fs/tree-digest target)
+         error (try (worker/run! scope captured target (first (:stores spec)) binding :unknown nil) nil
+                (catch error (:kind (ex-data error))))]
+    (is (= :offline-unknown-worker-mode error))
+    (is (= before (fs/tree-digest source)))
+    (is (= target-before (fs/tree-digest target))))
+   (finally (engine/release-source! scope) (close source) (close job)))))

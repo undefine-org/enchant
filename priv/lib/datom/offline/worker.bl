@@ -1,0 +1,76 @@
+;; Fixed SDK worker: no application callbacks/Conn and no native engine handle
+;; may escape in its reply. Process exit retires every owned engine before the
+;; coordinator can seal/hash/publish the closed physical target.
+(ns datom.offline.worker
+ (:require [datom.offline.engine :as engine] [datom.offline.reindex :as reindex]
+           [datom.offline.publication :as publication] [datom.offline.verify :as verify]
+           [datom.offline.blobs :as blobs] [datom.offline.audit :as audit]
+           [datom.offline.layout :as l] [datom.store-fjall :as fj]))
+
+(defn- nonce [] (String/downcase (binary/encode_hex (crypto/strong_rand_bytes 16))))
+(defn- scratch! [scope name]
+ ;; A nonce is only a locator. Native absent-only creation is the authority;
+ ;; a collision or interrupted prior allocation cannot reuse another witness.
+ (engine/open! scope (str "scratch/" name) {:create true}))
+(defn- copied! [job]
+ (loop []
+  (let [status (reindex/step! job)]
+   (when-not (contains? #{:copied :verified :cleaning} (:phase status)) (recur)))))
+
+(defn- convert! [scope spec bound]
+ (let [path (:path spec) token (nonce)
+       source (engine/open! scope (str "extract/" path))
+       target (engine/open! scope (str "target/" path)
+                {:create (not (File/exists? (str (:path scope) "/target/" path)))})
+       scratch (scratch! scope (str token "-rows"))]
+  (if (= {:version 2} (audit/read-slot target l/FORMAT-KEY))
+   (verify/verify-published! source target scratch bound)
+   (let [job (if (nil? (fj/raw-get target reindex/STATE-KEY))
+               (reindex/begin! source target bound) (reindex/resume! source target bound))]
+    (copied! job)
+    (publication/prepare! source target scratch bound)))))
+
+(defn- reconcile! [scope spec bound clone-prefix]
+ (let [source (engine/open! scope (str "extract/" (:path spec)))
+       target (engine/open! scope (str "extract/" clone-prefix "/" (:path spec)))
+       scratch (scratch! scope (str (nonce) "-reconcile"))]
+  ;; Both handles are logically read-only. Actual prepared files stay closed;
+  ;; any engine recovery happens ONLY in the disposable target clone.
+  (verify/verify-published! source target scratch bound)))
+
+(defn- execute! [scope snapshot-root target-root spec bound mode clone-prefix]
+ (let [proof (case mode
+               :convert (convert! scope spec bound)
+               :reconcile (reconcile! scope spec bound clone-prefix)
+               (l/refuse! :offline-unknown-worker-mode))
+       source (engine/open! scope (str "extract/" (:path spec)))
+       token (nonce)
+       source-proof (blobs/inspect-store! source 1 snapshot-root spec (scratch! scope (str token "-source-blobs")))
+       target-proof (blobs/inspect-store! source 1 target-root spec (scratch! scope (str token "-target-blobs")))]
+  (when-not (= source-proof target-proof) (l/refuse! :offline-blob-conservation-mismatch))
+  {:store (:id spec) :path (:path spec) :proof proof :blobs target-proof}))
+
+(defn run!
+ "Execute one store in a monitored, fixed SDK process. Replies contain only
+  bounded data; the caller waits for actual worker exit, then claims closed
+  store flocks before physical publication. A timeout is an uncertain outcome."
+ [scope snapshot-root target-root store-spec bound mode clone-prefix]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [owner (erlang/self) tag (erlang/make_ref)
+       monitored (erlang/spawn_monitor
+        (fn []
+         (try
+          (let [result (execute! scope snapshot-root target-root store-spec bound mode clone-prefix)]
+           (BeamLisp.CompilerData/check_first_order! result
+            {:max-nodes 131072 :max-depth 64 :max-bytes 16777216})
+           (erlang/send owner [tag :ok result]))
+          (catch error (erlang/send owner [tag :error (or (:kind (ex-data error)) :offline-worker-failed)])))))
+       worker (elem monitored 0) monitor (elem monitored 1)
+       result (receive [reply-tag status value] :when (= reply-tag tag)
+                [status value]
+                [:DOWN reference :process pid reason] :when (and (= reference monitor) (= pid worker))
+                 (l/refuse! :offline-worker-exited-before-proof)
+                (after 3600000 (l/refuse! :offline-worker-outcome-uncertain)))]
+  (receive [:DOWN reference :process pid reason] :when (and (= reference monitor) (= pid worker))
+   nil (after 30000 (l/refuse! :offline-worker-exit-uncertain)))
+  (if (= :ok (get result 0)) (get result 1) (l/refuse! (get result 1)))))
