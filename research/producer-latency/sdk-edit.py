@@ -63,9 +63,16 @@ def main():
         with (output / 'image.log').open('w') as log:
             subprocess.run(['nix-store', '-l', deriver], text=True, stdout=log, stderr=subprocess.STDOUT, check=True)
         report['phases'] = []
+        seen = set()
+        report['duplicate_phase_lines'] = 0
         for line in (output / 'image.log').read_text().splitlines():
             if line.startswith(('SDK-PHASE ', 'SDK-SHELL-PHASE ', 'SDK-UNIT-RESULT ',
                                 'SDK-UNIT-PHASES ', 'SDK-PARTS-RESULT ', 'SDK-IMAGE-RESULT ')):
+                # The bounded worker's exit trap replays its debug stream.
+                if line in seen:
+                    report['duplicate_phase_lines'] += 1
+                    continue
+                seen.add(line)
                 label, value = line.split(' ', 1)
                 report['phases'].append(dict(kind=label, value=json.loads(value)))
         prior = json.loads((before / 'unit-store/unit-index.json').read_text())
