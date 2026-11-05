@@ -35,6 +35,18 @@ def tree(root):
     return result
 
 
+def sync_fixture(parent):
+    # Sync only the test's ext4 fixture and its ancestor directory entries.
+    # Global sync would also flush the shared Nix store through virtiofs.
+    paths = sorted(parent.rglob('*'), key=lambda p: len(p.parts), reverse=True)
+    for path in [*paths, parent, *parent.parents]:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', required=True)
@@ -70,7 +82,7 @@ def main():
             baseline.write_text(json.dumps(before))
             # The original fixture predates the fault. Do this before the SDK
             # starts, so this cannot flush any conversion or publication work.
-            os.sync()
+            sync_fixture(parent)
         env = dict(os.environ, DATOM_CRASH_ROOT=str(parent), BL_DAEMON='off')
         command = [args.candidate, '--cold', 'run', 'test/support/datom_root_crash.bl']
         ack = parent / 'stopped'

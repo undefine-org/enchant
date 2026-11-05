@@ -32,7 +32,9 @@ let
   vmPkgs = if mode == "power" then pkgs // {
     vmTools = pkgs.vmTools.override { customQemu = qemu; };
   } else pkgs;
-  bounded = import ./bounded-build.nix { pkgs = vmPkgs; memoryMiB = 6144; diskMiB = 24576; cpuCount = 2; commandManager = true; };
+  # This proof owns cold SDK processes and native file descriptors directly;
+  # it does not exercise application service-manager activation.
+  bounded = import ./bounded-build.nix { pkgs = vmPkgs; memoryMiB = 6144; diskMiB = 24576; cpuCount = 2; commandManager = false; trace = true; };
 in assert builtins.elem mode [ "process" "power" ];
 bounded (pkgs.runCommand "datom-whole-root-${mode}-death" {
   __structuredAttrs = true;
@@ -56,6 +58,9 @@ bounded (pkgs.runCommand "datom-whole-root-${mode}-death" {
   test -e /bin/sh || ln -s ${pkgs.bash}/bin/sh /bin/sh
   test -e /lib64/ld-linux-x86-64.so.2 || ln -s ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
   export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.openssl pkgs.ncurses pkgs.zlib pkgs.glibc pkgs.stdenv.cc.cc.lib pkgs.brotli pkgs.zstd ]}
+  # The selected SDK is immutable. Its disposable portable extraction is not
+  # the application database and must not become a durability prerequisite.
+  export XDG_DATA_HOME=/run/datom-runtime
   export HOME=/build/home BL_DAEMON=off BL_SDK_PRODUCT=${selection}
   export PATH=${platform}/bin:$PATH
   export ELIXIR_ERL_OPTIONS='+fnu +S 2:2 +SDcpu 1:1 +SDio 1:1'
