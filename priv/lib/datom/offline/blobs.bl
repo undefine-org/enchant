@@ -1,0 +1,77 @@
+;; Validate historical attachments against a declared, pinned FS tier. Every
+;; physical byte, including orphans, is separately conserved by root capture.
+(ns datom.offline.blobs
+ (:require [datom.offline.layout :as l] [datom.offline.audit :as audit]
+           [datom.offline.fs :as fs] [datom.offline.manifest :as manifest]
+           [datom.file :as file] [datom.store-fjall :as fj]))
+
+(def CACHE-PREFIX (l/bytes [0 98]))
+(defn- descriptor! [value]
+ (when-not (and (erlang/is_map value)
+                (erlang/is_binary (:sha value)) (= 32 (erlang/byte_size (:sha value)))
+                (erlang/is_integer (:size value)) (<= 0 (:size value))
+                (or (nil? (:media-type value)) (string? (:media-type value)))
+                (not (contains? value :body)))
+  (l/refuse! :offline-invalid-file-descriptor))
+ value)
+
+(defn- check-file! [root binding scratch value]
+ (descriptor! value)
+ (let [hex (file/sha-hex (:sha value)) key (erlang/iolist_to_binary (list CACHE-PREFIX (:sha value)))
+       cached (fj/raw-get scratch key)]
+  (if cached
+   (do (when-not (erlang/=:= (l/checked-slot cached) (:size value))
+        (l/refuse! :offline-blob-size-mismatch)) false)
+   (let [tier (manifest/directory root (:path binding))
+         parent (fs/child! (fs/child! tier (String/slice hex 0 2)) (String/slice hex 2 2))
+         actual (fs/digest-file parent hex)]
+    (when-not (= hex (:sha256 actual)) (l/refuse! :offline-blob-hash-mismatch))
+    (when-not (= (:size value) (:bytes actual)) (l/refuse! :offline-blob-size-mismatch))
+    (fj/commit-raw! scratch [[:put key (erlang/term_to_binary (:size value))]])
+    true))))
+
+(defn- descriptors
+ "Payloads are already bounded first-order data. Include nested DFile records,
+  and structural descriptors of historically file-typed attributes."
+ [value file-attribute?]
+ (loop [pending [[value file-attribute?]] out []]
+  (if (empty? pending) out
+   (let [[value required?] (peek pending) pending (pop pending)]
+    (cond
+     (or required? (file/file? value))
+      (recur pending (conj out (descriptor! value)))
+     (or (sequential? value) (set? value))
+      (recur (reduce #(conj %1 [%2 false]) pending value) out)
+     (and (erlang/is_map value) (not (maps/is_key :__struct__ value)))
+      (recur (reduce (fn [p [k v]] (conj (conj p [k false]) [v false])) pending value) out)
+     :else (recur pending out))))))
+
+(defn inspect-store!
+ "Stream all EAVT history, including retractions. Hash each referenced blob
+  once, using a fresh private disk witness to bound memory. The witness is
+  disposable; another verification pass must supply its own empty scratch."
+ [store version root store-spec scratch]
+ (when-not (and (= :fs (get-in store-spec [:blobs :kind]))
+                (every? (fn [path]
+                         (and (not (manifest/within? path (:path scratch)))
+                              (not (manifest/within? (:path scratch) path))))
+                        [(:path store) (:path root)]))
+  (l/refuse! :offline-invalid-blob-verification))
+ (when (seq (:entries (fj/raw-page scratch nil nil nil 1 4194304)))
+  (l/refuse! :offline-blob-scratch-not-empty))
+ (let [inspected (audit/inspect-store store version)
+       result (audit/fold-pages store (l/bytes [1]) (l/bytes [1 255])
+        (fn [acc [key raw]]
+         (let [d (l/checked-datom raw (:basis inspected))
+               files (descriptors (get d 2) (contains? (:file-attrs inspected) (get d 1)))]
+          (reduce (fn [acc value]
+                    (let [fresh? (check-file! root (:blobs store-spec) scratch value)]
+                     (-> acc (update :references inc)
+                         (update :distinct-blobs + (if fresh? 1 0))
+                         (update :bytes + (if fresh? (:size value) 0))
+                         (update :digest #(crypto/hash_update % (erlang/term_to_binary [key (:sha value) (:size value)]))))))
+                  acc files)))
+        {:references 0 :distinct-blobs 0 :bytes 0 :digest (crypto/hash_init :sha256)})]
+  (fj/sync! scratch)
+  (assoc result :version 1 :store (:id store-spec) :source-digest (:digest inspected)
+    :digest (String/downcase (binary/encode_hex (crypto/hash_final (:digest result)))))))

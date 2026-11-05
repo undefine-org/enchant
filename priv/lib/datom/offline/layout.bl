@@ -1,7 +1,7 @@
 ;; Explicit persisted-format readers. No Conn, initialization, application
 ;; callback or current-runtime format admission is involved in offline reads.
 (ns datom.offline.layout
- (:require [datom.codec :as codec] [datom.value-codec :as slot]))
+ (:require [datom.codec :as codec] [datom.value-codec :as slot] [datom.file :as file]))
 
 (def FIRST-TX 1000000)
 (def ENTITY-KEY (erlang/list_to_binary (list 0 101)))
@@ -36,10 +36,34 @@
                (refuse! :offline-unknown-index)))))
 
 (declare checked-slot-in)
+(def FILE-TAG (maps/get :__struct__ (file/->DFile nil nil nil)))
+(defn- validation-view [value]
+ ;; Walk RAW closed terms only, before protocol dispatch. Allow this one inert
+ ;; application-independent record in the validation view. The original value
+ ;; and serialized bytes are returned unchanged; unknown structs still refuse.
+ (cond
+  (erlang/is_map value)
+   (let [plain (if (erlang/=:= FILE-TAG (maps/get :__struct__ value nil))
+                 (maps/remove :__struct__ value) value)]
+    (maps/from_list
+     (Enum/map (maps/to_list plain)
+      (fn [pair] (tuple (validation-view (elem pair 0)) (validation-view (elem pair 1)))))))
+  (erlang/is_tuple value)
+   (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list value) validation-view))
+  (erlang/is_list value) (Enum/map value validation-view)
+  :else value))
 (defn- checked-etf [raw]
+ ;; Reject runtime handles/functions, compression and structural over-budget
+ ;; data BEFORE decoding or recursively preparing the validation-only view.
+ (BeamLisp.CompilerData/check_closed_etf! raw
+  {:max-nodes 262144 :max-depth 128 :max-bytes 16777216})
  (let [value (BeamLisp.Env/decode_data_term! raw)]
-  (BeamLisp.CompilerData/check_first_order! value
-   {:max-nodes 131072 :max-depth 64 :max-bytes 16777216})
+  (let [limits {:max-nodes 131072 :max-depth 64 :max-bytes 16777216}]
+   (try (BeamLisp.CompilerData/check_first_order! value limits)
+    (catch error
+     (if (= :foreign-struct (:reason (ex-data error)))
+      (BeamLisp.CompilerData/check_first_order! (validation-view value) limits)
+      (throw error)))))
   ;; This reader explicitly supports default, uncompressed ETF from the
   ;; retained runtime contract. Different/trailing encodings require a reader,
   ;; never a best-effort reinterpretation or a silent end-of-scan.

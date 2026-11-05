@@ -1,0 +1,97 @@
+(ns datom.offline-blobs-test
+ (:require [datom.offline.blobs :as blobs] [datom.offline.audit :as audit]
+           [datom.offline.layout :as l] [datom.offline.fs :as fs]
+           [datom.file :as file] [datom.store-fjall :as fj] [datom.store :as s]
+           [datom.schema :as schema] [datom.index :as index]))
+
+(def definition {:db/ident :fixture/attachment :db/valueType :db.type/file
+                 :db/cardinality :db.cardinality/one})
+(def store-spec {:id "library/one" :path "library.fjall" :blobs {:kind :fs :path "library.blobs"}})
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn descriptor [body] (file/at-rest (file/file body {:media-type "text/plain"})))
+(def old-file (descriptor "retired attachment"))
+(def new-file (descriptor "current attachment"))
+(defn blob-path [root value]
+ (let [hex (file/sha-hex (:sha value))]
+  (str root "/library.blobs/" (String/slice hex 0 2) "/" (String/slice hex 2 2) "/" hex)))
+(defn write-blob! [root value body]
+ (let [path (blob-path root value)] (File/mkdir_p! (Path/dirname path)) (File/write! path body)))
+(defn fixture [values]
+ (let [st (fj/open-fresh) root (s/fresh-path ".offline-blobs")
+       sch (assoc (schema/empty-schema) :fixture/attachment definition)
+       ds (into (mapv (fn [op] [(get op 1) (get op 2) (get op 3) l/FIRST-TX true])
+                     (schema/definition-datoms 500 definition)) values)]
+  (File/mkdir_p! (str root "/library.blobs"))
+  (s/-put st l/TX-KEY (+ l/FIRST-TX 19)) (s/-put st l/ENTITY-KEY 700)
+  (doseq [d ds]
+   (fj/commit-raw! st (mapv (fn [idx] [:put (l/key-for 1 idx d) (erlang/term_to_binary d)])
+                          (index/indexes-for sch (get d 1)))))
+  (write-blob! root old-file "retired attachment")
+  (write-blob! root new-file "current attachment")
+  (File/write! (str root "/library.blobs/unclassified-orphan") "retain me too")
+  {:store st :root root}))
+(def history [[42 :fixture/attachment old-file l/FIRST-TX true]
+              [42 :fixture/attachment old-file (+ l/FIRST-TX 1) false]
+              [42 :fixture/attachment new-file (+ l/FIRST-TX 1) true]])
+
+(deftest historical-file-references-are-verified-once-per-distinct-content
+ (let [fixture (fixture history) st (:store fixture) root (fs/claim! (:root fixture) {:readonly true})
+       scratch (fj/open-fresh)]
+  (try
+   (let [before (fs/tree-digest root) rows (audit/fold-pages st nil nil conj [])
+         proof (blobs/inspect-store! st 1 root store-spec scratch)]
+    (is (= 3 (:references proof)))
+    (is (= 2 (:distinct-blobs proof)))
+    (is (= (+ (:size old-file) (:size new-file)) (:bytes proof)))
+    (is (= 64 (String/length (:digest proof))))
+    (is (= "library/one" (:store proof)))
+    (is (= before (fs/tree-digest root)))
+    (is (= rows (audit/fold-pages st nil nil conj [])))
+    (is (= :offline-blob-scratch-not-empty
+           (kind #(blobs/inspect-store! st 1 root store-spec scratch))))
+    (let [fresh (fj/open-fresh)]
+     (try (is (= proof (blobs/inspect-store! st 1 root store-spec fresh)))
+      (finally (s/close fresh)))))
+   (finally (s/close st) (s/close scratch) (fs/close! root)))))
+
+(deftest retracted-missing-corrupt-and-size-conflicting-blobs-refuse
+ (doseq [damage [:missing :hash :size]]
+  (let [values (if (= damage :size)
+                (conj history [43 :fixture/attachment (assoc old-file :size 1) (+ l/FIRST-TX 2) true]) history)
+        fixture (fixture values) st (:store fixture) path (:root fixture) scratch (fj/open-fresh)]
+   (case damage
+    :missing (File/rm! (blob-path path old-file))
+    :hash (File/write! (blob-path path old-file) "corrupt retained bytes")
+    :size nil)
+   (let [root (fs/claim! path {:readonly true})]
+    (try
+     (let [before (fs/tree-digest root) rows (audit/fold-pages st nil nil conj [])]
+      (is (contains? #{:offline-filesystem-refused :offline-blob-hash-mismatch :offline-blob-size-mismatch}
+             (kind #(blobs/inspect-store! st 1 root store-spec scratch))))
+      (is (= before (fs/tree-digest root)))
+      (is (= rows (audit/fold-pages st nil nil conj []))))
+     (finally (s/close st) (s/close scratch) (fs/close! root)))))))
+
+(deftest malformed-and-staged-persisted-descriptors-refuse
+ (doseq [value [(assoc old-file :body "retired attachment")
+                (assoc old-file :sha "wrong") (assoc old-file :size -1)
+                (assoc old-file :media-type 42) "not a descriptor"]]
+  (let [fixture (fixture [[42 :fixture/attachment value l/FIRST-TX true]])
+        st (:store fixture) root (fs/claim! (:root fixture) {:readonly true}) scratch (fj/open-fresh)]
+   (try
+    (is (= :offline-invalid-file-descriptor
+           (kind #(blobs/inspect-store! st 1 root store-spec scratch))))
+    (finally (s/close st) (s/close scratch) (fs/close! root))))))
+
+(deftest nested-records-and-removed-file-schema-remain-in-scope
+ (let [fixture (fixture [[42 :fixture/untyped {:nested [old-file]} l/FIRST-TX true]
+                         [500 :db/valueType :db.type/file (+ l/FIRST-TX 1) false]
+                         [43 :fixture/attachment new-file (+ l/FIRST-TX 1) false]])
+       st (:store fixture) root (fs/claim! (:root fixture) {:readonly true}) scratch (fj/open-fresh)]
+  (try
+   (let [proof (blobs/inspect-store! st 1 root store-spec scratch)]
+    (is (= 2 (:references proof))) (is (= 2 (:distinct-blobs proof)))
+    (is (contains? (:file-attrs (audit/inspect-store st 1)) :fixture/attachment)))
+   (is (= :offline-invalid-blob-verification
+          (kind #(blobs/inspect-store! st 1 root store-spec st))))
+   (finally (s/close st) (s/close scratch) (fs/close! root)))))
