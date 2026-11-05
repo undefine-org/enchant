@@ -1,0 +1,37 @@
+;; Persisted finite composite values keep their key bytes and temporal reads
+;; when optional lazy memo admission is unavailable.
+(ns datom.finite-composite-keys-test
+ (:require [datom :as d] [datom.time :as time] [datom.codec :as codec]))
+(defn without-lazy [compute]
+ (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)]
+  (Application/put_env :beam_lisp :lazy_cache_budget_bytes 0)
+  (try {:value (compute)} (catch cause {:error (ex-message cause)})
+   (finally (if (nil? previous) (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+              (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+(defn cases []
+ [{} {:from 10 :to 20} {:nested {:from 10 :to 20} :values [false nil 1]}
+  (sorted-map :a 1 :b 2) (sorted-map) {:sorted (sorted-map :a false :b nil)}
+  [] [1 2] (list 1 2) #{1 2} (sorted-set 1 2)
+  (tuple :span {:from 10 :to 20}) [{:x #{1 2}} {:y (sorted-map :a [1 2])}]])
+(deftest finite-composite-keys-preserve-exact-bytes-at-zero-optional-cache
+ (let [values (cases) expected (mapv codec/encode-value values)]
+  (println :finite-composite-key-bytes (mapv binary/encode_hex expected))
+  (doseq [[value bytes] (mapv (fn [value bytes] [value bytes]) values expected)]
+   (let [actual (without-lazy #(codec/encode-value value))]
+    (is (nil? (:error actual)) (str "Materialized key needs no lazy admission: " (:error actual)))
+    (is (= true (= bytes (:value actual))))))
+  (is (= (codec/encode-value (sorted-map :a 1 :b 2)) (codec/encode-value {:b 2 :a 1})))
+  (is (= (codec/encode-value [1 2]) (codec/encode-value (list 1 2))))))
+(deftest historical-composite-retractions-retain-the-entire-value
+ (let [c (d/connect [{:db/ident :finite-composite/value :db/valueType :db.type/term}])
+       old {:from 10 :to 20 :why {:actor "operator"}} new {:from 11 :to 21 :why {:actor "operator"}}]
+  (try
+   (let [first-report (d/transact! c [{:db/id -1 :finite-composite/value old}])
+         eid (get (:tempids first-report) -1) before (d/db c) at (d/basis-t before)]
+    (d/transact! c [[:db/add eid :finite-composite/value new]])
+    (let [current (d/db c) historical (time/as-of current at)
+          actual (without-lazy #(mapv (fn [db] (:finite-composite/value (d/entity db eid))) [before current historical]))]
+     (is (nil? (:error actual)) (str "Historical retraction pairing stays available: " (:error actual)))
+     (is (= [old new old] (:value actual)))
+     (is (= current (d/db c)))))
+   (finally (d/close! c)))))
