@@ -1,0 +1,84 @@
+(ns datom.offline-publication-test
+ (:require [datom.offline.publication :as publication] [datom.offline.reindex :as reindex]
+           [datom.offline.verify :as verify] [datom.offline.audit :as audit]
+           [datom.offline.layout :as l] [datom.offline.unique :as unique]
+           [datom.store-fjall :as fj] [datom.store :as s] [datom.index :as index]
+           [datom.schema :as schema] [datom.index-coverage :as coverage]))
+(def definition {:db/ident :fixture/key :db/valueType :db.type/tuple
+                 :db/cardinality :db.cardinality/one :db/unique :db.unique/identity})
+(def bound (reindex/job-binding (l/digest :source-runtime) (l/digest :tool)
+                              (l/digest :snapshot) (l/digest :manifest)))
+(defn kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn rows [st] (audit/fold-pages st nil nil conj []))
+(defn seed [n]
+ (let [st (fj/open-fresh) sch (assoc (schema/empty-schema) :fixture/key definition)
+       facts (mapv (fn [i] [(+ 1000 i) :fixture/key (list i [i]) l/FIRST-TX true]) (range n))
+       ds (into (mapv (fn [op] [(get op 1) (get op 2) (get op 3) l/FIRST-TX true])
+                      (schema/definition-datoms 500 definition)) facts)]
+  (s/-put st l/TX-KEY (+ l/FIRST-TX 19)) (s/-put st l/ENTITY-KEY 2000)
+  (doseq [d ds]
+   (fj/commit-raw! st (mapv (fn [idx] [:put (l/key-for 1 idx d) (erlang/term_to_binary d)])
+                          (index/indexes-for sch (get d 1))))) st))
+(defn copied! [source target]
+ (let [job (reindex/begin! source target bound)]
+  (loop [left 100]
+   (when (zero? left) (throw (ex-info "fixture conversion did not finish" {})))
+   (when-not (= :copied (:phase (reindex/step! job))) (recur (dec left))))))
+
+(deftest private-header-publication-requires-fresh-proof-and-reconciles-a-lost-reply
+ (let [source (seed 2) target (fj/open-fresh) scratch (fj/open-fresh) recovery (fj/open-fresh)]
+  (try
+   (let [before (rows source)]
+    (copied! source target)
+    (is (= :offline-store-not-verified (kind #(publication/cleanup-step! target bound))))
+    (let [proof (publication/prepare! source target scratch bound)
+          sch (:schema (audit/inspect-store source 1))]
+     (is (= {:version 2} (s/-get target l/FORMAT-KEY)))
+     (is (nil? (fj/raw-get target reindex/STATE-KEY)))
+     (is (empty? (:entries (fj/raw-page target unique/PREFIX nil (l/prefix-end unique/PREFIX) 1 4096))))
+     (is (coverage/complete? target sch :fixture/key (:basis proof)))
+     (is (coverage/complete? target sch :db/ident (:basis proof)))
+     (is (= 2 (:rows (coverage/certificate target :fixture/key))))
+     (is (= proof (verify/verify-published! source target recovery bound)))
+     (is (= before (rows source)))
+     (is (= 64 (String/length (:data-digest proof))))))
+   (finally (s/close source) (s/close target) (s/close scratch) (s/close recovery)))))
+
+(deftest interrupted-witness-cleanup-is-bounded-and-reverified-before-publication
+ (let [source (seed 130) target (fj/open-fresh) scratch (fj/open-fresh)
+       resumed (fj/open-fresh) recovery (fj/open-fresh)]
+  (try
+   (copied! source target)
+   (let [proof (verify/verify! source target scratch bound) before (rows source)
+         first (publication/cleanup-step! target bound)]
+    (is (= 128 (:removed first))) (is (not (:done? first)))
+    (is (= :cleaning (:phase (reindex/state target bound))))
+    (is (= (reindex/descriptor bound) (s/-get target l/FORMAT-KEY)))
+    ;; Reconstruct the job, with a fresh independent witness after the partial
+    ;; cleanup. Missing old builder events never count as uniqueness proof.
+    (is (= :cleaning (:phase (reindex/step! (reindex/resume! source target bound)))))
+    (is (= proof (publication/prepare! source target resumed bound)))
+    (is (= proof (verify/verify-published! source target recovery bound)))
+    (is (= before (rows source))))
+   (finally (s/close source) (s/close target) (s/close scratch) (s/close resumed) (s/close recovery)))))
+
+(deftest published-reconciliation-rejects-tampering-instead-of-relabeling
+ (doseq [damage [:data :missing-coverage :wrong-coverage :work-row :format :stale-cache]]
+  (let [source (seed 1) target (fj/open-fresh) scratch (fj/open-fresh) recovery (fj/open-fresh)]
+   (try
+    (copied! source target)
+    (publication/prepare! source target scratch bound)
+    (case damage
+     :data (s/-delete target (l/key-for 2 :aevt [1000 :fixture/key (list 0 [0]) l/FIRST-TX true]))
+     :missing-coverage (s/-delete target (l/derived-key (coverage/ident :fixture/key)))
+     :wrong-coverage (s/-put target (l/derived-key (coverage/ident :fixture/key)) {:status :complete :rows 999})
+     :work-row (s/-put target reindex/STATE-KEY {:phase :verified})
+     :format (s/-put target l/FORMAT-KEY {:version 2 :state :building})
+     :stale-cache (s/-put target (l/derived-key [:datom.current/pair 1000 :fixture/key]) {:values [[0 [0]]]}))
+    (let [before (rows target) source-before (rows source)]
+     (is (contains? #{:offline-missing-target-row :offline-target-inventory-mismatch
+                     :offline-stale-derived-state :offline-unrecognized-work-row
+                     :offline-unsupported-source-format}
+            (kind #(verify/verify-published! source target recovery bound))))
+     (is (= before (rows target))) (is (= source-before (rows source))))
+    (finally (s/close source) (s/close target) (s/close scratch) (s/close recovery))))))

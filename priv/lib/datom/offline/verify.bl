@@ -5,7 +5,20 @@
  (:require [datom.offline.layout :as l] [datom.offline.audit :as audit]
            [datom.offline.reindex :as reindex] [datom.offline.unique :as unique]
            [datom.store-fjall :as fj] [datom.index :as index]
-           [datom.value-codec :as slot]))
+           [datom.value-codec :as slot] [datom.schema :as schema]
+           [datom.index-coverage :as coverage]))
+
+(defn rebuilt-coverage
+ "Only complete selective indexes get new certificates. Counts come from a
+  fresh source reconstruction, not the builder's persisted progress."
+ [inspected expected]
+ (into {} (mapv (fn [attr]
+                 [(l/derived-key (coverage/ident attr))
+                  (slot/encode-slot {:status :complete
+                    :definition (coverage/definition (:schema inspected) attr)
+                    :basis (:basis inspected) :through (:basis inspected)
+                    :rows (get (:avet-rows expected) attr 0)})])
+             (filterv #(schema/indexed? (:schema inspected) %) (keys (:schema inspected))))))
 
 (defn- require-raw! [st key expected]
  (let [actual (fj/raw-get st key)]
@@ -44,19 +57,26 @@
          (l/refuse! :offline-page-did-not-advance))
         (recur (:last page) (dissoc next :events)))))))
 
-(defn- target-row [source target inspected acc [key raw]]
+(defn- target-row [source target inspected mode acc [key raw]]
  (cond
-  (= key reindex/STATE-KEY) acc
+  (= key reindex/STATE-KEY)
+   (if (:private mode) acc (l/refuse! :offline-unrecognized-work-row))
   (l/starts? key unique/PREFIX)
    (let [d (l/checked-datom raw (:basis inspected))]
-    (when-not (and (= key (unique/event-key d))
+    (when-not (and (:private mode) (= key (unique/event-key d))
                   (contains? (:unique-attrs inspected) (get d 1))
                   (erlang/=:= raw (fj/raw-get source (l/key-for 1 :eavt d))))
      (l/refuse! :offline-unrecognized-work-row))
     acc)
   :else
    (let [classification (l/classify key)]
-    (if (= :format (:kind classification)) (update acc :format-entries inc)
+    (cond
+     (= :format (:kind classification)) (update acc :format-entries inc)
+     (= :cache (:kind classification))
+      (if (erlang/=:= raw (get (:certificates mode) key))
+       (update acc :certificate-entries inc)
+       (l/refuse! :offline-stale-derived-state))
+     :else
      (let [acc (update acc :digest #(crypto/hash_update % (erlang/term_to_binary [key raw])))]
       (case (:kind classification)
        :index
@@ -74,12 +94,12 @@
        :authoritative (do (when-not (erlang/=:= raw (fj/raw-get source key))
                             (l/refuse! :offline-target-metadata-mismatch))
                           (update acc :authoritative inc))
-       :cache (l/refuse! :offline-stale-derived-state)))))))
+       (l/refuse! :offline-stale-derived-state)))))))
 
-(defn- target-pass [source target inspected]
- (let [result (audit/fold-pages target nil nil #(target-row source target inspected %1 %2)
+(defn- target-pass [source target inspected mode]
+ (let [result (audit/fold-pages target nil nil #(target-row source target inspected mode %1 %2)
                {:indexes {:eavt 0 :aevt 0 :avet 0 :vaet 0} :authoritative 0 :format-entries 0
-                :digest (crypto/hash_init :sha256)})]
+                :certificate-entries 0 :digest (crypto/hash_init :sha256)})]
   (assoc result :digest (String/downcase (binary/encode_hex (crypto/hash_final (:digest result)))))))
 
 (defn- verify-unique! [scratch basis]
@@ -98,39 +118,58 @@
        digest (String/downcase (binary/encode_hex (crypto/hash_final digest)))]
   (when-not (= digest expected) (l/refuse! :offline-source-changed))))
 
-(defn verify!
- "Reread a copied private store. The scratch store MUST be fresh and separate;
-  its events are generated from the source, never copied from builder work.
-  Returns a durable logical proof, not whole-root READY or activation authority."
- [source target scratch bound]
+(defn- distinct-stores! [source target scratch]
  (doseq [[a b] [[source target] [source scratch] [target scratch]]]
   (when (or (= (:path a) (:path b))
             (String/starts_with? (:path a) (str (:path b) "/"))
             (String/starts_with? (:path b) (str (:path a) "/")))
    (l/refuse! :offline-overlapping-stores)))
  (when (seq (:entries (fj/raw-page scratch nil nil nil 1 4194304)))
-  (l/refuse! :offline-verifier-scratch-not-empty))
+  (l/refuse! :offline-verifier-scratch-not-empty)))
+
+(defn- prove! [source target scratch bound inspected published?]
+ (let [expected (expected-pass source target scratch inspected)
+       certificates (if published? (rebuilt-coverage inspected expected) {})
+       actual (target-pass source target inspected {:private (not published?) :certificates certificates})]
+  (when-not (and (= (:indexes expected) (:indexes actual))
+                (= (:authoritative expected) (:authoritative actual))
+                (= 1 (:format-entries actual))
+                (= (count certificates) (:certificate-entries actual)))
+   (l/refuse! :offline-target-inventory-mismatch))
+  (verify-unique! scratch (:basis inspected))
+  (unchanged-source! source (:digest inspected))
+  {:version 1 :protocol :offline-key-reindex :binding bound
+   :source-format 1 :target-format 2 :source-digest (:digest inspected)
+   :data-digest (:digest actual) :schema-digest (:schema-digest inspected)
+   :basis (:basis inspected) :entity-counter (:entity-counter inspected)
+   :datoms (:datoms expected) :indexes (:indexes expected) :avet-rows (:avet-rows expected)
+   :authoritative (:authoritative expected) :unique-events (:unique-events expected)}))
+
+(defn verify!
+ "Reread a copied private store. The scratch store MUST be fresh and separate;
+  its events are generated from the source, never copied from builder work.
+  Returns a durable logical proof, not whole-root READY or activation authority."
+ [source target scratch bound]
+ (distinct-stores! source target scratch)
  (let [state (reindex/state target bound)
        inspected (audit/inspect-store source 1)]
-  (when-not (and (contains? #{:copied :verified} (:phase state))
+  (when-not (and (contains? #{:copied :verified :cleaning} (:phase state))
                 (= (:source-digest state) (:digest inspected))
                 (= (:schema-digest state) (:schema-digest inspected)))
    (l/refuse! :offline-unverifiable-job))
-  (let [expected (expected-pass source target scratch inspected)
-        actual (target-pass source target inspected)]
-   (when-not (and (= (:indexes expected) (:indexes actual))
-                 (= (:authoritative expected) (:authoritative actual))
-                 (= 1 (:format-entries actual)))
-    (l/refuse! :offline-target-inventory-mismatch))
-   (verify-unique! scratch (:basis inspected))
-   (unchanged-source! source (:digest inspected))
-   (let [proof {:version 1 :protocol :offline-key-reindex :binding bound
-                :source-format 1 :target-format 2 :source-digest (:digest inspected)
-                :data-digest (:digest actual) :schema-digest (:schema-digest inspected)
-                :basis (:basis inspected) :entity-counter (:entity-counter inspected)
-                :datoms (:datoms expected) :indexes (:indexes expected) :avet-rows (:avet-rows expected)
-                :authoritative (:authoritative expected) :unique-events (:unique-events expected)}
+  (let [proof (prove! source target scratch bound inspected false)
          next (assoc state :phase :verified :proof proof :proof-digest (l/digest proof))]
     (fj/commit-raw! target [[:put reindex/STATE-KEY (slot/encode-slot next)]])
     (fj/sync! target)
-    proof))))
+    proof)))
+
+(defn verify-published!
+ "Reconcile a completed header after a crash/lost reply. Reconstruct everything
+  from the sealed source with fresh scratch; require all rebuilt certificates
+  and NO temporary job rows. No prior proof or builder state is trusted."
+ [source target scratch bound]
+ (distinct-stores! source target scratch)
+ (when-not (= bound (reindex/job-binding (:source-runtime bound) (:tool bound) (:snapshot bound) (:manifest bound)))
+  (l/refuse! :offline-invalid-job-binding))
+ (audit/counters target 2)
+ (prove! source target scratch bound (audit/inspect-store source 1) true))

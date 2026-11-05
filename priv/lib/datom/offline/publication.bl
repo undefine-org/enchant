@@ -1,0 +1,66 @@
+;; Finalize a private store, never an active application generation. Whole-root
+;; READY must independently reconcile this header and all external blob bytes.
+(ns datom.offline.publication
+ (:require [datom.offline.layout :as l] [datom.offline.audit :as audit]
+           [datom.offline.reindex :as reindex] [datom.offline.verify :as verify]
+           [datom.offline.unique :as unique] [datom.store-fjall :as fj]
+           [datom.value-codec :as slot]))
+
+(defn- exclusive [target action]
+ (global/trans (tuple (tuple :datom.offline.reindex/writer (:path target)) (erlang/self)) action))
+
+(defn- clean-step [target bound]
+ (let [state (reindex/state target bound) proof (:proof state)]
+  (when-not (and (contains? #{:verified :cleaning} (:phase state))
+                (= bound (:binding proof)) (= (l/digest proof) (:proof-digest state)))
+   (l/refuse! :offline-store-not-verified))
+  ;; Delete the front page each time: removed keys themselves are durable
+  ;; progress. A crash cannot strand a separate deletion cursor ahead of data.
+  (let [page (fj/raw-page target unique/PREFIX nil (l/prefix-end unique/PREFIX)
+               reindex/PAGE-ROWS reindex/PAGE-BYTES)
+        next (assoc state :phase :cleaning)
+        operations (conj (mapv (fn [[key _]] [:delete key]) (:entries page))
+                        [:put reindex/STATE-KEY (slot/encode-slot next)])]
+   (fj/commit-raw! target operations) (fj/sync! target)
+   {:phase :cleaning :done? (:done? page) :removed (count (:entries page))})))
+
+(defn cleanup-step!
+ "One bounded temporary-witness cleanup turn. This never changes the building
+  header and cannot publish a store. prepare! must reverify after interruption."
+ [target bound]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (exclusive target #(clean-step target bound)))
+
+(defn- data-digest [target]
+ (let [digest (audit/fold-pages target nil nil
+               (fn [h [key raw]]
+                (if (or (= key l/FORMAT-KEY) (= key reindex/STATE-KEY)) h
+                 (let [classification (l/classify key)]
+                  (when-not (contains? #{:index :counter :authoritative} (:kind classification))
+                   (l/refuse! :offline-unexpected-publication-row))
+                  (crypto/hash_update h (erlang/term_to_binary [key raw])))))
+               (crypto/hash_init :sha256))]
+  (String/downcase (binary/encode_hex (crypto/hash_final digest)))))
+
+(defn prepare!
+ "Fresh independent verification, durable bounded cleanup, final data-hash
+  recheck, then one atomic header/certificate publication. Oversize certificate
+  batches refuse before publication under the raw batch bound. No READY here.
+  A lost final reply is reconciled with verify/verify-published!, never replayed."
+ [source target fresh-scratch bound]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (exclusive target
+  (fn []
+   (let [proof (verify/verify! source target fresh-scratch bound)]
+    (loop [] (when-not (:done? (clean-step target bound)) (recur)))
+    (when-not (= (:data-digest proof) (data-digest target))
+     (l/refuse! :offline-publication-data-changed))
+    (let [recovered (audit/recover-schema source 1 (:basis proof))]
+     (when-not (= (:schema-digest proof) (:schema-digest recovered))
+      (l/refuse! :offline-source-changed))
+     (let [certificates (verify/rebuilt-coverage (assoc recovered :basis (:basis proof)) proof)
+           ops (into (mapv (fn [[key raw]] [:put key raw]) certificates)
+                     [[:put l/FORMAT-KEY (slot/encode-slot {:version 2})]
+                      [:delete reindex/STATE-KEY]])]
+      (fj/commit-raw! target ops) (fj/sync! target)
+      proof))))))
