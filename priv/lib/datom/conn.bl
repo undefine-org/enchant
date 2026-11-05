@@ -98,16 +98,61 @@
 ; ids in a datom, the same reason Datomic partitions its id space.
 (def FIRST-TX 1000000)
 
+(defn- refuse-counter! [counter reason]
+ (throw (ex-info "Datom counter metadata requires offline inventory before writes"
+          {:kind :invalid-store-counter :counter counter :reason reason
+           :action :offline-counter-inventory-required})))
+
+(defn- checked-counter-value! [counter value minimum]
+ (when (and (some? value)
+            (not (and (erlang/is_integer value) (>= value minimum))))
+  (refuse-counter! counter :invalid-value))
+ value)
+
+(defn- read-counter! [store key counter minimum]
+ (let [value (datom.store/-get store key)]
+  (if (and (nil? value) (datom.store/entry-present? store key))
+   ;; A concurrent initializer may have installed a valid counter after the
+   ;; first read. Reconcile that publication before diagnosing stored nil.
+   (let [fresh (datom.store/-get store key)]
+    (when (nil? fresh) (refuse-counter! counter :stored-nil))
+    (checked-counter-value! counter fresh minimum))
+   (checked-counter-value! counter value minimum))))
+
+(defn- recover-tx-counter! [store]
+ (let [tx (read-counter! store TX-COUNTER-KEY :transaction (- FIRST-TX 1))
+       _ (read-counter! store ENTITY-COUNTER-KEY :entity 0)]
+  (if (some? tx) tx
+   (let [lo (erlang/list_to_binary (list datom.index/IDX-EAVT))
+         hi (datom.index/prefix-end lo)
+         counted (datom.store/count-range store lo hi 1)
+         facts? (if (some? counted) (pos? (:count counted))
+                    (seq (datom.store/-range store lo hi)))]
+    (when facts?
+     ;; Writer initialization can race this read-only recovery. A committed
+     ;; history requires an authoritative transaction high-water mark; never
+     ;; guess it from surviving facts, which can omit excised or failed turns.
+     (or (read-counter! store TX-COUNTER-KEY :transaction (- FIRST-TX 1))
+         (refuse-counter! :transaction :missing)))))))
+
 (defn- next-entity-id
   [store]
   (get (datom.store/-update store ENTITY-COUNTER-KEY
-                            (fn [cur] (if (nil? cur) 1 (inc cur))))
+                            (fn [cur]
+                             (checked-counter-value! :entity cur 0)
+                             (if (nil? cur) 1 (inc cur))))
        1))
 
 (defn- next-tx-id
-  [store]
+  [store basis]
   (get (datom.store/-update store TX-COUNTER-KEY
-                            (fn [cur] (if (nil? cur) FIRST-TX (inc cur))))
+                            (fn [cur]
+                             (checked-counter-value! :transaction cur (- FIRST-TX 1))
+                             (when (and (>= basis FIRST-TX) (nil? cur))
+                              (refuse-counter! :transaction :missing))
+                             (when (and (some? cur) (< cur basis))
+                              (refuse-counter! :transaction :regressed))
+                             (if (nil? cur) FIRST-TX (inc cur))))
        1))
 
 ;; ── the connection ──────────────────────────────────────────────────
@@ -657,7 +702,7 @@
          ; new writes reused transaction ids that already existed — and
          ; a datom key ends in `[... tx op]`, so a colliding tx silently
          ; overwrites a different datom.
-         existing-tx (datom.store/-get store TX-COUNTER-KEY)
+         existing-tx (recover-tx-counter! store)
          basis (if (nil? existing-tx) (- FIRST-TX 1) existing-tx)
          ; Schema lives in the store as datoms, so it comes back the same
          ; way. Definitions passed in are installed ON TOP, which is what
@@ -1344,7 +1389,7 @@
             ; invalidate anything. A tx with no datoms is a harmless gap in the
             ; log — ids are a counter, and a reader that scans by tx simply finds
             ; nothing there.
-            tx (next-tx-id store)
+            tx (next-tx-id store @(:basis conn))
             ; The attributes that LOST datoms, read off the raw datoms rather
             ; than assumed from the specs: `[:entity e]` names an entity, not its
             ; attributes, and which indexes an attribute maintains is the
@@ -2335,7 +2380,7 @@
                              expanded0))]
     (if (seq problems)
       (throw (ex-info "transaction rejected by schema" {:problems problems}))
-      (let [tx (next-tx-id store)
+      (let [tx (next-tx-id store (datom.db/basis-t db-before))
             ; The transaction REIFIES: it is an entity, and it records
             ; when it happened. That single datom is what lets a query
             ; ask `what changed on Tuesday?` rather than only `what
@@ -2456,7 +2501,7 @@
         schema (deref (:schema conn))
         db-before (db conn)
         _ (native-schema-journal-forms! store db-before tx-data)
-        tx (next-tx-id store)
+        tx (next-tx-id store (datom.db/basis-t db-before))
         instant [:db/add tx :db/txInstant (erlang/system_time :millisecond)]
         datoms (datom.tx/realize-fresh tx (conj (datom.tx/expand schema tx-data) instant))]
     ; One atomic commit for every index of every datom, exactly as the

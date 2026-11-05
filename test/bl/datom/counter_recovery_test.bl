@@ -1,0 +1,68 @@
+(ns datom.counter-recovery-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.index :as index]
+           [datom.schema :as schema] [datom.store :as s]
+           [datom.store-ets :as se] [datom.store-map :as sm] [datom.store-fjall :as fj]))
+
+(defn refusal [compute] (try (compute) nil (catch error (ex-data error))))
+(defn raw-fact! [st]
+ (index/write-datoms st (schema/empty-schema) [[42 :db/doc "retained" conn/FIRST-TX true]]))
+
+(deftest existing-history-without-a-transaction-counter-is-not-a-fresh-database
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (let [st (open) opened (atom nil)]
+   (try
+    (s/-put st conn/ENTITY-COUNTER-KEY 1000)
+    (raw-fact! st)
+    (let [before (vec (s/-range st nil nil))
+          error (refusal #(reset! opened (conn/connect-with st [])))]
+     (is (= :invalid-store-counter (:kind error)))
+     (is (= :transaction (:counter error)))
+     (is (= :missing (:reason error)))
+     (is (= before (vec (s/-range st nil nil)))))
+    (finally (when @opened (d/close! @opened)) (s/close st))))))
+
+(deftest malformed-counter-values-refuse-before-initialization
+ (doseq [[key good] [[conn/TX-COUNTER-KEY conn/FIRST-TX] [conn/ENTITY-COUNTER-KEY 10]]]
+  (doseq [bad [nil false -1 1.0 "private-counter-payload"]]
+   (let [st (se/open) opened (atom nil)]
+    (try
+     (s/-put st conn/TX-COUNTER-KEY conn/FIRST-TX)
+     (s/-put st conn/ENTITY-COUNTER-KEY 10)
+     (s/-put st key bad)
+     (let [before (vec (s/-range st nil nil))
+           error (refusal #(reset! opened (conn/connect-with st [])))]
+      (is (= :invalid-store-counter (:kind error)))
+      (is (not (String/contains? (pr-str error) "private-counter-payload")))
+      (is (= before (vec (s/-range st nil nil)))))
+     (finally (when @opened (d/close! @opened)) (s/close st)))))))
+
+(deftest valid-high-water-gaps-are-preserved-and-unused-entity-allocators-remain-valid
+ (doseq [open [se/open sm/open fj/open-fresh]]
+  (let [st (open)]
+   (try
+    (s/-put st conn/TX-COUNTER-KEY (+ conn/FIRST-TX 100))
+    (raw-fact! st)
+    (let [c (conn/connect-with st [])]
+     (try
+      (is (= (+ conn/FIRST-TX 100) (d/basis-t (d/db c))))
+      (is (= #{["retained"]} (d/q '[:find ?v :where [_ :db/doc ?v]] (d/db c))))
+      (is (nil? (s/-get st conn/ENTITY-COUNTER-KEY)))
+      (is (= (+ conn/FIRST-TX 100) (s/-get st conn/TX-COUNTER-KEY)))
+      (finally (d/close! c))))
+    (finally (s/close st))))))
+
+(deftest a-live-writer-refuses-to-rewind-a-missing-or-regressed-transaction-counter
+ (doseq [missing? [true false]]
+  (let [st (se/open) c (d/connect-with st [])]
+   (try
+    (d/transact! c [[:db/add 42 :db/doc "before"]])
+    (let [basis (d/basis-t (d/db c))]
+     (if missing? (s/-delete st conn/TX-COUNTER-KEY)
+                  (s/-put st conn/TX-COUNTER-KEY (- basis 1)))
+     (let [before (vec (s/-range st nil nil))
+           error (refusal #(d/transact! c [[:db/add 42 :db/doc "after"]]))]
+      (is (= :invalid-store-counter (:kind error)))
+      (is (= :transaction (:counter error)))
+      (is (= basis (d/basis-t (d/db c))))
+      (is (= before (vec (s/-range st nil nil))))))
+    (finally (d/close! c) (s/close st))))))
