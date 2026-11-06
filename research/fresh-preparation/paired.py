@@ -1,0 +1,30 @@
+"""Fresh-process preparation controls on an unchanged complete SDK catalog.
+
+The candidate modules are development artifacts loaded after boot; results
+qualify performance/output equivalence only. Native production qualification
+must separately build and judge the candidate compiler through Source.
+"""
+import argparse,hashlib,json,os,pathlib,subprocess,time,statistics
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--root',type=pathlib.Path,required=True);p.add_argument('--out',type=pathlib.Path,required=True)
+a=p.parse_args();root=a.root.resolve();out=a.out.resolve();out.mkdir(parents=True,exist_ok=False)
+r={'status':'running','scope':__doc__,'runs':[]}
+def save():(out/'results.json').write_text(json.dumps(r,indent=2)+'\n')
+def inventory(directory):return {str(p.relative_to(directory)):hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
+reference=inventory(root/'.local/fresh-profile-snapshot');assert reference
+try:
+ for pair in range(3):
+  for variant in (['before','after'] if pair%2==0 else ['after','before']):
+   name=f'{pair}-{variant}';target=out/name;env=dict(os.environ,PERF_TRACE='0',PERF_USE_CANDIDATE=str(int(variant=='after')),PERF_OUT=str(target))
+   started=time.monotonic()
+   with (out/(name+'.log')).open('w') as log:
+    run=subprocess.run([str(root/'bin/bl'),'--cold','run','.local/probe.bl'],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=180)
+   rows=[json.loads(x.split(' ',1)[1]) for x in (out/(name+'.log')).read_text().splitlines() if x.startswith('PREPARATION ')]
+   row={'pair':pair,'variant':variant,'exit':run.returncode,'wall_seconds':time.monotonic()-started,'units':rows,'prepare_seconds':sum(x['prepare-us'] for x in rows)/1e6,'emit_seconds':sum(x['emit-us'] for x in rows)/1e6}
+   r['runs'].append(row);save();assert run.returncode==0
+   assert len(rows)==6 and inventory(target)==reference
+   row['byte_identical_files']=len(reference);print(json.dumps(row),flush=True);save()
+ for v in ('before','after'):
+  rows=[x for x in r['runs'] if x['variant']==v];r[v]={k:{'median':statistics.median([x[k] for x in rows]),'min':min(x[k] for x in rows),'max':max(x[k] for x in rows)} for k in ('wall_seconds','prepare_seconds','emit_seconds')}
+ r['status']='passed'
+finally:save()

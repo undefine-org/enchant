@@ -1,0 +1,34 @@
+(ns tooling.fresh-preparation-probe)
+(when (= "1" (System/get_env "PERF_USE_CANDIDATE"))
+ (Code/eval_string "for m <- [BeamLisp.Loader,BeamLisp.AOT] do p=Path.join(System.fetch_env!(\"PERF_COMPILED\"),Atom.to_string(m) <> \".beam\"); {:module,^m}=:code.load_binary(m,String.to_charlist(p),File.read!(p)) end"))
+(let [root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))
+      metadata (Jason/decode! (File/read! (Path/join (System/fetch_env! "BL_SDK_PRODUCT") "artifact.json")))
+      index (get (Jason/decode! (File/read! (Path/join (get metadata "image") "unit-store/unit-index.json"))) "units")
+      names (String/split (System/fetch_env! "PERF_NAMES") ",")
+      destination (System/fetch_env! "PERF_OUT")
+      trace? (= "1" (System/get_env "PERF_TRACE"))]
+ (File/mkdir_p! destination)
+ (when trace?
+  (Code/eval_string "patterns = [{BeamLisp.Reader,:read_string,2},{BeamLisp.AOT,:constructor_unit!,1},{BeamLisp.AOT,:constructor_source_definitions,1},{BeamLisp.AOT,:constructor_source_declarations,1},{BeamLisp.AOT,:constructor_context,0},{BeamLisp.AOT,:constructor_metadata,2},{BeamLisp.AOT,:constructor_install_kernel!,0},{BeamLisp.AOT,:constructor_kernel_phase_state!,0},{BeamLisp.AOT,:stage_requires,1},{BeamLisp.AOT,:\"stage-sdk-unit!\",2},{BeamLisp.AOT,:artifact_inputs_valid!,2},{BeamLisp.AOT,:constructor_check_sources!,0},{BeamLisp.AOT,:ns_closure_hash,1},{BeamLisp.Loader,:read_forms,2}]; Process.put(:perf_patterns,patterns); for p <- patterns, do: :erlang.trace_pattern(p,true,[:local,:call_time]); :erlang.trace(:all,true,[:call,:silent])"))
+ (BeamLisp.AOT/with_source_snapshot
+  (fn []
+ (doseq [namespace names]
+  (let [path (Path/join root (get-in index [namespace "file"]))
+        workspace (BeamLisp.AOT/open_workspace
+                   {:version 2 :phase-imports (list 'core 'sugar) :roots (list root)
+                    :sources (list {:namespace (symbol namespace) :file path})} {})
+        started (erlang/monotonic_time :microsecond)]
+   (try
+    (let [prepared (BeamLisp.AOT/prepare_unit workspace (symbol namespace))
+          prepared-at (erlang/monotonic_time :microsecond)
+          emitted (BeamLisp.AOT/emit_unit prepared (Path/join destination namespace))
+          emitted-at (erlang/monotonic_time :microsecond)
+          _ (BeamLisp.AOT/verify_unit (Path/join destination namespace))]
+     (println (str "PREPARATION " (Jason/encode!
+       {:namespace namespace :prepare-us (- prepared-at started) :emit-us (- emitted-at prepared-at)
+        :inputs (count (:inputs prepared)) :modules (count (:modules emitted))}))))
+    (finally (BeamLisp.AOT/close_workspace! workspace)))))
+ ))
+ (when trace?
+  (Code/eval_string ":erlang.trace(:all,false,[:call,:silent]); for {m,f,a}=p <- Process.get(:perf_patterns), {:call_time, rows} = :erlang.trace_info(p,:call_time), is_list(rows), rows != [] do {count,us}=Enum.reduce(rows,{0,0},fn {_,n,s,u},{c,t}->{c+n,t+s*1_000_000+u} end); IO.puts(\"PREPARATION-CALL \" <> Jason.encode!(%{module: inspect(m),function: Atom.to_string(f),arity: a,calls: count,exclusive_us: us})); :erlang.trace_pattern(p,false,[:local,:call_time]) end"))
+ (Code/eval_string "memory=File.read!(\"/proc/self/status\") |> String.split(\"\\n\") |> Enum.filter(&String.starts_with?(&1,[\"VmHWM:\",\"VmRSS:\",\"VmSwap:\"])); IO.puts(\"PREPARATION-MEMORY \" <> Jason.encode!(memory))"))
