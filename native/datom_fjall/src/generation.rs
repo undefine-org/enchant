@@ -31,6 +31,8 @@ struct Activation { version: u8, phase: String, journal_revision: u64, writes_ad
                     candidate_release_id: String, data_version: u16, data_generation: Selection }
 struct Binding { marker: Marker, ready: Ready }
 struct Admission { journal: PathBuf, runtime: String, code: String }
+#[derive(Clone, PartialEq)]
+struct Cohort { code: String, runtime: String }
 pub(crate) struct BlobTier {
     pub(crate) path: PathBuf, pub(crate) parts: Vec<String>,
     pub(crate) directory: Mutex<Option<Arc<Directory>>>,
@@ -77,7 +79,7 @@ pub(crate) struct Owner {
     pub(crate) root: Arc<Directory>, app: Arc<Directory>, marker: Reader, ready: Reader,
     stores: HashMap<PathBuf, Arc<Directory>>, closed: AtomicBool,
     pub(crate) blobs: HashMap<PathBuf, Arc<BlobTier>>,
-    binding: Binding, admission: RwLock<Option<Admission>>,
+    binding: Binding, cohort: RwLock<Option<Cohort>>, admission: RwLock<Option<Admission>>,
     // Store locks drop before either root's explicit custody pin.
     _root_custody: Custody, _app_custody: Custody,
 }
@@ -260,7 +262,7 @@ fn fjall_generation_claim(app: ResourceArc<DirectoryHandle>, root: ResourceArc<D
     app.0.root.pins.fetch_add(1, Ordering::AcqRel);
     root.0.root.pins.fetch_add(1, Ordering::AcqRel);
     let owner = Arc::new(Owner { root: root.0.clone(), app: app.0.clone(), marker, ready: ready_reader, stores, blobs,
-        binding: Binding { marker: descriptor, ready }, admission: RwLock::new(None),
+        binding: Binding { marker: descriptor, ready }, cohort: RwLock::new(None), admission: RwLock::new(None),
         closed: AtomicBool::new(false), _root_custody: Custody(root.0.root.clone()),
         _app_custody: Custody(app.0.root.clone()) });
     owners.insert(root.0.path.clone(), Arc::downgrade(&owner));
@@ -282,54 +284,92 @@ fn fjall_generation_status(handle: ResourceArc<OwnerHandle>) -> NifResult<String
     trusted_directory(&owner.root.path, true).map_err(err)?;
     trusted_file(&owner.marker).map_err(err)?; trusted_file(&owner.ready).map_err(err)?;
     let bound = &owner.binding;
+    let cohort = owner.cohort.read().map_err(err)?;
     let observed = Observation { version: 1, writes_admitted: owner.writable().map_err(err)?,
         data_generation: Selection { version: 1, application: bound.ready.application.clone(),
             writer_root: owner.app.path.to_string_lossy().into_owned(), root: owner.root.path.to_string_lossy().into_owned(),
             generation: bound.marker.generation.clone(), ready: bound.marker.ready.clone(),
             key_format: bound.marker.key_format, data_version: bound.marker.data_version,
-            code: bound.ready.code.clone(), runtime: bound.ready.tool.clone() } };
+            code: cohort.as_ref().map_or_else(|| bound.ready.code.clone(), |c| c.code.clone()),
+            runtime: cohort.as_ref().map_or_else(|| bound.ready.tool.clone(), |c| c.runtime.clone()) } };
     serde_json::to_string(&observed).map_err(err)
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn fjall_generation_admit(handle: ResourceArc<OwnerHandle>, journal: ResourceArc<DirectoryHandle>, runtime: String) -> NifResult<bool> {
-    let owner = handle.0.lock().map_err(err)?.clone().ok_or_else(|| err("generation owner closed"))?;
-    owner.check().map_err(err)?; journal.0.check().map_err(err)?;
+fn selected_activation(owner: &Owner, journal: &Arc<Directory>) -> NifResult<(Activation, Reader)> {
+    owner.check().map_err(err)?; journal.check().map_err(err)?;
     // The fixed writer directory determines the ONE journal authority. A
     // stale root-owned journal copied elsewhere is never interchangeable.
     if owner.app.path.file_name().and_then(|p| p.to_str()) != Some("writer")
-        || owner.app.path.parent() != Some(journal.0.path.as_path())
-        || journal.0.path != journal.0.root.path || !digest(&runtime) {
+        || owner.app.path.parent() != Some(journal.path.as_path())
+        || journal.path != journal.root.path {
         return Err(err("generation journal authority mismatch"));
     }
-    trusted_directory(&journal.0.path, false).map_err(err)?;
+    trusted_directory(&journal.path, false).map_err(err)?;
     trusted_directory(&owner.app.path, false).map_err(err)?;
     trusted_directory(&owner.root.path, true).map_err(err)?;
     trusted_file(&owner.marker).map_err(err)?;
     let mut ready = owner.root.open_file("READY.json").map_err(err)?;
     trusted_file(&ready).map_err(err)?;
     let current: Ready = bounded_json(&mut ready, 16 * LIMIT).map_err(err)?;
-    let mut reader = journal.0.open_file("activation.json").map_err(err)?;
+    let mut reader = journal.open_file("activation.json").map_err(err)?;
     trusted_file(&reader).map_err(err)?;
     let record: Activation = bounded_json(&mut reader, LIMIT).map_err(err)?;
     let selected = &record.data_generation;
     let bound = &owner.binding;
     if record.version != 1 || record.journal_revision == 0 || record.journal_revision > i64::MAX as u64
-        || !matches!(record.phase.as_str(), "write-admitted" | "verified") || !record.writes_admitted
+        || !matches!(record.phase.as_str(), "starting" | "read-only-ready" | "write-admitted" | "verified")
         || selected.version != 1 || selected.application != bound.ready.application
         || selected.writer_root != owner.app.path.to_string_lossy() || selected.root != owner.root.path.to_string_lossy()
         || selected.generation != bound.marker.generation || selected.ready != bound.marker.ready
         || selected.key_format != bound.marker.key_format || selected.data_version != bound.marker.data_version
-        || record.data_version != selected.data_version || selected.code != bound.ready.code
-        || record.candidate_release_id != selected.code || selected.runtime != runtime || runtime != bound.ready.tool
+        || record.data_version != selected.data_version
+        || record.candidate_release_id != selected.code || !digest(&selected.code) || !digest(&selected.runtime)
         || current.code != bound.ready.code || current.tool != bound.ready.tool
         || current.generation != bound.marker.generation || current.application != bound.ready.application {
         return Err(err("journal does not durably admit this generation/code/runtime"));
     }
+    Ok((record, reader))
+}
+
+/// Pin the executing cohort from the ONE protected activation journal. READY
+/// remains immutable birth evidence; it does not pin every future compatible
+/// application/runtime to the converter's original code. No write grant here.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_select(handle: ResourceArc<OwnerHandle>, journal: ResourceArc<DirectoryHandle>, runtime: String) -> NifResult<bool> {
+    let owner = handle.0.lock().map_err(err)?.clone().ok_or_else(|| err("generation owner closed"))?;
+    let (record, reader) = selected_activation(&owner, &journal.0)?;
+    if !digest(&runtime) || record.data_generation.runtime != runtime {
+        return Err(err("selected generation requires another runtime cohort"));
+    }
+    let selected = Cohort { code: record.data_generation.code, runtime };
+    let mut cohort = owner.cohort.write().map_err(err)?;
+    if cohort.as_ref().is_some_and(|old| old != &selected) {
+        return Err(err("generation owner cohort is already pinned"));
+    }
+    if owner.admission.read().map_err(err)?.as_ref().is_some_and(|old| old.code != selected.code || old.runtime != selected.runtime) {
+        return Err(err("admitted generation cannot change its running cohort"));
+    }
+    reader.check().map_err(err)?; owner.check().map_err(err)?;
+    *cohort = Some(selected);
+    Ok(true)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_admit(handle: ResourceArc<OwnerHandle>, journal: ResourceArc<DirectoryHandle>, runtime: String) -> NifResult<bool> {
+    let owner = handle.0.lock().map_err(err)?.clone().ok_or_else(|| err("generation owner closed"))?;
+    let (record, reader) = selected_activation(&owner, &journal.0)?;
+    let selected = &record.data_generation;
+    let cohort = owner.cohort.read().map_err(err)?;
+    let code = cohort.as_ref().map_or(&owner.binding.ready.code, |c| &c.code);
+    let expected_runtime = cohort.as_ref().map_or(&owner.binding.ready.tool, |c| &c.runtime);
+    if !matches!(record.phase.as_str(), "write-admitted" | "verified") || !record.writes_admitted
+        || &selected.code != code || &selected.runtime != expected_runtime || selected.runtime != runtime {
+        return Err(err("journal does not durably admit this pinned generation/code/runtime"));
+    }
     // Repeat the actual file+directory flush before publishing the in-memory
     // grant, including reconciliation of a lost host reply. No flag can skip it.
     reader.sync().map_err(err)?; journal.0.file.sync_all().map_err(err)?;
-    ready.check().map_err(err)?; owner.check().map_err(err)?; journal.0.check().map_err(err)?;
+    owner.check().map_err(err)?; journal.0.check().map_err(err)?;
     let mut admission = owner.admission.write().map_err(err)?;
     if let Some(previous) = &*admission {
         if previous.journal != journal.0.path || previous.runtime != runtime || previous.code != selected.code {
