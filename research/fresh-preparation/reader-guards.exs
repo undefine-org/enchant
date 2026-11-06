@@ -4,16 +4,16 @@ if System.get_env("PERF_COMPILED") do
   {:module,^module}=:code.load_binary(module,String.to_charlist(path),File.read!(path))
  end
 end
-root=BeamLisp.AOT.physical_sdk_path(BeamLisp.Tiers.priv_root())
-path=BeamLisp.Loader.source_path("core")
-workspace=BeamLisp.AOT.open_workspace(%{version: 2,"phase-imports": [{:symbol,"core"},{:symbol,"sugar"}],roots: [root],sources: [%{namespace: {:symbol,"core"},file: path}]},%{})
+root=Path.join(System.get_env("BL_TEST_SOURCE_ROOT") || BeamLisp.cwd(),"test/fixtures/artifact-production")
+path=Path.join(root,"artifact/demo/values.bl")
+workspace=BeamLisp.AOT.open_workspace(%{version: 2,"phase-imports": [{:symbol,"core"},{:symbol,"sugar"}],roots: [root],sources: [%{namespace: {:symbol,"artifact.demo.values"},file: path}]},%{})
 w=Process.get({:bl_artifact_workspace,workspace})
 previous=BeamLisp.Env.capture();context=Process.get(:bl_sdk_constructor_context);view=BeamLisp.Env.fork(:global)
 check=fn condition,message -> if not condition,do: raise(message) end
 before_count=fn -> elem(:erlang.trace_info({BeamLisp.Ns.Reader,:read_string,2},:call_count),1) end
 try do
  BeamLisp.Loader.without_initialization(fn -> BeamLisp.Env.with_env(view,fn ->
-  Process.put(:bl_sdk_constructor_context,%{input: w.inputs["core"],"compiler-env": view,"artifact-workspace": workspace,"artifact-inputs": w.inputs,"phase-imports": w[:"phase-imports"],"phase-aware": true,units: %{},compiled: %{},compiling: BeamLisp.Set.new([]),clauses: %{},"seen-macros": BeamLisp.Set.new([]),"kernel-modules": BeamLisp.Set.new([]),"kernel-leases": [],"macro-steps": 16384,"new-atoms": 128,expanded: 0})
+  Process.put(:bl_sdk_constructor_context,%{input: w.inputs["artifact.demo.values"],"compiler-env": view,"artifact-workspace": workspace,"artifact-inputs": w.inputs,"phase-imports": w[:"phase-imports"],"phase-aware": true,units: %{},compiled: %{},compiling: BeamLisp.Set.new([]),clauses: %{},"seen-macros": BeamLisp.Set.new([]),"kernel-modules": BeamLisp.Set.new([]),"kernel-leases": [],"macro-steps": 16384,"new-atoms": 128,expanded: 0})
   BeamLisp.AOT.constructor_install_kernel!();BeamLisp.AOT.constructor_kernel_phase_state!()
   :erlang.trace_pattern({BeamLisp.Ns.Reader,:read_string,2},true,[:local,:call_count])
   BeamLisp.AOT.with_source_snapshot(fn ->
