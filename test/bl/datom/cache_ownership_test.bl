@@ -74,11 +74,17 @@
   (when (not (contains? #{0 73} status)) (throw {:probe-failed result}))
   (= 0 status)))
 
-(defn await-unlocked [path attempts]
- (erlang/garbage_collect)
- (if (os-lock-available? path) true
-  (if (zero? attempts) false
-   (do (Process/sleep 50) (await-unlocked path (dec attempts))))))
+(defn await-unlocked [path timeout-ms]
+ ;; Process DOWN precedes final native resource collection/engine teardown.
+ ;; Bound actual kernel-lock release by wall time; a retained cache key still
+ ;; fails this probe regardless of same-process claim sharing.
+ (let [deadline (+ (System/monotonic_time :millisecond) timeout-ms)]
+  (loop []
+   (erlang/garbage_collect)
+   (cond
+    (os-lock-available? path) true
+    (>= (System/monotonic_time :millisecond) deadline) false
+    :else (do (Process/sleep 50) (recur))))))
 
 (defn reopen [path attempts]
  (try (let [s (fjall/open path) marker (:vec (marks/durable-marks-of s))]
@@ -120,7 +126,10 @@
      (is (Process/alive? (ets/info :datom_attr_basis :owner)))
      (is (every? (fn [row] (some? (cache/footprint (elem row 0))))
                   (ets/tab2list :datom_corpus_cache)))
-     (is (await-unlocked path 40) "another OS process can acquire the directory lock")
+     (let [started (System/monotonic_time :millisecond)
+           unlocked (await-unlocked path 10000)]
+      (println "native-cache-retirement" {:unlocked unlocked :milliseconds (- (System/monotonic_time :millisecond) started)})
+      (is unlocked "another OS process can acquire the directory lock within the teardown deadline"))
      (is (reopen path 40) "a released database is reopenable while both caches survive")
      (finally
       (when (Process/alive? child) (Process/exit child :kill))
