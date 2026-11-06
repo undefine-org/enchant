@@ -11,7 +11,7 @@ import urllib.request
 
 candidate, worker, parent = map(Path, sys.argv[1:4])
 mode = sys.argv[4] if len(sys.argv) == 5 else 'admit'
-assert mode in ('admit', 'boot', 'incompatible')
+assert mode in ('admit', 'boot', 'incompatible', 'mismatch')
 assert os.getuid() == 0, "This fixture is for the bounded root VM only"
 assert parent.parent == Path('/tmp') and parent.name.endswith('.nonroot-admission')
 uid = gid = 65534
@@ -56,6 +56,8 @@ if mode != 'admit':
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
     arguments.append(str(port))
+    if mode == 'mismatch':
+        arguments.append('mismatch')
 child = subprocess.Popen(arguments,
                          cwd=sandbox, env=env, preexec_fn=drop_identity,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -93,9 +95,11 @@ try:
         output = 'NONROOT-GENERATION-BOOTSTRAPPED\n'
     else:
         output, _ = child.communicate(timeout=90)
-        if mode == 'incompatible':
+        if mode in ('incompatible', 'mismatch'):
             assert child.returncode != 0, output
-            assert 'Selected runtime cannot serve this index format' in output, output
+            expected = ('Selected runtime cannot serve this index format' if mode == 'incompatible'
+                        else 'Selected generation requires another release')
+            assert expected in output, output
             assert not (sandbox / 'application-loaded').exists()
             assert not (sandbox / 'initialized').exists()
             output += 'NONROOT-GENERATION-BOOT-REFUSED\n'
