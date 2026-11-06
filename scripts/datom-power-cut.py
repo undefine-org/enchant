@@ -11,6 +11,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--qemu', required=True)
     parser.add_argument('--virtiofsd', required=True)
+    parser.add_argument('--boundaries', nargs='+', default=['converting', 'store-complete', 'ready', 'renamed'])
+    parser.add_argument('--label', default='DATOM-POWER')
     parser.add_argument('qemu_args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     # Replacing vmTools' launcher must retain hardware acceleration. Never
@@ -23,9 +25,9 @@ def main():
                   .replace('path=virtio-xchg.sock', 'path=crash-xchg.sock') for arg in command]
     assert any('cache=writeback,format=raw' in arg for arg in command)
     cuts = []
-    for boundary in ('converting', 'store-complete', 'ready', 'renamed'):
+    for boundary in args.boundaries:
         for operation in ('prepare', 'recover'):
-            print('DATOM-POWER', boundary, operation, flush=True)
+            print(args.label, boundary, operation, flush=True)
             Path('xchg/power-stage').write_text(operation + ' ' + boundary + '\n')
             for name in ('xchg/power-ack', 'xchg/in-vm-exit', 'crash-store.sock', 'crash-xchg.sock'):
                 Path(name).unlink(missing_ok=True)
