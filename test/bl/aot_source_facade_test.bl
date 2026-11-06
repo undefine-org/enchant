@@ -1,0 +1,59 @@
+(ns aot-source-facade-test)
+
+(defn- fixture [facade binding action]
+ (let [root (str (System/tmp_dir!) "/source-facade-" (System/unique_integer (list :positive)))
+       marker (str root "/initialized")
+       rows (mapv (fn [[namespace file source]]
+                    (let [path (str root "/" file)]
+                     (File/write! path source)
+                     {:namespace namespace :file path}))
+              (do (File/mkdir_p! root)
+               [['artifact.facade.provider "provider.bl"
+                 (str "(ns artifact.facade.provider) (File/write! " (pr-str marker) " \"bad\") "
+                      "(defn answer [x] x) (defn- hidden [x] 99)")]
+                ['artifact.facade.exports "exports.bl" facade]
+                ['artifact.facade.consumer "consumer.bl"
+                 (str "(ns artifact.facade.consumer (:require [artifact.facade.exports :as api])) (defn result [] (api/" binding " 42))")]]))
+       workspace (BeamLisp.AOT/open_workspace
+                   {:version 2 :phase-imports (list 'core 'sugar) :roots (list root) :sources (to-list rows)} {})
+       before (BeamLisp.Env/capture)]
+  (try
+   (action workspace)
+   (is (= before (BeamLisp.Env/capture)))
+   (is (not (File/exists? marker)))
+   (is (not (BeamLisp.Env/loaded_ns? "artifact.facade.provider")))
+   (finally (BeamLisp.AOT/close_workspace! workspace) (File/rm_rf! root)))))
+
+(deftest selected-source-refers-prove-facade-declarations-without-initialization
+ (doseq [refer [":all" "[answer]"]]
+  (fixture (str "(ns artifact.facade.exports (:require [artifact.facade.provider :refer " refer "]))") "answer"
+   (fn [workspace]
+    (let [prepared (BeamLisp.AOT/prepare_unit workspace 'artifact.facade.consumer)]
+     (is (= :prepared-artifact-unit (:kind prepared)))
+     (is (contains? (:inputs prepared) "artifact.facade.provider"))
+     (is (contains? (:inputs prepared) "artifact.facade.exports"))
+     (is (seq (get-in (BeamLisp.AOT/compile_unit prepared) [:manifest :modules]))))))))
+
+(deftest a-private-referred-binding-is-still-private
+ (fixture "(ns artifact.facade.exports (:require [artifact.facade.provider :refer [hidden]]))" "hidden"
+  (fn [workspace]
+   (let [message (try (BeamLisp.AOT/prepare_unit workspace 'artifact.facade.consumer) "unexpected-success"
+                  (catch error (ex-message error)))]
+    (is (String/contains? message "not public") message)))))
+
+(deftest inherited-runtime-refers-cannot-authorize-an-undeclared-facade-name
+ (BeamLisp.Env/as_thunk
+  (fn []
+   (BeamLisp.Env/add_refer "artifact.facade.exports" "answer" "artifact.facade.provider")
+   (fixture "(ns artifact.facade.exports)" "answer"
+    (fn [workspace]
+     (let [message (try (BeamLisp.AOT/prepare_unit workspace 'artifact.facade.consumer) "unexpected-success"
+                    (catch error (ex-message error)))]
+      (is (String/contains? message "metadata is unavailable") message)))))))
+
+(deftest checked-generated-private-locals-shadow-public-refers
+ (fixture "(ns artifact.facade.exports (:require [artifact.facade.provider :refer [answer]])) (defmacro make [] '(defn- answer [x] x)) (make)" "answer"
+  (fn [workspace]
+   (let [message (try (BeamLisp.AOT/prepare_unit workspace 'artifact.facade.consumer) "unexpected-success"
+                  (catch error (ex-message error)))]
+    (is (String/contains? message "not public") message)))))
