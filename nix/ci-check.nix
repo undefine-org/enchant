@@ -1,6 +1,6 @@
 # Execute a finite check where the retained SDK lives; return only receipts.
 # Existing SDK selection is optional. The default uses the ordinary SDK recipe.
-{ source, request, sdk ? null, previous ? null, models ? null, memoryMiB ? 6144, cpuCount ? 2 }:
+{ source, request, sdk ? null, previous ? null, compatSdk ? null, models ? null, memoryMiB ? 6144, cpuCount ? 2 }:
 let
   root = /. + source;
   roots = builtins.filter (name: builtins.pathExists (root + "/${name}")) [
@@ -48,6 +48,14 @@ let
     import (builtins.storePath sdkMetadata.platform + "/artifact-platform/nix/portable-artifact.nix") {
       sdk = toString selection;
     };
+  compatSelection = if compatSdk == null then null else builtins.storePath compatSdk;
+  compatMetadata = if compatSelection == null then null else builtins.fromJSON
+    (builtins.unsafeDiscardStringContext (builtins.readFile (compatSelection + "/artifact.json")));
+  compatRelease = if compatSelection == null then null else
+    if compatMetadata ? release then builtins.storePath compatMetadata.release else
+    import (builtins.storePath compatMetadata.platform + "/artifact-platform/nix/portable-artifact.nix") {
+      sdk = toString compatSelection;
+    };
   bounded = import ./bounded-build.nix { inherit pkgs memoryMiB cpuCount; diskMiB = 24576; commandManager = true; };
 in bounded (pkgs.runCommand "beam-lisp-ci-check" {
   __structuredAttrs = true;
@@ -68,6 +76,10 @@ in bounded (pkgs.runCommand "beam-lisp-ci-check" {
   export ELIXIR_ERL_OPTIONS='+fnu +S ${toString cpuCount}:${toString cpuCount} +SDcpu 1:1 +SDio 1:1'
   export HOME=/build/home GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
   export CI_CHECK_RELEASE=${release}
+  ${pkgs.lib.optionalString (compatRelease != null) ''
+    export CI_CHECK_COMPAT_RELEASE=${compatRelease}
+    export CI_CHECK_COMPAT_SDK=${compatSelection}
+  ''}
   export CI_CHECK_SDK_RETAINED=${if sdk == null then "0" else "1"}
   ${pkgs.lib.optionalString (models != null) ''
     export BEAM_LISP_MODEL_DIR=${builtins.storePath models}

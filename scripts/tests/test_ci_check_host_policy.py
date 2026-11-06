@@ -35,7 +35,7 @@ receipt.update({name: '0' * 64 for name in ['sdk_descriptor_sha256', 'candidate_
             capture = base / 'nix-argv.json'
             env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'], CHECK_CAPTURE=str(capture),
                        NIX_CONFIG='builders = ssh://provider.example.invalid x86_64-linux\nmax-jobs = 0\n')
-            for index, (flags, expected) in enumerate((([], None), (['--local'], '1'), (['--remote'], '0'))):
+            for index, (flags, expected) in enumerate((([], None), (['--local'], '1'), (['--remote'], '0'), (['--remote', '--compat-sdk', str(source)], '0'))):
                 with self.subTest(flags=flags):
                     out = base / str(index)
                     subprocess.run([str(ROOT / 'scripts/ci-check'), *flags, '--source', str(source),
@@ -48,3 +48,6 @@ receipt.update({name: '0' * 64 for name in ['sdk_descriptor_sha256', 'candidate_
                         self.assertEqual(expected, argv[argv.index('--max-jobs') + 1])
                     self.assertIn('--out-link', argv)
                     self.assertNotIn('builders', argv)
+                    if '--compat-sdk' in flags:
+                        self.assertEqual(str(source.resolve()), argv[argv.index('compatSdk') + 1])
+                        self.assertNotIn('previous', argv)
