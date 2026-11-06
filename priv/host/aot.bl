@@ -7124,51 +7124,65 @@
     cost))))
 
 (defn- constructor_internal_cost_uncached! [value state]
- ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
- ;; internal capabilities; source literal/input endpoints reject them. Captured
- ;; environments are charged independently when each capability is constructed.
- (loop [pending (list (tuple value 0)) nodes 0 bytes 0]
-  (if (= (list) pending) {:nodes nodes :bytes bytes}
-   (let [task (erlang/hd pending) v (elem task 0) depth (elem task 1)
-         rest-tasks (erlang/tl pending) nodes (inc nodes)
-         bytes (+ bytes (cond (erlang/is_binary v) (erlang/byte_size v)
-                               (erlang/is_number v) (erlang/external_size v)
-                               (erlang/is_atom v) (erlang/byte_size (erlang/atom_to_binary v :utf8))
-                               :else 0))]
-    (constructor_walk_step! state)
-    (when (> depth 128) (constructor_refuse :data-depth-budget))
-    (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
-    (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
-    (cond
-     (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_binary v) (erlang/is_function v))
-      (recur rest-tasks nodes bytes)
-     (erlang/is_list v)
-      (if (= (list) v) (recur rest-tasks nodes bytes)
-       (recur (cons (tuple (erlang/hd v) (inc depth))
-                    (cons (tuple (erlang/tl v) depth) rest-tasks)) nodes bytes))
-     (erlang/is_tuple v)
-      (do (when (> (erlang/tuple_size v) 65536) (constructor_refuse :aggregate-node-budget))
-          (recur (Enum/reduce (erlang/tuple_to_list v) rest-tasks
-                   (fn [item acc] (cons (tuple item (inc depth)) acc))) nodes bytes))
-     (constructor_recipe? v state) (recur rest-tasks nodes bytes)
-     (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
-      ;; Validate the canonical container ONCE through its storage-aware raw
-      ;; checker. Its private MapSet/trie storage is not an independent public
-      ;; datum and must not be reclassified as a foreign input container.
-      (let [cost (constructor_container_cost! v state)
-            extra (dec (:nodes cost)) nodes (+ nodes extra) bytes (+ bytes (:bytes cost))]
-       (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
-       (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
-       (constructor_walk_steps! state extra)
-       (recur rest-tasks nodes bytes))
-     (erlang/is_map v)
-      (do (constructor_map_shape! v state)
-          (when (> (erlang/map_size v) 65536) (constructor_refuse :aggregate-node-budget))
-          (recur (Enum/reduce (maps/to_list v) rest-tasks
-                   (fn [pair acc]
-                    (cons (tuple (elem pair 0) (inc depth))
-                          (cons (tuple (elem pair 1) (inc depth)) acc)))) nodes bytes))
-     :else (constructor_refuse :opaque-internal-value))))))
+ ;; Preserve the raw walk's order, costs, fuel and refusals. Recursive native
+ ;; traversal needs no generic cons/tuple task construction for every node.
+ (let [cost (constructor_internal_cost_walk! value state 0 0 0)]
+  {:nodes (erlang/element 1 cost) :bytes (erlang/element 2 cost)}))
+
+(defn- constructor_internal_cost_pair [nodes bytes]
+ (erlang/setelement 2 (erlang/make_tuple 2 nodes) bytes))
+
+(defn- constructor_internal_cost_walk! [value state depth prior-nodes prior-bytes]
+ (let [nodes (erlang/+ prior-nodes 1)
+       bytes (erlang/+ prior-bytes
+               (cond (erlang/is_binary value) (erlang/byte_size value)
+                     (erlang/is_number value) (erlang/external_size value)
+                     (erlang/is_atom value) (erlang/byte_size (erlang/atom_to_binary value :utf8))
+                     :else 0))]
+  (constructor_walk_step! state)
+  (when (erlang/> depth 128) (constructor_refuse :data-depth-budget))
+  (when (erlang/> nodes 65536) (constructor_refuse :aggregate-node-budget))
+  (when (erlang/> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+  (cond
+   (or (erlang/is_atom value) (erlang/is_number value) (erlang/is_binary value) (erlang/is_function value))
+   (constructor_internal_cost_pair nodes bytes)
+   (erlang/is_list value)
+   (if (erlang/== () value) (constructor_internal_cost_pair nodes bytes)
+    (let [head (constructor_internal_cost_walk! (erlang/hd value) state (erlang/+ depth 1) nodes bytes)]
+     (constructor_internal_cost_walk! (erlang/tl value) state depth
+       (erlang/element 1 head) (erlang/element 2 head))))
+   (erlang/is_tuple value)
+   (let [size (erlang/tuple_size value)]
+    (when (erlang/> size 65536) (constructor_refuse :aggregate-node-budget))
+    ;; The former pending-stack reduce visited the last tuple field first.
+    (loop [index size nodes nodes bytes bytes]
+     (if (erlang/== index 0) (constructor_internal_cost_pair nodes bytes)
+      (let [cost (constructor_internal_cost_walk! (erlang/element index value) state
+                    (erlang/+ depth 1) nodes bytes)]
+       (recur (erlang/- index 1) (erlang/element 1 cost) (erlang/element 2 cost))))))
+   (constructor_recipe? value state) (constructor_internal_cost_pair nodes bytes)
+   (and (erlang/is_map value) (erlang/is_map_key :__struct__ value))
+   (let [cost (constructor_container_cost! value state)
+         extra (erlang/- (:nodes cost) 1)
+         nodes (erlang/+ nodes extra) bytes (erlang/+ bytes (:bytes cost))]
+    (when (erlang/> nodes 65536) (constructor_refuse :aggregate-node-budget))
+    (when (erlang/> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+    (constructor_walk_steps! state extra)
+    (constructor_internal_cost_pair nodes bytes))
+   (erlang/is_map value)
+   (do
+    (constructor_map_shape! value state)
+    (when (erlang/> (erlang/map_size value) 65536) (constructor_refuse :aggregate-node-budget))
+    ;; Likewise retain reverse maps/to_list order, key before value.
+    (loop [pairs (lists/reverse (maps/to_list value)) nodes nodes bytes bytes]
+     (if (erlang/== pairs ()) (constructor_internal_cost_pair nodes bytes)
+      (let [pair (erlang/hd pairs)
+            key-cost (constructor_internal_cost_walk! (erlang/element 1 pair) state
+                       (erlang/+ depth 1) nodes bytes)
+            val-cost (constructor_internal_cost_walk! (erlang/element 2 pair) state
+                       (erlang/+ depth 1) (erlang/element 1 key-cost) (erlang/element 2 key-cost))]
+       (recur (erlang/tl pairs) (erlang/element 1 val-cost) (erlang/element 2 val-cost))))))
+   :else (constructor_refuse :opaque-internal-value))))
 
 (defn- constructor_charge! [value state]
  (let [cost (constructor_internal_cost! value state)]
