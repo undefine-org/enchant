@@ -3,7 +3,7 @@
 (ns datom.generation
  (:require [datom.offline.fs :as fs] [datom.offline.journal :as journal]
            [datom.offline.manifest :as manifest] [datom.offline.layout :as l]
-           [datom.offline.tool :as tool]))
+           [datom.offline.tool :as tool] [datom.codec :as codec]))
 (defrecord Owner [handle root app])
 (defn- result! [value]
  (when (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value)) (= :error (elem value 0)))
@@ -51,3 +51,65 @@
    (result! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_admit
                (:handle owner) (:handle journal) (tool/identity!)))
    (finally (fs/close! journal)))))
+
+
+(defn status!
+ "Observe the actual native owner. Copied record paths/flags are not evidence.
+  This is observation only; admit! still requires Foundry's durable decision."
+ [owner]
+ (Jason/decode! (result! (BeamLisp.Native.Datom.StoreFjall/fjall_generation_status (:handle owner)))))
+
+(defn readiness!
+ "Bounded startup identity for the release controller. A format1 SDK cannot
+  report a format2 candidate ready, even when its raw native owner is valid."
+ [owner]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [observed (status! owner) selected (get observed "dataGeneration")
+       admitted (get observed "writesAdmitted") compatible (= codec/INDEX-VERSION (get selected "keyFormat"))]
+  (when-not (= (tool/identity!) (get selected "runtime"))
+   (throw (ex-info "Prepared generation requires its compatible runtime cohort" {:kind :generation-runtime-mismatch})))
+  {"version" 1 "status" (if admitted "write-admitted" (if compatible "read-only-ready" "read-only"))
+   "selection" (l/digest selected) "writesAdmitted" admitted
+   "runtimeKeyFormat" codec/INDEX-VERSION "keyFormat" (get selected "keyFormat")
+   "dataVersion" (get selected "dataVersion") "generation" (get selected "generation")
+   "code" (get selected "code") "runtime" (get selected "runtime")}))
+
+(defn open-selected!
+ "Read the existing activation journal and claim exactly its prepared pair.
+  READY carries the closed storage inventory; no application callback runs and
+  no missing path is created. A grant is never inferred from this return value."
+ [state-dir]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [state (fs/claim! state-dir {:readonly true})
+       record (try
+               (let [raw (journal/read-file state "activation.json" 1048576)]
+                (when-not raw (throw (ex-info "No selected generation" {:kind :generation-selection-required})))
+                (let [info (File/lstat! (str state-dir "/activation.json"))]
+                 (when-not (and (= :regular (:type info)) (= 0 (:uid info))
+                                (zero? (erlang/band (:mode info) 18)))
+                  (throw (ex-info "Unprotected activation record" {:kind :generation-selection-required}))))
+                (Jason/decode! raw))
+               (finally (fs/close! state)))
+       selected (get record "dataGeneration")]
+  (when-not (and (erlang/=:= 1 (get record "version")) (map? selected)
+                 (int? (get record "journalRevision")) (<= 1 (get record "journalRevision") 9223372036854775807)
+                 (or (erlang/=:= false (get record "writesAdmitted")) (erlang/=:= true (get record "writesAdmitted")))
+                 (contains? #{"starting" "read-only-ready" "write-admitted" "verified"} (get record "phase"))
+                 (= (str state-dir "/writer") (get selected "writerRoot")))
+   (throw (ex-info "Activation has no runnable generation selection" {:kind :generation-selection-required})))
+  (let [app (fs/claim! (get selected "writerRoot"))]
+   (try
+    (let [root (fs/claim! (get selected "root"))]
+     (try
+      (let [ready (Jason/decode! (journal/read-file root "READY.json" journal/LIMIT))
+            spec (manifest/from-document! (get ready "storage"))
+            owner (claim! app root (assoc spec :key-format 2))]
+       (try
+        (when-not (and (erlang/=:= selected (get (status! owner) "dataGeneration"))
+                       (= (get record "candidateReleaseId") (get selected "code"))
+                       (erlang/=:= (get record "dataVersion") (get selected "dataVersion")))
+         (throw (ex-info "Actual native generation differs from activation" {:kind :generation-selection-mismatch})))
+        owner
+        (catch error (release! owner) (throw error))))
+      (catch error (fs/close! root) (throw error))))
+    (catch error (fs/close! app) (throw error))))))

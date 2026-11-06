@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak, atomic::{AtomicBool, Ordering}};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MARKER: &str = ".bl-generation";
 const LIMIT: usize = 1048576;
@@ -21,7 +21,7 @@ struct Marker { version: u8, protocol: String, generation: String, ready: String
 #[serde(rename_all = "camelCase")]
 struct Ready { version: u8, protocol: String, application: String, generation: String, code: String,
                tool: String, destination: String, key_format: u8, data_version: u16 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Selection { version: u8, application: String, writer_root: String, root: String, generation: String,
                    ready: String, key_format: u8, data_version: u16, code: String, runtime: String }
@@ -265,6 +265,30 @@ fn fjall_generation_claim(app: ResourceArc<DirectoryHandle>, root: ResourceArc<D
         _app_custody: Custody(app.0.root.clone()) });
     owners.insert(root.0.path.clone(), Arc::downgrade(&owner));
     Ok(ResourceArc::new(OwnerHandle(Mutex::new(Some(owner)))))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Observation { version: u8, data_generation: Selection, writes_admitted: bool }
+
+/// Observation comes from the retained native claims, never an Owner record's
+/// copied paths/flags. It grants no authority and keeps the owner alive while
+/// checking protocol files and the actual native admission latch.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_generation_status(handle: ResourceArc<OwnerHandle>) -> NifResult<String> {
+    let owner = handle.0.lock().map_err(err)?.clone().ok_or_else(|| err("generation owner closed"))?;
+    owner.check().map_err(err)?;
+    trusted_directory(&owner.app.path, false).map_err(err)?;
+    trusted_directory(&owner.root.path, true).map_err(err)?;
+    trusted_file(&owner.marker).map_err(err)?; trusted_file(&owner.ready).map_err(err)?;
+    let bound = &owner.binding;
+    let observed = Observation { version: 1, writes_admitted: owner.writable().map_err(err)?,
+        data_generation: Selection { version: 1, application: bound.ready.application.clone(),
+            writer_root: owner.app.path.to_string_lossy().into_owned(), root: owner.root.path.to_string_lossy().into_owned(),
+            generation: bound.marker.generation.clone(), ready: bound.marker.ready.clone(),
+            key_format: bound.marker.key_format, data_version: bound.marker.data_version,
+            code: bound.ready.code.clone(), runtime: bound.ready.tool.clone() } };
+    serde_json::to_string(&observed).map_err(err)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
