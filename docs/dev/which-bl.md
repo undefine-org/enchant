@@ -12,6 +12,20 @@ producer/checker workflow. Keep experiments in private images and caches.
 Current cutover qualification is recorded in
 [production status](../../research/authoritative-nix-production/STATUS.org).
 
+Qualify a committed revision without rereading the mutable checkout's files:
+
+```sh
+scripts/ci-check-committed --revision main --staging-dir /dev/shm \
+  --sdk /nix/store/EXISTING-beam-lisp-sdk-selection \
+  --out .local/committed-check test/bl/datom/key_format_admission_test.bl
+```
+
+The exporter verifies every file's Git object identity, executable mode and
+complete selected inventory before normal CI capture and frozen-input checks.
+Export filters that omit or rewrite source refuse. Working edits are excluded.
+Staging is private and removed after the check; the source archive is capped at
+512 MiB. Omit `--staging-dir` to use the normal temporary directory.
+
 ## One compiler VM, fresh project code
 
 `./bin/bl` prepares its pinned native transport and prerequisites through Nix.
