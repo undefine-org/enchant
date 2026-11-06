@@ -65,6 +65,8 @@ try:
         deadline = time.monotonic() + 90
         successful = False
         while child.poll() is None and time.monotonic() < deadline:
+            if (parent / 'stop').exists():
+                break
             try:
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}/health/ready', timeout=1) as response:
                     health = json.load(response)
