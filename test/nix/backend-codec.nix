@@ -32,7 +32,7 @@ in bounded (pkgs.runCommand "beam-lisp-backend-codec-check" {} ''
   cp ${inputs}/priv/lib/nix.bl "$image/priv/lib/nix.bl"
   cp ${inputs}/priv/lib/nix/native.bl "$image/priv/lib/nix/native.bl"
   cp ${inputs}/priv/lib/build/backend.bl "$image/priv/lib/build/backend.bl"
-  ln -s ${native}/bl_nix.so "$image/priv/native/bl_nix.so"
+  ln -sfn ${native}/bl_nix.so "$image/priv/native/bl_nix.so"
   cp -a --no-preserve=ownership ${inputs}/. project
   chmod -R u+w project
   export HOME="$TMPDIR/home" XDG_CACHE_HOME="$TMPDIR/home/.cache"
