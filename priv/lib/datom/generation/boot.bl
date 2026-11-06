@@ -1,0 +1,85 @@
+;; Restart bootstrap: no application namespace/initializer before native grant.
+(ns datom.generation.boot
+ (:require [datom.generation :as generation] [datom.offline.manifest :as manifest]
+           [datom.offline.journal :as journal]
+           [datom.store-fjall :as fjall] [datom.store :as store] [datom.key-format :as format]
+           [datom :as d] [web]))
+(defonce ^:private active (atom nil))
+(defn active-readiness
+ "Non-sensitive health identity, checked against the retained native owner."
+ [] (when-let [owner (:owner @active)] (generation/observe! owner)))
+(defn- checked-reference! [reference]
+ ;; Only a sealed qualified reference is accepted, never caller-supplied code.
+ ;; Resolving it after admission also defers the application namespace body.
+ (when-not (and (string? reference)
+                (Regex/match? #"^[a-z][a-z0-9.-]*/[a-z][a-z0-9!?-]*$" reference))
+  (throw (ex-info "Invalid generation application reference" {:kind :generation-start-reference-invalid})))
+ reference)
+(defn- invoke! [reference options]
+ (let [start (BeamLisp/eval (checked-reference! reference))] (start options)))
+(defn- preflight! [owner]
+ (let [ready (Jason/decode! (journal/read-file (:root owner) "READY.json" journal/LIMIT))
+       spec (manifest/from-document! (get ready "storage"))]
+  (doseq [declared (:stores spec)]
+   (let [store (fjall/open (str (:path (:root owner)) "/" (:path declared)))]
+    (try
+     (when-not (erlang/=:= {:version 2} (store/-get store format/KEY))
+      (throw (ex-info "Selected store has no prepared format2 descriptor" {:kind :generation-store-format-invalid})))
+     (when (store/write-admitted? store)
+      (throw (ex-info "Preflight store is already writable" {:kind :generation-preflight-not-readonly})))
+     (finally (store/close store))))) spec))
+(defn- wait-admission! [owner timeout-ms]
+ (let [deadline (+ (System/monotonic_time :millisecond) timeout-ms)]
+  (loop []
+   (when (>= (System/monotonic_time :millisecond) deadline)
+    (throw (ex-info "Timed out awaiting Foundry write admission" {:kind :generation-admission-timeout})))
+   (let [admitted (try (generation/admit! owner)
+                      (catch error
+                       (if (contains? #{:generation-ownership-refused :offline-filesystem-refused} (:kind (ex-data error)))
+                        false (throw error))))]
+    (if admitted true (do (Process/sleep 100) (recur)))))))
+(defn run!
+ "One restart path. Without a selected-generation configuration, invoke the
+  existing application entry. With it, claim/preflight read-only, expose only
+  readiness, await durable admission, then load/initialize the application."
+ [opts]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [state (:state-dir opts) reference (checked-reference! (:start-ref opts)) options (:start-options opts {})]
+  (if (or (nil? state) (= "" state))
+   (invoke! reference options)
+   (do
+    (when @active (throw (ex-info "Generation bootstrap already owns this VM" {:kind :generation-already-started})))
+    (when-not (and (int? (:port opts)) (<= 0 (:port opts) 65535)
+                   (string? (:data-env opts)) (Regex/match? #"^[A-Z][A-Z0-9_]*$" (:data-env opts))
+                   (int? (:timeout-ms opts 120000)) (<= 1 (:timeout-ms opts 120000) 3600000))
+     (throw (ex-info "Invalid generation bootstrap configuration" {:kind :generation-boot-options-invalid})))
+    (let [owner (generation/open-selected! state) spec (preflight! owner)
+          declared (when-let [id (:control-id opts)] (some #(when (= id (:id %)) %) (:stores spec)))
+          _ (when (and (:control-id opts) (nil? declared))
+              (throw (ex-info "Undeclared bootstrap control store" {:kind :generation-control-store-invalid})))
+          ready (generation/readiness! owner)
+          _ (when-not (= "read-only-ready" (get ready "status"))
+              (throw (ex-info "Selected runtime cannot serve this index format" {:kind :generation-runtime-format-incompatible})))
+          _ (reset! active {:owner owner :phase :read-only})
+          listener (web/serve {:port (:port opts) :ip (tuple 127 0 0 1) :log :off
+                     :plug (fn [request]
+                             (if (and (= "GET" (:method request)) (= "/health/ready" (:request_path request)))
+                              (web/json request (generation/readiness! owner))
+                              (web/json request 503 {"status" "starting"})))})]
+     (when-not (= :ok (elem listener 0))
+      (throw (ex-info "Read-only generation listener failed" {:kind :generation-listener-failed})))
+     (try
+      (wait-admission! owner (:timeout-ms opts 120000))
+      (GenServer/stop (elem listener 1) :normal 10000)
+      ;; The data root is chosen from the retained native claims. Scope and
+      ;; the borrowed control connection are fixed before application loading.
+      (let [physical (get-in (generation/status! owner) ["dataGeneration" "root"])
+            _ (System/put_env (:data-env opts) physical)
+            control (when declared (d/connect-with (fjall/open (str physical "/" (:path declared)))))
+            options (cond-> (assoc options :data-root physical)
+                      control (assoc :control-conn control))]
+       (reset! active {:owner owner :control control :phase :initializing})
+       (let [result (invoke! reference options)]
+        (swap! active assoc :phase :running) result))
+      (finally
+       (when (Process/alive? (elem listener 1)) (GenServer/stop (elem listener 1) :normal 10000)))))))))

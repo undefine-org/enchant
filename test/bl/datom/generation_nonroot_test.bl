@@ -1,5 +1,5 @@
 (ns datom.generation-nonroot-test
- (:require [datom.generation :as generation] [datom.offline.root :as root]
+ (:require [datom.generation :as generation] [datom.codec :as codec] [datom.offline.root :as root]
            [datom.offline.fs :as fs] [datom.offline.journal :as journal]
            [datom.offline.layout :as l] [datom.store :as s]))
 (def spec {:version 1 :application "fixture.app" :key-format 2 :data-version 1
@@ -56,3 +56,84 @@
    (is (= 0 (elem result 1)) (elem result 0))
    (is (String/contains? (elem result 0) "NONROOT-GENERATION-ADMITTED")))))
 
+
+
+(deftest selection-opens-the-ready-inventory-and-observes-only-real-native-state
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".selected-generation")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))
+       selected (assoc (activation app root) "phase" "starting" "writesAdmitted" false)]
+  (try
+   (let [state (fs/claim! parent)]
+    (try (fs/group-readable! state 65534) (finally (close state))))
+   (fs/group-readable! app 65534)
+   (save-activation! app selected)
+   (finally (close root) (close app)))
+  (let [owner (generation/open-selected! parent)]
+   (try
+    (let [observed (generation/status! owner) ready (generation/readiness! owner)]
+     (is (= (get selected "dataGeneration") (get observed "dataGeneration")))
+     (is (= false (get observed "writesAdmitted")))
+     (is (= observed (generation/status! (assoc owner :root {} :app {} :writesAdmitted true))))
+     (is (= (l/digest (get selected "dataGeneration")) (get ready "selection")))
+     (is (= codec/INDEX-VERSION (get ready "runtimeKeyFormat")))
+     (is (= (if (= 2 codec/INDEX-VERSION) "read-only-ready" "read-only") (get ready "status"))))
+    (save-activation! (:app owner) (assoc selected "phase" "write-admitted" "writesAdmitted" true "journalRevision" 2))
+    (generation/admit! owner)
+    (is (= true (get (generation/status! owner) "writesAdmitted")))
+    (is (= "write-admitted" (get (generation/readiness! owner) "status")))
+    (finally
+     (generation/release! owner) (close (:root owner)) (close (:app owner)))))
+  (File/rm_rf! parent)))
+
+(defn admit-bootstrap! [parent selected observation]
+ (is (= "read-only-ready" (get observation "status")))
+ (is (= false (get observation "writesAdmitted")))
+ (let [state (fs/claim! parent)]
+  (try
+   (let [before (journal/read-file state "activation.json" 1048576)]
+    (is (= selected (Jason/decode! before)))
+    (fs/put! state "activation.json" before
+     (Jason/encode! (assoc selected "phase" "write-admitted" "writesAdmitted" true "journalRevision" 2))
+     {:read-group 65534}))
+   (finally (close state)))))
+
+(deftest bootstrap-defers-application-loading-and-initialization-until-native-admission
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".nonroot-admission")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))
+       selected (assoc (activation app root) "phase" "starting" "writesAdmitted" false)
+       original (fs/claim! (str parent "/original") {:readonly true})
+       before (try (fs/tree-digest original) (finally (close original)))]
+  (try
+   (let [state (fs/claim! parent)]
+    (try (fs/group-readable! state 65534) (finally (close state))))
+   (fs/group-readable! app 65534)
+   (save-activation! app selected)
+   (finally (close root) (close app)))
+  (try
+   (let [mode (if (= 2 codec/INDEX-VERSION) "boot" "incompatible")
+         command (fn [] (System/cmd "python3"
+                      (list "test/support/datom-generation-nonroot.py" (Path/expand ".bl/ci-candidate")
+                       (Path/expand "test/fixtures/datom/generation-boot.bl") parent mode)))
+         task (Task/async command)]
+    (when (= 2 codec/INDEX-VERSION)
+     (let [deadline (+ (System/monotonic_time :millisecond) 60000)
+           path (str parent "/readiness.json")]
+      (loop []
+       (when-not (File/exists? path)
+        (when-let [finished (Task/yield task 0)]
+         (throw (ex-info "Candidate exited before read-only readiness" {:result finished})))
+        (when (>= (System/monotonic_time :millisecond) deadline)
+         (throw (ex-info "Candidate never reached read-only readiness" {})))
+        (Process/sleep 50) (recur)))
+      (is (not (File/exists? (str parent "/child/application-loaded"))))
+      (is (not (File/exists? (str parent "/child/initialized"))))
+      (admit-bootstrap! parent selected (Jason/decode! (File/read! path)))))
+    (let [result (Task/await task 100000)]
+     (is (= 0 (elem result 1)) (elem result 0))
+     (is (String/contains? (elem result 0)
+           (if (= 2 codec/INDEX-VERSION) "NONROOT-GENERATION-BOOTSTRAPPED" "NONROOT-GENERATION-BOOT-REFUSED")))))
+   (let [original (fs/claim! (str parent "/original") {:readonly true})]
+    (try (is (= before (fs/tree-digest original))) (finally (close original))))
+   (when (= 1 codec/INDEX-VERSION)
+    (is (= selected (Jason/decode! (File/read! (str parent "/activation.json"))))))
+   (finally (File/rm_rf! parent)))))
