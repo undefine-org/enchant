@@ -1,0 +1,41 @@
+(ns aot-isolated-unit-test)
+
+(defn- refusal [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- workspace-keys []
+ (set (filter #(and (erlang/is_tuple %) (= 2 (erlang/tuple_size %))
+                    (= :bl_artifact_workspace (elem % 0))) (Process/get_keys))))
+
+(deftest one-unit-scopes-preserve-frozen-selection-and-explicit-macro-limits
+ (let [root (str (System/tmp_dir!) "/isolated-unit-" (System/unique_integer (list :positive)))
+       _ (File/mkdir_p! root)
+       rows (mapv (fn [[namespace calls]]
+                    (let [file (str root "/" (str namespace) ".bl")]
+                     (File/write! file
+                      (str "(ns " namespace ") (defmacro make [] '(defn value [] 42)) " calls))
+                     {:namespace namespace :file file}))
+              [['artifact.isolated.one "(make)"] ['artifact.isolated.two "(make)"]
+               ['artifact.isolated.excess "(make) (make)"]])
+       parent (BeamLisp.AOT/open_workspace
+                {:version 2 :phase-imports (list 'core 'sugar) :sources (to-list rows)} {:macro-steps 1})
+       before (BeamLisp.Env/capture) keys (workspace-keys)]
+  (try
+   ;; Ordinary workspaces keep their aggregate budget.
+   (is (= :prepared-artifact-unit (:kind (BeamLisp.AOT/prepare_unit parent 'artifact.isolated.one))))
+   (is (= :sdk-constructor-macro-budget
+        (refusal #(BeamLisp.AOT/prepare_unit parent 'artifact.isolated.two))))
+   ;; Each isolated unit has that SAME explicit one-macro ceiling.
+   (let [first (BeamLisp.AOT/prepare_isolated_unit parent 'artifact.isolated.two)]
+    (is (= :prepared-artifact-unit (:kind first)))
+    (is (= :sdk-constructor-macro-budget
+         (refusal #(BeamLisp.AOT/prepare_isolated_unit parent 'artifact.isolated.excess))))
+    (is (= (:world first) (:world (BeamLisp.AOT/prepare_isolated_unit parent 'artifact.isolated.two)))))
+   (is (= keys (workspace-keys)))
+   (is (= before (BeamLisp.Env/capture)))
+   (File/write! (:file (second rows)) "(ns artifact.isolated.two) (defn value [] 99)")
+   (is (= :artifact-source-changed
+        (refusal #(BeamLisp.AOT/prepare_isolated_unit parent 'artifact.isolated.two))))
+   (is (= keys (workspace-keys)))
+   (finally (BeamLisp.AOT/close_workspace! parent) (File/rm_rf! root)))
+  (is (= :invalid-artifact-workspace
+       (refusal #(BeamLisp.AOT/prepare_isolated_unit parent 'artifact.isolated.one))))))
