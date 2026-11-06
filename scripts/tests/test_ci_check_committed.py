@@ -75,6 +75,18 @@ class CommittedSourceTest(unittest.TestCase):
         with self.assertRaises(tarfile.AbsoluteLinkError):
             self.capture()
 
+    def test_forwarded_source_cannot_override_the_verified_snapshot(self):
+        for option in ('--source', '--sou', '--source=/tmp'):
+            with self.subTest(option=option):
+                args = [option] if '=' in option else [option, '/tmp']
+                output = Path(self.temporary.name) / 'results'
+                result = subprocess.run(['python3', str(ROOT / 'scripts/ci-check-committed'),
+                    '--revision', 'not-a-valid-commit', '--out', str(output), *args],
+                    text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn('--source cannot override', result.stderr)
+                self.assertFalse(Path(str(output) + '.inputs.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
