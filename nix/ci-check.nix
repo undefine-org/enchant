@@ -23,7 +23,7 @@ let
   tools = pkgs.lib.unique (pkgs.lib.concatMap (name:
     let entry = prerequisites.${name} or {}; in (entry.all or []) ++ (entry.linux or [])
   ) selectedFiles);
-  toolPackages = { bwrap = pkgs.bubblewrap; cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools;
+  toolPackages = { bwrap = pkgs.bubblewrap; restic = pkgs.restic; cargo = pkgs.cargo; rustc = pkgs.rustc; inotifywait = pkgs.inotify-tools;
     ssh = pkgs.openssh; ssh-keygen = pkgs.openssh; tesseract = pkgs.tesseract;
     rsvg-convert = pkgs.librsvg; ldd = pkgs.glibc.bin; };
   nativeFixture = builtins.elem "test/bl/execution_qualification_test.bl" selectedFiles;
