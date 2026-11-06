@@ -83,7 +83,7 @@ impl Store {
     /// Whether build `id` can be run: its payload is extracted, or its sealed
     /// drop is stored and can be.
     pub fn has(&self, id: &str) -> bool {
-        self.payload(id).join("bin").exists() || self.blob(id).is_file()
+        payload_ready(&self.payload(id)) || self.blob(id).is_file()
     }
 
     pub fn read(&self, rel: &str) -> Option<Pointer> {
@@ -771,7 +771,7 @@ mod store_tests {
     }
 
     fn stored(store: &Store, id: &str) {
-        std::fs::create_dir_all(store.payload(id).join("bin")).unwrap();
+        payload_fixture(&store.payload(id), b"entry");
     }
 
     /// The resolver with NO environment and NO config: the pure core, so a test

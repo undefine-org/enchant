@@ -1,6 +1,6 @@
 # One immutable stock launcher/codec producer for checkout and release builds.
 { pkgs, root ? ../tooling/drop }:
-(import ./bounded-build.nix { inherit pkgs; }) (pkgs.rustPlatform.buildRustPackage {
+(import ./bounded-build.nix { inherit pkgs; trace = true; }) (pkgs.rustPlatform.buildRustPackage {
   pname = "beam-lisp-drop-tools";
   version = "1";
   src = pkgs.lib.fileset.toSource {
@@ -14,7 +14,13 @@
   doCheck = true;
   nativeCheckInputs = [ pkgs.python3 ];
   cargoTestFlags = [ "--bin" "drop-launcher" "checkout_tests::" ];
+  # Store/build tests mutate process environment; keep the qualification serial.
+  RUST_TEST_THREADS = "1";
   postCheck = ''
+    for group in payload_cache_tests:: gc_tests::; do
+      cargo test --release --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+        --offline --bin drop-launcher "$group"
+    done
     python3 ${../test/scripts/test_engine_snapshot.py} \
       --launcher target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/drop-launcher \
       --reference ${../scripts/sdk-inputs}

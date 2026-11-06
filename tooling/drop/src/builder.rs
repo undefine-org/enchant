@@ -508,7 +508,7 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
 pub fn publish_drop(store: &Store, file: &Path) -> Result<String, String> {
     let t = try_read_trailer(file).ok_or_else(|| format!("{} is not a drop", file.display()))?;
     let id = sha8_of(&t);
-    if !store.payload(&id).join("bin").exists() {
+    if !payload_ready(&store.payload(&id)) {
         extract_checked(file, &t, &store.payload(&id))?;
     }
     let _ = std::fs::remove_file(file);
@@ -778,7 +778,11 @@ mod builder_tests {
             None => format!("{{:commit \"{commit}\"}}"),
         };
         let mut ar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
-        for (path, body) in [(BUILD_INFO_FILE, info.as_bytes()), (LAUNCHER_REL, b"#!/bin/sh\nexit 0\n".as_slice())] {
+        for (path, body) in [(BUILD_INFO_FILE, info.as_bytes()), (LAUNCHER_REL, b"#!/bin/sh\nexit 0\n".as_slice()),
+            ("releases/start_erl.data", b"17.0 0.1.0\n".as_slice()),
+            ("releases/0.1.0/elixir", b"elixir".as_slice()),
+            ("erts-17.0/bin/erl", b"erl".as_slice()), ("erts-17.0/bin/beam.smp", b"beam".as_slice()),
+            ("lib/beam_lisp-0.1.0/ebin/beam_lisp.app", b"app".as_slice())] {
             let mut h = tar::Header::new_gnu();
             h.set_size(body.len() as u64); h.set_mode(0o755); h.set_cksum();
             ar.append_data(&mut h, path, body).unwrap();

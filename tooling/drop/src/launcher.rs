@@ -248,33 +248,7 @@ fn build_from_sock(name: &str) -> Option<&str> {
 /// Build ids some process runs from: an executable or a mapped file under
 /// `<install>/<id>/`. Linux only; elsewhere nothing is known to run.
 fn running_builds(install: &Path) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    let prefix = format!("{}/", install.display());
-    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
-    let mut note = |s: &str| {
-        if let Some(id) = s.strip_prefix(&prefix).and_then(|r| r.split('/').next()) {
-            if is_build_id(id) {
-                out.insert(id.to_string());
-            }
-        }
-    };
-    for e in rd.flatten() {
-        if !e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let p = e.path();
-        if let Ok(exe) = std::fs::read_link(p.join("exe")) {
-            note(&exe.to_string_lossy());
-        }
-        if let Ok(maps) = std::fs::read_to_string(p.join("maps")) {
-            for line in maps.lines() {
-                if let Some(i) = line.find(&prefix) {
-                    note(&line[i..]);
-                }
-            }
-        }
-    }
-    out
+    running_payloads(install).into_iter().filter(|id| is_build_id(id)).collect()
 }
 
 /// When build `dir` was last used: its `.last-used` stamp, else the dir's mtime.
@@ -690,7 +664,7 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
         Target::Build(id) => {
             let blob = store.blob(&id);
             let payload = store.payload(&id);
-            if payload.join("bin").exists() {
+            if payload_ready(&payload) {
                 exec_payload(&payload, &id, argv)
             } else {
                 // Stored sealed, not yet extracted: the blob is a drop; its own
@@ -769,7 +743,7 @@ fn run_build(file: &std::path::Path, t: &Trailer, argv: &[String]) -> ! {
     let install = install_dir();
     let dest = install.join(&sha8);
 
-    if !dest.join("bin").exists() {
+    if !payload_ready(&dest) {
         verify_and_extract_from(file, t, &dest, &install);
         gc_old_versions(&install, &sha8);
     }
@@ -1162,8 +1136,7 @@ mod gc_tests {
         std::fs::create_dir_all(dest.join("lib")).unwrap();
         std::fs::write(dest.join("lib/partial.beam"), b"half").unwrap();
         // the finished staging tree
-        std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join(LAUNCHER_REL), b"#!/bin/sh\n").unwrap();
+        payload_fixture(&tmp, b"#!/bin/sh\n");
 
         publish(&tmp, &dest).expect("debris must not be fatal");
 
@@ -1185,10 +1158,8 @@ mod gc_tests {
         let dest = dir.join("c94bd7eb");
         let tmp = dir.join("c94bd7eb.tmp-4321");
 
-        std::fs::create_dir_all(dest.join("bin")).unwrap();
-        std::fs::write(dest.join(LAUNCHER_REL), b"winner\n").unwrap();
-        std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join(LAUNCHER_REL), b"loser\n").unwrap();
+        payload_fixture(&dest, b"winner\n");
+        payload_fixture(&tmp, b"loser\n");
 
         publish(&tmp, &dest).expect("losing the race is not failure");
 

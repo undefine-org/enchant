@@ -125,8 +125,14 @@ magic check) and fails loudly on a host-only payload — the classic
    * Linux: `$XDG_DATA_HOME/drop` else `~/.local/share/drop`
    * macOS: `~/Library/Application Support/drop`
    * Windows: `%LOCALAPPDATA%\drop`
-3. **Versioned payload dir**: `<install>/<sha8>/` — extraction is atomic
-   (`.tmp` + rename). A payload dir is removed only when nothing holds it
+3. **Versioned payload dir**: `<install>/<sha8>/` — extraction stages unique
+   directories, syncs files and directories on Unix, then renames and syncs the
+   parent. A permanent per-version kernel lock serializes publication/repair.
+   Startup checks `start_erl.data`, its selected release script and ERTS files;
+   a surviving `bin/` alone is incomplete and repairs from the verified drop.
+   Probe errors preserve the tree; Linux executable/mapping inventory also
+   refuses repair while a damaged tree is in use. Complete winners are retained.
+   A complete payload dir is garbage-collected only when nothing holds it
    (see §15, *Cleaning up*): a VM execs helper binaries (`inet_gethost`,
    `erl_child_setup`) out of its own erts dir, lazily, and a warm VM runs from
    its tree for its whole life, so deleting a tree some process runs from kills

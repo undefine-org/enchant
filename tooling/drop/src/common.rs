@@ -201,27 +201,99 @@ pub fn safe_path(base: &std::path::Path, rel: &std::path::Path) -> std::io::Resu
     Ok(out)
 }
 
-/// Atomic tar.gz extraction into `dest` (a per-process `.tmp-<pid>` sibling,
-/// then rename). Shared by the launcher (first-run install) and `drop unpack`
-/// (CI), so both tolerate a concurrent extractor of the same payload.
-pub fn extract_tar_gz(payload: &[u8], dest: &std::path::Path) -> std::io::Result<()> {
-    // Stage under a name only THIS process owns. Two `bl` invocations extract
-    // the same version more easily than it looks — an editor opening two
-    // workspaces, `bl realm start` beside a `bl run`, two jobs on one
-    // machine — and a SHARED staging path makes them delete each other's work
-    // mid-unpack (observed: "failed to unpack … into <dir>.tmp/…", and
-    // "Directory not empty" when the loser's rename met the winner's tree).
-    let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)?;
-
-    match unpack_into(payload, &tmp).and_then(|()| publish(&tmp, dest)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            Err(e)
+/// Cheap startup validation shared by every stored-payload execution path.
+/// A bin directory alone survives some interrupted extractions. Follow the
+/// release's own version selection, so a missing start_erl.data never turns
+/// into an attempted exec of releases//elixir. No whole-payload hash on warm use.
+pub fn payload_ready(root: &std::path::Path) -> bool {
+    payload_status(root).unwrap_or(false)
+}
+fn payload_status(root: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    fn component(value: &str) -> bool {
+        !value.is_empty() && value.len() <= 128 && value != "." && value != ".."
+            && value.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c))
+    }
+    fn metadata(path: std::path::PathBuf) -> std::io::Result<Option<std::fs::Metadata>> {
+        match std::fs::metadata(path) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+            Err(e) => Err(e),
         }
     }
+    fn regular(path: std::path::PathBuf) -> std::io::Result<bool> {
+        Ok(metadata(path)?.is_some_and(|m| m.is_file() && m.len() != 0))
+    }
+    let path = root.join("releases/start_erl.data");
+    if !regular(path.clone())? { return Ok(false); }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    file.take(513).read_to_end(&mut bytes)?;
+    if bytes.len() > 512 { return Ok(false); }
+    let Ok(text) = std::str::from_utf8(&bytes) else { return Ok(false) };
+    let fields: Vec<_> = text.split_whitespace().collect();
+    if fields.len() != 2 || !fields.iter().all(|v| component(v)) { return Ok(false); }
+    let release = root.join("releases").join(fields[1]);
+    let erts = root.join(format!("erts-{}/bin", fields[0]));
+    let unix = regular(root.join(LAUNCHER_REL))? && regular(release.join("elixir"))?
+        && regular(erts.join("erl"))? && regular(erts.join("beam.smp"))?;
+    let windows = regular(root.join("bin/bl.bat"))? && regular(release.join("elixir.bat"))?
+        && regular(erts.join("erl.exe"))? && regular(erts.join("beam.smp.dll"))?;
+    Ok((unix || windows) && metadata(root.join("lib"))?.is_some_and(|m| m.is_dir()))
+}
+
+/// Persist all file contents and directory entries before publishing the root.
+/// Unix directory fsync is essential: a successful rename alone is not a
+/// power-loss boundary. Windows retains its existing directory-flush behavior.
+fn sync_payload_tree(root: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() { sync_payload_tree(&entry.path())?; }
+        else if kind.is_file() { std::fs::File::open(entry.path())?.sync_all()?; }
+    }
+    sync_payload_directory(root)
+}
+fn sync_payload_directory(root: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(root)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// Atomic extraction. Staging names are unique even for concurrent calls in
+/// one process; publication/repair holds a permanent per-destination kernel
+/// lock. A process death releases custody without deleting its lock inode.
+pub fn extract_tar_gz(payload: &[u8], dest: &std::path::Path) -> std::io::Result<()> {
+    if dest.file_name().is_none() {
+        return Err(std::io::Error::other("payload destination has no name"));
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")))?;
+    let tmp = loop {
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dest.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => break path,
+            // A reboot can reuse a PID. Leave an interrupted staging tree
+            // intact; it is never authority to delete another invocation.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        unpack_into(payload, &tmp)?;
+        if !payload_ready(&tmp) { return Err(std::io::Error::other("payload lacks a complete BEAM release")); }
+        sync_payload_tree(&tmp)?;
+        publish(&tmp, dest)
+    })();
+    if result.is_err() { let _ = std::fs::remove_dir_all(&tmp); }
+    result
 }
 
 /// Unpack the payload into an existing, empty staging dir.
@@ -242,53 +314,71 @@ fn unpack_into(payload: &[u8], tmp: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Publish a finished staging tree as `dest`.
-///
-/// Losing the race is not an error: another process extracted the SAME payload
-/// — same sha256, verified before unpacking — so the tree already in place is
-/// the tree we were about to publish. What must not happen is publishing over
-/// it, or reporting failure for a `bl` that is ready to run.
-///
-/// A tree at `dest` with no `bin/` is the other case, and it used to be
-/// permanent: the install check is `dest/bin`, so a half-extracted tree reads
-/// as "version missing", every later run re-extracts, and every later run dies
-/// on the same `ENOTEMPTY` — `bl` unusable until a human deletes the directory
-/// (observed after a reboot landed in the middle of a first run). Such a tree
-/// holds nothing that can be running, so it is cleared and replaced.
-fn publish(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            if dest.join("bin").exists() {
-                let _ = std::fs::remove_dir_all(tmp);
-                Ok(())
-            } else {
-                // Debris: an extraction a reboot or a kill cut in half. The
-                // install check (`dest/bin`) still reads the version as
-                // missing, so every later run re-extracts and loses this same
-                // rename with ENOTEMPTY — `bl` stays dead until someone clears
-                // the tree by hand. Nothing runs out of a tree with no `bin/`.
-                if dest.is_dir() {
-                    let _ = std::fs::remove_dir_all(dest);
-                } else {
-                    let _ = std::fs::remove_file(dest);
-                }
-
-                match std::fs::rename(tmp, dest) {
-                    Ok(()) => Ok(()),
-                    Err(second) => {
-                        let _ = std::fs::remove_dir_all(tmp);
-                        // A sibling may have published a complete tree meanwhile.
-                        if dest.join("bin").exists() {
-                            Ok(())
-                        } else {
-                            Err(second)
-                        }
-                    }
+/// The same Linux executable/mapping inventory protects GC and cache repair.
+/// Other platforms retain their existing GC observation limits.
+fn running_payloads(install: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let prefix = format!("{}/", install.display());
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    let mut note = |s: &str| {
+        if let Some(id) = s.strip_prefix(&prefix).and_then(|r| r.split('/').next()) {
+            out.insert(id.to_string());
+        }
+    };
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let p = e.path();
+        if let Ok(exe) = std::fs::read_link(p.join("exe")) {
+            note(&exe.to_string_lossy());
+        }
+        if let Ok(maps) = std::fs::read_to_string(p.join("maps")) {
+            for line in maps.lines() {
+                if let Some(i) = line.find(&prefix) {
+                    note(&line[i..]);
                 }
             }
         }
     }
+    out
+}
+
+/// Repair and publication share one lock. Recheck after acquiring it: an
+/// extractor that observed debris must never remove a newly published winner.
+/// This lock file is permanent, outside the version tree and never unlinked.
+fn publish(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let name = dest.file_name().ok_or_else(|| std::io::Error::other("payload destination has no name"))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name); lock_name.push(".extract.lock");
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(parent.join(lock_name))?;
+    lock.lock()?;
+    // I/O or permission failure is not evidence that a tree is disposable.
+    if payload_status(dest)? {
+        // A winner may have died after rename and before parent fsync. Sync
+        // its publication before conceding the race, without replacing it.
+        sync_payload_directory(parent)?;
+        std::fs::remove_dir_all(tmp)?;
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.is_dir() => {
+            let actual = std::fs::canonicalize(dest)?;
+            let parent = actual.parent().ok_or_else(|| std::io::Error::other("payload root has no parent"))?;
+            let name = actual.file_name().unwrap().to_string_lossy();
+            if running_payloads(parent).contains(name.as_ref()) {
+                return Err(std::io::Error::other("incomplete payload is still in use; refusing destructive repair"));
+            }
+            std::fs::remove_dir_all(dest)?;
+        },
+        Ok(_) => std::fs::remove_file(dest)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
+    std::fs::rename(tmp, dest)?;
+    sync_payload_directory(parent)
 }
 
 #[cfg(unix)]
@@ -318,5 +408,163 @@ mod store_root_tests {
         for path in ["", "relative", "/", "/var/cache/../data", "/var/./cache"] {
             assert!(explicit_store_root(std::ffi::OsStr::new(path)).is_err(), "{path}");
         }
+    }
+}
+
+#[cfg(test)]
+fn payload_fixture(root: &std::path::Path, launcher: &[u8]) {
+    for (path, bytes) in [
+        (LAUNCHER_REL, launcher), ("releases/start_erl.data", b"17.0 0.1.0\n".as_slice()),
+        ("releases/0.1.0/elixir", b"elixir".as_slice()),
+        ("erts-17.0/bin/erl", b"erl".as_slice()), ("erts-17.0/bin/beam.smp", b"beam".as_slice()),
+        ("lib/beam_lisp-0.1.0/ebin/beam_lisp.app", b"app".as_slice()),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod payload_cache_tests {
+    use super::*;
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("drop-payload-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap(); path
+    }
+    fn archive(root: &std::path::Path) -> Vec<u8> {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        tar.append_dir_all(".", root).unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+    #[test]
+    fn release_selection_must_be_bounded_complete_and_cannot_escape_the_root() {
+        let root = scratch("validation");
+        payload_fixture(&root, b"entry"); assert!(payload_ready(&root));
+        for malformed in ["", "17.0", "17.0 0.1.0 extra", "../escape 0.1.0", "17.0 ../../escape", "17.0 .", "17.0 /absolute"] {
+            std::fs::write(root.join("releases/start_erl.data"), malformed).unwrap();
+            assert!(!payload_ready(&root), "{malformed}");
+        }
+        std::fs::write(root.join("releases/start_erl.data"), vec![b'x'; 513]).unwrap();
+        assert!(!payload_ready(&root));
+        for missing in ["bin/bl", "releases/start_erl.data", "releases/0.1.0/elixir", "erts-17.0/bin/erl", "erts-17.0/bin/beam.smp"] {
+            payload_fixture(&root, b"entry"); std::fs::remove_file(root.join(missing)).unwrap();
+            assert!(!payload_ready(&root), "missing {missing}");
+        }
+        payload_fixture(&root, b"entry");
+        std::fs::write(root.join("erts-17.0/bin/beam.smp"), b"").unwrap();
+        assert!(!payload_ready(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn bin_present_release_metadata_missing_is_repaired_and_retry_keeps_the_winner() {
+        let parent = scratch("repair"); let dest = parent.join("12345678");
+        let source = parent.join("source"); payload_fixture(&source, b"complete");
+        let bytes = archive(&source);
+        payload_fixture(&dest, b"broken");
+        std::fs::remove_file(dest.join("releases/start_erl.data")).unwrap();
+        assert!(dest.join("bin").is_dir()); assert!(!payload_ready(&dest));
+        extract_tar_gz(&bytes, &dest).unwrap();
+        assert!(payload_ready(&dest));
+        std::fs::write(dest.join("winner-preserved"), b"retain").unwrap();
+        extract_tar_gz(&bytes, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("winner-preserved")).unwrap(), b"retain");
+        assert!(parent.join(".12345678.extract.lock").is_file());
+        assert!(!std::fs::read_dir(&parent).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains(".tmp-")));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    fn concurrent_repair_and_extraction_share_one_publication() {
+        let parent = scratch("concurrent"); let source = parent.join("source");
+        payload_fixture(&source, b"complete"); let bytes = std::sync::Arc::new(archive(&source));
+        let dest = parent.join("abcdef01"); std::fs::create_dir_all(dest.join("bin")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let children: Vec<_> = (0..8).map(|_| {
+            let (bytes, barrier, dest) = (bytes.clone(), barrier.clone(), dest.clone());
+            std::thread::spawn(move || {
+                barrier.wait(); extract_tar_gz(&bytes, &dest).unwrap();
+                assert!(payload_ready(&dest));
+                #[cfg(unix)] { use std::os::unix::fs::MetadataExt; std::fs::metadata(&dest).unwrap().ino() }
+                #[cfg(not(unix))] { 0 }
+            })
+        }).collect();
+        let inodes: Vec<_> = children.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(inodes.iter().all(|i| *i == inodes[0]), "a valid winner is never replaced");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mapped_runtime_files_block_destructive_repair() {
+        use std::os::fd::AsRawFd;
+        struct Mapping(*mut libc::c_void);
+        impl Drop for Mapping { fn drop(&mut self) { unsafe { libc::munmap(self.0, 4); } } }
+        let parent = scratch("mapped-runtime"); let dest = parent.join("12345678");
+        let source = parent.join("source"); payload_fixture(&source, b"complete");
+        payload_fixture(&dest, b"preserve");
+        let file = std::fs::File::open(dest.join(LAUNCHER_REL)).unwrap();
+        let address = unsafe { libc::mmap(std::ptr::null_mut(), 4, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        assert_ne!(address, libc::MAP_FAILED); let mapping = Mapping(address);
+        std::fs::remove_file(dest.join("releases/start_erl.data")).unwrap();
+        assert!(!payload_ready(&dest));
+        assert!(extract_tar_gz(&archive(&source), &dest).is_err());
+        assert_eq!(std::fs::read(dest.join(LAUNCHER_REL)).unwrap(), b"preserve");
+        drop(mapping); drop(file);
+        extract_tar_gz(&archive(&source), &dest).unwrap(); assert!(payload_ready(&dest));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ambiguous_probe_errors_preserve_the_destination() {
+        let parent = scratch("probe-error"); let dest = parent.join("12345678");
+        let source = parent.join("source"); payload_fixture(&source, b"complete");
+        payload_fixture(&dest, b"preserve");
+        let selection = dest.join("releases/start_erl.data");
+        std::fs::remove_file(&selection).unwrap();
+        std::os::unix::fs::symlink("start_erl.data", &selection).unwrap();
+        assert!(payload_status(&dest).is_err());
+        assert!(extract_tar_gz(&archive(&source), &dest).is_err());
+        assert_eq!(std::fs::read(dest.join(LAUNCHER_REL)).unwrap(), b"preserve");
+        assert!(std::fs::symlink_metadata(selection).unwrap().is_symlink());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    fn cross_target_windows_layout_is_recognised_without_host_execution() {
+        let root = scratch("windows");
+        for path in ["bin/bl.bat", "releases/start_erl.data", "releases/0.1.0/elixir.bat",
+                     "erts-17.0/bin/erl.exe", "erts-17.0/bin/beam.smp.dll"] {
+            let file = root.join(path); std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, if path.ends_with("start_erl.data") { b"17.0 0.1.0".as_slice() } else { b"fixture".as_slice() }).unwrap();
+        }
+        std::fs::create_dir(root.join("lib")).unwrap();
+        assert!(payload_ready(&root));
+        std::fs::remove_file(root.join("erts-17.0/bin/beam.smp.dll")).unwrap();
+        assert!(!payload_ready(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn reused_pid_staging_and_unnamed_destinations_cannot_break_extraction() {
+        let parent = scratch("stale-pid"); let source = parent.join("source");
+        payload_fixture(&source, b"complete"); let bytes = archive(&source);
+        let dest = parent.join("12345678");
+        // NEXT is process-global; reserve many names, so this control works
+        // beside the other extraction tests without resetting shared state.
+        let debris: Vec<_> = (0..256).map(|i| dest.with_extension(format!("tmp-{}-{i}", std::process::id()))).collect();
+        for path in &debris { std::fs::create_dir(path).unwrap(); std::fs::write(path.join("keep"), b"old").unwrap(); }
+        extract_tar_gz(&bytes, &dest).unwrap(); assert!(payload_ready(&dest));
+        for path in &debris { assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"old"); }
+        for path in ["/", ".", ".."] { assert!(extract_tar_gz(&bytes, std::path::Path::new(path)).is_err()); }
+        let _ = std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    fn invalid_payload_never_replaces_an_existing_tree() {
+        let parent = scratch("invalid"); let source = parent.join("source");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(source.join("bin/bl"), b"not a release").unwrap();
+        let dest = parent.join("12345678"); payload_fixture(&dest, b"winner");
+        assert!(extract_tar_gz(&archive(&source), &dest).is_err());
+        assert_eq!(std::fs::read(dest.join(LAUNCHER_REL)).unwrap(), b"winner");
+        assert!(payload_ready(&dest));
+        let _ = std::fs::remove_dir_all(parent);
     }
 }
