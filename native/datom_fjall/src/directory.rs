@@ -387,13 +387,22 @@ pub(crate) fn put_protocol(parent: &Arc<Directory>, target: &str, value: &[u8]) 
     file.write_all(value)?; file.sync_all()?;
     rename_anchored(parent, &temp.name, target, true)
 }
-#[rustler::nif(schedule = "DirtyIo")]
-fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, expected: Option<Binary>, value: Binary)
- -> NifResult<bool> {
+/// Root-owned readers can observe a committed journal without replacing it.
+/// Metadata permissions are set on the private inode BEFORE fsync and rename;
+/// a crash cannot publish a grant and then lose its permission transition.
+fn put_metadata(handle: ResourceArc<DirectoryHandle>, target: String, expected: Option<Binary>, value: Binary,
+                read_group: Option<u32>) -> NifResult<bool> {
     if value.len() > MAX_META || expected.as_ref().is_some_and(|v| v.len() > MAX_META) { return Err(err("metadata byte bound exceeded")); }
     let _write = handle.0.root.write.lock().map_err(err)?;
     handle.0.writable().map_err(err)?; name(&target).map_err(err)?;
     handle.0.writable_path(&handle.0.path.join(&target)).map_err(err)?;
+    if let Some(gid) = read_group {
+        let metadata = handle.0.file.metadata().map_err(err)?;
+        if unsafe { libc::geteuid() } != 0 || gid == 0 || gid == u32::MAX || metadata.uid() != 0 || metadata.gid() != gid
+            || metadata.mode() & 0o777 != 0o750 {
+            return Err(err("shared publication requires a protected root-owned reader-group directory"));
+        }
+    }
     let old = match handle.0.open_file(&target) {
         Ok(mut reader) => {
             if reader.metadata.len() > MAX_META as u64 { return Err(err("metadata byte bound exceeded")); }
@@ -406,8 +415,36 @@ fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, exp
     };
     if old.as_deref() != expected.as_ref().map(|b| b.as_slice()) { return Ok(false); }
     let (mut file, temp) = temporary(&handle.0).map_err(err)?;
+    if let Some(gid) = read_group {
+        if unsafe { libc::fchown(file.as_raw_fd(), 0, gid) } < 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), 0o640) } < 0 {
+            return Err(err(std::io::Error::last_os_error()));
+        }
+    }
     file.write_all(value.as_slice()).map_err(err)?; file.sync_all().map_err(err)?;
     rename(&handle.0, &temp.name, &target, expected.is_none()).map_err(err)?;
+    Ok(true)
+}
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_directory_put(handle: ResourceArc<DirectoryHandle>, target: String, expected: Option<Binary>, value: Binary)
+ -> NifResult<bool> { put_metadata(handle, target, expected, value, None) }
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_directory_put_shared(handle: ResourceArc<DirectoryHandle>, target: String, expected: Option<Binary>, value: Binary, gid: u32)
+ -> NifResult<bool> { put_metadata(handle, target, expected, value, Some(gid)) }
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_directory_share_read(handle: ResourceArc<DirectoryHandle>, gid: u32) -> NifResult<bool> {
+    let _write = handle.0.root.write.lock().map_err(err)?;
+    handle.0.writable().map_err(err)?;
+    let metadata = handle.0.file.metadata().map_err(err)?;
+    if unsafe { libc::geteuid() } != 0 || gid == 0 || gid == u32::MAX || metadata.uid() != 0 {
+        return Err(err("only root can configure a protected reader group"));
+    }
+    if unsafe { libc::fchown(handle.0.file.as_raw_fd(), 0, gid) } < 0
+        || unsafe { libc::fchmod(handle.0.file.as_raw_fd(), 0o750) } < 0 {
+        return Err(err(std::io::Error::last_os_error()));
+    }
+    handle.0.file.sync_all().map_err(err)?;
+    handle.0.check().map_err(err)?;
     Ok(true)
 }
 #[rustler::nif(schedule = "DirtyIo")]

@@ -27,9 +27,10 @@ permissions(generation, 0o1770)
 permissions(generation / 'libraries', 0o1770)
 for name in ('.bl-generation', 'READY.json'):
     permissions(generation / name, 0o640)
-permissions(parent, 0o750)
-permissions(parent / 'writer', 0o750)
-permissions(parent / 'activation.json', 0o640)
+# The SDK, not this helper, must publish the protected reader permissions.
+for path, mode in ((parent, 0o750), (parent / 'writer', 0o750), (parent / 'activation.json', 0o640)):
+    metadata = path.stat()
+    assert (metadata.st_uid, metadata.st_gid, metadata.st_mode & 0o777) == (0, gid, mode), path
 sandbox = parent / 'child'
 sandbox.mkdir()
 runtime = sandbox / 'runtime'
