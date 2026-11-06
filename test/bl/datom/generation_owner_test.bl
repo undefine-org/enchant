@@ -463,3 +463,85 @@
    (is (= next-code (get-in (generation/status! owner) ["dataGeneration" "code"])))
    (is (= ready-before (journal/read-file root "READY.json" journal/LIMIT)))
    (finally (release-closed! owner) (close root) (close app) (File/rm_rf! parent)))))
+
+(deftest dynamic-stores-require-journal-capability-and-share-native-db-and-blob-custody
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".dynamic-generation")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))
+       path (str (:path root) "/firm/new.fjall") owner (generation/claim! app root spec)
+       selected (-> (activation app root) (assoc "phase" "starting" "writesAdmitted" false)
+                    (assoc-in ["dataGeneration" "dynamicStores"] 1))
+       ready-before (journal/read-file root "READY.json" journal/LIMIT)]
+  (try
+   (is (= :store-open-failed (:reason (try (fj/open path) nil (catch error (ex-data error))))))
+   (is (not (File/exists? (str (:path root) "/firm"))))
+   (save-activation! app selected)
+   (generation/select! owner)
+   (is (= 1 (get-in (generation/status! owner) ["dataGeneration" "dynamicStores"])))
+   (is (= :store-open-failed (:reason (try (fj/open path) nil (catch error (ex-data error))))))
+   (is (not (File/exists? (str (:path root) "/firm"))))
+   (save-activation! app (assoc selected "phase" "write-admitted" "writesAdmitted" true "journalRevision" 2))
+   (generation/admit! owner)
+   ((fn []
+    (let [store (fj/open path) again (fj/open path) bs (blob-fs/open (str path ".blobs")) sha (file/sha256 "dynamic")]
+     (try
+      (is (= {:version 2} (s/-get store (erlang/list_to_binary (list 0 107)))))
+      (is (= true (s/write-admitted? store)))
+      (s/-put store "owned" "new generation data")
+      (is (= "new generation data" (s/-get again "owned")))
+      (blob/-blob-put bs sha "dynamic")
+      (is (= "dynamic" (blob/-blob-get bs sha)))
+      (is (= :generation-ownership-refused (kind #(generation/release! owner))))
+      (doseq [bad [(str path "/nested.fjall") (str path ".blobs/nested.fjall")
+                   (str (:path root) "/control.fjall/child.fjall") (str (:path root) "/empty/child.fjall")
+                   (str (:path root) "/.hidden/new.fjall") (str (:path root) "/firm/not-a-store")]]
+       (is (= :store-open-failed (:reason (try (fj/open bad) nil (catch error (ex-data error))))))
+       (is (not (File/exists? bad))))
+      (is (= ready-before (journal/read-file root "READY.json" journal/LIMIT)))
+      (finally (s/close bs) (s/close again) (s/close store))))))
+   (release-closed! owner) (close root) (close app)
+   (let [reopened (generation/open-selected! parent)]
+    (try
+     (generation/admit! reopened)
+     ((fn []
+      (let [store (fj/open path) bs (blob-fs/open (str path ".blobs"))]
+       (try
+        (is (= "new generation data" (s/-get store "owned")))
+        (is (= "dynamic" (blob/-blob-get bs (file/sha256 "dynamic"))))
+        (is (= {:version 2} (s/-get store (erlang/list_to_binary (list 0 107)))))
+        (finally (s/close bs) (s/close store))))))
+     (finally (release-closed! reopened) (close (:root reopened)) (close (:app reopened)))))
+   (finally (try (generation/release! owner) (catch _ nil)) (close root) (close app) (File/rm_rf! parent)))))
+
+(deftest dynamic-creation-resumes-only-empty-or-versioned-stores-with-an-exact-pending-marker
+ (let [parent (str "/tmp/" (Path/basename (s/fresh-path ".dynamic-resume")))
+       {:keys [app root]} (fixture-at parent (fn [_] nil))
+       owner (generation/claim! app root spec)
+       selected (assoc-in (activation app root) ["dataGeneration" "dynamicStores"] 1)
+       pending "datom-generation-new-store-v1\n"
+       path (str (:path root) "/firm/pending.fjall")]
+  (try
+   (save-activation! app selected) (generation/select! owner) (generation/admit! owner)
+   (File/mkdir_p! path)
+   (File/write! (str path "/.bl-datom-create") pending)
+   ((fn [] (let [store (fj/open path)]
+    (try
+     (is (= {:version 2} (s/-get store (erlang/list_to_binary (list 0 107)))))
+     (is (not (File/exists? (str path "/.bl-datom-create"))))
+     (s/-put store "acknowledged" "retained")
+     ;; A pending marker is never permission to stamp nonempty unversioned data.
+     (s/-delete store (erlang/list_to_binary (list 0 107)))
+     (s/sync! store)
+     (finally (s/close store))))))
+   (erlang/garbage_collect)
+   (doseq [marker [nil pending "unknown creation protocol"]]
+    (when marker (File/write! (str path "/.bl-datom-create") marker))
+    (let [before (File/read! (str path "/version"))]
+     (is (= :store-open-failed (:reason (try (fj/open path) nil (catch error (ex-data error))))))
+     (is (= before (File/read! (str path "/version"))))))
+   (let [bad (str (:path root) "/firm/wrong-physical.fjall")]
+    (File/mkdir_p! bad)
+    (File/write! (str bad "/.bl-datom-create") pending)
+    (File/write! (str bad "/version") "FJL\u0003")
+    (is (= :store-open-failed (:reason (try (fj/open bad) nil (catch error (ex-data error))))))
+    (is (= [".bl-datom-create" "version"] (sort (File/ls! bad)))))
+   (finally (release-closed! owner) (close root) (close app) (File/rm_rf! parent)))))

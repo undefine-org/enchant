@@ -85,7 +85,7 @@ fn fjall_generation_blob_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<
     super::refuse_offline_path(Path::new(&path)).map_err(err)?;
     let Some(owner) = generation::access(Path::new(&path)).map_err(err)? else { return Ok(atoms::nil().encode(env)); };
     let canonical = canonical_missing(Path::new(&path)).map_err(err)?;
-    let tier = owner.blobs.get(&canonical).cloned().ok_or_else(|| err("blob tier outside generation inventory"))?;
+    let tier = owner.blob_tier(&canonical).map_err(err)?;
     let blob = Arc::new(Blob { owner, tier });
     // Existing tiers must be actual directories; missing empty tiers stay
     // absent until admission, including their .tmp directory.

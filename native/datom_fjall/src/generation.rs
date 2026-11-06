@@ -5,7 +5,9 @@
 use super::{directory::{Directory, DirectoryHandle, Reader}, err, sealing::{Custody, relative}};
 use rustler::{Binary, NifResult, Resource, ResourceArc};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak, atomic::{AtomicBool, Ordering}};
@@ -13,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 const MARKER: &str = ".bl-generation";
 const LIMIT: usize = 1048576;
+pub(crate) const CREATE_MARKER: &str = ".bl-datom-create";
+const CREATE_BYTES: &[u8] = b"datom-generation-new-store-v1\n";
 fn failure(message: &'static str) -> std::io::Error { std::io::Error::other(message) }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -20,11 +24,18 @@ struct Marker { version: u8, protocol: String, generation: String, ready: String
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Ready { version: u8, protocol: String, application: String, generation: String, code: String,
-               tool: String, destination: String, key_format: u8, data_version: u16 }
+               tool: String, destination: String, key_format: u8, data_version: u16, storage: Storage }
+#[derive(Deserialize)]
+struct Storage { files: Vec<String>, directories: Vec<String> }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Selection { version: u8, application: String, writer_root: String, root: String, generation: String,
-                   ready: String, key_format: u8, data_version: u16, code: String, runtime: String }
+                   ready: String, key_format: u8, data_version: u16, code: String, runtime: String,
+                   #[serde(default, deserialize_with = "capability", skip_serializing_if = "Option::is_none")] dynamic_stores: Option<u8> }
+// Absence is the legacy closed inventory; explicit null is not a capability.
+fn capability<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u8>, D::Error> {
+    u8::deserialize(deserializer).map(Some)
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Activation { version: u8, phase: String, journal_revision: u64, writes_admitted: bool,
@@ -32,7 +43,7 @@ struct Activation { version: u8, phase: String, journal_revision: u64, writes_ad
 struct Binding { marker: Marker, ready: Ready }
 struct Admission { journal: PathBuf, runtime: String, code: String }
 #[derive(Clone, PartialEq)]
-struct Cohort { code: String, runtime: String }
+struct Cohort { code: String, runtime: String, dynamic_stores: Option<u8> }
 pub(crate) struct BlobTier {
     pub(crate) path: PathBuf, pub(crate) parts: Vec<String>,
     pub(crate) directory: Mutex<Option<Arc<Directory>>>,
@@ -79,7 +90,7 @@ pub(crate) struct Owner {
     pub(crate) root: Arc<Directory>, app: Arc<Directory>, marker: Reader, ready: Reader,
     stores: HashMap<PathBuf, Arc<Directory>>, closed: AtomicBool,
     pub(crate) blobs: HashMap<PathBuf, Arc<BlobTier>>,
-    binding: Binding, cohort: RwLock<Option<Cohort>>, admission: RwLock<Option<Admission>>,
+    reserved: Vec<PathBuf>, binding: Binding, cohort: RwLock<Option<Cohort>>, admission: RwLock<Option<Admission>>,
     // Store locks drop before either root's explicit custody pin.
     _root_custody: Custody, _app_custody: Custody,
 }
@@ -88,10 +99,107 @@ impl Owner {
         if self.closed.load(Ordering::Acquire) { return Err(failure("generation owner closed")); }
         self.root.check()?; self.app.check()?; self.marker.check()?; self.ready.check()
     }
-    pub(crate) fn store_lock(&self, path: &Path) -> std::io::Result<File> {
+    fn dynamic_enabled(&self) -> std::io::Result<bool> {
         self.check()?;
-        let directory = self.stores.get(path).ok_or_else(|| failure("store outside generation inventory"))?;
-        directory.check()?; directory.file.try_clone()
+        Ok(self.cohort.read().map_err(|_| failure("generation cohort poisoned"))?
+            .as_ref().is_some_and(|cohort| cohort.dynamic_stores == Some(1)))
+    }
+    fn dynamic_parts<'a>(&self, path: &'a Path) -> std::io::Result<Vec<&'a str>> {
+        if !self.dynamic_enabled()? { return Err(failure("store outside generation inventory")); }
+        let relative_path = path.strip_prefix(&self.root.path).map_err(|_| failure("dynamic store outside generation"))?;
+        let parts = relative(relative_path.to_str().ok_or_else(|| failure("invalid dynamic store name"))?)?;
+        if parts.len() > 16 || parts.iter().any(|part| part.starts_with('.'))
+            || parts[..parts.len() - 1].iter().any(|part| part.ends_with(".fjall") || part.ends_with(".blobs"))
+            || !parts.last().is_some_and(|name| name.len() > 6 && name.ends_with(".fjall")) {
+            return Err(failure("unsupported dynamic store namespace"));
+        }
+        let blob = PathBuf::from(format!("{}.blobs", path.to_string_lossy()));
+        for existing in self.stores.keys().chain(self.blobs.keys()).chain(self.reserved.iter()) {
+            if [path, blob.as_path()].iter().any(|new| new.starts_with(existing) || existing.starts_with(new)) {
+                return Err(failure("dynamic store overlaps declared inventory"));
+            }
+        }
+        Ok(parts)
+    }
+    pub(crate) fn canonical_store(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.check()?;
+        if let Ok(canonical) = fs::canonicalize(path) {
+            if let Some(directory) = self.stores.get(&canonical) {
+                directory.check()?; return Ok(canonical);
+            }
+        }
+        let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+        let parts = self.dynamic_parts(&absolute)?;
+        let mut directory = self.root.clone();
+        for part in parts {
+            directory = match directory.child(part, false, false) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let permit = self.write_guard()?;
+                    directory.owned_child(part, &permit)?
+                }
+                Err(error) => return Err(error),
+            };
+        }
+        Ok(directory.path.clone())
+    }
+    pub(crate) fn store_directory(&self, path: &Path) -> std::io::Result<(Arc<Directory>, bool, bool)> {
+        self.check()?;
+        if let Some(directory) = self.stores.get(path) {
+            directory.check()?; return Ok((directory.clone(), false, false));
+        }
+        let parts = self.dynamic_parts(path)?;
+        let mut directory = self.root.clone();
+        for (index, part) in parts.iter().enumerate() {
+            directory = directory.child(part, false, index + 1 == parts.len())?;
+        }
+        let empty = fs::read_dir(super::directory::pinned(&directory.file, "."))?.next().transpose()?.is_none();
+        let creating = if empty {
+            let permit = self.write_guard()?;
+            permit.directory(&directory)?;
+            let mut marker = OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(super::directory::pinned(&directory.file, CREATE_MARKER))?;
+            marker.write_all(CREATE_BYTES)?; marker.sync_all()?; directory.file.sync_all()?;
+            true
+        } else {
+            match directory.open_file(CREATE_MARKER) {
+                Ok(mut marker) => {
+                    self.write_guard()?;
+                    if marker.len() != CREATE_BYTES.len() as u64 || marker.read(CREATE_BYTES.len())? != CREATE_BYTES {
+                        return Err(failure("unsupported pending store creation"));
+                    }
+                    match directory.open_file("version") {
+                        Ok(mut version) => {
+                            if version.len() != 4 || version.read(4)? != b"FJL\x02" {
+                                return Err(failure("unsupported pending physical engine version"));
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(error),
+                    }
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    super::require_existing_engine(path)?; false
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        Ok((directory, true, creating))
+    }
+    pub(crate) fn blob_tier(&self, path: &Path) -> std::io::Result<Arc<BlobTier>> {
+        self.check()?;
+        if let Some(tier) = self.blobs.get(path) { return Ok(tier.clone()); }
+        let text = path.to_str().ok_or_else(|| failure("invalid dynamic blob path"))?;
+        let store = Path::new(text.strip_suffix(".blobs").ok_or_else(|| failure("unsupported dynamic blob sibling"))?);
+        self.dynamic_parts(store)?;
+        // No registry file and no startup traversal: only the requested engine
+        // is checked. The whole-app owner excludes other generation writers.
+        super::require_existing_engine(store)?;
+        let parts = relative(path.strip_prefix(&self.root.path).map_err(|_| failure("blob outside generation"))?
+            .to_str().ok_or_else(|| failure("invalid dynamic blob path"))?)?.into_iter().map(str::to_owned).collect();
+        Ok(Arc::new(BlobTier { path: path.into(), parts, directory: Mutex::new(None) }))
     }
     pub(crate) fn write_guard(&self) -> std::io::Result<WriteGuard<'_>> {
         let admission = self.admission.read().map_err(|_| failure("generation admission poisoned"))?;
@@ -259,9 +367,12 @@ fn fjall_generation_claim(app: ResourceArc<DirectoryHandle>, root: ResourceArc<D
     if owners.get(&root.0.path).and_then(Weak::upgrade).is_some() {
         return Err(err("generation already has an owner"));
     }
+    let reserved = ready.storage.files.iter().chain(ready.storage.directories.iter()).map(|path| {
+        relative(path).map(|_| root.0.path.join(path))
+    }).collect::<std::io::Result<Vec<_>>>().map_err(err)?;
     app.0.root.pins.fetch_add(1, Ordering::AcqRel);
     root.0.root.pins.fetch_add(1, Ordering::AcqRel);
-    let owner = Arc::new(Owner { root: root.0.clone(), app: app.0.clone(), marker, ready: ready_reader, stores, blobs,
+    let owner = Arc::new(Owner { root: root.0.clone(), app: app.0.clone(), marker, ready: ready_reader, stores, blobs, reserved,
         binding: Binding { marker: descriptor, ready }, cohort: RwLock::new(None), admission: RwLock::new(None),
         closed: AtomicBool::new(false), _root_custody: Custody(root.0.root.clone()),
         _app_custody: Custody(app.0.root.clone()) });
@@ -291,7 +402,8 @@ fn fjall_generation_status(handle: ResourceArc<OwnerHandle>) -> NifResult<String
             generation: bound.marker.generation.clone(), ready: bound.marker.ready.clone(),
             key_format: bound.marker.key_format, data_version: bound.marker.data_version,
             code: cohort.as_ref().map_or_else(|| bound.ready.code.clone(), |c| c.code.clone()),
-            runtime: cohort.as_ref().map_or_else(|| bound.ready.tool.clone(), |c| c.runtime.clone()) } };
+            runtime: cohort.as_ref().map_or_else(|| bound.ready.tool.clone(), |c| c.runtime.clone()),
+            dynamic_stores: cohort.as_ref().and_then(|c| c.dynamic_stores) } };
     serde_json::to_string(&observed).map_err(err)
 }
 
@@ -324,6 +436,7 @@ fn selected_activation(owner: &Owner, journal: &Arc<Directory>) -> NifResult<(Ac
         || selected.key_format != bound.marker.key_format || selected.data_version != bound.marker.data_version
         || record.data_version != selected.data_version
         || record.candidate_release_id != selected.code || !digest(&selected.code) || !digest(&selected.runtime)
+        || selected.dynamic_stores.is_some_and(|version| version != 1)
         || current.code != bound.ready.code || current.tool != bound.ready.tool
         || current.generation != bound.marker.generation || current.application != bound.ready.application {
         return Err(err("journal does not durably admit this generation/code/runtime"));
@@ -341,7 +454,7 @@ fn fjall_generation_select(handle: ResourceArc<OwnerHandle>, journal: ResourceAr
     if !digest(&runtime) || record.data_generation.runtime != runtime {
         return Err(err("selected generation requires another runtime cohort"));
     }
-    let selected = Cohort { code: record.data_generation.code, runtime };
+    let selected = Cohort { code: record.data_generation.code, runtime, dynamic_stores: record.data_generation.dynamic_stores };
     let mut cohort = owner.cohort.write().map_err(err)?;
     if cohort.as_ref().is_some_and(|old| old != &selected) {
         return Err(err("generation owner cohort is already pinned"));
@@ -363,7 +476,8 @@ fn fjall_generation_admit(handle: ResourceArc<OwnerHandle>, journal: ResourceArc
     let code = cohort.as_ref().map_or(&owner.binding.ready.code, |c| &c.code);
     let expected_runtime = cohort.as_ref().map_or(&owner.binding.ready.tool, |c| &c.runtime);
     if !matches!(record.phase.as_str(), "write-admitted" | "verified") || !record.writes_admitted
-        || &selected.code != code || &selected.runtime != expected_runtime || selected.runtime != runtime {
+        || &selected.code != code || &selected.runtime != expected_runtime || selected.runtime != runtime
+        || selected.dynamic_stores != cohort.as_ref().and_then(|c| c.dynamic_stores) {
         return Err(err("journal does not durably admit this pinned generation/code/runtime"));
     }
     // Repeat the actual file+directory flush before publishing the in-memory

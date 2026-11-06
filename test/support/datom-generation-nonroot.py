@@ -12,7 +12,7 @@ import urllib.request
 
 candidate, worker, parent = map(Path, sys.argv[1:4])
 mode = sys.argv[4] if len(sys.argv) == 5 else 'admit'
-assert mode in ('admit', 'boot', 'incompatible', 'mismatch', 'task-unadmitted')
+assert mode in ('admit', 'dynamic', 'boot', 'incompatible', 'mismatch', 'task-unadmitted')
 assert os.getuid() == 0, "This fixture is for the bounded root VM only"
 assert parent.parent == Path('/tmp') and parent.name.endswith('.nonroot-admission')
 uid = gid = 65534
@@ -56,7 +56,7 @@ def drop_identity():
     os.setuid(uid)
 
 arguments = [str(candidate), '--cold', 'run', str(worker), '--', str(parent)]
-if mode != 'admit':
+if mode not in ('admit', 'dynamic'):
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
@@ -156,5 +156,7 @@ finally:
             if not entry.is_symlink() and entry.is_dir():
                 hand_back(entry)
     hand_back(sandbox)
+    if mode == 'dynamic':
+        hand_back(generation / 'firm')
 print(output, end='')
-raise SystemExit(child.returncode if mode == 'admit' else 0)
+raise SystemExit(child.returncode if mode in ('admit', 'dynamic') else 0)
