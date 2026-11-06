@@ -93,9 +93,13 @@ def main():
         for name in ('BL_ROOT', 'BL_EBIN', 'BL_BIN', 'BL_CHECKOUT_ROOT', 'BL_INTERNAL_PRODUCER',
                      'BEAM_LISP_PATH', 'ERL_LIBS', 'ERL_FLAGS', 'ERL_AFLAGS', 'ERL_ZFLAGS'):
             env.pop(name, None)
+        # A real nested Nix application producer has its own finite hour. Keep
+        # the host's 90-minute cgroup ceiling and leave five minutes for receipt
+        # collection; ordinary bounded-VM files retain their five-minute budget.
+        file_timeout = request.get('file_timeout_seconds', 5100 if args.host_nix else 300)
         command = [sys.executable, str(root / 'scripts/qualify-candidate.py'),
                    '--candidate', str(candidate), '--results', str(out / 'files.jsonl'),
-                   '--timeout', str(request.get('file_timeout_seconds', 300)), *files]
+                   '--timeout', str(file_timeout), *files]
         with (out / 'run.log').open('w') as log:
             result = subprocess.run(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT,
                                     timeout=request.get('timeout_seconds', 5400))
