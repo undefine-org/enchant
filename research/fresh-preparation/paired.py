@@ -7,15 +7,16 @@ must separately build and judge the candidate compiler through Source.
 import argparse,hashlib,json,os,pathlib,subprocess,time,statistics
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--root',type=pathlib.Path,required=True);p.add_argument('--out',type=pathlib.Path,required=True)
+p.add_argument('--before-beams',type=pathlib.Path,required=True);p.add_argument('--after-beams',type=pathlib.Path,required=True)
 a=p.parse_args();root=a.root.resolve();out=a.out.resolve();out.mkdir(parents=True,exist_ok=False)
-r={'status':'running','scope':__doc__,'runs':[]}
+r={'status':'running','scope':__doc__,'before_beams':str(a.before_beams),'after_beams':str(a.after_beams),'runs':[]}
 def save():(out/'results.json').write_text(json.dumps(r,indent=2)+'\n')
 def inventory(directory):return {str(p.relative_to(directory)):hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
 reference=inventory(root/'.local/fresh-profile-snapshot');assert reference
 try:
  for pair in range(3):
   for variant in (['before','after'] if pair%2==0 else ['after','before']):
-   name=f'{pair}-{variant}';target=out/name;env=dict(os.environ,PERF_TRACE='0',PERF_USE_CANDIDATE=str(int(variant=='after')),PERF_OUT=str(target))
+   name=f'{pair}-{variant}';target=out/name;env=dict(os.environ,PERF_TRACE='0',PERF_COMPILED=str(getattr(a,variant+'_beams')),PERF_OUT=str(target))
    started=time.monotonic()
    with (out/(name+'.log')).open('w') as log:
     run=subprocess.run([str(root/'bin/bl'),'--cold','run','.local/probe.bl'],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=180)
