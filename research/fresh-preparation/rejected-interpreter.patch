@@ -1,0 +1,212 @@
+diff --git a/priv/host/aot.bl b/priv/host/aot.bl
+index 0834a813c..5bbc2c5bb 100644
+--- a/priv/host/aot.bl
++++ b/priv/host/aot.bl
+@@ -7124,51 +7124,65 @@
+     cost))))
+ 
+ (defn- constructor_internal_cost_uncached! [value state]
+- ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
+- ;; internal capabilities; source literal/input endpoints reject them. Captured
+- ;; environments are charged independently when each capability is constructed.
+- (loop [pending (list (tuple value 0)) nodes 0 bytes 0]
+-  (if (= (list) pending) {:nodes nodes :bytes bytes}
+-   (let [task (erlang/hd pending) v (elem task 0) depth (elem task 1)
+-         rest-tasks (erlang/tl pending) nodes (inc nodes)
+-         bytes (+ bytes (cond (erlang/is_binary v) (erlang/byte_size v)
+-                               (erlang/is_number v) (erlang/external_size v)
+-                               (erlang/is_atom v) (erlang/byte_size (erlang/atom_to_binary v :utf8))
+-                               :else 0))]
+-    (constructor_walk_step! state)
+-    (when (> depth 128) (constructor_refuse :data-depth-budget))
+-    (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
+-    (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+-    (cond
+-     (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_binary v) (erlang/is_function v))
+-      (recur rest-tasks nodes bytes)
+-     (erlang/is_list v)
+-      (if (= (list) v) (recur rest-tasks nodes bytes)
+-       (recur (cons (tuple (erlang/hd v) (inc depth))
+-                    (cons (tuple (erlang/tl v) depth) rest-tasks)) nodes bytes))
+-     (erlang/is_tuple v)
+-      (do (when (> (erlang/tuple_size v) 65536) (constructor_refuse :aggregate-node-budget))
+-          (recur (Enum/reduce (erlang/tuple_to_list v) rest-tasks
+-                   (fn [item acc] (cons (tuple item (inc depth)) acc))) nodes bytes))
+-     (constructor_recipe? v state) (recur rest-tasks nodes bytes)
+-     (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
+-      ;; Validate the canonical container ONCE through its storage-aware raw
+-      ;; checker. Its private MapSet/trie storage is not an independent public
+-      ;; datum and must not be reclassified as a foreign input container.
+-      (let [cost (constructor_container_cost! v state)
+-            extra (dec (:nodes cost)) nodes (+ nodes extra) bytes (+ bytes (:bytes cost))]
+-       (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
+-       (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+-       (constructor_walk_steps! state extra)
+-       (recur rest-tasks nodes bytes))
+-     (erlang/is_map v)
+-      (do (constructor_map_shape! v state)
+-          (when (> (erlang/map_size v) 65536) (constructor_refuse :aggregate-node-budget))
+-          (recur (Enum/reduce (maps/to_list v) rest-tasks
+-                   (fn [pair acc]
+-                    (cons (tuple (elem pair 0) (inc depth))
+-                          (cons (tuple (elem pair 1) (inc depth)) acc)))) nodes bytes))
+-     :else (constructor_refuse :opaque-internal-value))))))
++ ;; Preserve the raw walk's order, costs, fuel and refusals. Recursive native
++ ;; traversal needs no generic cons/tuple task construction for every node.
++ (let [cost (constructor_internal_cost_walk! value state 0 0 0)]
++  {:nodes (erlang/element 1 cost) :bytes (erlang/element 2 cost)}))
++
++(defn- constructor_internal_cost_pair [nodes bytes]
++ (erlang/setelement 2 (erlang/make_tuple 2 nodes) bytes))
++
++(defn- constructor_internal_cost_walk! [value state depth prior-nodes prior-bytes]
++ (let [nodes (erlang/+ prior-nodes 1)
++       bytes (erlang/+ prior-bytes
++               (cond (erlang/is_binary value) (erlang/byte_size value)
++                     (erlang/is_number value) (erlang/external_size value)
++                     (erlang/is_atom value) (erlang/byte_size (erlang/atom_to_binary value :utf8))
++                     :else 0))]
++  (constructor_walk_step! state)
++  (when (erlang/> depth 128) (constructor_refuse :data-depth-budget))
++  (when (erlang/> nodes 65536) (constructor_refuse :aggregate-node-budget))
++  (when (erlang/> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
++  (cond
++   (or (erlang/is_atom value) (erlang/is_number value) (erlang/is_binary value) (erlang/is_function value))
++   (constructor_internal_cost_pair nodes bytes)
++   (erlang/is_list value)
++   (if (erlang/== () value) (constructor_internal_cost_pair nodes bytes)
++    (let [head (constructor_internal_cost_walk! (erlang/hd value) state (erlang/+ depth 1) nodes bytes)]
++     (constructor_internal_cost_walk! (erlang/tl value) state depth
++       (erlang/element 1 head) (erlang/element 2 head))))
++   (erlang/is_tuple value)
++   (let [size (erlang/tuple_size value)]
++    (when (erlang/> size 65536) (constructor_refuse :aggregate-node-budget))
++    ;; The former pending-stack reduce visited the last tuple field first.
++    (loop [index size nodes nodes bytes bytes]
++     (if (erlang/== index 0) (constructor_internal_cost_pair nodes bytes)
++      (let [cost (constructor_internal_cost_walk! (erlang/element index value) state
++                    (erlang/+ depth 1) nodes bytes)]
++       (recur (erlang/- index 1) (erlang/element 1 cost) (erlang/element 2 cost))))))
++   (constructor_recipe? value state) (constructor_internal_cost_pair nodes bytes)
++   (and (erlang/is_map value) (erlang/is_map_key :__struct__ value))
++   (let [cost (constructor_container_cost! value state)
++         extra (erlang/- (:nodes cost) 1)
++         nodes (erlang/+ nodes extra) bytes (erlang/+ bytes (:bytes cost))]
++    (when (erlang/> nodes 65536) (constructor_refuse :aggregate-node-budget))
++    (when (erlang/> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
++    (constructor_walk_steps! state extra)
++    (constructor_internal_cost_pair nodes bytes))
++   (erlang/is_map value)
++   (do
++    (constructor_map_shape! value state)
++    (when (erlang/> (erlang/map_size value) 65536) (constructor_refuse :aggregate-node-budget))
++    ;; Likewise retain reverse maps/to_list order, key before value.
++    (loop [pairs (lists/reverse (maps/to_list value)) nodes nodes bytes bytes]
++     (if (erlang/== pairs ()) (constructor_internal_cost_pair nodes bytes)
++      (let [pair (erlang/hd pairs)
++            key-cost (constructor_internal_cost_walk! (erlang/element 1 pair) state
++                       (erlang/+ depth 1) nodes bytes)
++            val-cost (constructor_internal_cost_walk! (erlang/element 2 pair) state
++                       (erlang/+ depth 1) (erlang/element 1 key-cost) (erlang/element 2 key-cost))]
++       (recur (erlang/tl pairs) (erlang/element 1 val-cost) (erlang/element 2 val-cost))))))
++   :else (constructor_refuse :opaque-internal-value))))
+ 
+ (defn- constructor_charge! [value state]
+  (let [cost (constructor_internal_cost! value state)]
+@@ -8031,10 +8045,11 @@
+  (when (> (constructor_counter! state :depth 1) 512) (constructor_refuse :depth-budget))
+  (try
+  (let [value
+-  (case (:op n)
+-   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n) (Map/get state :data-limits {})) (:val n))
+-   :var (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
+-   :global (let [key [(:ns n) (:name n)]
++  (let [operation (:op n)]
++   (cond
++   (erlang/== operation :lit) (do (BeamLisp.CompilerData/check_first_order! (:val n) (Map/get state :data-limits {})) (:val n))
++   (erlang/== operation :var) (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
++   (erlang/== operation :global) (let [key [(:ns n) (:name n)]
+                  alias (when-not (= :exact (:lookup n)) (get (:global-aliases state) key))
+                  source (when (and (not= :kernel-phase (:resolution-world state)) (constructor_context))
+                           (constructor_global_source (:ns n) (:name n)))]
+@@ -8057,7 +8072,7 @@
+                  (constructor_primitive :Elixir.BeamLisp.Ns.Core (erlang/binary_to_atom (:name n))
+                             (to-list arguments) state)) state)
+               :else (constructor_refuse {:global key})))
+-   :remote (let [args (Enum/map (:args n) #(constructor_interpret % env state))
++   (erlang/== operation :remote) (let [args (Enum/map (:args n) #(constructor_interpret % env state))
+                  target [(:mod n) (:fun n) (count args)]
+                  entry (or (get (:remotes state) target)
+                            (when (and (not= :kernel-phase (:resolution-world state)) (constructor_context))
+@@ -8065,48 +8080,48 @@
+              (if entry
+               (constructor_invoke (constructor_interpret {:op :fn :clauses (:clauses entry) :constructor-binding (:constructor-binding entry)} {} state) args state)
+               (constructor_primitive (:mod n) (:fun n) args state)))
+-   :arith (let [args (Enum/map (:args n) #(constructor_interpret % env state))]
++   (erlang/== operation :arith) (let [args (Enum/map (:args n) #(constructor_interpret % env state))]
+             (when-not (Enum/all? args (fn [item] (erlang/is_number item))) (constructor_refuse :non-numeric-arithmetic))
+             (constructor_primitive :erlang (:bif n) args state))
+-   :invoke (let [callee (constructor_interpret (:callee n) env state)
++   (erlang/== operation :invoke) (let [callee (constructor_interpret (:callee n) env state)
+                  arguments (constructor_interpret (:arguments n) env state)]
+              (when-not (erlang/is_list arguments) (constructor_refuse :invocation-arguments))
+              (constructor_native_operation
+               (fn [] (constructor_invoke callee (constructor_sequence! arguments state) state)) state))
+-   :apply (let [callee (constructor_interpret (:fn n) env state)
++   (erlang/== operation :apply) (let [callee (constructor_interpret (:fn n) env state)
+                 arguments (Enum/map (:args n) #(constructor_interpret % env state))]
+             (constructor_native_operation (fn [] (constructor_invoke callee arguments state)) state))
+-   :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
+-   :if (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
+-   :do (if-let [call (constructor_sdk_ready_call n state)]
++   (erlang/== operation :let) (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
++   (erlang/== operation :if) (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
++   (erlang/== operation :do) (if-let [call (constructor_sdk_ready_call n state)]
+          ;; This discharges a runtime initialization precondition using this
+          ;; SDK closure's exact artifact metadata. No loader operation runs;
+          ;; the original pure interpreter still evaluates every callee/operand.
+          (do (constructor_step! state) (constructor_step! state)
+              (constructor_interpret call env state))
+          (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state))))
+-   :tuple (do (constructor_allocation! (inc (count (:elems n))) 0 state)
++   (erlang/== operation :tuple) (do (constructor_allocation! (inc (count (:elems n))) 0 state)
+               (erlang/list_to_tuple (Enum/map (:elems n) #(constructor_interpret % env state))))
+-   :map (do (constructor_allocation! (+ 8 (* 8 (count (:pairs n)))) 0 state)
++   (erlang/== operation :map) (do (constructor_allocation! (+ 8 (* 8 (count (:pairs n)))) 0 state)
+          (constructor_map_shape!
+           (Enum/reduce (:pairs n) {}
+            (fn [[k v] acc] (Map/put acc (constructor_interpret k env state) (constructor_interpret v env state)))) state))
+-   :enil (list)
+-   :cons (let [head (constructor_interpret (:head n) env state)
++   (erlang/== operation :enil) (list)
++   (erlang/== operation :cons) (let [head (constructor_interpret (:head n) env state)
+                tail (constructor_interpret (:tail n) env state)]
+            (constructor_allocation! 2 0 state)
+            (if (constructor_recipe? tail state) (constructor_stream_cons! head tail state)
+             (cons head (constructor_sequence! tail state))))
+-   :struct (if (and (= :Elixir.BeamLisp.Vector (:mod n)) (= 1 (count (:fields n))))
++   (erlang/== operation :struct) (if (and (= :Elixir.BeamLisp.Vector (:mod n)) (= 1 (count (:fields n))))
+              (let [[k v] (first (:fields n)) key (constructor_interpret k env state) value (constructor_interpret v env state)]
+               (when-not (and (= :items key) (erlang/is_tuple value)) (constructor_refuse :vector-scaffold))
+               (BeamLisp.Vector/new (erlang/tuple_to_list value)))
+              (constructor_refuse :opaque-struct))
+-   :try (constructor_try n env state)
+-   :case (let [subject (constructor_interpret (:subj n) env state)]
++   (erlang/== operation :try) (constructor_try n env state)
++   (erlang/== operation :case) (let [subject (constructor_interpret (:subj n) env state)]
+            (constructor_match_clauses (:clauses n) (list subject) env
+             (fn [] (constructor_control_exception! :error (tuple :case_clause subject) state)) state))
+-   :fn (let [_ (constructor_charge! env state) clauses (:clauses n) arity (count (:pats (first clauses)))
++   (erlang/== operation :fn) (let [_ (constructor_charge! env state) clauses (:clauses n) arity (count (:pats (first clauses)))
+              run (fn [args]
+               (try (constructor_match_clauses clauses args env (fn [] (constructor_control_exception! :error :function_clause state)) state)
+                (catch error
+@@ -8145,7 +8160,7 @@
+           16 (fn [a b c d e f g h i j k l m n o p] (run (list a b c d e f g h i j k l m n o p)))
+           (constructor_refuse :function-arity))]
+           (constructor_register_callable! value state) value))
+-   (constructor_refuse {:operation (:op n)}))]
++   :else (constructor_refuse {:operation operation})))]
+   ;; An intermediate list tail or borrowed variable is already accounted for
+   ;; by its allocation site. Rewalking every growing cons prefix is quadratic
+   ;; and consumes the fuel before the actual aggregate admission boundary.
