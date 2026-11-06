@@ -1,0 +1,59 @@
+;; Synthetic generation creation crash fixture. The controller owns every path.
+(ns datom.generation-crash-fixture
+ (:require [datom.offline.root :as root] [datom.offline.fs :as fs] [datom.offline.layout :as l]
+           [datom.generation :as generation] [datom.store-fjall :as fj] [datom.store :as s]
+           [datom.blob-fs :as blobs] [datom.blob :as b] [datom.file :as file]))
+(def spec {:version 1 :application "fixture.app" :key-format 1 :data-version 1
+           :stores [{:id "control" :path "control.fjall" :blobs {:kind :fs :path "control.fjall.blobs"}}
+                    {:id "library/one" :path "libraries/a.fjall" :blobs {:kind :fs :path "libraries/a.fjall.blobs"}}]
+           :files ["config.json"] :directories ["empty"]})
+(defn require! [condition message] (when-not condition (throw (ex-info message {}))))
+(let [parent (System/fetch_env! "DATOM_CRASH_ROOT") mode (first (BeamLisp/argv))
+      state (str parent "/state") target (str parent "/generation")]
+ (require! (String/starts_with? parent "/build/generation-crash-fixtures/") "private synthetic root required")
+ (if (= mode "seed")
+  (let [evidence (Jason/decode! (File/read! "test/fixtures/datom/legacy-root-v1.json"))
+        ready (root/prepare! (str parent "/original") (str parent "/job") target
+                  (get-in evidence ["producer_receipt" "sdk_descriptor_sha256"]) (l/digest :fixture-release) spec)
+        marker (Jason/decode! (File/read! (str target "/.bl-generation")))
+        _ (File/mkdir_p! state)
+        writer (fs/claim! (str state "/writer") {:create true}) control (fs/claim! state)
+        selected {"version" 1 "application" "fixture.app" "writerRoot" (:path writer) "root" target
+                  "generation" (get ready "generation") "ready" (get marker "ready") "keyFormat" 2 "dataVersion" 1
+                  "code" (get ready "code") "runtime" (get ready "tool") "dynamicStores" 1}]
+   (try
+    (require! (fs/put! control "activation.json" nil
+                  (Jason/encode! {"version" 1 "phase" "write-admitted" "journalRevision" 1 "writesAdmitted" true
+                                  "candidateReleaseId" (get ready "code") "dataVersion" 1 "dataGeneration" selected})) "seed publication failed")
+    (finally (fs/close! control) (fs/close! writer))))
+  (let [owner (generation/open-selected! state) _ (generation/admit! owner)
+        path (str target "/firm/library.fjall") sha (file/sha256 "durable blob")]
+   (require! (contains? #{"write" "recover"} mode) "unsupported crash fixture operation")
+   ((fn []
+    (let [store (fj/open path) bs (blobs/open (str path ".blobs"))]
+     (try
+      (require! (= {:version 2} (s/-get store (erlang/list_to_binary (list 0 107)))) "dynamic format descriptor changed")
+      (if (= mode "write")
+       (do
+        (s/-put store "durable" "acknowledged value") (s/sync! store)
+        (b/-blob-put bs sha "durable blob")
+        (let [control (fs/claim! parent)]
+         (try (require! (fs/put! control "WRITE-ACK.json" nil "{\"acknowledged\":true}") "write acknowledgement failed")
+              (finally (fs/close! control))))
+        (throw (ex-info "Injector did not stop the writer" {})))
+       (do
+        (when (= "data-ack" (System/fetch_env! "DATOM_CRASH_BOUNDARY"))
+         (require! (= "acknowledged value" (s/-get store "durable")) "acknowledged database write lost")
+         (require! (= "durable blob" (b/-blob-get bs sha)) "acknowledged blob lost"))
+        (s/-put store "after" "recovered writer") (s/sync! store)
+        (require! (= "recovered writer" (s/-get store "after")) "recovered writer unavailable")
+        (b/-blob-put bs sha "durable blob")
+        (require! (= "durable blob" (b/-blob-get bs sha)) "recovered blob unavailable")
+        (println "DATOM-GENERATION-RECOVERED" (System/fetch_env! "DATOM_CRASH_BOUNDARY"))))
+      (finally (s/close bs) (s/close store))))))
+   (loop [left 100]
+    (let [released (try (generation/release! owner) true (catch _ false))]
+     (when-not released
+      (require! (pos? left) "native engine did not retire")
+      (erlang/garbage_collect) (Process/sleep 10) (recur (dec left)))))
+   (fs/close! (:root owner)) (fs/close! (:app owner)))))

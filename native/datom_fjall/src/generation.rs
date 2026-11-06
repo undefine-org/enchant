@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 const MARKER: &str = ".bl-generation";
 const LIMIT: usize = 1048576;
 pub(crate) const CREATE_MARKER: &str = ".bl-datom-create";
+const CREATE_PENDING: &str = ".bl-datom-create.pending";
 const CREATE_BYTES: &[u8] = b"datom-generation-new-store-v1\n";
 fn failure(message: &'static str) -> std::io::Error { std::io::Error::other(message) }
 #[derive(Deserialize)]
@@ -153,14 +154,32 @@ impl Owner {
         for (index, part) in parts.iter().enumerate() {
             directory = directory.child(part, false, index + 1 == parts.len())?;
         }
-        let empty = fs::read_dir(super::directory::pinned(&directory.file, "."))?.next().transpose()?.is_none();
-        let creating = if empty {
+        let mut entries = fs::read_dir(super::directory::pinned(&directory.file, "."))?;
+        let first = entries.next().transpose()?;
+        let empty = first.is_none();
+        let only_pending = first.as_ref().is_some_and(|entry| entry.file_name() == CREATE_PENDING)
+            && entries.next().transpose()?.is_none();
+        let creating = if empty || only_pending {
             let permit = self.write_guard()?;
             permit.directory(&directory)?;
+            if only_pending {
+                // This exact name is reserved for UNPUBLISHED creation, and
+                // there is no engine or other entry to relabel/delete. A
+                // crashed writer may leave zero or partial staging bytes.
+                let pending = directory.open_file(CREATE_PENDING)?;
+                if pending.metadata().uid() != unsafe { libc::geteuid() }
+                    || pending.metadata().mode() & 0o077 != 0 {
+                    return Err(failure("untrusted pending store creation"));
+                }
+                pending.check()?;
+                fs::remove_file(super::directory::pinned(&directory.file, CREATE_PENDING))?;
+                directory.file.sync_all()?;
+            }
             let mut marker = OpenOptions::new().write(true).create_new(true).mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(super::directory::pinned(&directory.file, CREATE_MARKER))?;
-            marker.write_all(CREATE_BYTES)?; marker.sync_all()?; directory.file.sync_all()?;
+                .open(super::directory::pinned(&directory.file, CREATE_PENDING))?;
+            marker.write_all(CREATE_BYTES)?; marker.sync_all()?;
+            super::directory::rename_anchored(&directory, CREATE_PENDING, CREATE_MARKER, true)?;
             true
         } else {
             match directory.open_file(CREATE_MARKER) {

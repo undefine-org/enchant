@@ -351,7 +351,7 @@ fn rename(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -
     parent.writable()?; parent.writable_path(&parent.path.join(target))?;
     rename_anchored(parent, temporary, target, no_replace)
 }
-fn rename_anchored(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -> std::io::Result<()> {
+pub(crate) fn rename_anchored(parent: &Directory, temporary: &str, target: &str, no_replace: bool) -> std::io::Result<()> {
     parent.check()?;
     let from = name(temporary)?; let to = name(target)?;
     let flags = if no_replace { libc::RENAME_NOREPLACE } else { 0 };
