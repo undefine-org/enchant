@@ -15,7 +15,7 @@ p.add_argument('--root', type=Path, required=True)
 p.add_argument('--out', type=Path, required=True)
 a = p.parse_args()
 a.out.mkdir(parents=True, exist_ok=False)
-report = {'status': 'running', 'scope': 'Same final native compiler; forced fresh 533-unit SDK; optional reader cache off/on',
+report = {'status': 'running', 'scope': 'Same final native compiler; forced fresh complete SDK; optional reader cache off/on',
           'variants': {}}
 inventories = {}
 for mode in ('off', 'on'):
@@ -38,7 +38,8 @@ for mode in ('off', 'on'):
     total = [x['value'] for x in phases if x['kind'] == 'FULL-PREPARATION']
     units = [x['value'] for x in phases if x['kind'] == 'SDK-UNIT-PHASES']
     assert len(total) == len(units) == 1, (mode, total, units)
-    assert total[0]['units'] == len(preparations) == units[0]['compiled'] == 533
+    index = json.loads((image / 'unit-store/unit-index.json').read_text())
+    assert total[0]['units'] == len(preparations) == units[0]['compiled'] == len(index['units'])
     assert units[0]['cached'] == 0
     directory = image / 'unit-store'
     inventory = {str(f.relative_to(directory)): hashlib.sha256(f.read_bytes()).hexdigest()
