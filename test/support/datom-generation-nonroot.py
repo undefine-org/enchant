@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import json
@@ -11,7 +12,7 @@ import urllib.request
 
 candidate, worker, parent = map(Path, sys.argv[1:4])
 mode = sys.argv[4] if len(sys.argv) == 5 else 'admit'
-assert mode in ('admit', 'boot', 'incompatible', 'mismatch')
+assert mode in ('admit', 'boot', 'incompatible', 'mismatch', 'task-unadmitted')
 assert os.getuid() == 0, "This fixture is for the bounded root VM only"
 assert parent.parent == Path('/tmp') and parent.name.endswith('.nonroot-admission')
 uid = gid = 65534
@@ -39,6 +40,10 @@ for path, reader_mode in ((parent, 0o750), (parent / 'writer', 0o750), (parent /
     assert (metadata.st_uid, metadata.st_gid, metadata.st_mode & 0o777) == (0, gid, reader_mode), path
 sandbox = parent / 'child'
 sandbox.mkdir()
+if mode in ('boot', 'task-unadmitted'):
+    shutil.copyfile(worker.with_name('generation-task-body.bl'), sandbox / 'task-body.bl')
+
+    os.chmod(sandbox / 'task-body.bl', 0o644)
 runtime = sandbox / 'runtime'
 runtime.mkdir()
 permissions(runtime, 0o700, uid)
@@ -58,6 +63,31 @@ if mode != 'admit':
     arguments.append(str(port))
     if mode == 'mismatch':
         arguments.append('mismatch')
+def stop(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=3)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+def task():
+    process = subprocess.Popen([str(candidate), '--cold', 'run', str(worker.with_name('generation-task.bl')),
+                                '--', str(parent)], cwd=sandbox, env=env, preexec_fn=drop_identity,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        output, _ = process.communicate(timeout=60)
+        return process.returncode, output
+    finally:
+        stop(process)
+
 child = subprocess.Popen(arguments,
                          cwd=sandbox, env=env, preexec_fn=drop_identity,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -92,9 +122,20 @@ try:
         if not successful and child.poll() is not None:
             raise AssertionError('generation bootstrap exited early:\n' + child.stdout.read())
         assert successful, 'generation bootstrap did not complete after admission'
-        output = 'NONROOT-GENERATION-BOOTSTRAPPED\n'
+        busy, diagnostic = task()
+        assert busy != 0, diagnostic
+        assert not (sandbox / 'task-loaded').exists(), 'task ran while the service retained its owner'
+        stop(child)
+        admitted, diagnostic = task()
+        assert admitted == 0 and 'GENERATION-TASK-WROTE' in diagnostic, diagnostic
+        assert (sandbox / 'task-loaded').exists()
+        output = 'NONROOT-GENERATION-BOOTSTRAPPED\nNONROOT-GENERATION-TASK-CUSTODY\n'
     else:
         output, _ = child.communicate(timeout=90)
+        if mode == 'task-unadmitted':
+            assert child.returncode != 0, output
+            assert not (sandbox / 'task-loaded').exists()
+            output += 'NONROOT-GENERATION-TASK-REFUSED\n'
         if mode in ('incompatible', 'mismatch'):
             assert child.returncode != 0, output
             expected = ('Selected runtime cannot serve this index format' if mode == 'incompatible'
@@ -104,20 +145,7 @@ try:
             assert not (sandbox / 'initialized').exists()
             output += 'NONROOT-GENERATION-BOOT-REFUSED\n'
 finally:
-    # Stop only this fixture's process group, including a stuck cold child.
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        child.wait(timeout=3)
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    stop(child)
     # The test VM deliberately lacks DAC override. Return only this child's
     # directories so its root controller can remove the private sandbox.
     # Never follow cache symlinks or change payload file permissions.
