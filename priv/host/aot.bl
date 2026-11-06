@@ -4826,9 +4826,11 @@
       (Process/put :bl_source_snapshot {})
       (let [previous (Process/get :bl_source_info_cache)
             previous-parts (Process/get :bl_source_parts_cache)
-            previous-nodes (Process/get :bl_source_graph_nodes)]
+            previous-nodes (Process/get :bl_source_graph_nodes)
+            previous-reader (Process/get :bl_constructor_reader_cache)]
         (Process/put :bl_source_graph_nodes {})
         (Process/put :bl_source_parts_cache {})
+        (Process/put :bl_constructor_reader_cache {:entries {} :bytes 0})
         (try (fun)
           (finally
             (Process/delete :bl_source_snapshot)
@@ -4837,7 +4839,9 @@
             (if (erlang/== nil previous-parts) (Process/delete :bl_source_parts_cache)
               (Process/put :bl_source_parts_cache previous-parts))
             (if (nil? previous-nodes) (Process/delete :bl_source_graph_nodes)
-              (Process/put :bl_source_graph_nodes previous-nodes))))))
+              (Process/put :bl_source_graph_nodes previous-nodes))
+            (if (nil? previous-reader) (Process/delete :bl_constructor_reader_cache)
+              (Process/put :bl_constructor_reader_cache previous-reader))))))
     (fun)))
 
 (defn ns_closure_hash
@@ -6164,7 +6168,7 @@
   (stage-refuse :sdk-stage-source-bound))
  (let [file (Keyword/get opts :file nil)
        attribution (if (floor_file? file) (floor_source file) file)
-       forms (BeamLisp.Reader/read_string source attribution)
+       forms (constructor_read_forms source attribution :host)
        header (stage-preflight! forms) ns (:ns header)
        previous (BeamLisp.Env/current_ns)
        prior-declarations (Process/get :bl_sdk_stage_declarations)]
@@ -8736,6 +8740,69 @@
 (defn- constructor_context_put! [key value]
  (Process/put :bl_sdk_constructor_context (Map/put (constructor_context!) key value)))
 
+(defn- constructor_reader_direct [source attribution mode]
+ (if (erlang/== mode :bare)
+  (BeamLisp.Ns.Reader/read_string source attribution)
+  (BeamLisp.Reader/read_string source attribution)))
+
+(defn- constructor_reader_replay [entry mode]
+ (let [run (fn []
+             (Enum/each (:events entry)
+              (fn [event]
+               (if (erlang/== :reset event) (BeamLisp.AtomGuard/reset)
+                (BeamLisp.AtomGuard/account! (erlang/element 2 event)))))
+             (:forms entry))]
+  (if (erlang/== mode :bare) (run) (BeamLisp.Reader/mapping_atom_limit run))))
+
+(defn constructor_read_forms
+ "Reuse inert reader output only in the current native constructor and Source
+  pass. Guard resets/accounting replay in order with current limits. Source
+  selection/currentness, preflight, fuel and artifact checks are independent."
+ [source attribution mode]
+ (let [context (Process/get :bl_sdk_constructor_context)
+       cache (Process/get :bl_constructor_reader_cache)
+       world (:kernel-phase-identity context)
+       epoch (when (and cache (:artifact-workspace context)) (BeamLisp.Env/code_evidence_generation))
+       modules (list :Elixir.BeamLisp.Reader :Elixir.BeamLisp.Ns.Reader
+                     :Elixir.BeamLisp.Ns.Body.Reader :Elixir.BeamLisp.AtomGuard :Elixir.BeamLisp.AOT)]
+  (if-not (and cache epoch (:artifact-workspace context) (:id world)
+                (erlang/function_exported :Elixir.BeamLisp.AtomGuard :reader_guard_event! 2)
+                (erlang/== (:compiler-env context) (BeamLisp.Env/env_id))
+                (nil? (Process/get :bl_constructor_reader_guard_capture))
+                (erlang/=< (erlang/byte_size source) 1048576)
+                (Enum/all? modules (fn [module] (erlang/module_loaded module))))
+   (constructor_reader_direct source attribution mode)
+   (let [_ (constructor_context!)
+         _ (constructor_kernel_manifest!)
+         identity (Enum/map modules (fn [module] (erlang/apply module :module_info (list :md5))))
+         key [(:compiler-key (:input context)) (:id world) epoch identity attribution (crypto/hash :sha256 source)]
+         hit (Map/get (:entries cache) key)]
+    (if hit
+     (let [forms (constructor_reader_replay hit mode)]
+      (if (and (erlang/== epoch (BeamLisp.Env/code_evidence_generation))
+                (erlang/== identity (Enum/map modules (fn [module] (erlang/apply module :module_info (list :md5))))))
+       forms (constructor_reader_direct source attribution mode)))
+     (let [forms
+           (try
+            (Process/put :bl_constructor_reader_guard_capture {:remaining 262144 :events (list) :overflow false})
+            (let [forms (constructor_reader_direct source attribution mode)
+                  captured (Process/get :bl_constructor_reader_guard_capture)
+                  latest (Process/get :bl_constructor_reader_cache)]
+             (when (and (erlang/is_list forms) (not (:overflow captured))
+                         (not (erlang/== () (:events captured)))
+                         (erlang/== :reset (lists/last (:events captured)))
+                         (erlang/== epoch (BeamLisp.Env/code_evidence_generation))
+                         (erlang/== identity (Enum/map modules (fn [module] (erlang/apply module :module_info (list :md5)))))
+                         (< (erlang/map_size (:entries latest)) 512))
+              (let [entry {:forms forms :events (Enum/reverse (:events captured))}
+                    size (erlang/external_size entry)]
+               (when (<= (+ (:bytes latest) size) 67108864)
+                (Process/put :bl_constructor_reader_cache
+                 {:entries (Map/put (:entries latest) key entry) :bytes (+ (:bytes latest) size)}))))
+             forms)
+            (finally (Process/delete :bl_constructor_reader_guard_capture)))]
+      forms))))))
+
 (defn- constructor_source_definitions [forms]
  (Enum/reduce (rest forms) {}
   (fn [form out]
@@ -8831,7 +8898,7 @@
          content (when path (BeamLisp.Loader/read_source path))
          source (constructor_source_input! namespace path content)
          attribution (if (floor_file? path) (floor_source path) path)
-         forms (BeamLisp.Reader/read_string content attribution)
+         forms (constructor_read_forms content attribution :host)
          header (stage-requires (first forms))
          unit (Map/merge source {:forms forms :header header :attribution attribution
                                 :definitions (constructor_source_definitions forms)})]
