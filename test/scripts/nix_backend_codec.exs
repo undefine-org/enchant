@@ -12,9 +12,10 @@ BeamLisp.eval("""
 (ns backend.codec-qualification (:require [build.backend :as backend]))
 (doseq [name ["local" "configured" "nixbuild" "ssh"]]
   (backend/compile-file! (str "tooling/build-backends/" name ".bl")))
+(doseq [path (Path/wildcard "tooling/build-backends/*.bl")] (backend/compile-file! path))
 """)
 File.mkdir_p!(System.fetch_env!("BL_CODEC_GENERATED"))
-for name <- ["local", "configured", "nixbuild", "ssh"] do
-  File.cp!("tooling/build-backends/#{name}.nix", Path.join(System.fetch_env!("BL_CODEC_GENERATED"), name <> ".nix"))
+for path <- Path.wildcard("tooling/build-backends/*.nix") do
+  File.cp!(path, Path.join(System.fetch_env!("BL_CODEC_GENERATED"), Path.basename(path)))
 end
 BeamLisp.Launcher.start_app!(["--cold", "test", "test/bl/nix_test.bl", "test/bl/build_backend_test.bl"], %{})
