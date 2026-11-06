@@ -1,0 +1,68 @@
+(ns application.workspace-admission-test
+ (:require [build :as build] [build-plan :as plan]))
+
+;; Invoke the actual worker's inert admission boundary, without starting Nix
+;; or compiling the application. Its callback stands at the first compile.
+(let [root (or (System/get_env "BL_TEST_SOURCE_ROOT") (BeamLisp/cwd))
+      source (File/read! (Path/join root "nix/application-worker.bl"))
+      helper (first (String/split
+                     (str "(defn with-application-workspace"
+                          (second (String/split source "(defn with-application-workspace")))
+                     "(let [request"))]
+ (BeamLisp/eval (str "(ns application.workspace-admission-test)\n" helper)))
+(ns application.workspace-admission-test)
+
+(defn refused [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+(defn fixtures [n action]
+ (let [root (str (System/tmp_dir!) "/application-workspace-" (System/unique_integer (list :positive)))
+       marker (str root "/source-executed")
+       rows (mapv (fn [i]
+                    (let [name (str "application.pool.fixture.n" i)
+                          file (str root "/application/pool/fixture/n" i ".bl")]
+                     (File/mkdir_p! (Path/dirname file))
+                     (File/write! file (str "(ns " name ")\n(File/write! " (pr-str marker) " \"bad\")\n"))
+                     {:namespace (symbol name) :file file})) (range n))]
+  (try
+   (BeamLisp.Loader/with_ambient_dirs (list root) (fn [] (action root rows marker)))
+   (finally (File/rm_rf! root)))))
+
+(deftest actual-worker-admits-hera-and-the-explicit-ceiling-before-compilation
+ (fixtures 512
+  (fn [root rows marker]
+   (doseq [n [265 512]]
+    (let [selected (vec (take n rows)) called (atom false)]
+     (is (= :admitted
+          (with-application-workspace root {:sources (mapv :file selected) :exclude []}
+           (fn [workspace] (reset! called true) (is (erlang/is_reference workspace)) :admitted))))
+     (is @called)
+     (is (not (File/exists? marker)))))
+   ;; The generic API keeps its old default; only explicit finite requests grow.
+   (is (= :invalid-artifact-inputs
+        (refused #(BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources (to-list rows)} {}))))
+   (is (= :invalid-artifact-limits
+        (refused #(BeamLisp.AOT/open_workspace {:version 1 :sources (list (first rows))} {:max-sources 513})))))))
+
+(deftest oversized-worker-pool-refuses-before-the-compilation-callback
+ (fixtures 513
+  (fn [root rows marker]
+   (let [called (atom false)]
+    (is (= :invalid-artifact-inputs
+         (refused #(with-application-workspace root {:sources (mapv :file rows) :exclude []}
+                    (fn [_] (reset! called true))))))
+    (is (not @called))
+    (is (not (File/exists? marker)))))))
+
+(deftest frozen-input-refusal-and-callback-failure-close-the-workspace
+ (fixtures 1
+  (fn [root rows marker]
+   (let [held (atom nil) source (first rows)]
+    (is (= :artifact-source-changed
+         (refused #(with-application-workspace root {:sources [(:file source)] :exclude []}
+                    (fn [workspace]
+                     (reset! held workspace)
+                     (File/write! (:file source) (str "(ns " (:namespace source) ")\n; changed\n"))
+                     (BeamLisp.AOT/prepare_unit workspace (:namespace source)))))))
+    (is (= :invalid-artifact-workspace
+         (refused #(BeamLisp.AOT/prepare_unit @held (:namespace source)))))
+    (is (not (File/exists? marker)))))))

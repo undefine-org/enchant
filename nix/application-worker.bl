@@ -38,6 +38,34 @@
    ;; retain their existing Source-effect contract.
    (BeamLisp.AOT/verify_unit directory))))
 
+(defn with-application-workspace
+ "Admit the complete selected Source pool before compilation. Final unit
+  preparation keeps its existing verified reuse path and these frozen inputs;
+  admission failures cannot spend a full application compile first."
+ [root options action]
+ (if (:world options) (action nil)
+  (let [paths (build/select-sources (:sources options) (:exclude options))
+        sources (mapv (fn [file]
+                       (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source file))]
+                        (when-not namespace
+                         (throw (ex-info "Application artifact source requires a namespace" {:file file})))
+                        {:namespace (symbol namespace) :file file})) paths)
+        closure (distinct (mapcat
+                   (fn [source]
+                    (BeamLisp.BuildPlan/nodes_from_resolver (str (:namespace source))
+                     (fn [name]
+                      (when-let [path (BeamLisp.Loader/source_path name)]
+                       (when (String/starts_with? (Path/expand path) (str root "/"))
+                        (plan/memo-node name (BeamLisp.Loader/read_source path))))))) sources))
+        selected (to-list (map (fn [node] {:namespace (symbol (:ns node))
+                                         :file (BeamLisp.Loader/source_path (:ns node))}) closure))
+        workspace (when (seq sources)
+                    (BeamLisp.AOT/open_workspace
+                     {:version 1 :roots (list root) :sources selected} {:max-sources 512}))]
+   (try
+    (action workspace)
+    (finally (when workspace (BeamLisp.AOT/close_workspace! workspace)))))))
+
 (let [request (Jason/decode! (File/read! (System/fetch_env! "BL_APPLICATION_REQUEST")))
       base (System/get_env "BL_APPLICATION_BASE")
       previous (when base (Jason/decode! (File/read! (Path/join base "result.json"))))
@@ -59,8 +87,10 @@
                :native (get request "native")
                :ex (when ex {:root (relative (get ex "root")) :exclude (get ex "exclude")})
                :log println}
-      unit-counts (atom {:compiled 0 :restored 0})
-      result (build/produce! options)
+      unit-counts (atom {:compiled 0 :restored 0})]
+ (with-application-workspace root options
+  (fn [workspace]
+   (let [result (build/produce! options)
       errors (Enum/map (:errors result) identity)]
   (when (seq errors) (throw (ex-info (str "Application production failed: " (pr-str errors)) {:errors errors})))
   ;; Per-request wall-clock history belongs to the coordinator/Nix log. Keep
@@ -81,20 +111,7 @@
                             (let [namespace (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source file))]
                               (when-not namespace
                                 (throw (ex-info "Application artifact source requires a namespace" {:file file})))
-                              {:namespace (symbol namespace) :file file})))
-                closure (distinct (mapcat
-                          (fn [source]
-                            (BeamLisp.BuildPlan/nodes_from_resolver (str (:namespace source))
-                              (fn [name]
-                                (when-let [path (BeamLisp.Loader/source_path name)]
-                                  (when (String/starts_with? (Path/expand path) (str root "/"))
-                                    (plan/memo-node name (BeamLisp.Loader/read_source path))))))) sources))
-                workspace-sources (Enum/map closure
-                                    (fn [node] {:namespace (symbol (:ns node))
-                                                :file (BeamLisp.Loader/source_path (:ns node))}))
-                workspace (when (seq sources)
-                            (BeamLisp.AOT/open_workspace {:version 1 :roots (list root) :sources workspace-sources} {}))]
-            (try
+                              {:namespace (symbol namespace) :file file})))]
               (Enum/map sources
                 (fn [source]
                   (let [namespace (:namespace source)
@@ -124,8 +141,7 @@
                           (let [prepared (BeamLisp.AOT/prepare_unit workspace namespace)]
                             (when (File/exists? directory) (File/rm_rf! directory))
                             (emit-produced-unit! prepared record (Path/join out "ebin") directory)))]
-                    {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))
-              (finally (when workspace (BeamLisp.AOT/close_workspace! workspace))))))
+                    {:namespace name :source (Path/relative_to (:file source) root) :directory relative :modules (count (get-in verified [:manifest :modules]))})))))
         incoming (when planning
                    (Enum/map (:order planning)
                      (fn [node]
@@ -174,4 +190,4 @@
                      :runtime-out (when (:runtime-out result) (Path/relative_to (:runtime-out result) out))
                      :app-file (when (:ok? resource) (Path/basename (:path resource)))
                      :app-why (:why resource)
-                     :app-resource (:ok? resource)}))))
+                     :app-resource (:ok? resource)})))))))
