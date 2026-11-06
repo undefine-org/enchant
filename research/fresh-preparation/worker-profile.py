@@ -12,15 +12,18 @@ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=path
 assert (root/'priv/build/unit-store.bl').read_text().count('(fn [] (mapv (fn [path]') == 1
 assert (root/'priv/build/build.bl').read_text().count('(ns build\n') == 1
 source=(root/'priv/build/selfbuild.bl').read_text();patches=[('(ns selfbuild\n','(ns profile-selfbuild\n')]
-setup='''us = File.read!(Path.join(stage,"build/unit-store.bl")) |> String.replace("(ns unit-store ","(ns profile-unit-store ")
-'''
-if a.mode=='off':setup+='''us = String.replace(us,"(fn [] (mapv (fn [path]","(fn [] (Process.delete :bl_constructor_reader_cache) (mapv (fn [path]")
-'''
-setup+='''BeamLisp.eval(us)
-bs = File.read!(Path.join(stage,"build/build.bl")) |> String.replace("(ns build\\n","(ns profile-build\\n") |> String.replace("(BeamLisp.Loader/ensure_loaded \\\"unit-store\\\")",":ok") |> String.replace("(BeamLisp.Env/fetch! \\\"unit-store\\\" \\\"produce!\\\")","(BeamLisp.Env/fetch! \\\"profile-unit-store\\\" \\\"produce!\\\")")
-BeamLisp.eval(bs)
-run = BeamLisp.Env.fetch!("profile-build","produce!")
-'''
+setup_lines=['us = File.read!(Path.join(stage,"build/unit-store.bl"))',
+             'us = String.replace(us, '+json.dumps('(ns unit-store ')+', '+json.dumps('(ns profile-unit-store ')+')']
+if a.mode=='off':
+ setup_lines.append('us = String.replace(us, '+json.dumps('(fn [] (mapv (fn [path]')+', '+json.dumps('(fn [] (Process/delete :bl_constructor_reader_cache) (mapv (fn [path]')+')')
+setup_lines += ['BeamLisp.eval(us)', 'bs = File.read!(Path.join(stage,"build/build.bl"))']
+for old,new in [('(ns build\n','(ns profile-build\n'),
+                ('(BeamLisp.Loader/ensure_loaded "unit-store")',':ok'),
+                ('(BeamLisp.Env/fetch! "unit-store" "produce!")','(BeamLisp.Env/fetch! "profile-unit-store" "produce!")')]:
+ setup_lines.append('bs = String.replace(bs, '+json.dumps(old)+', '+json.dumps(new)+')')
+setup_lines += ['BeamLisp.eval(bs)', 'run = BeamLisp.Env.fetch!("profile-build","produce!")']
+setup='\n'.join(setup_lines)+'\n'
+
 for line in source.splitlines():
  stripped=line.strip()
  if not stripped.startswith('"'):continue

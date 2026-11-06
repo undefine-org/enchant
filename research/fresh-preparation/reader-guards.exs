@@ -1,6 +1,8 @@
-for module <- [BeamLisp.AtomGuard,BeamLisp.Loader,BeamLisp.AOT] do
- path=Path.join(System.fetch_env!("PERF_COMPILED"),Atom.to_string(module) <> ".beam")
- {:module,^module}=:code.load_binary(module,String.to_charlist(path),File.read!(path))
+if System.get_env("PERF_COMPILED") do
+ for module <- [BeamLisp.AtomGuard,BeamLisp.Loader,BeamLisp.AOT] do
+  path=Path.join(System.fetch_env!("PERF_COMPILED"),Atom.to_string(module) <> ".beam")
+  {:module,^module}=:code.load_binary(module,String.to_charlist(path),File.read!(path))
+ end
 end
 root=BeamLisp.AOT.physical_sdk_path(BeamLisp.Tiers.priv_root())
 path=BeamLisp.Loader.source_path("core")
@@ -49,7 +51,14 @@ try do
     if interval==nil,do: Application.delete_env(:beam_lisp,:atom_check_interval),else: Application.put_env(:beam_lisp,:atom_check_interval,interval)
     if fraction==nil,do: Application.delete_env(:beam_lisp,:atom_high_water_fraction),else: Application.put_env(:beam_lisp,:atom_high_water_fraction,fraction)
    end
-   IO.puts("READER-GUARDS " <> Jason.encode!(%{status: "passed",guard_events: count,cache_entries: entries,cache_bytes: Process.get(:bl_constructor_reader_cache).bytes}))
+   prior=before_count.()
+   BeamLisp.Env.with_code_evidence_publication(fn -> :ok end)
+   check.(BeamLisp.AOT.constructor_read_forms(source,"cache.bl",:host)==a,"publication changed syntax")
+   check.(before_count.()==prior+1,"publication epoch reused stale reader evidence")
+   for n <- 1..520,do: BeamLisp.AOT.constructor_read_forms("(ns bounded#{n}) value","bounded.bl",:host)
+   bounded=Process.get(:bl_constructor_reader_cache)
+   check.(map_size(bounded.entries)==512 and bounded.bytes<=67108864,"reader retention exceeded its bound")
+   IO.puts("READER-GUARDS " <> Jason.encode!(%{status: "passed",guard_events: count,initial_entries: entries,cache_entries: map_size(bounded.entries),cache_bytes: bounded.bytes}))
   end)
   check.(Process.get(:bl_constructor_reader_cache)==nil,"Source pass retained reader cache")
  end) end)
