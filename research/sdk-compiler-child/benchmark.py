@@ -2,7 +2,8 @@
 
 Run serially, under a resource cap, on the configured build station. Each edit
 starts from the same SDK selection and uses new bytes to avoid a retained Nix
-result masquerading as compilation. This script restores Source and selection
+result masquerading as compilation. Image registration time guards against
+accidentally reused tags. This script restores Source and selection
 even on failure. Client RSS is explicitly separate from compiler-child RSS.
 """
 import argparse
@@ -46,11 +47,13 @@ def select(sdk):
 
 def prepare(label):
     before = Path('/proc/meminfo').read_text()
+    started_epoch = int(time.time())
     started = time.monotonic()
     with (out/(label+'.stdout')).open('w') as stdout, (out/(label+'.log')).open('w') as stderr:
         result = subprocess.run(['time', '-v', str(root/'scripts/prepare-checkout-sdk')],
                                 cwd=root, stdout=stdout, stderr=stderr, timeout=2400)
     row = {'stage': label, 'seconds': time.monotonic()-started, 'exit': result.returncode,
+           'started_epoch': started_epoch,
            'load_after': Path('/proc/loadavg').read_text().strip(),
            'available_before_kib': int(re.search(r'MemAvailable:\s+(\d+)', before)[1])}
     report['runs'].append(row)
@@ -60,6 +63,13 @@ def prepare(label):
     row['selection'] = str(sdk)
     metadata = json.loads((sdk/'artifact.json').read_text())
     row['artifacts'] = metadata
+    if label.startswith('edit-'):
+        info = json.loads(subprocess.check_output(
+            ['nix', 'path-info', '--json', '--json-format', '1', metadata['image']], text=True))
+        row['image_registered_epoch'] = info[metadata['image']]['registrationTime']
+        save()
+        assert row['image_registered_epoch'] >= started_epoch, (
+            'edit reused an existing image; use a fresh experiment tag', label)
     drv = subprocess.check_output(['nix-store', '-q', '--deriver', metadata['image']], text=True).strip()
     log = subprocess.check_output(['nix-store', '-l', drv], text=True)
     (out/(label+'.image.log')).write_text(log)
