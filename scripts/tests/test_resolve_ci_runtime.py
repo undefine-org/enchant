@@ -89,6 +89,33 @@ class ResolveRuntimeTests(unittest.TestCase):
 
 
 class ReleasePublicationGateTests(unittest.TestCase):
+    def test_automatic_release_requires_operator_opt_in_and_successful_trusted_ci(self):
+        source = (ROOT / '.github/workflows/release.yml').read_text()
+        block = source.split('  resolve-runtime:\n', 1)[1]
+        expression = re.search(r'^    if: (.+)$', block, re.M)[1]
+        replacements = {
+            'github.event_name': 'event', 'vars.AUTO_RELEASE_ENABLED': 'enabled',
+            'github.event.workflow_run.conclusion': 'conclusion',
+            'github.event.workflow_run.event': 'trigger',
+            'github.event.workflow_run.head_repository.full_name': 'upstream',
+            'github.repository': 'repository',
+        }
+        for before, after in replacements.items():
+            expression = expression.replace(before, after)
+        expression = expression.replace('&&', 'and').replace('||', 'or')
+        baseline = dict(event='workflow_run', enabled='', conclusion='success',
+                        trigger='push', upstream=REPOSITORY, repository=REPOSITORY)
+        for changes, expected in (({}, False), ({'enabled': 'false'}, False),
+                                  ({'enabled': 'true'}, True),
+                                  ({'enabled': 'true', 'conclusion': 'cancelled'}, False),
+                                  ({'enabled': 'true', 'trigger': 'pull_request'}, False),
+                                  ({'enabled': 'true', 'upstream': 'foreign/repo'}, False),
+                                  ({'event': 'workflow_dispatch'}, True),
+                                  ({'event': 'push'}, True)):
+            with self.subTest(changes=changes):
+                context = dict(baseline, **changes)
+                self.assertEqual(expected, eval(expression, {'__builtins__': {}}, context))
+
     def test_actual_tag_gate_allows_skipped_inventory_only_with_resolved_ci(self):
         source = (ROOT / '.github/workflows/release.yml').read_text()
         block = source.split('  publish:\n', 1)[1]

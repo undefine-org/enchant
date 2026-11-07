@@ -1,5 +1,22 @@
 # Working in this repo
 
+## One integration checkout
+
+Use this checkout's `main` for Enchant / Beam Lisp integration. Commit a coherent
+batch before starting its checks. Create another worktree only when the user
+explicitly asks; historical work is retained in Git archive refs and recovery
+bundles, so a parked experiment does not need a second checkout or VM.
+
+For a project change, keep its qualified immutable SDK pin. Batch language
+changes before producing one SDK, then reuse that exact artifact for focused
+checks. The private operator Source (`~/.config/beam-lisp/env.bl`) selects the
+build backend; its adjacent checked Nix projection and transport belong to the
+operator, not to project source. Use one substantive build/check at a time.
+
+Automatic rolling releases require repository variable `AUTO_RELEASE_ENABLED`
+to be `true`. Enable it only after the required activation rehearsal is
+qualified. Tag and manual release requests retain the exact-runtime gates.
+
 ## Cold commands start a whole BEAM
 
 A cold `bl run`, `bl test`, `bl eval` or `bl self-build` starts its own VM. That
