@@ -16,6 +16,8 @@
 //                                                 that keeps an idle socket
 //                                                 under the server's idle
 //                                                 timeout (no reply expected)
+//                     ["remount"]                 a patch op did not apply:
+//                                                 send a fresh ["mount"]
 //
 // Op set (mirrors diff.bl):
 //   ["set-attr",    path, k, v]
@@ -29,6 +31,18 @@
 // `path` is a vector of child indices from the mount root. A keyed op names
 // its child by the element's `key` attribute (the server strips `:key` from
 // HTML but re-emits it as `data-key` on rendered elements — see render()).
+//
+// What a page can listen to (CustomEvents on `document`) and wait on
+// (attributes on <html>):
+//   live:state    {up}           the socket opened/closed  · html[data-live="1"|"0"]
+//   live:pending  {count}        un-acked durable gestures · html[data-live-pending]
+//   live:mount    {root}         a ["mount"] repainted root · html[data-mounted="1"]
+//   live:patch    {root, ops}    a ["patch"] was applied
+//   live:patch-error {failed}    ops of that patch did not apply ({op, error}
+//                                each; the rest did); a ["remount"] is asked
+//   live:denied   {why}          the server refused an intent (["denied", why]);
+//                                also opts.onDenied(why) when the shell passed one
+//   live:tap      {t, basis}     a tapped socket's frame id (dev tools)
 
 (function () {
   "use strict";
@@ -175,8 +189,21 @@
     const el = document.createElementNS(inSvg ? SVG_NS : HTML_NS, bare);
     // shorthand id/classes on the tag (e.g. "li.task")
     applyShorthand(el, String(tag));
+    // then the attrs map, merged with the shorthand the way the server
+    // renderer (live/hiccup render-attrs) merges it: classes CONCATENATE
+    // (shorthand first, then :class) and an explicit :id wins. A plain
+    // setAttr here REPLACED the shorthand: `["span.x", {"class": "y"}]`
+    // painted class="y" in an inserted subtree where the first paint had "x y".
     for (const k in attrs) {
-      setAttr(el, k, attrs[k]);
+      const v = attrs[k];
+      const absent = v === null || v === undefined || v === false;
+      if (k === "class" && el.hasAttribute("class")) {
+        if (!absent) el.setAttribute("class", el.getAttribute("class") + " " + String(v));
+      } else if (k === "id" && absent && el.hasAttribute("id")) {
+        // a nil :id falls back to the shorthand's, as on the server
+      } else {
+        setAttr(el, k, v);
+      }
     }
     // a nested array of children (a spliced seq) flattens — at ANY depth, as
     // hiccup->html and diff's splice-children do: a seq of seqs (a `& body`
@@ -276,10 +303,21 @@
   // indexes that list's NEW children, so an inner parent is addressable only
   // after its outer list is rebuilt (deepest-first patched the row one late).
   // Within a parent, wire order already is removes → placements (anchor-fill).
+  //
+  // Every op is GUARDED. One op that throws (a path into a DOM the model does
+  // not describe — e.g. a parser-inserted element) used to abort the loop, and
+  // every later op of the patch was lost in silence. The rest of the patch now
+  // still lands; the failures are returned so the socket can report them and
+  // ask for a fresh mount (see connect()).
   const STRUCTURAL = { remove: 1, "remove-at": 1, insert: 1, move: 1 };
   function applyPatch(root, ops) {
     const structural = [];
     const deep = [];
+    const failed = [];
+    const run = (op) => {
+      try { applyOp(root, op); }
+      catch (e) { failed.push({ op: op, error: String(e && e.message || e) }); }
+    };
     for (const op of ops) (STRUCTURAL[op[0]] ? structural : deep).push(op);
     const byPath = new Map();
     for (const op of structural) {
@@ -289,9 +327,10 @@
     }
     const paths = Array.from(byPath.keys()).sort(
       (a, b) => JSON.parse(a).length - JSON.parse(b).length);
-    for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
-    for (const op of deep) applyOp(root, op);
+    for (const p of paths) for (const op of byPath.get(p)) run(op);
+    for (const op of deep) run(op);
     syncInputs(root);
+    return failed;
   }
 
   function applyOp(root, op) {
@@ -436,6 +475,8 @@
     // route is remembered here and flushed on (re)open. Last-wins — only the
     // final route matters, so a newer navigate replaces an older pending one.
     var pendingNav = null;
+    // a ["remount"] is in flight (a patch op failed); cleared by the mount
+    var remountAsked = false;
 
     // send a raw JSON frame string: straight through when OPEN, buffered while
     // CONNECTING, dropped when there is no socket (the outbox holds the durable
@@ -542,25 +583,65 @@
       ws.onmessage = function (msg) {
         const [kind, a, b] = JSON.parse(msg.data);
         if (kind === "mount") {
+          // The mount REPLACES the server-rendered page. Whatever the reader
+          // did to that page before the socket came up — text typed into a
+          // field, a box ticked, the caret in a textarea — lived only in the
+          // DOM the innerHTML below throws away. Carry it across (see
+          // keepFields): typed values, focus and selection survive, and a
+          // field bound to the server re-sends its value so the session's
+          // state agrees with what the reader sees.
+          const kept = keepFields(root);
+          remountAsked = false;
           discardInputs();
           root.__liveInputAck = !!(b && b["input-ack"]);
           root.innerHTML = a;
           syncInputs(root);
+          restoreFields(root, kept);
+          // a waitable mark (an event can fire before a test starts waiting)
+          try { document.documentElement.setAttribute("data-mounted", "1"); } catch (_e) {}
           announce("live:mount", { root: root });
         } else if (kind === "style") {
           // the head sheet holds what the warm reached; a socket that renders
           // a class the warm never did ships its rule first (see socket.bl
           // ship-css!). Append, never replace: the warm rules stay.
+          //
+          // WHERE the rules go is the page's call, not ours. The SSR shell's
+          // sheet is <style id="live-style"> (live.app render-page), placed
+          // wherever the app's :shell put its `style` argument — so appending
+          // INTO it keeps live's rules at that point of the cascade. A page
+          // with no such sheet gets one inserted BEFORE its first stylesheet,
+          // never after: appended at the end of <head>, live's base reset
+          // (body background and ink) overrode the app's own sheet, whose
+          // equal-specificity rules then lost on source order. An app that
+          // wants live's rules elsewhere declares an empty
+          // <style id="live-style"> there.
           let tag = document.getElementById("live-style");
-          if (!tag) { tag = document.createElement("style"); tag.id = "live-style"; document.head.appendChild(tag); }
+          if (!tag) {
+            tag = document.createElement("style"); tag.id = "live-style";
+            document.head.insertBefore(tag,
+              document.head.querySelector('link[rel~="stylesheet"], style'));
+          }
           tag.appendChild(document.createTextNode(a + "\n"));
         } else if (kind === "patch") {
-          applyPatch(root, a);
+          const failed = applyPatch(root, a);
           announce("live:patch", { root: root, ops: a });
+          if (failed.length) {
+            // the page no longer matches the tree the server diffs against, so
+            // every later patch would be computed for a page we do not have:
+            // say so, and ask for a fresh mount — once, until it arrives
+            try { console.error("live: " + failed.length + " patch op(s) did not apply", failed); }
+            catch (_e) {}
+            announce("live:patch-error", { failed: failed });
+            if (!remountAsked) { remountAsked = true; sendFrame(JSON.stringify(["remount"])); }
+          }
         } else if (kind === "tap") {
           announce("live:tap", { t: a, basis: b });
         } else if (kind === "denied") {
+          // a refusal must reach the page even when the shell passed no
+          // onDenied (live.app's default shell gives an app no way to): the
+          // DOM event is what any page can listen to
           if (opts.onDenied) opts.onDenied(a);
+          announce("live:denied", { why: a });
         } else if (kind === "ack") {
           if (outbox) { outbox.ack(a); setLive(true); }   // the gesture landed — drop it
         } else if (kind === "input-ack") {
@@ -670,6 +751,122 @@
     });
 
     return ws;
+  }
+
+  // ── what the reader did to the page survives the mount ────────────────
+  //
+  // The first paint is server HTML; the socket's ["mount"] replaces it. A
+  // reader who typed before the socket opened lost the text and the focus.
+  // keepFields snapshots, before the swap, every field the reader CHANGED
+  // (its value differs from what the HTML said: value ≠ defaultValue,
+  // checked ≠ defaultChecked, a select off its default option) plus the
+  // focused element and its selection; restoreFields finds each one again in
+  // the new DOM — by id, else by name (radios by name + value, nth among the
+  // same name), else by its child-index path — and puts it back. A restored
+  // field the view binds (data-ev-input / data-ev-change) fires its event, so
+  // the server's state learns the value instead of overwriting it later.
+  function isTextLike(el) {
+    return el.tagName === "TEXTAREA" ||
+      (el.tagName === "INPUT" && !/^(checkbox|radio|file|button|submit|reset|image|hidden)$/.test(el.type));
+  }
+  function isDirty(el) {
+    if (el.tagName === "SELECT") {
+      var opts = el.options, i;
+      if (el.multiple) {
+        for (i = 0; i < opts.length; i++) if (opts[i].selected !== opts[i].defaultSelected) return true;
+        return false;
+      }
+      var def = -1;
+      for (i = 0; i < opts.length; i++) if (opts[i].defaultSelected) def = i;
+      if (def < 0) for (i = 0; i < opts.length; i++) if (!opts[i].disabled) { def = i; break; }
+      return opts.length > 0 && el.selectedIndex !== def;
+    }
+    if (el.type === "checkbox" || el.type === "radio") return el.checked !== el.defaultChecked;
+    return isTextLike(el) && el.value !== el.defaultValue;
+  }
+  function childPath(root, el) {
+    var path = [];
+    for (var n = el; n && n !== root; n = n.parentNode) {
+      var p = n.parentNode;
+      if (!p) return null;
+      path.unshift(domChildren(p).indexOf(n));
+    }
+    return path;
+  }
+  function sameName(root, tag, name, radioValue) {
+    return Array.prototype.filter.call(root.getElementsByTagName(tag), function (o) {
+      return o.getAttribute("name") === name &&
+        (radioValue === null || (o.type === "radio" && o.value === radioValue));
+    });
+  }
+  function keyOf(root, el) {
+    if (el.id) return { id: el.id };
+    var name = el.getAttribute("name");
+    if (name) {
+      var radio = el.type === "radio" ? el.value : null;
+      return { name: name, tag: el.tagName, radio: radio,
+               n: sameName(root, el.tagName, name, radio).indexOf(el) };
+    }
+    return { path: childPath(root, el) };
+  }
+  function findKey(root, key) {
+    if (key.id) {
+      var byId = document.getElementById(key.id);
+      return byId && root.contains(byId) ? byId : null;
+    }
+    if (key.name) return sameName(root, key.tag, key.name, key.radio)[key.n] || null;
+    if (!key.path) return null;
+    var el = root;
+    for (var i = 0; i < key.path.length && el; i++) el = domChildren(el)[key.path[i]];
+    return el && el.nodeType === 1 ? el : null;
+  }
+  function keepFields(root) {
+    var kept = { fields: [], focus: null };
+    for (var el of root.querySelectorAll("input,textarea,select")) {
+      if (!isDirty(el)) continue;
+      var rec = { key: keyOf(root, el), tag: el.tagName, type: el.type };
+      if (el.tagName === "SELECT")
+        rec.selected = Array.prototype.map.call(el.selectedOptions, function (o) { return o.value; });
+      else if (el.type === "checkbox" || el.type === "radio") rec.checked = el.checked;
+      else rec.value = el.value;
+      kept.fields.push(rec);
+    }
+    var active = document.activeElement;
+    if (active && active !== root && root.contains(active)) {
+      kept.focus = { key: keyOf(root, active), tag: active.tagName };
+      try {
+        if (typeof active.selectionStart === "number")
+          kept.focus.sel = [active.selectionStart, active.selectionEnd, active.selectionDirection];
+      } catch (_e) { /* a type with no selection API */ }
+    }
+    return kept;
+  }
+  function restoreFields(root, kept) {
+    var bound = [];
+    for (var rec of kept.fields) {
+      var el = findKey(root, rec.key);
+      if (!el || el.tagName !== rec.tag || el.type !== rec.type) continue;
+      if (rec.selected) {
+        for (var o of el.options) o.selected = rec.selected.indexOf(o.value) >= 0;
+      } else if (rec.checked !== undefined) {
+        el.checked = rec.checked;
+      } else {
+        el.value = rec.value;
+      }
+      var ev = isTextLike(el) ? "input" : "change";
+      if (closestAttrPrefix(el, "data-ev-" + ev)) bound.push([el, ev]);
+    }
+    if (kept.focus) {
+      var f = findKey(root, kept.focus.key);
+      if (f && f.tagName === kept.focus.tag && typeof f.focus === "function") {
+        try { f.focus({ preventScroll: true }); } catch (_e) { f.focus(); }
+        if (kept.focus.sel) {
+          try { f.setSelectionRange(kept.focus.sel[0], kept.focus.sel[1], kept.focus.sel[2] || "none"); }
+          catch (_e) { /* not a text control after all */ }
+        }
+      }
+    }
+    for (var b of bound) b[0].dispatchEvent(new Event(b[1], { bubbles: true }));
   }
 
   // the value of the input nearest `el` (itself, or one in its container),

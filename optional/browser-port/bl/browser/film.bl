@@ -8,6 +8,8 @@
     :hover (page/hover! p (nth term 1))
     :key (page/key! p (nth term 1))
     :fill (page/fill! p (nth term 1) (nth term 2))
+    :select (page/select! p (nth term 1) (nth term 2))
+    :upload (page/upload! p (nth term 1) (nth term 2))
     :drag (page/drag! p (nth term 1) (nth term 2) (nth term 3 1500))
     :eval (page/evaluate! p (nth term 1))
     :wait (page/wait! p (nth term 1))
@@ -71,8 +73,17 @@
    Reference PNGs remain separate evidence. The aligned horizontal video is
    derived only from native frame streams, never from reference screenshots.
    actors is an ordered vector of [actor page-options]; opts accepts :ffmpeg,
-   :fps and :cursor? (default true). All ports stay with the scenario owner."
+   :fps and :cursor? (default true). :compose-preset selects the offline x264
+   speed/size tradeoff (default veryfast), without changing source recordings.
+   :compose-on-dispose? false defers mosaics after an abort while retaining raw
+   tracks/clocks. :compose-on-close? false also defers the normal full-width
+   mosaic for consumers supplying their own final composition; raw tracks and
+   clocks are complete, and the receipt explicitly reports a deferred source.
+   Both flags default true. All ports stay with the scenario owner."
   [actors directory opts]
+  (when (and (contains? opts :compose-on-close?)
+             (not (contains? #{true false} (:compose-on-close? opts))))
+    (throw (ex-info "compose-on-close? must be an explicit boolean" {})))
   (when (or (empty? actors) (not= (count actors) (count (set (map first actors))))
             (not (apply = (map #(get-in % [1 :height] 900) actors))))
     (throw (ex-info "Recorded actors require unique names and equal viewport heights" {})))
@@ -86,25 +97,31 @@
         release (fn []
                   (doseq [[_ p] @owned] (try (page/close! p) (catch _ nil)))
                   (reset! owned {}) (File/rm_rf! scratch))
-        finish (fn []
+        finish (fn [compose?]
                  (when (and (not @finished) @epoch)
                    (reset! finished true)
                    (let [recordings (mapv (fn [[actor _]] (assoc (page/stop-recording! (get @owned actor))
                                                                :actor actor :trim (get @starts actor))) actors)
-                         inputs (mapcat (fn [r] ["-ss" (str (:trim r)) "-i" (get r "path")]) recordings)
+                         receipt {:kind :native-screencast :layout :horizontal :source (when compose? movie)
+                                  :composition (if compose? :requested :deferred)
+                                  :actors (mapv first actors) :recordings recordings}
+                         _ (File/write! (str root "/recordings.json") (interop/->json receipt))
+                         _ (release)
+                         inputs (mapcat (fn [r] ["-threads" "2" "-ss" (str (:trim r)) "-i" (get r "path")]) recordings)
                          filters (str (apply str (map-indexed (fn [i _]
                                        (str "[" i ":v]setpts=PTS-STARTPTS[v" i "];")) actors))
                                       (apply str (map-indexed (fn [i _] (str "[v" i "]")) actors))
                                       (if (= 1 (count actors)) "null[out]"
                                           (str "hstack=inputs=" (count actors) ":shortest=1[out]")))
-                         result (System/cmd ffmpeg (to-list (concat ["-hide_banner" "-loglevel" "error" "-nostdin" "-n"] inputs
-                                  ["-filter_complex" filters "-map" "[out]" "-an" "-c:v" "libx264"
-                                   "-preset" "veryfast" "-crf" "18" "-pix_fmt" "yuv420p" "-movflags" "+faststart" movie])))]
-                     (when (not= 0 (elem result 1))
+                         result (when compose? (System/cmd ffmpeg (to-list (concat ["-hide_banner" "-loglevel" "error" "-nostdin" "-n"] inputs
+                                  ["-filter_complex" filters "-map" "[out]" "-an" "-threads" "4" "-c:v" "libx264"
+                                   "-preset" (get opts :compose-preset "veryfast") "-crf" "18" "-pix_fmt" "yuv420p" "-movflags" "+faststart" movie]))))]
+                     (when (and compose? (not= 0 (elem result 1)))
                        (throw (ex-info "Native multiscreen composition failed" {:diagnostic (elem result 0)})))
-                     (File/write! (str root "/recordings.json")
-                       (interop/->json {:kind :native-screencast :layout :horizontal :source movie
-                                        :actors (mapv first actors) :recordings recordings})))))]
+                     (when compose?
+                       (File/write! (str root "/recordings.json")
+                                    (interop/->json (assoc receipt :composition :complete))))
+                     :ok)))]
     {:kind :browser
      :open (fn [_]
              (when (seq @owned) (throw (ex-info "Browser world already open" {})))
@@ -115,7 +132,10 @@
                        p (page/open! options)]
                    (swap! owned assoc actor p)
                    (when (get options :cursor? (get opts :cursor? true)) (page/show-cursor! p))
-                   (page/record! p (str root "/" (name actor) ".mp4") opts)))
+                   (let [recorded (page/record! p (str root "/" (name actor) ".mp4") opts)]
+                     (when (and (contains? opts :paint-before-record?)
+                                (not= (:paint-before-record? opts) (get recorded "paintBeforeRecord")))
+                       (throw (ex-info "Recorder did not confirm the requested paint barrier" {:actor actor}))))))
                (reset! epoch (clock))
                (doseq [[actor _] actors]
                  ;; Capture each recorder's age at the common world epoch.
@@ -138,6 +158,6 @@
                            :video {:source movie :at (/ (- (clock) @epoch) 1000.0)
                                    :kind :native-screencast :actors (mapv first actors)}}]
                 (reset! last-basis basis) basis))
-     :close! (fn [_] (try (finish) @last-basis (finally (release))))
+     :close! (fn [_] (try (finish (get opts :compose-on-close? true)) @last-basis (finally (release))))
      :views-fn (fn [basis actor] (assoc basis :frame (get-in basis [:frames actor])))
-     :dispose! (fn [] (try (finish) (finally (release))))}))
+     :dispose! (fn [] (try (finish (get opts :compose-on-dispose? true)) (finally (release))))}))

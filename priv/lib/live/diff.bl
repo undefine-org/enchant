@@ -36,7 +36,7 @@
 ; trees. So the ops are not merely "plausible" — applying them to the old
 ; tree reconstructs the new one exactly.
 
-(ns live.diff)
+(ns live.diff (:require [live.hiccup :as hiccup]))
 
 ;; ── node accessors (a node is [:tag attrs? child*]) ─────────────────
 
@@ -67,8 +67,14 @@
           []
           cs))
 
-(defn- children-of [n]
-  (splice-children (subvec n (if (has-attrs? n) 2 1))))
+(defn- children-of
+  "A node's children as the DOM holds them: groups spliced, nils dropped, and
+   a table section's rows/cells inside the <tbody>/<tr> the HTML parser infers
+   (live.hiccup/parser-children — the renderer emits the same elements)."
+  [n]
+  (let [cs (splice-children (subvec n (if (has-attrs? n) 2 1)))
+        section (hiccup/table-section (tag-of n))]
+    (if (nil? section) cs (hiccup/parser-children section cs))))
 
 (defn node-key
   "A node's stable identity: `:key` in its attrs, else `^{:key …}` vector
@@ -92,10 +98,40 @@
 ;; `:key` is identity, not a DOM attribute, so it is excluded from the attr
 ;; diff (it never renders — live/hiccup strips it). Every other key is
 ;; compared: present-and-changed → :set-attr; gone → :remove-attr.
+;;
+;; The comparison is over the attributes AS THE DOM HOLDS THEM. The tag
+;; shorthand is part of the element's attributes: `[:span.x {:class "y"}]`
+;; renders class="x y" (live.hiccup/render-attrs puts the shorthand's classes
+;; ahead of :class, and an explicit :id ahead of the shorthand's). A :set-attr
+;; replaces the DOM attribute wholesale, so it has to carry that merged value:
+;; diffing the bare :class shipped "z" for a toggle and wiped the tag's `x`,
+;; and dropping :class shipped a :remove-attr that took `x` with it.
+
+(defn- shorthand? [tag]
+  (let [s (name tag)] (or (some? (index-of s ".")) (some? (index-of s "#")))))
+
+(defn- bare-tag
+  "The element name alone: `:span.x#a` → `:span`."
+  [tag]
+  (if (shorthand? tag) (keyword (:tag (hiccup/parse-tag tag))) tag))
+
+(defn- dom-attrs
+  "`attrs` with the tag shorthand folded in exactly as the renderer folds it:
+   classes concatenate (shorthand first, then :class), an explicit :id wins.
+   A tag without shorthand returns `attrs` itself."
+  [tag attrs]
+  (if (not (shorthand? tag))
+    attrs
+    (let [sh (hiccup/parse-tag tag)
+          c (get attrs :class)
+          cls (join " " (concat (:classes sh) (if (nil? c) [] [c])))
+          id (or (get attrs :id) (:id sh))
+          a (if (= cls "") (dissoc attrs :class) (assoc attrs :class cls))]
+      (if (nil? id) (dissoc a :id) (assoc a :id id)))))
 
 (defn- attr-ops
-  [path old-attrs new-attrs]
-  (let [oa (dissoc old-attrs :key) na (dissoc new-attrs :key)
+  [path tag old-attrs new-attrs]
+  (let [oa (dom-attrs tag (dissoc old-attrs :key)) na (dom-attrs tag (dissoc new-attrs :key))
         changed (reduce (fn [out kv]
                           (let [k (first kv) v (second kv)]
                             (if (= (get oa k :live.diff/absent) v) out
@@ -104,6 +140,37 @@
               (let [k (first kv)]
                 (if (contains? na k) out (conj out [:remove-attr path (name k)]))))
             changed (seq oa))))
+
+;; ── the wire form of a subtree ──────────────────────────────────────
+;;
+;; An [:insert]/[:replace] ships a whole subtree, and the client renders it
+;; from JSON, where a seq and an element are both arrays and a keyword tag and
+;; a text are both strings. A child group that leads with TEXT —
+;; `[:p (list "a" [:b "c"])]` — therefore arrived as ["p",["a",["b","c"]]], and
+;; its group reads as an element named "a" (InvalidCharacterError for any text
+;; with a space: the patch is lost and the page goes blank). Metadata does not
+;; cross JSON either, so a `^{:key …}` row inside the subtree lost its identity
+;; and every later keyed op on it named nothing. The first paint never had
+;; either problem because hiccup->html splices and renders meta keys. `wire`
+;; hands the client the same tree the renderer saw: groups spliced at every
+;; depth, nils dropped, a metadata key moved into the attrs, and a leaf that
+;; JSON would not render as its text (a keyword, a boolean) stringified as
+;; hiccup->html stringifies it.
+
+(defn wire
+  "A subtree in the shape it crosses the wire: every child group spliced,
+   nils dropped, metadata keys written as `:key` attrs, odd leaves as text."
+  [n]
+  (cond
+    (element? n)
+      (let [a (attrs-of n)
+            k (if (contains? a :key) nil (get (meta n) :key))
+            head (cond (some? k) [(tag-of n) (assoc a :key k)]
+                       (has-attrs? n) [(tag-of n) a]
+                       :else [(tag-of n)])]
+        (into head (map wire (children-of n))))
+    (or (nil? n) (string? n) (number? n) (vector? n)) n
+    :else (str n)))
 
 ;; ── keyed child reconcile ───────────────────────────────────────────
 ;;
@@ -155,10 +222,6 @@
                           (let [k (node-key n)]
                             (if (contains? new-idx k) out (conj out [:remove path k]))))
                         [] old-children)
-        ;; Metadata does not cross JSON: inserted nodes need identity in attrs.
-        attach-key (fn [n k]
-                     (if (and (has-attrs? n) (not (contains? (attrs-of n) :key)))
-                       (assoc n 1 (assoc (attrs-of n) :key k)) n))
         kept-old-indices (reduce (fn [out n]
                                   (let [k (node-key n)]
                                     (if (contains? old-idx k) (conj out (get old-idx k)) out)))
@@ -174,7 +237,9 @@
                   inner (diff-fn (conj path i) (nth old-children oi) n)
                   next (into out inner)]
               (recur (+ i 1) (if (contains? anchors oi) next (conj next [:move path k i]))))
-            (recur (+ i 1) (conj out [:insert path k i (attach-key n k)]))))))))
+            ;; `wire` writes a metadata key into the attrs: identity must
+            ;; survive JSON, or a later keyed op on this node names nothing
+            (recur (+ i 1) (conj out [:insert path k i (wire n)]))))))))
 
 ;; ── positional child reconcile (no keys) ────────────────────────────
 
@@ -195,7 +260,7 @@
                                                     (nth old-children i) (nth new-children i))))))
         inserts (loop [i overlap out paired]
                   (if (= i nc) out
-                    (recur (+ i 1) (conj out [:insert path nil i (nth new-children i)]))))]
+                    (recur (+ i 1) (conj out [:insert path nil i (wire (nth new-children i))]))))]
     ;; High indices first keep lower removal targets valid in the DOM.
     (loop [i (- oc 1) out inserts]
       (if (< i overlap) out
@@ -250,7 +315,7 @@
      ;; kind changed (text↔element, or different tag): a full replace
      (or (not (element? old)) (not (element? new))
          (not= (tag-of old) (tag-of new)))
-       [[:replace path new]]
+       [[:replace path (wire new)]]
      ;; same tag: diff attrs, then children. `into []` REALIZES the op seq:
      ;; `concat`/`mapcat` are lazy, and a lazy seq that reaches the wire
      ;; (interop/->json) has no Jason encoder — the ops must be a plain
@@ -277,7 +342,9 @@
              child-ops (if keyed
                          (keyed-child-ops path oc nc diff)
                          (positional-child-ops path oc nc diff))]
-         (into (attr-ops path (attrs-of old) (attrs-of new)) child-ops)))))
+         (into (if (= (attrs-of old) (attrs-of new)) []
+                 (attr-ops path (tag-of old) (attrs-of old) (attrs-of new)))
+               child-ops)))))
 
 ;; ── apply-ops: the REFERENCE semantics (mirrored by the JS client) ──
 ;;
@@ -354,12 +421,30 @@
    normalized to normalized — structural equality, not the incidental
    presence of an empty `{}`. Text/number nodes pass through.
 
+   The tag shorthand is folded into the attrs the way the DOM holds it
+   (`[:span.x {:class \"y\"}]` → `[:span {:class \"x y\"}]`): attr ops carry
+   DOM values (see `dom-attrs`), so the comparison is over what a browser
+   would show, not over which spelling the view chose.
+
    `:key` is excluded from the comparison: it is IDENTITY, not content —
    the differ may legitimately attach a key attr to an inserted subtree
    (see keyed-child-ops) without that counting as a difference."
   [node]
   (if (element? node)
-    (into [(tag-of node) (dissoc (attrs-of node) :key)] (map normalize (children-of node)))
+    (into [(bare-tag (tag-of node)) (dissoc (dom-attrs (tag-of node) (attrs-of node)) :key)]
+          (map normalize (children-of node)))
+    node))
+
+(defn- dom-form
+  "`normalize`, but KEEPING identity (an attr or metadata key becomes a :key
+   attr): the shape `apply-ops` patches, so a :set-attr's DOM value lands on
+   DOM attrs and a keyed op still finds its child."
+  [node]
+  (if (element? node)
+    (let [k (node-key node)
+          a (dom-attrs (tag-of node) (attrs-of node))]
+      (into [(bare-tag (tag-of node)) (if (nil? k) a (assoc a :key k))]
+            (map dom-form (children-of node))))
     node))
 
 ;; Structural (child-order) vs deep (in-place) op kinds. Structural ops
@@ -456,6 +541,6 @@
   [ops tree]
   (let [structural (filterv structural-op? ops)
         deep (filterv (fn [op] (not (structural-op? op))) ops)
-        reordered (apply-structural tree structural)
+        reordered (apply-structural (dom-form tree) structural)
         patched (reduce apply-op reordered deep)]
     (normalize patched)))

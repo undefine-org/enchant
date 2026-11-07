@@ -30,6 +30,23 @@ the user's compositor, display settings, sockets or environment. CPU rendering
 captures damage rather than polling browser screenshots. This follows wayvnc's
 [headless guidance](https://github.com/any1/wayvnc/blob/master/FAQ.md).
 
+Chromium also uses software rendering (`--disable-gpu`) in this owned display.
+A headless compositor can answer CDP while EGL initialization repeatedly fails;
+that is not a working native frame stream. Recording must receive a real frame
+before it reports that capture started.
+
+Encoders use four threads; multiscreen input decoders use two per stream.
+Completed actor tracks and their clock trims are saved before composition,
+and private browsers are released before that final encode. A composition
+failure therefore retains decodable tracks and provenance without keeping the
+display processes alive.
+
+`browser.page/fill!` supports writable text, number and civil-time controls.
+Text uses trusted CDP insertion. Segmented date/time controls use the DOM value
+setter and ordinary, untrusted `input`/`change` events: CDP text insertion does
+not edit them. Invalid civil values restore the existing draft and refuse;
+disabled or readonly controls are left untouched. This only edits form inputs.
+
 X11 is an explicit compatibility choice, with no silent fallback:
 
 ```sh
@@ -64,6 +81,13 @@ error. Diagnostics stay in private runtime files, not protocol stdout.
   Unmatched events are consumed; this is not an event subscription API.
 - `record-start` takes `targetId`, a new absolute MP4 `path`, even viewport
   `width`/`height`, `fps` (1–60, default 30) and an explicit `ffmpeg` executable.
+  Optional `preset` is `veryfast` (the existing default) or `ultrafast`. The
+  reply and recording receipt confirm `encoderPreset`. This changes encoder
+  work and file size, while preserving the frame rate, canvas, CRF 18, native
+  frame consumer and wall-clock pacing. Invalid presets refuse before media
+  creation. Beam Lisp callers use `:record-preset`; an explicit preset must be
+  acknowledged by the installed helper, preventing silent fallback to an older
+  executable. Multiscreen `:compose-preset` remains an independent offline choice.
   A separate native CDP connection continuously consumes and acknowledges
   `Page.screencastFrame` events, including while the caller waits. A bounded
   latest-frame buffer feeds a wall-clock-paced encoder. Static content holds
@@ -105,6 +129,14 @@ Keep the port in one supervised owner and serialize calls. Timeout closes the
 port to prevent late-response reuse; do not silently retry uncertain mutations.
 `close` requests stop before closing; callers needing a save acknowledgement use
 an explicit `stop` request and inspect its result. Owner death is abrupt recovery.
+
+For form submissions that redirect, use `browser.page/wait-url!` with a pure
+URL predicate before `wait!` checks DOM readiness. It reads `Target.getTargetInfo`
+through the browser process: renderer queries can block while navigation waits
+for a slow HTTP response. The caller supplies its navigation deadline; native
+transport limits remain unchanged. This barrier observes committed URLs and
+does not certify same-URL reloads, DOM readiness or business success. Predicate
+and protocol errors still propagate, and no submission is retried.
 
 ## Verification
 
@@ -148,6 +180,10 @@ Run the headed integration with `BL_BROWSER_PORT`, `CHROMIUM`, `SWAY` and
 ./bin/bl test -p optional/browser-port/bl optional/browser-port/test/film_test.bl
 ```
 
+`page/evaluate!` retains Chromium’s exception description in both the thrown
+message and structured data. `wait!` propagates genuine predicate errors; a
+readiness predicate must itself return false while its document is absent.
+
 `page/record!`, `recording`, and `stop-recording!` expose the native continuous
 recorder separately from `screenshot!`. `show-cursor!` opts into a visible
 pointer driven only by trusted browser pointer/drag events: screencasts omit
@@ -156,12 +192,38 @@ dispatch synthetic DOM drag events or manufacture a film-only pointer path.
 `optional/browser-port/test/recording_test.bl` verifies animated frames arrive
 without scenario actions/screenshots, trusted drag input, and a decodable movie.
 
+Recording foregrounds the requested page, awaits two browser animation-frame callbacks and captures
+its current surface before starting the recorder. That temporary image is
+discarded; video still comes from the native frame stream. The start receipt
+acknowledges `paintBeforeRecord`, and owned worlds check that acknowledgement
+for each actor when explicitly requested. Callers that already own this paint
+boundary can pass `:paint-before-record? false`; the option accepts only booleans.
+`initial_paint_test.bl` checks static desktop/phone pages,
+early refusal of invalid options and propagation to three actual recorders.
+
 `browser.film/owned-worlds` opens independent actors, records each continuously,
 and aligns their native takes into one horizontal video. Use ordered
 `[[:actor page-options] ...]`, equal viewport heights, and narrated scenes with
 `:capture :video`. `:basis :frames` retains reference PNGs separately;
 `:basis :video` supplies the continuous source and measured elapsed time. See
 the demo film documentation and `test/multiscreen_test.bl` for the contract.
+
+For long takes, `:compose-preset "ultrafast"` opts into a faster, larger
+offline mosaic. The default remains `"veryfast"`. This changes only derived
+composition encoding: native actor streams, their clocks, frame rate and
+reference screenshots are unchanged. Curated film export has its own encoding.
+
+Consumers that supply their own finished composition may set
+`:compose-on-close? false` to skip the otherwise redundant full-width mosaic.
+Normal close still finalizes every raw actor track, clock and browser release;
+`recordings.json` reports `composition: deferred` and no completed `source`.
+The caller owns the final video. Normal close composes by default; nonboolean
+values are refused before launch.
+
+For aborted actions, `:compose-on-dispose? false` retains complete raw actor
+videos and clocks without encoding a mosaic during cleanup. Its receipt marks
+composition `deferred` and has no joined source. Normal `:close!` still composes
+all views; the default disposal behavior remains unchanged.
 
 ## Demo tests
 
@@ -171,3 +233,12 @@ cleanup after successful runs and failed actions. Each `defdemo` is registered
 with the ordinary test engine; tests capture evidence, and `BL_DEMO_EXPORT=1`
 also produces a film. See [the executable two-demo literate file](../../examples/scenario/browser-demos.bl.org)
 and [the demo API](../../docs/scenarios/demo-films.md).
+
+Native clicks use a visible client-rectangle fragment and hit-test it before
+pressing. A union bounding-box centre can land between wrapped link lines or
+under another control. Scrolling waits for paint; the pointer still moves
+through real input, and a changed/covered target is refused before mouse press.
+
+Rejected DevTools calls name their method in the error and its `:method` data.
+Parameters are excluded: a transport failure must be locatable without exposing
+page data or credentials. Errors remain failures and are never retried.

@@ -14,7 +14,8 @@ const fs = require("fs");
 const path = require("path");
 
 const clientJs = fs.readFileSync(
-  path.join(__dirname, "../../priv/lib/live/client.js"),
+  process.env.LIVE_CLIENT_SOURCE ||
+    path.join(__dirname, "../../priv/lib/live/client.js"),
   "utf8"
 );
 
@@ -190,4 +191,71 @@ test("session: a fresh connect() mints a NEW sid (a reload is a new session)", a
   });
   expect(other).not.toBe(first);
   expect(other).toMatch(/[?&]live-sid=[0-9a-f]{32}/);
+});
+
+// ── a refused intent ──────────────────────────────────────────────────
+//
+// ["denied", why] reached only opts.onDenied. A shell that passes no
+// onDenied — live.app's default shell, which gives an app no way to pass one —
+// swallowed every refusal in silence. It is now ALSO a `live:denied` DOM
+// event, like live:mount / live:patch, so any page can show it.
+
+test("denied: a refusal is announced as a live:denied event with no onDenied", async ({ page }) => {
+  await boot(page, { heartbeatMs: 0 });
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const seen = await page.evaluate(() => {
+    var got = [];
+    document.addEventListener("live:denied", function (e) { got.push(e.detail); });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", "Seul un associé"]) });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", { reason: "key-not-held" }]) });
+    return got;
+  });
+  expect(seen).toEqual([{ why: "Seul un associé" }, { why: { reason: "key-not-held" } }]);
+});
+
+test("denied: onDenied still receives it, beside the event", async ({ page }) => {
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: FAKE });
+  await page.addScriptTag({ content: clientJs });
+  const seen = await page.evaluate(async () => {
+    var got = [];
+    document.addEventListener("live:denied", function (e) { got.push(["event", e.detail.why]); });
+    window.Live.connect({ root: document.getElementById("live-root"), url: "ws://fake/ws",
+                          heartbeatMs: 0, onDenied: function (why) { got.push(["callback", why]); } });
+    await new Promise(function (r) { setTimeout(r, 10); });
+    window.__sockets[0].onmessage({ data: JSON.stringify(["denied", "Clé non gardée"]) });
+    return got;
+  });
+  expect(seen).toEqual([["callback", "Clé non gardée"], ["event", "Clé non gardée"]]);
+});
+
+// ── a patch op that cannot apply ──────────────────────────────────────
+//
+// applyPatch ran its ops in one loop with no guard: one op that threw (a
+// path into a DOM the model did not describe) aborted the loop, and every
+// later op of that patch was lost in silence. Each op is now guarded: the
+// rest of the patch still lands, the failure is reported (console +
+// `live:patch-error`), and the client asks the server for a fresh mount
+// (["remount"]) — once, until that mount arrives.
+
+test("patch: one op that throws does not sink the rest; the client asks to remount", async ({ page }) => {
+  await boot(page, { heartbeatMs: 0 });
+  await page.waitForFunction(() => window.__sockets.length === 1 && window.__sockets[0].readyState === 1);
+  const out = await page.evaluate(() => {
+    var s = window.__sockets[0], errors = [];
+    document.addEventListener("live:patch-error", function (e) { errors.push(e.detail.failed.length); });
+    s.onmessage({ data: JSON.stringify(["mount", "<main><p>old</p><span>À relire</span></main>"]) });
+    var patch = ["patch", [["text", [9, 9, 0], "nowhere"], ["text", [1, 0], "Signé"]]];
+    s.onmessage({ data: JSON.stringify(patch) });
+    s.onmessage({ data: JSON.stringify(patch) });          // still out of step: no second request
+    var asked1 = s.sent.filter(function (d) { return d === '["remount"]'; }).length;
+    s.onmessage({ data: JSON.stringify(["mount", "<main><p>new</p><span>Signé</span></main>"]) });
+    s.onmessage({ data: JSON.stringify(patch) });          // a fresh failure after the mount asks again
+    return { pill: document.querySelector("#live-root span").textContent, errors: errors, asked1: asked1,
+             asked2: s.sent.filter(function (d) { return d === '["remount"]'; }).length };
+  });
+  expect(out.pill).toBe("Signé");
+  expect(out.errors).toEqual([1, 1, 1]);
+  expect(out.asked1).toBe(1);
+  expect(out.asked2).toBe(2);
 });

@@ -31,12 +31,30 @@
 
 (defn record!
   "Stream native compositor frames to an MP4 independently of screenshots and
-   scenario steps. The helper owns encoding; waits retain real elapsed time."
+   scenario steps. The helper owns encoding; waits retain real elapsed time.
+   Foregrounds and paints a newly sized viewport before asking for frames;
+   its screenshot is discarded, never substituted for a recorder frame."
   [page path opts]
-  (port/request (:port page) {"op" "record-start" "targetId" (:target page)
-                             "width" (:width page) "height" (:height page)
-                             "path" (Path/expand path) "fps" (or (:fps opts) 30)
-                             "ffmpeg" (or (:ffmpeg opts) (System/find_executable "ffmpeg"))}))
+  (let [paint? (get opts :paint-before-record? true)]
+  (when (and (contains? opts :paint-before-record?)
+             (not (contains? #{true false} (:paint-before-record? opts))))
+    (throw (ex-info "paint-before-record? must be boolean" {})))
+  (when paint?
+    (cdp! page "Page.bringToFront" {})
+    (evaluate! page "new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))")
+    (cdp! page "Page.captureScreenshot"
+      {"format" "jpeg" "quality" 1 "fromSurface" true "captureBeyondViewport" false}))
+  (let [supplied? (contains? opts :record-preset) preset (:record-preset opts)
+        result (port/request (:port page)
+                 (cond-> {"op" "record-start" "targetId" (:target page)
+                          "width" (:width page) "height" (:height page)
+                          "path" (Path/expand path) "fps" (or (:fps opts) 30)
+                          "ffmpeg" (or (:ffmpeg opts) (System/find_executable "ffmpeg"))}
+                   supplied? (assoc "preset" preset)))]
+    (when (and supplied? (not= preset (get result "encoderPreset")))
+      (try (port/request (:port page) {"op" "record-stop"}) (catch _ nil))
+      (throw (ex-info "Native recorder did not confirm the requested encoder preset" {})))
+    (assoc result "paintBeforeRecord" paint?))))
 (defn recording [page] (port/request (:port page) {"op" "record-info"}))
 (defn stop-recording! [page] (port/request (:port page) {"op" "record-stop"}))
 
@@ -51,14 +69,40 @@
 
 (defn evaluate! [page script]
   (let [response (cdp! page "Runtime.evaluate" {"expression" script "returnByValue" true "awaitPromise" true})]
-    (when (get response "exceptionDetails")
-      (throw (ex-info "Browser evaluation raised" {:exception (get response "exceptionDetails")})))
+    (when-let [exception (get response "exceptionDetails")]
+      (throw (ex-info (str "Browser evaluation raised: "
+                          (or (get-in exception ["exception" "description"]) (get exception "text")))
+                      {:exception exception})))
     (get-in response ["result" "value"])))
 
 (defn navigate! [page url]
   (let [result (cdp! page "Page.navigate" {"url" url})]
     (when (get result "errorText") (throw (ex-info "Browser navigation failed" {})))
     result))
+
+(defn current-url
+  "Read the committed target URL through the browser process. Renderer-scoped
+   commands can block while a form navigation waits for its HTTP response."
+  [page]
+  (let [result (port/request (:port page)
+                 {"op" "cdp" "method" "Target.getTargetInfo"
+                  "params" {"targetId" (:target page)}})
+        url (get-in result ["targetInfo" "url"])]
+    (when-not (string? url) (throw (ex-info "Browser target URL unavailable" {})))
+    url))
+
+(defn wait-url!
+  "Wait for a committed URL using a pure URL predicate. This is a navigation
+   barrier, not DOM readiness or proof of a same-URL reload. Protocol and
+   predicate errors propagate; an uncertain operation is never retried."
+  ([page predicate] (wait-url! page predicate 30000))
+  ([page predicate timeout-ms]
+   (let [deadline (+ (erlang/monotonic_time :millisecond) timeout-ms)]
+     (loop []
+       (if (= true (predicate (current-url page))) true
+         (if (>= (erlang/monotonic_time :millisecond) deadline)
+           (throw (ex-info "Browser URL condition timed out" {}))
+           (do (Process/sleep 50) (recur))))))))
 
 (defn wait!
   "Wait for a JavaScript predicate, bounded by timeout-ms. A timeout is an
@@ -76,11 +120,21 @@
   "Click a visible CSS target through real CDP input. Return normalized source
    coordinates for a film cursor keyframe; retain the gesture in :gestures."
   [page selector]
-  (let [point (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
-       ");if(!e||e.disabled)throw Error('Target unavailable');e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()"))
+  (let [point (evaluate! page (str "(async()=>{const selector=" (interop/->json selector) ";"
+       "const target=()=>{const e=document.querySelector(selector);if(!e||e.disabled)throw Error('Target unavailable');return e};"
+       "const paint=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));"
+       "const point=()=>{const e=target();for(const r of e.getClientRects()){const l=Math.max(0,r.left),t=Math.max(0,r.top),right=Math.min(innerWidth,r.right),bottom=Math.min(innerHeight,r.bottom);if(right<=l||bottom<=t)continue;const p={x:(l+right)/2,y:(t+bottom)/2};if(e.contains(document.elementFromPoint(p.x,p.y)))return p}return null};"
+       "target().scrollIntoView({block:'nearest'});await paint();let p=point();"
+       "if(!p){target().scrollIntoView({block:'center',inline:'center'});await paint();p=point()}"
+       "if(!p)throw Error('Target obscured or outside its visible fragment');return p})()"))
         x (get point "x") y (get point "y")]
     (move-pointer! page @(:pointer page) point 600 0)
     (Process/sleep 120)
+    ;; Layout may change during pointer approach. Recheck before pressing so
+    ;; a neighbour cannot receive the business action.
+    (when-not (= true (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
+                       ");return !!e&&!e.disabled&&e.contains(document.elementFromPoint(" x "," y "))})()")))
+      (throw (ex-info "Click target moved or became covered before press" {:selector selector})))
     (doseq [kind ["mousePressed" "mouseReleased"]]
       (cdp! page "Input.dispatchMouseEvent" {"type" kind "x" x "y" y
             "button" (if (= kind "mouseMoved") "none" "left") "clickCount" (if (= kind "mouseMoved") 0 1)}))
@@ -90,9 +144,37 @@
       gesture)))
 
 (defn fill! [page selector text]
-  (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
-    ");if(!e)throw Error('Target unavailable');e.focus();e.select();return true})()"))
-  (cdp! page "Input.insertText" {"text" text}))
+  "Edit an ordinary writable form control. Text uses native CDP insertion;
+   segmented date/time controls use their DOM value setter and form events,
+   because CDP text insertion leaves those fields empty. No app fact is set."
+  (let [kind (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
+               ");if(!e||!['INPUT','TEXTAREA'].includes(e.tagName)||e.matches(':disabled')||e.readOnly)throw Error('Input unavailable');"
+               "const t=e.type;if(e.tagName==='INPUT'&&!['text','password','email','search','tel','url','number','date','datetime-local','time','month','week'].includes(t))throw Error('Unsupported input type');e.focus();"
+               "if(['date','datetime-local','time','month','week'].includes(t)){const before=e.value,value=" (interop/->json text) ";"
+               "const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;set.call(e,value);"
+               "if(value&&!e.value){set.call(e,before);throw Error('Invalid civil-time value')}"
+               "e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return 'civil'}"
+               "e.select();return 'text'})()"))]
+    (when (= "text" kind) (cdp! page "Input.insertText" {"text" text}))
+    :ok))
+
+(defn upload!
+  "Choose local files through the browser's native file-input protocol. The
+   ordinary form owns upload/submission; no DOM File or product fact is faked.
+   Requires at least one existing file. Paths belong to the port host."
+  [page selector paths]
+  (let [files (mapv Path/expand paths)]
+    (when-not (and (seq files) (every? File/regular? files))
+      (throw (ex-info "Upload file unavailable" {})))
+    (when-not (= true (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
+                         ");return !!e&&e.tagName==='INPUT'&&e.type==='file'&&!e.disabled})()")))
+      (throw (ex-info "File input unavailable" {})))
+    (let [document (cdp! page "DOM.getDocument" {})
+          target (cdp! page "DOM.querySelector" {"nodeId" (get-in document ["root" "nodeId"]) "selector" selector})
+          node (get target "nodeId")]
+      (when-not (and (number? node) (pos? node))
+        (throw (ex-info "File input disappeared" {})))
+      (cdp! page "DOM.setFileInputFiles" {"nodeId" node "files" files}))))
 
 (defn point [page selector]
   (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
@@ -119,7 +201,26 @@
   (doseq [kind ["keyDown" "keyUp"]]
     (cdp! page "Input.dispatchKeyEvent" {"type" kind "key" key
       "code" (if (= key " ") "Space" key)
-      "windowsVirtualKeyCode" (get {"Enter" 13 "Escape" 27 "Tab" 9 " " 32} key 0)})))
+      "windowsVirtualKeyCode" (get {"Enter" 13 "Escape" 27 "Tab" 9 " " 32
+                                    "Home" 36 "End" 35 "ArrowLeft" 37 "ArrowUp" 38
+                                    "ArrowRight" 39 "ArrowDown" 40 "Backspace" 8 "Delete" 46} key 0)})))
+
+(defn select!
+  "Choose one enabled option through trusted native keyboard input. Inspection
+   reads option identity only; it never assigns a value or synthesizes change."
+  [page selector value]
+  (let [inspection (evaluate! page (str "(()=>{const e=document.querySelector(" (interop/->json selector)
+                    ");if(!e||e.tagName!=='SELECT'||e.multiple||e.disabled)throw Error('Select unavailable');"
+                    "const a=[...e.options].filter(o=>!o.disabled&&!o.parentElement.disabled);"
+                    "const matches=a.map((o,i)=>({o,i})).filter(x=>x.o.value===" (interop/->json value) ");"
+                    "if(matches.length!==1)throw Error('Option unavailable or ambiguous');return matches[0].i})()"))]
+    (click! page selector)
+    (key! page "Home")
+    (doseq [_ (range inspection)] (key! page "ArrowDown"))
+    (key! page "Enter")
+    (when-not (= value (evaluate! page (str "document.querySelector(" (interop/->json selector) ").value")))
+      (throw (ex-info "Native selection did not reach the requested option" {})))
+    :ok))
 
 (defn drag!
   "Drag between visible CSS targets with trusted pointer input. Its motion and

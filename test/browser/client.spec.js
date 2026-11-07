@@ -16,7 +16,8 @@ const fs = require("fs");
 const path = require("path");
 
 const clientJs = fs.readFileSync(
-  path.join(__dirname, "../../priv/lib/live/client.js"),
+  process.env.LIVE_CLIENT_SOURCE ||
+    path.join(__dirname, "../../priv/lib/live/client.js"),
   "utf8"
 );
 const fixture = JSON.parse(
@@ -190,6 +191,93 @@ test("an inserted subtree with a seq of seqs renders every child", async ({
     );
     expect(canonical(got), `nested step ${i + 1}`).toBe(canonical(step.html));
   }
+});
+
+test("an inserted subtree keeps its tag classes beside a :class attr", async ({
+  page,
+}) => {
+  // REGRESSION: `[:span.x {:class "y"}]` is class="x y" in the first paint,
+  // but render() set the attrs map's class over the shorthand's, so the same
+  // element INSERTED by a patch painted class="y"; and a :class toggle shipped
+  // the bare value, wiping `x` on an element the first paint rendered.
+  const classes = fixture.classes;
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, classes.mount);
+  for (let i = 0; i < classes.patches.length; i++) {
+    const step = classes.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `class step ${i + 1}`).toBe(canonical(step.html));
+  }
+  await expect(page.locator("#live-root span")).toHaveAttribute("class", "x");
+});
+
+test("an inserted child group that leads with text renders as text", async ({
+  page,
+}) => {
+  // REGRESSION: `[:p (list "two words" [:b "c"])]` crossed the wire as
+  // ["p",["two words",["b","c"]]], so render() took the group for an element
+  // named "two words": createElementNS threw InvalidCharacterError and the
+  // whole patch was lost (a blank page in the app). The first paint (HTML)
+  // was right. The differ now ships inserted subtrees already spliced.
+  const ts = fixture["text-seq"];
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, ts.mount);
+  for (let i = 0; i < ts.patches.length; i++) {
+    const step = ts.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `text-seq step ${i + 1}`).toBe(canonical(step.html));
+  }
+  expect(errors).toEqual([]);
+});
+
+test("a table written without <tbody> patches through the parser's tbody", async ({
+  page,
+}) => {
+  // REGRESSION: the browser inserts <tbody> into `<table><tr>…`, so the DOM
+  // is table > tbody > tr; the differ indexed rows as the table's children,
+  // `at` walked into undefined and threw, and every later op of the patch was
+  // lost — the pill after the table kept its old text.
+  const tb = fixture.table;
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, tb.mount);
+  for (let i = 0; i < tb.patches.length; i++) {
+    const step = tb.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `table step ${i + 1}`).toBe(canonical(step.html));
+  }
+  await expect(page.locator("#live-root .pill")).toHaveText("Archivé");
+  expect(errors).toEqual([]);
 });
 
 test("clipboard confirms only after resolution and offers manual copy on denial", async ({ page }) => {

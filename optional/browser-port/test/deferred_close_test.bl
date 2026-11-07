@@ -1,0 +1,52 @@
+(ns browser.deferred-close-test
+  (:require [browser.film :as film] [interop]))
+
+(deftest normal-close-can-leave-the-mosaic-to-its-owning-consumer
+  (let [root (str "/tmp/bl-world-close-deferred-" (erlang/unique_integer (list :positive)))
+        wrapper (str root "/ffmpeg-wrapper") marker (str root "/composition-called")
+        _ (File/mkdir_p! root)
+        _ (File/write! wrapper
+            (str "#!/bin/sh\nfor item do\n  if [ \"$item\" = \"-filter_complex\" ]; then : > '" marker "'; exit 23; fi\ndone\nexec '"
+                 (String/replace (System/find_executable "ffmpeg") "'" "'\"'\"'") "' \"$@\"\n"))
+        _ (File/chmod! wrapper 448)
+        options {:width 800 :height 480
+                 :launch {"chromium" (System/get_env "CHROMIUM") "compositor" (System/get_env "SWAY")
+                          "vnc" (System/get_env "WAYVNC") "width" 800 "height" 580}}
+        world (film/owned-worlds [[:actor options] [:observer options]] (str root "/frames")
+                                {:ffmpeg wrapper :fps 30 :compose-on-close? false})
+        pages ((:open world) {})]
+    (try
+      (doseq [actor [:actor :observer]]
+        ((:step! world) pages [:act actor [:navigate "data:text/html,<p>Native actor evidence, consumer composition</p>"]]))
+      (Process/sleep 500)
+      ((:basis world) pages)
+      (is (= :closed (try ((:close! world) pages) :closed (catch _ :composition-error))))
+      (is (not (File/exists? marker)))
+      (is (not (File/exists? (str root "/frames/continuous.mp4"))))
+      (let [metadata (interop/json-> (File/read! (str root "/frames/recordings.json")))
+            records (get metadata "recordings")]
+        (is (nil? (get metadata "source")))
+        (is (= "deferred" (get metadata "composition")))
+        (is (= 2 (count records)))
+        (doseq [record records]
+          (is (number? (get record "trim")))
+          (let [probe (System/cmd "ffprobe" (list "-v" "error" "-select_streams" "v:0"
+                         "-show_entries" "stream=width,height,r_frame_rate" "-of" "json" (get record "path")))
+                stream (first (get (interop/json-> (elem probe 0)) "streams"))]
+            (is (= 0 (elem probe 1)))
+            (is (= "30/1" (get stream "r_frame_rate")))
+            (is (= 800 (get stream "width")))
+            (is (= 480 (get stream "height"))))
+          (is (> (get record "sourceFrames") 0))
+          (is (> (get record "encodedFrames") 10))
+          (is (File/regular? (get record "path")))
+          (is (= 0 (elem (System/cmd "ffmpeg"
+                           (list "-v" "error" "-xerror" "-threads" "2" "-i" (get record "path") "-f" "null" "-")) 1)))))
+      (doseq [[_ p] pages] (is (= :undefined (erlang/port_info (:port p)))))
+      (finally ((:dispose! world)) (File/rm_rf! root)))))
+
+(deftest deferred-close-is-an-explicit-boolean-before-launch
+  (doseq [value [nil :later 0 "false"]]
+    (is (thrown? (film/owned-worlds [[:actor {:width 800 :height 480}]]
+                                   "/tmp/bl-world-invalid-deferred-close"
+                                   {:compose-on-close? value})))))

@@ -438,6 +438,9 @@ fn launch(v: &Value) -> Result<Session> {
         "--restore-last-session".into(),
         format!("--window-size={width},{height}"),
         "--disable-dev-shm-usage".into(),
+        // The owned headless compositor uses CPU rendering. Requiring EGL
+        // here can leave a working CDP session with no compositor frames.
+        "--disable-gpu".into(),
     ];
     if let Some(url) = v["url"].as_str() {
         if !url.starts_with("https://") && !url.starts_with("http://") {

@@ -68,6 +68,29 @@ driving a real Chromium with Playwright against the JS client.
    without losing a draft, doc replies interleaved with eval results, and a
    320px layout without horizontal overflow.
 
+7. **`mount.spec.js` › the server-rendered page survives the socket** — the
+   socket's `["mount"]` replaces the first paint. Text typed, boxes ticked,
+   options picked, the focused field and its caret survive it (matched by id,
+   else name, else child path); a restored field the view binds re-sends its
+   value so the session agrees; `<html data-mounted="1">` marks the mount.
+   Against the pre-fix client the typed values come back empty. And live's
+   `["style"]` rules go INTO the page's `<style id="live-style">` (the SSR
+   sheet, where the app's `:shell` placed it), or before the first stylesheet
+   when there is none — never after the app's own sheet, which used to lose to
+   live's base reset on source order.
+
+8. **`connect.spec.js` › a refusal is a DOM event** — `["denied", why]` used
+   to reach only `opts.onDenied`, so a shell that passed none (live.app's
+   default) swallowed refusals. It is now also `live:denied` `{why}` on
+   `document`, beside the callback.
+
+9. **`connect.spec.js` › one bad op does not sink a patch** — an op that
+   throws used to abort `applyPatch`, losing every later op in silence. Each
+   op is guarded: the rest lands, `live:patch-error` reports the failures, and
+   the client sends `["remount"]` (once, until the mount arrives) so the page
+   converges. (`client.spec.js` › the tbody-less table is the case that made
+   ops throw: the parser's `<tbody>` is now part of the model.)
+
 ## Run it
 
 ```sh

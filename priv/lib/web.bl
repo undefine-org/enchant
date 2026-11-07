@@ -356,13 +356,38 @@
        (cond ~@cond-clauses))))
 
 ;; ── WebSocket upgrade ─────────────────────────────────────────────────
+;;
+;; THE SERVING SCOPE CROSSES THE UPGRADE. `serve` conveys the serving scope
+;; (bl env, the command's process-local OS-env overlay, caps, cwd, argv) into
+;; each PLUG invocation and restores the worker after it. A WebSocket's
+;; callbacks run later, in the same connection process, after the plug has
+;; returned — outside that scope. They used to see the bare process: under
+;; `bl run`/`bl test` a `System/put_env` (which writes the command's overlay,
+;; see vm/osenv.bl) reached every HTTP page and no socket, and live.app's
+;; session process, started from the socket's `init`, captured that bare scope
+;; for its whole life. So `upgrade` captures the scope it is called in (the
+;; request's) and every callback runs under it, as a plug does.
+
+(defn- in-serving-scope
+  "`handlers` with every callback bound to the scope `upgrade` was called in."
+  [handlers]
+  (let [cwd (BeamLisp/cwd)
+        argv (BeamLisp/argv)
+        run (BeamLisp.Env/convey
+              (fn [thunk]
+                (BeamLisp/with_cwd cwd (fn [] (BeamLisp/with_argv argv thunk)))))]
+    (into {} (map (fn [[k f]]
+                    [k (if (fn? f) (fn [& args] (run (fn [] (apply f args)))) f)])
+                  handlers))))
 
 (defn upgrade
   "Upgrade `conn` to a WebSocket handled by `handlers` (a map of bl fns).
-   `init-state` (optional) is the bl callbacks' starting state."
+   `init-state` (optional) is the bl callbacks' starting state. The callbacks
+   run in the serving scope of the request that upgraded (env, OS-env
+   overlay, cwd, argv), as the request itself did."
   ([conn handlers] (upgrade conn handlers nil))
   ([conn handlers init-state]
-   (let [wrap (erlang/apply Adapter :wrap (list handlers init-state))
+   (let [wrap (erlang/apply Adapter :wrap (list (in-serving-scope handlers) init-state))
          opts (list (erlang/list_to_tuple (list :timeout 120000)))]
      (erlang/apply WSA :upgrade (list conn Adapter wrap opts)))))
 
@@ -571,6 +596,15 @@
         (erlang/demonitor monitor (list :flush))
         (tuple :error :listener-start-timeout)))))
 
+(defn- shared-request-plug [request-ref cwd argv]
+  ;; Listener/acceptor options cross many process heaps. Keep one conveyed
+  ;; callback in a shared reference, and copy only that reference into the pool.
+  ;; A separate factory also keeps the serving let’s other bindings out of it.
+  (fn [conn _opts]
+    (BeamLisp/with_cwd cwd
+      (fn [] (BeamLisp/with_argv argv
+        (fn [] (erlang/apply @request-ref (list conn))))))))
+
 (defn serve
   "Start a Bandit HTTP server. `opts` = {:port int :plug fn :ip tuple
    :log :stderr|:off|fn :log-pretty bool}.
@@ -611,10 +645,8 @@
                         (catch e
                           (access! sink pretty? conn nil t0 e)
                           (throw e))))))))
-        plug2 (fn [conn _opts]
-                (BeamLisp/with_cwd cwd
-                  (fn [] (BeamLisp/with_argv argv
-                    (fn [] (erlang/apply request (list conn)))))))
+        request-ref (atom request)
+        plug2 (shared-request-plug request-ref cwd argv)
         bopts (list (erlang/list_to_tuple (list :plug plug2))
                     (erlang/list_to_tuple (list :port port))
                     (erlang/list_to_tuple (list :scheme :http)))
