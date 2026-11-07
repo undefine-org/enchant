@@ -13,7 +13,24 @@
                     "code" "manifest" "snapshot" "dataVersion" "keyFormat" "destination"
                     "tree" "preserved" "stores"})
 (defn- nonce [] (String/downcase (binary/encode_hex (crypto/strong_rand_bytes 16))))
-(defn- close [root] (when root (try (fs/close! root) (catch _ nil))))
+(defn- retire! [operation]
+ ;; Worker DOWN does not imply that native resource destructors have run.
+ ;; Retry the actual custody/close operation; its native pins remain authority.
+ (loop [left 100]
+  (let [failed (try (operation) nil (catch error error))]
+   (when failed
+    (if (pos? left)
+     (do (erlang/garbage_collect) (Process/sleep 10) (recur (dec left)))
+     (throw (ex-info "Offline native ownership has not retired; retain the generation"
+                    {:kind :offline-ownership-retirement-uncertain :cause (:kind (ex-data failed))})))))))
+(defn- close [root] (when root (retire! #(fs/close! root))))
+(defn- cleanup! [scope job original]
+ ;; Attempt every owned release even if another one refuses. A successful
+ ;; prepare cannot silently retain the original's directory/store flocks.
+ (let [release-error (try (when scope (retire! #(engine/release-source! scope))) nil (catch error error))
+       job-error (try (close job) nil (catch error error))
+       original-error (try (close original) nil (catch error error))]
+  (when-let [error (or release-error job-error original-error)] (throw error))))
 (defn- save! [job record update]
  (let [next (journal/save! job (deref record) update)] (reset! record next) next))
 (defn- phase! [job record phase]
@@ -186,7 +203,7 @@
                         (= (Path/dirname job-path) (Path/dirname destination))
                         (not= job-path destination)) (l/refuse! :offline-invalid-job-path))
        original (fs/claim! source {:readonly true}) job (atom nil) scope (atom nil)]
-  (try
+  (let [result (try
    (no-legacy-protocol! original)
    (reset! job (fs/claim! job-path {:create (not (File/exists? job-path))}))
    (let [record (atom (if (seq (:entries (fs/entries (deref job) nil 1)))
@@ -196,6 +213,10 @@
     (if (File/exists? destination)
      (reconcile-open! (deref scope) original (deref job) record intent)
      (prepare-open! (deref scope) original (deref job) record intent)))
-   (finally
-    (when (deref scope) (try (engine/release-source! (deref scope)) (catch _ nil)))
-    (close (deref job)) (close original)))))
+   (catch error {:error error}))
+        retirement-error (try (cleanup! (deref scope) (deref job) original) nil (catch error error))]
+   ;; Preserve the preparation refusal; cleanup uncertainty must never turn a
+   ;; successful READY into a success while native ownership is still live.
+   (cond (contains? result :error) (throw (:error result))
+         retirement-error (throw retirement-error)
+         :else result))))
