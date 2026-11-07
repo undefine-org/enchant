@@ -19,6 +19,14 @@
             [vm.spec :as spec]
             [env]))
 
+(def fixture-vms (atom #{}))
+
+(defn- ensure-fixture! [spec]
+  (let [existing (mgr/get-vm (:id spec))
+        vm (mgr/ensure spec)]
+    (when (nil? existing) (swap! fixture-vms conj (:id spec)))
+    vm))
+
 (defn- loopt [] (fn [] (receive (after 60000 :ok))))
 (defn- sleep [ms] (erlang/apply :timer :sleep (list ms)))
 
@@ -38,8 +46,8 @@
 (deftest g1-commands-run-concurrently
   (testing "a slow command in VM-A does not delay a command in VM-B"
     (mgr/start)
-    (mgr/ensure {:id "g1-a" :root (str (System/tmp_dir!) "/g1a") :caps ["Elixir.String"]})
-    (mgr/ensure {:id "g1-b" :root (str (System/tmp_dir!) "/g1b") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g1-a" :root (str (System/tmp_dir!) "/g1a") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g1-b" :root (str (System/tmp_dir!) "/g1b") :caps ["Elixir.String"]})
     (let [parent (erlang/self)
           t0 (System/monotonic_time :millisecond)]
       ;; VM-A runs a 300ms command; VM-B runs an instant one — concurrently.
@@ -59,7 +67,7 @@
   (testing "200 commands across 10 VMs all complete (BEAM schedules them)"
     (mgr/start)
     (doseq [i (range 10)]
-      (mgr/ensure {:id (str "g1m-" i) :root (str (str (System/tmp_dir!) "/g1m") i) :caps ["Elixir.String"]}))
+      (ensure-fixture! {:id (str "g1m-" i) :root (str (str (System/tmp_dir!) "/g1m") i) :caps ["Elixir.String"]}))
     (let [parent (erlang/self) n 200]
       (doseq [i (range n)]
         (spawn (fn []
@@ -73,8 +81,8 @@
 (deftest g2-halt-scopes-to-caller-vm
   (testing "a command's (vm/halt) ends only its VM; others + node survive"
     (mgr/start)
-    (mgr/ensure {:id "g2-a" :root (str (System/tmp_dir!) "/g2a") :caps ["Elixir.String"]})
-    (mgr/ensure {:id "g2-b" :root (str (System/tmp_dir!) "/g2b") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g2-a" :root (str (System/tmp_dir!) "/g2a") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g2-b" :root (str (System/tmp_dir!) "/g2b") :caps ["Elixir.String"]})
     (mgr/serve "g2-a" :web (loopt))
     (mgr/serve "g2-a" :runner (loopt))
     (mgr/serve "g2-b" :web (loopt))
@@ -108,8 +116,8 @@
 (deftest g3-crashed-member-self-retracts
   (testing "killing a VM's members drops them from the owned set (monitor-retract)"
     (mgr/start)
-    (mgr/ensure {:id "g3-a" :root (str (System/tmp_dir!) "/g3a") :caps ["Elixir.String"]})
-    (mgr/ensure {:id "g3-b" :root (str (System/tmp_dir!) "/g3b") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g3-a" :root (str (System/tmp_dir!) "/g3a") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g3-b" :root (str (System/tmp_dir!) "/g3b") :caps ["Elixir.String"]})
     (doseq [_ (range 5)] (mgr/serve "g3-a" :w (loopt)))
     (doseq [_ (range 3)] (mgr/serve "g3-b" :w (loopt)))
     (let [a-before (owner/count "g3-a")
@@ -124,7 +132,7 @@
 (deftest g3-drain-is-idempotent-and-total
   (testing "drain kills exactly the VM's set; a second drain is 0"
     (mgr/start)
-    (mgr/ensure {:id "g3-d" :root (str (System/tmp_dir!) "/g3d") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g3-d" :root (str (System/tmp_dir!) "/g3d") :caps ["Elixir.String"]})
     (doseq [_ (range 4)] (mgr/serve "g3-d" :w (loopt)))
     (let [first-drain (mgr/drain "g3-d")]
       (sleep 40)
@@ -136,7 +144,7 @@
 (deftest g3-no-growth-across-cycles
   (testing "1000 spawn+drain cycles leave the owned set at 0 (no leak)"
     (mgr/start)
-    (mgr/ensure {:id "g3-cyc" :root (str (System/tmp_dir!) "/g3cyc") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g3-cyc" :root (str (System/tmp_dir!) "/g3cyc") :caps ["Elixir.String"]})
     (doseq [_ (range 100)]
       (dotimes-spawn "g3-cyc")
       nil)
@@ -169,7 +177,7 @@
     (is (some? (Process/whereis :vm-manager)))
     ;; The manager answers a read WHILE a long command runs in a VM — proving
     ;; the manager itself is not the command worker (it would block otherwise).
-    (mgr/ensure {:id "g6" :root (str (System/tmp_dir!) "/g6") :caps ["Elixir.String"]})
+    (ensure-fixture! {:id "g6" :root (str (System/tmp_dir!) "/g6") :caps ["Elixir.String"]})
     (let [parent (erlang/self)]
       (spawn (fn [] (mgr/run "g6" (fn [] (sleep 200) :slow))
                     (erlang/send parent :cmd-done)))
@@ -181,4 +189,8 @@
         (is (< dt 100)))
       (receive :cmd-done :ok))))
 
-(run-tests)
+(try (run-tests)
+  (finally
+    ;; Batched files share the real manager. Retire only this suite's VMs;
+    ;; leave the manager and any other file's realms intact.
+    (doseq [id @fixture-vms] (mgr/drain id))))
