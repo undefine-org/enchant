@@ -3,9 +3,12 @@
 ## One integration checkout
 
 Use this checkout's `main` for Enchant / Beam Lisp integration. Commit a coherent
-batch before starting its checks. Create another worktree only when the user
-explicitly asks; historical work is retained in Git archive refs and recovery
-bundles, so a parked experiment does not need a second checkout or VM.
+batch before starting its checks. Keep historical work in Git archive refs and
+recovery bundles. Routine fixes and profiling reuse this checkout and its SDK.
+If temporary isolation needs a worktree, record its owner and retirement
+condition, then merge or archive it and remove it before finishing the task.
+Keep one integration writer; parallel copies must not fix the same bug or
+produce duplicate SDKs.
 
 For a project change, keep its qualified immutable SDK pin. Batch language
 changes before producing one SDK, then reuse that exact artifact for focused
