@@ -105,7 +105,13 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `17 passed` (3 differ + 9 lifecycle + 5 REPL workspace).
+To reuse a system Chromium without downloading another browser, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to its absolute executable path. Use
+`--workers=1` on a shared workstation.
+
+The standalone client run covers 37 tests. The separate continuity journey
+requires the isolated server from `examples/continuity/verify.sh` and is skipped
+when its URL and evidence directory are absent.
 
 ## Why not Phoenix here
 

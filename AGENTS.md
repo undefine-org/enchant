@@ -13,6 +13,11 @@ checks. The private operator Source (`~/.config/beam-lisp/env.bl`) selects the
 build backend; its adjacent checked Nix projection and transport belong to the
 operator, not to project source. Use one substantive build/check at a time.
 
+Builder features describe verified capabilities. Advertising `kvm` does not
+provide `/dev/kvm`; verify access inside a Nix sandbox before placing VM work
+there. A QEMU fallback to TCG calls for corrected placement, with the existing
+compiler deadlines and validation checks preserved.
+
 Automatic rolling releases require repository variable `AUTO_RELEASE_ENABLED`
 to be `true`. Enable it only after the required activation rehearsal is
 qualified. Tag and manual release requests retain the exact-runtime gates.
