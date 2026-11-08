@@ -3,6 +3,7 @@ import json
 import contextlib
 import io
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +16,18 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class Receipts(unittest.TestCase):
+    def test_run_alone_suites_cannot_enter_the_shared_vm(self):
+        root = Path(__file__).resolve().parents[2]
+        isolated = json.loads((root / "scripts/test-isolation.json").read_text())
+        declared = [str(path.relative_to(root)) for path in (root / "test").rglob("*_test.bl")
+                    if re.search(r"(?mi)^\s*;;\s*Run alone\b", path.read_text())]
+        self.assertTrue(declared, "The native run-alone inventory must not become empty")
+        for name in declared:
+            with self.subTest(file=name):
+                self.assertIn(name, isolated, "Honor the suite's node-wide lifetime contract")
+                self.assertEqual([["before_test.bl", "after_test.bl"], [name]],
+                                 RUNNER.process_groups(["before_test.bl", name, "after_test.bl"], isolated))
+
     def test_private_runtime_preserves_the_real_user_manager_directory(self):
         env = RUNNER.runtime_environment({"XDG_RUNTIME_DIR": "/run/user/1000"})
         env["XDG_RUNTIME_DIR"] = "/run/user/1000/private-check"
