@@ -1,0 +1,242 @@
+; loom/tone.bl — colour as perception: OKLCH in, themes and their proofs out.
+;
+; ── Why this exists ───────────────────────────────────────────────────
+;
+; Hand-picked dark palettes go flat in a predictable way: every surface lands
+; in one narrow lightness band, the text tiers sit on top of each other, and
+; the accents are pale pastels as light as the meta text. Nothing fails a
+; WCAG check, so nothing says so. Material, Apple's HIG and Radix agree on
+; what a dark theme needs instead:
+;
+;   - a dark base and LIGHTER surfaces as they rise (Material's overlay
+;     ladder, Apple's base / elevated sets); depth is a lightness step
+;   - shadows that stay dark and get stronger, plus a lit top edge
+;   - two kinds of accent: desaturated text tones, and a saturated solid for
+;     the one or two elements that carry the brand
+;   - neutrals tinted toward the brand hue, never pure grey
+;   - steps named for jobs: background, component, border, solid, text
+;
+; So a dark theme is generated here from a few perceptual numbers (OKLCH:
+; lightness 0–1, chroma, hue in degrees), and `oomph` measures what WCAG
+; does not: that surfaces separate, text tiers separate, accents stand out,
+; solids keep their colour and the frame sits below the page.
+;
+;   (tone/dark {:hue 272 :chroma 0.03
+;               :accents {:action {:hue 58 :chroma 0.15}}})
+;   → {:frame "#…" :base "#…" :surface "#…" :raised "#…" … :action "#…"
+;      :action-solid "#…" :on-action "#…" :action-soft "#…"}
+;
+; Pure data in, data out: no theme is installed, no CSS is emitted. A design
+; system maps these roles onto its own token names.
+
+(ns loom.tone)
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. COLOUR — sRGB hex ⇄ OKLCH, with chroma reduced into gamut
+;; ════════════════════════════════════════════════════════════════════
+
+(defn- m [f & args] (erlang/apply :math f args))
+(defn- clamp [lo hi x] (max lo (min hi x)))
+(defn- cbrt [x] (if (neg? x) (- (m :pow (- x) (/ 1.0 3))) (m :pow x (/ 1.0 3))))
+
+(defn- cube [x] (* x x x))
+
+(defn- channel [h i] (erlang/binary_to_integer (subs h (+ 1 (* 2 i)) (+ 3 (* 2 i))) 16))
+(defn rgb "A #rrggbb colour as [r g b] in 0–255." [h] [(channel h 0) (channel h 1) (channel h 2)])
+
+(defn- hex2 [n]
+  (let [s (String/downcase (Integer/to_string (clamp 0 255 n) 16))]
+    (if (= 1 (count s)) (str "0" s) s)))
+
+(defn- to-linear [c]
+  (let [c (/ c 255.0)] (if (<= c 0.04045) (/ c 12.92) (m :pow (/ (+ c 0.055) 1.055) 2.4))))
+(defn- from-linear [x]
+  (erlang/round (* 255 (clamp 0.0 1.0 (if (<= x 0.0031308) (* 12.92 x) (- (* 1.055 (m :pow x (/ 1.0 2.4))) 0.055))))))
+
+(defn- oklab->linear [L a b]
+  (let [l (cube (+ L (* 0.3963377774 a) (* 0.2158037573 b)))
+        mm (cube (- L (* 0.1055613458 a) (* 0.0638541728 b)))
+        s (cube (- L (* 0.0894841775 a) (* 1.2914855480 b)))]
+    [(+ (* 4.0767416621 l) (* -3.3077115913 mm) (* 0.2309699292 s))
+     (+ (* -1.2684380046 l) (* 2.6097574011 mm) (* -0.3413193965 s))
+     (+ (* -0.0041960863 l) (* -0.7034186147 mm) (* 1.7076147010 s))]))
+
+(defn- lch->linear [L C h]
+  (let [r (* h (/ (m :pi) 180))] (oklab->linear L (* C (m :cos r)) (* C (m :sin r)))))
+
+(defn- in-gamut? [lin] (every? (fn [x] (and (>= x -0.0001) (<= x 1.0001))) lin))
+
+(defn oklch->hex
+  "An OKLCH colour as #rrggbb. Out-of-gamut colours keep their lightness and
+   hue and lose chroma until they fit — never a clipped, shifted hue."
+  [L C h]
+  (let [L (clamp 0.0 1.0 L)
+        C (if (in-gamut? (lch->linear L C h))
+            C
+            (loop [lo 0.0 hi C i 0]
+              (if (= i 24) lo
+                (let [mid (/ (+ lo hi) 2)]
+                  (if (in-gamut? (lch->linear L mid h)) (recur mid hi (inc i)) (recur lo mid (inc i)))))))
+        [r g b] (lch->linear L C h)]
+    (str "#" (hex2 (from-linear r)) (hex2 (from-linear g)) (hex2 (from-linear b)))))
+
+(defn oklch
+  "A #rrggbb colour as {:l :c :h} — lightness 0–1, chroma, hue in degrees."
+  [hex]
+  (let [[r g b] (map to-linear (rgb hex))
+        l (cbrt (+ (* 0.4122214708 r) (* 0.5363325363 g) (* 0.0514459929 b)))
+        mm (cbrt (+ (* 0.2119034982 r) (* 0.6806995451 g) (* 0.1073969566 b)))
+        s (cbrt (+ (* 0.0883024619 r) (* 0.2817188376 g) (* 0.6299787005 b)))
+        L (+ (* 0.2104542553 l) (* 0.7936177850 mm) (* -0.0040720468 s))
+        a (+ (* 1.9779984951 l) (* -2.4285922050 mm) (* 0.4505937099 s))
+        bb (+ (* 0.0259040371 l) (* 0.7827717662 mm) (* -0.8086757660 s))
+        deg (* (m :atan2 bb a) (/ 180 (m :pi)))]
+    {:l L :c (m :sqrt (+ (* a a) (* bb bb))) :h (if (neg? deg) (+ deg 360) deg)}))
+
+(defn luminance "WCAG relative luminance."
+  [hex]
+  (let [[r g b] (map to-linear (rgb hex))] (+ (* 0.2126 r) (* 0.7152 g) (* 0.0722 b))))
+
+(defn contrast "WCAG contrast ratio between two #rrggbb colours."
+  [a b]
+  (let [la (luminance a) lb (luminance b)] (/ (+ (max la lb) 0.05) (+ (min la lb) 0.05))))
+
+(defn- round2 [x] (/ (erlang/round (* 100 x)) 100.0))
+(defn- round3 [x] (/ (erlang/round (* 1000 x)) 1000.0))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. THE DARK THEME — roles, not swatches
+;; ════════════════════════════════════════════════════════════════════
+
+(def ladder
+  "Surface lightness, OKLCH L. The frame (a rail, a title bar) sits BELOW
+   the page; each surface that rises is one visible step lighter. A field is
+   recessed: darker than the card that holds it, so it reads as a well."
+  {:frame 0.165 :base 0.205 :sunken 0.185 :inset 0.235 :surface 0.265 :raised 0.305 :overlay 0.342
+   :field 0.220 :hover 0.292 :selected 0.335})
+
+(def ink
+  "Text and line lightness: three text tiers far enough apart to read as
+   tiers, three borders by job (Radix steps 6, 7, 8)."
+  {:text 0.955 :text-2 0.820 :text-3 0.700 :line-subtle 0.320 :line 0.375 :line-strong 0.560})
+
+(def accent-defaults
+  "An accent's text tone is light and moderately chromatic; its solid is the
+   brand at full strength, carrying dark ink."
+  {:text-l 0.80 :text-c 0.11 :solid-l 0.70 :solid-c 0.15 :soft-l 0.305 :soft-c 0.055})
+
+(defn- surface-chroma
+  "Tint grows a little with height, as a lit surface picks up more of the hue."
+  [c k]
+  (* c (case k :frame 1.9 :sunken 0.9 :base 1.0 :field 1.0 :inset 1.05 :surface 1.1 :hover 1.15 :raised 1.2 :selected 1.6 :overlay 1.25 1.0)))
+
+(defn dark
+  "A dark theme from perceptual numbers.
+
+   opts:
+     :hue      neutral hue in degrees (the brand's), default 265
+     :chroma   neutral tint, default 0.025 — 0 is pure grey
+     :frame    {:hue :chroma} for a branded frame, default the neutral, deeper
+     :lift     added to every surface L, to make the whole night lighter
+     :accents  {name {:hue :chroma? :text-l? :text-c? :solid-l? :solid-c?}}
+
+   Returns a flat map of #rrggbb roles: the ladder (:frame :base :sunken :inset
+   :surface :raised :overlay :field :hover :selected), the inks (:text :text-2
+   :text-3 :line-subtle :line :line-strong), and for every accent NAME the
+   keys NAME, NAME-solid, on-NAME and NAME-soft."
+  [opts]
+  (let [hue (or (:hue opts) 265)
+        c (or (:chroma opts) 0.025)
+        lift (or (:lift opts) 0)
+        fr (:frame opts)
+        surfaces (into {} (for [[k l] ladder]
+                            [k (if (and (= k :frame) fr)
+                                 (oklch->hex (+ l lift) (or (:chroma fr) (* 1.9 c)) (or (:hue fr) hue))
+                                 (oklch->hex (+ l lift) (surface-chroma c k) hue))]))
+        inks (into {} (for [[k l] ink] [k (oklch->hex l (* c (if (= k :text) 0.3 0.8)) hue)]))
+        on-solid (oklch->hex 0.17 (* c 1.2) hue)
+        accents (apply merge {}
+                  (for [[nm a] (:accents opts)]
+                    (let [a (merge accent-defaults a) h (:hue a) n (name nm)]
+                      {nm (oklch->hex (:text-l a) (:text-c a) h)
+                       (keyword (str n "-solid")) (oklch->hex (:solid-l a) (:solid-c a) h)
+                       (keyword (str "on-" n)) on-solid
+                       (keyword (str n "-soft")) (oklch->hex (+ (:soft-l a) lift) (:soft-c a) h)})))]
+    (merge surfaces inks accents)))
+
+(def elevation
+  "Dark elevation: the next surface step does most of the work; a hairline
+   lit edge on top and a shadow strong enough to be seen on a dark ground.
+   Light themes keep their own tinted, softer shadows."
+  {:rest "inset 0 1px 0 rgb(255 255 255 / .045),0 1px 2px rgb(0 0 0 / .45)"
+   :raise "inset 0 1px 0 rgb(255 255 255 / .06),0 8px 24px -6px rgb(0 0 0 / .55),0 2px 6px rgb(0 0 0 / .35)"
+   :sheet "inset 0 1px 0 rgb(255 255 255 / .07),0 24px 64px -12px rgb(0 0 0 / .7),0 4px 14px rgb(0 0 0 / .4)"})
+
+(def hairline
+  "Borders that work on every surface step: translucent light, not a fixed hex."
+  {:subtle "rgb(255 255 255 / .07)" :line "rgb(255 255 255 / .11)" :strong "rgb(255 255 255 / .2)"})
+
+(defn glow
+  "A faint light at the top of the page, so a large dark ground is not a
+   flat slab. Not a glow behind a component — elevation stays shadows."
+  [theme]
+  (str "radial-gradient(120% 60% at 50% -10%," (:raised theme) " 0%,transparent 60%)," (:base theme)))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. OOMPH — what a dark theme must have that WCAG does not ask for
+;; ════════════════════════════════════════════════════════════════════
+
+(def floors
+  "Minimums. :step is OKLCH ΔL between rising surfaces; :tier is the contrast
+   between adjacent text tiers; :stand is how far an accent must sit from the
+   meta text it competes with (contrast, or chroma ΔC); :solid is the chroma a
+   filled control keeps; :recess is how far below its holder a field sits;
+   :card is how far the main working surface rises above the page — Material's
+   first elevation level is about this much."
+  {:card 0.05 :step 0.025 :tier 1.25 :stand-contrast 1.25 :stand-chroma 0.09 :solid 0.12 :recess 0.015})
+
+(defn oomph
+  "Check a theme for depth and punch. `theme` is a map of #rrggbb values;
+   `roles` names its keys:
+
+     :steps    [k …]        surfaces bottom to top, each lighter by :step
+     :card     [card page]  the working surface, at least :card above the page
+     :frame    [frame base] the frame must sit below the base
+     :text     [k …]        text tiers, strongest first, apart by :tier
+     :accents  [[k meta] …] an accent and the meta text it must stand from
+     :solids   [k …]        filled controls, chroma at least :solid
+     :fields   [[field holder] …] a field recessed below its holder
+
+   Returns {:ok? bool :failures [{:check :pair :value :min}] :measures {…}}."
+  ([theme roles] (oomph theme roles floors))
+  ([theme roles floors]
+   (let [L (fn [k] (:l (oklch (get theme k))))
+         C (fn [k] (:c (oklch (get theme k))))
+         steps (for [[a b] (partition 2 1 (:steps roles))]
+                 {:check :step :pair [a b] :value (round3 (- (L b) (L a))) :min (:step floors)})
+         card (when-let [[c p] (:card roles)]
+                [{:check :card :pair [c p] :value (round3 (- (L c) (L p))) :min (:card floors)}])
+         frame (when-let [[f b] (:frame roles)]
+                 [{:check :frame :pair [f b] :value (round3 (- (L b) (L f))) :min 0.01}])
+         tiers (for [[a b] (partition 2 1 (:text roles))]
+                 {:check :tier :pair [a b] :value (round2 (contrast (get theme a) (get theme b))) :min (:tier floors)})
+         stands (for [[a meta] (:accents roles)]
+                  (let [cr (contrast (get theme a) (get theme meta)) dc (- (C a) (C meta))]
+                    {:check :stand :pair [a meta] :value (round2 cr) :chroma (round3 dc)
+                     :min (:stand-contrast floors)
+                     :pass? (or (>= cr (:stand-contrast floors)) (>= dc (:stand-chroma floors)))}))
+         solids (for [k (:solids roles)]
+                  {:check :solid :pair [k] :value (round3 (C k)) :min (:solid floors)})
+         fields (for [[f h] (:fields roles)]
+                  {:check :recess :pair [f h] :value (round3 (- (L h) (L f))) :min (:recess floors)})
+         all (concat steps card frame tiers stands solids fields)
+         failures (vec (filter (fn [r] (if (contains? r :pass?) (not (:pass? r)) (< (:value r) (:min r)))) all))]
+     {:ok? (empty? failures) :failures failures :measures (vec all)})))
+
+(defn wcag
+  "Check WCAG pairs: [[fg bg min what] …] → failures (empty when all pass)."
+  [theme pairs]
+  (vec (keep (fn [[fg bg mn what]]
+               (let [r (contrast (get theme fg) (get theme bg))]
+                 (when (< r mn) {:pair [fg bg] :what what :ratio (round2 r) :min mn})))
+             pairs)))
