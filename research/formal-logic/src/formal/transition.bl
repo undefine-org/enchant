@@ -1,0 +1,224 @@
+(ns formal.transition (:require [formal.term :as t] [formal.value :as v]))
+
+(defn- sorted-fields [schema] (vec (sort-by str (keys schema))))
+(defn- variables [prefix schema]
+ (into {} (map (fn [field] [field (t/variable (str prefix "." (str field)) (get schema field))]) (sorted-fields schema))))
+(defn- invoke-or-term [value state]
+ (v/lift (if (fn? value) (value state) value)))
+(defn- boolean! [value]
+ (when-not (= t/Bool (t/sort-of (v/term value)))
+  (throw (ex-info "Transition predicate must be Bool" {}))) value)
+(defn- predicate-holds [value]
+ (t/all (concat [(v/defined value) (v/within value) (v/term value)] (v/constraints value))))
+(defn- guard-attempt [guard]
+ ;; An ordinary false guard disables a transition. A guard that raises is an
+ ;; observable failed attempt, rather than an impossible path erased by SMT.
+ (t/any [(t/not (v/defined guard)) (v/term guard)]))
+
+(defn machine
+ "Compile pure builders once into a portable transition model. Returned
+  machines contain terms and data, never backend handles or executable code.
+  State and per-transition input names are explicit and namespaced."
+ [name state-schema specification]
+ (let [state (variables (str name ".state") state-schema)
+       initial (boolean! (invoke-or-term (get specification :init (t/bool true)) state))
+       invariant-specs (or (:invariants specification)
+                           {:invariant (get specification :invariant (t/bool true))})
+       invariants (into {} (map (fn [[label predicate]] [label (boolean! (invoke-or-term predicate state))]) invariant-specs))
+       transitions (mapv (fn [description]
+          (let [label (:name description)
+                input-schema (get description :inputs {})
+                inputs (variables (str name ".input." (str label)) input-schema)
+                guard-builder (get description :guard (fn [_ _] (t/bool true)))
+                guard (boolean! (v/lift (if (fn? guard-builder) (guard-builder state inputs) guard-builder)))
+                next-builder (:next description)
+                proposed (if (fn? next-builder) (next-builder state inputs) next-builder)
+                _ (when-not (and (map? proposed) (every? #(contains? state-schema %) (keys proposed)))
+                    (throw (ex-info "Transition updates unknown state fields" {:transition label})))
+                next (into {} (map (fn [field]
+                        (let [result (v/lift (get proposed field (get state field)))]
+                         (when-not (= (get state-schema field) (t/sort-of (v/term result)))
+                          (throw (ex-info "Transition changes a state field's sort" {:transition label :field field})))
+                         [field result])) (sorted-fields state-schema)))
+                condition-builder (get description :assumptions (fn [_ _] []))
+                conditions (if (fn? condition-builder) (condition-builder state inputs) condition-builder)
+                evaluating-next (t/all [(v/defined guard) (v/term guard)])]
+           {:name label :input-schema input-schema :inputs inputs :guard guard :next next
+            :assumptions (mapv #(predicate-holds (boolean! (v/lift %))) conditions)
+            :defined (t/all [(v/defined guard)
+                            (t/implies (v/term guard) (t/all (map v/defined (vals next))))])
+            :within (t/all [(v/within guard)
+                           (t/implies evaluating-next (t/all (map v/within (vals next))))])
+            :constraints (vec (distinct (concat (v/constraints guard)
+                                  (map #(t/implies evaluating-next %) (mapcat v/constraints (vals next))))))}))
+        (:transitions specification))]
+  (when-not (= (count transitions) (count (distinct (map :name transitions))))
+   (throw (ex-info "Transition names must be distinct" {})))
+  {:formal/machine 1 :name name :schema state-schema :state state :init initial
+   :invariants invariants :transitions transitions
+   :scope (get specification :scope {:mode :exact :profile :formal/pure-transition-model-v1})}))
+
+(defn- replacements [before after]
+ (into {} (map (fn [[field term]] [term (get after field)]) before)))
+(defn- instantiate [term replace] (t/substitute term replace))
+(defn- state-observations [states prefix]
+ (into {} (mapcat (fn [i]
+          (map (fn [[field term]] [(str prefix ".state." i "." (str field)) term]) (nth states i)))
+                  (range (count states)))))
+
+(defn invariant-at [model state]
+ (let [replace (replacements (:state model) state)]
+  (t/all (map (fn [invariant]
+           (instantiate (predicate-holds invariant) replace))
+              (vals (:invariants model))))))
+
+(defn unroll
+ "A finite trace of AT MOST depth real transitions, with explicit stuttering
+  to retain shorter terminal traces. After a language error only stuttering
+  is enabled; its failed step remains visible to safety, never erased.
+  Fresh prefix is caller-owned so independent queries cannot capture names."
+ [model depth fresh-prefix]
+ (when-not (and (string? fresh-prefix) (int? depth) (<= 0 depth) (<= depth 16))
+  (throw (ex-info "Trace requires an explicit fresh prefix and depth 0..16" {})))
+ (let [states (mapv (fn [i] (variables (str fresh-prefix ".state." i) (:schema model))) (range (inc depth)))
+       initial-replace (replacements (:state model) (first states))
+       init (:init model)
+       initial (vec (concat [(instantiate (v/defined init) initial-replace)
+                             (instantiate (v/within init) initial-replace)
+                             (instantiate (v/term init) initial-replace)]
+                            (map #(instantiate % initial-replace) (v/constraints init))))]
+  (loop [at 0 assumptions initial choices [] step-defined [] within [] inputs-seen []]
+   (if (= at depth)
+    {:formal/trace 1 :states states :choices choices :step-defined step-defined
+     :within within :inputs inputs-seen :assumptions assumptions
+     :step-labels (into {0 :stutter} (map-indexed (fn [i tr] [(inc i) (:name tr)]) (:transitions model)))
+     :scope {:mode (if (= :abstract (get-in model [:scope :mode])) :abstract :bounded)
+             :procedure :bounded-unroll :max-transitions depth :stuttering true
+             :machine-domain (:scope model) :profile :formal/finite-trace-v1}
+     :observations (merge (state-observations states fresh-prefix)
+                     (into {} (map (fn [i] [(str fresh-prefix ".choice." i) (nth choices i)]) (range depth)))
+                     (into {} (mapcat (fn [i]
+                                [[(str fresh-prefix ".step-defined." i) (nth step-defined i)]
+                                 [(str fresh-prefix ".step-within." i) (nth within i)]]) (range depth)))
+                     (into {} (mapcat (fn [i]
+                       (mapcat (fn [j]
+                        (map (fn [[field input]] [(str fresh-prefix ".input." i ".transition." j "." (str field)) input])
+                             (get-in inputs-seen [i j])))
+                        (range (count (:transitions model))))) (range depth))))}
+    (let [before (nth states at) after (nth states (inc at))
+          choice (t/variable (str fresh-prefix ".choice." at) t/Int)
+          transitions (:transitions model) alive (t/all step-defined)
+          compiled (mapv (fn [i]
+             (let [tr (nth transitions i)
+                   input (variables (str fresh-prefix ".input." at "." (str (:name tr))) (:input-schema tr))
+                   replace (merge (replacements (:state model) before) (replacements (:inputs tr) input))
+                   picked (t/eq choice (t/int (inc i)))
+                   guard (instantiate (guard-attempt (:guard tr)) replace)
+                   step-ok (instantiate (:defined tr) replace)
+                   represented (instantiate (:within tr) replace)
+                   next (into {} (map (fn [[field value]] [field (instantiate (v/term value) replace)]) (:next tr)))]
+              {:picked picked :guard guard :defined step-ok :within represented :next next :inputs input
+               :conditions (mapv #(instantiate % replace) (concat (:assumptions tr) (:constraints tr)))}))
+             (range (count transitions)))
+          enabled (t/any (cons (t/eq choice (t/int 0))
+                          (map (fn [tr] (t/all [alive (:picked tr) (:guard tr)])) compiled)))
+          successful (t/all (map (fn [tr] (t/implies (:picked tr) (:defined tr))) compiled))
+          represented (t/all (map (fn [tr] (t/implies (:picked tr) (:within tr))) compiled))
+          relation (mapv (fn [[field old]]
+             (let [new (reduce (fn [fallback tr]
+                                  (t/ite (t/all [(:picked tr) (:defined tr)])
+                                         (get (:next tr) field) fallback)) old (reverse compiled))]
+              (t/eq (get after field) new))) before)
+          conditions (mapcat (fn [tr] (map #(t/implies (:picked tr) %) (:conditions tr))) compiled)]
+     (recur (inc at)
+      (vec (concat assumptions [(t/le (t/int 0) choice) (t/le choice (t/int (count transitions))) enabled] relation conditions))
+      (conj choices choice) (conj step-defined successful) (conj within represented)
+      (conj inputs-seen (mapv :inputs compiled))))))))
+
+(defn safety
+ "Pure goal data for bounded safety, including runtime failure and leaving
+  the represented model. UNSAT proves only this explicitly bounded scope."
+ [model depth fresh-prefix]
+ (let [trace (unroll model depth fresh-prefix)]
+  (merge trace {:property (t/all (concat (map #(invariant-at model %) (:states trace))
+                                       (:step-defined trace) (:within trace)))})))
+
+(defn unreachable
+ "Prove no successful trace of at most depth transitions reaches target.
+  A SAT witness is reachability evidence in the model, not a live BEAM trace."
+ [model depth fresh-prefix target]
+ (let [trace (unroll model depth fresh-prefix)
+       target (boolean! (invoke-or-term target (:state model)))
+       targets (mapv (fn [state]
+                 (let [replace (replacements (:state model) state)]
+                  {:value (instantiate (v/term target) replace)
+                   :admissible (t/all (concat [(instantiate (v/defined target) replace)
+                                             (instantiate (v/within target) replace)]
+                                      (map #(instantiate % replace) (v/constraints target))))})) (:states trace))]
+  (merge trace
+   {:assumptions (vec (concat (:assumptions trace) (:step-defined trace) (:within trace)))
+    :property (t/all [(t/all (map :admissible targets)) (t/not (t/any (map :value targets)))])})))
+
+(defn induction
+ "Separate initiation and one-step preservation goals. These are unbounded
+  model induction obligations, not a relabelled finite trace. Callers must
+  also establish that init is satisfiable and check EVERY transition."
+ [model]
+ (let [state (:state model) invariant (invariant-at model state) init (:init model)
+       base {:id :initiation :assumptions (vec (concat [(v/defined init) (v/within init) (v/term init)] (v/constraints init)))
+             :property invariant :observations (state-observations [state] (:name model))
+             :scope (assoc (:scope model) :procedure :induction-initiation)}
+       steps (mapv (fn [transition]
+          (let [after (into {} (map (fn [[field value]] [field (v/term value)]) (:next transition)))
+                guard (:guard transition)]
+           {:id (:name transition)
+            :assumptions (vec (concat [invariant (guard-attempt guard)]
+                                 (:assumptions transition) (:constraints transition)))
+            :property (t/all [(:defined transition) (:within transition) (invariant-at model after)])
+            :observations (merge (state-observations [state after] (str (:name model) "." (str (:name transition))))
+                            (into {} (map (fn [[field term]] [(str "input." (str field)) term]) (:inputs transition))))
+            :scope (assoc (:scope model) :procedure :induction-preservation)})) (:transitions model))]
+  {:base base :steps steps
+   :init-feasibility {:id :init-feasibility :assumptions (vec (concat [(v/defined init) (v/within init)] (v/constraints init)))
+                      :property (t/not (v/term init)) :expected :refuted
+                      :observations (state-observations [state] (:name model))
+                      :scope (assoc (:scope model) :procedure :initial-state-witness)}
+   :coverage {:transitions (mapv :name (:transitions model)) :requires [:init-feasible :base :all-steps]}}))
+
+(defn simulation-step
+ "A chosen lockstep simulation witness, not arbitrary existential matching.
+  All abstract transitions need a separately checked supplied correspondence."
+ [abstract abstract-label concrete concrete-label relation input-relation]
+ (let [a (first (filter #(= abstract-label (:name %)) (:transitions abstract)))
+       b (first (filter #(= concrete-label (:name %)) (:transitions concrete)))]
+  (when-not (and a b) (throw (ex-info "Simulation names unknown transitions" {})))
+  (let [before (predicate-holds (boolean! (v/lift (relation (:state abstract) (:state concrete)))))
+        after-a (into {} (map (fn [[field value]] [field (v/term value)]) (:next a)))
+        after-b (into {} (map (fn [[field value]] [field (v/term value)]) (:next b)))
+        after (predicate-holds (boolean! (v/lift (relation after-a after-b))))
+        inputs (predicate-holds (boolean! (v/lift (input-relation (:inputs a) (:inputs b)))))]
+   {:assumptions (vec (concat [before inputs (guard-attempt (:guard a))]
+                              (:assumptions a) (:assumptions b) (:constraints a) (:constraints b)))
+    :property (t/all [(v/defined (:guard b)) (v/term (:guard b)) (:defined a) (:defined b)
+                     (:within a) (:within b) after])
+    :observations (merge (state-observations [(:state abstract) after-a] "abstract")
+                         (state-observations [(:state concrete) after-b] "concrete"))
+    :scope (assoc (v/join-scope [(v/make (t/bool true) {:scope (:scope abstract)})
+                                (v/make (t/bool true) {:scope (:scope concrete)})])
+             :procedure :chosen-lockstep-simulation :abstract abstract-label :concrete concrete-label
+             :model-domains [(:scope abstract) (:scope concrete)])})))
+
+(defn simulation-init
+ "Initial relatedness for a supplied lockstep simulation relation. Feasible
+  initial states and complete transition correspondence remain separate gates."
+ [abstract concrete relation]
+ (let [a (:init abstract) b (:init concrete)]
+  {:assumptions (vec (concat [(v/defined a) (v/within a) (v/term a)
+                              (v/defined b) (v/within b) (v/term b)]
+                            (v/constraints a) (v/constraints b)))
+   :property (predicate-holds (boolean! (v/lift (relation (:state abstract) (:state concrete)))))
+   :observations (merge (state-observations [(:state abstract)] "abstract")
+                        (state-observations [(:state concrete)] "concrete"))
+   :scope (assoc (v/join-scope [(v/make (t/bool true) {:scope (:scope abstract)})
+                               (v/make (t/bool true) {:scope (:scope concrete)})])
+            :procedure :simulation-initial-relatedness)}))

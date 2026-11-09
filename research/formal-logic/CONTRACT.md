@@ -50,8 +50,9 @@ is an arbitrary integer, FP data is the unsigned IEEE bit pattern. Common ops:
 
 * `:not :and :or :implies :xor :eq :distinct :ite`
 * `:add :sub :neg :mul :div :mod :lt :le :gt :ge :to-real :to-int :is-int`
-  (`:div`/`:mod` mean SMT Euclidean integer arithmetic; language variants are
-  explicit profile lowerings, never aliases).
+  (`:div` means SMT Euclidean division on Int and exact division on Real;
+  `:mod` is Euclidean integer remainder. Zero is unspecified at this primitive
+  layer. Language variants and failures are explicit profile lowerings).
 * `:array-const :select :store`
 * `:str-concat :str-len :str-contains :str-prefix :str-suffix :str-at
   :str-substr :str-index :str-replace` (SMT codepoint semantics, not graphemes).
@@ -91,6 +92,10 @@ t/Bool t/Int t/Real t/String
 
 Feature modules may use `t/app` for vocabulary above, but must not depend on
 the worker or query API. Pure term constructors reject sort/arity errors.
+Export validates canonical terms, free-variable sort identity and binder scope.
+`t/substitute` substitutes free variables only, with same-sort replacements
+that contain no free binder. Nested binders use fresh nominal identities;
+ambiguous shadowing is refused before native construction.
 
 ## Language outcomes and model bounds
 

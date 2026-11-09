@@ -227,9 +227,47 @@
   (visit term #{})))
 
 (defn substitute [term replacements]
- (if (contains? replacements term) (get replacements term)
-  (if (empty? (:args term)) term
-   (app (:op term) (:sort term) (mapv (fn [child] (substitute child replacements)) (:args term)) (:data term)))))
+ ;; Free-variable substitution only. Binder identities belong to quantifiers;
+ ;; refusing open replacements prevents accidental capture by equal names.
+ (doseq [[from to] replacements]
+  (require! (= :var (:op from)) "substitution keys must be free variables" {:term from})
+  (require! (= (sort-of from) (sort-of to)) "substitution changes sort" {})
+  (require! (empty? (free-bound to)) "substitution replacement has a free binder" {}))
+ (letfn [(visit [node]
+          (if (contains? replacements node) (get replacements node)
+           (if (empty? (:args node)) node
+            (app (:op node) (:sort node) (mapv visit (:args node)) (:data node)))))]
+  (visit term)))
+
+(defn validate!
+ "Validate portable data at the trust boundary, including forged maps and
+  nominal binder scope. Nested binder shadowing is deliberately refused."
+ [roots]
+ (let [nodes (walk roots) variables (atom {})]
+  (doseq [term nodes]
+   (let [op (:op term) sort (:sort term) args (:args term) data (:data term)
+         canonical (cond
+          (= op :var) (variable data sort)
+          (= op :bound) (bound data sort)
+          (contains? #{:bool :int :real :text :bv :fp-bits :rounding :enum} op) (literal sort data)
+          :else (app op sort args data))]
+    (require! (= canonical term) "noncanonical or forged term" {:term term})
+    (when (= op :var)
+     (require! (or (not (contains? @variables data)) (= sort (get @variables data)))
+               "free-variable name has conflicting sorts" {:name data})
+     (swap! variables assoc data sort))))
+  (letfn [(visit [term scope]
+           (cond
+            (= :bound (:op term))
+             (require! (= (:sort term) (get scope (:data term))) "free or wrong-sort bound variable" {:name (:data term)})
+            (contains? #{:forall :exists} (:op term))
+             (let [binders (:data term) names (map first binders)]
+              (require! (= (count names) (count (set names))) "duplicate binder identity" {})
+              (require! (not-any? #(contains? scope %) names) "nested binder shadowing requires fresh identities" {})
+              (visit (first (:args term)) (into scope binders)))
+            :else (doseq [child (:args term)] (visit child scope))))]
+   (doseq [root roots] (visit root {})))
+  true))
 
 (defn registry [] {:next 1 :ids {} :definitions {}})
 (defn export
@@ -237,8 +275,7 @@
   IDs are session-local, not semantic hashes; full term equality guards sharing."
  [registry roots]
  (let [state (atom registry) added (atom [])]
-  (doseq [root roots]
-   (require! (empty? (free-bound root)) "free bound variable" {:free (free-bound root)}))
+  (validate! roots)
   (doseq [term (walk roots)]
    (when-not (contains? (:ids @state) term)
     (let [id (:next @state) args (mapv (fn [child] (get (:ids @state) child)) (:args term))
