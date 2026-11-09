@@ -1,0 +1,129 @@
+(ns formal.review-serve
+ (:require [web] [live.hiccup :as h] [bl.json :as json] [codebase] [typed]
+           [dossier.org :as org] [dossier.page :as page] [dossier.design :as design]
+           [dossier.answer :as answer] [dossier.feedback :as feedback]
+           [dossier.film :as film] [dossier.witness :as witness] [dossier.roster :as roster]
+           [codebase-review.blocks :as review] [formal.presentation :as presentation]))
+
+(def root (Path/expand "research/formal-logic"))
+(def path (Path/expand (or (first (BeamLisp/argv)) (str root "/ATLAS.bl.org"))))
+(def directory (Path/dirname path))
+(def kit "/home/othman/projects/enchanted-skills/bl-org-dossier/kit")
+(def review-kit "/home/othman/projects/enchanted-skills/codebase-review/kit")
+(defn asset [name] (File/read! (str kit "/" name)))
+(defn owner? [request]
+ (let [owner (System/get_env "DOSSIER_OWNER")]
+  (and request (not (blank? owner)) (= owner (web/req-header request "tailscale-user-login")))))
+(defn roster-options [request] {:root root :can-write? (boolean (owner? request))})
+(defn document [text request]
+ (roster/enrich (witness/enrich (review/enrich (film/enrich (org/read-doc text) directory)) directory)
+                directory (roster-options request)))
+(defn revision [doc]
+ (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
+   [(File/read! path) (mapv :data (:nodes doc))])) (list (tuple :case :lower))))
+(defn css [] (str (asset "style.css") (File/read! (str review-kit "/review.css"))
+                  (asset "roster.css") (File/read! (str root "/dossier-local.css"))))
+(defn scripts [] (str (asset "live.js") (asset "roster.js")))
+(defn readonly-script []
+ "document.querySelectorAll('form.fb').forEach(f=>{f.querySelectorAll('button,textarea,input,select').forEach(c=>c.disabled=true);const s=f.querySelector('.fb-state');if(s)s.textContent='Only the dossier owner can save a review.'});")
+(defn standalone [body extra-css extra-js]
+ (str "<!doctype html><html data-design='forest'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Beam Lisp / logic lab</title><style>" (asset "style.css") (design/css)
+      (File/read! (str root "/presentation.css")) extra-css "</style></head><body>"
+      (h/hiccup->html body)
+      "<script>const t=new URLSearchParams(location.search).get('theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t;"
+      "addEventListener('message',e=>{if(e.origin===location.origin&&e.data&&['dark','light'].includes(e.data.theme))document.documentElement.dataset.theme=e.data.theme});"
+      extra-js "</script></body></html>"))
+(def corpora (into {} (map (fn [id] [id (json/decode (File/read! (str root "/evidence/" id ".json")))])
+                         ["features" "native" "advanced"])))
+
+;; Discovery reads authored metadata and source locations. Browser input only
+;; selects among this set; it cannot name a callable function or supply code.
+(defn discover []
+ (let [relative "research/formal-logic/src/formal/presentation.bl"
+       text (File/read! relative) forms (BeamLisp.Reader/read_string text)
+       facts (codebase/index-source {} "formal.presentation" text)]
+  (vec (keep (fn [form]
+    (when-let [name (codebase/defn-form form)]
+     (let [name-node (second (typed/node-items (typed/node-form form)))
+           annotation (codebase/name-annotation name-node) data (when (:ui annotation) (codebase/node-data (:ui annotation)))
+           fact (first (filter #(= name (:fn/name %)) (:fn facts)))]
+      (when data (merge data {:name name :qualified (str "formal.presentation/" name)
+                             :source relative :line (:fn/line fact)}))))) forms))))
+(def catalog (discover))
+(defn matches-query? [item example query]
+ (let [alternatives (String/split query "|")]
+  (or (blank? query)
+   (some (fn [alternative]
+    (every? (fn [part]
+      (let [pair (String/split part ":" (list (tuple :parts 2))) key (first pair) value (second pair)]
+       (and value (contains? #{"id" "family" "state"} key)
+            (= value (case key "id" (:id item) "family" (:family item) "state" (:state example))))))
+      (remove blank? (String/split (String/trim alternative) " ")))) alternatives))))
+(defn filtered [query]
+ (vec (keep (fn [item]
+              (let [examples (vec (filter #(matches-query? item % query) (:examples item)))]
+               (when (seq examples) (assoc item :examples examples)))) catalog)))
+(defn explorer [query]
+ (let [bad? (some (fn [term] (and (not (blank? term))
+                     (not (some #(starts-with? term %) ["id:" "family:" "state:"]))))
+                 (String/split (String/replace query "|" " ") " "))
+       entries (if bad? [] (filtered query))]
+  (standalone
+   [:main.fl-explorer [:div.fl-eyebrow "From public renderer annotations"] [:h1 "Inspect the same components"]
+    [:p "These specimens call the public BL functions used by the logic lab. The state selector narrows actual examples."]
+    [:form.fl-explorer-form {:method "get" :action "/explorer"}
+     [:label.sr-only {:for "component-query"} "Component query"]
+     [:input {:id "component-query" :name "q" :value query :placeholder "family:Evidence state:Candidate"}]
+     [:button {:type "submit"} "Filter"]]
+    (when bad? [:p.warning "Use id:, family: or state:. Space means AND; | means OR."])
+    (when (and (not bad?) (empty? entries)) [:p "No specimens match. Try family:Evidence."])
+    (for [item entries]
+     [:article.fl-specimen {:id (:id item)}
+      [:header [:h2 (:title item)] [:small (:family item)]] [:p (:use item)]
+      [:code (str (:qualified item) " · " (:source item) ":" (:line item))]
+      (for [example (:examples item)]
+       [:section.fl-specimen-example [:p (:state example)]
+        (apply (BeamLisp.Env/fetch! "formal.presentation" (:name item)) (:args example))])])]
+   "" "")))
+
+(defn handler [request]
+ (let [route (web/path request) method (web/method request)
+       params (URI/decode_query (web/query request))
+       text (File/read! path)
+       frame (Regex/run (Regex/compile! "^/witness-media/([A-Za-z0-9_-]+)/(frame-[1-9][0-9]*\\.png)$") route)
+       roster-frame (Regex/run (Regex/compile! "^/roster-media/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/(frame-[1-9][0-9]*\\.png)$") route)]
+  (cond
+   (and (= method "post") (contains? #{"/answer" "/roster-note"} route))
+    (if-not (owner? request) (web/json request 403 {:error "Only the configured dossier owner can save a review."})
+     (let [body (web/read-body-limited* request 16384 10000)]
+      (if (:error body) (web/json (:conn body) 413 {:error "Review too large"})
+       (let [result (if (= route "/answer")
+                      (feedback/submit! path (or (System/get_env "DOSSIER_HANDLE") "owner") (:body body))
+                      (roster/submit-note! (org/read-doc text) directory (roster-options request)
+                        (or (System/get_env "DOSSIER_HANDLE") "owner") (:body body)))]
+        (web/json (:conn body) (:status result) (:body result))))))
+   frame (if-let [file (witness/media-path (org/read-doc text) directory (nth frame 1) (nth frame 2))]
+           (web/bytes request "image/png" (File/read! file)) (web/text request 404 "Recorded frame unavailable"))
+   roster-frame (if-let [file (roster/media-path (org/read-doc text) directory (nth roster-frame 1) (nth roster-frame 2) (nth roster-frame 3) (roster-options request))]
+                 (web/bytes request "image/png" (File/read! file)) (web/text request 404 "Recorded frame unavailable"))
+   (= route "/views") (let [view (get params "view" "maps")]
+     (if (contains? (set presentation/topic-order) view)
+      (web/html request (standalone (presentation/lab-view view corpora) "" ""))
+      (web/text request 404 "Unknown model view")))
+   (= route "/explorer") (web/html request (explorer (get params "q" "")))
+   (= route "/explorer.json") (web/json request (filtered (get params "q" "")))
+   (contains? #{"/evidence/features.json" "/evidence/native.json" "/evidence/advanced.json" "/evidence/qualification.json"} route)
+    (web/bytes request "application/json" (File/read! (str root route)))
+   (= route "/src") (web/text request text)
+   (= route "/answers") (web/json request (vec (page/feedback-items (document text request))))
+   (= route "/rev") (web/json request {:rev (revision (document text request))})
+   (= route "/doc") (let [doc (document text request)]
+      (web/json request {:rev (revision doc) :html (join "" (map h/hiccup->html (page/doc-h doc)))}))
+   (= route "/") (let [doc (document text request)]
+     (web/html request (str "<!doctype html>" (h/hiccup->html (page/page-h doc (css)
+                          (str (scripts) (when-not (owner? request) (readonly-script))))))))
+   :else (web/text request 404 "Not found"))))
+(def port (erlang/binary_to_integer (or (System/get_env "PORT") "4093")))
+(web/serve {:port port :ip (tuple 127 0 0 1) :plug handler :log :off})
+(println (str "Formal BL review on http://127.0.0.1:" port "/ · " (count catalog) " discovered renderers"))
