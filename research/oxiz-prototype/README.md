@@ -1,10 +1,12 @@
 # OxiZ worker prototype
 
-Owner: this Codex session, one writer on `prototype/oxiz-worker`.
-Requested worktree: `/home/othman/code/undefine/enchant--oxiz-prototype`.
+Owner: the integration session, one writer in the repository's `main` checkout.
+Prototype branch: `prototype/oxiz-worker`.
 Base: `8e41ee0f6efef47ad8ccacd99296ac3ddb8d736f` (Enchant `main`).
-Retirement: after review, merge or archive this branch, retain its evidence,
-then remove the worktree. It stays available for the requested prototype review.
+The requested worktree supplied prototype isolation. Its qualified research
+batch is integrated and archived, with the temporary tree retired; see
+`../formal-logic/evidence/retirement.json`. The expanded term-based interface,
+theory atlas and comparison are in `../formal-logic/README.md`.
 
 This project reuses the exact qualified SDK in `sdk-pin.json`; it changes no
 runtime inputs and produces no SDK. The ignored `priv/z3` link reuses the

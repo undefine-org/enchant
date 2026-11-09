@@ -1,0 +1,94 @@
+(ns formal.dossier-render
+ (:require [live.hiccup :as h] [bl.json :as json]
+           [dossier.org :as org] [dossier.page :as page]
+           [codebase-review.blocks :as review]))
+
+;; Pure kit projection followed by local artifact writes. No application,
+;; solver, HTTP server, feedback writer or executable document cell is started.
+;;
+;; <pinned-sdk>/bin/bl \
+;;  -p /home/othman/projects/enchanted-skills/bl-org-dossier/kit \
+;;  -p /home/othman/projects/enchanted-skills/codebase-review/kit run \
+;;  research/formal-logic/dossier-render.bl -- \
+;;  research/formal-logic/ATLAS.bl.org research/formal-logic/evidence/dossier/atlas.html
+;; Optional argv 3/4 override the two kit asset directories (not library roots).
+
+(defn sha256 [text]
+ (Base/encode16 (crypto/hash :sha256 text) (list (tuple :case :lower))))
+
+(defn script-json [value]
+ (String/replace (json/encode value) "</" "<\\/"))
+
+(defn static-adapter [source revision]
+ (str "\n;(() => {\n"
+      "document.documentElement.dataset.readOnly = 'true';\n"
+      "document.querySelectorAll('form.fb').forEach(form => {\n"
+      " form.setAttribute('aria-disabled','true');\n"
+      " form.querySelectorAll('button,input,textarea,select').forEach(control => control.disabled = true);\n"
+      " const state=form.querySelector('.fb-state'); if(state) state.textContent='Read-only local review';\n"
+      "});\n"
+      "document.addEventListener('submit', event => { event.preventDefault(); event.stopImmediatePropagation(); }, true);\n"
+      "const sourcePath=" (script-json source) ";\n"
+      "const sourceURL=new URL('file://' + sourcePath);\n"
+      "document.querySelectorAll('a[href]').forEach(link => {\n"
+      " const href=link.getAttribute('href'); if(!href || href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;\n"
+      " link.href = href === 'src' ? sourceURL.href : new URL(href,sourceURL).href;\n"
+      "});\n"
+      "const stamp=document.getElementById('stamp'); if(stamp) stamp.textContent='static · read only';\n"
+      "window.__FORMAL_DOSSIER__={source:sourcePath,revision:" (script-json revision) ",readOnly:true};\n"
+      "})();\n"))
+
+(let [args (vec (BeamLisp/argv))
+      source (Path/expand (or (get args 0) "research/formal-logic/ATLAS.bl.org"))
+      output (Path/expand (or (get args 1) "research/formal-logic/evidence/dossier/atlas.html"))
+      dossier-kit (Path/expand (or (get args 2) "~/projects/enchanted-skills/bl-org-dossier/kit"))
+      review-kit (Path/expand (or (get args 3) "~/projects/enchanted-skills/codebase-review/kit"))
+      text (File/read! source)
+      revision (sha256 text)
+      document (review/enrich (org/read-doc text))
+      raw-live (File/read! (Path/join dossier-kit "live.js"))
+      polling "refresh(false); setInterval(() => refresh(false), 4000);"
+      _ (when-not (includes? raw-live polling)
+          (throw (ex-info "Kit live.js polling hook changed; review the read-only adapter" {})))
+      ;; Keep the actual kit navigation/theme/graph code. Only the live server
+      ;; poll is disabled for this standalone, read-only file projection.
+      live (String/replace raw-live polling "/* Standalone file: live polling disabled. */")
+      css (str (File/read! (Path/join dossier-kit "style.css"))
+               (File/read! (Path/join review-kit "review.css")))
+      html (str "<!doctype html>"
+             (h/hiccup->html (page/page-h document css (str live (static-adapter source revision)))))
+      ;; Local rendering uses installed fallback fonts and makes no font CDN
+      ;; request. The shared page/block renderers and interaction code remain.
+      offline-html (String/replace html (Regex/compile! "<link\\b[^>]*>") "")
+      parsed (org/read-doc text)
+      blocks (filter #(and (= :block (:t %))
+                           (contains? review/kinds (:lang %))) (:nodes parsed))
+      authoring-errors (vec (mapcat (fn [node]
+         (let [model (review/parse-body (:body node))
+               start (get-in node [:attrs :start])]
+          (concat (map #(hash-map :block (get-in node [:attrs :id]) :error %) (:errors model))
+                  (when (and start (not (some #(= start (:id %)) (:nodes model))))
+                    [{:block (get-in node [:attrs :id]) :error (str "Missing start: " start)}])))) blocks))
+      assets [(Path/join dossier-kit "style.css") (Path/join dossier-kit "live.js")
+              (Path/join dossier-kit "dossier/page.bl") (Path/join dossier-kit "dossier/org.bl")
+              (Path/join dossier-kit "dossier/ui.bl") (Path/join review-kit "review.css")
+              (Path/join review-kit "codebase_review/blocks.bl")]
+      manifest {:schema "enchant.formal.dossier-render.v1" :source source :source-sha256 revision
+                :html output :html-sha256 (sha256 offline-html)
+                :renderer {:page "dossier.page/page-h" :parser "dossier.org/read-doc"
+                           :review "codebase-review.blocks/enrich"
+                           :read-only-adapter-sha256 (sha256 (static-adapter source revision))
+                           :adaptations ["disable exact live polling hook" "disable feedback controls and submission"
+                                         "resolve local evidence links against source" "omit external font links"]
+                           :assets (mapv #(hash-map :path % :sha256 (sha256 (File/read! %))) assets)}
+                :scope {:read-only true :live-polling false :feedback-writes false
+                        :external-fonts false :document-cells-executed false
+                        :application-started false :server-started false}
+                :review-blocks (count blocks) :authoring-errors authoring-errors
+                :qualification {:rendered true :browser :pending :semantic-changes :unqualified}}]
+ (File/mkdir_p! (Path/dirname output))
+ (File/write! output offline-html)
+ (File/write! (str output ".render.json") (str (json/encode manifest {:pretty 2}) "\n"))
+ (println (json/encode {:html output :review-blocks (count blocks)
+                        :authoring-errors (count authoring-errors)}))
+ :ok)

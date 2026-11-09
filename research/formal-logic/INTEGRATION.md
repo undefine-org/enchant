@@ -154,23 +154,24 @@ The new owner's source preserves the important structure:
 | Existing verifier bridge, memo bypass | Historical bridge remains text-based | Do not substitute its passing result for term-only `system.core` cutover evidence |
 | Shadow comparison | `formal.logic/compare` keeps Z3 decision and OxiZ candidate separate | Implemented; all answers remain explicitly untrusted exploratory data |
 
-`formal/backend_test.bl` presently covers shared portable questions, vacuity,
-reset/stale generations, private tracking labels, cache identity separation and
-derived procedures. It does not reproduce the whole historical custody/busy
-cancellation matrix. This audit starts no VMs and provides no new runtime
-lifecycle qualification.
+`test/backend_test.bl` covers shared portable questions, vacuity, reset/stale
+generations, private tracking labels, cache identity, derived procedures,
+foreign borrower refusal, uncompressed ETF and reply identity/schema guards.
+`test/api_test.bl` checks persistent-context meaning, replay and cache identity.
+The [combined receipt](evidence/qualification.json) retains 795 passing
+assertions across seven files. It does not reproduce the whole historical
+busy-cancellation matrix.
 
 Further boundary checks needed before replacing `z3pool`:
 
-1. Validate every reply's complete schema, protocol, generation and backend
-   identity before committing the registry, including malformed fake-worker
-   responses. `binary_to_term(..., [:safe])` prevents new atoms; it does not
-   validate model types or semantics. Rust refuses compressed request ETF;
-   the host should likewise refuse compressed replies before decoding, since
-   the wire byte limit alone does not bound decompressed allocation.
-2. Keep typed hard-timeout/exit/packet errors and phase information. The
-   current owner catch reduces transport exceptions to an error string; this
-   must not be mistaken for a native `unknown` reason or a refutation.
+1. Extend the checked reply envelope into a complete typed observation schema,
+   including malformed fake-worker responses. Protocol, generation, backend,
+   result shape and compressed-reply refusal are implemented and tested.
+   `binary_to_term(..., [:safe])` prevents new atoms; it does not establish
+   model semantics or validate every observation's sort.
+2. Preserve transport error kind and phase through every failure. The owner
+   retains structured exception kinds (including hard timeout); native exit
+   and framing cases need finer classification and additional checks.
 3. Check zero/oversized/truncated packets, trailing ETF, native crash, stale
    generation and altered ID import. A reply that exceeds capacity currently
    ends the worker; it cannot authorize a proof or a missing-value default.
@@ -184,18 +185,15 @@ Further boundary checks needed before replacing `z3pool`:
 
 ## Persistent context, authority and cache obligations
 
-A source audit found that `backend/load!` retained native assertions while
-`logic/solve-in` initially built observations, replay and cache identity only
-from the explicit query. A loaded `x > 0` could therefore make a later
-`q/prove(x > 0)` appear unconditional and share its key with a fresh context.
-**Root is implementing a correction; qualification is pending:** prepend the
-retained assertions under `context/` labels to an effective portable question;
-include them in preflight, roots/free variables, replay, assumptions and cache
-identity; return a `:context` receipt with generation and assertion labels/
-digest. Duplicate native scope assertions are harmless. The regression must
-compare a loaded conditional proof with a fresh refutation, different cache
-keys and observed/replayed loaded free variables. Do not activate a cache or
-compiler optimization before that regression passes.
+`backend/load!` assertions are part of the effective question. `solve-in`
+prepends retained assertions under `context/` labels, includes them in
+preflight, roots/free variables, replay, assumptions and cache identity, and
+returns a `:context` receipt with generation and assertion labels/digest.
+Duplicate native scope assertions are harmless. The focused regression passes:
+a loaded `x > 0` yields a conditional proof, the fresh question is refuted,
+their cache identities differ, and a later SAT query observes/replays the
+loaded free variable. Vacuity policy and observation names/descriptor shapes
+also participate in evidence-cache identity.
 
 The remaining obligations apply to every consumer:
 
@@ -258,8 +256,9 @@ constraint or choosing a finite approximation. Non-NaN literals retain their
 bit meaning. `fp.eq`, SMT `=`, and equality of original BV payloads remain
 different questions. NaN observations remain opaque.
 
-The corpus adds negative-NaN, `fp-neg(NaN)` and UF congruence probes. Root must
-qualify the rebuilt artifact and retain the earlier failing evidence. This
+The corpus includes negative-NaN, `fp-neg(NaN)` and UF congruence probes. The
+rebuilt artifact is qualified by the combined receipt; the earlier failing
+evidence remains in `evidence/native-before-normalization.json`. This
 correction does not qualify arbitrary symbolic FP equalities, arithmetic,
 formats, rounding or combinations. Exact Real arithmetic is likewise not a
 substitute for IEEE FP runtime semantics.

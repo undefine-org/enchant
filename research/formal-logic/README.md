@@ -12,9 +12,11 @@ implemented fragments and deferred work distinguished per family. It does not
 claim 46 complete solver theories. [CONTRACT.md](CONTRACT.md) defines the shared
 data contract; [INTEGRATION.md](INTEGRATION.md) describes the production cutover.
 
-Owner: the integration session on `prototype/oxiz-worker`. The requested
-worktree is `/home/othman/code/undefine/enchant--oxiz-prototype`; retirement is
-merge/archive after the requested prototype review, then worktree removal.
+Owner: the integration session in the repository's `main` checkout. The
+requested `prototype/oxiz-worker` worktree supplied isolation for this
+experiment; the qualified research batch is integrated and archived, with the
+temporary worktree retired. [retirement.json](evidence/retirement.json) records
+the archive, recovery bundle and transfer of the exact native artifacts.
 Runtime source is unchanged. [sdk-pin.json](sdk-pin.json) retains the qualified
 SDK, verified by the runner; this project produces no SDK.
 
@@ -163,7 +165,32 @@ The Z3 adapter uses the exact patched library selected by the SDK runner.
 
 The retained evidence includes runtime canaries, source discovery, a language
 feature matrix and native theory probes. A qualification receipt records exact
-source, SDK, native artifacts, commands and result counts. The initial native
+source, SDK, native artifacts, commands and result counts. The combined run
+passes **795 assertions across seven files** on one native worker artifact.
+
+| Corpus | Questions | Z3 expected interpreted answers | OxiZ expected interpreted answers |
+| --- | ---: | ---: | ---: |
+| Language values, relations and transitions | 61 | 61 | 56 |
+| Native theory and boundary probes | 95 | 88 | 55 |
+| Bit layouts and declared FP outcomes | 31 | 31 | 17 |
+| Total | 187 | 180 | 128 |
+
+Z3's seven other outcomes are five SAT candidates with incomplete domain replay
+and two explicit adapter boundaries. OxiZ's other outcomes are 36 unknown,
+18 unsupported and five SAT candidates. No final case has an opposing decisive
+answer or invalid independently replayed model. These are query counts, not a
+solver coverage percentage or a performance benchmark. Details are retained in
+[features.json](evidence/features.json), [native.json](evidence/native.json),
+[advanced.json](evidence/advanced.json) and
+[qualification.json](evidence/qualification.json).
+
+Codebase additionally indexed all 21 prototype modules in
+[prototype-index.json](evidence/prototype-index.json), with local semantic
+analysis requested for `formal.value` and `formal.numeric`. This supplements
+the historical 32/33 core-source inventory; it does not erase its failed file
+or infer complete external-effect coverage.
+
+The initial native
 run is retained in [native-before-normalization.json](evidence/native-before-normalization.json):
 it exposed a genuine NaN identity mismatch on the direct OxiZ route. Native
 import now normalizes NaN literals to SMT's single NaN; raw payload identity
@@ -188,7 +215,7 @@ runtime observations are not relabeled as proposed behavior.
 
 ## Reproduce
 
-From the worktree root, with only one substantive check at a time:
+From the integration checkout root, with only one substantive check at a time:
 
 ```sh
 research/formal-logic/build
