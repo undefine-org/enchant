@@ -1,0 +1,80 @@
+(ns formal.browser-scenario
+ (:require [scenario :as s] [scenario.demo :as demo] [scenario.runner.adapt :as adapt]
+           [bl.json :as json] [interop]))
+
+(def output (Path/expand "research/formal-logic/evidence/story/walkthrough"))
+(def frames (str output "/frames"))
+(def base-url (or (first (BeamLisp/argv)) "http://127.0.0.1:4093"))
+(defn request [port message]
+ (Port/command port (json/encode message))
+ (receive
+  [seen [:data bytes]] :when (= seen port)
+   (let [reply (json/decode bytes)]
+    (if (get reply "ok") (get reply "result")
+     (throw (ex-info (get reply "error") {}))))
+  [seen [:exit_status status]] :when (= seen port) (throw (ex-info "Browser helper exited" {:status status}))
+  (after 30000 (throw (ex-info "Browser helper deadline" {})))))
+(def owned (atom nil))
+(defn dispose []
+ (when @owned
+  (let [port @owned]
+   (reset! owned nil)
+   (try (request port {:op "stop"}) (finally (when (Port/info port) (Port/close port)))))))
+(defn holds [expression]
+ (fn [port _] (= true (request port {:op "eval" :expression expression}))))
+(def world
+ (let [index (atom 0)]
+  {:kind :browser
+   :open (fn [_]
+     (File/mkdir_p! frames)
+     (let [port (erlang/open_port (tuple :spawn_executable "/home/othman/.nix-profile/bin/node")
+                  (list :binary :use_stdio :exit_status (tuple :packet 4)
+                   (tuple :args (list (Path/expand "research/formal-logic/browser-driver.mjs") frames))))]
+      (reset! owned port) (request port {:op "open" :width 390 :height 844}) port))
+   :step! (fn [port event]
+     (let [action (nth event 2) op (first action)]
+      (case op
+       :navigate (request port {:op "navigate" :url (str base-url (second action))})
+       :click (request port {:op "click" :selector (second action)})
+       :wait (request port {:op "wait" :expression (second action)})
+       :eval (request port {:op "eval" :expression (second action)})
+       (throw (ex-info "Unsupported recorded action" {:operation op})))) :ok)
+   :claim! (fn [port _ claim context] (claim port context))
+   :basis (fn [port]
+     (let [step (swap! index inc) file (str frames "/frame-" step ".png")
+           shot (request port {:op "screenshot" :path file})]
+      {:frame file :recorded-at (get shot "recordedAt")}))
+   :observe (fn [port _ lens] (lens port)) :liveness (fn [_] nil)
+   :close! (fn [_] (dispose) {}) :dispose! dispose
+   :views-fn (fn [basis _] basis)}))
+(def story
+ (s/scenario "Read the formal BL discussion" {:reader {}}
+  [(demo/scene :idea {:title "Start with the idea" :say "The language owns the meaning. Both engines receive the same question."}
+    (s/does :reader [:navigate "/#s-the-big-idea"])
+    (s/does :reader [:wait "!!document.querySelector('#s-the-big-idea')"])
+    (s/sees :reader (holds "document.title.includes('Beam Lisp') && document.body.innerText.includes('187')") "The introduction shows the recorded experiment, not an invented result."))
+   (demo/scene :foundation {:title "Explore a fully formal language" :say "Precise semantics, a total core and a verified compiler are different promises."}
+    (s/does :reader [:navigate "/#s-could-beam-lisp-be-fully-formal"])
+    (s/sees :reader (holds "document.body.innerText.includes('A total core') && document.body.innerText.includes('The small checker is future work')") "The formal-language chapter explains the total core and keeps the proof checker proposed."))
+   (demo/scene :milestones {:title "See the next meaningful step" :say "The milestone map connects a specified core to checkable proof objects."}
+    (s/does :reader [:navigate "/#s-a-path-we-can-actually-build"])
+    (s/does :reader [:click "#milestones-formal-delivery [data-milestone-to='M3']"])
+    (s/sees :reader (holds "!document.querySelector('[data-milestone-detail=\"M3\"]').hidden") "Selecting the proof-object milestone reveals its own steps and acceptance condition."))
+   (demo/scene :models {:title "Inspect the actual language model" :say "The same presentation components show retained evidence from the implemented interface."}
+    (s/does :reader [:navigate "/views?view=maps"])
+    (s/sees :reader (holds "document.querySelectorAll('[data-ui-component=\"formal-answer\"]').length===2 && document.body.innerText.includes('refuted')") "The presence example shows both retained backend answers through shared BL components."))
+   (demo/scene :components {:title "Inspect an evidence state" :say "A source-discovered component makes an incomplete candidate different from a theorem."}
+    (s/does :reader [:navigate "/explorer?q=family:Evidence%20state:Candidate"])
+    (s/sees :reader (holds "document.querySelectorAll('.fl-specimen-example').length===1 && !!document.querySelector('.fl-answer.candidate')") "The state query narrows the actual renderer examples to Candidate."))]))
+(try
+ (let [result (s/run-world story world)
+       run (adapt/of-scenario result {:id "formal-story" :title "Read the formal BL discussion"})
+       plan (demo/plan story result {})
+       witness (assoc (select-keys result [:name :world :ok :verdicts]) :recorded-at (erlang/system_time :millisecond))]
+  (File/write! (str output "/run.json") (interop/->json run))
+  (File/write! (str output "/film.json") (interop/->json plan))
+  (File/write! "research/formal-logic/evidence/story/witness.json" (json/encode witness {:pretty 2}))
+  (assert (:ok result))
+  (println (json/encode {:ok (:ok result) :claims (count (:verdicts result)) :world (:world result)}))
+  :ok)
+ (finally (dispose)))
