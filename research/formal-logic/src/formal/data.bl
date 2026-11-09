@@ -1,0 +1,163 @@
+(ns formal.data (:require [formal.term :as t] [formal.value :as v]))
+
+(defn inactive [sort]
+ (cond (= sort t/Bool) (t/bool false)
+       (= sort t/Int) (t/int 0)
+       (= sort t/Real) (t/real 0 1)
+       (= sort t/String) (t/text "")
+       (= :bv (first sort)) (t/literal sort 0)
+       :else (t/variable (str "__formal_inactive_" sort) sort)))
+
+(defn nullable
+ "Symbolic nil-or-scalar, retaining nil independently of the payload value."
+ [name sort]
+ (v/make {:nil? (t/variable (str name ".nil") t/Bool)
+          :item (t/variable (str name ".item") sort)}
+  {:domain {:kind :nullable :item-sort sort :profile :bl/nil-or-scalar-v1}}))
+
+(defn nil-of [sort]
+ (v/make {:nil? (t/bool true) :item (inactive sort)}
+  {:domain {:kind :nullable :item-sort sort :profile :bl/nil-or-scalar-v1}}))
+
+(defn non-nil [item]
+ (v/make {:nil? (t/bool false) :item (v/term item)}
+  (merge (v/context [item])
+   {:domain {:kind :nullable :item-sort (t/sort-of (v/term item)) :profile :bl/nil-or-scalar-v1}})))
+
+(defn nil? [item]
+ (when-not (= :nullable (get-in item [:domain :kind]))
+  (throw (ex-info "Expected a nullable scalar" {})))
+ (v/scalar (get-in item [:value :nil?]) [item] {}))
+
+(defn option
+ "An explicit lookup/result option. None and Some nil remain different."
+ [present item]
+ (let [p (v/term present) item (v/lift item)]
+  (when-not (= t/Bool (t/sort-of p))
+   (throw (ex-info "Option presence must be Bool" {})))
+  (v/make {:present p :item item}
+   {:defined (t/all [(v/defined present) (t/implies p (v/defined item))])
+    :within (t/all [(v/within present) (t/implies p (v/within item))])
+    :constraints (vec (concat (v/constraints present)
+                        (map #(t/implies p %) (v/constraints item))))
+    :scope (v/join-scope [present item])
+    :domain {:kind :option :item-domain (:domain item) :profile :formal/explicit-option-v1}})))
+(defn some [item] (option (t/bool true) item))
+(defn none [template] (option (t/bool false) template))
+(defn present? [item]
+ (when-not (= :option (get-in item [:domain :kind]))
+  (throw (ex-info "Expected an Option" {})))
+ (v/scalar (get-in item [:value :present]) [item] {}))
+(defn unwrap
+ "A deliberately strict option selector; the absent branch is undefined."
+ [item]
+ (when-not (= :option (get-in item [:domain :kind]))
+  (throw (ex-info "Expected an Option" {})))
+ (let [payload (get-in item [:value :item]) p (get-in item [:value :present])]
+  (assoc payload :defined (t/all [(v/defined item) p (v/defined payload)])
+                 :within (t/all [(v/within item) (v/within payload)])
+                 :constraints (vec (distinct (concat (v/constraints item) (v/constraints payload))))
+                 :scope (v/join-scope [item payload])
+                 :errors {:absent-option (t/not p)})))
+(defn get-or [item fallback]
+ (v/choose (present? item) (get-in item [:value :item]) (v/lift fallback)))
+(defn equal [a b] (v/equal a b))
+
+(defn finite-key
+ "A symbolic member of a declared closed universe. Scalar index encoding is
+  exact for this universe; it does not invent all possible language keywords."
+ [name labels]
+ (let [labels (vec labels) index (t/variable name t/Int)
+       legal (t/all [(t/le (t/int 0) index) (t/lt index (t/int (count labels)))])]
+  (when (empty? labels) (throw (ex-info "A symbolic finite key needs an inhabited universe" {})))
+  (when-not (= (count labels) (count (distinct labels)))
+   (throw (ex-info "Finite universe contains duplicate values" {:labels labels})))
+  (v/make index {:constraints [legal]
+                :scope {:mode :finite-universe :values labels}
+                :domain {:kind :finite-key :keys labels :profile :formal/closed-enum-v1}})))
+
+(defn key-literal [labels label]
+ (let [labels (vec labels)
+       index (first (keep (fn [i] (when (= label (nth labels i)) i)) (range (count labels))))]
+  (v/make (t/int (if (= nil index) -1 index))
+   {:within (t/bool (some? index)) :scope {:mode :finite-universe :values labels}
+    :domain {:kind :finite-key :keys labels :profile :formal/closed-enum-v1}})))
+
+(defn- field-value [prefix spec]
+ (if (fn? spec) (spec prefix) (v/lift (t/variable prefix spec))))
+
+(defn sum
+ "A closed tagged sum. Arms map tags to field-name → sort/factory maps.
+  Equality observes the selected constructor's fields only."
+ [name arms]
+ (let [tags (vec (sort-by str (keys arms))) tag (t/variable (str name ".tag") t/Int)
+       fields (into {} (map (fn [label]
+        [label (into {} (map (fn [[field spec]]
+         [field (field-value (str name "." (str label) "." (str field)) spec)]) (get arms label)))]) tags))
+       values (vec (mapcat vals (vals fields)))
+       active (fn [i] (t/eq tag (t/int i)))
+       arm-values (fn [i] (vals (get fields (nth tags i))))
+       layouts (into {} (map (fn [[label fs]] [label (into {} (map (fn [[field value]] [field (:domain value)]) fs))]) fields))]
+  (when (empty? tags) (throw (ex-info "A tagged sum needs at least one constructor" {})))
+  (v/make {:tag tag :arms fields}
+   (merge (v/context values)
+    {:defined (t/all (map (fn [i] (t/implies (active i) (t/all (map v/defined (arm-values i))))) (range (count tags))))
+     :within (t/all (map (fn [i] (t/implies (active i) (t/all (map v/within (arm-values i))))) (range (count tags))))
+     :constraints (vec (concat (mapcat (fn [i]
+                                  (map #(t/implies (active i) %) (mapcat v/constraints (arm-values i))))
+                                  (range (count tags)))
+                        [(t/le (t/int 0) tag) (t/lt tag (t/int (count tags)))]))
+     :scope (v/join-scope (conj values
+              (v/make (t/bool true) {:scope {:mode :finite-universe :constructors tags}})))
+     :domain {:kind :sum :tags tags :arms layouts :profile :formal/closed-tagged-sum-v1}}))))
+
+(defn- tag-index [value tag]
+ (let [tags (get-in value [:domain :tags])]
+  (or (first (keep (fn [i] (when (= tag (nth tags i)) i)) (range (count tags))))
+      (throw (ex-info "Unknown sum constructor" {:tag tag :known tags})))))
+
+(defn is [value tag]
+ (v/scalar (t/eq (get-in value [:value :tag]) (t/int (tag-index value tag))) [value] {}))
+
+(defn construct
+ "A constructor using a sum template's layout; inactive arms are unobserved."
+ [template tag fields]
+ (let [expected (get-in template [:value :arms tag])]
+  (when-not (= (set (keys fields)) (set (keys expected)))
+   (throw (ex-info "Sum constructor fields do not match its layout" {:tag tag})))
+  (let [fields (into {} (map (fn [[field item]]
+                   [field (v/lift item)]) fields))]
+   (doseq [[field item] fields]
+    ;; This also pins primitive sort compatibility through typed equality.
+    (v/equal (get expected field) item))
+   (v/make {:tag (t/int (tag-index template tag))
+            :arms (assoc (get-in template [:value :arms]) tag fields)}
+    (merge (v/context (vals fields))
+     {:scope (v/scope template) :domain (:domain template)})))))
+
+(defn field
+ "A strict constructor field projection; selectors on another arm are errors."
+ [value tag field-name]
+ (let [selected (get-in value [:value :arms tag field-name]) condition (v/term (is value tag))]
+  (when-not selected (throw (ex-info "Unknown sum field" {:tag tag :field field-name})))
+  (assoc selected
+   :defined (t/all [(v/defined value) condition (v/defined selected)])
+   :within (t/all [(v/within value) (v/within selected)])
+   :constraints (vec (distinct (concat (v/constraints value) (v/constraints selected))))
+   :scope (v/join-scope [value selected]) :errors {:wrong-constructor (t/not condition)})))
+
+(defn coverage
+ "Whether the given constructor cases cover this closed sum."
+ [value tags]
+ (v/scalar (t/any (map #(v/term (is value %)) tags)) [value] {}))
+
+(defn match
+ "Constructor matching with explicit failure for an uncovered constructor.
+  Branch functions receive their arm's field descriptors."
+ [value branches]
+ (when (empty? branches) (throw (ex-info "A symbolic match needs a branch" {})))
+ (let [results (mapv (fn [[tag body]]
+                [tag (v/lift (body (get-in value [:value :arms tag])))]) branches)
+       fallback (v/undefined (second (first results)) :uncovered-constructor)]
+  (reduce (fn [otherwise [tag result]] (v/choose (is value tag) result otherwise))
+          fallback (reverse results))))

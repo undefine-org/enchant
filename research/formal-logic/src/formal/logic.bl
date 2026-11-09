@@ -1,0 +1,165 @@
+(ns formal.logic
+ (:require [formal.term :as t] [formal.value :as v] [formal.query :as q]
+           [formal.backend :as backend] [formal.evaluate :as replay]))
+
+(defn- observations [problem]
+ (let [variables (t/variables (q/roots problem))
+       watched (vec (distinct (mapcat (fn [[_ item]] (v/terms item)) (:observe problem))))]
+  {:variables variables :watched watched
+   :rows (vec (concat (mapv (fn [variable] [(str "var/" (:data variable)) variable]) variables)
+               (mapv (fn [i] [(str "watch/" i) (nth watched i)]) (range (count watched)))))}))
+
+(defn- replay-and-decode [problem rows reply assertions]
+ (let [values (:values reply)
+       assignments (into {} (map (fn [variable] [(:data variable) (get values (str "var/" (:data variable))
+                                                                      (replay/unavailable :missing-variable))]) (:variables rows)))
+       watched (into {} (map (fn [i] [(nth (:watched rows) i)
+                                      (get values (str "watch/" i) (replay/unavailable :missing-observation))])
+                              (range (count (:watched rows)))))
+       resolver (fn [term] (get watched term (replay/value term assignments)))
+       witness (into {} (map (fn [[name descriptor]]
+                      [name (if (v/value? descriptor) (v/decode descriptor resolver) (resolver descriptor))]) (:observe problem)))]
+  {:assignments assignments :witness witness :validation (replay/validate assertions assignments)}))
+
+(defn- base-result [problem reply]
+ {:id (:id problem) :profile (:profile problem) :profiles (:profiles problem)
+  :scope (:scope problem) :mode (:mode problem) :trusted false
+  :identity (:identity reply) :backend (:backend reply)
+  :solver-status (:status reply) :model-status (:model-status reply)
+  :why (:why reply) :error (:error reply)
+  :stats (:stats reply) :wall-us (:wall-us reply)
+  :assumptions (:assumptions problem) :origin (:origin problem)
+  :core {:kind (:core-kind reply) :labels (:core reply)}
+  :certificate {:status :not-checked :kind :solver-answer}})
+
+(defn solve-in
+ "Run a portable question in an owned session. A proof first checks its
+  assumptions for satisfiability, so an inconsistent domain is visible."
+ [session problem]
+ (try
+  (let [rows (observations problem)
+        background (:assertions problem)
+        preflight (when (and (= :prove (:mode problem)) (not= :allow (:vacuity problem)))
+                    (backend/scope! session background [] []))]
+   (if (and preflight (or (not (:ok preflight)) (not= :sat (:status preflight))))
+    (assoc (base-result problem preflight)
+      :verdict (cond (= :unsat (:status preflight)) :vacuous
+                     (= :unsupported (:status preflight)) :unsupported
+                     (= :unknown (:status preflight)) :unknown :else :error)
+      :phase :assumption-consistency :validation {:status :not-applicable})
+    (let [assertions (vec (concat background (when (:counterexample problem) [(:counterexample problem)])))
+          reply (backend/scope! session assertions [] (:rows rows))
+          decoded (when (= :sat (:status reply)) (replay-and-decode problem rows reply assertions))
+          validation (get decoded :validation {:status :not-applicable})
+          verdict (cond
+                    (= :unsupported (:status reply)) :unsupported
+                    (or (not (:ok reply)) (= :error (:status reply))) :error
+                    (= :unknown (:status reply)) :unknown
+                    (= :unsat (:status reply)) (if (= :prove (:mode problem)) :proved :unsat)
+                    (= :invalid (:status validation)) :invalid-model
+                    (= :sat (:status reply))
+                      (if (= :valid (:status validation))
+                        (if (= :prove (:mode problem)) :refuted :sat)
+                        :candidate)
+                    :else :error)]
+     (merge (base-result problem reply) decoded
+       {:verdict verdict :validation validation :phase :query
+        :cache-key (q/cache-key problem (:identity session) {:solver-ms (:solver-ms session)} :model-and-core)
+        :nodes-imported (get-in reply [:stats :nodes])
+        :preflight (when preflight (select-keys preflight [:status :stats :wall-us]))}))))
+  (catch error
+   {:id (:id problem) :profile (:profile problem) :scope (:scope problem) :trusted false
+    :verdict :error :phase :frontend :solver-status :not-run :error (ex-message error)})))
+
+(defn run [opts problem]
+ (backend/with-session opts (fn [session] (solve-in session problem))))
+(defn prove [opts claim options] (run opts (q/prove claim options)))
+(defn equivalent [opts left right options] (run opts (q/equivalent left right options)))
+
+(defn compare
+ "Both backends receive the same typed question and profile. Status agreement,
+  replay quality and proof authority remain distinct facts."
+ ([problem] (compare problem {}))
+ ([problem opts]
+  (let [z3 (run (assoc opts :backend :z3) problem)
+        oxiz (run (assoc opts :backend :oxiz) problem)
+        decisive? (fn [r] (contains? #{:sat :unsat} (:solver-status r)))]
+   {:id (:id problem) :profile (:profile problem) :scope (:scope problem)
+    :authority :z3 :decision z3 :candidate oxiz
+    :status-agreement (and (decisive? z3) (decisive? oxiz) (= (:solver-status z3) (:solver-status oxiz)))
+    :disagreement (and (decisive? z3) (decisive? oxiz) (not= (:solver-status z3) (:solver-status oxiz)))
+    :candidate-replayed (= :valid (get-in oxiz [:validation :status]))
+    :promotion :disabled})))
+
+(defn enumerate-projection
+ "Enumerate scalar observation tuples; completeness means UNSAT after all
+  blocking clauses, never that a sample limit counted an infinite domain."
+ [opts assumptions projection limit]
+ (backend/with-session opts
+  (fn [session]
+   (loop [blocks [] answers []]
+    (if (>= (count answers) limit)
+     {:status :bounded-sample :answers answers :limit limit :complete false}
+     (let [problem (q/sat {:id :enumeration :assumptions (vec (concat assumptions blocks)) :observe projection})
+           result (solve-in session problem)]
+      (cond
+       (= :unsat (:verdict result)) {:status :complete :answers answers :complete true}
+       (not= :sat (:verdict result)) {:status :partial :answers answers :complete false :last result}
+       :else
+        (let [witness (:witness result)
+              equalities (mapv (fn [[name term]] (t/eq term (t/literal (t/sort-of term) (get witness name)))) projection)
+              block (t/not (t/all equalities))]
+         (recur (conj blocks block) (conj answers witness))))))))))
+
+(defn optimize-finite
+ "Exact finite choice-space optimization, implemented once above both native
+  backends. Unknown/incomplete candidates prevent an optimality claim."
+ [opts assumptions objective lower upper direction]
+ (when-not (and (= t/Int (t/sort-of objective)) (int? lower) (int? upper) (<= lower upper)
+                (<= (- upper lower) 256) (contains? #{:min :max} direction))
+  (throw (ex-info "Finite optimization needs explicit integer bounds <=256" {})))
+ (backend/with-session opts
+  (fn [session]
+   (let [candidates (if (= direction :min) (range lower (inc upper)) (reverse (range lower (inc upper))))]
+    (loop [remaining candidates tested 0]
+     (if (empty? remaining) {:status :infeasible :tested tested :bounds [lower upper]}
+      (let [candidate (first remaining)
+            problem (q/sat {:id :finite-optimization :assumptions (conj (vec assumptions) (t/eq objective (t/int candidate)))
+                            :observe {"objective" objective} :scope {:mode :bounded :objective [lower upper]}})
+            result (solve-in session problem)]
+       (cond
+        (= :sat (:verdict result)) {:status :optimal-in-bounds :value candidate :tested (inc tested)
+                                     :bounds [lower upper] :witness (:witness result) :evidence result}
+        (= :unsat (:verdict result)) (recur (rest remaining) (inc tested))
+        :else {:status :undecided :tested (inc tested) :bounds [lower upper] :evidence result}))))))))
+
+(defn synthesize
+ "Search a declared finite grammar of Boolean candidates. Every accepted
+  candidate is checked universally over the question's explicit domain."
+ [opts candidates options]
+ (backend/with-session opts
+  (fn [session]
+   (loop [remaining (seq candidates) rejected []]
+    (if (empty? remaining) {:status :grammar-exhausted :rejected rejected :grammar-size (count candidates)}
+     (let [[name claim] (first remaining) result (solve-in session (q/prove claim (assoc options :id name)))]
+      (cond (= :proved (:verdict result)) {:status :candidate-proved :candidate name :evidence result
+                                          :grammar-size (count candidates) :rejected rejected}
+            (= :refuted (:verdict result)) (recur (rest remaining) (conj rejected {:name name :witness (:witness result)}))
+            :else {:status :undecided :candidate name :evidence result :rejected rejected})))))))
+
+(defn explain-unsat
+ "Backend-independent deletion explanation. Unknown stops qualification of
+  minimality. A derived core is never presented as a native certificate."
+ [opts assertions]
+ (backend/with-session opts
+  (fn [session]
+   (let [initial (solve-in session (q/sat {:assumptions assertions}))]
+    (if (not= :unsat (:verdict initial)) {:status :not-unsat :evidence initial}
+     (loop [index 0 kept (vec assertions)]
+      (if (>= index (count kept)) {:status :subset-minimal :kind :derived-deletion :assertions kept}
+       (let [trial (vec (concat (take index kept) (drop (inc index) kept)))
+             result (solve-in session (q/sat {:assumptions trial}))]
+        (cond (= :unsat (:verdict result)) (recur index trial)
+              (= :sat (:verdict result)) (recur (inc index) kept)
+              :else {:status :input-cover :kind :derived-deletion :assertions kept
+                     :minimal false :reason result})))))))))

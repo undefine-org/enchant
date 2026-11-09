@@ -1,0 +1,69 @@
+(ns formal.query (:require [formal.term :as t] [formal.value :as v]))
+
+(defn assertion
+ ([label expression] (assertion label expression nil))
+ ([label expression origin]
+  (when-not (= t/Bool (t/sort-of expression))
+   (throw (ex-info "Formal assertions must be Boolean" {:label label :sort (t/sort-of expression)})))
+  {:label (str label) :term expression :origin origin}))
+(defn- named-terms [prefix terms]
+ (mapv (fn [i] (assertion (str prefix i) (nth terms i))) (range (count terms))))
+(defn- assumption [index item]
+ (cond
+  (and (map? item) (contains? item :term)) (assertion (:label item) (:term item) (:origin item))
+  (v/value? item) (assertion (str "assume/" index) (t/all [(v/defined item) (v/term item)]))
+  :else (assertion (str "assume/" index) item)))
+(defn- normalize-assumptions [items]
+ (mapv (fn [i] (assumption i (nth items i))) (range (count items))))
+
+(defn make
+ "A portable question with explicit semantics, domain, source and requested
+  observations. Watchers never add assumptions or alter the claim."
+ [opts]
+ (let [mode (get opts :mode :prove) claim (:claim opts)
+       _ (when-not (contains? #{:sat :prove} mode)
+           (throw (ex-info "Unknown formal query mode" {:mode mode})))
+       inputs (vec (get opts :inputs []))
+       context (vec (concat inputs (when claim [claim])))
+       assumptions (normalize-assumptions (vec (get opts :assumptions [])))
+       constraints (vec (distinct (mapcat v/constraints context)))
+       bounds (vec (distinct (map v/within context)))
+       input-success (mapv v/defined inputs)
+       background (vec (concat (named-terms "domain/" constraints)
+                       (named-terms "within/" bounds)
+                       (named-terms "input-success/" input-success) assumptions))
+       property (when (= mode :prove)
+                  (do (when (nil? claim) (throw (ex-info "A proof needs a claim" {})))
+                      (t/all [(v/defined claim) (v/term claim)])))
+       observations (get opts :observe {})]
+  {:formal/query 1 :id (get opts :id :anonymous) :mode mode :claim property
+   :assertions background :counterexample (when property (assertion "goal/counterexample" (t/not property) (:origin opts)))
+   :observe observations :profile (get opts :profile :enchant/formal-preview-v1)
+   :profiles (vec (distinct (keep (fn [x] (get-in x [:domain :profile])) context)))
+   :scope (get opts :scope (v/join-scope context)) :origin (:origin opts)
+   :vacuity (get opts :vacuity :report)
+   :assumptions (mapv (fn [a] (select-keys a [:label :origin])) background)}))
+
+(defn prove
+ ([claim] (prove claim {}))
+ ([claim opts] (make (assoc opts :mode :prove :claim claim))))
+(defn sat [opts] (make (assoc opts :mode :sat)))
+(defn equivalent [left right opts]
+ (prove (v/equivalent left right) (assoc opts :relation :raisedness-and-successful-value)))
+(defn from-case [case]
+ (prove (:property case)
+  {:id (:id case) :assumptions (:assumptions case) :observe (:observations case)
+   :scope (:scope case) :profile (get case :profile :enchant/formal-preview-v1)}))
+
+(defn roots [problem]
+ (vec (concat (map :term (:assertions problem)) (when (:claim problem) [(:claim problem)])
+              (mapcat (fn [[_ item]] (v/terms item)) (:observe problem)))))
+(defn cache-key
+ "A backend result cache cannot cross profiles, bounds, artifacts, settings or
+  requested evidence. This key never grants trusted compiler authority."
+ [problem identity settings result-kind]
+ (Base/encode16
+  (crypto/hash :sha256 (erlang/term_to_binary
+    [(:mode problem) (:profile problem) (:profiles problem) (:scope problem)
+     (mapv :label (:assertions problem)) (t/digest (roots problem))
+     identity settings result-kind])) (list (tuple :case :lower))))

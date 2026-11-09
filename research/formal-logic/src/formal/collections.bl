@@ -1,0 +1,218 @@
+(ns formal.collections
+ (:require [formal.term :as t] [formal.value :as v] [formal.data :as data]))
+
+;; This layer specifies language values. It is independent of native arrays,
+;; SMT text, native term IDs, and any particular solver implementation.
+(defn- item [name spec]
+ (v/lift (if (fn? spec) (spec name) (t/variable name spec))))
+(defn- sum-terms [terms] (reduce t/add (t/int 0) terms))
+(defn- check-universe! [keys]
+ (when-not (= (count keys) (count (distinct keys)))
+  (throw (ex-info "Finite collection universe contains duplicate keys" {:keys keys}))))
+(defn- key-index [collection key]
+ (let [keys (get-in collection [:domain :keys])]
+  (if (and (v/value? key) (= :finite-key (get-in key [:domain :kind])))
+   (do (when-not (= keys (get-in key [:domain :keys]))
+        (throw (ex-info "Symbolic key belongs to another finite universe" {})))
+       key)
+   (data/key-literal keys key))))
+(defn- selected [index n]
+ (mapv (fn [i] (t/eq (v/term index) (t/int i))) (range n)))
+(defn- vector-select [items selectors fallback]
+ (reduce (fn [otherwise i] (v/choose (nth selectors i) (nth items i) otherwise))
+         fallback (reverse (range (count items)))))
+
+(defn map-symbolic
+ "Finite-key map with independent presence and payload cells. A value spec
+  is a sort or a pure prefix→semantic-value constructor (e.g. nullable Int)."
+ [name keys value-spec]
+ (let [keys (vec keys) _ (check-universe! keys)
+       present (mapv (fn [i] (t/variable (str name ".present." i) t/Bool)) (range (count keys)))
+       items (mapv (fn [i] (item (str name ".item." i) value-spec)) (range (count keys)))
+       template (if (seq items) (first items) (item (str name ".empty-template") value-spec))]
+  (v/make {:present present :items items}
+   {:defined (t/all (map (fn [i] (t/implies (nth present i) (v/defined (nth items i)))) (range (count keys))))
+    :within (t/all (map (fn [i] (t/implies (nth present i) (v/within (nth items i)))) (range (count keys))))
+    :constraints (vec (mapcat (fn [i] (map #(t/implies (nth present i) %) (v/constraints (nth items i)))) (range (count keys))))
+    :scope {:mode :finite-universe :keys keys :value-scope (v/scope template)}
+    :domain {:kind :finite-map :keys keys :item-domain (:domain template) :profile :bl/finite-key-map-v1}
+    :template template})))
+
+(defn map-empty [name keys value-spec]
+ (let [m (map-symbolic name keys value-spec)]
+  (assoc m :value (assoc (:value m) :present (mapv (fn [_] (t/bool false)) keys))
+           :defined (t/bool true) :within (t/bool true) :constraints [])))
+
+(defn map-contains? [m key]
+ (let [index (key-index m key) picks (selected index (count (get-in m [:domain :keys])))
+       present (get-in m [:value :present])]
+  (v/scalar (t/any (map (fn [i] (t/all [(nth picks i) (nth present i)])) (range (count picks)))) [m index] {})))
+
+(defn map-lookup
+ "Explicit Option lookup, preserving absent versus present nil."
+ [m key]
+ (let [index (key-index m key) picks (selected index (count (get-in m [:domain :keys])))
+       picked (vector-select (get-in m [:value :items]) picks (:template m))
+       result (data/option (map-contains? m key) picked)]
+  (assoc result :defined (t/all [(v/defined m) (v/defined index) (v/defined result)])
+                :within (t/all [(v/within m) (v/within index) (v/within result)])
+                :constraints (vec (distinct (concat (v/constraints m) (v/constraints index) (v/constraints result))))
+                :scope (v/join-scope [m index result]))))
+(defn map-get-or [m key fallback] (data/get-or (map-lookup m key) fallback))
+
+(defn map-assoc
+ [m key value]
+ (let [index (key-index m key) value (v/lift value)
+       _ (v/equal (:template m) value)
+       picks (selected index (count (get-in m [:domain :keys])))
+       before (:value m)]
+  (v/make {:present (mapv (fn [i] (t/any [(nth picks i) (nth (:present before) i)])) (range (count picks)))
+           :items (mapv (fn [i] (v/choose (nth picks i) value (nth (:items before) i))) (range (count picks)))}
+   (merge (v/context [m index value]) {:scope (v/join-scope [m index value])
+     :domain (:domain m) :template (:template m)}))))
+(defn map-dissoc [m key]
+ (let [index (key-index m key) picks (selected index (count (get-in m [:domain :keys])))
+       before (:value m)]
+  (v/make (assoc before :present
+            (mapv (fn [i] (t/all [(t/not (nth picks i)) (nth (:present before) i)])) (range (count picks))))
+   (merge (v/context [m index]) {:domain (:domain m) :template (:template m)}))))
+(defn map-count [m]
+ (v/scalar (sum-terms (map #(t/ite % (t/int 1) (t/int 0)) (get-in m [:value :present]))) [m] {}))
+(defn map-equal [a b] (v/equal a b))
+
+(defn vector-symbolic
+ "An explicitly bounded finite vector. Runtime valid operations can exceed
+  capacity; :within says that separately from language :defined."
+ [name capacity value-spec]
+ (when-not (and (int? capacity) (<= 0 capacity) (<= capacity 64))
+  (throw (ex-info "Vector prototype capacity must be 0..64" {})))
+ (let [length (t/variable (str name ".length") t/Int)
+       items (mapv (fn [i] (item (str name ".item." i) value-spec)) (range capacity))
+       template (if (seq items) (first items) (item (str name ".empty-template") value-spec))
+       active (fn [i] (t/lt (t/int i) length))]
+  (v/make {:length length :items items}
+   {:defined (t/all (map (fn [i] (t/implies (active i) (v/defined (nth items i)))) (range capacity)))
+    :within (t/all [(t/le (t/int 0) length) (t/le length (t/int capacity))
+                   (t/all (map (fn [i] (t/implies (active i) (v/within (nth items i)))) (range capacity)))])
+    :constraints (vec (mapcat (fn [i] (map #(t/implies (active i) %) (v/constraints (nth items i)))) (range capacity)))
+    :scope {:mode :bounded :max-length capacity :item-scope (v/scope template)}
+    :domain {:kind :bounded-vector :capacity capacity :item-domain (:domain template) :profile :bl/vector-v1}
+    :template template})))
+(defn vector-empty [name capacity value-spec]
+ (let [result (vector-symbolic name capacity value-spec)]
+  (assoc result :value (assoc (:value result) :length (t/int 0))
+                :defined (t/bool true) :within (t/bool true) :constraints [])))
+(defn vector-length [xs] (v/scalar (get-in xs [:value :length]) [xs] {}))
+(defn vector-contains?
+ "BL contains? for vectors is index membership, never element membership."
+ [xs index]
+ (let [i (v/term index)]
+  (v/scalar (t/all [(t/le (t/int 0) i) (t/lt i (get-in xs [:value :length]))]) [xs index] {})))
+
+(defn vector-at
+ "Recommended explicit strict accessor. Current BL nth is the separate
+  lenient interface below."
+ [xs index]
+ (let [inside (vector-contains? xs index)
+       picks (selected index (get-in xs [:domain :capacity]))
+       result (vector-select (get-in xs [:value :items]) picks (:template xs))]
+  (assoc result
+   :defined (t/all [(v/defined xs) (v/defined index) (v/term inside) (v/defined result)])
+   :within (t/all [(v/within xs) (v/within index) (t/implies (v/term inside) (v/within result))])
+   :constraints (vec (distinct (concat (v/constraints xs) (v/constraints index)
+                            (map #(t/implies (v/term inside) %) (v/constraints result)))))
+   :scope (v/join-scope [xs index result]) :errors {:out-of-bounds (t/not (v/term inside))})))
+
+(defn vector-nth-or
+ "Current BL nth/3: only an absent position chooses default; present nil is
+  retained. This typed profile requires a default in the element domain."
+ [xs index fallback]
+ (let [inside (vector-contains? xs index)]
+  (v/choose inside (vector-at xs index) (v/lift fallback))))
+(defn vector-nth
+ "Current BL nth/2 for a nullable element domain: absent means nil."
+ [xs index]
+ (let [template (:template xs)]
+  (when-not (= :nullable (get-in template [:domain :kind]))
+   (throw (ex-info "Lenient nth/2 requires a nullable scalar element model" {})))
+  (vector-nth-or xs index (data/nil-of (get-in template [:domain :item-sort])))))
+
+(defn vector-assoc [xs index value]
+ (let [i (v/term index) value (v/lift value) _ (v/equal (:template xs) value)
+       n (get-in xs [:value :length]) capacity (get-in xs [:domain :capacity])
+       valid (t/all [(t/le (t/int 0) i) (t/le i n)])
+       after-length (t/ite (t/eq i n) (t/add n (t/int 1)) n)
+       picks (selected index capacity)]
+  (v/make {:length after-length
+           :items (mapv (fn [at] (v/choose (nth picks at) value (nth (get-in xs [:value :items]) at))) (range capacity))}
+   (merge (v/context [xs index value])
+    {:defined (t/all [(v/defined xs) (v/defined index) (v/defined value) valid])
+     :within (t/all [(v/within xs) (v/within index) (v/within value) (t/le after-length (t/int capacity))])
+     :domain (:domain xs) :template (:template xs)
+     :errors {:out-of-bounds (t/not valid)}}))))
+(defn vector-conj [xs value] (vector-assoc xs (vector-length xs) value))
+(defn vector-pop [xs]
+ (let [n (get-in xs [:value :length]) nonempty (t/gt n (t/int 0))]
+  (v/make (assoc (:value xs) :length (t/sub n (t/int 1)))
+   (merge (v/context [xs])
+    {:defined (t/all [(v/defined xs) nonempty]) :domain (:domain xs) :template (:template xs)
+     :errors {:empty-pop (t/not nonempty)}}))))
+(defn vector-equal [a b] (v/equal a b))
+
+(defn set-symbolic [name keys]
+ (let [keys (vec keys) _ (check-universe! keys)]
+  (v/make {:members (mapv (fn [i] (t/variable (str name ".member." i) t/Bool)) (range (count keys)))}
+   {:scope {:mode :finite-universe :values keys}
+    :domain {:kind :finite-set :keys keys :profile :bl/finite-set-v1}})))
+(defn set-empty [name keys]
+ (let [s (set-symbolic name keys)]
+  (assoc s :value {:members (mapv (fn [_] (t/bool false)) keys)})))
+(defn set-member? [s key]
+ (let [index (key-index s key) picks (selected index (count (get-in s [:domain :keys])))]
+  (v/scalar (t/any (map (fn [i] (t/all [(nth picks i) (nth (get-in s [:value :members]) i)])) (range (count picks)))) [s index] {})))
+(defn- set-combine [a b operation]
+ (when-not (= (:domain a) (:domain b)) (throw (ex-info "Set universes differ" {})))
+ (v/make {:members (mapv (fn [i] (operation (nth (get-in a [:value :members]) i)
+                                         (nth (get-in b [:value :members]) i)))
+                          (range (count (get-in a [:domain :keys]))))}
+  (merge (v/context [a b]) {:domain (:domain a)})))
+(defn set-union [a b] (set-combine a b (fn [x y] (t/any [x y]))))
+(defn set-intersection [a b] (set-combine a b (fn [x y] (t/all [x y]))))
+(defn set-difference [a b] (set-combine a b (fn [x y] (t/all [x (t/not y)]))))
+(defn set-subset? [a b]
+ (when-not (= (:domain a) (:domain b)) (throw (ex-info "Set universes differ" {})))
+ (v/scalar (t/all (map (fn [i] (t/implies (nth (get-in a [:value :members]) i)
+                                       (nth (get-in b [:value :members]) i)))
+                           (range (count (get-in a [:domain :keys]))))) [a b] {}))
+(defn set-cardinality [s]
+ (v/scalar (sum-terms (map #(t/ite % (t/int 1) (t/int 0)) (get-in s [:value :members]))) [s] {}))
+(defn set-equal [a b] (v/equal a b))
+
+(defn bag-symbolic [name keys]
+ (let [keys (vec keys) _ (check-universe! keys)
+       counts (mapv (fn [i] (t/variable (str name ".count." i) t/Int)) (range (count keys)))]
+  (v/make {:counts counts}
+   {:constraints (mapv #(t/le (t/int 0) %) counts)
+    :scope {:mode :finite-universe :values keys}
+    :domain {:kind :finite-bag :keys keys :profile :formal/nonnegative-bag-v1}})))
+(defn bag-union [a b]
+ (when-not (= (:domain a) (:domain b)) (throw (ex-info "Bag universes differ" {})))
+ (v/make {:counts (mapv (fn [i] (t/add (nth (get-in a [:value :counts]) i)
+                                    (nth (get-in b [:value :counts]) i)))
+                         (range (count (get-in a [:domain :keys]))))}
+  (merge (v/context [a b]) {:domain (:domain a)})))
+(defn bag-cardinality [bag] (v/scalar (sum-terms (get-in bag [:value :counts])) [bag] {}))
+(defn bag-equal [a b] (v/equal a b))
+
+(defn bytes-symbolic
+ "A bounded vector of unsigned bytes. No implicit UTF-8 or grapheme claim."
+ [name capacity]
+ (let [bytes (vector-symbolic name capacity t/Int)
+       length (get-in bytes [:value :length])
+       limits (mapv (fn [i]
+                (let [byte (v/term (nth (get-in bytes [:value :items]) i))]
+                 (t/implies (t/lt (t/int i) length)
+                  (t/all [(t/le (t/int 0) byte) (t/le byte (t/int 255))]))))
+               (range capacity))]
+  (assoc bytes :constraints (vec (concat (v/constraints bytes) limits))
+               :scope {:mode :bounded :max-bytes capacity :element-range [0 255]})))

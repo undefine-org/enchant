@@ -1,0 +1,229 @@
+(ns formal.value (:require [formal.term :as t]))
+
+;; A language result and the domain of its model are independent facts.
+;; In particular, a valid operation may exceed a bounded representation.
+(defn value? [x] (and (map? x) (= 1 (:formal/value x))))
+(defn make
+ [payload opts]
+ (let [result (merge {:formal/value 1 :value payload :defined (t/bool true)
+                     :within (t/bool true) :constraints [] :scope {:mode :exact}
+                     :domain {:kind :scalar :profile :formal/scalar-v1} :errors {}}
+                    opts {:formal/value 1 :value payload})
+       booleans (concat [(:defined result) (:within result)] (:constraints result))]
+  (when-not (every? (fn [term] (and (t/term? term) (= t/Bool (t/sort-of term)))) booleans)
+   (throw (ex-info "Formal success, model bounds and constraints must be Bool terms" {})))
+  (when-not (and (contains? #{:exact :finite-universe :bounded :abstract} (get-in result [:scope :mode]))
+                (map? (:domain result)))
+   (throw (ex-info "Formal value needs an explicit semantic domain and model scope" {})))
+  (assoc result :constraints (vec (:constraints result)))))
+(defn lift [expression]
+ (if (value? expression) expression
+  (do (when-not (t/term? expression)
+        (throw (ex-info "Expected a formal term or semantic value" {:value expression})))
+      (make expression {}))))
+(defn term [value]
+ (let [payload (if (value? value) (:value value) value)]
+  (when-not (t/term? payload)
+   (throw (ex-info "Expected a scalar formal value" {:domain (:domain value)})))
+  payload))
+(defn defined [value] (if (value? value) (:defined value) (t/bool true)))
+(defn within [value] (if (value? value) (:within value) (t/bool true)))
+(defn constraints [value] (if (value? value) (:constraints value) []))
+(defn scope [value] (if (value? value) (:scope value) {:mode :exact}))
+
+(defn join-scope [values]
+ (let [scopes (vec (distinct (map scope values))) modes (set (map :mode scopes))
+       mode (cond (contains? modes :abstract) :abstract
+                  (contains? modes :bounded) :bounded
+                  (contains? modes :finite-universe) :finite-universe
+                  :else :exact)]
+  (if (and (= 1 (count scopes)) (= mode (:mode (first scopes)))) (first scopes)
+   {:mode mode :components scopes})))
+
+(defn context
+ "Combine successful operand evaluation and explicitly retain model bounds."
+ [values]
+ {:defined (t/all (map defined values))
+  :within (t/all (map within values))
+  :constraints (vec (distinct (mapcat constraints values)))
+  :scope (join-scope values)})
+
+(defn scalar [expression operands opts]
+ (make expression (merge (context operands) opts)))
+
+(declare terms choose equal decode)
+
+(defn- compatible-domain? [a b]
+ (or (and (= :scalar (:kind a)) (= :scalar (:kind b)))
+     (= (dissoc a :profile) (dissoc b :profile))))
+
+(defn- payload-terms [payload]
+ (cond
+  (t/term? payload) [payload]
+  (value? payload) (terms payload)
+  (map? payload) (vec (mapcat payload-terms (vals payload)))
+  (or (vector? payload) (list? payload)) (vec (mapcat payload-terms payload))
+  :else []))
+
+(defn terms
+ "All observable term leaves, including runtime success and model admission."
+ [value]
+ (vec (distinct (if (value? value)
+                  (concat (payload-terms (:value value)) [(defined value) (within value)])
+                  (payload-terms value)))))
+
+(defn- choose-payload [condition yes no]
+ (cond
+  (and (t/term? yes) (t/term? no)) (t/ite condition yes no)
+  (and (value? yes) (value? no)) (choose condition yes no)
+  (and (map? yes) (map? no) (= (set (keys yes)) (set (keys no))))
+   (into {} (map (fn [key] [key (choose-payload condition (get yes key) (get no key))]) (keys yes)))
+  (and (vector? yes) (vector? no) (= (count yes) (count no)))
+   (mapv (fn [i] (choose-payload condition (nth yes i) (nth no i))) (range (count yes)))
+  (= yes no) yes
+  :else (throw (ex-info "Formal branches have different shapes" {:yes yes :no no}))))
+
+(defn choose
+ "Symbolic conditional with lazy language definedness, including composites.
+  Branch constraints are guarded; an inactive branch cannot restrict a proof."
+ [condition yes no]
+ (let [c (term condition) yes (lift yes) no (lift no)]
+  (when-not (compatible-domain? (:domain yes) (:domain no))
+   (throw (ex-info "Formal branches have different domains" {:yes (:domain yes) :no (:domain no)})))
+  (make (choose-payload c (:value yes) (:value no))
+   {:defined (t/all [(defined condition) (t/ite c (defined yes) (defined no))])
+    :within (t/all [(within condition) (t/ite c (within yes) (within no))])
+    :constraints (vec (concat (constraints condition)
+                       (map #(t/implies c %) (constraints yes))
+                       (map #(t/implies (t/not c) %) (constraints no))))
+    :scope (join-scope [condition yes no]) :domain (:domain yes)
+    :errors {:condition-undefined (t/not (defined condition))}})))
+
+(defn undefined
+ "An explicit unsuccessful computation with an inactive placeholder payload."
+ [template reason]
+ (assoc (lift template) :defined (t/bool false) :errors {reason (t/bool true)}))
+
+(defn- payload-eq [a b]
+ (cond
+  (and (t/term? a) (t/term? b)) (t/eq a b)
+  (and (value? a) (value? b)) (term (equal a b))
+  (and (map? a) (map? b) (= (set (keys a)) (set (keys b))))
+   (t/all (map (fn [key] (payload-eq (get a key) (get b key))) (keys a)))
+  (and (vector? a) (vector? b) (= (count a) (count b)))
+   (t/all (map (fn [i] (payload-eq (nth a i) (nth b i))) (range (count a))))
+  (= a b) (t/bool true)
+  :else (t/bool false)))
+
+(defn equal
+ "Language equality, ignoring all absent, inactive, and out-of-length payloads."
+ [left right]
+ (let [a (lift left) b (lift right) domain (:domain a)
+       x (:value a) y (:value b) kind (:kind domain)]
+  (when-not (compatible-domain? domain (:domain b))
+   (throw (ex-info "Cannot compare different formal domains" {:left domain :right (:domain b)})))
+  (let [result
+   (cond
+    (= kind :nullable)
+     (t/all [(t/eq (:nil? x) (:nil? y))
+             (t/implies (t/not (:nil? x)) (payload-eq (:item x) (:item y)))])
+    (= kind :option)
+     (t/all [(t/eq (:present x) (:present y))
+             (t/implies (:present x) (payload-eq (:item x) (:item y)))])
+    (= kind :sum)
+     (t/all (cons (t/eq (:tag x) (:tag y))
+       (map (fn [i]
+              (let [tag (nth (:tags domain) i)]
+               (t/implies (t/eq (:tag x) (t/int i))
+                 (payload-eq (get (:arms x) tag) (get (:arms y) tag)))))
+            (range (count (:tags domain))))))
+    (= kind :finite-map)
+     (t/all (map (fn [i]
+       (t/all [(t/eq (nth (:present x) i) (nth (:present y) i))
+               (t/implies (nth (:present x) i)
+                 (payload-eq (nth (:items x) i) (nth (:items y) i)))]))
+      (range (count (:keys domain)))))
+    (= kind :bounded-vector)
+     (t/all (cons (t/eq (:length x) (:length y))
+       (map (fn [i]
+          (t/implies (t/lt (t/int i) (:length x))
+            (payload-eq (nth (:items x) i) (nth (:items y) i))))
+        (range (:capacity domain)))))
+    :else (payload-eq x y))]
+   (scalar result [a b] {:domain {:kind :scalar :profile :formal/equality-v1}}))))
+
+(defn equivalent
+ "Equality of runtime success plus equality of successful result values.
+  Inactive result payloads do not decide equivalence when both sides raise."
+ [a b]
+ (let [same (term (equal a b))]
+  (make (t/all [(t/eq (defined a) (defined b)) (t/implies (defined a) same)])
+   {:defined (t/bool true) :within (t/all [(within a) (within b)])
+    :constraints (vec (distinct (concat (constraints a) (constraints b))))
+    :scope (join-scope [a b]) :domain {:kind :scalar :profile :formal/raisedness-equivalence-v1}})))
+
+(defn- resolve-payload [payload resolver]
+ (cond
+  (t/term? payload) (resolver payload)
+  (value? payload) (:value (decode payload resolver))
+  (map? payload) (into {} (map (fn [[key value]] [key (resolve-payload value resolver)]) payload))
+  (vector? payload) (mapv #(resolve-payload % resolver) payload)
+  :else payload))
+
+(defn decode
+ "A structured model observation. Undefined and outside-domain remain visible;
+  typed options retain presence separately from the stored value."
+ [descriptor resolver]
+ (let [value (lift descriptor) payload (:value value) domain (:domain value)
+       successful (resolver (defined value)) admitted (resolver (within value))
+       result
+        (cond
+         (= false successful) {:unavailable :undefined-result}
+         (= false admitted) {:unavailable :outside-model}
+         (= :nullable (:kind domain))
+          (let [is-nil (resolver (:nil? payload))]
+           (cond (= true is-nil) nil
+                 (= false is-nil) (resolve-payload (:item payload) resolver)
+                 :else {:unavailable :nonconcrete-nil-tag :tag is-nil}))
+         (= :option (:kind domain))
+          (let [present (resolver (:present payload))]
+           (cond (= false present) {:present false}
+                 (= true present) {:present true :value (resolve-payload (:item payload) resolver)}
+                 :else {:unavailable :nonconcrete-presence :present present}))
+         (= :sum (:kind domain))
+          (let [tag-index (resolver (:tag payload))]
+           (if (and (int? tag-index) (<= 0 tag-index) (< tag-index (count (:tags domain))))
+            (let [tag (nth (:tags domain) tag-index)]
+             {:tag tag :fields (resolve-payload (get (:arms payload) tag) resolver)})
+            {:unavailable :nonconcrete-constructor :tag tag-index}))
+         (= :finite-map (:kind domain))
+          (let [present (mapv resolver (:present payload))]
+           (if (every? (fn [p] (or (= true p) (= false p))) present)
+            (into {} (keep (fn [i] (when (nth present i)
+                     [(nth (:keys domain) i) (resolve-payload (nth (:items payload) i) resolver)]))
+                     (range (count (:keys domain)))))
+            {:unavailable :nonconcrete-presence :present present}))
+         (= :bounded-vector (:kind domain))
+          (let [length (resolver (:length payload))]
+           (if (and (int? length) (<= 0 length) (<= length (:capacity domain)))
+            (mapv #(resolve-payload % resolver) (take length (:items payload)))
+            {:unavailable :nonconcrete-or-unrepresented-length :length length}))
+         (= :finite-set (:kind domain))
+          (let [members (mapv resolver (:members payload))]
+           (if (every? (fn [p] (or (= true p) (= false p))) members)
+            (set (keep (fn [i] (when (nth members i) (nth (:keys domain) i)))
+                  (range (count (:keys domain)))))
+            {:unavailable :nonconcrete-membership :members members}))
+         (= :finite-bag (:kind domain))
+          (let [counts (mapv resolver (:counts payload))]
+           (if (every? int? counts)
+            (into {} (keep (fn [i] (let [n (nth counts i)]
+                    (when (pos? n) [(nth (:keys domain) i) n]))) (range (count (:keys domain)))))
+            {:unavailable :nonconcrete-multiplicity :counts counts}))
+         (= :finite-key (:kind domain))
+          (let [index (resolver payload)]
+           (if (and (int? index) (<= 0 index) (< index (count (:keys domain))))
+            (nth (:keys domain) index) {:out-of-universe index}))
+         :else (resolve-payload payload resolver))]
+  {:value result :defined successful :within admitted
+   :scope (scope value) :domain domain}))
