@@ -1,4 +1,4 @@
-use eetf::{Atom, BigInteger, Binary, List, Map, Term, Tuple};
+use eetf::{Atom, BigInteger, Binary, List, Map, Term};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
@@ -9,7 +9,6 @@ pub fn atom(name: &str) -> Term { Atom::from(name).into() }
 pub fn binary(text: &str) -> Term { Binary::from(text.as_bytes().to_vec()).into() }
 pub fn integer(value: impl Into<BigInt>) -> Term { BigInteger { value: value.into() }.into() }
 pub fn list(elements: Vec<Term>) -> Term { List::from(elements).into() }
-pub fn tuple(elements: Vec<Term>) -> Term { Tuple::from(elements).into() }
 pub fn map(entries: Vec<(&str, Term)>) -> Term {
     Map::from(entries.into_iter().map(|(k,v)| (atom(k),v)).collect::<HashMap<_,_>>()).into()
 }

@@ -33,11 +33,11 @@ impl Engine {
         solver.set_logic("ALL");
         Self { tm: TermManager::new(), solver, names: Names::default(), scopes: vec![], checks: 0 }
     }
-    fn sort(&self, form: &Term) -> Result<SortId> {
+    fn sort(&mut self, form: &Term) -> Result<SortId> {
         match wire::symbol(form)? {
             "Bool" => Ok(self.tm.sorts.bool_sort),
             "Int" => Ok(self.tm.sorts.int_sort),
-            "String" => Ok(self.tm.sorts.string_sort),
+            "String" => Ok(self.tm.sorts.string_sort()),
             s => Err(format!("unsupported sort: {s}")),
         }
     }
@@ -96,7 +96,7 @@ impl Engine {
         }
         let bool_sort = self.tm.sorts.bool_sort;
         let int_sort = self.tm.sorts.int_sort;
-        let string_sort = self.tm.sorts.string_sort;
+        let string_sort = self.tm.sorts.string_sort();
         match op {
             "and" | "or" | "not" | "=>" | "xor" => {
                 for arg in &args { self.expect_sort(*arg, bool_sort)?; }
@@ -151,6 +151,7 @@ impl Engine {
         }
     }
     fn vacant(&self, name: &str) -> Result<()> {
+        if name.starts_with("\\oxiz.") { return Err("reserved solver symbol prefix".into()); }
         if self.names.constants.contains_key(name) || self.names.functions.contains_key(name) || self.names.definitions.contains_key(name) {
             Err(format!("duplicate declaration: {name}"))
         } else { Ok(()) }
@@ -224,6 +225,12 @@ impl Engine {
         if self.scopes.len() >= 32 { return Err("scope capacity exceeded".into()); }
         self.scopes.push(self.names.clone()); self.solver.push(); Ok(())
     }
+    fn commands(&mut self, forms: &Term) -> Result<()> {
+        let forms = wire::items(forms)?;
+        if forms.len() > 4096 { return Err("command capacity exceeded".into()); }
+        for form in forms { self.command(form)?; }
+        Ok(())
+    }
     fn pop(&mut self) -> Result<()> {
         self.names = self.scopes.pop().ok_or("scope underflow")?; self.solver.pop(); Ok(())
     }
@@ -275,10 +282,24 @@ impl Engine {
         match op {
             "hello" if p.len() == 1 => Ok(wire::map(vec![("ok", wire::atom("true")), ("backend", wire::binary("oxiz-0.3.4")), ("pid", wire::integer(std::process::id()))])),
             "reset" if p.len() == 1 => { *self = Self::new(); Ok(wire::ok()) },
+            "begin" if p.len() == 2 => {
+                *self = Self::new(); self.commands(&p[1])?; Ok(wire::ok())
+            }
+            "query" if p.len() == 4 => {
+                *self = Self::new(); self.commands(&p[1])?;
+                self.check(wire::number(&p[2])?.to_u64().ok_or("invalid budget")?, wire::items(&p[3])?)
+            }
+            "scoped" if p.len() == 4 => {
+                self.push()?;
+                let result = (|| {
+                    self.commands(&p[1])?;
+                    self.check(wire::number(&p[2])?.to_u64().ok_or("invalid budget")?, wire::items(&p[3])?)
+                })();
+                let cleanup = self.pop();
+                match result { Ok(reply) => { cleanup?; Ok(reply) }, Err(e) => Err(e) }
+            }
             "commands" if p.len() == 2 => {
-                let forms = wire::items(&p[1])?;
-                if forms.len() > 4096 { return Err("command capacity exceeded".into()); }
-                for form in forms { self.command(form)?; }
+                self.commands(&p[1])?;
                 Ok(wire::ok())
             }
             "push" if p.len() == 1 => { self.push()?; Ok(wire::ok()) },
