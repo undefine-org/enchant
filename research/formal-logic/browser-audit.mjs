@@ -112,7 +112,7 @@ async function click(selector) {
     const element=document.querySelector(${JSON.stringify(selector)});
     if(!element) throw Error('Missing control: '+${JSON.stringify(selector)});
     if(element.disabled) throw Error('Disabled control: '+${JSON.stringify(selector)});
-    element.scrollIntoView({block:'nearest',inline:'nearest'});
+    element.scrollIntoView({block:'center',inline:'nearest'});
     const r=element.getBoundingClientRect();
     const x=Math.max(1,Math.min(innerWidth-2,r.x+r.width/2));
     const y=Math.max(1,Math.min(innerHeight-2,r.y+r.height/2));
@@ -210,12 +210,17 @@ try {
       await delay(50);
     }
     if (!ready) throw new Error(`Dossier did not initialize at ${viewport.name}`);
+    await evaluate('window.scrollTo(0,0)');
     await settle();
     const initial = await evaluate(`({title:document.title,graphs:[...document.querySelectorAll('.screen-graph')].map(g=>g.dataset.graph),
       readonly:window.__FORMAL_DOSSIER__.readOnly,
       enabledFeedback:document.querySelectorAll('form.fb button:not(:disabled),form.fb textarea:not(:disabled)').length,
       warnings:[...document.querySelectorAll('.warning')].map(e=>e.innerText),
-      width:document.documentElement.clientWidth,scrollWidth:document.documentElement.scrollWidth})`);
+      width:document.documentElement.clientWidth,scrollWidth:document.documentElement.scrollWidth,
+      overflowing:[...document.querySelectorAll('body *')].filter(e=>{
+        const r=e.getBoundingClientRect();return r.right>innerWidth+2 && r.width>0 && getComputedStyle(e).position!=='fixed';
+      }).slice(0,16).map(e=>({tag:e.tagName,cls:e.className,width:e.getBoundingClientRect().width,
+                             right:e.getBoundingClientRect().right,text:e.innerText?.slice(0,90)}))})`);
     const record = { ...viewport, initial, graphs: [] };
     report.viewports.push(record);
     check(`${viewport.name}: expected graph count`, initial.graphs.length === manifest['review-blocks'], { count: initial.graphs.length });
