@@ -7,8 +7,8 @@ Retirement: after review, merge or archive this branch, retain its evidence,
 then remove the worktree. It stays available for the requested prototype review.
 
 This project reuses the exact qualified SDK in `sdk-pin.json`; it changes no
-runtime inputs and produces no SDK. The ignored `.bl/sdks`, `.bl/platforms`, and
-`priv/z3` links reuse the integration checkout's retained artifacts.
+runtime inputs and produces no SDK. The ignored `priv/z3` link reuses the
+integration checkout's solver artifact. The runner needs no SDK cache links.
 
 This directory is a standalone project. Its runner verifies and invokes the
 qualified SDK's exact launcher, never the installed drop on PATH. The current
@@ -102,14 +102,17 @@ The last case is an adapter error, not an observed wrong SAT verdict: this
 adapter requires concrete scalar model values. A refusal gets a fresh worker
 for the next corpus entry, so it cannot contaminate the comparison.
 
-On this host, 100 tiny warm scoped integer contradictions measured a median
+In the retained [first sample](evidence/first-sample.json), 100 tiny warm scoped integer contradictions measured a median
 **127 µs OxiZ / 171 µs Z3**, maxima 244/367 µs. Each backend retained one
 prelude and made one OTP owner call per question; the wire protocols differ.
 The timer includes the respective adapters, and memo is disabled. The test
 does not measure startup, broad solver throughput, or large problems. It is
-evidence for this integration path only, not a general speed claim. Re-running
-the demo refreshes the report; the observation in this paragraph describes the
-first qualified sample.
+evidence for this integration path only, not a general speed claim. A repeat
+measured medians **159/388 µs** and maxima 444/4772 µs, illustrating host
+variation. The OxiZ series runs before the Z3 series; these are exploratory
+observations, not a controlled causal speedup measurement. Re-running the demo
+refreshes report.json. The [qualification receipt](evidence/qualification.json)
+retains the tested commits, output, SDK identity, and native artifact checksum.
 
 Keep Z3 authoritative. The useful next language change would be a forms-first
 backend seam in oracle with backend/version-scoped caching. This project proves
