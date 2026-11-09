@@ -1,0 +1,253 @@
+(ns formal.term)
+
+(def Bool [:bool])
+(def Int [:int])
+(def Real [:real])
+(def String [:string])
+(def Rounding [:rounding])
+
+(defn- fail [message data] (throw (ex-info (str "formal.term: " message) data)))
+(defn- require! [condition message data] (when-not condition (fail message data)))
+(defn- named! [value]
+ (require! (and (string? value) (pos? (count value))
+                (false? (String/contains? value (erlang/list_to_binary (list 0)))))
+           "a nonempty binary name without NUL is required" {:name value}) value)
+
+(declare sort? literal app)
+
+(defn sort? [sort]
+ (and (vector? sort)
+  (let [kind (first sort) n (count sort)]
+   (cond
+    (contains? #{:bool :int :real :string :rounding} kind) (= n 1)
+    (= :bv kind) (and (= n 2) (int? (second sort)) (<= 1 (second sort) 4096))
+    (= :fp kind) (and (= n 3) (int? (second sort)) (int? (nth sort 2))
+                      (<= 2 (second sort) 32) (<= 2 (nth sort 2) 4096))
+    (= :array kind) (and (= n 3) (sort? (second sort)) (sort? (nth sort 2)))
+    (= :seq kind) (and (= n 2) (sort? (second sort)))
+    (= :uninterpreted kind) (and (= n 2) (string? (second sort)))
+    (= :enum kind) (and (= n 3) (string? (second sort)) (vector? (nth sort 2))
+                        (pos? (count (nth sort 2)))
+                        (every? string? (nth sort 2))
+                        (= (count (nth sort 2)) (count (set (nth sort 2)))))
+    :else false))))
+
+(defn- sort! [sort] (require! (sort? sort) "invalid sort" {:sort sort}) sort)
+(defn bv-sort [width] (sort! [:bv width]))
+(defn fp-sort [exponent significand] (sort! [:fp exponent significand]))
+(defn array-sort [key-sort value-sort] (sort! [:array key-sort value-sort]))
+(defn seq-sort [element-sort] (sort! [:seq element-sort]))
+(defn enum-sort [name constructors] (named! name) (sort! [:enum name (vec constructors)]))
+(defn uninterpreted-sort [name] (named! name) (sort! [:uninterpreted name]))
+
+(defn term? [x] (and (map? x) (= 1 (:formal/term x))))
+(defn sort-of [term] (require! (term? term) "expected a term" {:value term}) (:sort term))
+(defn- node [op sort args data]
+ {:formal/term 1 :op op :sort (sort! sort) :args (vec args) :data data})
+(defn- arity! [op args n]
+ (require! (= n (count args)) "wrong arity" {:op op :expected n :actual (count args)}))
+(defn- operands! [op args sort]
+ (doseq [arg args]
+  (require! (= sort (sort-of arg)) "operand sort mismatch" {:op op :expected sort :actual (sort-of arg)})))
+(defn- result! [op actual expected]
+ (require! (= actual expected) "result sort mismatch" {:op op :expected expected :actual actual}))
+(defn- same! [op args]
+ (when (seq args) (operands! op args (sort-of (first args)))))
+(defn- arithmetic? [sort] (contains? #{[:int] [:real]} sort))
+
+(defn- gcd [a b]
+ (loop [x (if (< a 0) (- a) a) y (if (< b 0) (- b) b)]
+  (if (zero? y) x (recur y (erlang/rem x y)))))
+(defn rational [numerator denominator]
+ (require! (and (int? numerator) (int? denominator) (not= 0 denominator))
+           "a rational needs integer numerator and nonzero denominator" {:n numerator :d denominator})
+ (let [sign (if (< denominator 0) -1 1) divisor (gcd numerator denominator)]
+  [(erlang/div (* sign numerator) divisor) (erlang/div (* sign denominator) divisor)]))
+
+(defn literal [sort value]
+ (sort! sort)
+ (let [kind (first sort)]
+  (cond
+   (= :bool kind) (do (require! (or (= value true) (= value false)) "expected Boolean literal" {:value value})
+                     (node :bool sort [] value))
+   (= :int kind) (do (require! (int? value) "expected integer literal" {:value value}) (node :int sort [] value))
+   (= :real kind) (do (require! (and (sequential? value) (= 2 (count value))) "expected rational pair" {:value value})
+                     (node :real sort [] (rational (first value) (second value))))
+   (= :string kind) (do (require! (string? value) "expected text literal" {:value value}) (node :text sort [] value))
+   (= :bv kind) (do (require! (and (int? value) (>= value 0) (< value (erlang/bsl 1 (second sort))))
+                            "bit-vector literal outside width" {:sort sort :value value})
+                   (node :bv sort [] value))
+   (= :fp kind) (do (require! (and (int? value) (>= value 0)
+                                  (< value (erlang/bsl 1 (+ (second sort) (nth sort 2)))))
+                            "FP literal outside IEEE width" {:sort sort :value value})
+                   (node :fp-bits sort [] value))
+   (= :rounding kind) (do (require! (contains? #{"RNE" "RNA" "RTP" "RTN" "RTZ"} value)
+                                   "unknown rounding mode" {:value value}) (node :rounding sort [] value))
+   (= :enum kind) (do (require! (some (fn [name] (= name value)) (nth sort 2)) "unknown enum constructor" {:sort sort :value value})
+                     (node :enum sort [] value))
+   :else (fail "no ground literal encoding for sort" {:sort sort :value value}))))
+
+(defn bool [value] (literal Bool value))
+(defn int [value] (literal Int value))
+(defn real [numerator denominator] (literal Real [numerator denominator]))
+(defn text [value] (literal String value))
+(defn variable [name sort] (named! name) (node :var sort [] name))
+(defn bound [name sort] (named! name) (node :bound sort [] name))
+
+(defn app [op sort args data]
+ (sort! sort)
+ (let [args (vec args) n (count args)]
+  (doseq [arg args] (require! (term? arg) "application argument is not a term" {:op op :arg arg}))
+  (cond
+   (= :not op) (do (arity! op args 1) (operands! op args Bool) (result! op sort Bool))
+   (contains? #{:and :or} op) (do (operands! op args Bool) (result! op sort Bool))
+   (contains? #{:implies :xor} op) (do (arity! op args 2) (operands! op args Bool) (result! op sort Bool))
+   (= :eq op) (do (arity! op args 2) (same! op args) (result! op sort Bool))
+   (= :distinct op) (do (require! (>= n 2) "distinct requires two terms" {:op op}) (same! op args) (result! op sort Bool))
+   (= :ite op) (do (arity! op args 3) (operands! op [(first args)] Bool)
+                   (operands! op [(second args) (nth args 2)] sort))
+   (contains? #{:add :sub :mul :div} op)
+    (do (arity! op args 2) (require! (arithmetic? sort) "arithmetic result sort" {:sort sort}) (operands! op args sort))
+   (= :neg op) (do (arity! op args 1) (require! (arithmetic? sort) "negation requires arithmetic" {:sort sort}) (operands! op args sort))
+   (= :mod op) (do (arity! op args 2) (operands! op args Int) (result! op sort Int))
+   (contains? #{:lt :le :gt :ge} op)
+    (do (arity! op args 2) (same! op args) (require! (arithmetic? (sort-of (first args))) "ordered arithmetic required" {:op op}) (result! op sort Bool))
+   (= :to-real op) (do (arity! op args 1) (operands! op args Int) (result! op sort Real))
+   (contains? #{:to-int :is-int} op)
+    (do (arity! op args 1) (operands! op args Real) (result! op sort (if (= op :to-int) Int Bool)))
+   (= :array-const op) (do (arity! op args 1) (require! (= :array (first sort)) "expected array sort" {:sort sort})
+                           (operands! op args (nth sort 2)))
+   (= :select op) (do (arity! op args 2) (let [a (sort-of (first args))]
+                    (require! (= :array (first a)) "select requires array" {:sort a})
+                    (operands! op [(second args)] (second a)) (result! op sort (nth a 2))))
+   (= :store op) (do (arity! op args 3) (require! (= :array (first sort)) "store requires array" {:sort sort})
+                   (operands! op [(first args)] sort) (operands! op [(second args)] (second sort))
+                   (operands! op [(nth args 2)] (nth sort 2)))
+   (contains? #{:str-concat :str-contains :str-prefix :str-suffix} op)
+    (do (arity! op args 2) (operands! op args String) (result! op sort (if (= op :str-concat) String Bool)))
+   (= :str-len op) (do (arity! op args 1) (operands! op args String) (result! op sort Int))
+   (= :str-at op) (do (arity! op args 2) (operands! op [(first args)] String) (operands! op [(second args)] Int) (result! op sort String))
+   (= :str-substr op) (do (arity! op args 3) (operands! op [(first args)] String) (operands! op (rest args) Int) (result! op sort String))
+   (contains? #{:str-index :str-replace} op)
+    (do (arity! op args 3) (operands! op [(first args) (second args)] String)
+        (operands! op [(nth args 2)] (if (= op :str-index) Int String))
+        (result! op sort (if (= op :str-index) Int String)))
+   (contains? #{:bv-add :bv-sub :bv-mul :bv-and :bv-or :bv-xor :bv-shl :bv-lshr :bv-ashr} op)
+    (do (arity! op args 2) (require! (= :bv (first sort)) "expected BV sort" {:sort sort}) (operands! op args sort))
+   (contains? #{:bv-not :bv-neg} op)
+    (do (arity! op args 1) (require! (= :bv (first sort)) "expected BV sort" {:sort sort}) (operands! op args sort))
+   (contains? #{:bv-ult :bv-ule :bv-slt :bv-sle} op)
+    (do (arity! op args 2) (same! op args) (require! (= :bv (first (sort-of (first args)))) "BV comparison requires BV" {:op op}) (result! op sort Bool))
+   (= :bv-concat op)
+    (do (arity! op args 2) (doseq [a args] (require! (= :bv (first (sort-of a))) "concat requires BV" {:op op}))
+        (result! op sort (bv-sort (+ (second (sort-of (first args))) (second (sort-of (second args)))))))
+   (= :bv-extract op)
+    (do (arity! op args 1) (let [[high low] data width (second (sort-of (first args)))]
+         (require! (and (= :bv (first (sort-of (first args)))) (int? high) (int? low) (<= 0 low high) (< high width))
+                   "invalid BV extraction" {:data data :width width})
+         (result! op sort (bv-sort (inc (- high low))))))
+   (contains? #{:bv-zero-extend :bv-sign-extend} op)
+    (do (arity! op args 1) (require! (and (int? data) (>= data 0) (= :bv (first (sort-of (first args))))) "invalid BV extension" {:data data})
+        (result! op sort (bv-sort (+ data (second (sort-of (first args)))))))
+   (= :seq-empty op) (do (arity! op args 0) (require! (= :seq (first sort)) "expected Seq sort" {:sort sort}))
+   (= :seq-unit op) (do (arity! op args 1) (result! op sort (seq-sort (sort-of (first args)))))
+   (= :seq-concat op) (do (arity! op args 2) (require! (= :seq (first sort)) "expected Seq sort" {:sort sort}) (operands! op args sort))
+   (= :seq-len op) (do (arity! op args 1) (require! (= :seq (first (sort-of (first args)))) "expected Seq" {}) (result! op sort Int))
+   (= :seq-nth op) (do (arity! op args 2) (let [s (sort-of (first args))]
+                        (require! (= :seq (first s)) "expected Seq" {}) (operands! op [(second args)] Int) (result! op sort (second s))))
+   (= :seq-extract op) (do (arity! op args 3) (require! (= :seq (first sort)) "expected Seq" {})
+                          (operands! op [(first args)] sort) (operands! op (rest args) Int))
+   (= :uf op) (let [domain (get data "domain") range (get data "range")]
+                (named! (get data "name")) (require! (= n (count domain)) "UF arity" {:data data})
+                (doseq [[arg s] (map vector args domain)] (operands! op [arg] s)) (result! op sort range))
+   (contains? #{:forall :exists} op)
+    (do (arity! op args 1) (operands! op args Bool) (result! op sort Bool)
+        (require! (and (sequential? data) (seq data)) "quantifier needs binders" {})
+        (doseq [[name s] data] (named! name) (sort! s)))
+   (contains? #{:fp-add :fp-sub :fp-mul :fp-div} op)
+    (do (arity! op args 3) (operands! op [(first args)] Rounding)
+        (require! (= :fp (first sort)) "expected FP" {}) (operands! op (rest args) sort))
+   (= :fp-neg op) (do (arity! op args 1) (require! (= :fp (first sort)) "expected FP" {}) (operands! op args sort))
+   (contains? #{:fp-eq :fp-lt :fp-le} op)
+    (do (arity! op args 2) (same! op args) (require! (= :fp (first (sort-of (first args)))) "expected FP" {}) (result! op sort Bool))
+   (contains? #{:fp-is-nan :fp-is-inf :fp-to-ieee-bv} op)
+    (do (arity! op args 1) (let [s (sort-of (first args))]
+      (require! (= :fp (first s)) "expected FP" {})
+      (result! op sort (if (= op :fp-to-ieee-bv) (bv-sort (+ (second s) (nth s 2))) Bool))))
+   :else (fail "unknown primitive operation" {:op op}))
+  (node op sort args data)))
+
+(defn eq [a b] (app :eq Bool [a b] nil))
+(defn not [x] (app :not Bool [x] nil))
+(defn all [terms] (app :and Bool (vec terms) nil))
+(defn any [terms] (app :or Bool (vec terms) nil))
+(defn implies [a b] (app :implies Bool [a b] nil))
+(defn ite [c a b] (app :ite (sort-of a) [c a b] nil))
+(defn distinct [terms] (app :distinct Bool (vec terms) nil))
+(defn add [a b] (app :add (sort-of a) [a b] nil))
+(defn sub [a b] (app :sub (sort-of a) [a b] nil))
+(defn neg [a] (app :neg (sort-of a) [a] nil))
+(defn mul [a b] (app :mul (sort-of a) [a b] nil))
+(defn div [a b] (app :div (sort-of a) [a b] nil))
+(defn mod [a b] (app :mod Int [a b] nil))
+(defn lt [a b] (app :lt Bool [a b] nil))
+(defn le [a b] (app :le Bool [a b] nil))
+(defn gt [a b] (app :gt Bool [a b] nil))
+(defn ge [a b] (app :ge Bool [a b] nil))
+(defn select [array key] (app :select (nth (sort-of array) 2) [array key] nil))
+(defn store [array key value] (app :store (sort-of array) [array key value] nil))
+(defn const-array [key-sort value] (app :array-const (array-sort key-sort (sort-of value)) [value] nil))
+(defn uf [name domain range args] (app :uf range args {"name" name "domain" (vec domain) "range" range}))
+(defn forall [binders body] (app :forall Bool [body] (mapv (fn [b] [(:data b) (sort-of b)]) binders)))
+(defn exists [binders body] (app :exists Bool [body] (mapv (fn [b] [(:data b) (sort-of b)]) binders)))
+
+(defn walk
+ "Unique portable terms in topological order. Term identity excludes source origin."
+ [roots]
+ (let [seen (atom #{}) ordered (atom [])]
+  (letfn [(visit [term depth]
+           (require! (<= depth 256) "term depth capacity" {})
+           (require! (term? term) "non-term root" {:root term})
+           (when-not (contains? @seen term)
+            (doseq [child (:args term)] (visit child (inc depth)))
+            (swap! seen conj term) (swap! ordered conj term)))]
+   (doseq [root roots] (visit root 0)) @ordered)))
+
+(defn variables [roots]
+ (vec (filter (fn [term] (= :var (:op term))) (walk roots))))
+
+(defn free-bound
+ "Free binder identities, used to prevent an escaped binder becoming a constant."
+ [term]
+ (letfn [(visit [node names]
+          (cond (= :bound (:op node)) (if (contains? names (:data node)) #{} #{(:data node)})
+           (contains? #{:forall :exists} (:op node))
+            (visit (first (:args node)) (into names (map first (:data node))))
+           :else (reduce (fn [acc child] (into acc (visit child names))) #{} (:args node))))]
+  (visit term #{})))
+
+(defn substitute [term replacements]
+ (if (contains? replacements term) (get replacements term)
+  (if (empty? (:args term)) term
+   (app (:op term) (:sort term) (mapv (fn [child] (substitute child replacements)) (:args term)) (:data term)))))
+
+(defn registry [] {:next 1 :ids {} :definitions {}})
+(defn export
+ "Intern roots in a persistent session registry. Returns only newly imported nodes.
+  IDs are session-local, not semantic hashes; full term equality guards sharing."
+ [registry roots]
+ (let [state (atom registry) added (atom [])]
+  (doseq [root roots]
+   (require! (empty? (free-bound root)) "free bound variable" {:free (free-bound root)}))
+  (doseq [term (walk roots)]
+   (when-not (contains? (:ids @state) term)
+    (let [id (:next @state) args (mapv (fn [child] (get (:ids @state) child)) (:args term))
+          definition [id (name (:op term)) (:sort term) args (:data term)]]
+     (swap! state (fn [s] (-> s (update :next inc) (assoc-in [:ids term] id) (assoc-in [:definitions id] definition))))
+     (swap! added conj definition))))
+  {:registry @state :nodes @added :ids (mapv (fn [root] (get (:ids @state) root)) roots)}))
+
+(defn semantic-data [term]
+ [(:op term) (:sort term) (mapv semantic-data (:args term)) (:data term)])
+(defn digest [terms]
+ (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary (mapv semantic-data terms))) (list (tuple :case :lower))))
