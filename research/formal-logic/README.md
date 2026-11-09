@@ -12,6 +12,12 @@ implemented fragments and deferred work distinguished per family. It does not
 claim 46 complete solver theories. [CONTRACT.md](CONTRACT.md) defines the shared
 data contract; [INTEGRATION.md](INTEGRATION.md) describes the production cutover.
 
+Open the [standalone interactive atlas](evidence/dossier/atlas.html) to explore
+connected cards and source evidence. Its [browser audit](evidence/dossier/browser-audit/audit.json)
+passes 184 checks over all 12 graphs at desktop and phone sizes, including
+navigation/Back, map selection, fullscreen/Escape, overflow and themes. Local
+feedback is read-only, and rendering starts no server or application.
+
 Owner: the integration session in the repository's `main` checkout. The
 requested `prototype/oxiz-worker` worktree supplied isolation for this
 experiment; the qualified research batch is integrated and archived, with the
