@@ -296,7 +296,7 @@ impl Backend for Oxiz {
                 if bits < BigInt::zero() || bits >= (BigInt::one() << (eb+sb)) { return Err(Fault::invalid("IEEE bit pattern exceeds format")); }
                 let sign = ((&bits >> (eb+sb-1)) & BigInt::one()) == BigInt::one();
                 let exp = (&bits >> (sb-1)) & ((BigInt::one()<<eb)-1);
-                let sig = bits & ((BigInt::one()<<(sb-1))-1);
+                let sig: BigInt = bits & ((BigInt::one()<<(sb-1))-1);
                 // The SMT FP sort has exactly one NaN. OxiZ's raw FpLit
                 // constructor preserves sign/payload and bare FP equalities
                 // can otherwise remain in its EUF route. Normalize this

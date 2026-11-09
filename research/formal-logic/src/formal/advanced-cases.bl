@@ -1,0 +1,142 @@
+(ns formal.advanced-cases
+ (:require [formal.term :as t] [formal.value :as v]
+           [formal.bits :as bits] [formal.floating :as fp]))
+
+;; Pure named builders. The shared harness owns backend selection and replay.
+(defn- case-of [id family inputs property expected observations]
+ {:id id :family family :assumptions (vec (distinct (concat (mapcat v/constraints inputs)
+                                                    (map v/defined inputs) (map v/within inputs))))
+  :property property :expected expected :observations observations
+  :scope (v/join-scope inputs) :profile :formal/native-value-prototype-v1})
+
+(defn word-cases []
+ (let [fields [{:name :tag :width 3} {:name :flags :width 5} {:name :length :width 16}]
+       little (bits/layout fields {:field-order :msb-first :byte-order :little})
+       big (bits/layout fields {:field-order :msb-first :byte-order :big})
+       low-first (bits/layout fields {:field-order :lsb-first :byte-order :little})
+       values {:tag (bits/variable "header.tag" 3) :flags (bits/variable "header.flags" 5)
+               :length (bits/variable "header.length" 16)}
+       packed (bits/pack little values) raw (bits/variable "header.raw" 24)
+       decoded (bits/unpack little raw) replacement (bits/variable "header.replacement" 16)
+       changed (bits/update-field little raw :length replacement)
+       concrete (bits/word 24 1193046) ;; 0x123456
+       little-bytes (bits/to-bytes little concrete) big-bytes (bits/to-bytes big concrete)
+       x (bits/variable "word.x" 8) y (bits/variable "word.y" 8) one (bits/word 8 1)
+       maximum (bits/word 8 255) signed-maximum (bits/word 8 127)
+       signed-minimum (bits/word 8 128)
+       sum-wide (bits/add (bits/zero-extend x 1) (bits/zero-extend y 1))]
+  [(case-of :bits/fields-roundtrip :bit-layouts (vec (vals values))
+     (t/all (map (fn [[name value]]
+              (v/term (bits/equal (bits/read-field little packed name) value))) values)) :proved
+     {"packed" packed "decoded" (bits/unpack little packed)})
+   (case-of :bits/word-roundtrip :bit-layouts [raw]
+     (bits/equal (bits/pack little decoded) raw) :proved {"word" raw "fields" decoded})
+   (case-of :bits/low-fields-roundtrip :bit-layouts (vec (vals values))
+     (t/all (map (fn [[name value]]
+              (v/term (bits/equal (bits/read-field low-first (bits/pack low-first values) name) value))) values))
+     :proved {"low-first" (bits/pack low-first values) "high-first" packed})
+   (case-of :bits/lens-read-write :bit-field-lenses [raw replacement]
+     (bits/equal (bits/read-field little changed :length) replacement) :proved
+     {"before" raw "replacement" replacement "after" changed})
+   (case-of :bits/lens-other-field-preserved :bit-field-lenses [raw replacement]
+     (bits/equal (bits/read-field little changed :tag) (bits/read-field little raw :tag)) :proved
+     {"before" raw "after" changed})
+   (case-of :bits/lens-write-existing-is-identity :bit-field-lenses [raw]
+     (bits/equal (bits/update-field little raw :flags (bits/read-field little raw :flags)) raw) :proved
+     {"before" raw})
+   (case-of :bits/little-endian-bytes-roundtrip :binary-codecs [raw]
+     (bits/equal (bits/from-bytes little (bits/to-bytes little raw)) raw) :proved
+     {"word" raw "bytes" (bits/to-bytes little raw)})
+   (case-of :bits/big-endian-bytes-roundtrip :binary-codecs [raw]
+     (bits/equal (bits/from-bytes big (bits/to-bytes big raw)) raw) :proved
+     {"word" raw "bytes" (bits/to-bytes big raw)})
+   (case-of :bits/byte-order-is-explicit :binary-codecs [concrete]
+     (t/all [(v/term (bits/equal (first (:value little-bytes)) (bits/word 8 86)))
+             (v/term (bits/equal (first (:value big-bytes)) (bits/word 8 18)))]) :proved
+     {"little" little-bytes "big" big-bytes})
+   (case-of :bits/wrong-byte-order-changes-value :binary-codecs [concrete]
+     (bits/equal (bits/from-bytes big little-bytes) concrete) :refuted
+     {"bytes" little-bytes "wrong-order" (bits/from-bytes big little-bytes) "original" concrete})
+   (case-of :bits/wrapping-unsigned-overflow :machine-integer-semantics [maximum one]
+     (t/all [(v/term (bits/equal (bits/add maximum one) (bits/word 8 0)))
+             (v/term (bits/unsigned-add-overflow? maximum one))
+             (t/not (v/defined (bits/checked-add maximum one :unsigned)))]) :proved
+     {"wrapped" (bits/add maximum one) "checked" (bits/checked-add maximum one :unsigned)})
+   (case-of :bits/signed-and-unsigned-overflow-differ :machine-integer-semantics [signed-maximum one]
+     (t/all [(v/term (bits/signed-add-overflow? signed-maximum one))
+             (t/not (v/term (bits/unsigned-add-overflow? signed-maximum one)))]) :proved
+     {"wrapped" (bits/add signed-maximum one)})
+   (case-of :bits/signed-subtraction-overflow :machine-integer-semantics [signed-minimum one]
+     (bits/signed-subtract-overflow? signed-minimum one) :proved
+     {"wrapped" (bits/subtract signed-minimum one) "checked" (bits/checked-subtract signed-minimum one :signed)})
+   (case-of :bits/multiplication-overflow-is-visible :machine-integer-semantics [signed-minimum]
+     (t/all [(v/term (bits/unsigned-multiply-overflow? signed-minimum (bits/word 8 2)))
+             (v/term (bits/signed-multiply-overflow? signed-minimum (bits/word 8 2)))]) :proved
+     {"wrapped" (bits/multiply signed-minimum (bits/word 8 2))})
+   (case-of :bits/add-overflow-is-the-widened-carry :machine-integer-semantics [x y]
+     (t/eq (v/term (bits/unsigned-add-overflow? x y))
+           (v/term (bits/equal (bits/extract sum-wide 8 8) (bits/word 1 1)))) :proved
+     {"left" x "right" y "wide-sum" sum-wide "wrapped" (bits/add x y)})
+   (case-of :bits/wrapping-add-is-not-monotone :machine-integer-semantics [x]
+     (t/not (v/term (bits/unsigned-less? (bits/add x one) x))) :refuted
+     {"input" x "after" (bits/add x one)})]))
+
+(defn- half-case [id family inputs property expected observations arithmetic]
+ (assoc (case-of id family inputs property expected observations)
+  :profile :formal/binary16-rne-prototype-v1
+  :scope {:mode :finite-universe :format [:fp 5 11] :rounding "RNE"
+          :source-semantics :declared-format-only :binary64-qualified false}
+  :evidence {:arithmetic arithmetic
+             :ground-arithmetic-replay (if arithmetic :unavailable :not-required)
+             :qualification :requires-native-backend-result
+             :sat-arithmetic-policy :candidate-until-independent-replay}))
+
+(defn floating-cases []
+ (let [zero (fp/bits 5 11 0) minus-zero (fp/bits 5 11 32768)
+       one (fp/bits 5 11 15360) two (fp/bits 5 11 16384)
+       large (fp/bits 5 11 26624) negative-large (fp/bits 5 11 59392) ;; +/-2048
+       maximum (fp/bits 5 11 31743) ;; largest finite binary16 = 65504
+       nan (fp/ieee-bits 5 11 32257)
+       divided (fp/divide one zero) raw-divided (fp/ieee-divide one zero)
+       overflow (fp/multiply maximum two) raw-overflow (fp/ieee-multiply maximum two)
+       left (fp/add (fp/add large one) negative-large)
+       right (fp/add large (fp/add one negative-large))
+       rounded (fp/add large one)
+       propagated (fp/add divided one)
+       x (fp/variable "half.finite.x" 5 11)]
+  [(half-case :fp/signed-zeros-numerically-equal :floating-equality [zero minus-zero]
+     (fp/numeric-equal zero minus-zero) :proved {"positive-zero" zero "negative-zero" minus-zero} false)
+   (half-case :fp/signed-zeros-representations-differ :floating-equality [zero minus-zero]
+     (fp/representation-equal zero minus-zero) :refuted
+     {"positive-zero-bits" (fp/representation zero) "negative-zero-bits" (fp/representation minus-zero)} false)
+   (half-case :fp/outcome-equivalence-ignores-zero-sign :floating-outcomes [zero minus-zero]
+     (fp/equivalent zero minus-zero) :proved {"left" zero "right" minus-zero} false)
+   (half-case :fp/division-zero-is-failed-finite-outcome :floating-outcomes [one zero]
+     (t/not (v/defined divided)) :proved {"finite-outcome" divided} true)
+   (half-case :fp/raw-ieee-division-zero-is-infinite :raw-ieee [one zero]
+     (fp/infinite? raw-divided) :proved {"raw-ieee" raw-divided} true)
+   (half-case :fp/overflow-is-failed-finite-outcome :floating-outcomes [maximum two]
+     (t/not (v/defined overflow)) :proved {"finite-outcome" overflow} true)
+   (half-case :fp/raw-ieee-overflow-is-infinite :raw-ieee [maximum two]
+     (fp/infinite? raw-overflow) :proved {"raw-ieee" raw-overflow} true)
+   (half-case :fp/raw-ieee-zero-div-zero-is-nan :raw-ieee [zero]
+     (fp/nan? (fp/ieee-divide zero zero)) :proved {"raw-ieee" (fp/ieee-divide zero zero)} true)
+   (half-case :fp/nan-is-not-numerically-reflexive :raw-ieee [nan]
+     (fp/numeric-equal nan nan) :refuted {"nan" nan} false)
+   (half-case :fp/no-nan-payload-promise :floating-representation [nan]
+     (t/not (v/defined (fp/representation nan))) :proved {"pattern" (fp/representation nan)} false)
+   (half-case :fp/nan-is-outside-finite-input-domain :floating-admission []
+     (t/not (v/within (fp/finite nan))) :proved {"input" (fp/finite nan)} false)
+   (half-case :fp/ground-nonassociativity-witness :floating-algebra [large one negative-large]
+     (t/all [(v/defined left) (v/defined right)
+             (t/not (v/term (fp/numeric-equal left right)))
+             (v/term (fp/numeric-equal left zero)) (v/term (fp/numeric-equal right one))]) :proved
+     {"a" large "b" one "c" negative-large "left" left "right" right} true)
+   (half-case :fp/rne-halfway-rounds-to-even :floating-rounding [large one]
+     (fp/numeric-equal rounded large) :proved {"rounded" rounded "exact-input-a" large "exact-input-b" one} true)
+   (half-case :fp/failed-operand-does-not-become-a-domain-assumption :floating-outcomes [one zero]
+     (t/all [(t/not (v/defined propagated)) (v/within propagated)]) :proved {"result" propagated} true)
+   (half-case :fp/double-negation-preserves-finite-pattern :floating-representation [x]
+     (fp/representation-equal (fp/negate (fp/negate x)) x) :proved {"input" x} false)]))
+
+(defn cases [] (vec (concat (word-cases) (floating-cases))))

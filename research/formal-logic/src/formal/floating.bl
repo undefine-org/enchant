@@ -1,0 +1,101 @@
+(ns formal.floating (:require [formal.term :as t] [formal.value :as v]))
+
+;; A declared FP(e,s) model, not a claim that binary16 qualifies BEAM binary64.
+;; Raw IEEE operations and a proposed finite-result outcome profile coexist.
+;; Gradual underflow to a subnormal or signed zero remains a successful result.
+(def RNE (t/literal t/Rounding "RNE"))
+(defn format [exponent significand] (t/fp-sort exponent significand))
+(defn- format-of [value]
+ (let [sort (t/sort-of (v/term value))]
+  (when-not (= :fp (first sort)) (throw (ex-info "Expected a declared FP value" {:sort sort}))) sort))
+(defn- fp-scope [sort admission]
+ {:mode :finite-universe :format sort :rounding "RNE" :input-admission admission
+  :source-semantics :declared-format-only})
+(defn- fp-domain [sort profile] {:kind :scalar :format sort :rounding "RNE" :profile profile})
+(defn- predicate [op value]
+ (t/app op t/Bool [(v/term value)] nil))
+(defn- finite-term [value]
+ (format-of value)
+ (t/all [(t/not (predicate :fp-is-nan value)) (t/not (predicate :fp-is-inf value))]))
+
+(defn ieee-bits
+ "Raw IEEE input pattern. SMT identifies NaNs; NaN payload preservation is
+  deliberately not promised by this constructor or any operation."
+ [exponent significand bits]
+ (let [sort (format exponent significand)]
+  (v/make (t/literal sort bits)
+   {:scope (fp-scope sort :ieee-values) :domain (fp-domain sort :ieee/raw-rne-v1)})))
+(defn ieee-variable [name exponent significand]
+ (let [sort (format exponent significand)]
+  (v/make (t/variable name sort)
+   {:scope (fp-scope sort :ieee-values) :domain (fp-domain sort :ieee/raw-rne-v1)})))
+(defn finite
+ "Admit an input only when it is finite. Admission is :within, independent
+  of whether evaluating this input raised. Do not apply this to hide an
+  operation's failed finite-result obligation."
+ [value]
+ (let [value (v/lift value) sort (format-of value)]
+  (assoc value :within (t/all [(v/within value) (t/implies (v/defined value) (finite-term value))])
+               :scope (fp-scope sort :finite)
+               :domain (fp-domain sort :formal/fp-finite-rne-outcome-v1))))
+(defn bits [exponent significand pattern] (finite (ieee-bits exponent significand pattern)))
+(defn variable [name exponent significand] (finite (ieee-variable name exponent significand)))
+(defn finite? [value] (v/scalar (finite-term value) [value] {}))
+(defn nan? [value] (v/scalar (predicate :fp-is-nan value) [value] {}))
+(defn infinite? [value] (v/scalar (predicate :fp-is-inf value) [value] {}))
+
+(defn- ieee-operation [op a b]
+ (let [sort (format-of a)]
+  (when-not (= sort (format-of b)) (throw (ex-info "Floating formats differ" {})))
+  (v/scalar (t/app op sort [RNE (v/term a) (v/term b)] nil) [a b]
+   {:domain (fp-domain sort :ieee/raw-rne-v1)})))
+(defn ieee-add [a b] (ieee-operation :fp-add a b))
+(defn ieee-subtract [a b] (ieee-operation :fp-sub a b))
+(defn ieee-multiply [a b] (ieee-operation :fp-mul a b))
+(defn ieee-divide [a b] (ieee-operation :fp-div a b))
+(defn ieee-negate [value]
+ (v/scalar (t/app :fp-neg (format-of value) [(v/term value)] nil) [value]
+  {:domain (fp-domain (format-of value) :ieee/raw-rne-v1)}))
+(defn- outcome [raw operands]
+ (let [sort (format-of raw)
+       input-admission (map (fn [operand]
+                          (t/implies (v/defined operand) (finite-term operand))) operands)]
+  (assoc raw
+   :defined (t/all [(v/defined raw) (finite-term raw)])
+   :within (t/all (concat (map v/within operands) input-admission))
+   :scope (fp-scope sort :finite)
+   :domain (fp-domain sort :formal/fp-finite-rne-outcome-v1)
+   :errors {:operand-undefined (t/not (v/defined raw))
+            :nonfinite-nan (t/all [(v/defined raw) (predicate :fp-is-nan raw)])
+            :nonfinite-infinity (t/all [(v/defined raw) (predicate :fp-is-inf raw)])})))
+(defn add [a b] (outcome (ieee-add a b) [a b]))
+(defn subtract [a b] (outcome (ieee-subtract a b) [a b]))
+(defn multiply [a b] (outcome (ieee-multiply a b) [a b]))
+(defn divide [a b] (outcome (ieee-divide a b) [a b]))
+(defn negate [value] (outcome (ieee-negate value) [value]))
+
+(defn numeric-equal
+ "IEEE numeric equality: signed zeros agree; NaN equals no value, including
+  itself. This is explicitly different from SMT equality of FP terms."
+ [a b]
+ (v/scalar (t/app :fp-eq t/Bool [(v/term a) (v/term b)] nil) [a b]
+  {:domain {:kind :scalar :profile :ieee/numeric-equality-v1}}))
+(defn representation
+ "The nonNaN IEEE pattern. No result is promised for a NaN: SMT does not
+  preserve NaN payloads and fp.to_ieee_bv is unspecified for NaN."
+ [value]
+ (let [sort (format-of value) n (+ (second sort) (nth sort 2)) nonnan (t/not (predicate :fp-is-nan value))]
+  (v/scalar (t/app :fp-to-ieee-bv (t/bv-sort n) [(v/term value)] nil) [value]
+   {:defined (t/all [(v/defined value) nonnan])
+    :domain {:kind :scalar :format sort :profile :ieee/non-nan-representation-v1}
+    :errors {:unspecified-nan-encoding (t/not nonnan)}})))
+(defn representation-equal [a b] (v/equal (representation a) (representation b)))
+(defn equivalent
+ "Raisedness plus IEEE numeric equality on successful results. Exception
+  categories, effects, termination and NaN payloads are outside this profile."
+ [a b]
+ (let [same (v/term (numeric-equal a b))]
+  (v/make (t/all [(t/eq (v/defined a) (v/defined b)) (t/implies (v/defined a) same)])
+   {:within (t/all [(v/within a) (v/within b)])
+    :constraints (vec (distinct (concat (v/constraints a) (v/constraints b))))
+    :scope (v/join-scope [a b]) :domain {:kind :scalar :profile :formal/fp-outcome-equivalence-v1}})))

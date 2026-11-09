@@ -1,0 +1,160 @@
+(ns formal.bits (:require [formal.term :as t] [formal.value :as v]))
+
+;; Fixed-width words are distinct from unbounded BL integers. No conversion
+;; silently truncates an integer; wrapping is an explicitly named operation.
+(defn- width [value]
+ (let [sort (t/sort-of (v/term value))]
+  (when-not (= :bv (first sort)) (throw (ex-info "Expected a fixed-width word" {:sort sort})))
+  (second sort)))
+(defn- domain [n profile] {:kind :scalar :width n :profile profile})
+(defn- word-scope [n] {:mode :finite-universe :bit-width n :values :all-bit-patterns})
+(defn word [n unsigned]
+ (v/make (t/literal (t/bv-sort n) unsigned)
+  {:scope (word-scope n) :domain (domain n :formal/fixed-width-word-v1)}))
+(defn variable [name n]
+ (v/make (t/variable name (t/bv-sort n))
+  {:scope (word-scope n) :domain (domain n :formal/fixed-width-word-v1)}))
+(defn- binary [op a b]
+ (let [n (width a)]
+  (when-not (= n (width b)) (throw (ex-info "Word widths differ" {})))
+  (v/scalar (t/app op (t/bv-sort n) [(v/term a) (v/term b)] nil) [a b]
+   {:domain (domain n :formal/wrapping-word-v1)})))
+(defn add [a b] (binary :bv-add a b))
+(defn subtract [a b] (binary :bv-sub a b))
+(defn multiply [a b] (binary :bv-mul a b))
+(defn bit-and [a b] (binary :bv-and a b))
+(defn bit-or [a b] (binary :bv-or a b))
+(defn bit-xor [a b] (binary :bv-xor a b))
+(defn shift-left [a count] (binary :bv-shl a count))
+(defn shift-right-logical [a count] (binary :bv-lshr a count))
+(defn shift-right-arithmetic [a count] (binary :bv-ashr a count))
+(defn negate [a]
+ (v/scalar (t/app :bv-neg (t/bv-sort (width a)) [(v/term a)] nil) [a]
+  {:domain (domain (width a) :formal/wrapping-word-v1)}))
+(defn equal [a b] (v/equal a b))
+(defn unsigned-less? [a b]
+ (v/scalar (t/app :bv-ult t/Bool [(v/term a) (v/term b)] nil) [a b] {}))
+(defn signed-less? [a b]
+ (v/scalar (t/app :bv-slt t/Bool [(v/term a) (v/term b)] nil) [a b] {}))
+
+(defn extract [a high low]
+ (width a)
+ (let [n (inc (- high low))]
+  (v/scalar (t/app :bv-extract (t/bv-sort n) [(v/term a)] [high low]) [a]
+   {:domain (domain n :formal/word-slice-v1)})))
+(defn concatenate [high low]
+ (let [n (+ (width high) (width low))]
+  (v/scalar (t/app :bv-concat (t/bv-sort n) [(v/term high) (v/term low)] nil) [high low]
+   {:domain (domain n :formal/word-concatenation-v1)})))
+(defn- extend [op value extra]
+ (let [n (+ (width value) extra)]
+  (v/scalar (t/app op (t/bv-sort n) [(v/term value)] extra) [value]
+   {:domain (domain n :formal/word-extension-v1)})))
+(defn zero-extend [value extra] (extend :bv-zero-extend value extra))
+(defn sign-extend [value extra] (extend :bv-sign-extend value extra))
+(defn- sign [value] (let [i (dec (width value))] (v/term (extract value i i))))
+
+(defn unsigned-add-overflow? [a b] (unsigned-less? (add a b) a))
+(defn unsigned-subtract-overflow? [a b] (unsigned-less? a b))
+(defn signed-add-overflow? [a b]
+ (let [result (add a b)]
+  (v/scalar (t/all [(t/eq (sign a) (sign b)) (t/not (t/eq (sign result) (sign a)))]) [a b] {})))
+(defn signed-subtract-overflow? [a b]
+ (let [result (subtract a b)]
+  (v/scalar (t/all [(t/not (t/eq (sign a) (sign b))) (t/not (t/eq (sign result) (sign a)))]) [a b] {})))
+(defn unsigned-multiply-overflow? [a b]
+ ;; Widening is exact; widths above 2048 deliberately exceed the kernel's
+ ;; 4096-bit capacity and are refused rather than approximated.
+ (let [n (width a) wide (multiply (zero-extend a n) (zero-extend b n))]
+  (v/scalar (t/not (t/eq (v/term (extract wide (dec (* 2 n)) n)) (v/term (word n 0)))) [a b] {})))
+(defn signed-multiply-overflow? [a b]
+ (let [n (width a) wide (multiply (sign-extend a n) (sign-extend b n))
+       wrapped (multiply a b)]
+  (v/scalar (t/not (t/eq (v/term wide) (v/term (sign-extend wrapped n)))) [a b] {})))
+(defn- checked [operation overflow a b interpretation]
+ (when-not (contains? #{:unsigned :signed} interpretation)
+  (throw (ex-info "Checked word interpretation must be :unsigned or :signed" {})))
+ (let [result (operation a b) too-large ((get overflow interpretation) a b)]
+  (assoc result :defined (t/all [(v/defined result) (t/not (v/term too-large))])
+                :domain (assoc (domain (width result) :formal/checked-word-v1) :interpretation interpretation)
+                :errors {:operand-undefined (t/not (v/defined result))
+                         :integer-overflow (t/all [(v/defined result) (v/term too-large)])})))
+(defn checked-add [a b interpretation]
+ (checked add {:unsigned unsigned-add-overflow? :signed signed-add-overflow?} a b interpretation))
+(defn checked-subtract [a b interpretation]
+ (checked subtract {:unsigned unsigned-subtract-overflow? :signed signed-subtract-overflow?} a b interpretation))
+(defn checked-multiply [a b interpretation]
+ (checked multiply {:unsigned unsigned-multiply-overflow? :signed signed-multiply-overflow?} a b interpretation))
+
+(defn layout
+ "Declare every field's bit width and explicit field/byte order. Field order
+  assigns bit positions; byte order controls serialization, independently.
+  Signed annotation is interpretation metadata, never implicit extension."
+ [fields opts]
+ (let [fields (vec fields) n (reduce + 0 (map :width fields))
+       order (:field-order opts) byte-order (:byte-order opts)]
+  (when-not (and (seq fields) (<= 1 n 4096)
+                (contains? #{:msb-first :lsb-first} order)
+                (contains? #{:big :little} byte-order)
+                (every? (fn [field] (and (keyword? (:name field)) (int? (:width field))
+                                          (pos? (:width field))
+                                          (every? (fn [key] (contains? #{:name :width :signed?} key)) (keys field))
+                                          (or (not (contains? field :signed?))
+                                              (contains? #{true false} (:signed? field))))) fields)
+                (= (count fields) (count (distinct (map :name fields)))))
+   (throw (ex-info "Layout requires distinct named fields, positive widths and explicit field/byte order" {})))
+  {:formal/bit-layout 1 :width n :field-order order :byte-order byte-order
+   :fields (mapv (fn [i]
+              (let [field (nth fields i) offset (reduce + 0 (map :width (take i fields)))
+                    low (if (= order :msb-first) (- n offset (:width field)) offset)]
+               (assoc field :low low :high (dec (+ low (:width field)))))) (range (count fields)))
+   :profile :formal/bit-layout-v1}))
+(defn- field-spec [layout name]
+ (or (first (filter #(= name (:name %)) (:fields layout)))
+     (throw (ex-info "Unknown bit layout field" {:name name}))))
+(defn- packed! [layout value]
+ (when-not (= (:width layout) (width value))
+  (throw (ex-info "Packed word does not match layout width" {}))) value)
+(defn read-field [layout packed name]
+ (packed! layout packed)
+ (let [field (field-spec layout name)] (extract packed (:high field) (:low field))))
+(defn unpack [layout packed]
+ (packed! layout packed)
+ (v/make (into {} (map (fn [field] [(:name field) (read-field layout packed (:name field))]) (:fields layout)))
+  (merge (v/context [packed]) {:domain {:kind :bit-fields :layout layout :profile :formal/unpacked-fields-v1}})))
+(defn pack [layout fields]
+ (let [values (if (v/value? fields) (:value fields) fields)
+       expected (set (map :name (:fields layout)))]
+  (when-not (and (map? values) (= expected (set (keys values))))
+   (throw (ex-info "Packed field names do not match the declared layout" {})))
+  (doseq [field (:fields layout)]
+   (when-not (= (:width field) (width (get values (:name field))))
+    (throw (ex-info "Packed field width differs from layout" {:field (:name field)}))))
+  (let [ordered (reverse (sort-by :low (:fields layout)))
+        parts (mapv #(get values (:name %)) ordered)
+        result (reduce concatenate (first parts) (rest parts))
+        operands (cond-> (vec (vals values)) (v/value? fields) (conj fields))]
+   (v/scalar (v/term result) operands {:domain (domain (:width layout) :formal/packed-fields-v1)}))))
+(defn update-field [layout packed name value]
+ (field-spec layout name)
+ (pack layout (assoc (:value (unpack layout packed)) name value)))
+(defn to-bytes
+ "Serialize a byte-aligned packed word according to the layout's byte order."
+ [layout packed]
+ (packed! layout packed)
+ (when-not (zero? (erlang/rem (:width layout) 8))
+  (throw (ex-info "Byte serialization requires a byte-aligned layout" {})))
+ (let [n (erlang/div (:width layout) 8)
+       indices (if (= :little (:byte-order layout)) (range n) (reverse (range n)))]
+  (v/make (mapv (fn [i] (extract packed (+ (* i 8) 7) (* i 8))) indices)
+   (merge (v/context [packed])
+    {:domain {:kind :word-bytes :length n :byte-order (:byte-order layout) :profile :formal/packed-bytes-v1}}))))
+(defn from-bytes [layout bytes]
+ (let [parts (if (v/value? bytes) (:value bytes) bytes)]
+  (when-not (and (vector? parts) (seq parts) (= (:width layout) (* 8 (count parts)))
+                (every? #(= 8 (width %)) parts))
+   (throw (ex-info "Serialized bytes do not cover the declared layout" {})))
+  (let [ordered (if (= :little (:byte-order layout)) (reverse parts) parts)
+        result (reduce concatenate (first ordered) (rest ordered))]
+   (v/scalar (v/term result) (cond-> parts (v/value? bytes) (conj bytes))
+    {:domain (domain (:width layout) :formal/packed-fields-v1)}))))

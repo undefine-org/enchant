@@ -19,6 +19,34 @@
   (erlang/is_map data) (reduce (fn [out pair] (assoc out (elem pair 0) (read-data (elem pair 1)))) {} (maps/to_list data))
   (erlang/is_list data) (vec (map read-data data))
   :else data))
+(defn decode-frame [bytes]
+ (when-not (and (erlang/is_binary bytes) (<= 2 (erlang/byte_size bytes) 1048576)
+                (= 131 (binary/at bytes 0)) (not= 80 (binary/at bytes 1)))
+  (throw (ex-info "formal reply must be bounded, uncompressed ETF" {:kind :invalid})))
+ (read-data (erlang/binary_to_term bytes (list :safe))))
+(defn validate-reply [reply backend generation operation]
+ (let [ok (:ok reply) status (:status reply)
+       check? (contains? #{:check :scope} operation)]
+  (when-not (and (map? reply) (or (= true ok) (= false ok)) (= 1 (:protocol reply))
+                (= (name backend) (get-in reply [:backend :name]))
+                (string? (get-in reply [:backend :version]))
+                (= generation (:generation reply))
+                (if ok
+                 (cond
+                  (= operation :hello) (and (map? (:capabilities reply)) (int? (:pid reply)) (pos? (:pid reply)))
+                  check? (and (contains? #{:sat :unsat :unknown} status)
+                              (contains? #{:available :partial :unavailable} (:model-status reply))
+                              (vector? (:observations reply))
+                              (every? (fn [row] (and (vector? row) (= 2 (count row))
+                                               (string? (first row)) (vector? (second row))
+                                               (string? (first (second row))))) (:observations reply))
+                              (vector? (:core reply)) (every? string? (:core reply))
+                              (contains? #{:native :unsupported} (:core-kind reply))
+                              (map? (:stats reply)))
+                  :else (contains? #{:load :reset} operation))
+                 (and (contains? #{:error :unsupported} status) (string? (:error reply)))))
+   (throw (ex-info "formal native reply schema or identity mismatch" {:kind :invalid})))
+  reply))
 (defn- close! [port]
  (when (and (erlang/is_port port) (some? (Port/info port))) (Port/close port)) :ok)
 (defn- exchange! [port borrower-monitor payload timeout]
@@ -31,8 +59,7 @@
    (when-not (Port/command port bytes (list :nosuspend)) (throw (ex-info "formal backend port busy" {})))
    (receive
     [seen [:data bytes]] :when (= seen port)
-     (do (when (> (erlang/byte_size bytes) 1048576) (throw (ex-info "formal reply exceeds packet capacity" {})))
-         (read-data (erlang/binary_to_term bytes (list :safe))))
+     (decode-frame bytes)
     [:DOWN seen :process _ _] :when (= seen borrower-monitor)
      (do (close! port) (erlang/exit (erlang/self) :kill))
     [:DOWN seen :port _ _] :when (= seen monitor) (throw (ex-info "formal native worker exited" {}))
@@ -49,10 +76,12 @@
               (list :binary :use_stdio :exit_status (tuple :packet 4)
                (tuple :args (to-list (concat ["--backend" (name (:backend config))]
                     (if (= :z3 (:backend config)) ["--z3-library" (:library config)] []))))))
-        hello (exchange! port monitor (tuple :hello) (:hard-ms config))]
+        hello (validate-reply (exchange! port monitor (tuple :hello) (:hard-ms config))
+                              (:backend config) 0 :hello)]
    (when-not (and (:ok hello) (= 1 (:protocol hello)))
     (close! port) (throw (ex-info "formal protocol handshake refused" {:reply hello})))
    (ok {:port port :borrower (:borrower config) :monitor monitor :hello hello
+        :backend (:backend config) :generation 0
         :hard-ms (:hard-ms config) :retired false})))
  (handle-call [:invoke request] [from state]
   (cond
@@ -60,10 +89,16 @@
     (reply {:ok false :status :error :error "formal borrower required"} state)
    (:retired state) (reply {:ok false :status :error :error "formal context retired"} state)
    :else
-    (let [result (try (exchange! (:port state) (:monitor state) request (:hard-ms state))
-                  (catch e {:ok false :status :error :error (ex-message e)}))]
+    (let [result (try
+                   (let [reply (exchange! (:port state) (:monitor state) request (:hard-ms state))
+                         op (elem request 0)
+                         generation (if (and (:ok reply) (= op :reset)) (inc (:generation state)) (:generation state))]
+                    (validate-reply reply (:backend state) generation op))
+                  (catch e {:ok false :status :error :error (ex-message e)
+                            :why {:kind (get (ex-data e) :kind :invalid) :message (ex-message e)}}))]
      (when-not (:ok result) (close! (:port state)))
-     (reply result (assoc state :retired (not (:ok result)))))))
+     (reply result (cond-> (assoc state :retired (not (:ok result)))
+                         (:ok result) (assoc :generation (:generation result)))))))
  (handle-call :hello [from state]
   (reply (if (= (:borrower state) (elem from 0)) (:hello state)
            {:ok false :status :error :error "formal borrower required"}) state))
