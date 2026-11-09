@@ -1,0 +1,69 @@
+(ns formal.backend-test
+ (:require [formal.term :as t] [formal.backend :as backend] [formal.query :as q]
+           [formal.logic :as logic] [formal.evaluate :as replay]))
+
+(deftest both-native-backends-run-the-same-portable-questions
+ (doseq [engine [:z3 :oxiz]]
+  (backend/with-session {:backend engine}
+   (fn [session]
+    (is (= 1 (:protocol (backend/hello session))))
+    (let [x (t/variable "a" t/Int)
+          proof (q/prove (t/ge (t/add x (t/int 1)) (t/int 1))
+                         {:assumptions [(t/ge x (t/int 0))] :observe {"x" x}})
+          result (logic/solve-in session proof)]
+     (is (= :proved (:verdict result)) (pr-str result))
+     (is (= :unsat (:solver-status result)))
+     (is (= false (:trusted result))))
+    (let [x (t/variable "counter" t/Int)
+          result (logic/solve-in session
+                   (q/prove (t/gt x (t/int 0)) {:assumptions [(t/eq x (t/int -2))] :observe {"x" x}}))]
+     (is (= :refuted (:verdict result)) (pr-str result))
+     (is (= -2 (get (:witness result) "x")))
+     (is (= :valid (get-in result [:validation :status]))))))))
+
+(deftest contradictory-assumptions-are-reported-as-vacuous
+ (doseq [engine [:z3 :oxiz]]
+  (let [result (logic/run {:backend engine} (q/prove (t/bool false) {:assumptions [(t/bool false)]}))]
+   (is (= :vacuous (:verdict result)))
+   (is (= :assumption-consistency (:phase result))))))
+
+(deftest portable-terms-outlive-native-reset-but-generation-handles-do-not
+ (backend/with-session {:backend :z3}
+  (fn [session]
+   (let [p (t/variable "same-name" t/Bool) question (q/prove (t/eq p p))]
+    (is (= :proved (:verdict (logic/solve-in session question))))
+    (is (:ok (backend/reset! session)))
+    (is (= 1 (:generation @(:state session))))
+    (is (= :proved (:verdict (logic/solve-in session question))))
+    (let [bad (backend/invoke session (tuple :check 0 (list) (list) 100))]
+     (is (= false (:ok bad)))
+     (is (= :error (:status bad))))))))
+
+(deftest tracking-labels-never-alias-source-variables
+ (backend/with-session {:backend :z3}
+  (fn [session]
+   (let [p (t/variable "label" t/Bool)
+         question (q/sat {:assumptions [{:label "label" :term (t/not p)}] :observe {"p" p}})
+         result (logic/solve-in session question)]
+    (is (= :sat (:verdict result)) (pr-str result))
+    (is (= false (get (:witness result) "p")))))))
+
+(deftest artifact-and-semantic-profile-are-part-of-cache-identity
+ (let [a (q/prove (t/bool true) {:profile :current})
+       b (q/prove (t/bool true) {:profile :proposed})]
+  (is (not= (q/cache-key a {:backend :z3 :version "A"} {} :model)
+            (q/cache-key b {:backend :z3 :version "A"} {} :model)))
+  (is (not= (q/cache-key a {:backend :z3 :version "A"} {} :model)
+            (q/cache-key a {:backend :oxiz :version "A"} {} :model)))
+  (is (not= (q/cache-key a {:backend :z3 :version "A"} {} :model)
+            (q/cache-key a {:backend :z3 :version "A"} {} :core)))))
+
+(deftest derived-procedures-have-one-meaning-above-both-backends
+ (doseq [engine [:z3 :oxiz]]
+  (let [x (t/variable "finite.choice" t/Int) bounds [(t/ge x (t/int 0)) (t/le x (t/int 2))]
+        enumeration (logic/enumerate-projection {:backend engine} bounds {"x" x} 4)
+        optimum (logic/optimize-finite {:backend engine} [(t/ge x (t/int 1))] x 0 3 :min)]
+   (is (= :complete (:status enumeration)) (pr-str enumeration))
+   (is (= #{0 1 2} (set (map (fn [answer] (get answer "x")) (:answers enumeration)))))
+   (is (= :optimal-in-bounds (:status optimum)) (pr-str optimum))
+   (is (= 1 (:value optimum))))))
