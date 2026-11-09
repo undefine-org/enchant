@@ -31,6 +31,7 @@ impl Engine {
             ..SolverConfig::default()
         });
         solver.set_logic("ALL");
+        solver.enable_assumption_based_cores();
         Self { tm: TermManager::new(), solver, names: Names::default(), scopes: vec![], checks: 0 }
     }
     fn sort(&mut self, form: &Term) -> Result<SortId> {
@@ -262,7 +263,7 @@ impl Engine {
                     let value = model.eval(*term, &mut self.tm);
                     values.insert(wire::binary(name), self.scalar(value)?);
                 }
-            } else { return Err("sat without a model".into()); }
+            } else if !self.names.constants.is_empty() { return Err("sat without a scalar model".into()); }
             Map::from(values).into()
         } else { Map::from(HashMap::<Term, Term>::new()).into() };
         let core = self.solver.get_unsat_core().map(|c| c.names.iter().map(|s| wire::binary(s)).collect()).unwrap_or_default();
