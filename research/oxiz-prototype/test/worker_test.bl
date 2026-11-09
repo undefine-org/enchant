@@ -94,6 +94,56 @@
     (when (Process/alive? pid) (erlang/exit pid :kill))
     (Process/demonitor monitor (list :flush))))))
 
+(defn- pigeonhole
+ "A deliberately hard Boolean contradiction: 16 pigeons, 15 holes. Used
+  only to observe cancellation while the real Rust solver is running."
+ []
+ (let [v (fn [p h] (symbol (str "p_" p "_" h)))
+       declarations (for [p (range 16) h (range 15)]
+                      (list 'declare-const (v p h) 'Bool))
+       choices (map (fn [p] (list 'assert (cons 'or (map (fn [h] (v p h)) (range 15))))) (range 16))
+       exclusions (for [h (range 15) p (range 16) q (range p)]
+                    (list 'assert (list 'not (list 'and (v p h) (v q h)))))]
+  (vec (concat declarations choices exclusions))))
+
+(deftest hard-deadline-closes-a-real-busy-solver-and-retires-the-context
+ (w/with-worker {:solver-ms 100 :hard-ms 500}
+  (fn [worker]
+   (let [os-pid (:pid (w/info worker))]
+    (w/commands! worker (pigeonhole))
+    (let [started (erlang/monotonic_time :millisecond)
+          error (try
+                 ;; Deliberately give the native search more time than its
+                 ;; owner allows, exercising the independent hard backstop.
+                 (w/request! worker (tuple :check 10000 (list)))
+                 "unexpected completion"
+                 (catch e (ex-message e)))]
+     (is (String/contains? error "hard deadline") error)
+     (is (< (- (erlang/monotonic_time :millisecond) started) 2000))
+     (is (gone? os-pid) "EOF watchdog kills the actual native search")
+     (is (thrown? (w/check-here worker))))))))
+
+(deftest borrower-death-cancels-an-in-flight-native-check
+ (let [parent (erlang/self) tag (erlang/make_ref)
+       [pid monitor] (spawn-monitor
+        (fn [] (w/with-worker {:solver-ms 10000 :hard-ms 12000}
+         (fn [worker]
+          (w/commands! worker (pigeonhole))
+          (erlang/send parent [tag :checking (:pid (w/info worker))])
+          (w/check-here worker)
+          (erlang/send parent [tag :completed])))))]
+  (try
+   (let [os-pid (receive [seen :checking value] :when (= seen tag) value (after 5000 nil))]
+    (is (int? os-pid))
+    (Process/sleep 50)
+    (is (receive [seen :completed] :when (= seen tag) false (after 0 true))
+        "the test observed a running solve before cancellation")
+    (erlang/exit pid :kill)
+    (is (gone? os-pid)))
+   (finally
+    (when (Process/alive? pid) (erlang/exit pid :kill))
+    (Process/demonitor monitor (list :flush))))))
+
 (deftest existing-oracle-and-verifier-can-use-the-explicit-compatibility-bridge
  (oracle/memo-clear!)
  (let [obligation (oracle/obligation :bridge ['(declare-const x Int) '(assert (= x 4))])]
