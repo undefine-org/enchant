@@ -1,0 +1,53 @@
+(ns oxiz.demo
+ (:require [oxiz.worker :as w] [oxiz.oracle :as ox] [oracle] [smt]
+           [system.smt :as translate] [z3pool] [bl.json :as json]))
+
+(def corpus
+ [{:label :lia-sat :forms ['(declare-const x Int) '(assert (> x 4)) '(assert (< x 9))]}
+  {:label :lia-unsat :forms ['(declare-const x Int) '(assert (> x 4)) '(assert (< x 3))]}
+  {:label :boolean :forms ['(declare-const p Bool) '(assert (and p (not p)))]}
+  {:label :string :forms ['(declare-const s String) '(assert (= s "hello")) '(assert (str.contains s "ell"))]}
+  {:label :define-fun :forms ['(declare-const x Int) '(define-fun Inv ((v Int)) Bool (>= v 0))
+                            '(assert (= x 3)) '(assert (not (Inv x)))]}
+  ;; These use the real ANF translator's negative quot/rem encodings.
+  {:label :negative-quot :forms ['(declare-const a Int) '(assert (= a (- 7)))
+     (list 'assert (list 'not (list '= (translate/of-source #{"a"} "(quot a 3)") -2)))]}
+  {:label :negative-rem :forms ['(declare-const a Int) '(assert (= a (- 7)))
+     (list 'assert (list 'not (list '= (translate/of-source #{"a"} "(rem a 3)") -1)))]}
+  {:label :known-bool-uf-gap :forms ['(declare-const p Bool) '(declare-fun P (Bool) Bool)
+     '(assert (P p)) '(assert (not (P true))) '(assert (not (P false)))]}])
+
+(defn micros [] (erlang/monotonic_time :microsecond))
+(defn summary [values]
+ (let [ordered (vec (sort values)) n (count ordered)]
+  {:count n :median-us (nth ordered (quot n 2)) :max-us (last ordered)}))
+
+(try
+ (w/with-worker {}
+  (fn [worker]
+   (let [comparisons (mapv (fn [entry] (ox/compare worker (oracle/obligation (:label entry) (:forms entry)))) corpus)
+         iterations 100
+         native-times (w/session worker ['(declare-const x Int) '(assert (>= x 0))]
+          (fn []
+           (mapv (fn [i]
+             (let [started (micros)
+                   result (w/scoped worker [(list 'assert (list '< 'x (- (inc i))))])]
+              (when-not (= :unsat (:status result)) (throw (ex-info "unexpected scoped result" {:result result})))
+              (- (micros) started))) (range iterations))))
+         z3-times (oracle/with-memo false
+          (fn [] (oracle/session ['(declare-const x Int) '(assert (>= x 0))]
+           (fn [] (mapv (fn [i]
+             (let [question (oracle/obligation :bench [(list 'assert (list '< 'x (- (inc i))))])
+                   started (micros) result (oracle/scoped question)]
+              (when-not (= :unsat (:status result)) (throw (ex-info "unexpected Z3 result" {:result result})))
+              (- (micros) started))) (range iterations))))))
+         report {:prototype "oxiz-worker-v1" :worker (w/info worker)
+                 :authoritative :z3 :comparisons comparisons
+                 :agreements (count (filter :agreement comparisons))
+                 :total (count comparisons)
+                 :warm-scope-wall {:oxiz (summary native-times) :z3 (summary z3-times)
+                   :scope "push/assert/check/model/pop; one prelude; memo off; OxiZ three port requests, Z3 one"}}]
+    (File/mkdir_p! "research/oxiz-prototype/evidence")
+    (File/write! "research/oxiz-prototype/evidence/report.json" (json/encode report))
+    (println (json/encode report)))))
+ (finally (z3pool/pool-stop!)))

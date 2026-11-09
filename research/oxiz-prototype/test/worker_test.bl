@@ -1,0 +1,125 @@
+(ns oxiz.worker-test
+ (:require [oxiz.worker :as w] [oxiz.oracle :as ox] [oracle] [z3pool]
+           [system.core :as system]))
+
+(defn- gone? [os-pid]
+ (loop [left 100]
+  (if-not (File/exists? (str "/proc/" os-pid)) true
+   (if (zero? left) false (do (Process/sleep 10) (recur (dec left)))))))
+
+(deftest structured-models-preserve-values-and-worker-lifetime
+ (let [seen (atom nil)]
+  (w/with-worker {}
+   (fn [worker]
+    (reset! seen (:pid (w/info worker)))
+    (let [sat (w/check worker ['(declare-const x Int) '(declare-const s String)
+                               '(assert (= x (- 7))) '(assert (= s "héllo \"beam\""))])]
+     (is (= :sat (:status sat)))
+     (is (= -7 (get (:model sat) "x")))
+     (is (= "héllo \"beam\"" (get (:model sat) "s")))
+     (is (= false (:trusted sat))))
+    (is (= :unsat (:status (w/check worker ['(assert false)]))))))
+  (is (gone? @seen) "closing the lease stops the OS process")))
+
+(deftest scopes-share-one-native-context-and-retract-declarations
+ (w/with-worker {}
+  (fn [worker]
+   (let [pid (:pid (w/info worker))]
+    (w/session worker ['(declare-const x Int) '(assert (>= x 0))
+                       '(define-fun Inv ((n Int)) Bool (>= n 0))]
+     (fn []
+      (is (= :unsat (:status (w/scoped worker ['(assert (not (Inv x)))]))))
+      (is (= :sat (:status (w/scoped worker ['(assert (= x 3))]))))
+      (is (= :sat (:status (w/check-here worker))))))
+    (is (= pid (:pid (w/info worker))))))))
+
+(deftest assumptions-do-not-become-persistent-assertions
+ (w/with-worker {}
+  (fn [worker]
+   (w/commands! worker ['(declare-const p Bool) '(assert p)])
+   (is (= :unsat (:status (w/check-here worker ['(not p)]))))
+   (is (= :sat (:status (w/check-here worker)))))))
+
+(deftest native-named-assertions-return-core-names-as-binaries
+ (w/with-worker {}
+  (fn [worker]
+   (let [named (symbol ":named")
+         result (w/check worker
+                  ['(declare-const x Int)
+                   (list 'assert (list '! '(> x 0) named 'positive))
+                   (list 'assert (list '! '(< x 0) named 'negative))])]
+    (is (= :unsat (:status result)))
+    (is (= #{"positive" "negative"} (set (:core result))))))))
+
+(deftest unsupported-and-ill-sorted-input-retire-the-conversation
+ (doseq [forms [['(assert (missing 1))]
+                ['(declare-const x Int) '(assert (and x true))]
+                ['(declare-const a (Array Int Int))]
+                ['(define-fun f ((x Int)) Bool (+ x 1))]
+                ['(pop 1)]
+                ['(declare-const x Int) '(declare-const x Bool)]]]
+  (w/with-worker {}
+   (fn [worker]
+    (is (thrown? (w/commands! worker forms)))
+    (is (thrown? (w/check-here worker)) "a failed script cannot leak partial state")))))
+
+(deftest foreign-borrowers-cannot-touch-the-owned-context
+ (w/with-worker {}
+  (fn [worker]
+   (let [parent (erlang/self) tag (erlang/make_ref)
+         [pid monitor] (spawn-monitor
+                        (fn [] (erlang/send parent
+                         [tag (try (w/commands! worker ['(assert false)]) :accepted
+                                (catch _ :refused))])))]
+    (try
+     (is (= :refused (receive [seen result] :when (= seen tag) result (after 2000 :missing))))
+     (is (= :sat (:status (w/check-here worker))))
+     (finally
+      (when (Process/alive? pid) (erlang/exit pid :kill))
+      (Process/demonitor monitor (list :flush))))))))
+
+(deftest killed-borrowers-release-the-native-process
+ (let [parent (erlang/self) tag (erlang/make_ref)
+       [pid monitor] (spawn-monitor
+                      (fn [] (w/with-worker {}
+                       (fn [worker]
+                        (erlang/send parent [tag (:pid (w/info worker))])
+                        (receive :finish nil (after 10000 nil))))))]
+  (try
+   (let [os-pid (receive [seen value] :when (= seen tag) value (after 3000 nil))]
+    (is (int? os-pid))
+    (erlang/exit pid :kill)
+    (is (gone? os-pid)))
+   (finally
+    (when (Process/alive? pid) (erlang/exit pid :kill))
+    (Process/demonitor monitor (list :flush))))))
+
+(deftest existing-oracle-and-verifier-can-use-the-explicit-compatibility-bridge
+ (oracle/memo-clear!)
+ (let [obligation (oracle/obligation :bridge ['(declare-const x Int) '(assert (= x 4))])]
+  (oracle/with-oracle (fn [_ _] {:status "unsat"}) #(oracle/ask obligation))
+  (w/with-worker {}
+   (fn [worker]
+    (let [value (ox/with-oracle worker #(oracle/ask obligation true))]
+     (is (= :sat (:status value)) "a cached Z3/handler answer cannot hide the probe")
+     (is (= 4 (get (:model value) "x"))))
+    (let [machine (first (BeamLisp.Reader/read_string
+                   "(defserver ^{:invariant (>= balance 0)} account
+                     (init [balance] (ok balance))
+                     (handle-call [:withdraw amt] [_ balance]
+                       :when (and (>= amt 0) (>= balance amt))
+                       (reply :ok (- balance amt))))"))
+          checked (ox/with-oracle worker #(system/verify-process nil machine))]
+     (is (= true (:holds checked)))))))
+ (oracle/memo-clear!))
+
+(deftest shadow-comparison-always-returns-the-z3-decision
+ (try
+  (w/with-worker {}
+   (fn [worker]
+    (let [result (ox/compare worker (oracle/obligation :contradiction ['(assert false)]))]
+     (is (= :z3 (:authoritative result)))
+     (is (= :unsat (get-in result [:decision :status])))
+     (is (:agreement result))
+     (is (= false (get-in result [:candidate :trusted]))))))
+  (finally (z3pool/pool-stop!))))

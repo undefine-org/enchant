@@ -1,0 +1,135 @@
+(ns oxiz.worker)
+
+;; All names remain binaries across ETF. No user symbol is interned as a BEAM
+;; atom, and no Lisp struct layout crosses into Rust.
+(defn wire-form [form]
+ (cond
+  (symbol? form) (tuple :symbol (name form))
+  (or (list? form) (vector? form)) (to-list (map wire-form form))
+  (or (int? form) (string? form) (= true form) (= false form)) form
+  :else (throw (ex-info "OxiZ prototype: unsupported form" {:form form}))))
+
+(defn- from-wire [value]
+ (cond
+  (erlang/is_map value)
+   (reduce (fn [out pair] (assoc out (elem pair 0) (from-wire (elem pair 1))))
+           {} (maps/to_list value))
+  (erlang/is_list value) (vec (map from-wire value))
+  :else value))
+
+(defn- close-port! [port]
+ (when (and (erlang/is_port port) (some? (Port/info port)))
+  (Port/close port))
+ :ok)
+
+(defn- exchange! [port owner-ref payload budget]
+ (when-not (= (tuple :connected (erlang/self)) (erlang/port_info port :connected))
+  (throw (ex-info "OxiZ port owner required" {})))
+ (let [deadline (+ (erlang/monotonic_time :millisecond) budget)
+       bytes (erlang/term_to_binary payload)
+       monitor (erlang/monitor :port port)]
+  (try
+   (when (> (erlang/byte_size bytes) 1048576)
+    (throw (ex-info "OxiZ request capacity exceeded" {})))
+   (when-not (Port/command port bytes (list :nosuspend))
+    (throw (ex-info "OxiZ port busy" {})))
+   (receive
+    [seen [:data reply]] :when (= seen port)
+     (do
+      (when (> (erlang/byte_size reply) 1048576)
+       (throw (ex-info "OxiZ reply capacity exceeded" {})))
+      (from-wire (erlang/binary_to_term reply (list :safe))))
+    [:DOWN seen :process _ _] :when (= seen owner-ref)
+     (do (close-port! port) (erlang/exit (erlang/self) :normal))
+    [:DOWN seen :port _ _] :when (= seen monitor)
+     (throw (ex-info "OxiZ worker exited" {}))
+    [seen [:exit_status status]] :when (= seen port)
+     (throw (ex-info "OxiZ worker exited" {:exit-status status}))
+    (after (max 0 (- deadline (erlang/monotonic_time :millisecond)))
+     (throw (ex-info "OxiZ hard deadline exceeded" {:kind :timeout}))))
+   (catch error
+    (close-port! port)
+    (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+   (finally (Process/demonitor monitor (list :flush))))))
+
+(defserver solver-owner
+ (init [config]
+  (let [borrower (:borrower config)
+        owner-ref (Process/monitor borrower)
+        port (erlang/open_port (tuple :spawn_executable (:exe config))
+               (list :binary :use_stdio :exit_status (tuple :packet 4)))
+        hello (try (exchange! port owner-ref (tuple :hello) (:hard-ms config))
+                (catch error (close-port! port) (throw error)))]
+   (when-not (and (:ok hello) (= "oxiz-0.3.4" (:backend hello)))
+    (close-port! port)
+    (throw (ex-info "OxiZ worker handshake refused" {:reply hello})))
+   (ok {:port port :owner-ref owner-ref :borrower borrower
+        :hard-ms (:hard-ms config) :hello hello :retired false})))
+ (handle-call [:request payload] [from st]
+  (cond
+   (not= (elem from 0) (:borrower st))
+    (reply {:ok false :status :error :error "OxiZ borrower required"} st)
+   (:retired st)
+    (reply {:ok false :status :error :error "OxiZ conversation retired"} st)
+   :else
+    (let [result (try (exchange! (:port st) (:owner-ref st) payload (:hard-ms st))
+                  (catch error {:ok false :status :error :error (ex-message error)}))]
+     (when-not (:ok result) (close-port! (:port st)))
+     (reply result (assoc st :retired (not (:ok result)))))))
+ (handle-call :info [from st]
+  (reply (if (= (elem from 0) (:borrower st)) (:hello st)
+           {:ok false :error "OxiZ borrower required"}) st))
+ (handle-info [:DOWN ref :process _ _] [st]
+  (if (= ref (:owner-ref st)) (stop :normal st) (noreply st)))
+ (handle-info _ [st] (noreply st))
+ (terminate [_ st] (close-port! (:port st))))
+
+(defn with-worker
+ "Lease one private OTP owner and Rust process for f. A dead borrower closes
+  the port even during an exchange. The Rust stdin watchdog terminates a busy
+  solve on EOF. No retries, globals, NIFs, or changes to the Z3 pool."
+ [opts f]
+ (let [exe (or (:exe opts) (System/get_env "ENCHANT_OXIZ_WORKER"))
+       hard-ms (get opts :hard-ms 1500)
+       solver-ms (get opts :solver-ms 1000)]
+  (when-not (and (string? exe) (File/exists? exe))
+   (throw (ex-info "Set ENCHANT_OXIZ_WORKER to the built prototype" {})))
+  (when-not (and (int? hard-ms) (int? solver-ms) (> hard-ms solver-ms)
+                (> solver-ms 0) (<= hard-ms 15000) (<= solver-ms 10000))
+   (throw (ex-info "Require 0 < solver-ms < hard-ms <= 15000, solver-ms <= 10000" {})))
+  (let [pid (start solver-owner {:exe (Path/expand exe) :borrower (erlang/self) :hard-ms hard-ms})
+        handle {:pid pid :hard-ms hard-ms :solver-ms solver-ms}]
+   (try (f handle)
+    (finally
+     (when (Process/alive? pid) (GenServer/stop pid :normal 1000)))))))
+
+(defn request! [worker payload]
+ (let [result (call (:pid worker) [:request payload] (+ 1000 (:hard-ms worker)))]
+  (when-not (:ok result)
+   (throw (ex-info (or (:error result) "OxiZ request failed") {:reply result})))
+  result))
+
+(defn info [worker] (call (:pid worker) :info (+ 1000 (:hard-ms worker))))
+(defn commands! [worker forms]
+ (request! worker (tuple :commands (to-list (map wire-form forms)))))
+(defn reset! [worker] (request! worker (tuple :reset)))
+(defn push! [worker] (request! worker (tuple :push)))
+(defn pop! [worker] (request! worker (tuple :pop)))
+(defn check-here
+ ([worker] (check-here worker []))
+ ([worker assumptions]
+  (let [started (erlang/monotonic_time :microsecond)
+        result (request! worker (tuple :check (:solver-ms worker) (to-list (map wire-form assumptions))))]
+   (assoc result :wall-us (- (erlang/monotonic_time :microsecond) started)
+                 :tier :experimental :trusted false))))
+(defn check [worker forms]
+ (reset! worker) (commands! worker forms) (check-here worker))
+(defn session [worker prelude f]
+ (reset! worker) (commands! worker prelude) (f))
+(defn scoped [worker forms]
+ (push! worker)
+ (try (commands! worker forms) (check-here worker)
+  (finally
+   ;; A malformed or timed-out exchange retires the entire conversation.
+   ;; Preserve its original error if the pop is refused too.
+   (try (pop! worker) (catch _ nil)))))
