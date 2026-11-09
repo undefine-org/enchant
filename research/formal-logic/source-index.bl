@@ -1,0 +1,131 @@
+(ns formal.source-index
+ (:require [codebase] [source-graph :as graph] [typed]
+           [system.analyze :as analyze] [bl.json :as json]))
+
+;; Read source; never require the inspected namespaces or evaluate their forms.
+;; Run this with the SDK in sdk-pin.json. The root integration session owns
+;; runtime placement, resource limits and the launch receipt.
+;;
+;; <pinned-sdk>/bin/bl -p research/formal-logic/src run \
+;;   research/formal-logic/source-index.bl -- . evidence/source-index.json [paths...]
+;; With paths omitted, index the atlas's source_files. Failures remain records.
+
+(def analysis-paths
+ #{"priv/std/typed.bl" "priv/lib/minikanren.bl"
+   "research/formal-logic/src/formal/value.bl"
+   "research/formal-logic/src/formal/numeric.bl"})
+
+(defn sha256 [source]
+ (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower))))
+
+(defn exception-record [error]
+ {:status :error :kind (str (:__struct__ error)) :message (ex-message error)})
+
+(defn annotation-data [annotation]
+ (when (map? annotation)
+  (into {} (map (fn [[k node]] [k (codebase/node-data node)]) annotation))))
+
+(defn definitions [forms]
+ (vec (keep (fn [form]
+              (when-let [name (codebase/defn-form form)]
+               (let [items (typed/node-items (typed/node-form form))
+                     name-node (second items)]
+                {:name name :position (typed/node-pos name-node)
+                 :annotation (annotation-data (codebase/name-annotation name-node))})))
+            forms)))
+
+(defn selected-fn [fact]
+ (select-keys fact [:fn/name :fn/ns :fn/qualified :fn/arity :fn/line
+                    :fn/variadic :fn/ret-tag :fn/ret-source]))
+
+(defn selected-call [fact]
+ (assoc (select-keys fact [:call/caller :call/caller-qualified :call/callee
+                          :call/callee-qualified :call/arity :call/line
+                          :call/loop-depth :call/cost-coverage])
+        :resolution (if (some? (:call/callee-qualified fact)) :qualified :unresolved)))
+
+(defn selected-summary [summary]
+ ;; Sets and maps become ordinary JSON data through bl.json. No internal ANF,
+ ;; evaluator closure, Env handle or source expression is copied into evidence.
+ (select-keys summary [:returns :footprint :termination :edges :latent
+                       :conditional-effects]))
+
+(defn semantic-analysis [relative source]
+ (if-not (contains? analysis-paths relative)
+  {:status :not-requested :coverage :none
+   :reason "Analysis is deliberately restricted to the named source subset."}
+  (try
+   (let [prepared (analyze/prepare-program source)
+         result (analyze/analyze-prepared prepared {} (set (keys (:bodies prepared))))]
+    {:status :observed :implementation "system.analyze/prepare-program + analyze-prepared"
+     :rounds (:rounds result) :converged (:converged? result)
+     :coverage (:coverage result)
+     :summaries (into {} (map (fn [[name summary]] [name (selected-summary summary)])
+                              (:summaries result)))
+     :scope "This source only. External calls and effects retain analyzer coverage limits."})
+   (catch error (exception-record error)))))
+
+(defn inspect-source [root relative]
+ (try
+  (let [path (Path/join root relative)
+        source (File/read! path)
+        forms (BeamLisp.Reader/read_string source)
+        namespace (or (first (graph/header source)) "user")
+        ;; The stable three-argument API is intentional: do not substitute a
+        ;; home-grown regex index if the pinned Codebase implementation refuses.
+        facts (codebase/index-source {} namespace source)
+        calls (mapv selected-call (:calls facts))]
+   {:path relative :sha256 (sha256 source) :bytes (erlang/byte_size source)
+    :basis :current-worktree-source :status :observed :namespace namespace
+    :discovery {:implementation "codebase/index-source/3"
+                :source-evaluated false :namespace-loaded false
+                :definitions (mapv selected-fn (:fn facts))
+                :reader-definitions (definitions forms)
+                :calls calls :requires (:requires facts)
+                :coverage {:unresolved-calls (count (filter #(= :unresolved (:resolution %)) calls))
+                           :dynamic-dispatch :requires-manual-review
+                           :unknown-macro-expansion :implementation-dependent}}
+    :analysis (semantic-analysis relative source)})
+  (catch error (merge {:path relative :basis :current-worktree-source}
+                      (exception-record error)))))
+
+(defn git-revision [root]
+ (try
+  (let [result (System/cmd "git" (list "rev-parse" "HEAD") (list (tuple :cd root)))]
+   (if (= 0 (elem result 1)) (String/trim (elem result 0))
+    {:status :unavailable :exit (elem result 1)}))
+  (catch error (exception-record error))))
+
+(defn main [argv]
+ (let [args (vec argv)
+       root (Path/expand (or (get args 0) "."))
+       output (get args 1)
+       atlas (json/decode (File/read! (Path/join root "research/formal-logic/atlas.json")))
+       pin (json/decode (File/read! (Path/join root "research/formal-logic/sdk-pin.json")))
+       requested (vec (drop 2 args))
+       paths (if (empty? requested) (get atlas "source_files") requested)
+       files (mapv #(inspect-source root %) paths)
+       result {:schema "enchant.formal.source-index.v1"
+               :git (git-revision root) :root root :declared-sdk-pin pin
+               :runtime {:otp (erlang/system_info :otp_release)
+                         :elixir (System/version)
+                         :pin-verification :launcher-receipt-required}
+               :basis {:source :current-worktree
+                       :discovery-runtime :invoking-sdk
+                       :claims "Source and runtime identities are separate; no semantic equivalence is inferred."}
+               :safety {:application-started false :inspected-source-evaluated false
+                        :credential-environment-read false :private-operator-source-read false}
+               :coverage {:requested (count paths)
+                          :observed (count (filter #(= :observed (:status %)) files))
+                          :complete (every? #(= :observed (:status %)) files)
+                          :analysis-requested (vec (filter #(contains? analysis-paths %) paths))}
+               :files files}
+       encoded (json/encode result {:pretty 2})]
+  (if (some? output)
+   (let [target (Path/join root output)]
+    (File/mkdir_p! (Path/dirname target))
+    (File/write! target (str encoded "\n")))
+   (println encoded))
+  result))
+
+(main (BeamLisp/argv))

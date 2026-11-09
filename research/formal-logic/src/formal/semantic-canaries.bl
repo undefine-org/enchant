@@ -1,0 +1,139 @@
+(ns formal.semantic-canaries (:require [decimal]))
+
+;; Observation source, not a proposal implementation and not a regression suite.
+;; The same file must run against the qualified SDK before source-inferred
+;; behavior is described as observed runtime behavior. Nothing runs on require.
+
+(defn representation [value]
+ ;; Do not use the equality under review to erase representation differences.
+ (cond
+  (nil? value) {:kind :nil}
+  (erlang/=:= true value) {:kind :bool :value true}
+  (erlang/=:= false value) {:kind :bool :value false}
+  (decimal/decimal? value)
+   {:kind :decimal :unscaled (decimal/unscaled value) :scale (decimal/scale value)
+    :printed (decimal/plain-str value)}
+  (int? value) {:kind :integer :value value}
+  (float? value)
+   {:kind :binary64 :printed (erlang/float_to_binary value (list :short))
+    :etf-hex (Base/encode16 (erlang/term_to_binary value) (list (tuple :case :lower)))}
+  (string? value) {:kind :string :value value :utf8-bytes (erlang/byte_size value)}
+  (keyword? value) {:kind :keyword :printed (pr-str value)}
+  (symbol? value) {:kind :symbol :printed (pr-str value)}
+  (vector? value) {:kind :vector :items (mapv representation value)}
+  (list? value) {:kind :list :items (mapv representation value)}
+  (set? value) {:kind :set :items (mapv representation value)}
+  (map? value) {:kind :map :entries (mapv (fn [[key item]]
+                                           [(representation key) (representation item)]) value)}
+  :else {:kind :other :printed (pr-str value)}))
+
+(defn observe [id review expression expectation thunk]
+ (merge {:id id :review review :expression expression
+         :current-source-expectation expectation :basis :executed-runtime-observation
+         :authority :observation-only :certification :none}
+  (try {:outcome :returned :value (representation (thunk))}
+   (catch error {:outcome :raised :exception {:kind (str (:__struct__ error))
+                                            :message (ex-message error)}}))))
+
+(defn snapshot []
+ {:schema "enchant.formal.semantic-canaries.v1"
+  :runtime {:otp (erlang/system_info :otp_release) :elixir (System/version)}
+  :interpretation {:kind :observations :production-semantics-changed false
+                   :proposal-qualified false
+                   :source-runtime-equivalence :not-inferred
+                   :scope "Only these concrete calls on the invoking runtime."}
+  :observations
+  [
+   (observe :vector-nth-missing :vector-access "(nth [10] 1)"
+    "Current vector source returns nil for an out-of-range index."
+    (fn [] (nth [10] 1)))
+   (observe :vector-nth-negative :vector-access "(nth [10] -1)"
+    "Current vector source returns nil for a negative index."
+    (fn [] (nth [10] -1)))
+   (observe :vector-get-default :vector-access "(get [10] 1 :missing)"
+    "Lookup default applies to absent vector index."
+    (fn [] (get [10] 1 :missing)))
+   (observe :vector-assoc-at-count :vector-access "(assoc [10] 1 20)"
+    "Current vector assoc at count appends."
+    (fn [] (assoc [10] 1 20)))
+   (observe :vector-assoc-past-count :vector-access "(assoc [10] 2 20)"
+    "Current vector assoc past count raises."
+    (fn [] (assoc [10] 2 20)))
+   (observe :map-present-nil-default :missing-nil "(get {:a nil} :a :missing)"
+    "Present nil remains nil; it does not trigger the lookup default."
+    (fn [] (get {:a nil} :a :missing)))
+   (observe :map-absent-default :missing-nil "(get {:a nil} :b :missing)"
+    "Absent key triggers the explicit lookup default."
+    (fn [] (get {:a nil} :b :missing)))
+   (observe :map-contains-nil :missing-nil "(contains? {:a nil} :a)"
+    "Presence is independent of payload nil."
+    (fn [] (contains? {:a nil} :a)))
+   (observe :get-in-present-nil :missing-nil "(get-in {:a {:b nil}} [:a :b] :missing)"
+    "Current get-in uses a fresh sentinel to preserve present nil."
+    (fn [] (get-in {:a {:b nil}} [:a :b] :missing)))
+   (observe :sequence-value-equality :equality "(= [1] (list 1))"
+    "Finite sequence kinds currently share content equality."
+    (fn [] (= [1] (list 1))))
+   (observe :sequence-native-identity :data-identity "(erlang/=:= [1] (list 1))"
+    "Vector struct and native proper list have different representations."
+    (fn [] (erlang/=:= [1] (list 1))))
+   (observe :sequence-conj-observability :equality "[(conj [1] 2) (conj (list 1) 2)]"
+    "Content-equivalent sequence kinds can have observably different conj behavior."
+    (fn [] [(conj [1] 2) (conj (list 1) 2)]))
+   (observe :metadata-value-equality :data-identity "(= (with-meta [1] {:origin :a}) [1])"
+    "Current semantic equality erases metadata."
+    (fn [] (= (with-meta [1] {:origin :a}) [1])))
+   (observe :decimal-scale-structural :decimal-scale "(= 1.5M 1.50M)"
+    "Current source special-cases two Decimal values using scale-sensitive identity."
+    (fn [] (= (decimal/of "1.5") (decimal/of "1.50"))))
+   (observe :decimal-scale-numeric :decimal-scale "(== 1.5M 1.50M)"
+    "Numeric comparison ignores Decimal scale."
+    (fn [] (== (decimal/of "1.5") (decimal/of "1.50"))))
+   (observe :decimal-float-equality-bridge :equality "[(= 1.5M 1.5) (= 1.5 1.50M) (= 1.5M 1.50M)]"
+    "Source suggests [true true false], a possible transitivity defect; runtime observation is required."
+    (fn [] (let [a (decimal/of "1.5") b 1.5 c (decimal/of "1.50")]
+             [(= a b) (= b c) (= a c)])))
+   (observe :decimal-representation :decimal-scale "[1.5M 1.50M]"
+    "Observe digits and scale independently of numeric equality."
+    (fn [] [(decimal/of "1.5") (decimal/of "1.50")]))
+   (observe :decimal-float-arithmetic :real-float "(+ 1.5M 1.5)"
+    "Current Decimal arithmetic rejects an implicit Float conversion."
+    (fn [] (+ (decimal/of "1.5") 1.5)))
+   (observe :integer-slash :real-float "(/ 7 2)"
+    "Current ordinary integer slash uses native floating division."
+    (fn [] (/ 7 2)))
+   (observe :float-rounding :real-float "[(+ 0.1 0.2) (= (+ 0.1 0.2) 0.3)]"
+    "Native binary64 rounding differs from mathematical Real addition."
+    (fn [] [(+ 0.1 0.2) (= (+ 0.1 0.2) 0.3)]))
+   (observe :float-overflow :real-float "(erlang/* 1.0e308 1.0e308)"
+    "BEAM finite floats raise rather than returning IEEE Infinity."
+    (fn [] (erlang/apply :erlang :* (list 1.0e308 1.0e308))))
+   (observe :float-divide-zero :real-float "(/ 1.0 0.0)"
+    "BEAM finite floats raise rather than returning IEEE Infinity or NaN."
+    (fn [] (erlang/apply :erlang :/ (list 1.0 0.0))))
+   (observe :float-zero-representation :real-float "[0.0 -0.0 (= 0.0 -0.0)]"
+    "Observe numeric equality separately from encoded sign-of-zero bits."
+    (fn [] [0.0 -0.0 (= 0.0 -0.0)]))
+   (observe :negative-truncation :division-sign "[(quot -7 3) (rem -7 3)]"
+    "Current quot truncates toward zero and rem follows the dividend."
+    (fn [] [(quot -7 3) (rem -7 3)]))
+   (observe :negative-divisor-mod :division-sign "[(mod 7 -3) (mod -7 -3)]"
+    "Current BL mod follows the divisor sign; expected [-2 -1]. SMT Euclidean mod differs."
+    (fn [] [(mod 7 -3) (mod -7 -3)]))
+   (observe :integer-divide-zero :division-sign "(quot 1 0)"
+    "Integer zero division is exceptional, while solver integer division is total."
+    (fn [] (quot 1 0)))
+   (observe :text-three-index-domains :text-indices "[(count e+acute) (count (String/codepoints e+acute)) (erlang/byte_size e+acute)]"
+    "Current strings count graphemes; decomposed e+acute has 1 grapheme, 2 codepoints and 3 UTF-8 bytes."
+    (fn [] (let [s "é"] [(count s) (count (String/codepoints s)) (erlang/byte_size s)])))
+   (observe :grapheme-concat-nonadditivity :text-indices "[(count e) (count acute) (count (str e acute))]"
+    "A combining mark may merge at concatenation: grapheme count is not additive."
+    (fn [] [(count "e") (count "́") (count (str "e" "́"))]))
+   (observe :truthiness-domain :truthiness "[(if nil true false) (if false true false) (if 0 true false) (if \"\" true false) (if [] true false)]"
+    "Only nil and false are falsey; zero, empty text and empty vector are truthy."
+    (fn [] [(if nil true false) (if false true false) (if 0 true false)
+             (if "" true false) (if [] true false)]))
+   (observe :or-selected-value :truthiness "(or nil 0 :unreached)"
+    "BL or returns a selected language value rather than necessarily a Bool."
+    (fn [] (or nil 0 :unreached)))
+  ]})
