@@ -173,6 +173,7 @@ impl Backend for Oxiz {
                 ("max-bv-width", wire::integer(4096)), ("max-fp-bits", wire::integer(128)),
                 ("real-literal-bits", wire::integer(64)), ("symbolic-rounding", wire::atom("false")),
                 ("native-cores", wire::atom("false")), ("max-text-codepoint", wire::integer(0x2ffff)),
+                ("fp-literal-normalization", wire::binary("all IEEE NaN encodings denote one SMT NaN; payloads remain opaque")),
                 ("model", wire::binary("observed native scalars and nullary constructors; opaque otherwise")),
             ])),
         ])
@@ -296,7 +297,14 @@ impl Backend for Oxiz {
                 let sign = ((&bits >> (eb+sb-1)) & BigInt::one()) == BigInt::one();
                 let exp = (&bits >> (sb-1)) & ((BigInt::one()<<eb)-1);
                 let sig = bits & ((BigInt::one()<<(sb-1))-1);
-                self.context.terms.mk_fp_lit(sign,exp,sig,eb,sb)
+                // The SMT FP sort has exactly one NaN. OxiZ's raw FpLit
+                // constructor preserves sign/payload and bare FP equalities
+                // can otherwise remain in its EUF route. Normalize this
+                // semantic value before interning; IEEE payload identity is
+                // a BV question and is never an FP model observation.
+                if exp == (BigInt::one() << eb)-1 && !sig.is_zero() {
+                    self.context.terms.mk_fp_nan(eb,sb)
+                } else { self.context.terms.mk_fp_lit(sign,exp,sig,eb,sb) }
             }
             "fp-neg" => self.context.terms.mk_fp_neg(args[0]),
             "fp-eq" => self.context.terms.mk_fp_eq(args[0],args[1]),

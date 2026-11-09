@@ -1,0 +1,382 @@
+--- a/priv/boot/rt.bl
++++ b/priv/boot/rt.bl
+@@ -2068,12 +2068,10 @@
+         :else 1))))
+ 
+ (defn k-eqv
+-  "`=`. Defined by the order, so these can never disagree — with ONE documented
+-   exception: two DECIMALS are equal only when they are the same VALUE, scale
+-   included. `(= 1.5M 1.50M)` is false and `(== 1.5M 1.50M)` true, exactly as
+-   `equals` and `compareTo` differ on the JVM (docs/exact-decimals.bl.md, the
+-   Java oracle row `(.equals 1.0M 1.00M)`). The order still places them
+-   together; `=` asks the stricter question."
++  "`=`. Defined by the order. Finite numbers compare by their exact values:
++   `(= 1.5M 1.50M)` is true, while `(= 0.1M 0.1)` is false because the
++   Float's IEEE value differs. Decimal scale remains representation information;
++   `decimal/same-representation?` asks whether coefficient and scale both agree."
+   [a b]
+   (cond
+     ; THE LEAF FAST PATH. `=` is the most-called predicate in the language —
+@@ -2081,8 +2079,7 @@
+     ; general answer below costs `unwrap-meta`, `kind` and `family` per side
+     ; (~40 reductions) to say what one term test already knows. Each clause is
+     ; an EXACT correspondence with `k-compare`, never an approximation:
+-    ;   * identical terms are distance 0 (k-compare's own first clause; a
+-    ;     decimal pair that is =:= is the same value, scale included);
++    ;   * identical terms are distance 0 (k-compare's own first clause);
+     ;   * an atom (nil, a boolean, a keyword) is only ever equal to itself or
+     ;     to a `{:meta …}` wrapper of itself — no struct, number, string,
+     ;     list or map shares an atom's family — so an atom against anything
+@@ -2091,8 +2088,6 @@
+     (erlang/=:= a b) true
+     (erlang/is_atom a) (cond (erlang/is_tuple b) (erlang/== 0 (k-compare a b)) :else false)
+     (erlang/is_atom b) (cond (erlang/is_tuple a) (erlang/== 0 (k-compare a b)) :else false)
+-    (and (struct-of? a :"Elixir.BeamLisp.Decimal") (struct-of? b :"Elixir.BeamLisp.Decimal"))
+-      (erlang/=:= a b)
+     :else (erlang/== 0 (k-compare a b))))
+ 
+ 
+--- a/priv/lib/decimal.bl
++++ b/priv/lib/decimal.bl
+@@ -6,9 +6,10 @@
+ ; here because the SCALE IS INFORMATION: `1.50M` says cents, `1.5M` does not,
+ ; and an arithmetic that dropped the difference would round money silently.
+ ;
+-; Two equalities, on purpose. `=` is structural: `1.5M` and `1.50M` are
+-; different values (as in Java `equals`). `==`, `compare`, `<` and friends are
+-; numeric: `(== 1.5M 1.50M)` is true. Every core operator sees a decimal —
++; Generic `=` compares exact numeric values: `1.5M` and `1.50M` are equal.
++; `same-representation?` separately compares coefficient AND scale, as Java
++; BigDecimal.equals does. Scale remains observable in printing and arithmetic.
++; `==`, `compare`, `<` and friends are numeric. Every core operator sees a decimal —
+ ; `(+ 1.10M 2.20M)` is `3.30M`, exact, and an integer beside a decimal promotes.
+ ; A FLOAT beside a decimal is refused: `0.1` is not one tenth, and laundering
+ ; it into exact arithmetic is the bug this type exists to prevent.
+@@ -56,6 +57,15 @@
+   "True for a decimal value."
+   [x]
+   (BeamLisp.Ns.Rt/decimal? x))
++
++(defn same-representation?
++  "True when two Decimal values have the same coefficient and scale.
++   `(same-representation? 1.5M 1.50M)` is false although generic `=` is true.
++   A non-Decimal operand answers false; no numeric coercion is performed."
++  [a b]
++  (and (decimal? a) (decimal? b)
++       (erlang/=:= (BeamLisp.Decimal/unscaled a) (BeamLisp.Decimal/unscaled b))
++       (erlang/=:= (BeamLisp.Decimal/scale a) (BeamLisp.Decimal/scale b))))
+ 
+ ;; ── exact arithmetic ──────────────────────────────────────────────────
+ 
+--- a/priv/host/decimal.bl
++++ b/priv/host/decimal.bl
+@@ -2,9 +2,10 @@
+ ;
+ ; `BeamLisp.Decimal` is the exact decimal: an unbounded integer `unscaled` and
+ ; a non-negative integer `scale`, denoting `unscaled × 10⁻ˢᶜᵃˡᵉ`. `1.50M` is
+-; `{150, 2}` and `1.5M` is `{15, 1}`: numerically equal, NOT `=`-equal, exactly
+-; `java.math.BigDecimal` — the scale IS information (cents vs. tenths) and is
+-; never silently dropped. This file is the `.bl` port of
++; `{150, 2}` and `1.5M` is `{15, 1}`: the same numeric value with different
++; representations. `decimal/same-representation?` exposes Java BigDecimal.equals
++; semantics; generic `=` compares numeric values. Scale is never silently
++; dropped. This file is the `.bl` port of
+ ; `lib/beam_lisp/decimal.ex`, compiled by `BeamLisp.AOT/compile_host_file` into
+ ; ONE exact-named beam whose `__struct__/0,1` pair and `__info__/1` are
+ ; SYNTHESIZED by the `:struct_fields` option (`[{:unscaled 0} {:scale 0}]`,
+--- a/priv/host/num.bl
++++ b/priv/host/num.bl
+@@ -49,8 +49,9 @@
+ ;     REFUSED (`:decimal/inexact-operand`) — the binary float is not the number
+ ;     that was written, so it must not enter exact arithmetic;
+ ;   * anything else raises the ordinary `:badarith`, as before;
+-;   * `==`/ordering are NUMERIC (`1 == 1.0`, `1.0M == 1.00M`) while decimal
+-;     `=`/scale are untouched — `cmp/2` is the tower's three-way answer;
++;   * `==`/ordering are NUMERIC (`1 == 1.0`, `1.0M == 1.00M`); the Decimal
++;     representation keeps its scale. `cmp/2` is the tower's three-way answer;
++;     generic exact-value `=` belongs to Rt, not this arithmetic tower;
+ ;   * ordering and sign predicates stay TOTAL over Erlang term order for a
+ ;     non-decimal (`(< "A" "B")`, `(pos? :x)`) — only a decimal operand takes
+ ;     the tower, so the compiler's guard expansion and the function form agree.
+--- a/docs/exact-decimals.bl.md
++++ b/docs/exact-decimals.bl.md
+@@ -41,14 +41,16 @@
+ 
+ ## Two equalities, on purpose
+ 
+-`=` is structural: `1.5M` and `1.50M` are different *values*, exactly as
+-`equals` says on the JVM. `==`, `compare`, `<` and their family are *numeric*:
+-the two are the same *number*. Sorting, `max`, `min` and `sort-by` all go
+-through the numeric side, so a mixed column of integers and decimals orders
+-correctly.
++`=` compares exact numeric values: `1.5M` and `1.50M` are the same number.
++Their representations retain different scales. `d/same-representation?` asks
++the coefficient-and-scale question that `BigDecimal.equals` asks on the JVM.
++Generic equality and `compare` use the Float's actual IEEE value, so
++`(= 0.1M 0.1)` is false and `(= 0.50M 0.5)` is true. This comparison does not
++convert a Float into Decimal arithmetic. Sorting, `max`, `min` and `sort-by`
++retain numeric ordering; exact arithmetic continues to preserve scale.
+ 
+ ```beam-lisp
+-(println "=  " (= 1.5M 1.50M) "  == " (== 1.5M 1.50M))
++(println "=  " (= 1.5M 1.50M) "  same representation? " (d/same-representation? 1.5M 1.50M))
+ (println (sort [3M 1.5M 2 0.25M]) (max 1M 2.5M 2) (compare 2.50M 2.5M))
+ ```
+ 
+--- a/test/bl/host_num_test.bl
++++ b/test/bl/host_num_test.bl
+@@ -25,14 +25,14 @@
+ ;   * a non-number beside a number keeps the plain `:badarith`;
+ ;   * ordering and sign predicates are TOTAL over Erlang term order for a
+ ;     non-decimal pair, so strings and atoms answer instead of raising;
+-;   * `==`/`<` are NUMERIC (`1 == 1.0`, `1.00M == 1.0M`) while `=`/scale are
+-;     untouched;
++;   * `==`/`<` are NUMERIC (`1 == 1.0`, `1.00M == 1.0M`), generic `=` uses
++;     exact values, and the separate representation API retains scale;
+ ;   * zero division (`1 / 0`, decimal / zero) and non-terminating decimal
+ ;     division answer as the live module answers.
+ ;
+ ; Run: bin/bl test test/bl/host_num_test.bl
+ 
+-(ns host.num.test)
++(ns host.num.test (:require [decimal :as d]))
+ 
+ (defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+ 
+@@ -259,14 +259,15 @@
+ ; ── equality and scale ───────────────────────────────────────────────────
+ 
+ (deftest num-pinned-keeps-numeric-equality-and-decimal-scale
+-  (testing "== / < are numeric; = and the scale of a decimal are untouched"
++  (testing "numeric equality and representation equality are separate"
+     (let [dir (tmp-dir)]
+       (compile-probe dir)
+       (let [a (of 100 2)   ; 1.00
+             b (of 1 0)     ; 1
+             c (of 10 1)]   ; 1.0
+-        ; the value model keeps the scale: `1.00M` and `1M` are NOT `=`.
+-        (is (not= a b))
++        ; Exact values agree while coefficient-and-scale representations differ.
++        (is (= a b))
++        (is (not (d/same-representation? a b)))
+         (is (= 2 (BeamLisp.Decimal/scale a)))
+         (is (= 0 (BeamLisp.Decimal/scale b)))
+         (is (= 1 (BeamLisp.Decimal/scale c)))
+@@ -280,11 +281,10 @@
+         (doseq [f (list :num_eq :cmp :lt :gt :le :ge)]
+           (is (= (erlang/apply live f (list a b)) (erlang/apply probe f (list a b)))
+               (str "decimal scale on " f)))
+-        ; int vs float: the language's `=` on raw numbers IS the numeric
+-        ; `==` (`erlang/==`), and so is the tower's `==` — while a decimal
+-        ; pair differs structurally because the map carries the scale.
++        ; Generic equality uses exact numeric value across representations.
+         (is (= 1 1.0))
+-        (is (not= a b))
++        (is (= a b))
++        (is (not (d/same-representation? a b)))
+         (is (erlang/apply probe :num_eq (list 1 1.0)))
+         (is (not (erlang/apply probe :lt (list 1 1.0))))
+         (is (= 0 (erlang/apply probe :cmp (list 1 1.0)))))
+--- a/test/bl/decimal_oracle_port_test.bl
++++ b/test/bl/decimal_oracle_port_test.bl
+@@ -5,7 +5,8 @@
+ ; Every row's answer was CAPTURED FROM THE JVM (`clojure -M` evaluating the first
+ ; column with `java.math.BigDecimal`/`RoundingMode` imported) — an oracle, not a
+ ; restatement of this implementation. The second column is the beam-lisp
+-; spelling of the same computation; the test asserts beam-lisp's printed answer
++; spelling of the same computation (`BigDecimal.equals` uses the explicit
++; representation predicate); the test asserts beam-lisp's printed answer
+ ; equals the JVM's. A row whose JVM side raised `ArithmeticException` carries
+ ; "ERR".
+ ;
+@@ -1065,20 +1066,20 @@
+     ["(.toPlainString (.multiply -2.355M 0.5M))" "(d/plain-str (* -2.355M 0.5M))" "-1.1775"]
+     ["(.compareTo 0.5M 0.1M)" "(compare 0.5M 0.1M)" "1"]
+     ["(.toPlainString (.multiply -1M -2.355M))" "(d/plain-str (* -1M -2.355M))" "2.355"]
+-    ["(.equals 7.125M 0.005M)" "(= 7.125M 0.005M)" "false"]
++    ["(.equals 7.125M 0.005M)" "(d/same-representation? 7.125M 0.005M)" "false"]
+   ])
+ 
+ (def ^:private rows-19
+   [
+     ["(.toPlainString (.add -12.5M 3.3333M))" "(d/plain-str (+ -12.5M 3.3333M))" "-9.1667"]
+-    ["(.equals 12.5M 1M)" "(= 12.5M 1M)" "false"]
++    ["(.equals 12.5M 1M)" "(d/same-representation? 12.5M 1M)" "false"]
+     ["(.toPlainString (.multiply 1M -1M))" "(d/plain-str (* 1M -1M))" "-1"]
+-    ["(.equals 0.2M 0M)" "(= 0.2M 0M)" "false"]
+-    ["(.equals 1234.5678M 100M)" "(= 1234.5678M 100M)" "false"]
+-    ["(.equals 100M 0.5M)" "(= 100M 0.5M)" "false"]
+-    ["(.equals 12.5M -0.001M)" "(= 12.5M -0.001M)" "false"]
++    ["(.equals 0.2M 0M)" "(d/same-representation? 0.2M 0M)" "false"]
++    ["(.equals 1234.5678M 100M)" "(d/same-representation? 1234.5678M 100M)" "false"]
++    ["(.equals 100M 0.5M)" "(d/same-representation? 100M 0.5M)" "false"]
++    ["(.equals 12.5M -0.001M)" "(d/same-representation? 12.5M -0.001M)" "false"]
+     ["(.toPlainString (.add 0.2M -0.001M))" "(d/plain-str (+ 0.2M -0.001M))" "0.199"]
+-    ["(.equals 12.5M 0.005M)" "(= 12.5M 0.005M)" "false"]
++    ["(.equals 12.5M 0.005M)" "(d/same-representation? 12.5M 0.005M)" "false"]
+     ["(.compareTo 1.50M 1.50M)" "(compare 1.50M 1.50M)" "0"]
+     ["(.toPlainString (.add 0.2M 0.1M))" "(d/plain-str (+ 0.2M 0.1M))" "0.3"]
+     ["(.compareTo 0M -2.345M)" "(compare 0M -2.345M)" "1"]
+@@ -1087,7 +1088,7 @@
+     ["(.toPlainString (.multiply 1M -0.001M))" "(d/plain-str (* 1M -0.001M))" "-0.001"]
+     ["(.toPlainString (.multiply 0M -12.5M))" "(d/plain-str (* 0M -12.5M))" "0.0"]
+     ["(.toPlainString (.multiply 2.345M -1M))" "(d/plain-str (* 2.345M -1M))" "-2.345"]
+-    ["(.equals 2.355M 0.005M)" "(= 2.355M 0.005M)" "false"]
++    ["(.equals 2.355M 0.005M)" "(d/same-representation? 2.355M 0.005M)" "false"]
+     ["(.toPlainString (.add 0.2M 0.5M))" "(d/plain-str (+ 0.2M 0.5M))" "0.7"]
+     ["(.toPlainString (.multiply 0M 0.1M))" "(d/plain-str (* 0M 0.1M))" "0.0"]
+     ["(.compareTo 100M 0.005M)" "(compare 100M 0.005M)" "1"]
+@@ -1095,11 +1096,11 @@
+     ["(.compareTo -0.001M 0.2M)" "(compare -0.001M 0.2M)" "-1"]
+     ["(.compareTo 0.1M 12.5M)" "(compare 0.1M 12.5M)" "-1"]
+     ["(.toPlainString (.add 2.345M 2.345M))" "(d/plain-str (+ 2.345M 2.345M))" "4.690"]
+-    ["(.equals 3.3333M -12.5M)" "(= 3.3333M -12.5M)" "false"]
++    ["(.equals 3.3333M -12.5M)" "(d/same-representation? 3.3333M -12.5M)" "false"]
+     ["(.compareTo 2.355M 2.345M)" "(compare 2.355M 2.345M)" "1"]
+-    ["(.equals 12.5M 1.50M)" "(= 12.5M 1.50M)" "false"]
++    ["(.equals 12.5M 1.50M)" "(d/same-representation? 12.5M 1.50M)" "false"]
+     ["(.compareTo -2.345M 12.5M)" "(compare -2.345M 12.5M)" "-1"]
+-    ["(.equals 3.3333M -2.355M)" "(= 3.3333M -2.355M)" "false"]
++    ["(.equals 3.3333M -2.355M)" "(d/same-representation? 3.3333M -2.355M)" "false"]
+     ["(.toPlainString (.multiply 0M -1M))" "(d/plain-str (* 0M -1M))" "0"]
+     ["(.toPlainString (.add 12.5M 0.2M))" "(d/plain-str (+ 12.5M 0.2M))" "12.7"]
+     ["(.compareTo -1M 2.345M)" "(compare -1M 2.345M)" "-1"]
+@@ -1113,9 +1114,9 @@
+     ["(.toPlainString (.multiply -2.355M 0.005M))" "(d/plain-str (* -2.355M 0.005M))" "-0.011775"]
+     ["(.compareTo 2.355M 0.5M)" "(compare 2.355M 0.5M)" "1"]
+     ["(.compareTo 3.3333M 0.1M)" "(compare 3.3333M 0.1M)" "1"]
+-    ["(.equals -2.345M 7.125M)" "(= -2.345M 7.125M)" "false"]
++    ["(.equals -2.345M 7.125M)" "(d/same-representation? -2.345M 7.125M)" "false"]
+     ["(.toPlainString (.add 0M 0.1M))" "(d/plain-str (+ 0M 0.1M))" "0.1"]
+-    ["(.equals 1M 0.2M)" "(= 1M 0.2M)" "false"]
++    ["(.equals 1M 0.2M)" "(d/same-representation? 1M 0.2M)" "false"]
+     ["(.toPlainString (.multiply 0.1M 0.5M))" "(d/plain-str (* 0.1M 0.5M))" "0.05"]
+     ["(.toPlainString (.multiply -1M 12.5M))" "(d/plain-str (* -1M 12.5M))" "-12.5"]
+     ["(.toPlainString (.add 1234.5678M 0.1M))" "(d/plain-str (+ 1234.5678M 0.1M))" "1234.6678"]
+@@ -1124,21 +1125,21 @@
+ 
+ (def ^:private rows-20
+   [
+-    ["(.equals -2.345M 0.1M)" "(= -2.345M 0.1M)" "false"]
+-    ["(.equals 1234.5678M -2.345M)" "(= 1234.5678M -2.345M)" "false"]
++    ["(.equals -2.345M 0.1M)" "(d/same-representation? -2.345M 0.1M)" "false"]
++    ["(.equals 1234.5678M -2.345M)" "(d/same-representation? 1234.5678M -2.345M)" "false"]
+     ["(.toPlainString (.add 1M 0.1M))" "(d/plain-str (+ 1M 0.1M))" "1.1"]
+     ["(.compareTo 0M -2.355M)" "(compare 0M -2.355M)" "1"]
+     ["(.compareTo -12.5M -2.355M)" "(compare -12.5M -2.355M)" "-1"]
+     ["(.toPlainString (.multiply 0M 0M))" "(d/plain-str (* 0M 0M))" "0"]
+     ["(.toPlainString (.multiply 2.345M 7.125M))" "(d/plain-str (* 2.345M 7.125M))" "16.708125"]
+     ["(.toPlainString (.multiply 2.345M 100M))" "(d/plain-str (* 2.345M 100M))" "234.500"]
+-    ["(.equals 1M -2.345M)" "(= 1M -2.345M)" "false"]
++    ["(.equals 1M -2.345M)" "(d/same-representation? 1M -2.345M)" "false"]
+     ["(.compareTo 100M 100M)" "(compare 100M 100M)" "0"]
+     ["(.toPlainString (.add 1234.5678M -1M))" "(d/plain-str (+ 1234.5678M -1M))" "1233.5678"]
+     ["(.toPlainString (.multiply 1234.5678M 3.3333M))" "(d/plain-str (* 1234.5678M 3.3333M))" "4115.18484774"]
+-    ["(.equals -0.001M 2.345M)" "(= -0.001M 2.345M)" "false"]
++    ["(.equals -0.001M 2.345M)" "(d/same-representation? -0.001M 2.345M)" "false"]
+     ["(.toPlainString (.multiply 1M -12.5M))" "(d/plain-str (* 1M -12.5M))" "-12.5"]
+-    ["(.equals 0.1M 1.50M)" "(= 0.1M 1.50M)" "false"]
++    ["(.equals 0.1M 1.50M)" "(d/same-representation? 0.1M 1.50M)" "false"]
+     ["(.compareTo 2.345M 2.355M)" "(compare 2.345M 2.355M)" "-1"]
+     ["(.compareTo -12.5M 0.5M)" "(compare -12.5M 0.5M)" "-1"]
+     ["(.toPlainString (.add -2.345M 2.345M))" "(d/plain-str (+ -2.345M 2.345M))" "0.000"]
+@@ -1146,17 +1147,17 @@
+     ["(.compareTo -1M 2.355M)" "(compare -1M 2.355M)" "-1"]
+     ["(.toPlainString (.multiply -2.355M -2.345M))" "(d/plain-str (* -2.355M -2.345M))" "5.522475"]
+     ["(.toPlainString (.multiply -2.355M -12.5M))" "(d/plain-str (* -2.355M -12.5M))" "29.4375"]
+-    ["(.equals 0M -2.345M)" "(= 0M -2.345M)" "false"]
+-    ["(.equals -0.001M 0M)" "(= -0.001M 0M)" "false"]
++    ["(.equals 0M -2.345M)" "(d/same-representation? 0M -2.345M)" "false"]
++    ["(.equals -0.001M 0M)" "(d/same-representation? -0.001M 0M)" "false"]
+     ["(.toPlainString (.multiply 0.5M 0.5M))" "(d/plain-str (* 0.5M 0.5M))" "0.25"]
+-    ["(.equals 0.5M -0.001M)" "(= 0.5M -0.001M)" "false"]
++    ["(.equals 0.5M -0.001M)" "(d/same-representation? 0.5M -0.001M)" "false"]
+     ["(.toPlainString (.add 2.355M 100M))" "(d/plain-str (+ 2.355M 100M))" "102.355"]
+     ["(.compareTo -1M 3.3333M)" "(compare -1M 3.3333M)" "-1"]
+     ["(.compareTo 0M 2.345M)" "(compare 0M 2.345M)" "-1"]
+     ["(.compareTo 1M -0.001M)" "(compare 1M -0.001M)" "1"]
+     ["(.toPlainString (.add 100M 1234.5678M))" "(d/plain-str (+ 100M 1234.5678M))" "1334.5678"]
+     ["(.toPlainString (.multiply 3.3333M -1M))" "(d/plain-str (* 3.3333M -1M))" "-3.3333"]
+-    ["(.equals 1.50M 7.125M)" "(= 1.50M 7.125M)" "false"]
++    ["(.equals 1.50M 7.125M)" "(d/same-representation? 1.50M 7.125M)" "false"]
+     ["(.toPlainString (.add -12.5M -2.345M))" "(d/plain-str (+ -12.5M -2.345M))" "-14.845"]
+     ["(.toPlainString (.multiply 0.1M 1M))" "(d/plain-str (* 0.1M 1M))" "0.1"]
+     ["(.toPlainString (.multiply 2.345M 1M))" "(d/plain-str (* 2.345M 1M))" "2.345"]
+@@ -1170,7 +1171,7 @@
+     ["(.compareTo 0.5M -1M)" "(compare 0.5M -1M)" "1"]
+     ["(.toPlainString (.add 1234.5678M 100M))" "(d/plain-str (+ 1234.5678M 100M))" "1334.5678"]
+     ["(.toPlainString (.multiply -0.001M 2.355M))" "(d/plain-str (* -0.001M 2.355M))" "-0.002355"]
+-    ["(.equals 2.345M 3.3333M)" "(= 2.345M 3.3333M)" "false"]
++    ["(.equals 2.345M 3.3333M)" "(d/same-representation? 2.345M 3.3333M)" "false"]
+     ["(.toPlainString (.add 0M 0M))" "(d/plain-str (+ 0M 0M))" "0"]
+     ["(.toPlainString (.multiply 0.1M -12.5M))" "(d/plain-str (* 0.1M -12.5M))" "-1.25"]
+     ["(.compareTo -2.355M 0.5M)" "(compare -2.355M 0.5M)" "-1"]
+--- a/test/bl/datom/query_composite_join_test.bl
++++ b/test/bl/datom/query_composite_join_test.bl
+@@ -58,12 +58,12 @@
+           (is (= expected (engine/run-clauses db rows [clause] nil {})))))
+       (finally (d/close! c)))))
+ 
+-(deftest semantic-key-collisions-do-not-establish-equality
++(deftest decimal-scale-variants-match-by-value-in-scans-and-hash-joins
+   (let [c (d/connect [{:db/ident :join/term :db/valueType :db.type/term}])]
+     (try
+       (d/transact! c [{:db/id 100 :join/term 1.0M}])
+       (let [db (d/db c) rows [{'?e 100 '?v 1.00M}] clause '[?e :join/term ?v]
+             expected (vec (mapcat (fn [row] (engine/eval-pattern db row clause)) rows))]
+-        (is (= [] expected))
++        (is (= 1 (count expected)))
+         (is (= expected (engine/run-clauses db rows [clause] nil {}))))
+       (finally (d/close! c)))))
+--- /dev/null
++++ b/test/bl/numeric_equality_test.bl
+@@ -0,0 +1,49 @@
++(ns numeric.equality-test (:require [decimal :as d]))
++
++;; Algebraic laws and representation boundaries, rather than a second copy
++;; of the rational comparison implementation. Run on the proposed SDK.
++(def finite-numbers
++ [0 -0.0 0M 0.00M 1 1.0 1M 1.00M 1.5 1.5M 1.50M
++  0.1 0.1M 0.5 0.50M 9007199254740992 9007199254740992.0
++  9007199254740993 -9007199254740993])
++
++(deftest finite-numeric-equality-is-an-equivalence-relation
++ (doseq [a finite-numbers]
++  (is (= a a)))
++ (doseq [a finite-numbers b finite-numbers]
++  (is (= (= a b) (= b a)))
++  (is (= (= a b) (zero? (compare a b)))))
++ (doseq [a finite-numbers b finite-numbers c finite-numbers]
++  (when (and (= a b) (= b c)) (is (= a c)))))
++
++(deftest exact-ieee-values-do-not-follow-printed-approximations
++ (is (= 1.5M 1.5))
++ (is (= 1.5 1.50M))
++ (is (= 1.5M 1.50M))
++ (is (= 0.50M 0.5))
++ (is (not= 0.1M 0.1))
++ (is (not= 9007199254740993 9007199254740992.0)))
++
++(deftest equality-is-compositional-and-metadata-insensitive
++ (doseq [a finite-numbers b finite-numbers]
++  (is (= (= a b) (= [a] [b])))
++  (is (= (= a b) (= (list a) [b])))
++  (is (= (= a b) (= {:value a} {:value b})))
++  (is (= (= a b) (= (tuple :meta a {:origin :ignored}) b)))))
++
++(deftest equal-values-have-equal-semantic-projections
++ (doseq [a finite-numbers b finite-numbers]
++  (when (= a b)
++   (is (= (BeamLisp.Ns.Rt/semantic-key a) (BeamLisp.Ns.Rt/semantic-key b)))
++   (is (= (BeamLisp.Ns.Rt/semantic-hash a) (BeamLisp.Ns.Rt/semantic-hash b))))))
++
++(deftest decimal-representation-equality-is-explicit-and-preserves-scale
++ (is (d/same-representation? 1.50M 1.50M))
++ (is (not (d/same-representation? 1.5M 1.50M)))
++ (is (not (d/same-representation? 1.5M 1.5)))
++ (is (not (d/same-representation? 1M 1)))
++ (is (= 2 (d/scale 1.50M)))
++ (is (= 150 (d/unscaled 1.50M)))
++ (is (= "1.50" (d/plain-str 1.50M))))
++
++(run-tests)

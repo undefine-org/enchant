@@ -293,7 +293,10 @@ impl Z3 {
     }
     fn eval(&self, model: H, expression: H) -> Option<H> {
         let mut value = ptr::null_mut();
-        if unsafe { (self.api.Z3_model_eval)(self.context,model,expression,false,&mut value) } && !value.is_null() {
+        // Complete only don't-care symbols in the already returned SAT
+        // model. This chooses a concrete extension for independent replay;
+        // it neither changes solver status nor asserts uniqueness.
+        if unsafe { (self.api.Z3_model_eval)(self.context,model,expression,true,&mut value) } && !value.is_null() {
             Some(value)
         } else { None }
     }
@@ -388,6 +391,7 @@ impl Backend for Z3 {
                 ("max-bv-width",wire::integer(4096)),("max-fp-bits",wire::integer(128)),
                 ("real-literal-bits",wire::binary("arbitrary")),("symbolic-rounding",wire::atom("true")),
                 ("native-cores",wire::atom("true")),("max-text-codepoint",wire::integer(0x2ffff)),
+                ("model-completion",wire::binary("concrete-extension")),
                 ("model",wire::binary("observed scalars and enum constructors; select/nth for collections")),
             ])),
         ])
