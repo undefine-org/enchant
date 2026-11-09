@@ -1,0 +1,169 @@
+(ns formal.evaluate (:require [formal.term :as t]))
+
+;; This evaluator is deliberately independent of a native solver's get-value.
+;; It reads assignments only for free variables. Unsupported mathematics stays
+;; incomplete; a solver-evaluated predicate is never counted as replay evidence.
+(defn unavailable [reason] {:formal/unavailable reason})
+(defn unavailable? [value] (and (map? value) (contains? value :formal/unavailable)))
+(defn real [n d] {:formal/real (t/rational n d)})
+(defn bv [width value]
+ {:formal/bv [width (erlang/band value (dec (erlang/bsl 1 width)))]})
+(defn- rational? [value] (and (map? value) (contains? value :formal/real)))
+(defn- pair [value] (if (rational? value) (:formal/real value) [value 1]))
+(defn- radd [a b]
+ (let [[an ad] (pair a) [bn bd] (pair b)] (real (+ (* an bd) (* bn ad)) (* ad bd))))
+(defn- rneg [a] (let [[n d] (pair a)] (real (- n) d)))
+(defn- rmul [a b]
+ (let [[an ad] (pair a) [bn bd] (pair b)] (real (* an bn) (* ad bd))))
+(defn- rdiv [a b]
+ (let [[an ad] (pair a) [bn bd] (pair b)]
+  (if (zero? bn) (unavailable :unspecified-real-division-by-zero) (real (* an bd) (* ad bn)))))
+(defn- compare-real [a b]
+ (let [[an ad] (pair a) [bn bd] (pair b) left (* an bd) right (* bn ad)]
+  (cond (< left right) -1 (> left right) 1 :else 0)))
+(defn- ediv [a b]
+ (if (zero? b) (unavailable :unspecified-integer-division-by-zero)
+  (let [q (erlang/div a b) r (erlang/rem a b)]
+   (if (>= r 0) q (if (> b 0) (dec q) (inc q))))))
+(defn- emod [a b]
+ (let [q (ediv a b)] (if (unavailable? q) q (- a (* b q)))))
+(defn- codepoints [text] (vec (unicode/characters_to_list text)))
+(defn- chars [points] (unicode/characters_to_binary (to-list points)))
+(defn- seq-index [haystack needle start]
+ (let [n (count haystack) m (count needle)]
+  (if (or (< start 0) (> start n)) -1
+   (loop [offset start]
+    (cond (> (+ offset m) n) -1
+     (= needle (vec (take m (drop offset haystack)))) offset
+     :else (recur (inc offset)))))))
+
+(declare value)
+(defn- array-read [array key]
+ (if (and (map? array) (contains? array :formal/array))
+  (let [model (:formal/array array) matches (filter (fn [[k _]] (= k key)) (:updates model))]
+   (if (seq matches) (second (last matches)) (:default model)))
+  (unavailable :nonconcrete-array)))
+(defn- array-store [array key item]
+ (if (and (map? array) (contains? array :formal/array))
+  (update-in array [:formal/array :updates] conj [key item])
+  (unavailable :nonconcrete-array)))
+(defn- equal [a b]
+ (cond
+  (and (map? a) (contains? a :formal/array) (map? b) (contains? b :formal/array))
+   (let [ad (:default (:formal/array a)) bd (:default (:formal/array b))
+         keys (set (concat (map first (:updates (:formal/array a))) (map first (:updates (:formal/array b)))))]
+    ;; Different defaults can still describe equal arrays over a finite index
+    ;; sort if their updates cover it; do not guess that case.
+    (if (not= ad bd) (unavailable :array-default-domain-needed)
+     (every? (fn [k] (= (array-read a k) (array-read b k))) keys)))
+  :else (= a b)))
+
+(defn- signed [width bits]
+ (if (>= bits (erlang/bsl 1 (dec width))) (- bits (erlang/bsl 1 width)) bits))
+(defn- bv-op [op sort args data]
+ (let [[width a] (:formal/bv (first args)) b (second (:formal/bv (second args)))]
+  (cond
+   (= op :bv-add) (bv width (+ a b)) (= op :bv-sub) (bv width (- a b))
+   (= op :bv-mul) (bv width (* a b)) (= op :bv-and) (bv width (erlang/band a b))
+   (= op :bv-or) (bv width (erlang/bor a b)) (= op :bv-xor) (bv width (erlang/bxor a b))
+   (= op :bv-not) (bv width (erlang/bnot a)) (= op :bv-neg) (bv width (- a))
+   (= op :bv-shl) (bv width (if (>= b width) 0 (erlang/bsl a b)))
+   (= op :bv-lshr) (bv width (if (>= b width) 0 (erlang/bsr a b)))
+   (= op :bv-ashr) (bv width (erlang/bsr (signed width a) (min b width)))
+   (= op :bv-ult) (< a b) (= op :bv-ule) (<= a b)
+   (= op :bv-slt) (< (signed width a) (signed width b))
+   (= op :bv-sle) (<= (signed width a) (signed width b))
+   (= op :bv-concat) (let [[bw bv-value] (:formal/bv (second args))]
+                      (bv (+ width bw) (+ (erlang/bsl a bw) bv-value)))
+   (= op :bv-extract) (let [[high low] data] (bv (inc (- high low)) (erlang/bsr a low)))
+   (= op :bv-zero-extend) (bv (second sort) a)
+   (= op :bv-sign-extend) (bv (second sort) (signed width a))
+   :else (unavailable :unsupported-bv-evaluation))))
+
+(defn value [term assignments]
+ (let [op (:op term) sort (:sort term) data (:data term) children (:args term)]
+  (cond
+   (= op :var) (get assignments data (unavailable {:unassigned data}))
+   (= op :bound) (unavailable {:free-binder data})
+   (contains? #{:bool :int :text :rounding} op) data
+   (= op :real) (real (first data) (second data))
+   (= op :bv) (bv (second sort) data)
+   (= op :fp-bits) {:formal/fp [(second sort) (nth sort 2) data]}
+   (= op :enum) {:formal/enum [(second sort) data]}
+   (= op :ite)
+    (let [condition (value (first children) assignments)]
+     (cond (= true condition) (value (second children) assignments)
+           (= false condition) (value (nth children 2) assignments)
+           :else condition))
+   (= op :and)
+    (loop [xs children unknown nil]
+     (if (empty? xs) (or unknown true)
+      (let [v (value (first xs) assignments)]
+       (cond (= false v) false (unavailable? v) (recur (rest xs) v)
+             :else (recur (rest xs) unknown)))))
+   (= op :or)
+    (loop [xs children unknown nil]
+     (if (empty? xs) (or unknown false)
+      (let [v (value (first xs) assignments)]
+       (cond (= true v) true (unavailable? v) (recur (rest xs) v)
+             :else (recur (rest xs) unknown)))))
+   :else
+    (let [args (mapv (fn [child] (value child assignments)) children)
+          missing (first (filter unavailable? args)) a (first args) b (second args)]
+     (if missing missing
+      (cond
+       (= op :not) (= false a)
+       (= op :implies) (or (= false a) (= true b))
+       (= op :xor) (not= a b)
+       (= op :eq) (equal a b)
+       (= op :distinct) (and (= (count args) (count (set args))) true)
+       (contains? #{:add :sub :mul :neg :div :mod} op)
+        (if (= sort t/Real)
+         (case op :add (radd a b) :sub (radd a (rneg b)) :mul (rmul a b)
+                  :neg (rneg a) :div (rdiv a b) (unavailable :real-mod))
+         (case op :add (+ a b) :sub (- a b) :mul (* a b) :neg (- a)
+                  :div (ediv a b) :mod (emod a b)))
+       (contains? #{:lt :le :gt :ge} op)
+        (let [c (compare-real a b)]
+         (case op :lt (< c 0) :le (<= c 0) :gt (> c 0) :ge (>= c 0)))
+       (= op :to-real) (real a 1)
+       (= op :to-int) (let [[n d] (pair a)] (ediv n d))
+       (= op :is-int) (= 1 (second (pair a)))
+       (= op :array-const) {:formal/array {:default a :updates []}}
+       (= op :select) (array-read a b)
+       (= op :store) (array-store a b (nth args 2))
+       (= op :str-concat) (str a b)
+       (= op :str-len) (count (codepoints a))
+       (= op :str-contains) (>= (seq-index (codepoints a) (codepoints b) 0) 0)
+       (= op :str-prefix) (= 0 (seq-index (codepoints b) (codepoints a) 0))
+       (= op :str-suffix) (let [aa (codepoints a) bb (codepoints b)]
+                            (and (<= (count aa) (count bb)) (= aa (vec (drop (- (count bb) (count aa)) bb)))))
+       (= op :str-at) (let [cps (codepoints a)] (if (and (>= b 0) (< b (count cps))) (chars [(nth cps b)]) ""))
+       (= op :str-substr) (let [cps (codepoints a) length (nth args 2)]
+                            (if (or (< b 0) (>= b (count cps)) (<= length 0)) "" (chars (take length (drop b cps)))))
+       (= op :str-index) (seq-index (codepoints a) (codepoints b) (nth args 2))
+       (= op :str-replace) (let [aa (codepoints a) bb (codepoints b) offset (seq-index aa bb 0)]
+                            (if (< offset 0) a (chars (concat (take offset aa) (codepoints (nth args 2)) (drop (+ offset (count bb)) aa)))))
+       (= op :seq-empty) [] (= op :seq-unit) [a]
+       (= op :seq-concat) (vec (concat a b)) (= op :seq-len) (count a)
+       (= op :seq-nth) (if (and (>= b 0) (< b (count a))) (nth a b) (unavailable :unspecified-seq-nth))
+       (= op :seq-extract) (if (or (< b 0) (< (nth args 2) 0)) [] (vec (take (nth args 2) (drop b a))))
+       (String/starts_with? (name op) "bv-") (bv-op op sort args data)
+       (= op :fp-neg) (let [[e s bits] (:formal/fp a)] {:formal/fp [e s (erlang/bxor bits (erlang/bsl 1 (dec (+ e s))))]})
+       (= op :fp-to-ieee-bv) (let [[e s bits] (:formal/fp a)] (bv (+ e s) bits))
+       (contains? #{:fp-is-nan :fp-is-inf} op)
+        (let [[e s bits] (:formal/fp a) mantissa (erlang/band bits (dec (erlang/bsl 1 (dec s))))
+              exponent (erlang/band (erlang/bsr bits (dec s)) (dec (erlang/bsl 1 e))) all-ones (dec (erlang/bsl 1 e))]
+         (and (= exponent all-ones) (if (= op :fp-is-nan) (not= 0 mantissa) (= 0 mantissa))))
+       :else (unavailable {:unsupported-operation op})))))))
+
+(defn validate [assertions assignments]
+ (let [results (mapv (fn [assertion]
+                  (let [actual (value (:term assertion) assignments)]
+                   {:label (:label assertion) :value actual
+                    :status (cond (= actual true) :valid (= actual false) :invalid :else :incomplete)})) assertions)
+       invalid (vec (filter (fn [r] (= :invalid (:status r))) results))
+       missing (vec (filter (fn [r] (= :incomplete (:status r))) results))]
+  {:status (cond (seq invalid) :invalid (seq missing) :incomplete :else :valid)
+   :kind :independent-replay :checked (- (count results) (count missing))
+   :invalid invalid :incomplete missing :results results}))

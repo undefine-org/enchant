@@ -1,0 +1,148 @@
+(ns formal.backend (:require [formal.term :as t] [formal.evaluate :as ev]))
+
+(def ^:private wire-atoms
+ #{:ok :protocol :generation :backend :name :version :capabilities :operations :sorts :limits :pid
+   :status :error :why :kind :message :stats :solve-us :nodes :checks :observations :model-status
+   :core :core-kind :sat :unsat :unknown :unsupported :available :partial :unavailable :native
+   :unspecified :timeout :incomplete :canceled :invalid :max-bv-width :max-fp-bits
+   :real-literal-bits :symbolic-rounding :native-cores :max-text-codepoint :max-nodes})
+
+(defn native-data [data]
+ (cond
+  (keyword? data) (name data)
+  (or (vector? data) (list? data)) (to-list (map native-data data))
+  (map? data) (reduce (fn [out [k v]] (Map/put out (if (keyword? k) (name k) k) (native-data v)))
+                       (maps/from_list (list)) data)
+  :else data))
+(defn- read-data [data]
+ (cond
+  (erlang/is_map data) (reduce (fn [out pair] (assoc out (elem pair 0) (read-data (elem pair 1)))) {} (maps/to_list data))
+  (erlang/is_list data) (vec (map read-data data))
+  :else data))
+(defn- close! [port]
+ (when (and (erlang/is_port port) (some? (Port/info port))) (Port/close port)) :ok)
+(defn- exchange! [port borrower-monitor payload timeout]
+ (when-not (= (tuple :connected (erlang/self)) (erlang/port_info port :connected))
+  (throw (ex-info "formal backend port custody required" {})))
+ (let [deadline (+ (erlang/monotonic_time :millisecond) timeout)
+       bytes (erlang/term_to_binary payload) monitor (erlang/monitor :port port)]
+  (try
+   (when (> (erlang/byte_size bytes) 1048576) (throw (ex-info "formal request exceeds packet capacity" {})))
+   (when-not (Port/command port bytes (list :nosuspend)) (throw (ex-info "formal backend port busy" {})))
+   (receive
+    [seen [:data bytes]] :when (= seen port)
+     (do (when (> (erlang/byte_size bytes) 1048576) (throw (ex-info "formal reply exceeds packet capacity" {})))
+         (read-data (erlang/binary_to_term bytes (list :safe))))
+    [:DOWN seen :process _ _] :when (= seen borrower-monitor)
+     (do (close! port) (erlang/exit (erlang/self) :kill))
+    [:DOWN seen :port _ _] :when (= seen monitor) (throw (ex-info "formal native worker exited" {}))
+    [seen [:exit_status status]] :when (= seen port) (throw (ex-info "formal native worker exited" {:status status}))
+    (after (max 0 (- deadline (erlang/monotonic_time :millisecond)))
+     (throw (ex-info "formal backend hard deadline exceeded" {:kind :timeout}))))
+   (catch error (close! port) (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))
+   (finally (Process/demonitor monitor (list :flush))))))
+
+(defserver native-owner
+ (init [config]
+  (let [monitor (Process/monitor (:borrower config))
+        port (erlang/open_port (tuple :spawn_executable (:worker config))
+              (list :binary :use_stdio :exit_status (tuple :packet 4)
+               (tuple :args (to-list (concat ["--backend" (name (:backend config))]
+                    (if (= :z3 (:backend config)) ["--z3-library" (:library config)] []))))))
+        hello (exchange! port monitor (tuple :hello) (:hard-ms config))]
+   (when-not (and (:ok hello) (= 1 (:protocol hello)))
+    (close! port) (throw (ex-info "formal protocol handshake refused" {:reply hello})))
+   (ok {:port port :borrower (:borrower config) :monitor monitor :hello hello
+        :hard-ms (:hard-ms config) :retired false})))
+ (handle-call [:invoke request] [from state]
+  (cond
+   (not= (:borrower state) (elem from 0))
+    (reply {:ok false :status :error :error "formal borrower required"} state)
+   (:retired state) (reply {:ok false :status :error :error "formal context retired"} state)
+   :else
+    (let [result (try (exchange! (:port state) (:monitor state) request (:hard-ms state))
+                  (catch e {:ok false :status :error :error (ex-message e)}))]
+     (when-not (:ok result) (close! (:port state)))
+     (reply result (assoc state :retired (not (:ok result)))))))
+ (handle-call :hello [from state]
+  (reply (if (= (:borrower state) (elem from 0)) (:hello state)
+           {:ok false :status :error :error "formal borrower required"}) state))
+ (handle-info [:DOWN ref :process _ _] [state]
+  (if (= ref (:monitor state)) (stop :normal state) (noreply state)))
+ (handle-info _ [state] (noreply state))
+ (terminate [_ state] (close! (:port state))))
+
+(defn- checksum [path] (Base/encode16 (crypto/hash :sha256 (File/read! path)) (list (tuple :case :lower))))
+(defn with-session [opts f]
+ (let [backend (get opts :backend :z3)
+       worker (or (:worker opts) (System/get_env "ENCHANT_FORMAL_WORKER"))
+       library (or (:library opts) (System/get_env "ENCHANT_Z3_LIBRARY"))
+       solver-ms (get opts :solver-ms 500) hard-ms (get opts :hard-ms 2000)]
+  (when-not (and (contains? #{:z3 :oxiz} backend) (string? worker) (File/exists? worker)
+                (or (= backend :oxiz) (and (string? library) (File/exists? library)))
+                (int? solver-ms) (int? hard-ms) (< 0 solver-ms hard-ms) (<= hard-ms 15000) (<= solver-ms 10000))
+   (throw (ex-info "formal backend configuration refused" {:backend backend :worker worker :library library})))
+  (let [identity {:backend backend :worker-sha256 (checksum worker)
+                  :library-sha256 (when (= backend :z3) (checksum library))
+                  :sdk (System/get_env "BL_SDK_PRODUCT")}
+        pid (start native-owner {:backend backend :worker (Path/expand worker) :library library
+                                 :borrower (erlang/self) :hard-ms hard-ms})
+        hello (call pid :hello (+ 1000 hard-ms))
+        session {:pid pid :solver-ms solver-ms :hard-ms hard-ms :identity identity :hello hello
+                 :state (atom {:generation (:generation hello) :registry (t/registry) :assertions []})}]
+   (try (f session)
+    (finally (when (Process/alive? pid) (GenServer/stop pid :normal 1000)))))))
+
+(defn invoke [session request]
+ (call (:pid session) [:invoke request] (+ 1000 (:hard-ms session))))
+(defn hello [session] (:hello session))
+(defn reset! [session]
+ (let [result (invoke session (tuple :reset (:generation @(:state session))))]
+  (when (:ok result)
+   (swap! (:state session) (fn [_] {:generation (:generation result) :registry (t/registry) :assertions []}))) result))
+
+(defn- label [x] (if (keyword? x) (str x) (str x)))
+(defn- prepare [session assertions assumptions observations]
+ (let [before @(:state session)
+       roots (vec (concat (map :term assertions) assumptions (map second observations)))
+       exported (t/export (:registry before) roots) ids (:ids (:registry exported))]
+  {:state before :registry (:registry exported) :nodes (:nodes exported)
+   :assertions (mapv (fn [a] [(label (:label a)) (get ids (:term a))]) assertions)
+   :assumptions (mapv (fn [term] (get ids term)) assumptions)
+   :observations (mapv (fn [[name term]] [(str name) (get ids term)]) observations)}))
+
+(defn load! [session assertions]
+ (let [prepared (prepare session assertions [] [])
+       result (invoke session (tuple :load (:generation (:state prepared))
+                      (native-data (:nodes prepared)) (native-data (:assertions prepared))))]
+  (when (:ok result)
+   (swap! (:state session) (fn [state] (-> state (assoc :registry (:registry prepared))
+                                         (update :assertions #(vec (concat % assertions))))))) result))
+
+(defn decode-native [wire]
+ (if-not (and (vector? wire) (seq wire)) (ev/unavailable :malformed-observation)
+  (let [kind (first wire)]
+   (cond
+    (contains? #{"bool" "int" "text"} kind) (second wire)
+    (= kind "real") (ev/real (second wire) (nth wire 2))
+    (= kind "bv") (ev/bv (second wire) (nth wire 2))
+    (= kind "fp") {:formal/fp [(second wire) (nth wire 2) (nth wire 3)]}
+    (= kind "enum") {:formal/enum [(second wire) (nth wire 2)]}
+    (= kind "constructor") {:formal/constructor [(second wire) (mapv decode-native (nth wire 2))]}
+    (= kind "array") {:formal/array {:default (decode-native (second wire))
+                          :updates (mapv (fn [[k v]] [(decode-native k) (decode-native v)]) (nth wire 2))}}
+    :else (ev/unavailable {:kind kind :reason (second wire)})))))
+
+(defn scope!
+ "One generation-checked native exchange. Portable terms persist; scoped
+  assertions do not. Witness availability is independent of solver status."
+ [session assertions assumptions observations]
+ (let [started (erlang/monotonic_time :microsecond)
+       prepared (prepare session assertions assumptions observations)
+       reply (invoke session (tuple :scope (:generation (:state prepared))
+               (native-data (:nodes prepared)) (native-data (:assertions prepared))
+               (native-data (:assumptions prepared)) (native-data (:observations prepared)) (:solver-ms session)))]
+  (when (:ok reply) (swap! (:state session) assoc :registry (:registry prepared)))
+  (assoc reply :identity (:identity session) :trusted false
+               :values (into {} (map (fn [[name v]] [name (decode-native v)]) (:observations reply)))
+               :wall-us (- (erlang/monotonic_time :microsecond) started))))
